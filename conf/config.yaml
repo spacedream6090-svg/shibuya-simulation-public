@@ -1,0 +1,953 @@
+# ============================================================
+# 実験の全条件をここで宣言する(D11)。コードは書き換えない。
+# 上書き例: python scripts/run.py run.seed=7 run.n_agents=30
+# ============================================================
+
+run:
+  seed: 42
+  n_agents: 10
+  n_steps: 144          # 144 step = シミュ内1日(1 step = 10分)
+  out_dir: runs         # 実行ごとに runs/<name>/ が作られる
+  name: null            # null なら seed から自動命名
+
+# ---- state 更新則の magnitude(OPEN#2: 因果構造は factors/update.py、量はここで調律)----
+factors:
+  congestion_grievance: 0.010     # 混雑遅延 → 不満+(Epstein)
+  heard_valence_grievance: 0.020  # ネガ発話を聞く → 不満+ ×|感情価|(SIMCA affective)
+  heard_valence_efficacy: 0.006   # ポジ発話を聞く → 効力感+
+  being_heard_efficacy: 0.006     # 聞き手がいた → 効力感+(社会的説得)
+  ignored_efficacy: -0.004        # 誰にも聞かれない → 効力感−微
+  work_done_efficacy: 0.012       # 勤務完遂 → 効力感+(達成経験=最強の源泉)
+  vicarious_efficacy: 0.004       # 他者の言葉・成功の目撃 → 効力感+(代理経験)
+  park_grievance: -0.008          # 公園滞在 → 不満−(回復環境)
+  own_adopted_ownership: 0.030    # 自分の造語が採用される → 当事者意識+
+  own_adopted_efficacy: 0.010     #                        → 効力感+
+  money_pressure_grievance: 0.015 # 手持ちが逼迫している間 → 不満+(1日1回、経済 v0)
+  media_grievance: -0.03          # 在宅娯楽の気分修復(media.enabled 時のみ発火。Vuorre 2024
+                                  # の +0.034/15分 を逆符号で。media OFF なら一切読まれない)
+  relative_deprivation_grievance: 0.0  # ★ON 推奨: 例 0.012。参照集団(街に居る他者)の所持金
+                                  # 中央値を下回る量に応じた不満(Wave G1・1日1回・非LLM・決定論)。
+                                  # 個体の相対的地位で grievance に個体差が復活=飽和を破る。0.0=OFF(不変)
+  threshold_dist: normal          # normal | lognormal(発火閾値の分布形。B段 seam)
+                                  # ★手続き生成経路のみに作用(名簿 entry 使用時は名簿値優先=不変)
+
+# ---- k(経験→内部状態の結合)= 内省の書き戻し自由度(D7) ----
+k:
+  writeback: free       # free | degraded | sham | off
+  degraded_alpha: 0.5   # degraded 時に書き戻す確率
+  reflect_period_days: 1
+
+# ---- 反射=自己モデル(第11バッチ)+出来事誘発の深い内省・無意識層(第12バッチ 2026-07-08)----
+# 文献検証: docs/research/deep-reflection-triggers.md / self-concept-identity.md。
+# deep: 深い内省は固定周期でなく出来事に誘発される。日内の衝撃ゲージ(|Δstate| の
+#   ネガ非対称加重=信念との乖離の近似)が個人閾値(traits 写像)を超えた日→侵入的段階
+#   (「頭から離れない」記憶)→ incubation_days(1晩以上)おいて夜の内省を深い内省に格上げ
+#   (PTG の 侵入的→熟慮的)。深い内省は自己像 self/ties を生成し agent.self_model を更新
+#   (呼数・rng 消費は不変=R1。書き込みは belief と同じ k ゲート=作用チャネル1本)。
+# implicit_self: 無意識層=行動・経験カウントのベースライン逸脱と感情価から決定論で
+#   「最近の自分」1行を日次更新(Bem 自己知覚・working self-concept。揮発層=核自己と分離)。
+# self_model_days: 旧固定周期(レガシー・実験対照用)。すべて既定 OFF=従来と完全同一。
+reflection:
+  self_model_days: 0    # レガシー固定周期(0=無効)。第12バッチ以降の主経路は下の deep
+  deep:
+    enabled: false      # ★ON 推奨(本番): true(出来事誘発の深い内省)
+    threshold: 0.60     # 日内衝撃ゲージの基準閾値(個人差は traits→reflect_trigger_params)
+    neg_weight: 2.0     # ネガの非対称重み(Baumeister: 負は徹底処理される)
+    pos_weight: 1.0     # ポジもゼロにしない(畏敬・転機も深い内省を誘発しうる)
+    incubation_days: 1  # 侵入的→熟慮的の間(日)。個人差で +1 されうる
+    cooldown_days: 3    # 深い内省後の不応期(過剰反芻の抑制)
+  implicit_self:
+    enabled: false      # ★ON 推奨(本番): true(無意識の自己認識更新=裏で回る系)
+    ema: 0.7            # 行動ベースラインの平滑率(高いほど「いつもの自分」が変わりにくい)
+
+# ---- 対照系列(D7: null/compute一定は k 掃引時に使用) ----
+controls:
+  mode: none            # none | null_series | compute_matched
+  null_calls: 1         # null_series 時、発火あたりに撃つ内容非結合ダミー LLM の本数
+
+# ---- エージェント(ペルソナ v2: D6)----
+agents:
+  personas_file: null   # data/personas_80.json 等(scripts/build_personas.py 生成)。null=手続き生成
+                        # ★流入通勤者(commuter)入り名簿 = data/personas_100_inflow.json。
+                        #   commute=true の個体は朝 arrival_min に範囲外から enter_area →勤務→夕 homing。
+                        #   出入口配分・到着二峰・沿線タグは data/shibuya_population.json の inflow 節。
+                        #   commuter は名簿の新規生成分のみ有効(既存 personas_40/80 の挙動は不変)。
+  icebreak_file: null   # data/icebreak_N.json(scripts/build_icebreak.py 生成)。null=初期関係なし
+                        # ★全k条件で同一ファイルを読む=初期関係が条件間で同一(交絡の排除)
+
+model:
+  backend: mock         # mock | ollama | vllm(本選)
+  name: mock-v0
+  lang: ja              # ja | en(D3: 日本語仮決定)
+  temperature: 0.7
+  max_tokens: 320       # 発話・投稿・DMの生成上限
+  reflect_max_tokens: 1200  # 内省(思考モード)の生成上限(深い振り返り用)
+  plan_max_tokens: 0    # 0=max_tokens と同じ(朝の計画のみ上限を分けたい時に設定)
+  reflect_think: true   # 内省を qwen3 の思考モードで回す(thinking/response 分離)
+  cache: true           # 応答キャッシュ(D13: 再現性の実体)
+  # ---- 本選(backend: vllm)用。mock/ollama では未使用=既定挙動は完全不変 ----
+  servers: []           # vLLM の base_url リスト。空=vllm 選択時のみエラー。1台マルチGPU/複数ノード両対応。
+                        #   単一 (1本):   servers: ["http://localhost:8000"]                     → VllmBackend 直
+                        #   1台7GPU:      servers: ["http://localhost:8000", ..., "http://localhost:8006"]  → FleetLLM(艦隊)
+                        #   複数ノード:   servers: ["http://node1:8000", "http://node2:8000", ...]          → FleetLLM(艦隊)
+  timeout_s: 120        # 1 リクエストのタイムアウト秒(vllm のみ)
+  # tiers:              # 任意: purpose(rng_key 先頭: reflect/deliberate/... )別のサーバ振り分け。既定 null=全 URL を default プールへ。
+  #   reflect: ["http://localhost:8000"]                       # 内省=重い/大モデル1本に寄せる
+  #   default: ["http://localhost:8001", "http://localhost:8002"]  # 会話・投稿=小モデル群
+  #   ※ tiers を書くと servers が1本でも FleetLLM が使われる(seam を通す)。
+  # ---- 合成ルータ(backend: router のときだけ読む。第23バッチ M2)----
+  # 異なるモデル・異なる提供元(ローカル/API)を purpose 別に1ランへ混載する。
+  # 子は各自 CachedLLM で包まれ、キャッシュは子の name 別ファイル(llm_cache.<name>.jsonl)=D13維持。
+  # APIキーは環境変数のみ(api_key_env で変数名を指定)。config にキーの値を書かないこと。
+  # agent_tier(エージェント階層別)は未実装=ユーザー討議後(docs/research/agent-lod-deepdive.md)。
+  # router:
+  #   default: {backend: ollama, name: "qwen3:4b"}                       # 必須。deliberate 等すべての既定
+  #   purpose:
+  #     reflect: {backend: ollama, name: "qwen3:14b"}                    # 例: 内省だけ大モデル
+  #     # reflect: {backend: anthropic, name: "claude-haiku-4-5"}        # 例: 内省だけ API
+  #     # plan: {backend: openai_compat, base_url: "http://localhost:11434/v1", name: "qwen3:8b"}
+
+world:
+  map: data/shibuya_osm.json    # ★OSM 実道路網(渋谷駅中心 約1.0×0.7km)。旧: data/shibuya_core.json
+  scenario: baseline            # baseline(既定=no-op)| shock_closure | shock_event(#8 摂動カタログ)
+  # scenario_params: 選んだ scenario の引数(baseline では未使用)。座標は地図ローカル m(原点=スクランブル交差点)。
+  #   shock_closure(区間封鎖): at_step から duration_steps の間、center 半径 radius_m 内の道路を封鎖し
+  #                            新規経路が迂回する(移動中は現エッジを走り切る)。解除で復帰。
+  #     例) scenario_params: { at_step: 36, duration_steps: 18, center: [0, 0], radius_m: 150 }
+  #   shock_event(定型ニュース注入): at_step に title/text/word を世界イベント列へ合流(公式発表と同経路)。
+  #     例) scenario_params: { at_step: 24, title: "駅前で大規模イベント", text: "混雑注意", word: "封鎖祭り" }
+  scenario_params: {}           # 既定は空(baseline では読まれない)
+  perception_radius_m: 40.0     # この距離内で会話が聞こえる(建物内=同じ階のみ)
+  edge_capacity: 20             # 混雑=この人数を超えると減速(grievance 源)
+  modes:                        # 移動手段(1 step = 10分 で進める距離 m)
+    speeds: { walk: 800.0, bicycle: 2000.0, car: 3500.0 }
+  exit_prob: 0.02               # 暇なとき範囲外へ出かける確率/step
+  building_enter_prob: 0.35     # 入口に居るとき建物に入る確率
+  outside_steps: [18, 144]      # 範囲外滞在の長さ(3時間〜1日)。外は計算しない
+  meal_prob: 0.35               # 食事時間帯に飲食店(実在 POI)へ行く確率/step
+  traffic:                      # 背景交通(エージェント以外の通過車両)
+    enabled: true
+    mode: ambient               # ambient(既定=周期的な背景フロー。現行挙動と完全同一)
+                                # od(本番推奨): 車を個体化。各車が出発地=車道ゲートウェイ、
+                                #   目的地=別ゲートウェイ(通過交通)or 域内 POI 近傍を決め、
+                                #   一方通行を尊重した最短路を辿る。信号=ノード別の期待遅延、
+                                #   車線=エッジ容量(超過で渋滞減速)。要 features_file。
+                                #   重い場合は本番(vllm)だけ od、開発は ambient のままで可。
+    cars_per_day: 30000         # ambient: 台/日。センサス区間実値が未確認のため仮置き(幹線+周辺の合算オーダー)
+    max_log: 120                # 1step にログへ残す車両軌跡の上限(可視化用。両モード共通)
+    # ---- od モード専用(mode: ambient のときは一切読まれない=既定挙動は完全同一)----
+    features_file: data/traffic_features_shibuya.json  # scripts/build_traffic.py 生成(信号/車線/oneway/ゲートウェイ)
+    od_cars_per_day: 8000       # od: 個体化して追跡する車の 1日総発生台数(ambient の集計フローより軽め)
+    through_ratio: 0.7          # od: 発生車のうち通過交通(別ゲートウェイ行き)の比率。残りは域内 POI 近傍へ
+    capacity_per_lane: 8        # od: 1車線あたり同時走行許容台数。超過エッジは減速(渋滞)
+    default_lanes: 2            # od: OSM に車線タグが無いエッジの既定車線数
+    signal_cycle_s: 90          # od: 信号1周期の秒数。★1step=600s>周期なので緑赤の瞬時状態ではなく
+                                #     一様到着の期待待ち(r²·C/2)を距離換算で差し引く近似を使う
+    free_speed_min: 3000        # od: 自由流速度の下限(m/10分。約18km/h。信号/渋滞で実効はこれ以下)
+    free_speed_max: 5000        # od: 自由流速度の上限(m/10分。約30km/h)
+    max_cars_log: 200           # od: traffic_flow payload の cars[] 上限(可視化補助)
+
+  events_file: null             # シナリオイベント(例: data/events_demo.json)。ビューアの「シナリオ」タブで作成可
+
+  # ---- 擬似視覚 C(壁による遮蔽。既定 OFF=本番トグル。ユーザー要望 2026-07-06)----
+  # ON 時: 半径・同一階の既存フィルタ通過後に視線(LOS)判定を追加。建物内は決定論生成の
+  # 壁セグメント(開口部あり)で隔たれたペアが互いに不可聴=交流不可になる。
+  # outdoor=true で屋外も建物フットプリント遮蔽(重いので既定 false)。設計: docs/research/vision-los.md
+  vision:
+    enabled: false
+    outdoor: false
+
+  # ---- 日付・カレンダー(第7バッチ 2026-07-07。既定 OFF=現行挙動と完全同一)----
+  # ON 時: 全発火/計画/内省プロンプトに「今日は◯年◯月◯日(曜)です。」を1行注入(全員共通・k非依存)。
+  #   weekday_work=true にすると本業勤務・登校を平日(非休日)だけに絞る(バイトの曜日挙動は不変)。
+  #   日付は sim_min からの純関数導出=乱数不使用。holidays は "YYYY-MM-DD" 文字列リスト(土日は自動休日)。
+  calendar:
+    enabled: false              # ★ON 推奨(本番): true(暦をエージェント行動の要因にする)
+    start_date: "2026-04-01"    # シミュ初日の実日付(day_index=0 の日)
+    weekday_work: false         # ★ON 推奨: true(平日のみ勤務・登校。土日祝は休み)
+    holidays: []                # 追加の休日(例: ["2026-04-29", "2026-05-05"])。土日は自動で休日
+
+# ---- 経済 v0(賃金+消費+バイト+心理接続。ユーザー決定 2026-07-05)----
+# 職業→賃金カテゴリ・持ち金・バイトの写像は src/society/economy.py(persona/sim 側)。
+# engine は precompute 済みの金額しか見ない(no-fingerprint 契約に触れない)。
+economy:
+  enabled: true
+  wages:                          # 本業の日給(勤務完遂で支給)。part_time_hourly=学生バイト時給
+    会社員: 12000
+    自営: 10000
+    店員: 9000
+    part_time_hourly: 1100        # 学生バイト時給(×4h/シフト)
+  # 最低賃金の床(制度深化3 2026-07-08)。一次確認: 東京都最低賃金 1,226円/時(2025-10-03 発効・
+  # 東京労働局)。>0 で雇用者賃金に床を適用: part_time_hourly=max(現値, 床)、日給カテゴリ
+  # (会社員/店員/公務員)=max(現値, 床×8h)。自営は労働者でない=対象外(現実の制度と同じ)。
+  # 既定 0.0=床なし=従来と完全同一(ゴールデン維持)。★ON 推奨(本番): 1226
+  min_wage_hourly: 0.0
+  prices:                         # 消費の価格(残高不足なら選ばない)
+    food: 900
+    cafe: 500
+    shop: 2500
+    nightlife: 1800
+    leisure: 0                    # 公園・緑地は無料
+  allowance_visitor: 20000        # 来街者の持ち金初期値レンジの中心(賃金なし)
+  visitor_refresh: false          # ★ON 推奨(本番): true。来街者が帰宅から戻るたび手持ちを
+                                  # allowance_visitor まで補充(家で財布を補充する近似)。来街者は
+                                  # 反復収入が無く長期ランで恒久破綻し消費・宿泊から脱落する
+                                  # (docs/research/sim-improvement-analysis.md P2)ことへの対処。
+                                  # 決定論・k 非依存(wage source="home_refill")。false=従来と完全同一
+  money_pressure_threshold: 2000  # 残高がこれ未満 = 逼迫(1日1回 grievance+)
+  fixed_cost_daily: 0.0           # ★ON 推奨: 例 300。家賃以外の日次固定費(光熱費・サブスク等)=
+                                  # 恒常的生活圧(Wave G1)。日次で spend(cat=fixed_cost)。来街者は対象外。
+                                  # 0.0=控除ゼロ=イベントなし(バイト一致)
+  # ---- 口座(銀行)概念 E5(既定 OFF。ユーザー決定 2026-07-06。100日=月次の資金繰り)----
+  # ON 時: 初期資産を口座8割/現金2割に分割。賃金・バイト・日銭・売上は口座へ入金。
+  #   月給者(会社員等)は日割りでなく給料日(payday_dom)に月給まとめ支給、翌日に家賃を
+  #   口座から引き落とし(月収相当×rent_share)。支払いは card_threshold 以上=口座(カード)、
+  #   未満=現金。現金不足は最寄り ATM で自動引出(移動なし=ATM はどこにでもある近似)。
+  #   逼迫判定(money_pressure)は現金+口座の合算に切替。OFF 時はバイト一致で完全不変。
+  accounts:
+    enabled: false
+    payday_dom: 25                # 給料日(暦の何日目。1日=144step、run開始日=1日として day%30)
+    rent_share: 0.30              # 家賃 = 月収相当 × これ(給料日翌日に引き落とし)
+    card_threshold: 3000          # これ以上の支払いは口座(カード)、未満は現金
+    atm_withdraw: 20000           # 現金不足時の1回あたり引き出し基本額(不足分が大きければそれ以上)
+    cash_share: 0.20              # 初期資産の現金比率(残り=口座)
+    # ---- 立退き・破産サイクル(制度深化3 2026-07-08。要 accounts.enabled=true)----
+    # 現実の対応: 滞納の継続→信頼関係破壊の法理で契約解除=立退き(住居喪失=路上就寝・
+    # 家賃の新規発生停止)、さらに続くと自己破産(免責=滞納債務消滅+自由財産以外を圧縮+
+    # 制限期間=出店不可)。完済で再入居=サイクルが閉じる。既定 0/0=どちらも無効=E5 従来と完全同一。
+    eviction_days: 0              # ★ON 推奨(本番): 例 30(滞納がこの日数続くと立退き)
+    bankruptcy_days: 0            # ★ON 推奨(本番): 例 60(滞納がこの日数続くと自己破産)
+    bankruptcy_keep: 10000        # 破産後も手元に残る自由財産(実法の99万円を所持金スケールに圧縮)
+    bankruptcy_restrict_days: 30  # 破産後の制限期間(日)。この間は出店不可(資格制限のモデル)
+    eviction_grievance: 0.10      # 立退きの生活不安(factors 経由の不透明 magnitude)
+    bankruptcy_grievance: 0.15    # 破産の生活不安(同上)
+
+# ---- 「世界を変える」ツール群(4軸を最小で覆う affordance。中立提示・自然使用の観察)----
+# モノ=open_venture / 制度=propose / 人=host_event(勉強会) / 虚構=host_event・flyer・group。
+# R1: 提示・可否は k と無関係(所持金など客観条件のみ)。R4: 効果は客観カウント(LLM審判なし)。
+tools:
+  enabled: true
+  equip_all: false              # 標準装備(H 2026-07-06): true で全発火プロンプトに「所持ツール」節を
+                                # 中立告知(勧誘なし・呼数不変)。実LLMのツール0使用対策。
+                                # ★B段の実LLM検証で true を新標準にする予定(ユーザー承認待ち)
+  venture_cost: 30000           # 出店の開業費(これ以上の所持金がある時だけ提示・実行)
+  # 営業許可(制度深化2 第10バッチ。保健所・風営法等の参入障壁の最小形。調査: rights-institutions-gap.md §J)
+  permit_steps: 0               # ★ON 推奨(本番): 例 6(申請〜開業までの許可待ち。待ちの間は販売なし)
+  permit_deny_prob: 0.0         # ★ON 推奨(本番): 例 0.15(却下確率。新 stream "permit"。却下=開業費は返る)
+  venture_price: 800            # 屋台の商品単価(通行人が購入)
+  venture_close_days: 3         # 売上ゼロがこの日数続くと自動閉店
+  proposal_threshold: 0.25      # 署名が全体のこの割合に達すると提案成立(象徴的成立)
+  event_duration_steps: 6       # イベントの開催時間(step)= 会場滞在・教育の帯域
+  flyer_ttl_steps: 144          # 掲示・ビラの寿命(1日)
+  flyer_max_per_node: 3         # 同一ノードのビラ上限(古い順に上書き)
+  attend_base: 0.25             # イベント参加の基礎確率
+  attend_relation_bonus: 0.35   # 主催者が関係台帳にいる時の上乗せ
+  group_join_prob: 0.4          # グループ名を知り関係者がいる時の加入確率
+  buy_prob: 0.3                 # 屋台に到着した通行人が購入する確率
+
+# ---- 制度DSL(ホワイトリスト型ルールの自動制定。ユーザー構想 2026-07-06)----
+# エージェントは propose で制度を作る。署名 25% で成立した瞬間、機械可読 rule が
+# シミュ世界の実効ルール(価格・支給・行き先抑制・定期イベント)として自動制定される。
+# 自由なコード生成は避け、4型のホワイトリストに閉じる(決定論・R1 全員平等・R4 客観測定)。
+# 検証に失敗した rule は「文言だけの制度」に降格して成立(壊れない)。false で完全に旧挙動。
+rules:
+  enabled: true
+  allow_declare: false          # ★ON 推奨(本番): true。権利創設・宣言型 rule
+                                # {"type":"declare","title":"…"} を許可(制度深化 第9バッチ)。
+                                # エンジンの価格・移動には作用しない象徴的制度(現実の例: 渋谷区
+                                # パートナーシップ条例 2015=一区の制度改変が全国へ波及した実在 keystone)。
+                                # 再帰性の norm_line・ニュースで知覚され、Y の symbolic 層で測る。
+  max_active: 5                 # 同時アクティブ上限(超過は古い順に失効=rule_expired)
+  duration_days: 0              # 各ルールの有効期限(日)。0 = 無期限
+  fee_max_ratio: 0.5            # fee delta の上限 = 対象カテゴリ基準価格に対する比率(±50%)
+  bonus_max: 500                # bonus 支給額の上限(円/回)
+  boost_prob: 0.5               # weekly_event 発火日にその場所を余暇候補へ選ぶ確率/step
+
+# ---- 再帰性(第9バッチ 2026-07-07。ユーザー要望: 規範・現状の監視→知覚→フィードバック→改変)----
+# エージェントが「いま実際に効いている取り決め」と「昨日の街の動き(提案/成立/廃止/取り締まりの
+# 客観カウント)」を発火プロンプトで知覚し、気に入らない取り決めは propose の
+# rule={"type":"repeal","target":"名前の一部"} で廃止を提案できる(成立で rule_repealed)。
+# 取り締まりが多発したルールは日次でニュース化(社会の自己観測=メディアが制度の帰結を報じる)。
+# すべて非LLM・決定論・乱数不使用。R1: generate() を1本も足さない(注入は内容のみ=呼数不変。
+# impact_news は聞く語が変わり発火が動きうるが k・内面状態を読まない=compute_matched の k 不変性で担保)。
+# 既定 OFF=注入なし・rule_repealed/norm_digest 0 件=現行挙動と完全同一(ゴールデンを守る)。
+recursion:
+  enabled: false                # ★ON 推奨(本番): true(再帰性=世界を変える閉ループの知覚側を有効化)
+  rules_in_prompt: true         # いま実効の取り決めを全発火プロンプトに1行注入
+  digest_in_prompt: true        # 昨日の街の動き(提案/成立/廃止/取り締まり件数)を1行注入
+  allow_repeal: true            # propose の rule.type=repeal(既存の取り決めの廃止)を許可
+  impact_news: true             # 取り締まりが多発したルールを日次ニュース化
+  impact_news_threshold: 3      # 前日の執行がこの件数以上のルールをニュースにする
+  max_rules_in_prompt: 3        # プロンプトに載せる取り決めの最大件数(最新から)
+
+# ---- インターネット層(スマホ: SNS / ニュース / 検索 / DM)----
+# 発信(投稿・DM)の起動は欲求発火(drive)経由。ここは閲覧系(非LLM)のみ。
+net:
+  enabled: true
+  browse_prob: 0.12             # 暇なとき SNS タイムラインを見る確率/step
+  news_prob: 0.06               # ニュースアプリを見る確率/step
+  feed_size: 6                  # 1回の閲覧で読む投稿数
+  follow_k: 6                   # 初期フォロー人数(+対面で知り合うと自動フォロー)
+  like_prob: 0.15               # 閲覧した投稿にいいねする確率(#14。非LLM・専用stream)
+  reshare_prob: 0.03            # 閲覧した投稿をリシェアする確率(#14。フォロワーへ自然再配信)
+  posts_max: 0                  # B7(スケール): SNS 投稿の保持上限。>0 で古い投稿をエイジアウト
+                                # (id は不変で react/timeline は id ベース=安全)。0=無制限で従来と完全同一。
+
+# ---- 欲求駆動発火(Phase A: 推論タイミングの分散。ユーザー仕様 2026-07-04)----
+# 出来事が欲求ゲージを溜め、個人別閾値で「申請」→ 個人の重みで確率発火 →
+# 不発ならゲージを数十%減衰。発火回数は k 条件間で監査可能(R1 対策)。
+drive:
+  decay: 0.02                   # ゲージの自然減衰/step
+  fail_decay: 0.30              # 抽選落ち時の減衰(ユーザー仕様「数十%」)
+  fire_reset: 0.20              # 発火後に残るゲージ比率
+  refractory_steps: 3           # 不応期(発火直後は考え込まない)
+  conv_max_turns: 3             # 対面会話で片側が返答できる最大回数(無限連鎖の抑制)
+  conv_cooldown_steps: 6        # 会話セッション終了後のクールダウン(step)
+  firing: fixed                 # fixed(既定=閾値ゲート+個人重み抽選)| logistic(p=σ(slope·(drive−threshold)))
+  slope: 8.0                    # logistic 時のシャープさ(B段 seam。fixed では未使用)
+  weights:                      # 出来事 → ゲージ増分(相対重み。RQ1 検収後に調整)
+    novel_place: 0.35
+    congestion: 0.30
+    unknown_word: 0.40
+    addressed: 0.25
+    dm_received: 0.35
+    news: 0.15
+    sns: 0.08
+    company: 0.10
+    silence: 0.015
+    state_change: 0.50
+  # ---- 内省しやすさの時間ドリフト E2(既定 OFF。設計: docs/research/reflection-drift.md)----
+  # 実効閾値 = clip(drive_threshold + theta_drift, 0.30, 0.85)。fire_weight は不変。
+  #   馴化: 低顕著の単調入力(沈黙/SNS/同席/ニュース)が続く → theta_drift↑(内省が減る)。
+  #   鋭敏化: 発火経験・新奇/強イベント(初訪問/未知語/大 |Δstate|)→ theta_drift↓(乗ってくる)。
+  #   自発回復: 毎 step theta_drift を 0 へ緩やかに引く(静穏で base へ戻る)。
+  #   向き・速さの個体差は traits 由来(factors/registry.drift_params。NFC高=鋭敏化寄り)。
+  # R1: 入力は出来事量・発火経験のみ(belief 書き戻し・k.writeback を一切参照しない)。
+  # OFF 時は theta_drift 恒等 0=drive_threshold と完全同一(ゴールデン/決定論を壊さない)。
+  drift:
+    enabled: false
+    habit_rate: 0.02            # 馴化の基準率(× 出来事の顕著さ。閾値↑)
+    sens_rate: 0.02             # 鋭敏化の基準率(発火1回=−sens_rate。新奇は × 顕著さ)
+    recovery_rate: 0.01         # 自発回復の基準率(毎 step theta_drift を 0 へ)
+    max_abs: 0.15               # |theta_drift| の可動域(clip[0.30,0.85] と二重で暴走防止)
+
+# ---- 朝の一日計画(ユーザー要望 2026-07-06)----
+# 起床(来街者は帰還)直後に1回、LLM で「今日一日の予定(2〜5個)」を立て、それが
+# LLM 非駆動時のルールベース行動(routine)の行き先の土台になる。呼数は k 非依存(R1)。
+planning:
+  enabled: true                 # 既定 ON = 新しい標準挙動。false で完全に旧挙動へ戻る
+  max_items: 5                  # 1日の予定の最大件数(2〜max_items を採用)
+
+# ---- プロンプト調整(改善 P3 第9バッチ。既定 OFF=注入なし=バイト一致)----
+# 発話の定型化対策(sim-improvement-analysis.md P3: 冒頭句「この時間の渋谷…」が発話の5〜9.5%)。
+# ON で social/reply/solo の状況文に「決まり文句で始めない」注意書きを1行足す(内容のみ=呼数不変=R1)。
+prompts:
+  variety_hint: false           # ★ON 推奨(本番): true(実LLM の発話多様性を上げる)
+
+# ---- 交通機関: タクシー+簡易バス(ユーザー要望 2026-07-06)----
+# 電車の高度化(GTFS 実ダイヤ・駅構内)は API 申請待ちのため保留(transit.gtfs_dir 参照)。
+transit_ride:
+  taxi:                         # 既定 ON。遠距離かつ所持金があれば低確率で乗車。自家用車保有者は使わない
+    enabled: true
+    prob: 0.15                  # 条件成立時に乗る確率(stream("taxi", id, step))
+    min_dist_m: 600             # 直線距離がこれ超で候補(近距離は徒歩/自転車)
+    base_fare: 500              # 初乗り(円)
+    per_km: 400                 # 距離運賃(円/km)。運賃 = base_fare + per_km × 距離km
+  bus:                          # 既定 OFF = 本番トグル。合成/簡易路線での短縮移動+運賃
+    enabled: false
+    fare: 230                   # 運賃(円)
+    stop_radius_m: 100          # 出発/目的ノードが停留所からこの距離内なら乗車可
+    headway_steps: 1            # 便の間隔(step。1 step = 10分)
+
+transit:
+  file: data/transit_shibuya.json  # 定刻ダイヤ(乱れなし)。GTFS 実ダイヤに差し替え可
+  gtfs_dir: null                # ODPT 等の GTFS(stops.txt 等)を置いたフォルダを指定すると実ダイヤに切替
+
+lod:
+  max_llm_per_step: 300         # LLM 発火の step 上限(実機実測で更新)
+  congestion_surprise: 0.5      # 混雑係数がこれ未満なら「驚き」
+
+# ---- 開放行動+価値の4軸(第17バッチ 2026-07-10。既定 OFF=現行と完全同一)----
+# LLM 自身が自由記述で行動を決める "do" をメニューに追加し、価値(実用/感情/社会/認識)で
+# 観測する(決定論辞書+中立自己申告のブレンド)。接地: docs/research/desire-value-theory.md。
+freedom:
+  open_actions: false           # "do" 行をヘッダに足す(OFF=ヘッダ・挙動バイト一致)
+  satiation_gain: 0.3           # 価値の飢餓→ゲージ感度の変調幅(0=純観測。k掃引では0推奨)
+  sat_step: 0.15                # 自由行動1回の充足量(限界効用逓減つき)
+  sat_decay: 0.15               # 日次の中立(0.5)への回帰率(需要の再蓄積)
+  max_minutes: 240              # 1回の開放行動の上限時間(分)
+
+# ---- 主観的世界モデル(第20バッチ 2026-07-12。既定 OFF=現行と完全同一)----
+# 各エージェントの「世界の解釈」: C1 期待形成(場所×時間帯の人出EMA=検証可能な仮説)+
+# C2 可制御性(全員0.5起点・世界の応答だけで分岐=純経験の経路依存)+ C6 規範予期
+# (新しいことを始める人がいる街かの記述規範)。日次 worldview イベントで観測。
+# 乱数ゼロ・呼数不変。接地: docs/research/world-models.md C1/C2/C6。
+worldview:
+  enabled: false
+  crowd_alpha: 0.2              # C1: 期待EMAの学習率
+  expect_line: true             # C1: 「いつもと違う」1行(差が gap_min 以上のときだけ)
+  gap_min: 3.0                  # C1: 期待との人数差の閾値
+  ctrl_line: true               # C2: 手応え/無力の自然文1行(閾値超えのみ)
+  ctrl_step: 0.15               # C2: 世界の応答1件あたりの更新幅(限界効用逓減)
+  weak_scale: 0.3               # C2: 弱い応答(売上・閲覧・参加・賛同)の倍率
+  ctrl_hi: 0.7                  # C2: これ以上で「手応え」文
+  ctrl_lo: 0.3                  # C2: これ以下で「無力」文
+  ctrl_daily_strong: 2          # C2: 強い応答の日次計上上限(応答洪水での全員天井=飽和を防ぐ)
+  ctrl_daily_weak: 3            # C2: 弱い応答の日次計上上限
+  norm_line: true               # C6: 記述規範1行(全員共通)
+  norm_window_days: 7           # C6: 開拓的行動(出店・提案・主催・結成)の集計窓
+  norm_hi: 0.02                 # C6: 1人日あたり率がこれ以上で「珍しくない」
+  snapshot: true                # 日次 worldview イベント(観測の要)
+
+# ---- 街路の環境情報(第18バッチ 2026-07-11。既定 OFF=現行と完全同一)----
+# 街頭広告(OOH)=掲出地点の視認判定→ad_exposure+発火時の中立1行(広告主=シミュ内 POI で
+# 接触→来店→購買のファネルが閉じる)。効果量の接地: docs/research/commercial-analytics.md §7。
+# 掲出地点(large/slots)は環境プロファイル側で与える(基盤=機構のみ・場所の値を持たない)。
+ads:
+  enabled: false                # OFF=draw・イベント・プロンプトとも既定と不変
+  large: []                     # 大型ビジョンの掲出地点(POI 名)
+  slots: []                     # 通常看板の掲出地点(POI 名)
+  radius_m: 60.0                # 掲出地点からの視認距離(m)
+  p_see_large: 0.45             # 大型の視認率(現実バンド 0.3〜0.6)
+  p_see_normal: 0.20            # 通常看板の視認率(0.1〜0.3)
+  cooldown_steps: 6             # 同一枠の再接触の最短間隔(6step=1時間)
+  daily_cap: 4                  # 1人1日の接触記録上限
+  recall_steps: 144             # プロンプト注入の想起窓(1日=adstock 近似)
+  eff_frequency: 3              # 有効フリークエンシー(累計これ以上で「何度も」)
+  campaign_days: 7              # キャンペーン改定周期(日)
+  target_cats: [food, cafe, shop, leisure, nightlife]   # 広告主になれる POI カテゴリ
+crowd_visual:
+  enabled: false                # 群衆の視覚情報1行(同席者の決定論要約=記述的規範)。OFF=不変
+sns_geo:
+  enabled: false                # SNS/DM 伝播に両者の物理距離 dist_m を記録(第22バッチ P2)。
+                                # ON でも乱数・LLM呼数は不変(transmission payload にキーを足すだけ)。OFF=バイト一致
+
+labeling:
+  mode: constrained             # constrained | open(D9)
+  adopt_threshold: 2            # complex contagion: 2回聞いたら採用
+
+rewards:
+  enabled: false                # D9: 既定 off(過正当化の交絡を排除)
+  amount_per_adoption: 300      # enabled 時、自分の造語が採用されるたび creator に与える報酬額(円)
+
+# ---- 記憶(P2 seam。既定は日常 push のみ=現状不変)----
+memory:
+  agentic_pull: false           # 発火・内省で能動的に記憶検索する(true でプロンプトに1行想起を追加)
+  relations_max: 0              # B6(スケール): 関係台帳の上限件数。>0 で超過時に LRU(last_step 最古)を退避。
+                                # 0=無制限で従来と完全同一。大規模ラン(hub 個体の台帳肥大・checkpoint 膨張)対策。
+
+# ---- 社会関係の質(現実ギャップ Wave G2 2026-07-07。既定 OFF=現行挙動と完全同一)----
+# ON 時: 関係台帳に親密度 weight(closeness)を持たせ、交流の符号(発話/DM の感情価)で増減。
+#   weight の閾値で質的段階 tier(0=見知らぬ/1=知人/2=友人/3=親友)を決定論導出し、プロンプトに
+#   「○○とは友人」と載せる。ネガ交流・長期不在(日次減衰)で weight が下がり段階が落ちる
+#   (relation_tier/relation_break)。各 agent の評判(reputation)を語の採用・被傾聴で集計し
+#   「街で名が知られている」1行に反映(reputation_update)。同じグループ所属は「同じ仲間」注記。
+#   すべて決定論・RNG不要・LLM 非増(R1)。tier/reputation は efficacy/grievance 等の因子には
+#   結合しない(独立の観測スコア+プロンプト文脈)。OFF 時は closeness を一切足さず・イベント
+#   0 件・プロンプト不変=ゴールデン(golden_baseline_l1.json)を守る。
+relations:
+  enabled: false                # ★ON 推奨(本番): true(関係の質=社会資本を有効化)
+  tier_acquaintance: 2.0        # closeness weight がこれ以上で知人(tier 1)
+  tier_friend: 5.0              #   〃           友人(tier 2)
+  tier_close: 12.0             #   〃           親友(tier 3)
+  pos_weight: 1.0               # ポジ交流(感情価≥0)1件あたりの weight 増分
+  neg_weight: 2.0               # ネガ交流(感情価<0)1件あたりの weight 減分(悪化は速い)
+  decay_per_day: 1.0            # 長期不在の相手の weight を1不在日ごとにこれだけ減衰
+  decay_after_days: 0           # 最終接触からこの日数を超えた不在で減衰(0=翌日から)
+  rep_adopted: 1.0              # 自分の造語が採用されるたび評判+(影響の可視化)
+  rep_mention: 0.2              # 聞き手のいる発話をするたび評判+(社会的可視性)
+  rep_decay_per_day: 0.5        # 評判の日次風化
+  rep_known_threshold: 3.0      # 評判がこれ以上で「街で名が知られている」文脈をプロンプトに
+  faction: true                 # 同じグループ所属を「同じ仲間」1行に(軽量。重い分極は後続波)
+
+# ---- 社会的ヒエラルキー(地位・信用・名声。第11バッチ 2026-07-08。既定 OFF=現行挙動と完全同一)----
+# 調査: docs/research/hierarchy.md(採択候補 #2 観測 + #1 評判→動員 + #3 優先的選択)。
+# 理論: マタイ効果/累積優位(Merton, DiPrete)= 信用のある人に人とリソースが集まる正のフィードバック。
+#       優先的選択(Barabási)= 既に多く繋がる相手へ優先接続=べき則/ハブの創発。威信=prestige(Henrich)。
+# ON 時: 客観カウント(評判/被フォロー数/資産/提案可決数/売上/主催回数)の母集団内百分位を重み混合して
+#   各 agent の合成地位 status(0..1)を日次再計算(決定論・非LLM・k 非参照)。地位は既存確率の変調のみに
+#   使う: イベント集客(+attract_gain×主催者 status)・グループ加入(同・創設者)・屋台購買(×(1+buy_gain×店主
+#   status))・フィード露出(×(1+feed_gain×status)×(1+被フォロー数)=優先的選択)。★禁止(injection):
+#   プロンプトへ「地位が高い/低い」注入や高地位個体の変革行動への直接誘導はしない(可視化・変換のみ)。
+# OFF 時: status 一切不変(=0)・動員フックは加算0/倍率1・feed は従来 TL・L3 に status なし・L2 集計は列なし
+#   =乱数消費・イベント列・スナップショットがバイト一致(ゴールデン golden_baseline_l1.json を守る)。
+hierarchy:
+  enabled: false                # ★ON 推奨(本番): true(地位=信用に人とリソースが集まる機構)
+  attract_gain: 0.15            # イベント参加/グループ加入の確率に + gain × 主催者(創設者)status
+  feed_gain: 0.3                # フィード露出重みに ×(1 + gain × 投稿者 status)
+  buy_gain: 0.2                 # 屋台購買確率に ×(1 + gain × 店主 status)
+  # weights(材料の混合重み)は build_status_cfg の既定に埋め込み済み(rep/followers/wealth/inst/biz/host)。
+  # 上書きするなら hierarchy.weights.followers=0.4 のように指定(母集団内百分位への相対重み)。
+
+# ---- 行動心理プラグイン(config 着脱式・すべて既定 OFF。ユーザー方針 2026-07-06)----
+# 文献の数値を固定実装せず、回しながら柔軟に変える seam。OFF 時はイベント列がバイト一致で不変。
+# no-fingerprint: engine/cognition は因子名を見ず、factors から不透明な倍率・スコアだけ受け取る。
+psych:
+  sdt:                          # 自己決定理論(Ryan&Deci): 内発/外発で欲求ゲージ入力を個人別に倍率化
+    enabled: false
+    intrinsic_boost: 1.4        # 内発(NFC+内的統制)高 → novel_place/unknown_word をこの倍率まで押し上げ
+    extrinsic_boost: 1.4        # 外発(外的統制+リスク許容)高 → sns/addressed/company/dm_received を押し上げ
+  collective:                   # 集団効力感・社会的アイデンティティ(SIMCA/Bandura)
+    enabled: false
+    group_success_magnitude: 0.05  # 所属グループの成功(提案成立・イベント参加)→ collective_efficacy+
+    ingroup_boost: 1.2          # 同じグループのメンバーの発話を聞く → heard_valence をこの倍率
+    attend_threshold: 2         # グループイベントで「成功」とみなす参加メンバー数の下限
+  lynch:                        # 都市イメージ(Lynch): landmark 重み付き行き先 + 観測レンズ
+    enabled: false
+    landmark_weight: 1.0        # landmark_score = 1.0 + weight×(POI数 + 命名地点 + 命名建物)
+  searle:                       # 制度化(Searle "X counts as Y"): 成立提案を制度としてプロンプト注入
+    enabled: false
+    max_recent: 2               # 発火プロンプトに載せる最新の取り決め件数
+
+# ---- 意見力学(Friedkin-Johnsen #16)。チャネル別の説得重み。既定で有効(y_external 不変)----
+opinion:
+  enabled: true                 # false で意見更新を止める(opinion_shift を出さない)
+  w_face: 0.20                  # 対面で聞いた話に意見が寄る強さ
+  w_dm: 0.15                    # DM で受け取った話
+  w_sns: 0.08                   # SNS 閲覧(弱い)
+
+storage:
+  backend: memory               # memory(開発) | redis_pg(本番)
+
+observer:
+  snapshot_every: 12            # L3 スナップショット間隔(=2時間ごと)
+  checkpoint_every: 0           # D16: この step ごとに完全状態を保存+ログを part 化(0=無効)。
+                                # >0 で --resume 可能に。既定0=part を作らず出力・挙動は従来と完全同一。
+  flush_every_steps: 0          # B2(スケール): この step ごとに L1 ログを part 化して RAM を解放
+                                # (checkpoint とは独立。0=無効で従来と完全同一)。大規模ランの OOM 回避用。
+                                # checkpoint_every と同一 step では二重 flush しない。finalize で part を結合。
+  y_weights: null               # Y外部(世界改変量)の4層合成重み。既定 null=合成せず列を出すのみ。
+                                # ★合成式は B段でユーザーと決定(analyze 側で使用)。例:
+                                # y_weights: { spatial: 1.0, resource: 1.0, symbolic: 1.0, network: 1.0 }
+
+# ============================================================
+# 第6バッチ(ユーザー要望 2026-07-06)。すべて既定 OFF=現行挙動と完全同一。
+# 本番・B段での ON はユーザー承認のうえ一括で行う(ON 例は各ブロックのコメント)。
+# ============================================================
+
+# ---- 行政 B(区/都/国の税・給付・公務員給与。調査: docs/research/shibuya-government.md)----
+# ON 時: 賃金から所得税(→国)+住民税(→区6:都4)を源泉徴収(手取り支給)、消費に内税の
+# 消費税(標準10%/食品8%、国78:地方22)を計上(価格の名目は不変)。区は困窮者へ給付。
+# 公務員(区職員=区予算/警察官・消防士=都予算)の給与は予算から歳出。日次で public_budget。
+# 詳細パラメータ(税率・予算初期値・給付閾値)は src/society/government.py の既定値を
+# ここで上書き可能(income_brackets 含む)。
+government:
+  enabled: false                # ★ON 推奨(本番): true。公務員入り名簿 = data/personas_100_civic.json
+
+# ---- 娯楽メディア D(TV/動画/ゲーム。文献: docs/lit/media__entertainment-effects.md)----
+# ON 時: 在宅の朝/夜帯に年齢・職業別プロファイルでメディアセッション(media_use)。
+# セッション中は外出・SNS閲覧を置換(時間置換)。終了時に factors.media_grievance で気分修復。
+media:
+  enabled: false                # ★ON 推奨(本番): true(現代生活の再現に必須=ユーザー要望)
+  prompt_context: false         # 直近視聴タイトル(架空)1行を発火文脈へ(LLMキャッシュキーに影響する独立フラグ)
+  start_prob: 0.5               # 在宅×時間帯の1機会あたり基礎開始確率(×年齢・職業倍率)
+  min_steps: 2                  # セッション長 下限(20分)
+  max_steps: 8                  # セッション長 上限(80分)
+  max_sessions_per_day: 2
+
+# ---- 組織 W2-1(職場・学校の実態。台帳: data/organizations_shibuya.json = 架空・統計準拠)----
+# ON 時: 名簿対応の配属(org_assignments_*)で各エージェントに職場/学校を付与。勤務完遂→
+# production(何を作った/提供したか)、学生の登校→study(何を学んだか)、プロンプトに所属1行。
+# 組織会計(org_ledger)は集計のみ(市場メカニズムは B段)。仕様: docs/design-candidates/org-integration-spec.md
+organizations:
+  enabled: false                # ★ON 推奨(本番): true(要 agents.personas_file=data/personas_80.json 等)
+  book: data/organizations_shibuya.json
+  revenue_margin: 1.5           # 勤務完遂1回=日給×これ を組織収益の代理指標として集計
+  commute_to_poi: false         # ★ON 推奨(本番): true(第7バッチ)。配属者の職場/学校を台帳の
+                                # workplace_poi(実在ノード)へ束縛=実際にそこへ通勤・通学する。
+                                # false(既定)なら work_node は上書きしない=既存挙動とバイト一致。
+
+# ---- 欲求プロファイルの個人差 W2-2(文献: docs/lit/needs__individual-differences.md)----
+# ON 時: traits・年齢・職業から5次元の価値プロファイル(刺激/安全/関係/有能/自律)を決定論生成し、
+# 欲求ゲージ入力(novel_place/congestion/silence 等)への個人別感度倍率に変換(「何を欲し・
+# 何を不快と感じるか」の個体差)。R1: k 非依存(専用 stream "needs")。psych.sdt と乗算合成可。
+needs:
+  enabled: false                # ★ON 推奨(本番): true(現実の欲求多様性の再現=ユーザー要望)
+  sensitivity_gain: 0.6         # 倍率の効き幅(1±gain×プロファイル偏差)
+  profile_sigma: 0.10           # 個体固有ゆらぎ(価値プロファイルの分散)
+  occupation_weight: 1.0        # 職業ニュアンスの強さ
+  clip_lo: 0.5                  # 倍率下限
+  clip_hi: 2.0                  # 倍率上限
+
+# ---- 感情・興味・注意ハブ(affect。文献: docs/lit/neuroscience__emotion-interest-attention.md §5.1/§6)----
+# 脳科学の核: 感情・興味・注意は独立モジュールでなく、覚醒度 arousal(1スカラ)+ 顕著さ salience(1関数)を
+# 共有した1回路(Russell core affect / Menon&Uddin salience network)。最小版=非LLM・決定論・RNG不要の3改造:
+#  (1) arousal スカラ(観測イベントで↑、毎step baseline へ減衰)
+#  (2) novelty/arousal → memory.importance 加点(顕著記憶の符号化増強)
+#  (3) salience 上位 K ゲート(同時知覚の容量制約 Cowan)+ 発火閾値の逆U字変調(Yerkes-Dodson)
+# すべて既定 OFF=現行挙動と完全同一(バイト一致)。R1: 入力は観測イベントのみ(k 非依存)。ON は本番でユーザー承認のうえ。
+affect:
+  enabled: false               # ★ON推奨: true(感情・興味・注意を有効化)
+  arousal_baseline: 0.2
+  arousal_gain: 0.0            # ★ON推奨: 例 0.15(観測イベント→覚醒の上がりやすさ)
+  arousal_decay: 0.1          # 毎step baseline へ戻る率(ON時のみ効く)
+  importance_arousal_w: 0.0   # ★ON推奨: 例 2.0(高覚醒の出来事を顕著記憶に)
+  importance_novelty_w: 0.0   # ★ON推奨: 例 1.5
+  salience_k: 0               # 0=無効(全通し)。★ON推奨: 4(Cowan。同時知覚の上限)
+  threshold_gain: 0.0         # ★ON推奨: 小さめ(中覚醒で発火しやすく=逆U字)
+
+# ---- 内面本格版(現実ギャップ 後続波 H6。文献: docs/lit/neuroscience__emotion-interest-attention.md §5.2)----
+# 内面を3機構で豊穣化する。すべて決定論・非LLM・既定 OFF=現行挙動と完全同一(バイト一致)。実装 src/society/inner_life.py。
+#  (1) 離散感情ラベル(emotion): core affect(mood_valence × arousal)から Ekman 系ラベルを純関数写像し
+#      「今は不安/高揚している」等をプロンプトへ(神経科学 §1.2 の二層設計)。★affect.enabled=true が前提
+#      (arousal が動かないと無効)。ラベル変化のときだけ emotion_label を記録(sparse)。
+#  (2) 長期目標(goals)★keystone 駆動源: 価値プロファイル(needs)/traits から長期目標を決定論導出し、
+#      「長期的に◯◯したい」をプロンプトへ注入して行動を長期的に方向づける(現状は1日計画のみ)。long_goal を記録。
+#  (3) 趣味・関心(hobbies): 職業+価値プロファイルから趣味を決定論付与→プロンプト文脈 + 余暇の行き先バイアス。
+# R1: 感情/目標/趣味のプロンプト注入は内容のみ=呼数不変(FixedLLM で ON==OFF)。趣味の行き先バイアス
+# (hobbies.leisure_bias>0)だけは物理位置=co-location を変えうる=呼数不変は compute_matched 下の k 不変性で担保
+# (crowd G4 / 観光 H5 と同型。専用 stream "inner")。既定 leisure_bias=0.0=注入のみ(純粋 ON==OFF を保つ)。
+# 既定 OFF(enabled=false)=感情ラベル更新なし・目標/趣味を付けず・プロンプト注入なし・"inner" stream も
+# 引かない=イベント 0 件・乱数消費不変(ゴールデン golden_baseline_l1.json を守る)。
+inner_life:
+  enabled: false               # ★master ゲート。ON推奨(本番): true(内面=感情・目標・趣味を有効化)
+  emotion:                     # 離散感情ラベル(要 affect.enabled=true)
+    enabled: true
+    arousal_high: 0.35         # 覚醒がこれ以上=高覚醒帯(高揚/不安)。未満=低覚醒帯(穏やか/しょんぼり)
+    valence_deadzone: 0.15     # |mood_valence| がこれ未満=中立(平静/高ぶり)
+  goals:                       # 長期目標・人生設計(keystone 駆動源)
+    enabled: true
+    inject_prompt: true        # 「長期的な目標: ◯◯」を発火プロンプトへ注入
+    leisure_bias: 0.0          # 現状は注入のみ(目標の行き先方向づけは趣味 hobbies 側に集約)
+  hobbies:                     # 趣味・関心・サブカルチャー
+    enabled: true
+    inject_prompt: true        # 「趣味・関心: ◯◯」を発火プロンプトへ注入
+    leisure_bias: 0.0          # ★ON推奨: 例 0.3(余暇の行き先を趣味の場所へ寄せる。専用 stream "inner")
+
+# ============================================================
+# 第7バッチ(ユーザー要望 2026-07-07: 日付・天気・通勤/通学の物理 POI 束縛)。
+# 日付=world.calendar / 通勤=organizations.commute_to_poi / 天気=下記 weather。
+# すべて既定 OFF=現行挙動と完全同一(バイト一致)。ON は本番でユーザー承認のうえ。
+# ============================================================
+
+# ---- 天気(第7バッチ 2026-07-07)----
+# ON 時: 日次で天気を決定論生成(新 stream "weather")。全発火/計画/内省プロンプトに
+# 「今日の天気: ◯、最高◯℃。」を1行注入(全員共通・k非依存)。1日の始まりに weather イベントを
+# agent_id=-1 で1件ログ。calendar 有効なら月から季節バイアス(夏は高温・梅雨は雨増)を掛ける。
+# 雨天の日は rain_grievance 分だけ不快感(grievance)を上げる(factors 経由・1日1回・決定論)。
+weather:
+  enabled: false                # ★ON 推奨(本番): true(暦とともに現代生活の再現)
+  rain_grievance: 0.0           # ★ON 推奨: 0.01(雨天の日の不快感。0.0=天気イベント・文脈行のみで grievance 不変)
+
+# ---- 長期予定・スケジュール帳(第7バッチ 2026-07-07)----
+# ON 時: 会話(speak/DM)に未来の日付・時刻が入っていれば決定論パーサで抽出し、話者と
+# 聞き手の双方のスケジュール帳へ自動記入(appointment イベント)。近い予定は発火・計画
+# プロンプトに1行注入し、行動・発話の継続性(人間らしさ)を出す。追加 LLM 呼び出しゼロ
+# (既に生成済みの発話テキストの正規表現解析)。相対日は world.calendar で絶対日に解決。
+# 既定 OFF=抽出も注入もせず・appointment 0 件=現行挙動と完全同一(バイト一致)。
+schedule:
+  enabled: false                # ★ON 推奨(本番): true(会話からの予定抽出・スケジュール帳)
+  max_items: 8                  # 1人が保持する予定の上限(超過は古い順に間引き)
+  horizon_days: 14              # 何日先まで抽出・注入するか
+  inject_prompt: true           # 近い予定をプロンプトに1行注入(ON時のみ効く)
+
+# ---- 制度改変の3ルート(現実ギャップ Wave G3 2026-07-07。すべて既定 OFF=現行挙動と完全同一)----
+# 世界改変=制度の変更には現実で3ルートある。既存の propose/rules/government を土台にした最小拡張。
+# すべて決定論・非LLM(R1: FixedLLM で ON==OFF 呼数不変)。OFF 時は labor_action/vote_*/enforcement
+# が 0 件・プロンプト/イベント列/乱数消費が不変=ゴールデン(golden_baseline_l1.json)を守る。
+institution_routes:
+  # 労働争議/組合(職域ルート): 被雇用者(organizations 配属の非学生)の propose を「労働争議」
+  #   variant として記録(labor_action)。賛同/露出が同じ org の同僚に偏る集合行為。可決は既存
+  #   proposal_passed 経路 or 下の投票。要 organizations.enabled=true(org_id が付く)。
+  labor:
+    enabled: false              # ★ON 推奨(本番): true(要 organizations.enabled=true + personas_file)
+  # 選挙/投票(民主ルート): ON かつ露出者が閾値に達したとき、署名でなく決定論投票で可決を決める。
+  #   各 agent は grievance が閾値超 or 提案語への opinion 整合で yes(LLM 非呼び出し)。過半数で可決。
+  vote:
+    enabled: false              # ★ON 推奨(本番): true(署名モードを投票モードに置換)
+    grievance_threshold: 0.5    # grievance がこれ以上なら yes(不満が投票行動に出る)
+    majority: 0.5               # 可決 = yes 比率がこの値を超える(既定=過半数)
+    # 供託金(制度深化 第9バッチ。公選法の供託金=政治参入の所持金障壁のモデル)。既定 0=不変。
+    # propose の正式受理に deposit 円の拠出が要る(払えなければ演説どまり=SNS投稿のみで受理されない)。
+    # 可決 or 得票率 >= refund_share で返還、未満は没収(government ON なら区の歳入)。deposit イベント。
+    deposit: 0                  # ★ON 推奨(本番): 例 30000(区議選の供託金30万円を所持金スケールに圧縮)
+    refund_share: 0.1           # 返還ライン(公選法の没収ライン=有効投票の1/10 に準拠)
+  # 審議・パブコメ段階(制度深化 第9バッチ。現実の「請願→パブコメ→議会審議→議決(否決可)」の最小形。
+  # 調査: docs/research/rights-institutions-gap.md §H=最重要。摩擦ゼロの署名即成立を否決されうる熟議に)。
+  # 署名到達で即決せず proposal_review(start)→審議 days 日のあいだ認知者の反対(決定論 no)を集め、
+  # 反対 > 賛同×reject_ratio なら否決(reject+供託金没収)、でなければ approve→投票/成立へ。
+  # 決定論・非LLM・乱数なし(R1)。既定 OFF=proposal_review 0 件・従来どおり即成立(バイト一致)。
+  deliberation:
+    enabled: false              # ★ON 推奨(本番): true(制度改変に否決可能な熟議の摩擦を導入)
+    days: 2                     # 審議期間(日)=パブコメ窓
+    reject_ratio: 0.5           # 否決 = 反対数 > 賛同数 × これ(審議満了時)
+  # 代表制議会(制度深化3 2026-07-08。rights-institutions-gap の見送り分)。既定 OFF=露出者の
+  # 直接投票のまま(現行挙動と完全同一)。ON: term_days ごとに住民(非来街者)が「意見が最も
+  # 近い他の住民」に投票する決定論選挙(Downs 空間投票の最近傍形・非LLM・乱数なし)で size 人の
+  # 議会を選出(council_elected)し、提案の採決は露出者でなく議会が行う(vote_cast/vote_result
+  # に council 印)。直接投票と結果が変わり得る=代表制の歪みを観測できる。
+  assembly:
+    enabled: false              # ★ON 推奨(本番): true(要 vote.enabled=true)
+    size: 9                     # 議席数(渋谷区議会34議席を100体スケールに圧縮)
+    term_days: 30               # 任期(日)。満了で改選(100日ランで3期)
+  # 警察/条例執行(執行ルート): 制度DSL の prohibit ルール下で、近傍(同ノード)の警察官が
+  #   禁止カテゴリの場所に居る違反者を執行=罰金(区の歳入)+ grievance+(factors 経由)。
+  enforcement:
+    enabled: false              # ★ON 推奨(本番): true(要 rules.enabled=true + 警察官入り名簿)
+    fine: 1000                  # 執行時の罰金(円)。government ON なら区(ward)の歳入へ
+    grievance: 0.05             # 執行を受けた違反者の不満増分(0.0=罰金のみで grievance 不変)
+    # 勾留の最小形(制度深化2 第10バッチ。逮捕→勾留→処分の「時間による自由の剥奪」を1段で。
+    # 調査: docs/research/rights-institutions-gap.md §F)。執行時に違反者をその場で行動停止
+    # (会話・発火・移動なし。detention イベント)。既定 0=拘束なし=従来と完全同一。
+    detention_steps: 0          # ★ON 推奨(本番): 例 3(=30分の拘束)
+
+# ---- 文化カレンダー・群集(現実ギャップ Wave G4 2026-07-07。すべて既定 OFF=現行挙動と完全同一)----
+# 暦(world.calendar)の上に文化的リズムを載せる。ON 時: 命名年中行事(正月/ハロウィン/年末)を
+# 暦の特定日に発生させ、全発火プロンプトに「今日は◯◯です。」を1行注入(全員共通・k非依存)+
+# annual_event を1日1回記録。群集フラグ(crowd)のある行事日(渋谷ハロウィン)には、自由時間の
+# 行き先をスクランブル交差点付近の集会ノードへ確率的に寄せ(専用 stream "crowd")、集中が閾値超で
+# crowd_surge を記録する(=世界改変・規制=G3 執行 の実舞台)。要 world.calendar.enabled=true。
+# 定例イベント(会場集客の外生リズム)は既存の制度DSL weekly_event(rules)に委ねる(重複回避)。
+# R1: 群集は generate を1回も増やさない(行き先バイアス=移動のみ / 群集密度は発火系に接続しない)。
+# 既定 OFF=event_line/annual_event/crowd_surge とも無し・乱数消費不変(ゴールデン golden_baseline_l1 を守る)。
+# ---- キャリア転換(現実ギャップ Wave G5 2026-07-07。すべて既定 OFF=現行挙動と完全同一)----
+# 生活基盤の非連続=行動と動機の転換点。既存の economy/organizations/open_venture の最小拡張。
+# ON 時: 日境界で新 stream "career" から確率判定(決定論・非LLM)。
+#  失業: 被雇用者(organizations 配属の非学生)が layoff_prob で職を失う=org/勤務窓/賃金クリア(自由時間 EPR へ)+
+#        unemployment(lost)+job_change を記録+生活不安(grievance+。unemployment_grievance=factors 経由)。政府 ON なら
+#        既存の生活保護 seam に自然に載る。
+#  求職: 失業者が rehire_prob で新 org へ再就職=勤務窓・収入が復帰(unemployment(hired)+job_change)。
+#  転職: 被雇用者が switch_prob で別 org へ(職場が変わる。job_change。失業と排他=失業判定を優先)。
+#  起業転換: open_venture の累計売上 ≥ venture_fulltime_sales かつ開店から venture_fulltime_days 以上で、
+#        所有者が本業を辞め出店を本業化(venture_fulltime)=org/本業賃金クリア・勤務地を屋台へ。
+# 要 organizations.enabled=true(再配属に会社台帳が要る。失業/起業転換は org 配属が前提)。
+# R1: career は generate を1回も増やさず k・内面状態を読まない(呼数は k 非依存)。ただし失業=物理位置が変わり
+# 対面 co-location が変化しうる(群集 G4 と同型)=呼数不変は compute_matched 下の k 不変性で担保。
+# 既定 OFF=unemployment/job_change/venture_fulltime とも無し・新 stream も引かない=乱数消費不変
+# (ゴールデン golden_baseline_l1.json を守る)。
+career:
+  enabled: false                # ★ON 推奨(本番): true(要 organizations.enabled=true + personas_file)
+  layoff_prob: 0.02             # 被雇用者が職を失う日次確率(失業)
+  switch_prob: 0.02             # 被雇用者が別 org へ移る日次確率(転職。失業と排他)
+  rehire_prob: 0.30             # 失業者が新 org へ再就職する日次確率(求職)
+  unemployment_grievance: 0.05  # 失業時の生活不安=不満増分(factors 経由。0.0=金銭のみで grievance 不変)
+  venture_fulltime_sales: 8000  # 起業転換の累計売上閾値(open_venture の売上がこれ以上で本業化。0=起業転換 OFF)
+  venture_fulltime_days: 2      # 起業転換の最短経過日数(開店からこの日数以上)
+  # 解雇規制の最小形(制度深化2 第10バッチ。解雇権濫用法理のモデル。調査: rights-institutions-gap.md §C)
+  severance_days: 0.0           # ★ON 推奨(本番): 例 5(解雇時の退職金=日給×日数。wage source="severance")
+  unfair_ratio: 0.0             # ★ON 推奨(本番): 例 0.3(解雇のうち不当解雇の割合。>0 のときのみ追加 draw)
+  unfair_grievance_mult: 2.0    # 不当解雇時の生活不安(unemployment_grievance)の倍率
+
+annual_events:
+  enabled: false                # ★ON 推奨(本番): true(要 world.calendar.enabled=true)
+  crowd_threshold: 8            # 集会ノード周辺(crowd_radius_m 内)の在住者数がこれ超で crowd_surge
+  crowd_bias: 0.7               # 群集日に自由時間の行き先を集会ノードへ寄せる確率/step(stream "crowd")
+  crowd_radius_m: 60.0          # 集会ノード(スクランブル交差点)からこの距離内を群集としてカウント
+  ambient: false               # 群集密度(非LLM・可視化用の雰囲気推定)を crowd_surge payload に併記
+  ambient_per_surge: 3000       # ambient=true 時、level×これ を推定群集規模として payload に載せる
+  # events: 未指定なら既定(正月 1/1 / ハロウィン 10/31=群集 / 年末 12/31)。上書き例:
+  #   events: [ {name: ハロウィン, month: 10, day: 31, crowd: true}, {name: 正月, month: 1, day: 1, crowd: false} ]
+
+# ---- 情報環境の非対称(現実ギャップ Wave G6 2026-07-07。すべて既定 OFF=現行挙動と完全同一)----
+# 意見分極と伝播の加速器。既存の net/internet(SNS)+ opinion(FJ)の最小拡張。すべて非LLM・決定論。
+# ON 時(マスター enabled=true + 各機構 enabled=true):
+#  推薦(recommendation): SNS の TL 提示を閲覧者の意見整合バイアスで並べ替え/選別(近い投稿を優先表示・
+#    遠い投稿を間引く=エコーチェンバー)。意見参照は opinion.alignment 経由で不透明化。feed_rank を記録。
+#  バイラル(influence): フォロワー数の非対称を活かし高フォロワー author の投稿のリシェア到達(reach)を加重
+#    (拡散カウンタの増分=非LLM 状態更新・新規投稿は作らない)。viral_cascade を記録。
+#  炎上(misinfo): 一部投稿を誤情報として扱い(新 stream "info" で決定論判定)、訂正の拡散・炎上(ネガ反応の
+#    殺到)を記録。炎上→発信者の grievance は factors 経由・任意(flame_grievance>0 のときのみ・drive 非接続)。
+# R1: どの機構も generate() を1本も足さない。推薦は「どの投稿を読むか」を変えるため FixedLLM で ON!=OFF に
+#   なりうるが、機構は k・内面状態を読まず暦・config・意見・フォロワー・新 stream のみ参照する=compute_matched
+#   下の k 不変性で担保(career G5 / crowd G4 と同型)。既定 OFF=feed_rank/viral_cascade/misinfo とも 0 件・
+#   TL は従来の時系列・乱数消費不変(ゴールデン golden_baseline_l1.json を守る)。
+info_env:
+  enabled: false                # ★ON 推奨(本番): true(情報環境の非対称=意見分極の加速器を有効化)。マスターゲート
+  recommendation:
+    enabled: false              # ★ON 推奨(本番): true(意見整合バイアスで TL を選別=エコーチェンバー)
+  influence:
+    enabled: false              # ★ON 推奨(本番): true(高フォロワー投稿の reach を加重=バイラル)
+    follower_threshold: 8       # フォロワーがこれ以上の author をインフルエンサーとみなす
+    reach_weight: 1.0           # 追加 reach = weight ×(フォロワー数 − 閾値 + 1)
+    max_reach: 30               # 1投稿あたり追加 reach の上限(暴走防止)
+  misinfo:
+    enabled: false              # ★ON 推奨(本番): true(誤情報・訂正・炎上のダイナミクス)
+    rate: 0.15                  # 新規投稿が誤情報として扱われる割合(新 stream "info")
+    correction_prob: 0.5        # 誤情報が訂正(拡散)される確率
+    flame_grievance: 0.0        # ★ON 推奨: 例 0.02。炎上を受けた発信者の不満増分(factors 経由・drive 非接続)。
+                                # 0.0=観測のみ(misinfo イベントは出るが grievance は不変)
+
+# ---- 健康・疲労・病気・メンタル(現実ギャップ 後続波 H1 2026-07-07。すべて既定 OFF=現行挙動と完全同一)----
+# 生活の身体的基盤。最小・非LLM・決定論の3機構(実装 src/society/health.py):
+#  疲労: fatigue ゲージ(drive/arousal と並列の内部 transient)が活動(勤務/移動)で蓄積・睡眠で回復。
+#    高疲労で発火 effective_threshold を上げる(休息へ寄る=行動が鈍る)。fatigue_gain=0 で恒等(不変)。
+#  病気: 日次に新 stream "health" で確率発症→欠勤(勤務スキップ)・外出抑制(在宅=自宅へ寄せる)・
+#    受診で医療消費(medical_visit=spend cat="medical")。illness_days 日で回復(illness state=onset/recover)。
+#  メンタル: 慢性的な高 grievance の持続→引きこもり(withdrawn=自由時間の外出を控え社会的活動が低下)。
+#    grievance の参照は health.py(CHECKED_DIRS 外)に閉じる=no-fingerprint 契約に触れない。
+# R1: どの機構も generate() を1本も足さない。病気(在宅)・疲労(休息)は物理位置を変え対面 co-location が
+#   変化しうる(=FixedLLM で ON!=OFF)が、機構は k・内面状態(構成概念)を発火判断に食わせず暦・config・
+#   新 stream・物理位置・grievance(k 非依存)のみ参照=compute_matched 下の k 不変性で呼数一致を担保する。
+# 既定 OFF(enabled=false)=疲労更新なし・発症/受診なし・引きこもりなし・health stream も引かない・
+#   イベント 0 件・乱数消費不変(ゴールデン golden_baseline_l1.json を守る)。新イベント種は illness /
+#   medical_visit / health_update(schema.py 登録済み)。
+health:
+  enabled: false                # ★ON 推奨(本番): true(生活の身体的基盤=疲労・病気・メンタルを有効化)
+  # ---- 疲労(内部 transient。既定 gain=0=恒等=不変)----
+  fatigue_gain_work: 0.0        # ★ON 推奨: 例 0.02。勤務中1stepあたりの疲労蓄積
+  fatigue_gain_move: 0.0        # ★ON 推奨: 例 0.015。移動中1stepあたりの疲労蓄積
+  fatigue_recovery: 0.15        # 睡眠中1stepあたりの回復量(ON時のみ効く)
+  fatigue_high: 0.6             # 「高疲労」とみなす閾値(health_update / 行動鈍化の境界)
+  fatigue_threshold_gain: 0.0   # ★ON 推奨: 例 0.1。高疲労→発火 effective_threshold の上げ幅(休息へ寄る)。0=恒等
+  # ---- 病気(新 stream "health"。既定 onset_prob=0=発症なし)----
+  onset_prob: 0.0               # ★ON 推奨: 例 0.02。居住者の日次発症確率(数日間の欠勤・在宅)
+  illness_days: 3               # 発症してから回復までの日数
+  medical_prob: 0.0             # ★ON 推奨: 例 0.5。発症直後に受診する確率(→ medical_visit + spend)
+  medical_cost: 3000            # 受診1回の医療費(spend cat="medical")
+  # ---- メンタル(慢性高 grievance→引きこもり。既定 閾値高で通常不発)----
+  mental_grievance_threshold: 0.7  # 「高 grievance」とみなす閾値
+  mental_withdraw_days: 3       # 高 grievance がこの日数続いたら引きこもり(0=メンタル無効)
+
+# ---- 世帯・家族・恋愛(現実ギャップ 後続波 H2 2026-07-07。すべて既定 OFF=現行挙動と完全同一)----
+# 現状は全員独立個人。生活の紐帯(世帯・同居・家族・恋愛)を最小・非LLM・決定論で載せる
+# (実装 src/society/household.py)。3機構(childbirth/死別=エージェント数が変わる重い機構は本波では作らない):
+#  世帯・同居: 起動時に居住者を決定論で世帯(夫婦・家族・ルームシェア)へグループ化(新 stream "household")。
+#    同一世帯は home(住居建物・ノード・階)を共有=夜間の家庭内 co-location(会話の場)。各メンバに
+#    household_id / 同居者 id を付し、後段の「顔なじみ」で housemate が初期関係に入る。
+#  家族関係: 同居者・恋人が同席したとき「同居する家族/同居人/恋人の○○」をプロンプトに1行添える(G2 と協調)。
+#  恋愛・パートナー: G2 relations の親密度 closeness が相互に partner_closeness 超の2者を日次で決定論的に
+#    パートナー(恋人)にする(要 relations.enabled=true。closeness が積まれる)。パートナーは特別な間柄
+#    (親友の上位)+ デート(共有の目的地・新 stream "date")が移動理由に。partner_formed / life_event を記録。
+# R1: どの機構も generate() を1本も足さない。住居共有・デートは物理位置を変え対面 co-location が変化しうる
+#   (=FixedLLM で ON!=OFF)が、機構は k・内面状態を読まず名簿・config・closeness・物理位置のみ参照する=
+#   compute_matched 下の k 不変性で呼数一致を担保(career G5 / crowd G4 / 健康 H1 と同型)。
+# 既定 OFF=世帯を組まず(home 割当も不変)・パートナー形成なし・context/date とも無し・"household"/"date"
+#   stream も引かない=イベント 0 件・乱数消費不変(ゴールデン golden_baseline_l1.json を守る)。新イベント種は
+#   partner_formed / life_event(schema.py 登録済み。世帯の家族文脈は relation 文脈で表現=新種不要)。
+household:
+  enabled: false                # ★ON 推奨(本番): true(生活の紐帯=世帯・家族・恋愛を有効化。恋愛は要 relations.enabled=true)
+  # ---- 世帯グループ化(起動時1回。新 stream "household")----
+  sizes: [1, 2, 3, 4]           # 取りうる世帯サイズ(1=単身は世帯を組まない=個人のまま)
+  size_weights: [0.35, 0.30, 0.22, 0.13]  # サイズの相対重み(合計は正規化)
+  family_ratio: 0.7             # 2人以上世帯が「家族」の割合(残りはルームシェア=同居人)
+  # ---- 恋愛・パートナー形成(日次。G2 closeness から決定論。要 relations.enabled=true)----
+  partner_closeness: 15.0       # 相互 closeness がこれ以上でパートナー成立(親友 relations.tier_close の上位)
+  date_bias: 0.5                # 自由時間にパートナーとの共有デート先へ寄せる確率/step(stream "date")
+
+# ---- 商業・店舗のダイナミクス(現実ギャップ 後続波 H3 2026-07-07。すべて既定 OFF=現行挙動と完全同一)----
+# 現状 POI(店・会社)は静的で常時営業・価格固定。商業の動きを最小・非LLM・決定論で載せる
+# (実装 src/society/commerce.py)。3機構(都市再開発=地図が変わる機構は本波では作らない=注記に留める):
+#  営業時間: POI のカテゴリから開閉時刻を時刻の純関数で決める(乱数不要)。閉店中のカテゴリは routine の
+#    行き先候補(食事/買物/夜遊び先)から除外し、開閉遷移を shop_state(カテゴリ単位=1日数件・sparse)で記録。
+#  動的価格・需給: その POI/時間帯の需要(在館数=観測量)に応じて価格係数を決定論で消費額に掛ける
+#    (混雑した店で高く=surge、閑散でセール<1)。price_change(cat, ratio)。★係数は既存 spend 抽選の外で掛ける
+#    (economy の _poi_price/spend の draw を汚さない)。price_sensitivity=0.0=恒等=不変。
+#  在庫・品切れ・行列: 需要が stock_threshold 超の POI で資源希少化(品切れ/行列)= その場の購入抑制 + 不満
+#    (factors 経由 on_scarcity)。stock_out(poi, cat)。
+# R1: どの機構も generate() を1本も足さない。閉店による行き先除外は物理位置=対面 co-location を変えうる
+#   (=FixedLLM で ON!=OFF になりうる=career G5 / crowd G4 / 健康 H1 / 世帯 H2 と同型)が、機構は k・内面状態を
+#   読まず時刻・config・在館数(観測量)のみ参照する=compute_matched 下の k 不変性で呼数一致を担保する。
+#   動的価格・在庫は移動を変えない(消費額・購入可否のみ)=呼数に無関係。品切れ→grievance は drive 非接続。
+# 既定 OFF=営業時間ゲートなし(全 POI 常時営業扱い)・価格係数なし(消費額不変)・品切れなし・
+#   shop_state/price_change/stock_out とも 0 件・乱数消費不変(ゴールデン golden_baseline_l1.json を守る)。
+commerce:
+  enabled: false                # ★ON 推奨(本番): true(商業の動き=営業時間・動的価格・在庫を有効化)
+  # ---- 営業時間(cat → [開店時, 閉店時]。24h表記。閉<=開 は翌朝までの夜間営業。未掲載カテゴリは常時営業)----
+  hours:
+    food: [11, 23]              # 飲食店 11:00〜23:00
+    shop: [10, 21]              # 物販 10:00〜21:00
+    nightlife: [18, 5]          # 夜遊び 18:00〜翌05:00(夜間営業)
+  # ---- 動的価格(需給。在館数=需要 が demand_ref を超えると係数>1=surge、下回るとセール<1)----
+  price_sensitivity: 0.15       # 在館数 1 人差あたりの価格係数変化(0.0=恒等=消費額不変)
+  demand_ref: 2                 # 基準需要(在館数)。これと同数で係数 1.0
+  price_min: 0.7                # 価格係数の下限(セール)
+  price_max: 1.6                # 価格係数の上限(surge)
+  # ---- 在庫/品切れ・行列(在館数が stock_threshold 以上で品切れ/行列=購入抑制+不満)----
+  stock_threshold: 6            # これ以上の在館で品切れ/行列(0 以下=在庫機構 無効)
+  stock_grievance: 0.02         # ★ON 推奨: 例 0.02。品切れ/行列に遭遇→不満(factors 経由。0.0=観測のみ=grievance 不変)
+
+# ---- 都市・環境インフラのショック(現実ギャップ 後続波 H4 2026-07-07。すべて既定 OFF=現行挙動と完全同一)----
+# 生活を麻痺させる外生ショック=集団的 grievance の源。既存の scenario/transit の最小拡張(独立 phase。
+# 都市再開発=地図が時間で変わる機構は本波では作らない=注記に留める)。実装 src/society/disaster.py。3機構:
+#  災害(disaster): 台風/地震/大雪など。発生日(days)or 確率(onset_prob)で発動し、発生中は
+#    交通麻痺(電車運休=transit.has_service 停止=駅経由の退出/帰還を止める)+ 外出抑制(在宅=routine が
+#    自宅へ寄せる。stay_home_bias)+ 強い grievance(factors 経由)+ プロンプト文脈(「台風で交通が麻痺…」)。
+#    発生/解除を disaster(agent_id=-1, phase=onset/clear)で記録。
+#  交通の遅延・運休(transit_delay): 電車は現状 定刻(乱れなし)。日次に遅延/運休を新 stream "disaster" で
+#    注入(既存の定刻ダイヤの draw は汚さない)。運休日は has_service 停止。乗れない/遅れる→grievance。
+#  インフラ障害(infra_outage): 停電/通信断/断水=生活麻痺。軽実装=在宅娯楽(media)・スマホ(SNS/検索等)の
+#    一部を抑制 + grievance。発生/解除を infra_outage で記録。
+# R1: どの機構も generate() を1本も足さない。発生/遅延/障害の確率判定は新 stream "disaster"(既存 draw 順に
+#   挿入しない=決定論)、発生日指定は暦不要の day-index からの純関数(乱数なし)。災害(在宅)・運休は物理位置・
+#   移動を変え対面 co-location が変化しうる(=FixedLLM で ON!=OFF=career G5 / crowd G4 / 健康 H1 / 世帯 H2 /
+#   商業 H3 と同型)が、機構は k・内面状態を読まず day-index・config・新 stream・物理位置のみ参照する=
+#   compute_matched 下の k 不変性で呼数一致を担保。grievance は drive(発火系)に接続しない。既存の摂動シナリオ
+#   (world.scenario の shock_closure/shock_event)の挙動・イベント列は一切変えない(独立 phase)。
+# 既定 OFF=disaster/transit_delay/infra_outage とも 0 件・transit 運休なし・"disaster" stream も引かない=
+#   乱数消費不変(ゴールデン golden_baseline_l1.json を守る)。新イベント種は disaster / transit_delay /
+#   infra_outage(schema.py 登録済み)。
+disaster:
+  enabled: false                # ★ON 推奨(本番): true(生活を麻痺させる外生ショック=集団的 grievance の源を有効化)
+  # ---- 災害ショック(台風/地震/大雪)----
+  days: []                      # 発生日の day-index リスト(run 開始=0。決定論・乱数不要)。例: [10, 45]
+  onset_prob: 0.0               # ★ON 推奨: 例 0.01。days 非該当日の発症確率(新 stream "disaster")
+  duration_days: 1              # 1回の災害の継続日数
+  kind: 台風                    # 災害の種類(台風/地震/大雪。プロンプト・イベントの語)
+  grievance: 0.0                # ★ON 推奨: 例 0.06。災害中の不満増分(factors 経由・1日1回。0.0=観測のみ)
+  stay_home_bias: 0.0           # ★ON 推奨: 例 0.7。災害中に住民が在宅(外出抑制)になる確率(新 stream "disaster")
+  suspend_transit: true         # 災害中に電車を運休にするか(交通麻痺。false で運休なし)
+  # ---- 交通の遅延・遅刻・運休(独立。定刻ダイヤを新 stream "disaster" で乱す)----
+  delay_prob: 0.0               # ★ON 推奨: 例 0.05。日次の遅延/運休発生確率(新 stream "disaster")
+  suspend_prob: 0.0             # ★ON 推奨: 例 0.3。遅延日のうち運休(has_service 停止)になる確率(残りは遅延=grievanceのみ)
+  delay_grievance: 0.0          # ★ON 推奨: 例 0.02。遅延/運休に遭遇した街内の人の不満増分(factors 経由。0.0=観測のみ)
+  # ---- インフラ障害(停電/通信断/断水。軽実装)----
+  outage_prob: 0.0              # ★ON 推奨: 例 0.02。日次の障害発生確率(新 stream "disaster")
+  outage_kind: 停電             # 障害の種類(停電/通信断/断水)
+  outage_duration_days: 1       # 障害の継続日数
+  outage_grievance: 0.0         # ★ON 推奨: 例 0.03。障害中の不満増分(factors 経由・1日1回。0.0=観測のみ)
+
+# ---- 宿泊・ホテル滞在(第9バッチ Wave L 2026-07-07。既定 OFF=現行挙動と完全同一)----
+# 来街者(visitor)が夜の帰宅退出の代わりにホテルへ宿泊する(実装 src/society/lodging.py +
+# scheduler の _maybe_lodge/_lodging_checkin/_phase_lodging)。夜の帰宅(homing)の退出時に
+# 新 stream "lodging" で抽選→最寄り hotel POI へ→チェックイン(lodging_checkin+spend
+# cat="lodging")→建物内で就寝(内省=k 処置も自宅就寝と同格に発火)→checkout_hour に
+# チェックアウト。連泊は max_nights まで(毎晩支払い。帰宅=退出でリセット)。
+# R1: generate() を足さない。宿泊は物理位置を変え FixedLLM で ON!=OFF になりうるが、機構は
+# k・内面状態を読まない=compute_matched 下の k 不変性で担保(G4/G5/H1 と同型)。
+# 既定 OFF=抽選せず・lodging_checkin/checkout 0 件・"lodging" stream も引かない(ゴールデンを守る)。
+lodging:
+  enabled: false                # ★ON 推奨(本番): true(hotel POI が地図に無ければ ON でも完全 no-op)
+  price_per_night: 12000        # 1泊の宿泊費(spend cat="lodging")
+  prob: 0.4                     # 夜の帰宅退出の代わりにホテル泊を選ぶ確率(所持金が足りる visitor のみ)
+  checkout_hour: 9              # チェックアウト時刻(この時刻に活動再開)
+  max_nights: 3                 # 連泊の上限(超えたら帰宅=範囲外退出)
+
+# ---- 観光・多言語・犯罪・治安(現実ギャップ 後続波 H5 2026-07-07。すべて既定 OFF=現行挙動と完全同一)----
+# 渋谷の街の多様性と負の相互作用を最小・非LLM・決定論で載せる(実装 src/society/diversity.py)。4機構:
+#  観光客・訪日客: visitor の一部を「回遊型の観光客」に決定論(名簿・id 順)で仕立て、自由時間の行き先を
+#    landmark_score 高ノード(イメージアビリティ、既存 Lynch と同素材)へ寄せる(tourist_visit・専用 stream
+#    "tourist")。プロンプト文脈「観光で来ている」。
+#  多言語・文化の多様性: 一部を非日本語話者に決定論で仕立て、語の採用(labeling)で異言語間は採用閾値を
+#    上げる(伝播障壁=語が言語をまたぐと広まりにくい)。プロンプト文脈「主に○○語を話す」。
+#  犯罪・迷惑行為: 街内で窃盗(被害者 money−+grievance を factors 経由)・迷惑行為(その場の周囲の grievance)を
+#    発生させる(crime/nuisance・専用 stream "crime")。近傍(同ノード)に警察官(G3)が居れば抑止。
+#  治安の体感・回避: 犯罪履歴のあるノード=危険地帯を、自由時間の行き先(EPR)から避ける(空間行動の変化)。
+# R1: どの機構も generate() を1本も足さない。観光属性・言語属性は名簿からの決定論付与、観光回遊/犯罪発生は
+#   専用 stream(既存 draw 順に挿入しない)、伝播障壁は言語属性からの純関数、危険地帯回避は犯罪履歴(観測量)
+#   からの決定論。観光回遊・犯罪(被害者 money−)・危険地帯回避は物理位置=対面 co-location を変えうる(=FixedLLM
+#   で ON!=OFF になりうる=career G5 / crowd G4 / 健康 H1 / 世帯 H2 / 商業 H3 / 災害 H4 と同型)が、機構は k・内面
+#   状態を読まず名簿・config・新 stream・物理位置・犯罪履歴(k 非依存)のみ参照=compute_matched 下の k 不変性で
+#   呼数一致を担保。grievance は drive(発火系)に接続しない。
+# 既定 OFF=属性付与なし・観光回遊なし・伝播障壁なし・犯罪/迷惑なし・危険地帯回避なし・"tourist"/"crime" stream も
+#   引かない=イベント 0 件・乱数消費不変(ゴールデン golden_baseline_l1.json を守る)。新イベント種は crime /
+#   nuisance / tourist_visit(schema.py 登録済み)。
+society_diversity:
+  enabled: false                # ★ON 推奨(本番): true(街の多様性と負の相互作用を有効化。観光は要 visitor 入り名簿、犯罪抑止は要 警察官入り名簿)
+  # ---- 観光客・訪日客(回遊型)----
+  tourist_ratio: 0.0            # ★ON 推奨: 例 0.5(visitor のうち観光客にする割合。決定論・id 順)
+  tourist_bias: 0.7            # 自由時間にランドマークへ回遊する確率/step(stream "tourist")
+  landmark_top: 8              # 回遊先候補にする上位ランドマーク数
+  # ---- 多言語・文化の多様性 ----
+  foreign_ratio: 0.0            # ★ON 推奨: 例 0.2(非日本語話者にする割合。決定論・id 順)
+  languages: [英語, 中国語, 韓国語]  # 割り当てる言語ラベル(循環)
+  cross_lang_barrier: 2         # 異言語間の語採用に必要な追加聴取回数(伝播障壁)
+  # ---- 犯罪・迷惑行為 ----
+  crime_prob: 0.0               # ★ON 推奨: 例 0.005(街内の1人1stepあたりの窃盗発生確率。stream "crime")
+  nuisance_prob: 0.0            # ★ON 推奨: 例 0.005(迷惑行為の発生確率。stream "crime")
+  theft_amount: 3000.0          # 窃盗の被害額(被害者 money−。現金の範囲で)
+  crime_grievance: 0.0          # ★ON 推奨: 例 0.08(窃盗被害者の不満増分。factors 経由。0.0=金銭のみで grievance 不変)
+  nuisance_grievance: 0.0       # ★ON 推奨: 例 0.03(迷惑行為の周囲の不満増分。factors 経由。0.0=観測のみ)
+  nuisance_kinds: [客引き, ナンパ, 喧嘩, 路上の騒ぎ]  # 迷惑行為の種類(決定論で選択)
+  # ---- 治安の体感・回避 ----
+  danger_threshold: 3           # 犯罪履歴回数がこれ以上のノード=危険地帯(避ける)。0 以下=回避無効
+  avoid_danger: true            # 危険地帯を自由時間の行き先から避ける(enabled 時のみ効く)

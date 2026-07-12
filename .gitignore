@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+runs/
+.pytest_cache/
+uv.lock
+# チャレンジ限定データ(公共交通オープンデータチャレンジ)は再配布不可の可能性 → コミット禁止
+data/odpt_challenge/
+# 手動バックアップ(2026-07-12 フォルダ復元の源泉)はリポジトリに含めない
+shibuya　バックアップ/
+# ローカル個人設定
+.claude/settings.local.json

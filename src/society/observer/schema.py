@@ -1,0 +1,179 @@
+"""イベントの正準スキーマ + 種類レジストリ(D12)。
+
+新しいログ種類の追加 = `register_event_kind("kind名", "説明")` を1行呼ぶだけ。
+固定列は変えない(詳細は payload に入れる)ので、過去データとの互換は常に保たれる。
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+EVENT_KINDS: dict[str, str] = {}
+
+
+def register_event_kind(kind: str, description: str) -> None:
+    EVENT_KINDS[kind] = description
+
+
+# ---- 既定のイベント種類(D12 で確定した最初のセット) ----
+register_event_kind("route_start",   "目的地への経路探索を開始 {dest, path, dist_m}")
+register_event_kind("move_segment",  "経路に沿った1stepの前進 {from_xy, to_xy, dist_m, edge}")
+register_event_kind("arrive",        "目的地に到着 {node}")
+register_event_kind("stay",          "滞在(その場に留まる){node}")
+register_event_kind("speak",         "発話 {text, item_ids, hearers}")
+register_event_kind("hear",          "聴取 {speaker, item_ids}")
+register_event_kind("label_coin",    "ラベル/新語の創出 {item_id, text}")
+register_event_kind("label_adopt",   "ラベルの採用(閾値到達){item_id}")
+register_event_kind("vocab_coin",    "★新規・専門語彙の誕生(ユーザー指定ログ){item_id, text}")
+register_event_kind("vocab_use",     "★語彙の使用(ユーザー指定ログ){item_id}")
+register_event_kind("transmission",  "★伝播系譜: item が from→to へ伝わった(ユーザー指定ログ){item_id, from, channel}")
+register_event_kind("reflect",       "ソロ内省(k の実装部位){mode, written_back, belief}")
+register_event_kind("state_update",  "state 更新(OPEN#2 seam){name, old, new, cause}")
+register_event_kind("fallback",      "LLM 失敗→routine 代替(D16){reason}")
+register_event_kind("llm_deliberate","LLM 熟考が発火 {trigger}")
+register_event_kind("enter_building","建物に入る {building, name, floor}")
+register_event_kind("exit_building", "建物から出る {building}")
+register_event_kind("floor_move",    "建物内で階を移動 {building, floor}")
+register_event_kind("exit_area",     "シミュ範囲外へ退出 {gateway, via}")
+register_event_kind("enter_area",    "範囲外から帰還 {gateway, via}")
+register_event_kind("sleep_start",   "自宅で就寝(個別時刻){until_step, building}")
+register_event_kind("wake_up",       "起床 {slept_steps}")
+register_event_kind("traffic_flow",  "背景交通(通過車両)の1step分の軌跡 {n, total, segs}")
+register_event_kind("sns_post",      "SNS に投稿 {text, items}")
+register_event_kind("sns_read",      "SNS タイムラインを閲覧 {n_posts, authors}")
+register_event_kind("news_read",     "ニュースアプリを閲覧 {titles}")
+register_event_kind("dm",            "1対1メッセージ送信(受信側は transmission/hear 相当){to, text}")
+register_event_kind("search",        "検索エンジンで調べる {query}")
+register_event_kind("world_event",   "シナリオイベント発生(公式発表など){title, word}")
+register_event_kind("scenario_shock", "摂動シナリオの発動・解除(#8){kind, at, phase, params}")
+register_event_kind("drive_request", "欲求発火の申請(Phase A){drive, threshold, lottery, granted, reason}")
+register_event_kind("wage",          "賃金の支給(本業の勤務完遂・バイトのシフト完遂・月給まとめ・日銭){amount, balance, to, account?, source?}")
+register_event_kind("spend",         "消費(食事・買い物・nightlife・taxi・bus){amount, balance, cat, src?, account?}")
+# ---- 口座(銀行)概念 E5(既定 OFF。ユーザー決定 2026-07-06)----
+register_event_kind("withdraw",      "現金不足→口座から自動引き出し(ATM近似・移動なし){amount, cash, account}")
+register_event_kind("rent",          "家賃の口座引き落とし(給料日翌日・不足は翌日繰越){amount, paid, carry, account, phase}")
+# ---- 朝の一日計画 / 交通機関(ユーザー要望 2026-07-06)----
+register_event_kind("day_plan",      "朝の一日計画(LLM。ルールベース行動の土台){n, plan}")
+register_event_kind("ride",          "交通機関の乗車(タクシー/簡易バス){mode, fare, from, to}")
+register_event_kind("free_action",   "開放行動(第17バッチ: LLM の自由記述行動+価値4軸の観測){what, category, tags, match, report, minutes, cost, dest, sat}")
+# ---- 主観的世界モデル(第20バッチ 2026-07-12: 期待・可制御性・規範予期の日次観測。既定 OFF)----
+register_event_kind("worldview",     "主観的世界モデルの日次スナップ(agent: ctrl/期待規模/期待誤差、街: norm_rate){ctrl?, expect_n?, err_mean?, err_n?, norm_rate?, pioneer_1d?}")
+# ---- 街頭広告 OOH(第18バッチ 2026-07-11: 街路の環境情報。既定 OFF)----
+register_event_kind("ad_campaign",   "街頭広告キャンペーンの改定(枠×周期・世界イベント agent_id=-1){slot, campaign, target, cat, period}")
+register_event_kind("ad_exposure",   "街頭広告の視認(接触→来店→購買ファネルの起点){campaign, target, slot, cat, n_seen}")
+# ---- ツール(世界を変える affordance。中立提示・自然使用の観察。R1/R4 準拠) ----
+register_event_kind("event_host",    "イベントを開催宣言 {event_id, title, node, start_step}")
+register_event_kind("event_attend",  "イベントに参加(会場到着){event_id, host, title}")
+register_event_kind("flyer_post",    "掲示・ビラを貼る {author, node, text, items}")
+register_event_kind("flyer_view",    "掲示・ビラを閲覧(通行人・ユニーク){author, node}")
+register_event_kind("flyer_expire",  "掲示・ビラの撤去(ttl 失効・上限超過){author, node, reason}")
+register_event_kind("group_found",   "コミュニティを結成 {group_id, name, purpose, founder}")
+register_event_kind("group_join",    "コミュニティに加入 {group_id, name, founder}")
+register_event_kind("proposal",      "提案・署名運動を起こす {proposal_id, text}")
+register_event_kind("proposal_support", "提案に賛同=署名(露出2回){proposal_id, author}")
+register_event_kind("proposal_passed", "提案が成立(署名が閾値到達){proposal_id, text, supporters}")
+register_event_kind("venture_open",  "出店(屋台を開業){name, offer, node, cost, balance}")
+register_event_kind("venture_sale",  "出店の売上(通行人の購入){amount, balance, buyer}")
+register_event_kind("venture_close", "出店の閉店(売上ゼロ継続){name, node}")
+# ---- 行動心理プラグイン(既定 OFF。Searle 制度化)----
+register_event_kind("institution",   "成立提案の制度化(status function 樹立。Searle){name, norm_text, created_by}")
+# ---- 制度DSL(ホワイトリスト型ルールの自動制定。既定 ON。ユーザー構想 2026-07-06) ----
+register_event_kind("institution_rule", "成立提案が実効ルールとして自動制定(制度DSL){rule_id, type, name, proposer, rule}")
+register_event_kind("rule_bonus",       "制度DSL bonus ルールによる支給(park/event_attend/flyer_view){rule_id, behavior, amount, balance}")
+register_event_kind("rule_expired",     "制度DSL ルールの失効(duration 期限切れ / max_active 上限超過){rule_id, type, reason}")
+register_event_kind("rule_weekly_fire", "制度DSL weekly_event の期日発火(定期ニュース+場所ブースト){rule_id, title, place, node}")
+# ---- 再帰性(第9バッチ 2026-07-07。規範・現状の監視→知覚→フィードバック→改変。既定 OFF) ----
+register_event_kind("rule_repealed",    "再帰性: repeal 提案の成立による既存ルールの廃止 {rule_id, type, name, proposer, repealed_by}")
+register_event_kind("norm_digest",      "再帰性: 昨日の街の動きの日次ダイジェスト(客観カウント){day, proposals, passed, enacted, repealed, enforced, active_rules}")
+# ---- 実験プロトコル核(D7 対照 / D9 過正当化 / agentic pull。既定 off で現状不変) ----
+register_event_kind("llm_null",      "null 系列対照: 内容非結合のダミー LLM 呼び出し(D7 R1){i}")
+register_event_kind("memory_recall", "内省の agentic pull: 思い出したいことのクエリと件数 {query, n_hits}")
+register_event_kind("reward",        "採用報酬(D9 過正当化 ablation。既定off){amount, balance}")
+# ---- 意見力学(FJ #16)+ SNS 反応(#14)。非LLM・決定論(いいね/リシェアは新streamで抽選)----
+register_event_kind("opinion_shift", "意見の更新(Friedkin-Johnsen。source が聞き手の意見を動かした){source, old, new}")
+register_event_kind("sns_like",      "SNS 投稿へのいいね {post_id, author}")
+register_event_kind("sns_reshare",   "SNS 投稿のリシェア(RT。フォロワーへ自然再配信){post_id, author}")
+# ---- 第6バッチ(ユーザー要望 2026-07-06: 行政・税/娯楽メディア/職場・学校の実態)----
+register_event_kind("tax",           "税の徴収(所得税・住民税・消費税など){tax, amount, to, base?, balance?}")
+register_event_kind("civic_service", "行政サービスの利用・給付(区/都/国){service, level, amount?, detail?}")
+register_event_kind("public_budget", "行政主体の会計集計(歳入・歳出・残高){level, revenue, expense, balance}")
+register_event_kind("media_use",     "娯楽メディアの利用(TV/動画/ゲーム。タイトルは架空){medium, title?, steps, at}")
+register_event_kind("study",         "学校の授業・学習(教科・講義){org, subject, role}")
+register_event_kind("production",    "職場での産出(財・サービスの実態){org, output, kind}")
+# ---- 第7バッチ(ユーザー要望 2026-07-07: 日付・天気)----
+register_event_kind("weather",       "その日の天気(日次・世界イベント agent_id=-1){date, weekday, cond, temp_hi, holiday?}")
+# ---- 長期予定・スケジュール帳(第7バッチ 2026-07-07。会話からの自動記入。既定 OFF)----
+register_event_kind("appointment",   "予定の設定(会話からの自動記入){day, when, what, place, with}")
+register_event_kind("appointment_kept", "予定の遵守(予定時間帯に該当場所に居た。任意観測){day, when, what, place}")
+# ---- 感情・興味・注意ハブ(affect。既定 OFF。設計: docs/lit/neuroscience__emotion-interest-attention.md)----
+register_event_kind("affect_update", "覚醒度arousalの更新(感情・興味・注意ハブ){old,new,cause}")
+# ---- 現実ギャップ実装 Wave G2(社会関係の質。既定 OFF。設計: docs/design-candidates/gap-implementation-plan.md)----
+register_event_kind("relation_tier",   "関係の深化段階の変化(知人→友人→親友等){other, tier, count}")
+register_event_kind("relation_break",  "関係の断絶・悪化(ネガ交流・長期不在){other, from_tier, to_tier, cause}")
+register_event_kind("reputation_update", "評判・信頼スコアの更新(口コミ・語の採用で伝播){old, new, cause}")
+# ---- 現実ギャップ実装 Wave G3(制度改変の3ルート: 職域・民主・執行。既定 OFF)----
+register_event_kind("labor_action",  "労働争議の提起(職場同僚への集合行為){org, demand, initiator}")
+register_event_kind("vote_cast",     "提案への投票(民主的ルート){proposal_id, vote}")
+register_event_kind("vote_result",   "投票による提案の可決・否決 {proposal_id, yes, no, passed}")
+# ---- 制度深化(第9バッチ 2026-07-07。多段制定=審議/パブコメ・供託金。既定 OFF)----
+register_event_kind("proposal_review", "提案の審議段階(パブコメ窓の開始/可決送り/否決){proposal_id, phase, supporters?, opposed?}")
+register_event_kind("deposit",         "供託金(propose の受理拠出・返還・没収・拠出不能){proposal_id?, amount, phase, balance?}")
+# ---- 制度深化 第2弾(第10バッチ 2026-07-08。勾留・営業許可。既定 OFF)----
+register_event_kind("detention",       "執行時の拘束=勾留の最小形(数stepの行動停止){target, officer, rule_id, steps}")
+register_event_kind("venture_permit",  "出店の営業許可(却下 or 許可=開業待ち){name, outcome, open_step?, reason?}")
+# ---- 出来事誘発の深い内省(第12バッチ 2026-07-08。既定 OFF)----
+register_event_kind("reflection_trigger", "日内衝撃ゲージの閾値超え=深い内省の予約(侵入的段階の開始){gauge, day, due_day}")
+# ---- 制度深化 第3弾(2026-07-08。代表制議会・立退き・破産サイクル。既定 OFF)----
+register_event_kind("council_elected", "代表制議会の改選(意見最近傍の決定論選挙。世界イベント agent_id=-1){term, day, members, n_candidates}")
+register_event_kind("eviction",        "家賃滞納の立退き/完済の再入居(住居サイクル){phase, arrears?, days?}")
+register_event_kind("bankruptcy",      "自己破産=免責+自由財産以外の圧縮+制限期間{debt, seized, keep, until_step, venture_closed}")
+register_event_kind("enforcement",   "条例・制度DSLルールの執行(公務員=警察官による){rule_id, officer, target, penalty}")
+# ---- 現実ギャップ実装 Wave G4(文化カレンダー・群集。既定 OFF)----
+register_event_kind("annual_event",  "年中行事の発生(正月・ハロウィン・年末など。世界イベント agent_id=-1){name, date}")
+register_event_kind("crowd_surge",   "大規模群集の発生・観測(スクランブル等への集中){node, level, event}")
+# ---- 現実ギャップ実装 Wave G5(キャリア転換。既定 OFF)----
+register_event_kind("job_change",    "転職・配属変更(職場が変わった){from_org, to_org, cause}")
+register_event_kind("unemployment",  "失業・求職(職を失う/職を得る){state, org?}")
+register_event_kind("venture_fulltime", "起業転換(本業を辞め出店を本業にする){name, node}")
+# ---- 現実ギャップ実装 Wave G6(情報環境の非対称。既定 OFF)----
+register_event_kind("feed_rank",     "TL推薦の並べ替え(意見整合バイアス=エコーチェンバー){agent, boosted, filtered}")
+register_event_kind("viral_cascade", "バイラル拡散(インフルエンサー非対称のリシェア連鎖){post_id, author, reach}")
+register_event_kind("misinfo",       "誤情報・訂正・炎上(フェイクの拡散と打ち消し){post_id, kind}")
+# ---- 現実ギャップ実装 後続波 H1(健康・疲労・病気。既定 OFF)----
+register_event_kind("illness",       "病気の発症・回復(欠勤・外出抑制){state, kind?}")
+register_event_kind("medical_visit", "医療機関の受診(移動・消費){node?, cost}")
+register_event_kind("health_update", "疲労・メンタルの状態更新(内部 transient){name, old, new, cause}")
+# ---- 現実ギャップ実装 後続波 H2(世帯・家族・恋愛。既定 OFF)----
+register_event_kind("partner_formed", "恋愛・パートナー関係の成立(相互の強い親密度から){other}")
+register_event_kind("life_event",     "ライフイベント(結婚・同居・別れなど){kind, other?}")
+# ---- 現実ギャップ実装 後続波 H3(商業ダイナミクス。既定 OFF)----
+register_event_kind("shop_state",    "店舗の開店・閉店(営業時間){poi, state}")
+register_event_kind("price_change",  "動的価格の変動(需給・セール){poi?, cat, ratio}")
+register_event_kind("stock_out",     "品切れ・行列(需要集中の資源希少化){poi, cat}")
+# ---- 現実ギャップ実装 後続波 H4(都市・環境ショック。既定 OFF)----
+register_event_kind("disaster",      "災害ショック(台風・地震・大雪。世界イベント agent_id=-1){kind, phase}")
+register_event_kind("transit_delay", "交通の遅延・運休(電車・バス){line?, kind}")
+register_event_kind("infra_outage",  "インフラ障害(停電・通信断・断水){kind, phase}")
+# ---- 現実ギャップ実装 後続波 H5(観光・多言語・犯罪・治安。既定 OFF)----
+register_event_kind("crime",         "犯罪・被害(窃盗など。被害者/加害者){kind, victim?, offender?, amount?}")
+register_event_kind("nuisance",      "迷惑行為(客引き・ナンパ・騒ぎ){kind, node}")
+register_event_kind("tourist_visit", "観光客のランドマーク回遊(訪日客・回遊型){node}")
+# ---- 現実ギャップ実装 後続波 H6(内面本格版: 離散感情・長期目標・趣味。既定 OFF)----
+register_event_kind("emotion_label", "離散感情ラベルの変化(core affect→怒/哀/喜/怖/驚等){label}")
+register_event_kind("long_goal",     "長期目標・人生設計の設定/変化(keystone の駆動源){goal}")
+# ---- 宿泊・ホテル滞在(第9バッチ 2026-07-07。来街者・観光客の夜間宿泊。既定 OFF)----
+register_event_kind("lodging_checkin",  "ホテルへのチェックイン(宿泊費の支払い・夜間滞在){poi, node, price, nights}")
+register_event_kind("lodging_checkout", "ホテルからのチェックアウト(滞在終了・活動再開){poi, nights_stayed}")
+
+
+@dataclass
+class Event:
+    step: int
+    sim_min: int
+    agent_id: int
+    kind: str
+    x: float
+    y: float
+    payload: dict[str, Any] = field(default_factory=dict)
+    rng_stream: str = ""
+    llm_call_id: str | None = None

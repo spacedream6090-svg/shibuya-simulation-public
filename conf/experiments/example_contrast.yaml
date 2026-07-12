@@ -1,0 +1,31 @@
+# 対照実験マニフェストの例(第9バッチ 2026-07-07)。
+#
+# 方針(scripts/run_experiment.py の docstring 参照): 条件差は**コードでなくパラメータ宣言**。
+# 全条件をこのファイルに宣言し、runs/<name>_<condition>_s<seed>/ が条件×シード本できる。
+# 各ランの config スナップショットに条件が完全記録される=再現・監査・横断分析が機械的。
+#
+# 使い方:
+#   python scripts/run_experiment.py conf/experiments/example_contrast.yaml --dry-run
+#   python scripts/run_experiment.py conf/experiments/example_contrast.yaml
+#
+# この例: 「再帰性(規範の知覚+repeal)が制度ダイナミクスに効くか」の 2×2 もどき対照
+# (本番プロファイルの上で、再帰性 ON/OFF × k free/off を掃引する)。
+
+name: ex_recursion_k
+profile: conf/production.yaml     # 基底 config.yaml に本番プロファイルを重ねた上で条件を掛ける
+seeds: [1, 2, 3]
+
+common:                           # 全条件共通(パイロット規模。本番は上書きして拡大)
+  run.n_agents: 60
+  run.n_steps: 1440               # 10日
+  controls.mode: compute_matched  # R1: 全条件で内省の計算量を一致させる
+
+conditions:
+  - name: rec_on_kfree
+    overrides: { k.writeback: free }
+  - name: rec_on_koff
+    overrides: { k.writeback: "off" }
+  - name: rec_off_kfree
+    overrides: { recursion.enabled: false, k.writeback: free }
+  - name: rec_off_koff
+    overrides: { recursion.enabled: false, k.writeback: "off" }

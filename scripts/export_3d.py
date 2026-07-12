@@ -1,0 +1,515 @@
+"""ラン → 中立 3D シーン書き出し(バッチE / 3D 可視化)。
+
+使い方:  python scripts/export_3d.py runs/<name> [--map data/shibuya_osm.json]
+                                  [--sample-agents N] [--step-stride K]
+  --sample-agents N : tracks の対象を先頭 N エージェントに間引く(大規模ランの LOD 出力)。
+  --step-stride K   : K step ごとに1フレームだけ出力する(時間ダウンサンプル)。
+  既定はどちらも全量=現行と完全同一。
+生成物:  runs/<name>/scene3d/
+  scene.json     — 静的シーン(建物押出し情報・道路・線路・POI)。座標系 local-m(X=east,Y=north,Z=up)。
+  tracks.json    — 時系列(エージェント位置・移動ポリライン・車トラフィック・sim 時刻)。
+  buildings.glb  — 建物押出しプリズムの glTF 2.0 バイナリ(numpy+stdlib 手書き生成、依存追加なし)。
+
+設計方針: sim⇄viz 疎結合(docs/lit/viz__plateau-pipeline-overview.md)。
+  本スクリプトは l1_events.parquet を読むだけ。sim 本体には非依存。
+  座標は local-m のまま(2D ビューアの canvas 用 Y 反転は持ち込まない)。
+  scene.json / tracks.json は Z-up。buildings.glb は glTF 標準の Y-up(-90°X 回転)で書き出す。
+
+位置再構成ロジックは viz/make_viewer.py の 82-125 行(build_data 内)を移植・整理したもの。
+make_viewer.py 自体は変更しない。
+"""
+from __future__ import annotations
+
+import json
+import struct
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+FLOOR_HEIGHT = 3.5
+STEP_MINUTES = 10
+DEFAULT_START_MIN = 7 * 60  # make_viewer と同じ既定(7:00)
+
+# 建物 kind → 頂点色 RGB(glb / three.js 共通の意図)
+KIND_COLOR = {
+    "station": (0xE8, 0x6A, 0x33),
+    "retail": (0x3B, 0xA8, 0x9C),
+    "office": (0x5B, 0x8F, 0xD6),
+    "residential": (0x7A, 0xB8, 0x6A),
+    "hotel": (0xC9, 0x6A, 0xB0),
+    "public": (0x9B, 0x7F, 0xD4),
+    "generic": (0xB8, 0xBE, 0xC7),
+    "house?": (0xA9, 0x9E, 0x92),
+}
+DEFAULT_COLOR = (0xB8, 0xBE, 0xC7)
+
+
+# ------------------------------------------------------------------ 設定/入出力
+def _load_yaml(path: Path) -> dict:
+    """config.yaml を読む。yaml が無い環境でも omegaconf で読めるようにフォールバック。"""
+    try:
+        import yaml
+        return yaml.safe_load(path.read_text(encoding="utf-8"))
+    except ModuleNotFoundError:
+        from omegaconf import OmegaConf
+        return OmegaConf.to_container(OmegaConf.load(str(path)), resolve=True)
+
+
+def _resolve_map_path(run_dir: Path, override: Path | None) -> Path:
+    if override is not None:
+        return override if override.is_absolute() else (REPO_ROOT / override)
+    cfg_path = run_dir / "config.yaml"
+    if cfg_path.exists():
+        cfg = _load_yaml(cfg_path)
+        mp = Path(cfg.get("world", {}).get("map", "data/shibuya_osm.json"))
+        return mp if mp.is_absolute() else (REPO_ROOT / mp)
+    return REPO_ROOT / "data" / "shibuya_osm.json"
+
+
+# ------------------------------------------------------------------ ear clipping
+def _signed_area(ring: list) -> float:
+    a = 0.0
+    n = len(ring)
+    for i in range(n):
+        x1, y1 = ring[i]
+        x2, y2 = ring[(i + 1) % n]
+        a += x1 * y2 - x2 * y1
+    return a * 0.5
+
+
+def _point_in_tri(p, a, b, c) -> bool:
+    """p が三角形 abc の内部(辺上は除外)にあるか。"""
+    (px, py), (ax, ay), (bx, by), (cx, cy) = p, a, b, c
+    d1 = (px - bx) * (ay - by) - (ax - bx) * (py - by)
+    d2 = (px - cx) * (by - cy) - (bx - cx) * (py - cy)
+    d3 = (px - ax) * (cy - ay) - (cx - ax) * (py - ay)
+    has_neg = (d1 < 0) or (d2 < 0) or (d3 < 0)
+    has_pos = (d1 > 0) or (d2 > 0) or (d3 > 0)
+    return not (has_neg and has_pos)
+
+
+def triangulate(ring: list) -> list:
+    """凹多角形対応の ear clipping。ring は閉じない頂点列 [(x,y),...]。
+    戻り値は ring への index 三つ組のリスト(CCW 巻き)。"""
+    pts = [tuple(p) for p in ring]
+    # 末尾が先頭と重複していれば除去
+    if len(pts) > 1 and pts[-1] == pts[0]:
+        pts = pts[:-1]
+    n = len(pts)
+    if n < 3:
+        return []
+    idx = list(range(n))
+    if _signed_area(pts) < 0:  # CCW に正規化
+        idx.reverse()
+    tris: list = []
+    guard = 0
+    limit = 4 * n * n + 16
+    while len(idx) > 3 and guard < limit:
+        guard += 1
+        m = len(idx)
+        ear = False
+        for k in range(m):
+            i0, i1, i2 = idx[(k - 1) % m], idx[k], idx[(k + 1) % m]
+            a, b, c = pts[i0], pts[i1], pts[i2]
+            cross = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+            if cross <= 1e-12:  # reflex または退化
+                continue
+            clean = True
+            for j in idx:
+                if j in (i0, i1, i2):
+                    continue
+                if _point_in_tri(pts[j], a, b, c):
+                    clean = False
+                    break
+            if clean:
+                tris.append((i0, i1, i2))
+                idx.pop(k)
+                ear = True
+                break
+        if not ear:
+            break  # 退化ポリゴン: これ以上分割できない
+    if len(idx) == 3:
+        tris.append((idx[0], idx[1], idx[2]))
+    return tris
+
+
+# ------------------------------------------------------------------ glb 生成
+def _extrude_building(ring, base, top, color, pos, nrm, col, idxs):
+    """1 建物の押出しメッシュを配列に追記(座標は local-m Z-up のまま渡す)。"""
+    pts = [tuple(p) for p in ring]
+    if len(pts) > 1 and pts[0] == pts[-1]:
+        pts = pts[:-1]
+    n = len(pts)
+    if n < 3:
+        return
+    tris = triangulate(pts)
+    if not tris:
+        return
+    # CCW を保証してから壁の外向き法線を決める
+    ccw = _signed_area(pts) >= 0
+    base_v = len(pos)
+
+    def add(x, y, z, nx, ny, nz):
+        pos.append((x, y, z))
+        nrm.append((nx, ny, nz))
+        col.append(color)
+
+    # bottom cap 頂点 (下向き法線)  [0 .. n-1]
+    for (x, y) in pts:
+        add(x, y, base, 0.0, 0.0, -1.0)
+    # top cap 頂点 (上向き法線)      [n .. 2n-1]
+    for (x, y) in pts:
+        add(x, y, top, 0.0, 0.0, 1.0)
+    for (i0, i1, i2) in tris:
+        # top: そのまま(上から見て CCW → 上向き)
+        idxs.extend([base_v + n + i0, base_v + n + i1, base_v + n + i2])
+        # bottom: 巻き反転(下向き)
+        idxs.extend([base_v + i0, base_v + i2, base_v + i1])
+    # side walls (辺ごとに独立頂点=フラット法線)
+    for e in range(n):
+        p0 = pts[e]
+        p1 = pts[(e + 1) % n]
+        dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+        L = (dx * dx + dy * dy) ** 0.5 or 1.0
+        # CCW ポリゴンの外向き法線 = (dy,-dx)/L
+        nx, ny = (dy / L, -dx / L) if ccw else (-dy / L, dx / L)
+        v = len(pos)
+        add(p0[0], p0[1], base, nx, ny, 0.0)   # 0 b0
+        add(p1[0], p1[1], base, nx, ny, 0.0)   # 1 b1
+        add(p1[0], p1[1], top, nx, ny, 0.0)    # 2 t1
+        add(p0[0], p0[1], top, nx, ny, 0.0)    # 3 t0
+        idxs.extend([v + 0, v + 1, v + 2, v + 0, v + 2, v + 3])
+
+
+def _pad4(b: bytes, fill: bytes) -> bytes:
+    r = (-len(b)) % 4
+    return b + fill * r
+
+
+def build_glb(buildings: list) -> bytes:
+    """建物リスト([{footprint,height,base,kind}]) から glTF 2.0 バイナリを生成。
+    座標系変換: local-m (X=east,Y=north,Z=up) → glTF 標準 (x=east, y=up, z=-north)。"""
+    pos: list = []
+    nrm: list = []
+    col: list = []
+    idxs: list = []
+    for b in buildings:
+        color = KIND_COLOR.get(b.get("kind"), DEFAULT_COLOR)
+        base = float(b.get("base", 0.0))
+        top = base + float(b.get("height", FLOOR_HEIGHT))
+        _extrude_building(b["footprint"], base, top, color, pos, nrm, col, idxs)
+
+    if not pos:
+        pos = [(0.0, 0.0, 0.0)]
+        nrm = [(0.0, 0.0, 1.0)]
+        col = [DEFAULT_COLOR]
+        idxs = [0, 0, 0]
+
+    P = np.array(pos, dtype=np.float32)                  # (N,3) Z-up
+    Nn = np.array(nrm, dtype=np.float32)
+    # Z-up → Y-up: (x, y, z) -> (x, z, -y)
+    P = np.column_stack([P[:, 0], P[:, 2], -P[:, 1]]).astype(np.float32)
+    Nn = np.column_stack([Nn[:, 0], Nn[:, 2], -Nn[:, 1]]).astype(np.float32)
+    C = np.array([(r, g, bl, 255) for (r, g, bl) in col], dtype=np.uint8)
+    I = np.array(idxs, dtype=np.uint32)
+
+    pos_b = P.tobytes()
+    nrm_b = Nn.tobytes()
+    col_b = _pad4(C.tobytes(), b"\x00")
+    idx_b = I.tobytes()
+
+    o0 = 0
+    o1 = o0 + len(pos_b)
+    o2 = o1 + len(nrm_b)
+    o3 = o2 + len(col_b)
+    blob = pos_b + nrm_b + col_b + idx_b
+
+    gltf = {
+        "asset": {"version": "2.0", "generator": "shibuya-sim export_3d"},
+        "scene": 0,
+        "scenes": [{"nodes": [0]}],
+        "nodes": [{"mesh": 0, "name": "shibuya_buildings"}],
+        "materials": [{
+            "name": "buildings", "doubleSided": True,
+            "pbrMetallicRoughness": {
+                "baseColorFactor": [1, 1, 1, 1],
+                "metallicFactor": 0.0, "roughnessFactor": 0.9},
+        }],
+        "meshes": [{"primitives": [{
+            "attributes": {"POSITION": 0, "NORMAL": 1, "COLOR_0": 2},
+            "indices": 3, "material": 0}]}],
+        "accessors": [
+            {"bufferView": 0, "componentType": 5126, "count": len(P),
+             "type": "VEC3",
+             "min": [float(P[:, 0].min()), float(P[:, 1].min()), float(P[:, 2].min())],
+             "max": [float(P[:, 0].max()), float(P[:, 1].max()), float(P[:, 2].max())]},
+            {"bufferView": 1, "componentType": 5126, "count": len(Nn), "type": "VEC3"},
+            {"bufferView": 2, "componentType": 5121, "normalized": True,
+             "count": len(C), "type": "VEC4"},
+            {"bufferView": 3, "componentType": 5125, "count": len(I), "type": "SCALAR"},
+        ],
+        "bufferViews": [
+            {"buffer": 0, "byteOffset": o0, "byteLength": len(pos_b), "target": 34962},
+            {"buffer": 0, "byteOffset": o1, "byteLength": len(nrm_b), "target": 34962},
+            {"buffer": 0, "byteOffset": o2, "byteLength": len(col_b), "target": 34962},
+            {"buffer": 0, "byteOffset": o3, "byteLength": len(idx_b), "target": 34963},
+        ],
+        "buffers": [{"byteLength": len(blob)}],
+    }
+
+    json_b = _pad4(json.dumps(gltf, separators=(",", ":")).encode("utf-8"), b" ")
+    bin_b = _pad4(blob, b"\x00")
+    total = 12 + 8 + len(json_b) + 8 + len(bin_b)
+    out = bytearray()
+    out += struct.pack("<4sII", b"glTF", 2, total)
+    out += struct.pack("<I4s", len(json_b), b"JSON")
+    out += json_b
+    out += struct.pack("<I4s", len(bin_b), b"BIN\x00")
+    out += bin_b
+    return bytes(out)
+
+
+# ------------------------------------------------------------------ scene.json
+def _close_ring(fp: list) -> list:
+    ring = [[round(float(p[0]), 1), round(float(p[1]), 1)] for p in fp]
+    if len(ring) >= 1 and ring[0] != ring[-1]:
+        ring.append(ring[0])
+    return ring
+
+
+def build_scene(city: dict, buildings: list) -> dict:
+    blds_out = []
+    for b in buildings:
+        levels = int(b.get("levels", 2) or 2)
+        below = int(b.get("below", 0) or 0)
+        blds_out.append({
+            "id": b["id"],
+            "kind": b.get("kind", "generic"),
+            "name": b.get("name", ""),
+            "footprint": _close_ring(b["footprint"]),
+            "levels": levels,
+            "below": below,
+            "height": round(levels * FLOOR_HEIGHT, 2),
+            "base": round(-below * FLOOR_HEIGHT, 2),
+            "cx": round(float(b.get("cx", 0.0)), 1),
+            "cy": round(float(b.get("cy", 0.0)), 1),
+        })
+
+    roads = [{
+        "klass": e.get("klass", "footway"),
+        "layer": int(e.get("layer", 0) or 0),
+        "g": [[round(float(x), 1), round(float(y), 1)] for x, y in e["geometry"]],
+    } for e in city.get("edges", []) if e.get("geometry")]
+
+    rails = [{
+        "name": r.get("name", ""),
+        "kind": r.get("kind", "rail"),
+        "z": -8.0 if r.get("kind") == "subway" else 0.0,
+        "g": [[round(float(x), 1), round(float(y), 1)] for x, y in r["geometry"]],
+    } for r in city.get("railways", []) if r.get("geometry")]
+
+    # 名前つき POI の上位のみ(建物ひも付けを優先)
+    named = [p for p in city.get("pois", []) if p.get("name")]
+    named.sort(key=lambda p: (0 if p.get("building") else 1, p.get("name", "")))
+    pois = [{
+        "x": round(float(p["x"]), 1), "y": round(float(p["y"]), 1),
+        "name": p["name"], "cat": p.get("cat", ""),
+        "floor": int(p.get("floor", 0) or 0),
+        "building": p.get("building", ""),
+    } for p in named[:250]]
+
+    meta = city.get("meta", {})
+    return {
+        "meta": {
+            "crs": "local-m",
+            "axes": "X=east,Y=north,Z=up",
+            "origin_latlon": meta.get("origin_latlon"),
+            "bbox": meta.get("bbox"),
+            "step_minutes": STEP_MINUTES,
+            "floor_height": FLOOR_HEIGHT,
+            "attribution": meta.get("attribution", ""),
+            "source": meta.get("name", ""),
+        },
+        "buildings": blds_out,
+        "roads": roads,
+        "rails": rails,
+        "pois": pois,
+    }
+
+
+# ------------------------------------------------------------------ tracks.json
+def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
+                       sample_agents: int | None = None,
+                       step_stride: int = 1) -> dict:
+    """viz/make_viewer.py build_data の位置再構成を移植・整理。
+    positions[step][i] = [x, y, w]  (w: 0=路上 -1=範囲外 -2=睡眠 1000+bIdx*100+floor=屋内)
+    moves[step][i] = [mode, pts] または None,  traffic[step] = {n, segs}
+
+    B4-lite(スケール): sample_agents/step_stride で LOD 出力(既定=全量・現行と同一)。
+    - sample_agents=N: 対象を先頭 N エージェントに絞る(位置配列の幅を N に)。
+    - step_stride=K: 状態は毎 step 更新しつつ、K step ごとに1フレームだけ出力する。"""
+    n_steps = max((e["step"] for e in events), default=-1) + 1
+    bld_idx = {b["id"]: i for i, b in enumerate(buildings)}
+
+    agent_ids = sorted({e["agent_id"] for e in events if e["agent_id"] >= 0})
+    if agents_meta:
+        idx = {a["id"]: i for i, a in enumerate(agents_meta)}
+        agent_ids = [a["id"] for a in agents_meta]
+    else:
+        idx = {aid: i for i, aid in enumerate(agent_ids)}
+        agents_meta = [{"id": a, "name": f"agent{a}", "occupation": "?",
+                        "visitor": False} for a in agent_ids]
+    # LOD: 先頭 N エージェントに間引く(idx/agent_ids/agents_meta を一貫して縮小)
+    if sample_agents and sample_agents > 0 and sample_agents < len(agents_meta):
+        agents_meta = agents_meta[:sample_agents]
+        agent_ids = [a["id"] for a in agents_meta]
+        idx = {a["id"]: i for i, a in enumerate(agents_meta)}
+    stride = max(1, int(step_stride or 1))
+
+    by_step: dict[int, list[dict]] = defaultdict(list)
+    step_min: dict[int, int] = {}
+    for e in events:
+        by_step[e["step"]].append(e)
+        sm = e.get("sim_min")
+        if sm is not None:
+            step_min.setdefault(e["step"], int(sm))
+
+    mode_code = {"walk": 0, "bicycle": 1, "car": 2}
+    positions, moves, traffic = [], [], []
+    cur = [[0.0, 0.0, 0] for _ in agent_ids]
+    for step in range(n_steps):
+        mv = [None] * len(agent_ids)
+        tr_step = {"n": 0, "segs": []}
+        for e in by_step.get(step, []):
+            p = json.loads(e["payload"]) if e.get("payload") else {}
+            kind = e["kind"]
+            if kind == "traffic_flow":
+                segs = [[[round(float(a), 1), round(float(b), 1)] for a, b in seg]
+                        for seg in p.get("segs", [])]
+                tr_step = {"n": p.get("n", 0), "segs": segs}
+                continue
+            if e["agent_id"] not in idx:
+                continue
+            i = idx[e["agent_id"]]
+            if kind in ("move_segment", "arrive", "speak", "reflect"):
+                cur[i][0], cur[i][1] = round(float(e["x"]), 1), round(float(e["y"]), 1)
+            if kind == "move_segment" and p.get("pts"):
+                pts = [[round(float(a), 1), round(float(b), 1)] for a, b in p["pts"]]
+                mv[i] = [mode_code.get(p.get("mode", "walk"), 0), pts]
+            elif kind == "enter_building":
+                bi = bld_idx.get(p.get("building"), 0)
+                cur[i] = [round(float(e["x"]), 1), round(float(e["y"]), 1),
+                          1000 + bi * 100 + int(p.get("floor", 1))]
+            elif kind == "floor_move":
+                bi = bld_idx.get(p.get("building"), 0)
+                cur[i][2] = 1000 + bi * 100 + int(p.get("floor", 1))
+            elif kind == "exit_building":
+                cur[i] = [round(float(e["x"]), 1), round(float(e["y"]), 1), 0]
+            elif kind == "exit_area":
+                cur[i][2] = -1
+            elif kind == "enter_area":
+                cur[i] = [round(float(e["x"]), 1), round(float(e["y"]), 1), 0]
+            elif kind == "sleep_start":
+                cur[i][2] = -2
+            elif kind == "wake_up":
+                cur[i][2] = 0 if cur[i][2] == -2 else cur[i][2]
+        if step % stride == 0:                     # LOD: K step ごとに1フレームだけ出力
+            positions.append([list(p) for p in cur])
+            moves.append(mv)
+            traffic.append(tr_step)
+
+    start_min = step_min.get(0, DEFAULT_START_MIN)
+    emitted = list(range(0, n_steps, stride))
+    sim_min = [step_min.get(s, start_min + s * STEP_MINUTES) for s in emitted]
+
+    agents_slim = [{
+        "id": a["id"], "name": a.get("name", f"agent{a['id']}"),
+        "visitor": bool(a.get("visitor", False)),
+        "occupation": a.get("occupation", "?"),
+        "age": a.get("age", 0), "gender": a.get("gender", "?"),
+        "has_car": bool(a.get("has_car", False)),
+        "has_bicycle": bool(a.get("has_bicycle", False)),
+    } for a in agents_meta]
+
+    meta = {"nSteps": len(positions), "step_minutes": STEP_MINUTES,
+            "start_min": start_min, "floor_height": FLOOR_HEIGHT}
+    if stride > 1:                                  # 追加専用: 全量時は出さない=現行と同一
+        meta["step_stride"] = stride
+    return {
+        "meta": meta,
+        "agents": agents_slim,
+        "ids": agent_ids,
+        "positions": positions,
+        "moves": moves,
+        "traffic": traffic,
+        "sim_min": sim_min,
+    }
+
+
+# ------------------------------------------------------------------ top-level
+def export_run(run_dir: Path, map_path: Path | None = None,
+               sample_agents: int | None = None, step_stride: int = 1) -> dict:
+    run_dir = Path(run_dir)
+    import pyarrow.parquet as pq
+    events = pq.read_table(run_dir / "l1_events.parquet").to_pylist()
+
+    mp = _resolve_map_path(run_dir, map_path)
+    city = json.loads(mp.read_text(encoding="utf-8"))
+    buildings = city.get("buildings", [])
+
+    am_path = run_dir / "agents.json"
+    agents_meta = json.loads(am_path.read_text(encoding="utf-8")) if am_path.exists() else []
+
+    scene = build_scene(city, buildings)
+    tracks = reconstruct_tracks(events, buildings, agents_meta,
+                                sample_agents=sample_agents,
+                                step_stride=step_stride)
+    glb = build_glb(scene["buildings"])
+
+    out_dir = run_dir / "scene3d"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    scene_p = out_dir / "scene.json"
+    tracks_p = out_dir / "tracks.json"
+    glb_p = out_dir / "buildings.glb"
+    scene_p.write_text(json.dumps(scene, ensure_ascii=False, separators=(",", ":")),
+                       encoding="utf-8")
+    tracks_p.write_text(json.dumps(tracks, ensure_ascii=False, separators=(",", ":")),
+                        encoding="utf-8")
+    glb_p.write_bytes(glb)
+    return {"scene": scene_p, "tracks": tracks_p, "glb": glb_p,
+            "n_buildings": len(scene["buildings"]), "n_steps": tracks["meta"]["nSteps"]}
+
+
+def main(argv: list) -> int:
+    if not argv:
+        print(__doc__)
+        return 1
+    run_dir = Path(argv[0]).resolve()
+    map_override = None
+    if "--map" in argv:
+        map_override = Path(argv[argv.index("--map") + 1])
+    sample_agents = None
+    if "--sample-agents" in argv:
+        sample_agents = int(argv[argv.index("--sample-agents") + 1])
+    step_stride = 1
+    if "--step-stride" in argv:
+        step_stride = int(argv[argv.index("--step-stride") + 1])
+    res = export_run(run_dir, map_override, sample_agents=sample_agents,
+                     step_stride=step_stride)
+    for k in ("scene", "tracks", "glb"):
+        sz = res[k].stat().st_size
+        try:
+            shown = res[k].relative_to(REPO_ROOT)
+        except ValueError:
+            shown = res[k]
+        print(f"  {shown}  ({sz/1024:.1f} KB)")
+    print(f"  buildings={res['n_buildings']}  steps={res['n_steps']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

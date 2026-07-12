@@ -1,0 +1,242 @@
+# 平凡な日常プロファイル(第14バッチ 2026-07-09)。production.yaml(較正済み)を土台に、
+# 日常を壊す出来事と非現実な制度圧縮を除去。再現度検証用。
+# 由来: ユーザー指示『とにかく日常の範囲内で、かつ現実に忠実なもののみ』
+#
+# これは「基底 conf/config.yaml との差分だけ」を書いた重ね書き用ファイル。基底の上に
+# OmegaConf.merge で重なる(未指定キーは基底のまま=既定OFFの実験ノブは触らない)。
+#   使い方: python scripts/run.py --profile conf/daily.yaml
+#           さらに dotlist で上書き可(例: run.seed=7 run.n_steps=288)。
+#
+# production.yaml との差分(それ以外は production.yaml の較正値をそのまま維持):
+#  - run.n_agents: 100 → 300(名簿・台帳・配属も 300 版へ)
+#  - disaster.enabled: true → false(台風・停電・運休の全ショック除去。
+#      ★交通の日常遅延 delay_prob も disaster モジュール内なので同時に消える=日常遅延なし)
+#  - institution_routes.assembly.term_days: 30 → 1460(区議会は4年任期=ラン内改選なし。
+#      初回選出のみ。30日改選は非現実のため)
+#  - economy.accounts.eviction_days: 30 → 90(実法の3ヶ月滞納相当)
+#  - economy.accounts.bankruptcy_days: 60 → 240(ラン内でほぼ起きない=現実の稀さ)
+#  - model トークン較正(docs/research/token-budgets.md の推奨)を追加
+
+# ---- 初期条件(規模・期間・シード)----
+run:
+  n_agents: 300
+  n_steps: 14400          # 100日(1日=144step)。短くするなら run.n_steps=… で上書き
+  seed: 42
+
+agents:
+  # 公務員(警察官/消防士/区職員)入り + 組織配属あり名簿=行政・警察執行・組織を同時に成立させる
+  # ★300体版(別担当が並行生成中)。
+  personas_file: data/personas_300_civic.json
+
+# ---- 地図(第10バッチ: 広域 wide v7 へ移行)----
+world:
+  map: data/shibuya_osm_wide_v7.json
+  calendar:
+    enabled: true
+    start_date: "auto"    # 開始日=実行当日を初日にする(具体日付 "2026-10-31" 等を書けば固定も可)
+    weekday_work: true    # 平日のみ勤務・登校(土日祝は休み)
+
+# ---- 電車ダイヤ(第10バッチ: ODPT 実ダイヤ)----
+transit:
+  file: data/transit_odpt.json
+
+# ---- タクシー(現実較正 2026-07-09)----
+transit_ride:
+  taxi:
+    prob: 0.02
+
+# ---- 天気 ----
+weather:
+  enabled: true
+  rain_grievance: 0.01
+
+# ---- LLM トークン較正(docs/research/token-budgets.md の推奨。日常プロファイルで本番投入)----
+#  reflect_max_tokens: qwen3:4b の思考モードで 1200 だと最終JSONが 11-18% 飢える実測 → 2048。
+#  plan_max_tokens: plan が現行 320 天井に衝突する実測 → 448(タスク2の新 seam)。
+#  max_tokens: 発話は 50-130tok で十分 → 320 据え置き。
+#  reflect_think: false(第20バッチ 2026-07-12 修正)— ollama の num_predict は思考トークンを
+#    含むため、qwen3:4b の think=true では夜間内省の最終JSONが**全ラン100%空**だった実測
+#    (wv_llm_2d/freedom_llm_2d/daily_llm_20a7d/exp_kfree_llm_s7 全て written_back=0件)。
+#    空の内省より思考なしの内省=belief 書き戻し(kの作用チャネル)の開通を優先する。
+model:
+  max_tokens: 320
+  reflect_max_tokens: 2048
+  plan_max_tokens: 448
+  reflect_think: false
+
+# ---- 職場・学校の実態 + 物理通勤/通学(第10バッチ: 広域地図用の台帳・配属)----
+#  ★300体版(book/assignments とも別担当が並行生成中。personas_file とセットで切替)。
+organizations:
+  enabled: true
+  commute_to_poi: true
+  book: data/organizations_shibuya_wide300.json
+  assignments: data/org_assignments_300_civic_wide.json
+
+# ---- 行政・税・公務員 ----
+government:
+  enabled: true
+
+# ---- 娯楽メディア ----
+media:
+  enabled: true
+
+# ---- 欲求の多様化 ----
+needs:
+  enabled: true
+
+# ---- 感情・興味・注意(arousal + salience 統一ハブ)----
+affect:
+  enabled: true
+  arousal_gain: 0.15
+  importance_arousal_w: 2.0
+  importance_novelty_w: 1.5
+  salience_k: 4
+  threshold_gain: 0.05
+
+# ---- 長期予定・スケジュール帳(会話からの自動記入)----
+schedule:
+  enabled: true
+
+# ---- 世界を変えるツールの標準装備 + 営業許可(制度深化2)----
+tools:
+  equip_all: true
+  permit_steps: 6                # 出店の営業許可待ち(1時間。待ちの間は販売なし)
+  permit_deny_prob: 0.15         # 許可の却下確率(却下=開業費は返る・出店なし)
+
+# ==== 現実ギャップ実装 G1-G6 ====
+factors:
+  relative_deprivation_grievance: 0.012   # G1 相対的剥奪(飽和を破る)
+economy:
+  fixed_cost_daily: 300                    # G1 固定費(光熱費・サブスク)
+  visitor_refresh: true                    # P2 来街者の財布補充(帰宅ごと。恒久破綻の解消)
+  # 最低賃金の床(制度深化3 2026-07-08)。一次確認: 東京都最低賃金 1,226円/時(2025-10-03 発効・
+  # 東京労働局)。適用で part_time_hourly 1100→1226、店員日給 9000→9,808(床×8h)に持ち上がる。
+  # 自営(フリーランス等)は労働者でない=対象外(現実の制度と同じ穴)。
+  min_wage_hourly: 1226
+  # 口座 E5(ユーザー決定 2026-07-06。100日=月次の資金繰り)+ 立退き・破産サイクル(制度深化3)
+  accounts:
+    enabled: true                          # 給料日25日に月給まとめ支給→翌日家賃引落し(月収×0.3)
+    # ★日常較正: 実法の「3ヶ月滞納で契約解除」に忠実な 90日。ラン内でほぼ起きない現実の稀さに合わせる。
+    eviction_days: 90                      # 滞納90日で立退き(実法の3ヶ月滞納相当)
+    bankruptcy_days: 240                   # 滞納240日で自己破産(現実の稀さ=100日ランでほぼ起きない)
+rules:
+  allow_declare: true                      # 制度深化: 権利創設・宣言型 rule(パートナーシップ条例モデル)
+prompts:
+  variety_hint: true                       # P3 発話の定型化対策(決まり文句で始めない注意書き)
+relations:
+  enabled: true                            # G2 社会関係の質(深化段階/断絶/評判/派閥)
+institution_routes:                        # G3 制度改変の3ルート + 制度深化(第9バッチ)
+  labor:
+    enabled: true                          # 労働争議(職域)
+  vote:
+    enabled: true                          # 選挙/投票(民主)
+    deposit: 30000                         # 供託金(政治参入の所持金障壁。可決/得票1割で返還)
+  enforcement:
+    enabled: true                          # 警察/条例執行(執行)
+    detention_steps: 3                     # 制度深化2: 執行時の拘束30分(勾留の最小形)
+  deliberation:
+    enabled: true                          # 審議・パブコメ段階(否決されうる熟議=制度改変の摩擦)
+  assembly:
+    enabled: true                          # 制度深化3: 代表制議会
+    size: 9                                # 議席数(渋谷区議会34議席をスケールに圧縮)
+    # ★日常較正: 区議会は4年任期=ラン内改選なし(初回選出のみ)。30日改選は非現実。
+    term_days: 1460                        # 任期(4年=1460日。100日ラン内では改選しない)
+annual_events:
+  enabled: true                            # G4 文化カレンダー・ハロウィン型群集
+career:
+  enabled: true                            # G5 キャリア転換(転職/失業/起業転換)
+  severance_days: 5                        # 制度深化2: 解雇時の退職金=日給×5日
+  unfair_ratio: 0.3                        # 制度深化2: 解雇の3割は不当解雇(生活不安を増幅)
+  # 現実較正(2026-07-09): 既定 0.02/0.02/0.30 は失業率24%・転職が現実の~80倍になる。
+  # 雇用動向調査(非自発的離職1-2%/年・転職5-10%/年)に合わせ、観測性のため2-5倍圧縮のみ許容。
+  layoff_prob: 0.0002                      # 解雇 0.02%/日 ≈ 7%/年(現実1-2%+圧縮)
+  switch_prob: 0.0004                      # 転職 0.04%/日 ≈ 15%/年(現実5-10%+圧縮)
+  rehire_prob: 0.02                        # 再就職 2%/日 → 平均失業期間~50日(現実の中央値2-3ヶ月)
+info_env:                                  # G6 情報環境の非対称
+  enabled: true
+  recommendation:
+    enabled: true                          # 推薦/エコーチェンバー
+  influence:
+    enabled: true                          # インフルエンサー非対称/バイラル
+  misinfo:
+    enabled: true                          # フェイク/炎上
+    flame_grievance: 0.02
+
+# ==== 現実ギャップ後続波 H1-H6(中関連度)====
+health:                        # H1 健康・疲労・病気
+  enabled: true
+  fatigue_gain_work: 0.02
+  fatigue_gain_move: 0.015
+  fatigue_threshold_gain: 0.1
+  onset_prob: 0.02
+  medical_prob: 0.5
+household:                     # H2 世帯・家族・恋愛(恋愛は relations.enabled=true 前提=上でON済)
+  enabled: true
+commerce:                      # H3 商業ダイナミクス(営業時間・動的価格・在庫)
+  enabled: true
+  stock_grievance: 0.02
+disaster:                      # H4 都市・環境ショック(災害・交通遅延・インフラ障害)
+  # ★日常較正: 日常を壊す外生ショックは全除去(台風・停電・電車運休)。
+  #   交通の日常遅延 delay_prob もこの disaster モジュール内なので enabled=false で同時に消える
+  #   (=日常遅延も無し)。以下の onset/grievance/delay/suspend/outage 値は enabled=false のとき
+  #   一切読まれない(注記として production 値を残置)。
+  enabled: false
+  onset_prob: 0.01
+  grievance: 0.06
+  stay_home_bias: 0.7
+  delay_prob: 0.05
+  suspend_prob: 0.3
+  delay_grievance: 0.02
+  outage_prob: 0.02
+  outage_grievance: 0.03
+society_diversity:             # H5 観光・多言語・犯罪・治安
+  enabled: true
+  tourist_ratio: 0.5
+  foreign_ratio: 0.2
+  # 現実較正(2026-07-09): 0.005/step は窃盗被害 0.166件/人日=渋谷区の認知件数(~2.8e-5/人日)の
+  # ~550倍だった。5.0e-6 の100日実測は 5.0e-4/人日(×18)とまだ許容(≤10倍)超え → 2.0e-6 に締める
+  # (期待 ~1.4e-4/人日=現実の~5倍・100日100人で1-2件)。
+  crime_prob: 0.000002
+  nuisance_prob: 0.005         # 迷惑行為への遭遇 0.15件/人日は渋谷中心部の体感として現実的 → 据え置き
+  crime_grievance: 0.08
+  nuisance_grievance: 0.03
+inner_life:                    # H6 内面本格版(離散感情ラベル・長期目標・趣味サブカル)
+  enabled: true
+  hobbies:
+    leisure_bias: 0.3          # 余暇の行き先を趣味の場所へ寄せる
+
+# ==== 再帰性(第9バッチ 2026-07-07)====
+recursion:                     # 規範・現状の監視→知覚→フィードバック→改変(repeal)の閉ループ
+  enabled: true
+
+# ==== 宿泊・ホテル滞在(第9バッチ Wave L)====
+lodging:                       # 来街者の夜間ホテル泊(hotel POI 8件が本番地図に実在)
+  enabled: true
+
+# ==== 反射=自己モデル(第11バッチ→第12バッチで出来事誘発に刷新 2026-07-08)====
+reflection:
+  self_model_days: 0
+  deep:
+    enabled: true
+  implicit_self:
+    enabled: true
+
+# ==== 内省しやすさの時間ドリフト E2(第11バッチで本番ON)====
+drive:
+  drift:
+    enabled: true
+
+# ==== 社会的ヒエラルキー(第11バッチ 2026-07-08)====
+hierarchy:
+  enabled: true
+
+# ==== 街路の環境情報(第18バッチ 2026-07-11)====
+# 街頭広告(OOH)。掲出地点=渋谷の実在広告スポット(大型ビジョン=QFRONT・SHIBUYA109 シリンダー・
+# 駅前ビジョン群の代理としてハチ公前広場/通常看板=マークシティ)。enabled は既定 false のまま
+# =検証・本番投入はユーザー判断で ads.enabled=true の1フラグ。効果量は commercial-analytics §7。
+ads:
+  enabled: false
+  large: ["QFRONT", "SHIBUYA 109", "ハチ公前広場"]
+  slots: ["渋谷マークシティ"]
+crowd_visual:
+  enabled: false

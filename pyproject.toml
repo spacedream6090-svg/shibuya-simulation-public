@@ -1,0 +1,18 @@
+[project]
+name = "shibuya-society"
+version = "0.0.1"
+description = "LLM artificial society in Shibuya — emergence of world-changers (k* phase transition)"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "networkx>=3.2",
+    "omegaconf>=2.3",
+    "pyarrow>=15.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
