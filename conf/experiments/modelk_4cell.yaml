@@ -1,0 +1,33 @@
+# model×k 対照 4セル(第31バッチ 2026-07-14)。設計: docs/research/model-contrast-setup.md §4-5。
+# - instruct×{free, off} の2セルは k実験再検証(docs/plans/pending-decisions.md 事項2)を兼ねる
+#   (旧パイロット exp_kfree_llm_s7 は reflect_think バグで belief 全滅のまま測った差=無効。
+#    daily.yaml は修正済み reflect_think=false → 本ランで belief 経路が開通した状態で測り直す)。
+# - シードは全セル共通(§4.3: 変える変数を model と k だけに限定)。2シードでペア統計の最小形。
+#   展開順は条件優先(inst_free→inst_off→ablit_free→ablit_off の順に各シード)なので、
+#   時間切れの場合も k再検証(instruct ペア)から先に確保される。
+# - キャッシュはキー= backend.name+params+prompt なので model.name が違えば自動分離(§4.3)。
+# - 検収項目: belief 書き戻し率(free セルで >0 必須)・fallback 率・呼数のセル間一致。
+name: modelk
+profile: conf/daily.yaml
+seeds: [42, 7]
+common:
+  run.n_agents: 15
+  run.n_steps: 288          # 2日(1日=144step)
+  model.backend: ollama
+conditions:
+  - name: inst_free
+    overrides:
+      model.name: "qwen3:4b"
+      k.writeback: "free"
+  - name: inst_off
+    overrides:
+      model.name: "qwen3:4b"
+      k.writeback: "off"
+  - name: ablit_free
+    overrides:
+      model.name: "huihui_ai/qwen3-abliterated:4b-v2-q4_K_M"
+      k.writeback: "free"
+  - name: ablit_off
+    overrides:
+      model.name: "huihui_ai/qwen3-abliterated:4b-v2-q4_K_M"
+      k.writeback: "off"

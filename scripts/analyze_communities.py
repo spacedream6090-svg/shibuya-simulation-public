@@ -396,6 +396,123 @@ def pagerank_leaders(graph: dict, comm_members: dict[int, set]) -> dict[int, tup
 
 
 # --------------------------------------------------------------------------- #
+# ⑤社会ネットワークの変化(第31バッチ W3)= 窓ごとの大域指標・tie decay・窓遷移
+#   既存 build_window_graph の足切り済みグラフ(W/adj/nodes)を再利用する
+#   (二重実装しない)。クラスタ係数等は純Python(networkx 等の新規依存を足さない)。
+# --------------------------------------------------------------------------- #
+def _gini_seq(values) -> float:
+    """数列の gini(0=平等..1=集中)。空/総和0 は 0。次数分布の集中度に使う。"""
+    xs = sorted(float(v) for v in values)
+    n = len(xs)
+    tot = sum(xs)
+    if n == 0 or tot <= 0:
+        return 0.0
+    cum = 0.0
+    for i, x in enumerate(xs, 1):
+        cum += i * x
+    return (2.0 * cum) / (n * tot) - (n + 1.0) / n
+
+
+def avg_clustering(adj: dict) -> float:
+    """平均局所クラスタ係数(Watts-Strogatz)。純Python・非加重・決定論(ソート走査)。
+    局所 C_u = 2·(隣接同士の実辺数)/(k(k−1))、k=deg(u)。次数<2 のノードは平均から除外。"""
+    csum = 0.0
+    cnt = 0
+    for u in sorted(adj):
+        neigh = adj[u]
+        k = len(neigh)
+        if k < 2:
+            continue
+        ns = sorted(neigh)
+        links = 0
+        for i in range(len(ns)):
+            ai = adj.get(ns[i], ())
+            for j in range(i + 1, len(ns)):
+                if ns[j] in ai:
+                    links += 1
+        csum += 2.0 * links / (k * (k - 1))
+        cnt += 1
+    return csum / cnt if cnt else 0.0
+
+
+def giant_component_frac(nodes: set, adj: dict) -> float:
+    """最大連結成分のノード比(BFS・決定論)。孤立ノードは build 側で既に除外済み。"""
+    ns = set(nodes)
+    if not ns:
+        return 0.0
+    seen: set = set()
+    best = 0
+    for start in sorted(ns):
+        if start in seen:
+            continue
+        stack = [start]
+        seen.add(start)
+        size = 0
+        while stack:
+            u = stack.pop()
+            size += 1
+            for v in adj.get(u, ()):  # adj は無向(両端に登録済み)
+                if v not in seen:
+                    seen.add(v)
+                    stack.append(v)
+        best = max(best, size)
+    return best / len(ns)
+
+
+def network_metrics(graph: dict) -> dict:
+    """1つの窓グラフの大域指標(密度・平均次数・クラスタ係数・次数gini・最大成分比・
+    平均紐帯重み)。graph = build_window_graph の返り値(W/adj/nodes)。"""
+    nodes, adj, W = graph["nodes"], graph["adj"], graph["W"]
+    N = len(nodes)
+    E = len(W)
+    density = (2.0 * E / (N * (N - 1))) if N > 1 else 0.0
+    mean_degree = (2.0 * E / N) if N else 0.0
+    degrees = [len(adj[u]) for u in nodes]
+    return {
+        "n_nodes": N, "n_edges": E,
+        "density": _r(density, 6),
+        "mean_degree": _r(mean_degree, 4),
+        "clustering_coeff": _r(avg_clustering(adj), 6),
+        "degree_gini": _r(_gini_seq(degrees), 4),
+        "giant_component_frac": _r(giant_component_frac(nodes, adj), 4),
+        "mean_tie_weight": _r(sum(W.values()) / E, 4) if E else 0.0,
+    }
+
+
+def tie_decay_hist(graphs_by_win: list[dict]) -> list[dict]:
+    """紐帯寿命=各ペアが「最初に現れた窓→最後に現れた窓」の生存窓数の分布(ヒストグラム)。
+    ペアは build_window_graph の足切り後の W(=紐帯)を正準とする。"""
+    first: dict[tuple, int] = {}
+    last: dict[tuple, int] = {}
+    for w, g in enumerate(graphs_by_win):
+        for e in g["W"]:                    # e=(u,v)・u<v(build 側で正規化済み)
+            if e not in first:
+                first[e] = w
+            last[e] = w
+    hist: Counter = Counter()
+    for e in first:
+        hist[last[e] - first[e] + 1] += 1
+    return [{"lifespan_windows": k, "n_ties": hist[k]} for k in sorted(hist)]
+
+
+def community_flows(comm_by_win: list[dict]) -> list[dict]:
+    """隣接窓のコミュニティ間で共有メンバー数を数える(alluvial/帯グラフ用)。
+    community_id はメンバー最小 id(既存の正準化)。決定論(ソート走査)。"""
+    rows: list[dict] = []
+    for w in range(len(comm_by_win) - 1):
+        A, B = comm_by_win[w], comm_by_win[w + 1]
+        for ca in sorted(A):
+            ma = A[ca]
+            for cb in sorted(B):
+                shared = len(ma & B[cb])
+                if shared > 0:
+                    rows.append({"window_from": w, "community_from": ca,
+                                 "window_to": w + 1, "community_to": cb,
+                                 "n_shared_members": shared})
+    return rows
+
+
+# --------------------------------------------------------------------------- #
 # 空間フットプリント(メンバーの最頻滞在エリア)
 # --------------------------------------------------------------------------- #
 def spatial_footprint(win_events: list[dict], members: set) -> list[dict]:
@@ -609,10 +726,12 @@ def analyze(run_dir: str, window_days: int = 7,
     comm_by_win: list[dict[int, set]] = []       # size>=2 のみ(ライフサイクル用)
     part_by_win: list[dict[int, int]] = []        # 全ノード分割(達成帰属・NMI 用)
     ach_by_win: list[dict] = []
+    graphs_by_win: list[dict] = []                # 窓グラフ(W3 大域指標・tie decay 用)
 
     for w in range(n_windows):
         we = win_events[w]
         graph = build_window_graph(we, min_weight)
+        graphs_by_win.append(graph)
         det = detect(graph, n_agents)
         part = det["part"]        # 足切り後に紐帯を持つノードのみ(孤立=無所属)
         part_by_win.append(part)
@@ -717,8 +836,17 @@ def analyze(run_dir: str, window_days: int = 7,
             })
         wout["communities"] = comms_json
 
+    # ---- ⑤W3: 大域指標の時系列 / tie decay / 窓遷移(communities.json 本体は不変・追加のみ)----
+    network_ts = [dict(window=w, day_start=windows_out[w]["day_start"],
+                       day_end=windows_out[w]["day_end"],
+                       **network_metrics(graphs_by_win[w]))
+                  for w in range(n_windows)]
+
     return {
         "run": run_name,
+        "network_ts": network_ts,
+        "community_flows": community_flows(comm_by_win),
+        "tie_decay": tie_decay_hist(graphs_by_win),
         "params": {
             "window_days": window_days, "window_steps": window_steps,
             "seed": SEED, "resolution": gamma, "tau": tau,
@@ -856,8 +984,62 @@ def write_report(result: dict, path: str) -> None:
                      f"{a['rules_enacted']} | {casc} |")
         L.append("")
 
+    _write_report_w3(L, result)
+
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(L))
+
+
+def _write_report_w3(L: list, result: dict) -> None:
+    """⑤W3: ネットワーク大域指標の時系列・tie decay・窓遷移の節(追加のみ)。"""
+    L.append("## ネットワーク大域指標の時系列(第31バッチ W3)")
+    net = result.get("network_ts") or []
+    if not net:
+        L.append("(窓グラフが空=データ不足)\n")
+    else:
+        L.append("| 窓 | 日 | ノード | エッジ | 密度 | 平均次数 | クラスタ係数 | "
+                 "次数gini | 最大成分比 | 平均紐帯重み |")
+        L.append("|---|---|---|---|---|---|---|---|---|---|")
+        for r in net:
+            L.append(f"| {r['window']} | {r['day_start']}–{r['day_end']} | "
+                     f"{r['n_nodes']} | {r['n_edges']} | {r['density']} | "
+                     f"{r['mean_degree']} | {r['clustering_coeff']} | "
+                     f"{r['degree_gini']} | {r['giant_component_frac']} | "
+                     f"{r['mean_tie_weight']} |")
+        L.append("")
+        L.append("※ 全量は panel/network_ts.parquet。密度・クラスタ係数は足切り後"
+                 "(min_weight)の重み付き無向グラフの非加重指標。\n")
+
+    L.append("## 紐帯寿命の分布(tie decay)")
+    dec = result.get("tie_decay") or []
+    if not dec:
+        L.append("(観測された紐帯が無い=データ不足)\n")
+    else:
+        total = sum(d["n_ties"] for d in dec)
+        ephem = sum(d["n_ties"] for d in dec if d["lifespan_windows"] == 1)
+        L.append(f"- ユニーク紐帯(窓横断のペア)総数: {total} / うち1窓限りの一過性: "
+                 f"{ephem}({_r(ephem / total, 3) if total else 0.0})")
+        L.append("| 寿命(窓数) | 紐帯数 |")
+        L.append("|---|---|")
+        for d in dec:
+            L.append(f"| {d['lifespan_windows']} | {d['n_ties']} |")
+        L.append("")
+
+    L.append("## コミュニティの窓遷移(alluvial 用・共有メンバー)")
+    fl = result.get("community_flows") or []
+    if not fl:
+        L.append("(2窓以上に跨る帯が無い=データ不足)\n")
+    else:
+        L.append(f"- 遷移エッジ数: {len(fl)}(全量 panel/community_flows.parquet)"
+                 "。合流=同一 to へ複数 from が集まる帯・分裂=同一 from から複数 to。")
+        L.append("| 窓 | コミュ元 | → 窓 | コミュ先 | 共有メンバー |")
+        L.append("|---|---|---|---|---|")
+        for r in sorted(fl, key=lambda x: (x["window_from"], -x["n_shared_members"],
+                                           x["community_from"], x["community_to"]))[:20]:
+            L.append(f"| {r['window_from']} | {r['community_from']} | "
+                     f"{r['window_to']} | {r['community_to']} | "
+                     f"{r['n_shared_members']} |")
+        L.append("")
 
 
 # --------------------------------------------------------------------------- #
@@ -868,6 +1050,54 @@ def _strip_private(result: dict) -> dict:
             if k.startswith("_"):
                 w.pop(k)
     return result
+
+
+# W3 追加出力の parquet 化(communities.json/レポートは非破壊で別ファイルに置く)
+_W3_KEYS = ("network_ts", "community_flows", "tie_decay")
+
+
+def _write_w3_panels(run_dir: str, result: dict) -> dict:
+    """network_ts / community_flows / tie_decay を runs/<name>/panel へ書く(追加のみ)。"""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    out_dir = os.path.join(run_dir, "panel")
+    os.makedirs(out_dir, exist_ok=True)
+    f = pa.field
+
+    def _write(name, keys, schema, rows):
+        cols = {c: [r.get(c) for r in rows] for c in keys}
+        pq.write_table(pa.Table.from_pydict(cols, schema=schema),
+                       os.path.join(out_dir, name))
+
+    _write("network_ts.parquet",
+           ["window", "day_start", "day_end", "n_nodes", "n_edges", "density",
+            "mean_degree", "clustering_coeff", "degree_gini",
+            "giant_component_frac", "mean_tie_weight"],
+           pa.schema([
+               f("window", pa.int64()), f("day_start", pa.int64()),
+               f("day_end", pa.int64()), f("n_nodes", pa.int64()),
+               f("n_edges", pa.int64()), f("density", pa.float64()),
+               f("mean_degree", pa.float64()), f("clustering_coeff", pa.float64()),
+               f("degree_gini", pa.float64()),
+               f("giant_component_frac", pa.float64()),
+               f("mean_tie_weight", pa.float64())]),
+           result.get("network_ts", []))
+    _write("community_flows.parquet",
+           ["window_from", "community_from", "window_to", "community_to",
+            "n_shared_members"],
+           pa.schema([
+               f("window_from", pa.int64()), f("community_from", pa.int64()),
+               f("window_to", pa.int64()), f("community_to", pa.int64()),
+               f("n_shared_members", pa.int64())]),
+           result.get("community_flows", []))
+    _write("tie_decay.parquet", ["lifespan_windows", "n_ties"],
+           pa.schema([f("lifespan_windows", pa.int64()),
+                      f("n_ties", pa.int64())]),
+           result.get("tie_decay", []))
+    return {"network_ts": len(result.get("network_ts", [])),
+            "community_flows": len(result.get("community_flows", [])),
+            "tie_decay": len(result.get("tie_decay", []))}
 
 
 def main() -> None:
@@ -889,18 +1119,26 @@ def main() -> None:
                      min_weight=args.min_weight)
     result = _strip_private(result)
 
+    # W3 追加出力(panel/*.parquet)。communities.json 本体は W3 キーを除いて従来通り。
+    w3 = _write_w3_panels(args.run_dir, result)
+
     js_path = os.path.join(args.run_dir, "communities.json")
     md_path = os.path.join(args.run_dir, "communities_report.md")
+    core = {k: v for k, v in result.items() if k not in _W3_KEYS}
     with open(js_path, "w", encoding="utf-8") as fh:
-        fh.write(json.dumps(result, sort_keys=True, ensure_ascii=False))
+        fh.write(json.dumps(core, sort_keys=True, ensure_ascii=False))
     write_report(result, md_path)
 
     n_comm = sum(w["n_communities"] for w in result["windows"])
     print(f"[communities] {args.run_dir}: {result['n_windows']} 窓 / "
           f"検出コミュニティ延べ {n_comm} / ライフサイクル事象 "
           f"{len(result['lifecycle_events'])}")
+    print(f"  W3: network_ts {w3['network_ts']} 行 / community_flows "
+          f"{w3['community_flows']} 行 / tie_decay {w3['tie_decay']} 区分")
     print(f"  -> {js_path}")
     print(f"  -> {md_path}")
+    print(f"  -> {os.path.join(args.run_dir, 'panel')}/(network_ts, "
+          "community_flows, tie_decay).parquet")
 
 
 if __name__ == "__main__":

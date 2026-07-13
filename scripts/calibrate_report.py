@@ -15,6 +15,7 @@ mock LLM ラン では LLM 依存の行動頻度(発話・投稿・グループ�
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import os
 import statistics as st
@@ -24,14 +25,17 @@ from collections import Counter, defaultdict
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "src"))
+sys.path.insert(0, _HERE)                     # 同ディレクトリの build_panel を import
 
 # Windows コンソール(cp932)でも ✅ 等を印字できるように(ファイル出力は常に UTF-8)
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+import build_panel as bp                       # noqa: E402  (活動復元の再利用=二重実装回避)
 from society.observer.measure import load_events  # noqa: E402
 
 MIN_PER_DAY = 1440
+MIN_PER_STEP = 10
 
 # --------------------------------------------------------------------------- #
 # 現実基準(近似バンド)。value の単位は metric ごとに合わせる。
@@ -143,6 +147,90 @@ def read_l2(run_dir: str) -> dict[str, list]:
     if not os.path.exists(path):
         return {}
     return pq.read_table(path).to_pydict()
+
+
+# --------------------------------------------------------------------------- #
+# ④行動統計(第31バッチ W3): 分布一致指標(1次元・純Python自作。scipy 非依存)
+#   KS = 経験CDFの最大差 / EMD(Wasserstein-1)= |CDF差| の積分。標本サイズが違っても可。
+# --------------------------------------------------------------------------- #
+def ks_stat(a: list, b: list):
+    """2標本 Kolmogorov-Smirnov 統計量 D = max_x |F_a(x) − F_b(x)|。空群は None。"""
+    a = sorted(float(x) for x in a if x is not None)
+    b = sorted(float(x) for x in b if x is not None)
+    if not a or not b:
+        return None
+    na, nb = len(a), len(b)
+    d = 0.0
+    for x in sorted(set(a) | set(b)):
+        fa = bisect.bisect_right(a, x) / na
+        fb = bisect.bisect_right(b, x) / nb
+        d = max(d, abs(fa - fb))
+    return d
+
+
+def emd_1d(a: list, b: list):
+    """1次元 Earth Mover's Distance(Wasserstein-1)= ∫|F_a(x) − F_b(x)|dx。
+    値の単位は入力と同じ(分など)。空群は None。決定論(乱数なし)。"""
+    a = sorted(float(x) for x in a if x is not None)
+    b = sorted(float(x) for x in b if x is not None)
+    if not a or not b:
+        return None
+    na, nb = len(a), len(b)
+    pts = sorted(set(a) | set(b))
+    tot = 0.0
+    for i in range(len(pts) - 1):
+        x, w = pts[i], pts[i + 1] - pts[i]
+        fa = bisect.bisect_right(a, x) / na
+        fb = bisect.bisect_right(b, x) / nb
+        tot += abs(fa - fb) * w
+    return tot
+
+
+# 生活時間配分の参考バンド(既存 REALITY の睡眠・労働バンドを分/日へ換算・出典継承)。
+# 現実の「カテゴリ別 分/日 の完全分布」はリポジトリ内に無いため、参照は睡眠・労働のみ。
+_ACT_LABEL_JP = {"sleep": "睡眠", "home": "在宅", "work": "仕事", "food": "飲食",
+                 "shop": "買物", "leisure": "余暇(視聴)", "move": "移動",
+                 "other": "その他(判定不能)"}
+_ACT_REF_BAND = {   # category -> (lo_min, hi_min, 出典・注記)
+    "sleep": (6.9 * 60, 8.1 * 60,
+              "NHK国民生活時間調査2020/社会生活基本調査R3(全活動日平均・就床時間)"),
+    "work": (7.0 * 60, 9.8 * 60,
+             "毎月勤労統計 所定+残業(※現実は出勤日あたり・本表は全活動日平均で分母が異なる)"),
+}
+
+
+def activity_summary(recon: dict) -> dict:
+    """reconstruct_activity の出力から、カテゴリ別 分/日(全体/平日/休日)と
+    平日vs休日の分布一致(KS/EMD)を計算する。"""
+    adc = recon["adc"]
+    hol = recon["holiday_by_day"]
+    cats = recon["cats"]
+    by_ad: dict[tuple, dict] = defaultdict(lambda: defaultdict(float))
+    for (aid, d, c), n in adc.items():
+        by_ad[(aid, d)][c] += n * MIN_PER_STEP
+    all_ad = sorted(by_ad)
+    wk = [ad for ad in all_ad if hol.get(ad[1]) is False]
+    hd = [ad for ad in all_ad if hol.get(ad[1]) is True]
+
+    def means(subset):
+        k = len(subset)
+        if k == 0:
+            return {c: None for c in cats}, 0
+        return ({c: sum(by_ad[ad].get(c, 0.0) for ad in subset) / k
+                 for c in cats}, k)
+
+    overall, n_all = means(all_ad)
+    weekday, n_wk = means(wk)
+    holiday, n_hd = means(hd)
+    dist: dict[str, dict] = {}
+    if wk and hd:
+        for c in ("sleep", "work"):
+            av = [by_ad[ad].get(c, 0.0) for ad in wk]
+            bv = [by_ad[ad].get(c, 0.0) for ad in hd]
+            dist[c] = {"ks": ks_stat(av, bv), "emd": emd_1d(av, bv)}
+    return {"cats": cats, "overall": overall, "weekday": weekday,
+            "holiday": holiday, "n_all": n_all, "n_wk": n_wk, "n_hd": n_hd,
+            "has_split": bool(wk and hd), "dist": dist}
 
 
 # --------------------------------------------------------------------------- #
@@ -341,6 +429,13 @@ def analyze(run_dir: str) -> dict:
     m["reflect_deep_share"] = reflect_deep / reflect_n if reflect_n else None
     m["relation_break_pp"] = kinds.get("relation_break", 0) / (n_all * n_days)
 
+    # ---- ④生活時間配分(第31バッチ W3): build_panel の活動復元を再利用 ----
+    try:
+        recon = bp.reconstruct_activity(evs, agents)
+        m["_activity"] = activity_summary(recon)
+    except Exception:
+        m["_activity"] = None
+
     m["_meta"] = {
         "run_dir": run_dir, "n_agents": n_all, "n_residents": n_res,
         "n_employed": n_emp, "n_days": n_days, "n_steps": n_steps,
@@ -390,7 +485,60 @@ def render(m: dict) -> str:
         "> 注: [LLM依存] の行動頻度は mock ランでは行動分布として意味が薄い(実LLMで再判定)。",
         "> 現実バンドは公表統計の近似(出典名を明記)。バンド外=即誤りではなく調律候補。",
     ]
+    lines += _render_activity(m.get("_activity"))
     return "\n".join(lines)
+
+
+def _render_activity(act: dict | None) -> list[str]:
+    """生活時間配分表(カテゴリ×分/日・平日/休日別)+ 分布一致(KS/EMD)の節。"""
+    L = ["", "## 生活時間配分(活動カテゴリ別 分/日)"]
+    if not act or not act.get("n_all"):
+        L.append("(活動を復元できるイベントが不足=データ不足)")
+        return L
+    L.append("L1 から各エージェントの在圏状態を step 単位(1step=10分)で復元し、活動日"
+             "あたりの分に集計(判定できない step は計上しない=捏造なし)。")
+    hdr = "| カテゴリ | 全体 分/日 |"
+    sep = "|---|---|"
+    if act["has_split"]:
+        hdr += " 平日 分/日 | 休日 分/日 |"
+        sep += "---|---|"
+    hdr += " 参考バンド(分/日) |"
+    sep += "---|"
+    L.append(hdr)
+    L.append(sep)
+    for c in act["cats"]:
+        ov = act["overall"].get(c)
+        row = f"| {_ACT_LABEL_JP.get(c, c)} | {fmt(ov)} |"
+        if act["has_split"]:
+            row += f" {fmt(act['weekday'].get(c))} | {fmt(act['holiday'].get(c))} |"
+        band = _ACT_REF_BAND.get(c)
+        row += (f" {band[0]:.0f}〜{band[1]:.0f} |" if band else " ― |")
+        L.append(row)
+    L.append("")
+    L.append(f"- 集計対象: 活動日 {act['n_all']}(平日 {act['n_wk']} / 休日 {act['n_hd']})"
+             "= agent×日 の延べ。")
+    for c in ("sleep", "work"):
+        b = _ACT_REF_BAND.get(c)
+        if b:
+            L.append(f"- 参考({_ACT_LABEL_JP[c]}): {b[2]}")
+
+    L.append("")
+    L.append("## 分布一致指標(KS統計量・EMD・1次元自作)")
+    L.append("> **参照分布の扱い**: 現実の生活時間調査の「カテゴリ別 分/日 の完全分布」は"
+             "リポジトリ内に無いため、外部参照との KS/EMD は算出しない(上表のみ)。"
+             "KS/EMD は純関数として提供し、ラン間比較・同一ラン内の平日/休日比較に適用する。")
+    if act["has_split"] and act["dist"]:
+        L.append("")
+        L.append("同一ラン内の**平日 vs 休日**の分布差(agent×日 の分/日 分布):")
+        L.append("| カテゴリ | KS統計量 | EMD(分) |")
+        L.append("|---|---|---|")
+        for c in ("sleep", "work"):
+            d = act["dist"].get(c, {})
+            L.append(f"| {_ACT_LABEL_JP.get(c, c)} | {fmt(d.get('ks'))} | "
+                     f"{fmt(d.get('emd'))} |")
+    else:
+        L.append("(平日/休日の区分が取れない=weather 未観測のため、平日休日比較は非該当)")
+    return L
 
 
 def main() -> None:
