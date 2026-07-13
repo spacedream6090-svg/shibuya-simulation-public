@@ -366,6 +366,12 @@ transit:
 lod:
   max_llm_per_step: 300         # LLM 発火の step 上限(実機実測で更新)
   congestion_surprise: 0.5      # 混雑係数がこれ未満なら「驚き」
+  # ---- 入力解像度LOD(第30バッチ・既定OFF=バイト一致)。docs/plans/input-resolution-lod.md ----
+  # 「世界に対する解像度」の個体差: 知覚/記憶/フィードの注入件数を水準別に振る(呼数不変=R1安全)。
+  # 割当は cognition/lod.py の共通軸機構(trait非依存・軸専用 stream "lod_input_res")。
+  # levels 省略時は lod.py の既定(narrow/mid/wide・mid=現行定数。beliefs と全員共通行は対象外)。
+  input_res:
+    enabled: false
 
 # ---- 開放行動+価値の4軸(第17バッチ 2026-07-10。既定 OFF=現行と完全同一)----
 # LLM 自身が自由記述で行動を決める "do" をメニューに追加し、価値(実用/感情/社会/認識)で

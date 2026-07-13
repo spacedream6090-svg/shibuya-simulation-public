@@ -1284,10 +1284,15 @@ def _phone(sim, agent, step: int, sim_min: int) -> dict | None:
             if affect_on and sim.affectcfg["salience_k"] > 0:
                 # 注意の容量制約(Cowan): 同時知覚の TL 投稿を salience 上位 K だけ記憶へ符号化する。
                 # 反応(意見/いいね/著者への drive)は全 item に効いたまま=発火・呼数は不変(R1)。
+                # 入力解像度LOD(第30バッチ): ゲートが有効なときだけ K を個体別に上書き
+                # (salience_k=0 の水準は現行のグローバル値のまま=OFF/mid はバイト一致)。
+                _irk = int((getattr(agent, "input_res", None) or {})
+                           .get("salience_k", 0))
+                _sk = _irk if _irk > 0 else sim.affectcfg["salience_k"]
                 scores = [affect.salience_score(agent, sim.affectcfg,
                                                 valence_abs=valence(p["text"]))
                           for p in feed]
-                for p in salience_gate(feed, scores, sim.affectcfg["salience_k"]):
+                for p in salience_gate(feed, scores, _sk):
                     agent.remember(f"SNSで見た: 「{p['text'][:24]}」", kind="sns",
                                    importance_bonus=_imp_bonus(sim, agent))
             else:
@@ -1310,10 +1315,14 @@ def _phone(sim, agent, step: int, sim_min: int) -> dict | None:
                 _arouse(sim, agent, "news", step, sim_min,
                         valence_abs=abs(av))       # 驚き(大 |valence| news)→覚醒↑(OFF=no-op)
             if affect_on and sim.affectcfg["salience_k"] > 0:
+                # 入力解像度LOD: feed 側と同じ個体別 K の上書き(ゲート有効時のみ)
+                _irk = int((getattr(agent, "input_res", None) or {})
+                           .get("salience_k", 0))
+                _sk = _irk if _irk > 0 else sim.affectcfg["salience_k"]
                 scores = [affect.salience_score(agent, sim.affectcfg,
                                                 valence_abs=valence(a["title"] + a["text"]))
                           for a in articles]
-                for a in salience_gate(articles, scores, sim.affectcfg["salience_k"]):
+                for a in salience_gate(articles, scores, _sk):
                     agent.remember(f"ニュースで見た: 「{a['title']}」", kind="news",
                                    importance_bonus=_imp_bonus(sim, agent))
             else:

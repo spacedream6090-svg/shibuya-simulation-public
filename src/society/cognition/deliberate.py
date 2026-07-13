@@ -131,6 +131,15 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
     1回行い1行注入する。LLM 呼び出しは増やさない(発火時の pull はここに集約)。
     labeling_mode(constrained 既定 / open)はヘッダの coin_label 行のみを差し替える。
     open_actions(第17バッチ・既定 False)は開放行動 "do" の1行だけをヘッダ末尾に足す。"""
+    # 入力解像度LOD(第30バッチ・lod.input_res)。OFF=属性なし → 既定値=現行定数で
+    # バイト一致。ON でも変わるのは注入の「件数」だけ(呼数・乱数・発火は不変=R1)。
+    # beliefs(k の行動流入路 D7)と全員共通行は解像度の対象外(docs/plans/input-resolution-lod.md §2)。
+    _ir = getattr(agent, "input_res", None) or {}
+    _poi_n = int(_ir.get("poi_n", 3))
+    _people_n = int(_ir.get("people_n", 0))        # 0 = 全列挙(現行)
+    _recent_n = int(_ir.get("recent_n", 4))
+    _retrieve_n = int(_ir.get("retrieve_n", 3))
+    _feed_n = int(_ir.get("feed_n", 3))
     lines = [_header(labeling_mode, open_actions), agent.persona]
     # 反射=自己モデル(第11バッチ 2026-07-08。深い内省の産物。OFF は None=行なし=バイト一致)。
     # persona(固定の自己紹介)の直後に「経験から更新される自己理解」を置く=自己認識の再帰。
@@ -162,7 +171,7 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
     lines += [f"時刻: {_time_label(sim_min)}",
               f"場所: {place_name}"]
     if nearby_pois:
-        lines.append(f"周りにある店・場所: {'、'.join(nearby_pois[:3])}")
+        lines.append(f"周りにある店・場所: {'、'.join(nearby_pois[:_poi_n])}")
     if wv_expect_line:                   # 場所の期待vs実際(worldview 有効かつ差が大きい時のみ。第20バッチ)
         lines.append(wv_expect_line)
     if institutions:                     # Searle 制度化(ON時のみ。全員平等・k非依存の1行)
@@ -185,18 +194,21 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
         lines.append(f"あなたの考え(これまでの内省から): "
                      f"{' / '.join(agent.beliefs[-3:])}")
     if nearby_names:
-        lines.append(f"近くにいる人: {'、'.join(nearby_names)}")
+        # 注意の幅(people_n>0 のときだけ列挙を絞る。間柄 relation_line は nearby_ids
+        # ベースで不変=「見えているが名前として意識に上らない」の近似)
+        _names = nearby_names[:_people_n] if _people_n > 0 else nearby_names
+        lines.append(f"近くにいる人: {'、'.join(_names)}")
     if crowd_line:                       # 群衆の視覚情報(crowd_visual 有効時のみ。実在集計=第18バッチ)
         lines.append(crowd_line)
     if agent.adopted:
         lines.append(f"知っている言葉: {'、'.join(sorted(agent.adopted))}")
     if familiar_places:                  # Lynch 認知地図(ON時のみ。よく知っている場所 上位3)
         lines.append(f"馴染みの場所: {'、'.join(familiar_places[:3])}")
-    recent = agent.mem.recent(4)
+    recent = agent.mem.recent(_recent_n)
     if recent:
         lines.append(f"直近の出来事: {' / '.join(recent)}")
     recalled = agent.mem.retrieve(step, [place_name] + list(nearby_names or []),
-                                  n=3)
+                                  n=_retrieve_n)
     if recalled:
         lines.append(f"記憶に残っていること: {' / '.join(recalled)}")
     if pull_query:                       # agentic pull(発火時。決定論・呼び出しは増やさない)
@@ -226,7 +238,7 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
         lines.append("注意: さっきと同じ話題・言い回しを繰り返さない。"
                      "今の時刻・場所・気分・出来事に根ざした新しい内容を話す。")
     if feed_texts:
-        lines.append(f"タイムライン: {' / '.join(feed_texts[:3])}")
+        lines.append(f"タイムライン: {' / '.join(feed_texts[:_feed_n])}")
     if surprise == "social":
         lines.append("状況: 近くにいる人と自然に会話する。今この場所・この時間ならではの"
                      "話題(店、時間帯、出来事、気分)で、あなたらしい一言を speak で。")

@@ -490,6 +490,21 @@ class Simulation:
         raw_snsgeo = (OmegaConf.to_container(raw_snsgeo, resolve=True)
                       if OmegaConf.is_config(raw_snsgeo) else raw_snsgeo)
         self.snsgeo_on = bool((raw_snsgeo or {}).get("enabled", False))
+        # 入力解像度LOD(第30バッチ・lod.input_res・既定OFF=属性なし=バイト一致)。
+        # 割当は cognition/lod.py の共通軸機構(軸専用 stream "lod_input_res"・trait非依存)。
+        from ..cognition import lod as _lod_mod
+        raw_ir = cfg.get("lod", {}).get("input_res", None)
+        raw_ir = (OmegaConf.to_container(raw_ir, resolve=True)
+                  if OmegaConf.is_config(raw_ir) else raw_ir)
+        self.inputrescfg = _lod_mod.build_input_res_cfg(raw_ir)
+        if self.inputrescfg:
+            _lv = _lod_mod.assign_axis([a.id for a in self.agents],
+                                       self.hub.stream("lod_input_res"),
+                                       self.inputrescfg["levels"])
+            for a in self.agents:
+                spec = self.inputrescfg["levels"][_lv[a.id]]
+                a.input_res = {"level": _lv[a.id],
+                               **{k: v for k, v in spec.items() if k != "share"}}
         self.net.init_follows([a.id for a in self.agents],
                               self.hub.stream("follows"),
                               k=int(cfg.get("net", {}).get("follow_k", 6)))
@@ -543,7 +558,9 @@ class Simulation:
               "money": round(a.money, 1), "wage": round(a.wage, 1),
               "part_time": bool(a.part_time),
               "part_time_name": (a.part_time["name"] if a.part_time else None),
-              **({"sdt": a.drive_mods} if a.drive_mods else {})}
+              **({"sdt": a.drive_mods} if a.drive_mods else {}),
+              **({"input_res": a.input_res["level"]}
+                 if getattr(a, "input_res", None) else {})}
              for a in self.agents],
             ensure_ascii=False), encoding="utf-8")
 
