@@ -339,7 +339,8 @@ class Simulation:
             raw = MockBackend(self.hub)
         elif backend == "ollama":
             from ..llm.ollama import OllamaBackend
-            raw = OllamaBackend(str(cfg.model.name))
+            raw = OllamaBackend(str(cfg.model.name),
+                                format_mode=str(cfg.model.get("format", "json")))
         elif backend == "vllm":
             # 本選: OpenAI 互換 vLLM。servers が 1本=単一バックエンド、複数=艦隊ルータ。
             # tiers があれば(単一 URL でも)艦隊で purpose 別振り分けの seam を通す。
@@ -351,13 +352,15 @@ class Simulation:
             timeout_s = float(cfg.model.get("timeout_s", 120.0))
             tiers = cfg.model.get("tiers", None)
             tiers = OmegaConf.to_container(tiers, resolve=True) if tiers else None
+            fmt = str(cfg.model.get("format", "json"))
             if len(servers) == 1 and not tiers:
                 from ..llm.vllm import VllmBackend
-                raw = VllmBackend(model_name, servers[0], timeout_s=timeout_s)
+                raw = VllmBackend(model_name, servers[0], timeout_s=timeout_s,
+                                  format_mode=fmt)
             else:
                 from ..llm.fleet import FleetLLM
                 raw = FleetLLM(servers, model_name, timeout_s=timeout_s,
-                               tiers=tiers)
+                               tiers=tiers, format_mode=fmt)
         elif backend == "router":
             # 第23バッチ M2: 合成ルータ。purpose(rng_key 先頭)別に子バックエンドへ振り分ける。
             # ★子を各自 CachedLLM で包んでから router に渡す(キャッシュキーは子の name 由来=D13)。
@@ -579,11 +582,13 @@ class Simulation:
         if b == "ollama":
             from ..llm.ollama import OllamaBackend
             return OllamaBackend(name, host=str(spec.get("host", "http://localhost:11434")),
-                                 timeout_s=timeout_s)
+                                 timeout_s=timeout_s,
+                                 format_mode=str(spec.get("format", "json")))
         if b == "vllm":
             from ..llm.vllm import VllmBackend
             return VllmBackend(name, str(spec.get("base_url", "http://localhost:8000")),
-                               timeout_s=timeout_s)
+                               timeout_s=timeout_s,
+                               format_mode=str(spec.get("format", "json")))
         if b == "openai_compat":
             from ..llm.openai_compat import OpenAICompatBackend
             return OpenAICompatBackend(

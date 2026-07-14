@@ -29,9 +29,14 @@ class CachedLLM:
     def _key(self, prompt: str, temperature: float, max_tokens: int,
              think: bool) -> str:
         # think をキーに含める(含めないと思考モード切替時に旧キャッシュを誤再生する)。
-        blob = json.dumps({"model": self.backend.name, "t": temperature,
-                           "m": max_tokens, "think": bool(think), "p": prompt},
-                          ensure_ascii=False, sort_keys=True)
+        parts = {"model": self.backend.name, "t": temperature,
+                 "m": max_tokens, "think": bool(think), "p": prompt}
+        # format 等のバックエンド属性差もキーに含める(第33バッチ 計画A)。
+        # 既定(format=json)では cache_extra=None=従来キーと同一 → 過去ランの再生互換を保つ。
+        extra = getattr(self.backend, "cache_extra", None)
+        if extra:
+            parts.update(extra)
+        blob = json.dumps(parts, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
     def generate(self, prompt: str, *, rng_key: str, temperature: float,

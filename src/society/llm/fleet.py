@@ -38,7 +38,8 @@ class FleetLLM(LLMBackend):
                  timeout_s: float = 120.0,
                  tiers: dict[str, list[str]] | None = None,
                  cooldown_s: float = 30.0,
-                 now: Callable[[], float] = time.monotonic):
+                 now: Callable[[], float] = time.monotonic,
+                 format_mode: str = "json"):
         if not servers:
             raise ValueError("FleetLLM には少なくとも1本の server URL が必要。")
         self.name = f"fleet/{model}"          # ★URL 非依存(D13)
@@ -46,9 +47,13 @@ class FleetLLM(LLMBackend):
         self.servers = [s.rstrip("/") for s in servers]
         self.cooldown_s = float(cooldown_s)
         self._now = now
+        # format ノブ(第33バッチ 計画A)は子 VllmBackend へ透過。キー互換規約も子と同じ。
+        self.format_mode = format_mode
+        self.cache_extra = None if format_mode == "json" else {"f": format_mode}
         # URL ごとに1バックエンド(name は全て同一=キャッシュを共有できる)
         self._backend: dict[str, VllmBackend] = {
-            u: VllmBackend(model, u, timeout_s=timeout_s) for u in self.servers}
+            u: VllmBackend(model, u, timeout_s=timeout_s, format_mode=format_mode)
+            for u in self.servers}
         # tier プール(purpose → URL リスト)。既定は全 URL の default 1プール。
         self._tiers: dict[str, list[str]] = {}
         if tiers:
@@ -56,7 +61,8 @@ class FleetLLM(LLMBackend):
                 pool = [str(u).rstrip("/") for u in urls]
                 for u in pool:                # tier だけに現れる URL も稼働対象へ登録
                     self._backend.setdefault(
-                        u, VllmBackend(model, u, timeout_s=timeout_s))
+                        u, VllmBackend(model, u, timeout_s=timeout_s,
+                                       format_mode=format_mode))
                 self._tiers[str(purpose)] = pool
         self._default = self._tiers.get("default", list(self.servers))
         self._cooldown: dict[str, float] = {}

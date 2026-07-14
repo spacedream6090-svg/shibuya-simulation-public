@@ -85,6 +85,12 @@ model:
   plan_max_tokens: 0    # 0=max_tokens と同じ(朝の計画のみ上限を分けたい時に設定)
   reflect_think: true   # 内省を qwen3 の思考モードで回す(thinking/response 分離)
   cache: true           # 応答キャッシュ(D13: 再現性の実体)
+  format: json          # 構造化出力の強制(第33バッチ 計画A。docs/research/constrained-decoding.md)
+                        #   json(既定)=従来挙動そのまま(ollama format=json / vLLM response_format)。
+                        #   none=送らない(プロンプト規約のみ)。schema は将来拡張(未対応)。
+                        #   ★think=True の呼(内省)には自動で送らない(GBNF が思考を殺す実測への境界ガード)。
+                        #   router の子は spec の format キーで個別指定可。キャッシュキーは json のとき
+                        #   従来と同一(過去ランの llm_cache 再生互換)・none のみ別キー。
   # ---- 本選(backend: vllm)用。mock/ollama では未使用=既定挙動は完全不変 ----
   servers: []           # vLLM の base_url リスト。空=vllm 選択時のみエラー。1台マルチGPU/複数ノード両対応。
                         #   単一 (1本):   servers: ["http://localhost:8000"]                     → VllmBackend 直

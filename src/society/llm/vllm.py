@@ -28,12 +28,17 @@ _THINK_BLOCK = re.compile(r"^\s*<think>.*?</think>\s*", re.DOTALL)
 
 class VllmBackend(LLMBackend):
     def __init__(self, model: str, base_url: str = "http://localhost:8000",
-                 timeout_s: float = 120.0):
+                 timeout_s: float = 120.0, format_mode: str = "json"):
+        if format_mode not in ("none", "json"):
+            raise ValueError(f"model.format '{format_mode}' は未対応(none | json)。")
         self.name = f"vllm/{model}"          # ★URL 非依存(D13: キャッシュキー安定)
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.timeout_s = float(timeout_s)
         self._mode = "completions"           # 404 を見たら "chat" へ1度だけ切替
+        self.format_mode = format_mode
+        # キャッシュキー拡張(CachedLLM._key)。既定 "json"=None=従来キー互換。
+        self.cache_extra = None if format_mode == "json" else {"f": format_mode}
 
     # ---- HTTP ----
     def _post(self, path: str, body: dict) -> dict:
@@ -77,7 +82,13 @@ class VllmBackend(LLMBackend):
 
     def generate(self, prompt: str, *, rng_key: str, temperature: float,
                  max_tokens: int, think: bool = False) -> str:
-        for json_fmt in (True, False):       # response_format 非対応(400)なら外して1度だけ再送
+        # think 境界ガード(ollama.py と対称。guided decoding が思考を拘束しうるため
+        # think=True の呼には response_format を送らない。実機未検証=本選で疎通確認)。
+        if think or self.format_mode == "none":
+            attempts: tuple[bool, ...] = (False,)
+        else:
+            attempts = (True, False)
+        for json_fmt in attempts:            # response_format 非対応(400)なら外して1度だけ再送
             try:
                 if self._mode == "completions":
                     body = self._completions_body(prompt, temperature,
