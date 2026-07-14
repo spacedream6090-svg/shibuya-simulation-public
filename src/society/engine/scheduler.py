@@ -14,6 +14,7 @@ from .. import annual as annual_mod
 from .. import commerce as commerce_mod
 from .. import disaster as disaster_mod
 from .. import diversity as diversity_mod
+from .. import freedom_p2 as freedom_p2_mod
 from .. import health as health_mod
 from .. import household as household_mod
 from .. import inner_life as inner_life_mod
@@ -337,19 +338,24 @@ def _atm_withdraw(sim, agent, need: float, step: int, sim_min: int) -> None:
                                   "account": round(agent.account, 1)}))
 
 
-def _spend(sim, agent, amount: float, cat: str, step: int, sim_min: int) -> None:
+def _spend(sim, agent, amount: float, cat: str, step: int, sim_min: int,
+           chosen: bool = False) -> None:
     """消費(食事・買い物・nightlife・taxi・bus)。残高は 0 未満にしない。
 
     口座 ON(E5): 金額 ≥ card_threshold は口座から(カード)。未満は現金で、現金が
-    足りなければ最寄り ATM で自動引き出し(withdraw)してから支払う。"""
+    足りなければ最寄り ATM で自動引き出し(withdraw)してから支払う。
+    chosen(P2 #7 buy・既定 False=既存呼び出しは payload 不変=バイト一致): LLM が発火時に
+    能動選択した消費に payload へ chosen:true を添える(非発火の抽選消費と区別する観測用)。"""
     if amount <= 0:
         return
     if not _accounts_on(sim):
         agent.money = max(0.0, agent.money - amount)
+        payload = {"amount": round(float(amount), 1),
+                   "balance": round(agent.money, 1), "cat": cat}
+        if chosen:
+            payload["chosen"] = True
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
-                             kind="spend", x=agent.x, y=agent.y,
-                             payload={"amount": round(float(amount), 1),
-                                      "balance": round(agent.money, 1), "cat": cat}))
+                             kind="spend", x=agent.x, y=agent.y, payload=payload))
         if _government_on(sim):                 # 消費税を内訳計上(価格は名目不変)
             _record_consumption_tax(sim, agent, amount, cat, step, sim_min)
         return
@@ -362,11 +368,13 @@ def _spend(sim, agent, amount: float, cat: str, step: int, sim_min: int) -> None
             _atm_withdraw(sim, agent, amount - agent.money, step, sim_min)
         agent.money = max(0.0, agent.money - amount)
         src = "cash"
+    payload = {"amount": round(float(amount), 1),
+               "balance": round(agent.money, 1), "cat": cat,
+               "src": src, "account": round(agent.account, 1)}
+    if chosen:
+        payload["chosen"] = True
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
-                         kind="spend", x=agent.x, y=agent.y,
-                         payload={"amount": round(float(amount), 1),
-                                  "balance": round(agent.money, 1), "cat": cat,
-                                  "src": src, "account": round(agent.account, 1)}))
+                         kind="spend", x=agent.x, y=agent.y, payload=payload))
     if _government_on(sim):                     # 消費税を内訳計上(価格は名目不変)
         _record_consumption_tax(sim, agent, amount, cat, step, sim_min)
 
@@ -844,6 +852,8 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
         pois = sim.city.pois_in_building(agent.building, agent.floor)
     else:
         pois = sim.city.pois_at_node(agent.node)
+    # 生活の自己決定 P2(D3・既定 全 OFF は None=1行も足さない=バイト一致)。中立提示・客観条件つき。
+    p2_offers = _p2_offers(sim, agent, trigger, pois, company)
     tool_offers = memberships = None
     tools = getattr(sim, "tools", None)
     if tools is not None and trigger in ("solo", "social", "post"):
@@ -945,7 +955,8 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
                                      variety_hint=variety_hint,
                                      labeling_mode=sim.labels.mode,
                                      open_actions=bool(getattr(sim, "freedomcfg", None)
-                                                       and sim.freedomcfg["open_actions"]))
+                                                       and sim.freedomcfg["open_actions"]),
+                                     p2_offers=p2_offers)
     rng_key = f"deliberate/{agent.id}/{step}"
     response, call_id, cached = sim.llm.generate(
         prompt, rng_key=rng_key,
@@ -1351,6 +1362,11 @@ def _apply(sim, agent, action: dict, step: int, sim_min: int) -> None:
         fcfg = getattr(sim, "freedomcfg", None)
         if fcfg is not None and fcfg["open_actions"]:
             _apply_free_action(sim, agent, action, step, sim_min)
+        return
+
+    if kind in ("move_home", "buy", "study", "propose_partnership", "break_up"):
+        # 生活の自己決定 P2(D3)。該当項目が OFF や解釈不能では静かに無視(=wander 相当)。
+        _apply_p2(sim, agent, action, step, sim_min)
         return
 
     if kind == "go_to_bed":
@@ -1992,6 +2008,176 @@ def _free_dest(sim, where: str) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------- 生活の自己決定 P2(D3 棚卸し)
+def _p2cfg(sim) -> dict | None:
+    """freedom.p2 サブ設定(既定 全 OFF)。freedom 無効なら None。"""
+    fc = getattr(sim, "freedomcfg", None)
+    return fc.get("p2") if fc else None
+
+
+def _freedom_tally(sim, key: str) -> None:
+    """自由度の観測カウンタ(その step の choice_points / exercised)を1増やす(L2 追加列の元)。"""
+    fs = getattr(sim, "freedom_stats", None)
+    if fs is None:
+        fs = sim.freedom_stats = {"choice_points": 0, "exercised": 0}
+    fs[key] = fs.get(key, 0) + 1
+
+
+def _p2_offers(sim, agent, trigger: str, pois, company) -> str | None:
+    """発火プロンプトに載せる P2 メニュー(中立提示・客観条件つき・決定論・乱数なし)。
+
+    覚醒・自由時間の非会話デリバレーション発火(solo/social/post/novel_place/congestion/
+    unknown_word)で、条件を満たす選択肢だけを1行ずつ置く(POI 到着=novel_place は buy/study の
+    自然な機会)。会話系(reply/dm)は相手への応答が主眼なので載せない。提示があれば choice_points
+    を1計上する。P2 全 OFF / 非該当なら None(=build_prompt が1行も足さない=バイト一致)。"""
+    p2 = _p2cfg(sim)
+    if not p2 or trigger not in ("solo", "social", "post",
+                                 "novel_place", "congestion", "unknown_word"):
+        return None
+    if not any(p2.get(k) for k in ("move_home", "buy", "study", "partnership", "deviance")):
+        return None
+    free_time = (agent.activity not in ("working", "commuting")
+                 and not agent.sleeping and agent.loc != "outside")
+    cats = {p["cat"] for p in pois}
+    tools = getattr(sim, "tools", None)
+    venture_cost = float(getattr(tools, "cfg", {}).get("venture_cost", 30000.0)) \
+        if tools is not None else 30000.0
+    text = freedom_p2_mod.menu(
+        agent, cfg=p2, venture_cost=venture_cost,
+        near_commercial=bool(cats & freedom_p2_mod.COMMERCIAL_CATS),
+        near_school=bool(cats & freedom_p2_mod.STUDY_CATS),
+        free_time=free_time, has_company=bool(company),
+        accounts_on=_accounts_on(sim))
+    if text:
+        _freedom_tally(sim, "choice_points")
+    return text
+
+
+def _apply_p2(sim, agent, action: dict, step: int, sim_min: int) -> None:
+    """P2 行動(#6-#10)の裁定ディスパッチ。該当項目が OFF なら静かに無視(=wander 相当)。
+
+    いずれの裁定も money/closeness/物理位置(k 非依存の観測量)と config・新 stream のみを見る
+    (k を発火判断に食わせない)。行使できたら exercised を1計上(自由度行使率の観測)。"""
+    p2 = _p2cfg(sim)
+    if p2 is None:
+        return
+    kind = action["type"]
+    if kind == "move_home":
+        _apply_move_home(sim, agent, action, step, sim_min, p2)
+    elif kind == "buy":
+        _apply_buy(sim, agent, action, step, sim_min, p2)
+    elif kind == "study":
+        _apply_study(sim, agent, action, step, sim_min, p2)
+    elif kind == "propose_partnership":
+        _apply_partnership(sim, agent, action, step, sim_min, p2)
+    elif kind == "break_up":
+        _apply_break_up(sim, agent, step, sim_min, p2)
+
+
+def _apply_move_home(sim, agent, action, step, sim_min, p2) -> None:
+    """#6 住居移転: 敷金(=現金障壁)を払えるとき、空き住戸(他エージェントの home でない
+    residential)へ新 stream "move_home" で決定論転居する。家賃額は現行の収入比のまま
+    (建物別家賃の内生化はしない=正直な近似)。イベント move_home(from/to/deposit)。"""
+    if not p2["move_home"]:
+        return
+    deposit = float(p2["deposit"])
+    accounts_on = _accounts_on(sim)
+    total = agent.money + (agent.account if accounts_on else 0.0)
+    if total < deposit:                                # 敷金が払えない=引っ越せない(客観条件)
+        return
+    rng = sim.hub.stream("move_home", agent.id, step)  # 新 stream(既存 draw 順に不干渉)
+    bld = freedom_p2_mod.pick_home(sim, agent, action.get("area"), rng)
+    if bld is None:                                    # 空き住戸なし
+        return
+    old = agent.home_building
+    dep = deposit                                      # 敷金の控除(口座→現金の順)
+    if accounts_on:
+        take = min(agent.account, dep)
+        agent.account -= take
+        dep -= take
+    agent.money = max(0.0, agent.money - dep)
+    levels = int(bld.get("levels", 1) or 1)
+    agent.home_building = bld["id"]
+    agent.home_node = bld["entrance"]
+    agent.home_floor = 1 + int(rng.integers(max(1, levels)))
+    if agent.home_floor > levels:
+        agent.home_floor = max(1, levels)
+    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                         kind="move_home", x=agent.x, y=agent.y,
+                         payload={"from": old, "to": bld["id"],
+                                  "deposit": round(deposit, 1)}))
+    agent.remember("新しい住まいに引っ越した")
+    _freedom_tally(sim, "exercised")
+
+
+def _apply_buy(sim, agent, action, step, sim_min, p2) -> None:
+    """#7 消費の意思: 既存の消費経路(_spend)で即時支出し、spend payload に chosen:true を足す
+    (新 kind 不要)。非発火の既存 buy 抽選はフォールバックとしてそのまま残す(完全置換しない)。"""
+    if not p2["buy"]:
+        return
+    cat = str(action.get("cat") or "").strip().lower()
+    price_cat = freedom_p2_mod.BUY_PRICE_CAT.get(cat, "shop")
+    if _economy_on(sim):
+        price = price_of(price_cat, sim.economy, getattr(sim, "rulebook", None))
+        total = agent.money + (agent.account if _accounts_on(sim) else 0.0)
+        if price > 0 and total >= price:
+            _spend(sim, agent, price, price_cat, step, sim_min, chosen=True)
+    agent.remember(f"欲しい物を買った({cat or price_cat})")
+    _freedom_tally(sim, "exercised")
+
+
+def _apply_study(sim, agent, action, step, sim_min, p2) -> None:
+    """#8 学び直し: 既存 study イベントで記録+その場に滞在。効果は記録のみ(既存の記憶接触に
+    留める)。★賃金/生産性への経路は Skill(技能蓄積)討議後(ユーザー決定)。"""
+    if not p2["study"]:
+        return
+    topic = str(action.get("topic") or "").strip()[:60] or "自習"
+    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                         kind="study", x=agent.x, y=agent.y,
+                         payload={"subject": topic, "role": "self", "chosen": True}))
+    agent.stay_until = max(agent.stay_until, step + 2)  # その場に留まる(聴講)
+    agent.remember(f"学んだ: {topic}")
+    _freedom_tally(sim, "exercised")
+
+
+def _apply_partnership(sim, agent, action, step, sim_min, p2) -> None:
+    """#9 交際の申込: 相手が近傍に実在し、既存 relations の closeness が household の形成閾値
+    以上なら partner_formed(既存 kind・既存の世帯結合処理を再利用)、未満なら partnership_declined
+    (新 kind)。相手側の発火時応答は将来拡張(今回は既存閾値の決定論判定=正直な簡略化)。"""
+    if not p2["partnership"]:
+        return
+    to_name = str(action.get("to") or "").strip()
+    if not to_name or getattr(agent, "partner_id", None) is not None:
+        return
+    radius = float(sim.cfg.world.perception_radius_m)
+    company = hearers_of(agent, sim.agents, radius)
+    target = next((c for c in company if c.name == to_name), None)
+    if target is None:                                 # 名前の部分一致で救済
+        target = next((c for c in company if to_name in c.name), None)
+    if target is None or getattr(target, "partner_id", None) is not None:
+        return                                         # 相手が近くにいない/既に交際中
+    thr = freedom_p2_mod.partner_threshold(sim, p2)
+    rel = agent.mem.relations.get(target.id)
+    closeness = float(rel.get("closeness", 0.0)) if rel else 0.0
+    if closeness >= thr:
+        household_mod.bond(sim, agent, target, step, sim_min)   # 世帯結合処理を再利用
+    else:
+        sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                             kind="partnership_declined", x=agent.x, y=agent.y,
+                             payload={"to": int(target.id),
+                                      "closeness": round(closeness, 3)}))
+        agent.remember(f"{target.name}に交際を申し込んだが、まだその段階ではなかった")
+    _freedom_tally(sim, "exercised")
+
+
+def _apply_break_up(sim, agent, step, sim_min, p2) -> None:
+    """#9 別れ: 既存 relation_break 流儀+世帯分離(household.unbond で双方の partner_id を外す)。"""
+    if not p2["partnership"]:
+        return
+    if household_mod.unbond(sim, agent, step, sim_min):
+        _freedom_tally(sim, "exercised")
+
+
 def _apply_free_action(sim, agent, action: dict, step: int, sim_min: int) -> None:
     """開放行動 "do" の裁定(第17バッチ)。物理・所持金・拘束(勤務/就寝)の客観ゲートだけ
     かけて、意味づけは価値タグ(辞書+中立自己申告)で観測する。乱数なし=決定論。
@@ -2064,6 +2250,47 @@ def _routes(sim) -> dict:
     return routes_of(sim)
 
 
+def _enforce_ventures(sim, officer_at, step: int, sim_min: int) -> None:
+    """#10 逸脱: 無許可出店(venture の permitted:false)を近傍(同ノード)の警察官が摘発する。
+
+    摘発 = 罰金(所持金−。government ON なら区の歳入)+ grievance+(factors 経由=no-fingerprint)
+    + 強制閉店(既存 force_close_venture)。罰金額は新パラメータ freedom.p2.deviance_fine、grievance は
+    既存 enforcement の係数を再利用(=既存の執行・罰金機構への接続)。決定論・非LLM・乱数なし。
+    deviance OFF / tools 無し / 無許可出店なし なら完全 no-op(enforcement イベント 0 件=バイト一致)。"""
+    p2 = _p2cfg(sim)
+    if p2 is None or not p2["deviance"]:
+        return
+    tools = getattr(sim, "tools", None)
+    if tools is None:
+        return
+    fine = float(p2["deviance_fine"])
+    griev = float(_routes(sim)["enforcement"]["grievance"])
+    gov_on = _government_on(sim)
+    for node in sorted(officer_at):                    # node 昇順=決定論
+        officer = officer_at[node]
+        for v in list(tools.ventures_by_node.get(node, [])):   # 閉店で index が縮むので複製を走査
+            if v.get("permitted", True):               # 許可済みは対象外(既定 True=不変)
+                continue
+            owner = sim.agent_by_id.get(v["owner"])
+            if owner is None or owner.id == officer.id:
+                continue
+            penalty = min(owner.money, fine)           # 罰金(所持金の範囲で)
+            owner.money = max(0.0, owner.money - fine)
+            if gov_on and penalty > 0:
+                sim.government.collect("ward", penalty)
+            factor_update.on_enforcement(owner, griev, step=step, sim_min=sim_min,
+                                         logger=sim.logger)
+            x, y = sim.city.node_xy(node)
+            sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=officer.id,
+                                 kind="enforcement", x=float(x), y=float(y),
+                                 payload={"rule_id": None, "officer": officer.id,
+                                          "target": owner.id,
+                                          "penalty": round(penalty, 1),
+                                          "venture": v["name"]}))
+            tools.force_close_venture(sim, owner, step, sim_min, reason="unpermitted")
+            owner.remember(f"無許可の出店を摘発され、店を畳んだ(罰金{round(penalty, 1)}円)")
+
+
 def _phase_enforcement(sim, step: int, sim_min: int) -> None:
     """執行ルート(Wave G3): prohibit ルール下で、近傍(同ノード)に居る警察官が違反者を執行。
 
@@ -2073,19 +2300,22 @@ def _phase_enforcement(sim, step: int, sim_min: int) -> None:
     完全 no-op(enforcement イベント 0 件・所持金/grievance 不変=ゴールデンを守る)。"""
     if not _routes(sim)["enforcement"]["enabled"]:
         return
-    rb = getattr(sim, "rulebook", None)
-    if rb is None or not rb.cfg["enabled"] or not rb.has_prohibit():
-        return
-    hour = (sim_min % 1440) // 60
-    prohibited = rb.prohibited_cats(hour)
-    if not prohibited:
-        return
     officer_at: dict[str, object] = {}                 # node -> 最小 id の警察官(id 昇順で先勝ち)
     for a in sim.agents:
         if a.occupation in POLICE_OCCS and a.loc != "outside" and not a.sleeping \
                 and a.node not in officer_at:
             officer_at[a.node] = a
     if not officer_at:
+        return
+    # #10 逸脱: 無許可出店(permitted:false)を近傍の警察官が摘発(deviance ON のみ。既存機構に接続)。
+    # deviance OFF なら完全 no-op=禁止POI執行の従来経路はこの下で不変(=ゴールデンを守る)。
+    _enforce_ventures(sim, officer_at, step, sim_min)
+    rb = getattr(sim, "rulebook", None)
+    if rb is None or not rb.cfg["enabled"] or not rb.has_prohibit():
+        return
+    hour = (sim_min % 1440) // 60
+    prohibited = rb.prohibited_cats(hour)
+    if not prohibited:
         return
     ecfg = _routes(sim)["enforcement"]
     fine = float(ecfg["fine"])
@@ -2649,6 +2879,7 @@ def _phase_inner_life(sim, step: int, sim_min: int) -> None:
 # ---------------------------------------------------------------- 1 step
 def run_step(sim, step: int) -> None:
     sim.budget.reset()
+    sim.freedom_stats = {"choice_points": 0, "exercised": 0}  # 自由度観測(P2)の step 境界。OFF は L2 で列不在
     sim_min = sim.clock.sim_min(step)
     _ensure_orgs(sim)                              # 組織台帳の遅延初期化(既定OFF=no-op)
     for agent in sim.agents:

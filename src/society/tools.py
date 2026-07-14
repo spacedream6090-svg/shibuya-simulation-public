@@ -432,10 +432,18 @@ class Tools:
                       {"name": name, "outcome": "denied", "reason": "bankruptcy"})
             agent.remember("破産直後で出店の許可が下りなかった")
             return
+        # 軽微な逸脱(P2 #10 deviance・既定 OFF): 無許可出店を「選べる」。deviance 有効かつ
+        # permit:false のとき、許可待ち・却下抽選をスキップして即開店するが permitted:false
+        # (=近傍の警察官が違反として摘発する=既存 enforcement 機構に接続。暴力・実在人物は扱わない R17)。
+        fcfg = getattr(sim, "freedomcfg", None)
+        deviance_on = bool(fcfg and fcfg.get("p2", {}).get("deviance"))
+        unpermitted = bool(deviance_on and action.get("permit") is False)
         # 営業許可(制度深化2・既定 0/0=従来と完全同一): 却下なら開業費を払わず出店なし。
         # 許可待ち(permit_steps)の間は開店済みでも販売できない(open_at まで pending)。
         permit_steps = int(self.cfg["permit_steps"])
-        if float(self.cfg["permit_deny_prob"]) > 0.0:
+        if unpermitted:
+            permit_steps = 0                            # 無許可=許可待ちなしで即時営業(だが違反)
+        elif float(self.cfg["permit_deny_prob"]) > 0.0:
             rng = sim.hub.stream("permit", agent.id, step)   # 新 stream(既存 draw 順に不干渉)
             if rng.random() < float(self.cfg["permit_deny_prob"]):
                 self._log(sim, step, sim_min, agent, "venture_permit",
@@ -447,13 +455,16 @@ class Tools:
                    "offer": offer, "price": self.cfg["venture_price"],
                    "opened_step": step, "last_sale_step": step + permit_steps,
                    "open_at": step + permit_steps,     # 許可待ち明けから販売可(既定 0=即時)
+                   "permitted": not unpermitted,        # 無許可出店(#10)は摘発対象(既定 True=不変)
                    "sales_total": 0.0, "fulltime": False}   # 起業転換(Wave G5)の累計売上・転換済みフラグ
         self.ventures[agent.id] = venture
         self.ventures_by_node[agent.node].append(venture)
         self.n_ventures_total += 1
-        self._log(sim, step, sim_min, agent, "venture_open",
-                  {"name": name, "offer": offer, "node": agent.node,
-                   "cost": round(cost, 1), "balance": round(agent.money, 1)})
+        open_payload = {"name": name, "offer": offer, "node": agent.node,
+                        "cost": round(cost, 1), "balance": round(agent.money, 1)}
+        if unpermitted:                                 # 既定(permitted)は payload 不変=バイト一致
+            open_payload["permitted"] = False
+        self._log(sim, step, sim_min, agent, "venture_open", open_payload)
         if permit_steps > 0:                           # 許可制: 開業待ちを記録(既定 0=出さない)
             self._log(sim, step, sim_min, agent, "venture_permit",
                       {"name": name, "outcome": "granted",

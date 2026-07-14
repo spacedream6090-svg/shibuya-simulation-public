@@ -157,6 +157,35 @@ class MockBackend(LLMBackend):
                      "value": vals[int(rng.integers(len(vals)))]},
                     ensure_ascii=False)
 
+        # 生活の自己決定 P2(D3・freedom.p2.* のメニュー "生活の選択" がある時だけ=OFFでは
+        # draw も分岐も無い=バイト一致)。各行の JSON トークンが載っている項目だけ低確率で返す。
+        if "生活の選択" in prompt:
+            tp = rng.random()
+            if '"action":"move_home"' in prompt and tp < 0.15:
+                return json.dumps({"action": "move_home", "area": place},
+                                  ensure_ascii=False)
+            if '"permit":false' in prompt and 0.15 <= tp < 0.30:
+                return json.dumps({"action": "open_venture", "name": f"{place}の露店",
+                                   "offer": "軽食", "permit": False}, ensure_ascii=False)
+            if '"action":"buy"' in prompt and 0.30 <= tp < 0.50:
+                cat = ["food", "goods", "leisure"][int(rng.integers(3))]
+                return json.dumps({"action": "buy", "cat": cat}, ensure_ascii=False)
+            if '"action":"study"' in prompt and 0.50 <= tp < 0.65:
+                return json.dumps({"action": "study", "topic": "歴史"},
+                                  ensure_ascii=False)
+            if '"action":"propose_partnership"' in prompt and 0.65 <= tp < 0.80:
+                names = []
+                for line in prompt.splitlines():
+                    if line.startswith("近くにいる人:"):
+                        names = [t for t in line.split(":", 1)[1].strip().split("、") if t]
+                if names:
+                    return json.dumps(
+                        {"action": "propose_partnership",
+                         "to": names[int(rng.integers(len(names)))]},
+                        ensure_ascii=False)
+            if '"action":"break_up"' in prompt and 0.80 <= tp < 0.90:
+                return json.dumps({"action": "break_up"}, ensure_ascii=False)
+
         if "内省してください" in prompt:
             belief = f"{place}での経験から、自分は少し考えが変わった気がする。"
             out = {

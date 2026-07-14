@@ -393,6 +393,17 @@ freedom:
   sat_step: 0.15                # 自由行動1回の充足量(限界効用逓減つき)
   sat_decay: 0.15               # 日次の中立(0.5)への回帰率(需要の再蓄積)
   max_minutes: 240              # 1回の開放行動の上限時間(分)
+  # ---- 生活の自己決定 P2(D3 棚卸し。docs/plans/agent-freedom-plan.md #6-#10。既定 全 OFF=バイト一致)----
+  # 5項目を個別 bool で切る(中立メニュー提示+決定論裁定=R1 呼数不変)。ON 化はユーザー判断(daily/production は触らない)。
+  p2:
+    move_home: false            # #6 空き住戸への転居(敷金=現金障壁)
+    buy: false                  # #7 発火時の消費意思(非発火の buy 抽選はフォールバックで残す)
+    study: false                # #8 学校/図書館での聴講(記録のみ。賃金経路は Skill 討議後)
+    partnership: false          # #9 交際の申込/別れ(相手側の応答は将来拡張)
+    deviance: false             # #10 無許可出店(既存 enforcement が近傍で摘発)
+    deposit: 50000              # #6 引っ越しの敷金(1ヶ月分の家賃相当の現金障壁)
+    deviance_fine: 5000         # #10 無許可出店の摘発時の罰金(既存 enforcement 機構に接続)
+    partner_closeness: 15.0     # #9 交際成立の closeness 閾値(household 既定と同値。household OFF 時の後退値)
 
 # ---- 主観的世界モデル(第20バッチ 2026-07-12。既定 OFF=現行と完全同一)----
 # 各エージェントの「世界の解釈」: C1 期待形成(場所×時間帯の人出EMA=検証可能な仮説)+

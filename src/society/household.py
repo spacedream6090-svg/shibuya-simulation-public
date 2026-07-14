@@ -187,6 +187,44 @@ def _log_partner(a, b, step: int, sim_min: int, logger) -> None:
                      payload={"kind": "partner", "other": int(b.id)}))
 
 
+def bond(sim, a, b, step: int, sim_min: int) -> None:
+    """2者をパートナーにする(partner_id 相互設定 + partner_formed/life_event + 記憶)。
+
+    form_partners(日次の自動成立)と P2 の propose_partnership(#9)で共用する「世帯結合処理」。
+    決定論・LLM 非増(呼び出し側が成立可否=closeness 閾値を判定してから呼ぶ)。"""
+    a.partner_id = int(b.id)
+    b.partner_id = int(a.id)
+    _log_partner(a, b, step, sim_min, sim.logger)
+    a.remember(f"{b.name}と付き合い始めた")
+    b.remember(f"{a.name}と付き合い始めた")
+
+
+def unbond(sim, a, step: int, sim_min: int) -> bool:
+    """パートナー関係を解消する(P2 break_up #9)。解消したら True、独身なら False。
+
+    既存 relation_break 流儀 + life_event(kind="breakup")を a 視点で記録し、双方の partner_id を
+    外す(=世帯的な紐帯の分離)。相手側の応答は将来拡張(今回は起点側の決定で解消=正直な簡略化)。"""
+    pid = getattr(a, "partner_id", None)
+    if pid is None:
+        return False
+    b = sim.agent_by_id.get(pid)
+    a.partner_id = None
+    if b is not None and getattr(b, "partner_id", None) == a.id:
+        b.partner_id = None
+    other_name = b.name if b is not None else ""
+    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=a.id,
+                         kind="relation_break", x=a.x, y=a.y,
+                         payload={"other": int(pid), "from_tier": 3, "to_tier": 0,
+                                  "cause": "breakup"}))
+    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=a.id,
+                         kind="life_event", x=a.x, y=a.y,
+                         payload={"kind": "breakup", "other": int(pid)}))
+    a.remember(f"{other_name}と別れた" if other_name else "恋人と別れた")
+    if b is not None:
+        b.remember(f"{a.name}と別れた")
+    return True
+
+
 def form_partners(sim, step: int, sim_min: int) -> None:
     """日次: G2 relations の親密度 closeness が相互に閾値超の2者を決定論でパートナーにする。
 
@@ -198,7 +236,6 @@ def form_partners(sim, step: int, sim_min: int) -> None:
     if not cfg["enabled"]:
         return
     thr = float(cfg["partner_closeness"])
-    logger = sim.logger
     for a in sim.agents:                                   # id 昇順=決定論
         if a.visitor or getattr(a, "partner_id", None) is not None:
             continue
@@ -219,8 +256,4 @@ def form_partners(sim, step: int, sim_min: int) -> None:
             continue
         cands.sort(key=lambda t: (t[0], t[1]), reverse=True)  # 相互最大→id 最小
         b = cands[0][2]
-        a.partner_id = int(b.id)
-        b.partner_id = int(a.id)
-        _log_partner(a, b, step, sim_min, logger)
-        a.remember(f"{b.name}と付き合い始めた")
-        b.remember(f"{a.name}と付き合い始めた")
+        bond(sim, a, b, step, sim_min)                        # 世帯結合処理(P2 と共用)

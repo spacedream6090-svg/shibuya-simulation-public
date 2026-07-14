@@ -124,7 +124,8 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
                  digest_line: str | None = None,
                  variety_hint: bool = False,
                  labeling_mode: str = "constrained",
-                 open_actions: bool = False) -> str:
+                 open_actions: bool = False,
+                 p2_offers: str | None = None) -> str:
     """個別文脈(時刻・場所・活動・気分・記憶・直近発話)を渡し、内容の固定化を防ぐ。
 
     pull_query が渡された時だけ(agentic_pull=true)、その文で決定論の記憶想起を
@@ -277,6 +278,8 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
         lines.append(tool_offers)
     if equip_all:                        # 標準装備の中立告知(勧誘なし。R1: 客観条件のみ)
         lines.append(_equip_section(agent, venture_cost))
+    if p2_offers:                        # 生活の自己決定 P2(freedom.p2.* 有効時のみ。中立提示・客観条件つき)
+        lines.append(p2_offers)          # 促進・誘導なし(scheduler が客観条件で組み立て済み)
     return "\n".join(lines)
 
 
@@ -370,9 +373,30 @@ def parse_action(response: str) -> dict | None:
     if kind == "open_venture":
         name = _text_of("name", "title")
         if name:
-            return {"type": "open_venture", "name": name,
-                    "offer": _text_of("offer", "text", "content") or ""}
+            out = {"type": "open_venture", "name": name,
+                   "offer": _text_of("offer", "text", "content") or ""}
+            # 逸脱(#10 deviance): 無許可出店の申告。permit が偽(bool/文字列)なら通す
+            # (裁定側=tools が deviance 有効時のみ許可待ちをスキップし permitted:false で開店)。
+            permit = data.get("permit")
+            if permit is False or (isinstance(permit, str)
+                                   and permit.strip().lower() in ("false", "no", "なし")):
+                out["permit"] = False
+            return out
         return None
+    # ---- 生活の自己決定 P2(#6-#10。OFF 時は提示されないだけで解釈は常に受ける=寛容) ----
+    if kind == "move_home":              # #6 住居移転
+        return {"type": "move_home", "area": _text_of("area", "region", "where", "place")}
+    if kind == "buy":                    # #7 消費の意思(cat は裁定側で正準化)
+        return {"type": "buy", "cat": _text_of("cat", "category", "what", "item")}
+    if kind == "study":                  # #8 学び直し(効果は記録のみ)
+        return {"type": "study", "topic": _text_of("topic", "subject", "what", "text")}
+    if kind == "propose_partnership":    # #9 交際の申込
+        to = _text_of("to", "name", "target", "partner")
+        if to:
+            return {"type": "propose_partnership", "to": to}
+        return None
+    if kind == "break_up":               # #9 別れ
+        return {"type": "break_up"}
     if kind in ("do", "free", "activity"):   # 開放行動(第17バッチ。OFF 時は提示されないだけで
         what = _text_of("what", "text", "content", "action_desc")  # 解釈は常に受ける=寛容)
         if what:

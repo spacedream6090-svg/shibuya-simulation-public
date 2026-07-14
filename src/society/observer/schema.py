@@ -56,6 +56,9 @@ register_event_kind("rent",          "家賃の口座引き落とし(給料日�
 register_event_kind("day_plan",      "朝の一日計画(LLM。ルールベース行動の土台){n, plan}")
 register_event_kind("ride",          "交通機関の乗車(タクシー/簡易バス){mode, fare, from, to}")
 register_event_kind("free_action",   "開放行動(第17バッチ: LLM の自由記述行動+価値4軸の観測){what, category, tags, match, report, minutes, cost, dest, sat}")
+# ---- 生活の自己決定 P2(D3 棚卸し。freedom.p2.*。既定 全 OFF)----
+register_event_kind("move_home",       "住居移転(#6: 空き住戸へ転居。敷金=現金障壁){from, to, deposit}")
+register_event_kind("partnership_declined", "交際の申込が不成立(#9: closeness が形成閾値未満){to, closeness}")
 # ---- 主観的世界モデル(第20バッチ 2026-07-12: 期待・可制御性・規範予期の日次観測。既定 OFF)----
 register_event_kind("worldview",     "主観的世界モデルの日次スナップ(agent: ctrl/期待規模/期待誤差、街: norm_rate){ctrl?, expect_n?, err_mean?, err_n?, norm_rate?, pioneer_1d?}")
 # ---- 街頭広告 OOH(第18バッチ 2026-07-11: 街路の環境情報。既定 OFF)----

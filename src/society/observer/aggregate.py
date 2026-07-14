@@ -334,6 +334,30 @@ def _mean_collective_efficacy(sim):
     return round(sum(vals) / len(vals), 4)
 
 
+# ---- 生活の自己決定 P2(D3 棚卸し。既定 全 OFF)。OFF は None=列なし=L2 不変 ----
+def _p2_any_on(sim) -> bool:
+    fc = getattr(sim, "freedomcfg", None)
+    p2 = fc.get("p2") if fc else None
+    return bool(p2 and any(p2.get(k) for k in
+                           ("move_home", "buy", "study", "partnership", "deviance")))
+
+
+@register_aggregator("freedom_choice_points")
+def _freedom_choice_points(sim):
+    """その step に P2 メニュー(生活の選択肢)が LLM に提示された回数。OFF は None=列なし。"""
+    if not _p2_any_on(sim):
+        return None
+    return int(getattr(sim, "freedom_stats", {}).get("choice_points", 0))
+
+
+@register_aggregator("freedom_exercised")
+def _freedom_exercised(sim):
+    """その step に既定ルーチンと異なる P2 選択(引っ越し/購入/学び/交際/無許可出店)を行使した回数。OFF は None。"""
+    if not _p2_any_on(sim):
+        return None
+    return int(getattr(sim, "freedom_stats", {}).get("exercised", 0))
+
+
 @register_aggregator("n_active_rules")
 def _n_active_rules(sim):
     """制度DSL: 現在アクティブな実効ルール数(rules 無効時は None=列なし=L2 不変)。"""

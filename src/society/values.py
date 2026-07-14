@@ -110,6 +110,36 @@ _REASON_TO_TAG = {
 }
 
 
+# ---- 生活の自己決定 P2(D3 棚卸し。docs/plans/agent-freedom-plan.md #6-#10。既定 全 OFF)----
+# 5項目(move_home/buy/study/partnership/deviance)を個別 bool で切る。全 false=現行とバイト一致。
+# メニューは中立提示(客観条件のみ)・裁定は決定論(新 stream のみ)=R1 の呼数不変。
+_P2_DEFAULTS = {
+    "move_home": False,     # #6 住居移転(空き住戸へ転居。敷金=現金障壁)
+    "buy": False,           # #7 消費の意思(発火時の buy。非発火の buy 抽選はフォールバックで残す)
+    "study": False,         # #8 学び直し(学校/図書館で聴講=記録のみ。賃金経路は Skill 討議後)
+    "partnership": False,   # #9 家族の主体性(交際の申込/別れ。相互応答は将来拡張)
+    "deviance": False,      # #10 軽微な逸脱(無許可出店→既存 enforcement が摘発)
+    "deposit": 50000.0,     # #6 引っ越しの敷金(月家賃1ヶ月分相当の現金障壁。建物別家賃の内生化はしない)
+    "deviance_fine": 5000.0,  # #10 無許可出店の摘発時の罰金(既存 enforcement 機構に接続)
+    "partner_closeness": 15.0,  # #9 交際成立の closeness 閾値(household 既定と同値。household OFF 時の後退値)
+}
+_P2_BOOL = ("move_home", "buy", "study", "partnership", "deviance")
+
+
+def _build_p2(raw) -> dict:
+    """freedom.p2 サブブロックの型強制(既定 全 false=完全 no-op)。OmegaConf/dict の両方を受ける。"""
+    from omegaconf import OmegaConf
+    if OmegaConf.is_config(raw):
+        raw = OmegaConf.to_container(raw, resolve=True)
+    raw = dict(raw or {})
+    cfg = dict(_P2_DEFAULTS)
+    for k, v in raw.items():
+        if k not in _P2_DEFAULTS:
+            continue
+        cfg[k] = bool(v) if k in _P2_BOOL else float(v)
+    return cfg
+
+
 def build_cfg(raw: dict | None) -> dict:
     """conf の freedom ブロックを型強制つきで正準化(既定 OFF=現行と完全同一)。"""
     raw = dict(raw or {})
@@ -121,6 +151,7 @@ def build_cfg(raw: dict | None) -> dict:
         "max_minutes": int(raw.get("max_minutes", 240)),
         "mods_lo": float(raw.get("mods_lo", 0.7)),
         "mods_hi": float(raw.get("mods_hi", 1.5)),
+        "p2": _build_p2(raw.get("p2")),
     }
 
 
