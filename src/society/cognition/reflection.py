@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from ..observer.logger import ObserverLogger
 from ..observer.schema import Event
+from ..rng import _stable_hash
 from .deliberate import build_prompt, parse_action
 
 _REFLECT_TASK = (
@@ -91,6 +92,52 @@ _DEEP_REFLECT_TASK = (
     ' "belief": "今日の経験からの考え方の変化・結論を一文",'
     ' "self": "自分がどんな人間か・最近の変化の要約を一文",'
     ' "ties": "自分にとって大事な人間関係の要約を一文"}')
+
+
+# ---------------------------------------------------------------- 内省プロンプト改善 A4(第20バッチ検収)
+# 実LLM 検収で belief の約25%が雛形の復唱=「今日の経験から〜」で始まる定型文だった問題への対策。
+# prompts.reflect_variety=true のとき、belief 説明(JSON 例)の言い回しを個体×日で 4 バリアントの
+# **決定論ローテーション**にし、「決まり文句で belief を始めない」1行を足す。狙いは、常に同じ
+# 例文「今日の経験からの…」を見せることで生じる冒頭句のアンカー効果を外すこと。
+#   - バリアントはすべて意味等価(問うことは同じ=「今日をふまえ自分の中で動いた考え・結論を一文」。
+#     言い回しだけを変える)。JSON のキー(summary/salient/belief/self/ties)は一切変えない。
+#   - 選択は乱数を使わず _stable_hash(agent_id, day)(rng.py 流儀=プロセス非依存)で決める=
+#     呼数・乱数構造・発火は不変(R1)。既定 OFF は _REFLECT_TASK/_DEEP_REFLECT_TASK とバイト一致
+#     (ゴールデン tests/test_scenario.py を守る)。
+_ORIG_BELIEF_DESC = "今日の経験からの考え方の変化・結論を一文"
+_JSON_HEAD = "\n出力は次の JSON 1個のみ(キー名は厳守):"
+# ★既知の限界(実LLM検収 a4_reflect_variety_on_s42・qwen3:4b・2026-07-15):
+#   4B モデルは説明句を belief 値へ**そのまま丸写し**することがある(15件中5件)。
+#   文言の言い換え(体言句化)や「説明の文言を写さない」注意でも防げないことを
+#   ペアプローブ(同一文脈15本×新旧文言)で確認済み=語調でなく確率的な失敗。
+#   → 文言は検収ランで検証済みのこのセットに固定。丸写しの機械ガード(完全一致 belief の
+#   棄却)や reflect 温度の調整は writeback 率・R1 に触れるためユーザー判断待ち。
+_BELIEF_VARIANTS = (
+    "考えたことの結論・自分の中で変わった見方を一文",
+    "心に残った気づきや、これからに活きる結論を一文",
+    "自分なりにたどり着いた結論・変化した考えを一文",
+    "いまの実感に近い言葉で、得た気づき・結論を一文",
+)
+_VARIETY_NOTE = ("\n※ belief は「今日の経験から」「今日の出来事」などの決まり文句で"
+                 "書き始めず、自分の言葉で書いてください。")
+# 差し替えの足場(冒頭句アンカー)が両タスク文にちょうど1回ずつ在ることを import 時に担保。
+# ここが壊れると variety の note/変異が黙って落ちるので、崩れたら即座に import を失敗させる。
+assert _ORIG_BELIEF_DESC in _REFLECT_TASK and _ORIG_BELIEF_DESC in _DEEP_REFLECT_TASK
+assert _JSON_HEAD in _REFLECT_TASK and _JSON_HEAD in _DEEP_REFLECT_TASK
+
+
+def _reflect_task(*, deep: bool, variety: bool, agent_id: int, day: int) -> str:
+    """内省タスク文を返す。variety=False は従来定数とバイト一致(既定 OFF=ゴールデン不変)。
+
+    variety=True のときだけ belief 説明を個体×日で決定論ローテーションし、定型句回避の1行を
+    足す。乱数は使わず _stable_hash で選ぶ(R1: 呼数・乱数消費・発火は不変)。JSON 契約キーは不変。
+    """
+    base = _DEEP_REFLECT_TASK if deep else _REFLECT_TASK
+    if not variety:
+        return base
+    idx = _stable_hash(f"reflect_variety/{agent_id}/{day}") % len(_BELIEF_VARIANTS)
+    task = base.replace(_ORIG_BELIEF_DESC, _BELIEF_VARIANTS[idx])
+    return task.replace(_JSON_HEAD, _VARIETY_NOTE + _JSON_HEAD)
 
 
 # ---------------------------------------------------------------- 無意識層(第12バッチ)
@@ -177,7 +224,8 @@ def maybe_reflect(agent, *, step: int, sim_min: int, writeback: str, alpha: floa
                   controls: str = "none", agentic_pull: bool = False,
                   date_line: str | None = None,
                   weather_line: str | None = None,
-                  reflect_cfg: dict | None = None) -> None:
+                  reflect_cfg: dict | None = None,
+                  reflect_variety: bool = False) -> None:
     """就寝中で reflect_step に達していれば内省(1睡眠につき1回)。
 
     v2(Phase B): 同じ1回の呼び出しで**記憶の統合**(日次要約+顕著エピソード
@@ -193,6 +241,10 @@ def maybe_reflect(agent, *, step: int, sim_min: int, writeback: str, alpha: floa
     参照)。日内衝撃ゲージの閾値超え(factors._bump 側)が agent.deep_due_day を予約し、
     その日以降の夜に深い内省が起こる(侵入的→熟慮的の遅延)。実行後は cooldown。
     レガシーの固定周期(self_model_days)も併存(実験対照用)。既定は全OFF=従来と完全同一。
+
+    v5(A4 第20バッチ検収): reflect_variety=True のとき内省タスク文の belief 説明を個体×日で
+    決定論ローテーション(_reflect_task)+定型句回避の1行を足す。belief の雛形復唱対策。
+    既定 OFF はプロンプト・呼数・乱数消費とも従来と完全同一(R1・ゴールデン不変)。
     """
     if step != agent.reflect_step:
         return
@@ -218,11 +270,13 @@ def maybe_reflect(agent, *, step: int, sim_min: int, writeback: str, alpha: floa
     due = int(getattr(agent, "deep_due_day", -1))
     deep_event = bool(due >= 0 and day >= due)
     deep = deep_event or bool(period > 0 and day >= 1 and day % period == 0)
+    task = _reflect_task(deep=deep, variety=reflect_variety,
+                         agent_id=agent.id, day=day)   # A4: 既定 OFF=従来定数と同一
     prompt = (build_prompt(agent, place_name=place_name, surprise=None,
                            nearby_names=[], step=step,
                            date_line=date_line, weather_line=weather_line)
               + (f"\n思い出したこと: {' / '.join(recalled)}" if recalled else "")
-              + (_DEEP_REFLECT_TASK if deep else _REFLECT_TASK))
+              + task)
     rng_key = f"reflect/{agent.id}/{step}"
     response, call_id, cached = llm.generate(
         prompt, rng_key=rng_key, temperature=0.7, max_tokens=max_tokens,

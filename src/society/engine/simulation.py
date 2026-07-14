@@ -57,6 +57,8 @@ class Simulation:
         prcfg = cfg.get("prompts", {}) or {}
         self.promptscfg = {
             "variety_hint": bool(prcfg.get("variety_hint", False)),
+            # A4(第20バッチ検収): 内省 belief の雛形復唱対策。既定 OFF=内省プロンプト不変。
+            "reflect_variety": bool(prcfg.get("reflect_variety", False)),
         }
         # 日付・カレンダー / 天気(第7バッチ 2026-07-07。すべて既定 OFF=現行挙動と完全同一)。
         # 当日の date_line/weather を run_step の日境界で確定し sim に保持(全エージェント共通・

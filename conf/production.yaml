@@ -113,6 +113,8 @@ rules:
   allow_declare: true                      # 制度深化: 権利創設・宣言型 rule(パートナーシップ条例モデル)
 prompts:
   variety_hint: true                       # P3 発話の定型化対策(決まり文句で始めない注意書き)
+  # A4 reflect_variety: 実LLM検収で丸写し(placeholder echo)33% → 正味悪化のため当面 OFF(daily.yaml と同判断)。
+  reflect_variety: false
 relations:
   enabled: true                            # G2 社会関係の質(深化段階/断絶/評判/派閥)
 institution_routes:                        # G3 制度改変の3ルート + 制度深化(第9バッチ)
@@ -225,3 +227,13 @@ drive:
 # status_gini / status_top10_share / status_rank_mobility を L2 に出し、集中と移動性を観測する。
 hierarchy:
   enabled: true
+
+# ==== LLM トークン設定(第34バッチ 2026-07-15・pending-decisions 事項1の適用)====
+# reflect_think: false — ollama の num_predict は思考トークンを含むため、qwen3 系の think=true では
+# 夜間内省の最終JSON(belief)が全滅する実測(wv_llm_2d 等4ラン全て書き戻し0件)。daily.yaml は
+# 第20バッチで修正済み・production は未修正のままだった=本選での再発防止。修正後の検証で
+# 15/15 書き戻し成功(belief は k の作用チャネル=空の内省より思考なしの内省を優先する)。
+model:
+  reflect_think: false
+  reflect_max_tokens: 768   # 右サイズ化(A1 実測根拠は daily.yaml の注記参照。think=false 前提・
+                            # think=true に戻すなら 1600 以上へ)。vLLM では KV スロット予約が縮み高並列が改善。

@@ -60,7 +60,10 @@ weather:
 #    空の内省より思考なしの内省=belief 書き戻し(kの作用チャネル)の開通を優先する。
 model:
   max_tokens: 320
-  reflect_max_tokens: 2048
+  # 右サイズ化(第34バッチ A1 実測: reflect_think=false の実LLM10ラン・139内省で raw JSON max=459字
+  # ≈247tok → 768 は最悪値の~2.2倍余裕。2048 は think=true 時代の名残=約8倍過大)。
+  # ★think=true に戻す場合は思考が予算を食うため 1600 以上へ戻すこと。
+  reflect_max_tokens: 768
   plan_max_tokens: 448
   reflect_think: false
 
@@ -123,6 +126,10 @@ rules:
   allow_declare: true                      # 制度深化: 権利創設・宣言型 rule(パートナーシップ条例モデル)
 prompts:
   variety_hint: true                       # P3 発話の定型化対策(決まり文句で始めない注意書き)
+  # A4 reflect_variety は実LLM検収で復唱 17.9%→0% の一方「バリアント説明句の丸写し」が 33% 発生
+  # (belief が指示文そのもの=k経路を汚染)。正味悪化のため当面 OFF(第34バッチ 2026-07-15 Fable判断)。
+  # 再ON条件: 丸写し棄却ガード or reflect を 8b へ(router)— docs/plans/unimplemented-inventory.md 参照。
+  reflect_variety: false
 relations:
   enabled: true                            # G2 社会関係の質(深化段階/断絶/評判/派閥)
 institution_routes:                        # G3 制度改変の3ルート + 制度深化(第9バッチ)

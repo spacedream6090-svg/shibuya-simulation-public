@@ -2715,7 +2715,9 @@ def run_step(sim, step: int) -> None:
                           agentic_pull=getattr(sim, "agentic_pull", False),
                           date_line=getattr(sim, "today_date_line", None),
                           weather_line=getattr(sim, "today_weather_line", None),
-                          reflect_cfg=getattr(sim, "reflectcfg", None))
+                          reflect_cfg=getattr(sim, "reflectcfg", None),
+                          reflect_variety=bool(getattr(sim, "promptscfg", {})
+                                               .get("reflect_variety", False)))
 
     sim.logger.log_metrics(step, collect(sim))
     if step % int(sim.cfg.observer.snapshot_every) == 0:

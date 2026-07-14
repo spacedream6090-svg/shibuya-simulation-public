@@ -1,0 +1,56 @@
+# =============================================================================
+# 運用プロファイル(例)— ローカル + API 混載 / router(第24バッチ A5 / M4)
+#
+# 「基底 conf/config.yaml との差分だけ」を重ねる **例**。--profile 明示時のみ有効。
+# 使いどころ(multi-model-lod.md の設計判断4): API は「前景の少数 or reflect の品質上澄み」だけ。
+# 全体 API 化は k×seed 掃引で破綻($2.1k〜$23k)= 本命は全ローカル、API は上澄み買い。
+#
+# ★API キーは **環境変数名だけ** を config に書く(値は絶対に書かない・ログにも出さない)。
+#   export/setx ANTHROPIC_API_KEY=...(値はシェル側)   OPENAI_API_KEY / GEMINI_API_KEY も同様。
+#   子は各自 CachedLLM に包まれ、キャッシュは子の name 別ファイル(llm_cache.<name>.jsonl)=
+#   「初回ラン=生成→以降=バイト一致で再生」の規律を API 混載でも保つ(再現性の実体)。
+#
+# 課金の作法(コスト事前見積り=E4):
+#   - スモークは1呼だけ叩いて単価×トークンで見積り(scripts/check_llm_backends.py)。
+#   - 本番は Batch API(50%引き)で「初回ランを事前生成→キャッシュ再生」を推奨。
+#   - reflect は全呼の ~3.8% = API に出しても総コストは小さい(前景10%×1日 <$1 目安)。
+# =============================================================================
+
+model:
+  backend: router
+  cache: true
+  format: json
+  temperature: 0.7
+
+  # 出力上限(bench 実測の右サイズ。根拠は local-ollama.yaml と同じ)
+  max_tokens: 320
+  plan_max_tokens: 448
+  reflect_max_tokens: 768
+  reflect_think: false
+
+  router:
+    # 既定(deliberate/plan/speak/… = 呼数の大半)= ローカル ollama 4b。
+    default:
+      backend: ollama
+      name: "qwen3:4b"
+      host: "http://localhost:11434"
+    purpose:
+      # reflect(少数・高価値)だけ API へ。品質の上澄み買い。
+      #  例A: Anthropic ネイティブ(temp/seed 無し=キャッシュが再現性の唯一の実体)
+      reflect:
+        backend: anthropic
+        name: "claude-haiku-4-5"
+        api_key_env: "ANTHROPIC_API_KEY"      # ★変数名のみ。値は書かない
+        base_url: "https://api.anthropic.com"
+      #  例B: OpenAI 互換(OpenAI 本家 / Gemini 互換 / LM Studio 等)へ振るなら↓の形
+      # reflect:
+      #   backend: openai_compat
+      #   name: "gpt-5.4-mini"
+      #   api_key_env: "OPENAI_API_KEY"
+      #   base_url: "https://api.openai.com/v1"
+      #  例C: Gemini(OpenAI 互換エンドポイント)
+      # reflect:
+      #   backend: openai_compat
+      #   name: "gemini-2.5-flash-lite"
+      #   api_key_env: "GEMINI_API_KEY"
+      #   base_url: "https://generativelanguage.googleapis.com/v1beta/openai"

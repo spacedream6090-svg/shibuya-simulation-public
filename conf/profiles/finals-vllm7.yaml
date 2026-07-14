@@ -1,0 +1,57 @@
+# =============================================================================
+# 運用プロファイル(例)— 本選 GPU 7枚 / vLLM 艦隊(第24バッチ A5 / M4)
+#
+# 「基底 conf/config.yaml との差分だけ」を重ねる **例**。--profile 明示時のみ有効。
+# realism・規模は production.yaml が担う(本ファイルは model=バックエンド配線のみ)。
+# 本番相当:  production.yaml の model: ブロックを本内容へ差し替えて --profile production.yaml
+#
+# 前提トポロジ(ops topology A = 単一データセンターノードに 7 GPU):
+#   - vLLM プロセスをポート 8000〜8006 に1本ずつ(GPU0〜6 に固定)= ops/launch-vllm-finals.ps1
+#   - FleetLLM が agent_id で sticky 割当 → 同一エージェントの prefix が同じサーバに当たり続け、
+#     prefix cache ヒット率が上がる(単一機の天井 ~96%)。
+#   - tiers で purpose 別にサーバ群を分ける。下の例は「reflect=大モデル1本(8000)/
+#     deliberate 系=残り6本(8001-8006)」。7GPU に 32B×TP2 + 8B×5 を割るなら servers/tiers を
+#     その port 割当に合わせて書き換える(構成は docs/research/multi-model-lod.md §2.2)。
+#
+# ★speculative decoding / prefix caching は **config ではなく vLLM 起動フラグ**:
+#     --enable-prefix-caching / --speculative-config(EAGLE 等)。本ファイルからは制御しない。
+#     起動フラグ・GPU 割当・実測手順は ops/launch-vllm-finals.ps1 と
+#     ops/finals-compute-checklist.md を参照(EAGLE draft は本選機で未検証=要疎通)。
+# =============================================================================
+
+model:
+  backend: vllm
+  cache: true
+  format: json
+  temperature: 0.7
+  timeout_s: 120           # 1リクエストのタイムアウト秒(重い内省が長い場合は上げる)
+
+  # --- 出力上限(bench 実測の右サイズ。reflect_think=false 前提。根拠は local-ollama.yaml と同じ)---
+  #  vLLM は max_tokens ぶんの KV スロットを見込んで連続バッチングするため、reflect の上限を
+  #  2048→768 に下げると 1リクエストの KV 予約が縮み、同時実行スロットが増える=高並列時の
+  #  スループット改善に効く(ollama 単一ストリームでは非拘束=無効。効果は本選機で要実測)。
+  max_tokens: 320
+  plan_max_tokens: 448
+  reflect_max_tokens: 768
+  reflect_think: false
+
+  # --- 艦隊(7本)+ tier 割当の例 ---
+  name: "qwen3:8b"         # 既定モデル名(全サーバ同一モデルを想定。混在時は tiers 側で port を分ける)
+  servers:
+    - "http://localhost:8000"   # GPU0
+    - "http://localhost:8001"   # GPU1
+    - "http://localhost:8002"   # GPU2
+    - "http://localhost:8003"   # GPU3
+    - "http://localhost:8004"   # GPU4
+    - "http://localhost:8005"   # GPU5
+    - "http://localhost:8006"   # GPU6
+  tiers:                    # purpose(rng_key 先頭)別のサーバ群。tiers を書くと servers 1本でも艦隊経路を通る
+    reflect:                # 内省=重い/大モデルに寄せる(例では 8000 の1本に集約)
+      - "http://localhost:8000"
+    default:                # deliberate/plan/speak/... = 残り6本で捌く
+      - "http://localhost:8001"
+      - "http://localhost:8002"
+      - "http://localhost:8003"
+      - "http://localhost:8004"
+      - "http://localhost:8005"
+      - "http://localhost:8006"

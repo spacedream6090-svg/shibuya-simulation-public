@@ -1,0 +1,48 @@
+# =============================================================================
+# 運用プロファイル(例)— 手元 PC / Ollama・purpose-LOD(第24バッチ A5 / M4)
+#
+# これは「基底 conf/config.yaml との差分だけ」を重ねる **例** のプロファイル。
+# --profile 明示時のみ有効=既定挙動は一切変えない。model(バックエンド)ブロックが
+# 可搬部分。realism・規模(n_agents 等)は conf/daily.yaml / conf/production.yaml が担うので、
+# 本番相当で回すなら model ブロックをそちらへ写すか、dotlist で realism を足すこと
+# (load_config は profile を1枚しか重ねない=daily と本プロファイルの二枚重ねは不可)。
+#
+# 使い方(モデル配線のスモーク):
+#   python scripts/run.py --profile conf/profiles/local-ollama.yaml run.n_agents=6 run.n_steps=20
+# 本番相当(production の realism + このモデル配線):
+#   → production.yaml の model: ブロックを本ファイルの内容へ差し替えて --profile production.yaml
+#
+# 前提の環境変数(Ollama に2モデル常駐させ、reflect=8b / それ以外=4b を切替なしで同居):
+#   setx OLLAMA_MAX_LOADED_MODELS 2     # 4b と 8b を同時ロード(VRAM 次第で調整)
+#   setx OLLAMA_KEEP_ALIVE 30m          # アンロード頻発を防ぐ
+#   ollama pull qwen3:4b && ollama pull qwen3:8b
+# =============================================================================
+
+model:
+  backend: router          # purpose(呼種)別に子バックエンドへ振り分ける(M2)
+  cache: true              # 再現性の実体(D13)。初回=生成、以降=再生
+  format: json
+  temperature: 0.7
+
+  # --- 出力上限(第24バッチ bench 実測の右サイズ提案。reflect_think=false 前提)---
+  #  reflect: 実測 raw 応答 p95=411 / max=459 字(qwen3:4b・10ラン・139内省)= 実測 1.855 字/tok で
+  #           ~247tok。深い内省の self/ties を足しても ~350tok。2048 は think=true 時代の名残で
+  #           think=false では 8x 過大 → 768 に右サイズ(観測 max の ~2.2x 余裕)。
+  #  ★条件付き: reflect_think を true に戻すなら思考が予算を食うため 768 では飢える=1600 以上へ。
+  max_tokens: 320          # 発話・投稿・DM(実測 speak raw max=367字≈201tok < 320=妥当)
+  plan_max_tokens: 448     # 朝の計画(実測 plan raw max=543字≈215-302tok < 448=妥当)
+  reflect_max_tokens: 768  # 内省(2048→768。上記根拠)
+  reflect_think: false     # ollama num_predict は思考を含むため内省は think=false(第20バッチ実測)
+
+  # --- purpose-LOD: reflect(全体の ~3.8%)だけ大モデル、他は 4b ---
+  #  R1 安全: 全エージェント一様の purpose 振り分け=呼数もモデルも k と交絡しない。
+  router:
+    default:
+      backend: ollama
+      name: "qwen3:4b"
+      host: "http://localhost:11434"
+    purpose:
+      reflect:
+        backend: ollama
+        name: "qwen3:8b"     # 内省だけ一段大きいモデル(手元 VRAM で回る範囲の例)
+        host: "http://localhost:11434"
