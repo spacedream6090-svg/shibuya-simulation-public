@@ -45,15 +45,168 @@ _FLOAT_KEYS = [
 ]
 
 
+def _resolve_data(path_str: str, label: str) -> str:
+    """EnvPack のデータ参照(リポジトリルート相対 or 絶対)を実在チェックしてそのまま返す。
+
+    欠けていたら明確なエラー(どのキーのどのファイルが無いか)を出す。パスは config へは
+    元の相対文字列のまま入れる(既存 config と同じ「リポジトリルート相対」規約=Simulation 側で解決)。
+    """
+    p = Path(path_str)
+    full = p if p.is_absolute() else REPO_ROOT / p
+    if not full.exists():
+        raise FileNotFoundError(
+            f"EnvPack のデータファイルが実在しない({label}): {path_str}")
+    return str(path_str)
+
+
+def build_env_overlay(env: str | Path) -> dict:
+    """EnvPack manifest(env/<place>/env.yaml または env.yaml パス)を既存 config キー群へ写像する。
+
+    3層設計(docs/plans/env-classification.md):
+      ③-A データ実体 → world.map / transit.file / agents.personas_file / organizations.* /
+                        world.traffic.features_file / ads.*
+      ③-B 語彙・行事・気候・番組名・原点・駅名 → envpack.*
+      ② 制度: institutions.pref を ref/institutions_jp.yaml から解決 → institutions.*(税・按分・
+         労働日)+ economy.min_wage_hourly(都道府県スコープ)。既定=現行コード値=ref なので L1 不変。
+      ③ 地点固有の制度: council → institution_routes.assembly/vote / rent_income_ratio → economy.accounts
+
+    返す dict は profile と同じ重ね書き機構(OmegaConf.merge)で基底へ載せる。必須キー(env.name /
+    data.map)の欠落・データファイルの不在は明確なエラーにする。transit 無し env は縮退(徒歩の街)。
+    """
+    p = Path(env)
+    manifest = (p / "env.yaml") if p.is_dir() else p
+    if not manifest.exists():
+        raise FileNotFoundError(f"EnvPack manifest が見つからない: {manifest}")
+    doc = OmegaConf.to_container(OmegaConf.load(manifest), resolve=True) or {}
+    base_dir = manifest.parent
+
+    # ---- 必須キー検証 ----
+    if not (doc.get("env") or {}).get("name"):
+        raise ValueError(f"EnvPack manifest に必須キー env.name が無い: {manifest}")
+    data = doc.get("data") or {}
+    if not data.get("map"):
+        raise ValueError(f"EnvPack manifest に必須キー data.map が無い(地図は必須): {manifest}")
+
+    overlay: dict = {}
+
+    # ---- ③-A データ実体 → 既存 config キー ----
+    world: dict = {"map": _resolve_data(data["map"], "data.map")}
+    if data.get("traffic_features"):
+        world["traffic"] = {"features_file":
+                            _resolve_data(data["traffic_features"], "data.traffic_features")}
+    overlay["world"] = world
+    if data.get("transit"):                              # 無ければ縮退(徒歩の街)=基底の transit を使う
+        overlay["transit"] = {"file": _resolve_data(data["transit"], "data.transit")}
+    if data.get("personas"):
+        overlay["agents"] = {"personas_file":
+                             _resolve_data(data["personas"], "data.personas")}
+    orgs: dict = {}
+    if data.get("organizations"):
+        orgs["book"] = _resolve_data(data["organizations"], "data.organizations")
+    if data.get("assignments"):
+        orgs["assignments"] = _resolve_data(data["assignments"], "data.assignments")
+    if orgs:
+        overlay["organizations"] = orgs
+
+    # ---- ③-B envpack(語彙・行事・気候・番組名・原点・駅名フィルタ)→ envpack.* ----
+    culture = doc.get("culture") or {}
+    envpack: dict = {}
+    if culture.get("lexicon"):
+        envpack["lexicon"] = dict(culture["lexicon"])
+    if culture.get("events") is not None:
+        envpack["culture"] = {"events": list(culture["events"])}
+    if culture.get("media"):
+        envpack["media"] = dict(culture["media"])
+    if (doc.get("origin") or {}).get("landmark"):
+        envpack["origin"] = {"landmark": doc["origin"]["landmark"]}
+    if doc.get("climate"):
+        envpack["climate"] = dict(doc["climate"])
+    if (doc.get("transit") or {}).get("station_filters"):
+        envpack["transit"] = {"station_filters": list(doc["transit"]["station_filters"])}
+    if envpack:
+        overlay["envpack"] = envpack
+
+    # ---- ③-A 街頭広告の掲出地点 → ads.*(ads.enabled は env が触らない=既定 OFF のまま)----
+    ads = doc.get("ads") or {}
+    ads_ov = {k: list(ads[k]) for k in ("large", "slots") if k in ads}
+    if ads_ov:
+        overlay["ads"] = ads_ov
+
+    # ---- ② 制度: pref セレクタ + ref 解決 → institutions.* / economy.min_wage_hourly ----
+    inst = doc.get("institutions") or {}
+    if inst.get("pref"):
+        ref_rel = inst.get("ref")
+        ref_path = None
+        if ref_rel:
+            rp = Path(ref_rel)
+            ref_path = rp if rp.is_absolute() else (base_dir / rp)
+        if ref_path is None or not ref_path.exists():
+            ref_path = REPO_ROOT / "ref" / "institutions_jp.yaml"
+        if not ref_path.exists():
+            raise FileNotFoundError(f"institutions.ref が実在しない: {ref_path}")
+        ref = OmegaConf.to_container(OmegaConf.load(ref_path), resolve=True) or {}
+        prefs = ref.get("prefectures") or {}
+        pref = inst["pref"]
+        if pref not in prefs:
+            raise ValueError(f"ref に prefecture '{pref}' が無い: {ref_path}")
+        pv = prefs[pref] or {}
+        nat = ref.get("national") or {}
+        inst_ov: dict = {}
+        if nat.get("income_tax_effective"):             # ref は upto キー → institutions は up_to
+            inst_ov["income_brackets"] = [
+                {"up_to": b.get("upto"), "rate": b["rate"]}
+                for b in nat["income_tax_effective"]]
+        if nat.get("consumption"):
+            cc = nat["consumption"]
+            inst_ov["consumption"] = {
+                "rate": cc.get("rate"), "reduced_rate": cc.get("reduced"),
+                "national_share": cc.get("national_share"),
+                "reduced_cats": list(cc.get("reduced_cats") or ["food"])}
+        res: dict = {}
+        if nat.get("resident_tax", {}).get("rate") is not None:
+            res["rate"] = nat["resident_tax"]["rate"]
+        if pv.get("special_ward_resident_split"):
+            res["ward_share"] = pv["special_ward_resident_split"][0]
+        if res:
+            inst_ov["resident"] = res
+        if (nat.get("labor") or {}).get("annual_workdays") is not None:
+            inst_ov["labor"] = {"annual_workdays": nat["labor"]["annual_workdays"]}
+        if inst_ov:
+            overlay["institutions"] = inst_ov
+        if pv.get("min_wage_hourly") is not None:       # 最賃=都道府県スコープ → economy
+            overlay["economy"] = {"min_wage_hourly": pv["min_wage_hourly"]}
+
+    # ---- ③ 地点固有の制度: council → institution_routes / rent_income_ratio → economy.accounts ----
+    council = inst.get("council") or {}
+    ir: dict = {}
+    asm = {k: council[k] for k in ("size", "term_days") if council.get(k) is not None}
+    if asm:
+        ir["assembly"] = asm
+    if council.get("deposit") is not None:
+        ir["vote"] = {"deposit": council["deposit"]}
+    if ir:
+        overlay["institution_routes"] = ir
+    if inst.get("rent_income_ratio") is not None:
+        overlay.setdefault("economy", {}).setdefault("accounts", {})["rent_share"] = \
+            inst["rent_income_ratio"]
+
+    return overlay
+
+
 def load_config(overrides: list[str] | None = None,
                 path: str | Path | None = None,
-                profile: str | Path | None = None) -> DictConfig:
-    """基底 config.yaml(または path)に、profile 差分 YAML → dotlist の順で重ねる。
+                profile: str | Path | None = None,
+                env: str | Path | None = None) -> DictConfig:
+    """基底 config.yaml(または path)に、env → profile 差分 YAML → dotlist の順で重ねる。
 
+    env:     EnvPack(env/<place> ディレクトリ or env.yaml パス)。「場所」を束ねた manifest を
+             既存 config キー群へ写像して重ねる(build_env_overlay)。
     profile: 本番用など「基底との差分だけ」を書いた YAML(conf/production.yaml 等)。
-             基底の上に OmegaConf.merge で重ねる(未指定キーは基底のまま)。
+    優先順位: 基底 < env < profile < dotlist(env=「場所」、profile=「用途」なので profile が勝つ)。
     """
     cfg = OmegaConf.load(Path(path) if path else DEFAULT_CONFIG)
+    if env is not None:
+        cfg = OmegaConf.merge(cfg, build_env_overlay(env))
     if profile is not None:
         cfg = OmegaConf.merge(cfg, OmegaConf.load(Path(profile)))
     if overrides:

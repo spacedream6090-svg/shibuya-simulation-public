@@ -38,6 +38,14 @@ class Simulation:
                        if OmegaConf.is_config(raw_envpack) else raw_envpack)
         self.envpackcfg = _envpack_mod.build_cfg(raw_envpack)
         self.place_name = self.envpackcfg["lexicon"]["place_name"]  # 街の名前(プロンプト用)
+        # 制度値(institutions)= 税率・予算・給付など「値=環境/参照」(D1-W3)。基盤(src)は
+        # コード埋没の制度値を持たず、ここで conf の institutions ブロックを1回だけ正準化して保持する
+        # (envpack と同じ build_cfg 流儀)。government(scheduler)は sim.institutionscfg 経由で読む。
+        from .. import institutions as _institutions_mod
+        raw_inst = cfg.get("institutions", None)
+        raw_inst = (OmegaConf.to_container(raw_inst, resolve=True)
+                    if OmegaConf.is_config(raw_inst) else raw_inst)
+        self.institutionscfg = _institutions_mod.build_cfg(raw_inst)
         map_path = Path(cfg.world.map)
         if not map_path.is_absolute():
             map_path = REPO_ROOT / map_path

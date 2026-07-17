@@ -170,7 +170,9 @@ def _gov(sim):
         raw = sim.cfg.get("government", None)
         raw = (OmegaConf.to_container(raw, resolve=True)
                if OmegaConf.is_config(raw) else dict(raw or {}))
-        gov = Government(build_government_cfg(raw))
+        # 制度値は simulation.py が正準化した institutions ブロック(D1-W3)から供給する。
+        inst = getattr(sim, "institutionscfg", None)
+        gov = Government(build_government_cfg(raw, institutions=inst))
         sim.government = gov
     return gov
 

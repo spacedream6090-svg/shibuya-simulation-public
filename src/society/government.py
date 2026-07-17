@@ -21,6 +21,8 @@ from __future__ import annotations
 
 # ---- 消費税の国:地方 配分(国税庁 No.6303: 地方消費税=消費税額×22/78 → 国78% / 地方22%)----
 #   標準10%(国7.8+地方2.2)も軽減8%(国6.24+地方1.76)も比率は同じ 78:22。
+#   D1-W3: この値も含め制度値は institutions ブロック(既定=institutions.py の現行値)から来る。
+#   下の module 定数は歴史的な既定の記録用。実際の按分は self.cfg["consumption_national_share"]。
 _CONSUMPTION_NATIONAL_SHARE = 0.78
 
 
@@ -30,52 +32,45 @@ def _default_income_brackets() -> list[dict]:
     給与所得控除・基礎控除・社保控除があるため額面に対する実効税率は低め(docs 参照)。
     統計的な限界税率表(5/10/20/23/33/40/45%)ではなく「年収→実効税率」の近似である旨を明記。
     up_to=None(最後)は上限なし。年換算は日給×annual_workdays で行う(government cfg)。
+    D1-W3: 既定の正準は institutions.build_cfg(None)(値の二重管理を避けここへ委譲)。
     """
-    return [
-        {"up_to": 2_000_000, "rate": 0.02},
-        {"up_to": 3_300_000, "rate": 0.03},
-        {"up_to": 5_000_000, "rate": 0.05},
-        {"up_to": 7_000_000, "rate": 0.07},
-        {"up_to": 10_000_000, "rate": 0.11},
-        {"up_to": None, "rate": 0.20},
-    ]
+    from . import institutions as _inst_mod
+    return _inst_mod.build_cfg(None)["income_brackets"]
 
 
-def build_government_cfg(raw: dict | None) -> dict:
-    """config(government ブロック)→ 実行時 dict。既定は **OFF**(現状挙動を一切変えない)。
+def build_government_cfg(raw: dict | None, institutions: dict | None = None) -> dict:
+    """config(government ブロック + institutions ブロック)→ 実行時 dict。既定 **OFF**(現状不変)。
 
-    初期残高は「年間予算 ÷ 人口 × 100体」でスケール換算(docs/research §7)。短ランでは
-    日次の税フローに対し十分な準備金。config.yaml は本バッチでは編集せず(最終スチュワード統合)、
-    既定値はここに置く(final 報告に config キー案を提示)。
+    D1-W3: 税率・予算初期値・給付など**制度値**は institutions ブロック(既定=現行コード値)から来る。
+    ``institutions`` は simulation.py が institutions.build_cfg で1回だけ正準化した dict(平キー)。
+    None のときは institutions.build_cfg(None)=現行コード既定を使う(直接構築する既存テスト互換)。
+    ``government`` ブロック(raw)は ``enabled`` を持ち、個別の制度値上書きがあれば institutions より
+    優先する(config.yaml の「ここで上書き可能」注記の後方互換)。
+
+    初期残高は「年間予算 ÷ 人口 × 100体」でスケール換算(docs/research §7)。
     """
+    from . import institutions as _inst_mod
     raw = dict(raw or {})
-    brackets = raw.get("income_brackets")
-    if brackets:
-        brackets = [{"up_to": (None if b.get("up_to") in (None, "", "null")
-                               else float(b["up_to"])),
-                     "rate": float(b["rate"])} for b in brackets]
-    else:
-        brackets = _default_income_brackets()
-    return {
-        "enabled": bool(raw.get("enabled", False)),          # ★既定 OFF
-        # 初期予算残高(円)。docs/research §7 のスケール換算。
-        "ward_initial": float(raw.get("ward_initial", 60_000_000)),   # 渋谷区 1,468.73億÷24.4万×100
-        "metro_initial": float(raw.get("metro_initial", 65_000_000)), # 東京都 9.158兆÷1,400万×100
-        "nation_initial": float(raw.get("nation_initial", 92_000_000)),  # 国 115兆÷1.25億×100
-        # 住民税(所得割): 区6% + 都4% = 10%。区:都 = 6:4(docs §1)。
-        "resident_rate": float(raw.get("resident_rate", 0.10)),
-        "resident_ward_share": float(raw.get("resident_ward_share", 0.6)),
-        # 所得税(国税・源泉徴収): 日給を annual_workdays で年換算しレンジ別実効税率(docs §2)。
-        "annual_workdays": int(raw.get("annual_workdays", 245)),
-        "income_brackets": brackets,
-        # 消費税: 標準10% / 軽減8%(food系)。国:地方=78:22(docs §3)。
-        "consumption_rate": float(raw.get("consumption_rate", 0.10)),
-        "consumption_reduced_rate": float(raw.get("consumption_reduced_rate", 0.08)),
-        "reduced_cats": list(raw.get("reduced_cats", ["food"])),   # food=8%(他10%)。※現実の軽減対象は持帰り飲食料品
-        # セーフティネット(区の生活困窮者支援): 所持金がこの額未満で給付(docs §4.2)。
-        "benefit_threshold": float(raw.get("benefit_threshold", 2000)),
-        "benefit_amount": float(raw.get("benefit_amount", 3000)),
+    # 制度値の基底 = institutions ブロック(正準済み dict)。未指定なら現行コード既定。
+    gov = dict(institutions) if institutions is not None else _inst_mod.build_cfg(None)
+    # 後方互換: government ブロックに個別の制度値上書きがあれば優先する。
+    if raw.get("income_brackets"):
+        gov["income_brackets"] = _inst_mod.build_cfg(
+            {"income_brackets": raw["income_brackets"]})["income_brackets"]
+    _casts = {
+        "ward_initial": float, "metro_initial": float, "nation_initial": float,
+        "resident_rate": float, "resident_ward_share": float,
+        "annual_workdays": int, "consumption_rate": float,
+        "consumption_reduced_rate": float, "consumption_national_share": float,
+        "benefit_threshold": float, "benefit_amount": float,
     }
+    for key, cast in _casts.items():
+        if raw.get(key) is not None:
+            gov[key] = cast(raw[key])
+    if raw.get("reduced_cats"):
+        gov["reduced_cats"] = list(raw["reduced_cats"])
+    gov["enabled"] = bool(raw.get("enabled", False))          # ★既定 OFF
+    return gov
 
 
 class Government:
@@ -164,5 +159,6 @@ class Government:
                 if cat in self.cfg["reduced_cats"]
                 else float(self.cfg["consumption_rate"]))
         ct = price * rate / (1.0 + rate)                 # 内税の税額
-        national = ct * _CONSUMPTION_NATIONAL_SHARE
+        national = ct * float(self.cfg.get("consumption_national_share",
+                                            _CONSUMPTION_NATIONAL_SHARE))
         return national, ct - national, rate             # 地方=残り(合計を厳密一致させる)

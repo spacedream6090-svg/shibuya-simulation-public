@@ -11,13 +11,16 @@ schema_version: 1
 
 # ---- 全国一律(法律で定まり都道府県で変わらない)----
 national:
-  # 所得税 実効税率ブラケット(government.py:35-41 の近似=累進の圧縮)。出典: 所得税法・国税庁 速算表の近似。
+  # 所得税 実効税率ブラケット(額面年収レンジ→実効税率の近似=累進の圧縮)。出典: 所得税法・国税庁 速算表の近似。
+  # D1-W3: conf/config.yaml の institutions.income_brackets(=現行の government.py 埋没値)と一致させる
+  # (値の二重管理のズレ検知。tests/test_institutions.py が固定)。W1 scaffold 時の rate 中段
+  # (0.05/0.10/0.15/0.18)はコード実値と不一致だったため現行コード値へ訂正。
   income_tax_effective:
     - {upto: 2000000,  rate: 0.02}
-    - {upto: 3300000,  rate: 0.05}
-    - {upto: 5000000,  rate: 0.10}
-    - {upto: 7000000,  rate: 0.15}
-    - {upto: 10000000, rate: 0.18}
+    - {upto: 3300000,  rate: 0.03}
+    - {upto: 5000000,  rate: 0.05}
+    - {upto: 7000000,  rate: 0.07}
+    - {upto: 10000000, rate: 0.11}
     - {upto: null,     rate: 0.20}   # 上限超
   consumption:
     rate: 0.10           # 消費税 標準税率(消費税法・地方税法)

@@ -6,6 +6,8 @@
     python scripts/run.py k.writeback=sham      # R1 対照(偽内省)
     python scripts/run.py --profile conf/production.yaml   # 本番: 全リアリズム機能ON+初期条件
         # プロファイルは基底 config.yaml の上に差分を重ねる。dotlist で更に上書き可(例: run.seed=7)。
+    python scripts/run.py --env env/shibuya      # EnvPack(場所)を束ねて読む(D1-W4)
+        # 優先順位: 基底 < env < profile < dotlist。--profile と併用可(env=場所・profile=用途)。
     python scripts/run.py --resume runs/<name>  # D16 途中再開(最新 checkpoint から続行)
         # resume は run dir の config.yaml を読む。さらに先まで回すなら run.n_steps=… を併記。
         # 例: python scripts/run.py --resume runs/day80 run.n_steps=288
@@ -26,6 +28,7 @@ def main() -> None:
     args = list(sys.argv[1:])
     resume_dir: str | None = None
     profile: str | None = None
+    env: str | None = None
     overrides: list[str] = []
     i = 0
     while i < len(args):
@@ -34,6 +37,9 @@ def main() -> None:
             i += 2
         elif args[i] == "--profile":
             profile = args[i + 1]
+            i += 2
+        elif args[i] == "--env":
+            env = args[i + 1]
             i += 2
         else:
             overrides.append(args[i])
@@ -46,7 +52,7 @@ def main() -> None:
         sim = Simulation(cfg, out_dir=run_dir)     # 既存 run dir は消さずに続行する
         summary = sim.run(resume_from=run_dir)
     else:
-        cfg = load_config(overrides=overrides, profile=profile)
+        cfg = load_config(overrides=overrides, profile=profile, env=env)
         sim = Simulation(cfg)
         summary = sim.run()
     print(json.dumps(summary, ensure_ascii=False, indent=2))

@@ -608,12 +608,49 @@ observer:
 # 本番・B段での ON はユーザー承認のうえ一括で行う(ON 例は各ブロックのコメント)。
 # ============================================================
 
+# ============================================================
+# 制度値 institutions(基盤モデル抽出 D1-W3。docs/plans/env-classification.md の3層設計)。
+# 従来 government.py に **コード埋没** していた日本の制度値をここへ外出しした(既定=現行コード値
+# =ゴールデン/本番の挙動を一切変えない)。simulation.py が institutions.build_cfg で1回正準化し、
+# government(税・予算・給付)が読む。W4 の EnvPack ローダは env.yaml の institutions.pref: tokyo を
+# ref/institutions_jp.yaml から解決してこのブロックへ展開する(② 共有参照 → ③ 環境固有 の橋渡し)。
+# 掟(値の二重管理のズレ検知): 国・都道府県スコープの値は ref/institutions_jp.yaml と一致させる
+# (tests/test_institutions.py が固定)。市区町村スコープ(区の予算・給付)は env 固有=③ として残す。
+# ============================================================
+institutions:
+  # 所得税 実効税率ブラケット(国スコープ。額面年収レンジ→実効税率の近似=累進の圧縮)。
+  # up_to=null は上限なし。年換算は日給×labor.annual_workdays。ref national.income_tax_effective と一致。
+  income_brackets:
+    - {up_to: 2000000,  rate: 0.02}
+    - {up_to: 3300000,  rate: 0.03}
+    - {up_to: 5000000,  rate: 0.05}
+    - {up_to: 7000000,  rate: 0.07}
+    - {up_to: 10000000, rate: 0.11}
+    - {up_to: null,     rate: 0.20}
+  consumption:                    # 消費税(国スコープ)。ref national.consumption と一致。
+    rate: 0.10                    # 標準税率
+    reduced_rate: 0.08            # 軽減税率(food系)
+    national_share: 0.78          # 国:地方=78:22(地方消費税=消費税額×22/78)
+    reduced_cats: [food]          # 軽減対象カテゴリ
+  resident:                       # 住民税(所得割)。rate=国スコープ / ward_share=都(特別区)スコープ。
+    rate: 0.10                    # 標準税率(区6%+都4%)。ref national.resident_tax.rate と一致。
+    ward_share: 0.6               # 区:都=6:4。ref prefectures.tokyo.special_ward_resident_split と一致。
+  labor:
+    annual_workdays: 245          # 年間労働日(日給→年換算)。ref national.labor.annual_workdays と一致。
+  budget:                         # 予算初期残高(円。年予算÷人口×100体スケール)。
+    ward_initial: 60000000        # 渋谷区(市区町村スコープ=③ 環境固有)
+    metro_initial: 65000000       # 東京都(都道府県スコープ)
+    nation_initial: 92000000      # 国(国スコープ)
+  benefit:                        # 区の生活困窮者支援(市区町村スコープ=③ 環境固有)。
+    threshold: 2000               # 所持金がこの額未満で給付
+    amount: 3000                  # 給付額
+
 # ---- 行政 B(区/都/国の税・給付・公務員給与。調査: docs/research/shibuya-government.md)----
 # ON 時: 賃金から所得税(→国)+住民税(→区6:都4)を源泉徴収(手取り支給)、消費に内税の
 # 消費税(標準10%/食品8%、国78:地方22)を計上(価格の名目は不変)。区は困窮者へ給付。
 # 公務員(区職員=区予算/警察官・消防士=都予算)の給与は予算から歳出。日次で public_budget。
-# 詳細パラメータ(税率・予算初期値・給付閾値)は src/society/government.py の既定値を
-# ここで上書き可能(income_brackets 含む)。
+# 制度値(税率・予算初期値・給付閾値・income_brackets)は上の institutions ブロックが供給する。
+# この government ブロックは機構トグル(enabled)を持つ(個別の制度値上書きも後方互換で可)。
 government:
   enabled: false                # ★ON 推奨(本番): true。公務員入り名簿 = data/personas_100_civic.json
 
