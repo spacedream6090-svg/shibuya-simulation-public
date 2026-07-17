@@ -543,6 +543,12 @@ def synth(run_dir: Path, cx: float, cy: float, r: float,
 
 
 def main(argv: list) -> int:
+    # Windows コンソール(cp932)対策: 進捗 print の en-dash 等で死なない(pimmur_probe と同修正)。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     ap = argparse.ArgumentParser(description="スクランブル領域の微視軌跡オフライン合成(案a)")
     ap.add_argument("run_dir", type=Path)
     ap.add_argument("--center-x", type=float, default=None)
