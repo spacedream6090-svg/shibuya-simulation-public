@@ -152,7 +152,7 @@ def _sick_home(agent, sim, sim_min: int, step: int, rng: np.random.Generator) ->
 
 
 # ---- 朝の一日計画(routine の行き先の土台。ユーザー要望 2026-07-06)----
-# meetup = 待ち合わせ(ハチ公像 等の landmark)。会えたかは既存の対面機構が拾う。
+# meetup = 待ち合わせ(像・名所 等の landmark)。会えたかは既存の対面機構が拾う。
 _PLAN_CAT = {"meal": "food", "shop": "shop", "leisure": "leisure",
              "park": "leisure", "work": "office", "meetup": "landmark",
              "visit": "landmark"}
@@ -294,7 +294,7 @@ def _curfew_suppressed(agent, sim, dest_node: str, sim_min: int, step: int) -> b
 
 
 def _crowd_dest(agent, sim, step: int) -> str | None:
-    """群集日(渋谷ハロウィン型): 自由時間の行き先を集会ノード(スクランブル付近)へ確率的に寄せる。
+    """群集日(大規模行事型): 自由時間の行き先を集会ノード(地図原点付近)へ確率的に寄せる。
 
     群集無効 / 非群集日(today_crowd_event なし)/ 集会ノードが現在地 / 寄せない抽選 なら、乱数を
     一切引かず None(=既定不変・通常の行き先選択へ)。専用 stream 'crowd' のみ使用=既存 draw 順を
@@ -421,7 +421,8 @@ def _media_action(agent, sim, sim_min: int, step: int) -> dict | None:
     agent.activity = "media"
     payload = {"medium": medium, "steps": int(steps), "at": _time_band(sim_min)}
     if mcfg["prompt_context"]:                # 独立フラグ(LLM キャッシュキーに影響)
-        title = media.pick_title(medium, rng)
+        title = media.pick_title(medium, rng,
+                                 titles=sim.envpackcfg["media"])
         payload["title"] = title
         agent.remember(f"「{title}」({media.medium_jp(medium)})を楽しんだ", kind="media")
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
@@ -587,13 +588,13 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
         bld = blds[int(rng.integers(len(blds)))]
         return {"type": "enter_building", "building": bld["id"],
                 "stay_steps": int(rng.integers(2, 7))}   # 2-6 step(短縮)
-    # 自由時間の行き先。群集(渋谷ハロウィン型)> 観光回遊(後続波 H5)> デート(後続波 H2)>
+    # 自由時間の行き先。群集(大規模行事型)> 観光回遊(後続波 H5)> デート(後続波 H2)>
     # 趣味(後続波 H6)> 制度DSL の weekly_event ブースト > Lynch landmark > EPR の順。いずれも OFF・非該当では乱数を
     # 引かず None=以降は従来通り(不変)。観光回遊は観光客のランドマーク巡り(tourist_visit)へ寄せる。
     # EPR の行き先候補は危険地帯(犯罪履歴ノード=治安回避 H5)を除いたリストにする(OFF=全候補で不変)。
     crowd = _crowd_dest(agent, sim, step)
     if crowd is not None:
-        dest = crowd                                 # 群集日: スクランブル付近の集会ノードへ寄せる
+        dest = crowd                                 # 群集日: 地図原点付近の集会ノードへ寄せる
     elif (tour := _diversity.tourist_dest(agent, sim, step, sim_min)) is not None:
         dest = tour                                  # 観光客: ランドマークへ回遊(後続波 H5)
     elif (date := _household.date_dest(agent, sim, step, sim_min)) is not None:

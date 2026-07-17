@@ -191,14 +191,16 @@ def update_implicit_self(agent, ema: float) -> None:
 
 def _recall_query(agent, *, step: int, sim_min: int, llm, place_name: str,
                   logger: ObserverLogger, date_line: str | None = None,
-                  weather_line: str | None = None) -> list[str]:
+                  weather_line: str | None = None,
+                  city_name: str = "") -> list[str]:
     """agentic pull 第1段: 何を思い出したいかを LLM に出させ、mem.query で想起する。
 
     LLM 呼び出しを1本足す(R1: writeback 条件に依らず一定)。想起自体は決定論。
     date_line/weather_line は当日の暦・天気(既定 None=注入せず従来と完全一致)。
+    city_name はプロンプト冒頭の街名(envpack。基盤に地名を残さない)。
     """
     prompt = (build_prompt(agent, place_name=place_name, surprise=None,
-                           nearby_names=[], step=step,
+                           nearby_names=[], step=step, city_name=city_name,
                            date_line=date_line, weather_line=weather_line)
               + "\n今日の内省を始める前に、まず今日のことで思い出したいことを一つ挙げてください。"
               + "\n出力は次の JSON 1個のみ:"
@@ -225,7 +227,8 @@ def maybe_reflect(agent, *, step: int, sim_min: int, writeback: str, alpha: floa
                   date_line: str | None = None,
                   weather_line: str | None = None,
                   reflect_cfg: dict | None = None,
-                  reflect_variety: bool = False) -> None:
+                  reflect_variety: bool = False,
+                  city_name: str = "") -> None:
     """就寝中で reflect_step に達していれば内省(1睡眠につき1回)。
 
     v2(Phase B): 同じ1回の呼び出しで**記憶の統合**(日次要約+顕著エピソード
@@ -260,7 +263,8 @@ def maybe_reflect(agent, *, step: int, sim_min: int, writeback: str, alpha: floa
     if agentic_pull:
         recalled = _recall_query(agent, step=step, sim_min=sim_min, llm=llm,
                                  place_name=place_name, logger=logger,
-                                 date_line=date_line, weather_line=weather_line)
+                                 date_line=date_line, weather_line=weather_line,
+                                 city_name=city_name)
 
     # 深い内省の夜か。(1) 出来事誘発(第12バッチ・主経路): 衝撃ゲージの閾値超えが予約した
     # deep_due_day 以降の最初の夜(侵入的→熟慮的の遅延)。(2) レガシー固定周期(対照用)。
@@ -273,7 +277,7 @@ def maybe_reflect(agent, *, step: int, sim_min: int, writeback: str, alpha: floa
     task = _reflect_task(deep=deep, variety=reflect_variety,
                          agent_id=agent.id, day=day)   # A4: 既定 OFF=従来定数と同一
     prompt = (build_prompt(agent, place_name=place_name, surprise=None,
-                           nearby_names=[], step=step,
+                           nearby_names=[], step=step, city_name=city_name,
                            date_line=date_line, weather_line=weather_line)
               + (f"\n思い出したこと: {' / '.join(recalled)}" if recalled else "")
               + task)

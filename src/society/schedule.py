@@ -44,11 +44,12 @@ _WHAT_PATTERNS = (
     (re.compile(r"イベント|ライブ|コンサート|花火|祭"), "イベント"),
 )
 
-# 場所(place)のヒント語(会話に出やすい地名・施設。長い語を先に)。
-_PLACE_HINTS = (
-    "スクランブル交差点", "スクランブル", "ハチ公前", "ハチ公", "センター街",
-    "道玄坂", "宮益坂", "渋谷駅", "渋谷", "新宿", "原宿", "表参道", "恵比寿",
-    "代官山", "図書館", "美術館", "映画館", "居酒屋", "レストラン", "喫茶店",
+# 場所(place)のヒント語のうち **generic な施設語**(場所非依存=基盤に置いてよい)。
+# 地名固有のヒント(スクランブル交差点・渋谷駅 等)は envpack.lexicon.place_hints から受ける
+# (基盤に地名を残さない)。抽出時は place_hints(地名固有)を先に、この施設語を後に連結する
+# (元の「長い語=地名を先に」順を保つ=バイト一致)。
+_GENERIC_PLACE_HINTS = (
+    "図書館", "美術館", "映画館", "居酒屋", "レストラン", "喫茶店",
     "カフェ", "公園", "駅", "学校", "会社", "家",
 )
 # 「◯◯で(会う/集まる/…)」= 場所の助詞パターン(ヒントに無い固有地名の後退用)。
@@ -189,8 +190,9 @@ def _match_what(text: str) -> str:
     return ""
 
 
-def _match_place(text: str) -> str:
-    for hint in _PLACE_HINTS:
+def _match_place(text: str, place_hints: tuple | list = ()) -> str:
+    # 地名固有ヒント(envpack)を先に、generic 施設語を後に(元の順を保つ)。
+    for hint in tuple(place_hints) + _GENERIC_PLACE_HINTS:
         if hint in text:
             return hint
     m = _DE_RE.search(text)
@@ -200,7 +202,7 @@ def _match_place(text: str) -> str:
 
 
 def extract(text: str, *, base_day: int, base_min: int, cal: dict | None = None,
-            horizon_days: int = 14) -> list[dict]:
+            horizon_days: int = 14, place_hints: tuple | list = ()) -> list[dict]:
     """発話テキストから未来の予定を抽出する(決定論・乱数不使用)。
 
     未来の日時が1つも無ければ空リスト。相対日は calendar で絶対 day_index に解決する
@@ -228,7 +230,7 @@ def extract(text: str, *, base_day: int, base_min: int, cal: dict | None = None,
             if mins is not None and mins <= base_min % 1440:
                 return []
     return [{"day": int(day), "when": when,
-             "what": _match_what(t), "place": _match_place(t)}]
+             "what": _match_what(t), "place": _match_place(t, place_hints)}]
 
 
 # ---------------------------------------------------------------- 帳簿操作
@@ -278,7 +280,7 @@ def _day_label(dd: int) -> str:
 
 
 def _sentence(e: dict, today: int) -> str:
-    """1件の予定を自然な句にする(例: 明日15:00に渋谷で会う約束)。"""
+    """1件の予定を自然な句にする(例: 明日15:00に駅前で会う約束)。"""
     label = _day_label(int(e["day"]) - today)
     when = e["when"]
     where = f"{e['place']}で" if e["place"] else ""

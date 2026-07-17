@@ -818,7 +818,8 @@ def _record_appointments(sim, speaker, text: str, party_ids: list[int],
     day = sim_min // 1440
     appts = schedule.extract(text, base_day=day, base_min=sim_min,
                              cal=getattr(sim, "calendarcfg", None),
-                             horizon_days=scfg["horizon_days"])
+                             horizon_days=scfg["horizon_days"],
+                             place_hints=sim.envpackcfg["lexicon"]["place_hints"])
     if not appts:
         return
     hearers = [sim.agent_by_id[i] for i in party_ids if i in sim.agent_by_id]
@@ -889,7 +890,8 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
             agent, [a.id for a in company], sim.agent_by_id)
     # 観光・多言語(後続波 H5): 観光客/非日本語話者の文脈を1行注入(既定 OFF は None=1行も足さない
     # =バイト一致)。決定論・LLM 非増(agent の名簿属性のみ参照=k 非依存)。
-    diversity_line = diversity_mod.context_line(agent) if _diversity_on(sim) else None
+    diversity_line = (diversity_mod.context_line(agent, getattr(sim, "place_name", ""))
+                      if _diversity_on(sim) else None)
     # 内面本格版(後続波 H6): 離散感情・長期目標・趣味の文脈を1行ずつ注入(既定 OFF は None=1行も
     # 足さない=バイト一致)。決定論・LLM 非増(注入は内容のみ=呼数不変=R1 の ON==OFF)。感情は
     # affect ON 前提(arousal が動かないと無効)。目標/趣味は precompute 済みの決定論値を読むだけ。
@@ -933,6 +935,7 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
                                      institutions=institutions,
                                      equip_all=equip_all,
                                      venture_cost=equip_venture_cost,
+                                     city_name=getattr(sim, "place_name", ""),
                                      date_line=getattr(sim, "today_date_line", None),
                                      weather_line=getattr(sim, "today_weather_line", None),
                                      schedule_line=schedule_line,
@@ -1836,7 +1839,7 @@ def _gov_payroll(sim, gov, step: int, sim_min: int) -> None:
 
     勤務地写像(persona 側=別バッチ所有で編集不可)に公務員が無く通常の勤務完遂経路に乗らないため、
     行政のペイロールとして日次で予算から直接支給する(WAGE_CAT 外=gig/本業と二重にならない)。
-    sim.agents は id 昇順・乱数なし(決定論)。通勤(来街)公務員も渋谷で働く扱いで支給。"""
+    sim.agents は id 昇順・乱数なし(決定論)。通勤(来街)公務員もこの街で働く扱いで支給。"""
     for agent in sim.agents:
         pay = civil_servant_pay(agent.occupation, sim.economy)
         if pay is None:
@@ -2461,7 +2464,7 @@ def _phase_annual(sim, step: int, sim_min: int) -> None:
 
 
 def _phase_crowd(sim, step: int, sim_min: int) -> None:
-    """群集(渋谷ハロウィン型)の集中を観測し crowd_surge を記録する(annual 有効時のみ)。
+    """群集(大規模行事型)の集中を観測し crowd_surge を記録する(annual 有効時のみ)。
 
     非群集日・annual OFF は完全 no-op。発火系(grievance/drive)には一切接続しない(混雑=雰囲気
     密度のみ=観測/可視化)。決定論・非LLM(R1: generate を1回も追加しない=呼数不変)。"""
@@ -2929,7 +2932,7 @@ def run_step(sim, step: int) -> None:
     for agent, action in actions:
         _apply(sim, agent, action, step, sim_min)
     _phase_jitter(sim, step, sim_min)              # 路上滞在の完全静止を解消(微移動)
-    _phase_crowd(sim, step, sim_min)               # 群集(渋谷ハロウィン型)の集中を観測(既定OFF=no-op)
+    _phase_crowd(sim, step, sim_min)               # 群集(大規模行事型)の集中を観測(既定OFF=no-op)
     infoenv_mod.phase(sim, step, sim_min)          # 情報環境: バイラル加重・誤情報/炎上(既定OFF=no-op。Wave G6)
 
     for agent in sim.agents:      # 内省(就寝直後 or 来街者の帰路。個別時刻に分散)
@@ -2938,6 +2941,7 @@ def run_step(sim, step: int) -> None:
                           writeback=str(sim.cfg.k.writeback),
                           alpha=float(sim.cfg.k.degraded_alpha), llm=sim.llm,
                           place_name="自宅",
+                          city_name=getattr(sim, "place_name", ""),
                           rng=sim.hub.stream("writeback", agent.id, step),
                           logger=sim.logger,
                           max_tokens=int(sim.cfg.model.reflect_max_tokens),

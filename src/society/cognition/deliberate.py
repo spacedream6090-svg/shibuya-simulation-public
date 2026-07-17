@@ -10,8 +10,12 @@ from ..factors.mood import mood_text
 
 # ヘッダは run 内固定(labeling_mode は run を通して不変)なので APC の prefix 一致は保たれる。
 # constrained(既定)の文言は現行と一字一句同一に保つ(既定の再現性=キャッシュ整合のため)。
-_HEADER_HEAD = (
-    "あなたは渋谷の街で暮らす一人の人間です。状況に対して自然に振る舞ってください。\n"
+# 街の名前(冒頭の {city})は基盤に持たせず cfg(envpack.lexicon.place_name)から受ける。
+# 既定値は config.yaml の envpack が供給するので出力はバイト一致(ゴールデン維持)。
+_HEADER_INTRO = (
+    "あなたは{city}の街で暮らす一人の人間です。状況に対して自然に振る舞ってください。\n"
+)
+_HEADER_FORMS = (
     "出力は次のいずれかの JSON 1個のみ(キー名は厳守):\n"
     '  {"action": "speak", "text": "話す内容"}\n'
 )
@@ -34,13 +38,15 @@ _DO_LINE = (
 )
 
 
-def _header(labeling_mode: str, open_actions: bool = False) -> str:
+def _header(labeling_mode: str, open_actions: bool = False,
+            city_name: str = "") -> str:
     coin = _COIN_LINE.get(labeling_mode, _COIN_LINE["constrained"])
     do = _DO_LINE if open_actions else ""
-    return _HEADER_HEAD + coin + _HEADER_TAIL + do
+    head = _HEADER_INTRO.format(city=city_name) + _HEADER_FORMS
+    return head + coin + _HEADER_TAIL + do
 
 
-# 既定(constrained)ヘッダ = 現行の _COMMON_HEADER と完全一致(後方互換の基準)
+# ヘッダの構造ベースライン(街名は呼び出し時に注入=ここでは空)。後方互換の基準。
 _COMMON_HEADER = _header("constrained")
 
 # 「所持ツール」節(標準装備の中立告知)。tools.equip_all=true のとき全発火プロンプトに
@@ -125,6 +131,7 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
                  variety_hint: bool = False,
                  labeling_mode: str = "constrained",
                  open_actions: bool = False,
+                 city_name: str = "",
                  p2_offers: str | None = None) -> str:
     """個別文脈(時刻・場所・活動・気分・記憶・直近発話)を渡し、内容の固定化を防ぐ。
 
@@ -141,7 +148,7 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
     _recent_n = int(_ir.get("recent_n", 4))
     _retrieve_n = int(_ir.get("retrieve_n", 3))
     _feed_n = int(_ir.get("feed_n", 3))
-    lines = [_header(labeling_mode, open_actions), agent.persona]
+    lines = [_header(labeling_mode, open_actions, city_name), agent.persona]
     # 反射=自己モデル(第11バッチ 2026-07-08。深い内省の産物。OFF は None=行なし=バイト一致)。
     # persona(固定の自己紹介)の直後に「経験から更新される自己理解」を置く=自己認識の再帰。
     sm = getattr(agent, "self_model", None)
@@ -244,7 +251,7 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
         lines.append("状況: 近くにいる人と自然に会話する。今この場所・この時間ならではの"
                      "話題(店、時間帯、出来事、気分)で、あなたらしい一言を speak で。")
         if variety_hint:                 # 改善 P3(既定 OFF): 定型の情景報告で始めない
-            lines.append("書き出しの注意: 「この時間の渋谷は…」のような情景報告の"
+            lines.append(f"書き出しの注意: 「この時間の{city_name}は…」のような情景報告の"
                          "決まり文句で始めない。具体的な出来事・固有名詞・相手への"
                          "問いかけなど、毎回違う切り口で。")
     elif surprise == "reply" and reply_to is not None:

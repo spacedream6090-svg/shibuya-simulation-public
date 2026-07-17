@@ -55,14 +55,13 @@ _OCC_FREE = {
     "デザイナー": 0.95,
 }
 
-# 架空タイトルプール(実在番組・作品名は使わない=R17)。渋谷世界に閉じた造語。
+# 架空タイトルの generic フォールバック(実在番組・作品名は使わない=R17)。
+# 地名を含む番組名は基盤に置かず envpack.media(場所の値)から受ける。実運用では
+# routine が envpack のタイトルを渡すため、この generic 既定はスタンドアロン利用の保険。
 _TITLES = {
-    "tv": ["夜のスクランブル", "ハチ公前ニュース9", "渋谷トークナイト",
-           "深夜のセンター街劇場", "みんなの気象台"],
-    "video": ["路地裏グルメ散歩", "10分でわかる都市伝説", "配信者ミナトの日常",
-              "ネオン街ウォーク", "猫と暮らす部屋"],
-    "game": ["スクランブル・ラッシュ", "タワー・オブ・シブヤ", "パズル横丁",
-             "ネオンレーサー2", "ハチ公クエスト"],
+    "tv": ["夜のニュース", "トークナイト", "みんなの気象台"],
+    "video": ["路地裏グルメ散歩", "10分でわかる都市伝説", "猫と暮らす部屋"],
+    "game": ["パズル横丁", "ネオンレーサー2"],
 }
 
 
@@ -142,9 +141,14 @@ def pick_medium(prof: dict, rng: np.random.Generator) -> str:
     return _MEDIA[int(rng.choice(len(_MEDIA), p=w))]
 
 
-def pick_title(medium: str, rng: np.random.Generator) -> str:
-    """架空タイトルを1件抽選(実在作品名は含まない=R17)。"""
-    pool = _TITLES.get(medium, _TITLES["tv"])
+def pick_title(medium: str, rng: np.random.Generator,
+               titles: dict | None = None) -> str:
+    """架空タイトルを1件抽選(実在作品名は含まない=R17)。
+
+    titles(envpack.media=場所の値)があればそれを使う。無ければ generic 既定(_TITLES)。
+    """
+    pool_src = titles or _TITLES
+    pool = pool_src.get(medium) or pool_src.get("tv") or _TITLES["tv"]
     return pool[int(rng.integers(len(pool)))]
 
 

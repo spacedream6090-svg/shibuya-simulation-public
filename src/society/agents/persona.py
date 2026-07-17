@@ -65,7 +65,8 @@ def build_agent(agent_id: int, rng: np.random.Generator, nodes: list[str],
                 economy: dict | None = None,
                 threshold_dist: str = "normal",
                 drift: dict | None = None,
-                reflection: dict | None = None) -> Agent:
+                reflection: dict | None = None,
+                place_name: str = "この街") -> Agent:
     """entry(scripts/build_personas.py の名簿)があればそれを使い、
     無ければ手続き生成(v2 以前の互換動作: 全員居住者)。
 
@@ -143,13 +144,14 @@ def build_agent(agent_id: int, rng: np.random.Generator, nodes: list[str],
         bedtime_min = min(int(bedtime_min), 23 * 60 + 50)        # 当日内に収める
 
     if not persona_txt:
+        # 街名は基盤に持たせず envpack(place_name)から受ける。既定=渋谷(config.yaml)=バイト一致。
         if commute:
-            where = residence_line or "渋谷の外"
-            living = f"{where}に住んでいて、毎日渋谷に通勤・通学している"
+            where = residence_line or f"{place_name}の外"
+            living = f"{where}に住んでいて、毎日{place_name}に通勤・通学している"
         elif visitor:
-            living = "渋谷の街の外に住んでいて、よく渋谷に来る"
+            living = f"{place_name}の街の外に住んでいて、よく{place_name}に来る"
         else:
-            living = "渋谷の街で暮らしている"
+            living = f"{place_name}の街で暮らしている"
         persona_txt = (f"あなたは{name}、{age}歳の{occupation}({gender}性)。"
                        f"{living}。自分の言葉で自然に、短く話す。")
     if work_name and work_name not in persona_txt:

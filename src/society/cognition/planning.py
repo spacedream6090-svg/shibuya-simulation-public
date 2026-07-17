@@ -45,7 +45,8 @@ _PLAN_TASK = (
 def build_plan_prompt(agent, *, place_name: str, sim_min: int, step: int,
                       date_line: str | None = None,
                       weather_line: str | None = None,
-                      schedule_line: str | None = None) -> str:
+                      schedule_line: str | None = None,
+                      city_name: str = "") -> str:
     """build_prompt の文脈(ペルソナ・記憶・日記・信念)+ 所持金 + 計画タスク。
 
     ★ build_prompt の出力は既存の呼び出し(発話・内省)と共有するため一切変えない。
@@ -55,6 +56,7 @@ def build_plan_prompt(agent, *, place_name: str, sim_min: int, step: int,
     """
     base = build_prompt(agent, place_name=place_name, surprise=None,
                         nearby_names=[], sim_min=sim_min, step=step,
+                        city_name=city_name,
                         date_line=date_line, weather_line=weather_line,
                         schedule_line=schedule_line)
     money_line = f"\n今の所持金: 約{int(getattr(agent, 'money', 0.0))}円"
@@ -83,6 +85,7 @@ def make_plan(sim, agent, step: int, sim_min: int, place_name: str) -> None:
     max_items = int(sim.planningcfg.get("max_items", 5))
     prompt = build_plan_prompt(agent, place_name=place_name, sim_min=sim_min,
                               step=step,
+                              city_name=getattr(sim, "place_name", ""),
                               date_line=getattr(sim, "today_date_line", None),
                               weather_line=getattr(sim, "today_weather_line", None),
                               schedule_line=_today_schedule_line(sim, agent, sim_min))

@@ -1,0 +1,46 @@
+# ============================================================
+# 共有参照層 ②(Shared Reference): 日本の制度参照テーブル
+#   docs/plans/env-classification.md の3層設計の②。同一国・言語の全環境で使い回す値。
+#   「渋谷の値」ではなく「東京都/国の値」= env.yaml の pref セレクタ1行(③)で引く。
+#   D1-W1 の scaffold(W3 で economy/government がここを参照して読む予定)。
+#
+# 掟: 全項目に出典。全国一律の値は national: に、都道府県で変わる値は prefectures: に置く。
+#     現状は東京都1行から(47都道府県へ拡張可能な表)。未確認の県は追記しない(捏造ガード)。
+# ============================================================
+schema_version: 1
+
+# ---- 全国一律(法律で定まり都道府県で変わらない)----
+national:
+  # 所得税 実効税率ブラケット(government.py:35-41 の近似=累進の圧縮)。出典: 所得税法・国税庁 速算表の近似。
+  income_tax_effective:
+    - {upto: 2000000,  rate: 0.02}
+    - {upto: 3300000,  rate: 0.05}
+    - {upto: 5000000,  rate: 0.10}
+    - {upto: 7000000,  rate: 0.15}
+    - {upto: 10000000, rate: 0.18}
+    - {upto: null,     rate: 0.20}   # 上限超
+  consumption:
+    rate: 0.10           # 消費税 標準税率(消費税法・地方税法)
+    reduced: 0.08        # 軽減税率(飲食料品等)
+    national_share: 0.78 # 国:地方 = 78:22(国分の割合。government.py:24)
+    reduced_cats: [food]
+  resident_tax:
+    rate: 0.10           # 個人住民税 標準税率(市町村民税6%+道府県民税4%。地方税法)
+  election:
+    municipal_assembly_deposit: 300000  # 市区町村議会議員選挙の供託金(公職選挙法。所持金スケールへは env で圧縮)
+  assembly:
+    term_years: 4        # 地方議会議員の任期(地方自治法)
+  labor:
+    annual_workdays: 245 # 年間労働日の目安(完全週休二日+祝日の近似。government.py:69)
+
+# ---- 都道府県で変わる値(現状は東京都のみ。47行へ拡張可能)----
+prefectures:
+  tokyo:
+    label: 東京都
+    # 東京都最低賃金 1,226円/時(2025-10-03 発効・東京労働局。厚生労働省 地域別最低賃金)。
+    min_wage_hourly: 1226
+    # 特別区(23区)の住民税 区6:都4 の配分近似(government.py resident_ward_share=0.6)。
+    special_ward_resident_split: [0.6, 0.4]
+  # --- 他46道府県は min_wage_hourly 等を一次確認のうえ順次追記する ---
+  # osaka:  {label: 大阪府,  min_wage_hourly: <要一次確認>}
+  # aichi:  {label: 愛知県,  min_wage_hourly: <要一次確認>}

@@ -132,14 +132,14 @@ def assign_attributes(sim) -> None:
                 a.language = langs[i % len(langs)]
 
 
-def context_line(agent) -> str | None:
+def context_line(agent, place_name: str = "この街") -> str | None:
     """発火/計画/内省プロンプト用: 観光・言語の文脈行(決定論・k 非依存)。
 
     観光客なら「観光で来ている」、非日本語話者なら「主に○○語を話す」を添える。該当なしなら None
-    (build_prompt は1行も足さない=OFF/非該当はバイト一致)。"""
+    (build_prompt は1行も足さない=OFF/非該当はバイト一致)。place_name は街名(envpack)。"""
     parts: list[str] = []
     if getattr(agent, "tourist", False):
-        parts.append("あなたは観光で渋谷を訪れている(この街の生活者ではなく、名所を見て回っている)。")
+        parts.append(f"あなたは観光で{place_name}を訪れている(この街の生活者ではなく、名所を見て回っている)。")
     lang = getattr(agent, "language", "")
     if lang:
         parts.append(f"あなたは主に{lang}を話し、日本語での会話は少し不自由に感じている。")

@@ -32,21 +32,30 @@ _NEUTRAL_CLIMATE = (21, 12, 0.22, 0.0)
 _BAD_CONDS = {"雨", "雪"}
 
 
-def build_cfg(raw: dict | None) -> dict:
-    """conf の weather ブロックを正準化(既定 OFF=現行挙動と完全同一)。"""
+def build_cfg(raw: dict | None, monthly: dict | None = None,
+              neutral: list | tuple | None = None) -> dict:
+    """conf の weather ブロックを正準化(既定 OFF=現行挙動と完全同一)。
+
+    月別気候テーブル(monthly)と季節なし既定(neutral)は envpack(場所の値)から受ける。
+    未指定なら generic フォールバック(_MONTH_CLIMATE / _NEUTRAL_CLIMATE)を使う。
+    """
     raw = dict(raw or {})
+    mon = {int(k): tuple(v) for k, v in (monthly or {}).items()} or _MONTH_CLIMATE
+    neu = tuple(neutral) if neutral else _NEUTRAL_CLIMATE
     return {
         "enabled": bool(raw.get("enabled", False)),
         # 雨天の日に grievance を上げる係数(factors 経由の加算量)。★ON 推奨: 0.01。
         # 既定 0.0 = 天気 ON でも grievance は動かさない(天気イベント・文脈行のみ)。
         "rain_grievance": float(raw.get("rain_grievance", 0.0)),
+        "monthly": mon,       # 月(int)→ (最高, 最低, 雨重み, 雪重み)。envpack.climate.monthly
+        "neutral": neu,       # 季節なし既定。envpack.climate.neutral
     }
 
 
-def _sample(rng, month: int | None) -> dict:
+def _sample(rng, month: int | None, monthly: dict, neutral) -> dict:
     """1日ぶんの天気を決定論生成(rng は当日専用 stream)。"""
     hi_c, lo_c, rain_w, snow_w = (
-        _MONTH_CLIMATE[month] if month is not None else _NEUTRAL_CLIMATE)
+        monthly[month] if month is not None else neutral)
     r = float(rng.random())
     if r < snow_w:
         cond = "雪"
@@ -74,7 +83,8 @@ def weather_for(sim, day_index: int) -> dict:
     month = None
     if cal and cal.get("enabled"):
         month = _calendar.date_of(cal, day_index * 1440).month
-    return _sample(rng, month)
+    wcfg = sim.weathercfg
+    return _sample(rng, month, wcfg["monthly"], wcfg["neutral"])
 
 
 def weather_line(weather_dict: dict | None) -> str | None:

@@ -32,12 +32,17 @@ _DEFAULT_EVENTS: list[dict] = [
 ]
 
 
-def build_cfg(raw: dict | None) -> dict:
-    """conf の annual_events ブロックを正準化(既定 OFF=現行挙動と完全同一)。"""
+def build_cfg(raw: dict | None, default_events: list[dict] | None = None) -> dict:
+    """conf の annual_events ブロックを正準化(既定 OFF=現行挙動と完全同一)。
+
+    events の既定は envpack.culture.events(場所の値=default_events)を使う。それも無ければ
+    モジュール既定 _DEFAULT_EVENTS(行事名=文化語彙・地名ではない)にフォールバックする。
+    """
     raw = dict(raw or {})
     events_raw = raw.get("events", None)
     if events_raw is None:
-        events = [dict(e) for e in _DEFAULT_EVENTS]
+        src = default_events if default_events is not None else _DEFAULT_EVENTS
+        events = [dict(e) for e in src]
     else:
         events = []
         for e in (events_raw or []):

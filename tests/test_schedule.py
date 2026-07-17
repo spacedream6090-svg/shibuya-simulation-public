@@ -46,9 +46,11 @@ def test_extract_relative_time_place():
 
 def test_extract_various_patterns():
     cal = calendar.build_cfg({"enabled": True, "start_date": "2026-04-01"})
-    # 明後日 + 時間帯語 + 場所 + 食事
+    # 地名固有のヒントは envpack.lexicon.place_hints(場所の値)から与える(基盤に地名を残さない)。
+    hints = ("スクランブル交差点", "スクランブル", "センター街", "道玄坂", "渋谷駅", "渋谷")
+    # 明後日 + 時間帯語 + 場所 + 食事(センター街=地名固有ヒント)
     a = schedule.extract("明後日の夕方、センター街でご飯食べよう", base_day=0,
-                         base_min=8 * 60, cal=cal)[0]
+                         base_min=8 * 60, cal=cal, place_hints=hints)[0]
     assert a["day"] == 2 and a["when"] == "夕方"
     assert a["what"] == "食事" and a["place"] == "センター街"
     # ◯日後(時刻なし)

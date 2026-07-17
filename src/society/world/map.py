@@ -22,7 +22,10 @@ _DEFAULT_FLOORGUIDE = (Path(__file__).resolve().parents[3]
 
 
 class CityMap:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, underground_label: str = "地下通路"):
+        # 地下(layer<0)ノードのフォールバック地名。地名は基盤に持たせず envpack から受ける
+        # (既定は generic「地下通路」。実値=conf/envpack.lexicon.underground_name)。
+        self.underground_label = str(underground_label)
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
         self.meta: dict = raw.get("meta", {})
         self.graph = nx.Graph()
@@ -95,7 +98,7 @@ class CityMap:
     def destinations(self) -> list[str]:
         """目的地候補 = 名前つき地点 + 建物入口 + 待ち合わせ名所(landmark POI)。
 
-        landmark(ハチ公像等)を余暇・待ち合わせの行き先候補に含める(ユーザー要望
+        landmark(像・名所等)を余暇・待ち合わせの行き先候補に含める(ユーザー要望
         2026-07-06)。旧地図は landmark cat が不在=候補は変わらない(バイト一致)。
         重複除去・ソート=決定論。"""
         dests = set(self.pois())
@@ -161,7 +164,7 @@ class CityMap:
             return f"{pois[0]['name']}の前"
         lyr = d.get("layer", 0)
         if lyr < 0:
-            return "地下通路(渋谷ちかみち)"
+            return self.underground_label      # 地下街の地名(envpack。基盤に地名を残さない)
         if lyr > 0:
             return "ペデストリアンデッキ"
         return "路上"

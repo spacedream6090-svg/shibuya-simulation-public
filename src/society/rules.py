@@ -38,7 +38,7 @@ def build_rules_cfg(raw: dict | None) -> dict:
     raw = dict(raw or {})
     return {
         "enabled": bool(raw.get("enabled", True)),
-        # 権利創設・宣言型(第9バッチ 制度深化。渋谷パートナーシップ条例 2015 のモデル化)。既定 OFF=
+        # 権利創設・宣言型(第9バッチ 制度深化。地域のパートナーシップ条例のモデル化)。既定 OFF=
         # declare 型は従来どおり検証失敗→文言制度へ降格(現行挙動と完全同一)。
         "allow_declare": bool(raw.get("allow_declare", False)),
         "max_active": int(raw.get("max_active", 5)),
@@ -124,7 +124,7 @@ class RuleBook:
                     "every_days": every}
         if rtype == "declare":
             # 権利創設・宣言型(制度深化 第9バッチ): 特定の承認・権利・理念を公式な取り決めとして
-            # 樹立する。エンジンの価格・移動には作用しない**象徴的制度**(現実の例: 渋谷区
+            # 樹立する。エンジンの価格・移動には作用しない**象徴的制度**(現実の例: 地域の
             # パートナーシップ条例)。再帰性の norm_line・institution_rule・ニュースで知覚され、
             # Y の symbolic/network 層で「ローカル制度の樹立・波及」として測る。既定 OFF。
             if not self.cfg["allow_declare"]:

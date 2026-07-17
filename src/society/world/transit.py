@@ -2,11 +2,12 @@
 
 現状のダイヤは公表の始発・終電・運転間隔から生成した近似(ファイルに明記)。
 ★実ダイヤへの切替(v3): conf の transit.gtfs_dir に GTFS(stops.txt / stop_times.txt /
-trips.txt / routes.txt)を置いたフォルダを指定すると、渋谷駅の実発車時刻から
-路線ごとの始発・終電・間隔を再構成して置き換える。
+trips.txt / routes.txt)を置いたフォルダを指定すると、対象駅の実発車時刻から
+路線ごとの始発・終電・間隔を再構成して置き換える。対象駅名は envpack の
+station_filters(場所の値)で与える(基盤に駅名を持たせない)。
 GTFS の入手 = ODPT(公共交通オープンデータセンター)。developer.odpt.org で無料の
 開発者登録(確認に最大2営業日)→ アクセストークン発行 → ckan.odpt.org から
-事業者別 GTFS を取得(JR-East / TokyoMetro / Tokyu)。
+事業者別 GTFS を取得。
 役割: (1) 駅経由の退出/帰還を運行時間帯に制約(終電後は帰って来られない)
       (2) 到着ごとの人の波(パルス)の源。
 """
@@ -22,14 +23,19 @@ def _to_min(text: str) -> int:
     return int(parts[0]) * 60 + int(parts[1])
 
 
-def _load_gtfs(gtfs_dir: Path) -> list[dict] | None:
-    """GTFS から渋谷停車の路線別 始発/終電/中央間隔を再構成する(最小実装)。"""
+def _load_gtfs(gtfs_dir: Path, station_filters: list[str]) -> list[dict] | None:
+    """GTFS から対象駅停車の路線別 始発/終電/中央間隔を再構成する(最小実装)。
+
+    station_filters は対象駅名の部分一致リスト(envpack=場所の値)。空なら抽出不能=None。
+    """
+    if not station_filters:
+        return None
     try:
         stops = list(csv.DictReader(
             (gtfs_dir / "stops.txt").open(encoding="utf-8-sig")))
-        shibuya_ids = {s["stop_id"] for s in stops if "渋谷" in s.get("stop_name", "")
-                       or "Shibuya" in s.get("stop_name", "")}
-        if not shibuya_ids:
+        station_ids = {s["stop_id"] for s in stops
+                       if any(f in s.get("stop_name", "") for f in station_filters)}
+        if not station_ids:
             return None
         trips = {t["trip_id"]: t["route_id"] for t in csv.DictReader(
             (gtfs_dir / "trips.txt").open(encoding="utf-8-sig"))}
@@ -40,7 +46,7 @@ def _load_gtfs(gtfs_dir: Path) -> list[dict] | None:
         deps: dict[str, list[int]] = {}
         for st in csv.DictReader(
                 (gtfs_dir / "stop_times.txt").open(encoding="utf-8-sig")):
-            if st["stop_id"] in shibuya_ids and st.get("departure_time"):
+            if st["stop_id"] in station_ids and st.get("departure_time"):
                 route = routes.get(trips.get(st["trip_id"], ""), "不明")
                 deps.setdefault(route, []).append(_to_min(st["departure_time"]))
         lines = []
@@ -60,7 +66,10 @@ def _load_gtfs(gtfs_dir: Path) -> list[dict] | None:
 
 
 class Transit:
-    def __init__(self, path: str | Path, gtfs_dir: str | Path | None = None):
+    def __init__(self, path: str | Path, gtfs_dir: str | Path | None = None,
+                 station_filters: list[str] | None = None):
+        # 対象駅名(GTFS 抽出用)は envpack=場所の値。既定なし=GTFS 実ダイヤ切替時のみ要る。
+        self.station_filters = list(station_filters or [])
         self.source = "approximation"
         # 運休フラグ(都市・環境ショック 後続波 H4。既定 False=通常運行)。災害/運休の日に
         # disaster 層が True にすると駅経由の退出/帰還が不可(交通麻痺)。disaster OFF では常に
@@ -72,7 +81,7 @@ class Transit:
         self.bus_lines: list[dict] = list(raw_file.get("bus_lines", []))
         lines = None
         if gtfs_dir:
-            lines = _load_gtfs(Path(gtfs_dir))
+            lines = _load_gtfs(Path(gtfs_dir), self.station_filters)
             if lines:
                 self.source = "gtfs"
         if lines is None:

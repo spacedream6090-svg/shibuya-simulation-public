@@ -28,10 +28,22 @@ class Simulation:
         name = cfg.run.name or f"seed{cfg.run.seed}"
         self.out_dir = Path(out_dir) if out_dir else REPO_ROOT / str(cfg.run.out_dir) / str(name)
         self.hub = RngHub(cfg.run.seed)
+        # 環境パック(EnvPack)= 場所の知識(地名・ランドマーク・年中行事・気候・語彙・
+        # メディア番組名)。基盤(src)は地名リテラルを持たず、ここで conf の envpack ブロックを
+        # 1回だけ正準化して保持する(既存 build_cfg 流儀)。以降 city/transit/persona/prompt/
+        # annual/weather/media/schedule/diversity は cfg 経由で読む(深い get を散らさない)。
+        from .. import envpack as _envpack_mod
+        raw_envpack = cfg.get("envpack", None)
+        raw_envpack = (OmegaConf.to_container(raw_envpack, resolve=True)
+                       if OmegaConf.is_config(raw_envpack) else raw_envpack)
+        self.envpackcfg = _envpack_mod.build_cfg(raw_envpack)
+        self.place_name = self.envpackcfg["lexicon"]["place_name"]  # 街の名前(プロンプト用)
         map_path = Path(cfg.world.map)
         if not map_path.is_absolute():
             map_path = REPO_ROOT / map_path
-        self.city = CityMap(map_path)
+        self.city = CityMap(
+            map_path,
+            underground_label=self.envpackcfg["lexicon"]["underground_name"])
         self.router = Router(self.city)
         self.clock = Clock()
         self.logger = ObserverLogger(self.out_dir)
@@ -46,7 +58,9 @@ class Simulation:
         if not transit_path.is_absolute():
             transit_path = REPO_ROOT / transit_path
         gtfs_dir = cfg.transit.get("gtfs_dir")
-        self.transit = Transit(transit_path, gtfs_dir=gtfs_dir or None)
+        self.transit = Transit(
+            transit_path, gtfs_dir=gtfs_dir or None,
+            station_filters=self.envpackcfg["transit"]["station_filters"])
         # 朝の一日計画(既定 ON = 新しい標準挙動)。ユーザー要望 2026-07-06。
         pcfg = cfg.get("planning", {}) or {}
         self.planningcfg = {
@@ -73,7 +87,10 @@ class Simulation:
         raw_wea = cfg.get("weather", None)
         raw_wea = (OmegaConf.to_container(raw_wea, resolve=True)
                    if OmegaConf.is_config(raw_wea) else raw_wea)
-        self.weathercfg = _weather_mod.build_cfg(raw_wea)
+        # 月別気候テーブルは envpack(場所の値)から与える(基盤に東京の気候を残さない)。
+        self.weathercfg = _weather_mod.build_cfg(
+            raw_wea, monthly=self.envpackcfg["climate"]["monthly"],
+            neutral=self.envpackcfg["climate"]["neutral"])
         # 長期予定・スケジュール帳(第7バッチ 2026-07-07。既定 OFF=現行挙動と完全同一)。
         # 会話由来の決定論抽出(追加 LLM 呼び出しゼロ)。calendarcfg を相対日→絶対日の解決に使う。
         raw_sched = cfg.get("schedule", None)
@@ -87,18 +104,20 @@ class Simulation:
         self._sched_day = -1                   # 日境界(予定 GC)の進行管理
         # 文化カレンダー・群集(現実ギャップ Wave G4 2026-07-07。既定 OFF=現行挙動と完全同一)。
         # 命名年中行事(正月/ハロウィン/年末)を暦の特定日に発生させ、群集フラグ行事日には
-        # 自由行動の行き先をスクランブル付近の集会ノードへ寄せる。要 world.calendar.enabled=true
+        # 自由行動の行き先を地図原点付近の集会ノードへ寄せる。要 world.calendar.enabled=true
         # (日付判定に暦を使う)。決定論(群集バイアスは新 stream "crowd" のみ=既存 draw 順は不変)。
         from .. import annual as _annual_mod
         raw_annual = cfg.get("annual_events", None)
         raw_annual = (OmegaConf.to_container(raw_annual, resolve=True)
                       if OmegaConf.is_config(raw_annual) else raw_annual)
-        self.annualcfg = _annual_mod.build_cfg(raw_annual)
+        # 年中行事(名前・日付・群集フラグ)は envpack(文化=場所の値)を既定に使う。
+        self.annualcfg = _annual_mod.build_cfg(
+            raw_annual, default_events=self.envpackcfg["culture"]["events"])
         self.today_event_line = None           # 当日の年中行事1行(annual 有効かつ当日のみ非 None)
         self.today_crowd_event = None          # 当日の群集イベント名(群集フラグ行事日のみ非 None)
         self._annual_day = -1                  # 日境界(年中行事の確定)の進行管理
         self._crowd_surge_day = -1             # crowd_surge を1日1回に制限(群集の記録済み日)
-        self.crowd_node = None                 # 集会ノード(スクランブル交差点付近。ON 時のみ解決)
+        self.crowd_node = None                 # 集会ノード(地図原点付近。ON 時のみ解決)
         if self.annualcfg["enabled"]:
             self.crowd_node = _annual_mod.gathering_node(self.city, self.dests)
         # 交通機関(タクシー既定 ON / 簡易バス既定 OFF=本番トグル)。ユーザー要望 2026-07-06。
@@ -413,7 +432,8 @@ class Simulation:
                                 economy=self.economy,
                                 threshold_dist=self.threshold_dist,
                                 drift=self.drivecfg["drift"],
-                                reflection=self.reflectcfg)
+                                reflection=self.reflectcfg,
+                                place_name=self.place_name)
             agent.x, agent.y = self.city.node_xy(agent.node)
             agent.visits[agent.node] += 1
             agent._heard_unknown = False
