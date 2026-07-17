@@ -113,12 +113,17 @@ out body;
 
 def fetch_overpass(bbox: tuple[float, float, float, float],
                    osm_date: str | None = None, retries: int = 3) -> dict:
-    """Overpass 公式 API から取得。混雑・タイムアウト時はバックオフ付きでリトライ。"""
+    """Overpass 公式 API から取得。混雑・タイムアウト時はバックオフ付きでリトライ。
+
+    複数のパブリック・ミラーを巡回する(504 Gateway Timeout=サーバ過負荷への耐性)。
+    いずれも OpenStreetMap contributors(ODbL)のデータを提供する Overpass 実装。"""
     query = build_query(bbox, osm_date)
     body = ("data=" + urllib.request.quote(query)).encode("utf-8")
     endpoints = [
         "https://overpass-api.de/api/interpreter",
         "https://overpass.kumi.systems/api/interpreter",
+        "https://overpass.private.coffee/api/interpreter",
+        "https://overpass.osm.jp/api/interpreter",
     ]
     last_err: Exception | None = None
     for attempt in range(retries):
@@ -139,11 +144,31 @@ def fetch_overpass(bbox: tuple[float, float, float, float],
     raise RuntimeError(f"Overpass 取得に失敗(全リトライ): {last_err}")
 
 
+# 原点未指定時に build() が使う既定原点のセンチネル(None=既定=ORIGIN=スクランブル交差点)。
+_DEFAULT = object()
+
+
+def _make_project(origin: tuple[float, float]):
+    """原点(lat, lon)を束ねた projector を返す。汎用化: 街ごとに原点を差し替える。
+
+    既定原点=ORIGIN(スクランブル交差点)のとき、返る関数は従来 project と完全同値。"""
+    o_lat, o_lon = origin[0], origin[1]
+    cos_lat = math.cos(math.radians(o_lat))
+
+    def _project(lat: float, lon: float) -> tuple[float, float]:
+        x = (lon - o_lon) * 111320.0 * cos_lat
+        y = (lat - o_lat) * 110540.0
+        return round(x, 1), round(y, 1)
+
+    return _project
+
+
 def project(lat: float, lon: float) -> tuple[float, float]:
-    """緯度経度 → 原点基準ローカル平面(m)。1km 級なら十分な近似。"""
-    x = (lon - ORIGIN[1]) * 111320.0 * math.cos(math.radians(ORIGIN[0]))
-    y = (lat - ORIGIN[0]) * 110540.0
-    return round(x, 1), round(y, 1)
+    """緯度経度 → 原点基準ローカル平面(m)。1km 級なら十分な近似。
+
+    モジュール既定原点(ORIGIN=スクランブル交差点)版。街を差し替える build() 内では
+    `project = _make_project(origin)` の局所束縛が優先される(=同名の局所変数で影を作る)。"""
+    return _make_project(ORIGIN)(lat, lon)
 
 
 def polyline_length(points: list[tuple[float, float]]) -> float:
@@ -203,16 +228,19 @@ def point_in_poly(x: float, y: float, poly: list) -> bool:
     return inside
 
 
-def poi_category(tags: dict) -> str | None:
+def poi_category(tags: dict, landmark_name_kws: tuple = LANDMARK_NAME_KWS) -> str | None:
     """OSM タグ → POI カテゴリ。v6 拡大(ユーザー要望 2026-07-06): 飲食だけでなく
     office(会社)/school(学校)/cinema(映画館)/hall(イベントホール・劇場)/
     landmark(待ち合わせ名所)まで対象を広げる。既存カテゴリ体系(food/nightlife/
     service/shop/office/hotel/attraction/leisure)に整合させて新値を追加する。
     ★旧地図(data/shibuya_osm.json)は再生成しない=旧 cat のまま。本関数の変更は
-      新規に生成する地図(v6/wide)にのみ効く。"""
+      新規に生成する地図(v6/wide)にのみ効く。
+
+    landmark_name_kws: 名称マッチで landmark に寄せる待ち合わせ名所のキーワード。既定=
+      渋谷(ハチ公/モヤイ/忠犬)。別の街では make_env/CLI が街固有語または空 () を渡す。"""
     name = tags.get("name:ja") or tags.get("name") or ""
     # 待ち合わせ名所(名称マッチ最優先: ハチ公/モヤイ/忠犬)。
-    if any(kw in name for kw in LANDMARK_NAME_KWS):
+    if landmark_name_kws and any(kw in name for kw in landmark_name_kws):
         return "landmark"
     amenity = tags.get("amenity", "")
     if amenity in ("restaurant", "cafe", "fast_food", "food_court",
@@ -273,7 +301,27 @@ def building_kind(tags: dict, area: float, name: str | None) -> str:
 
 
 def build(raw: dict, bbox: tuple[float, float, float, float],
-          osm_date: str | None = None) -> dict:
+          osm_date: str | None = None, *,
+          origin: tuple[float, float] | None = None,
+          landmarks: list | None = None,
+          landmark_name_kws=_DEFAULT,
+          hachiko_fallback=_DEFAULT,
+          map_name: str | None = None,
+          description: str | None = None) -> dict:
+    """OSM 生データ → シミュ地図 JSON。
+
+    汎用化(D2): 街固有の定数を引数化。**すべて None/既定=現行渋谷値**なので、位置引数だけで
+    呼ぶ従来の使い方(build(raw, bbox, date))は出力が完全同値。別の街は make_env/CLI が
+    origin(原点 lat,lon)・landmarks(ランドマーク座標表)・landmark_name_kws(名称マッチ語)・
+    hachiko_fallback(名所フォールバック|None=無効)・map_name/description を差し替える。"""
+    origin_ll = tuple(origin) if origin is not None else ORIGIN
+    # 局所束縛で street 全体の project(...) 呼を街の原点版へ切替(既定=ORIGIN で従来同値)。
+    project = _make_project(origin_ll)
+    landmarks = LANDMARKS if landmarks is None else list(landmarks)
+    kws = (LANDMARK_NAME_KWS if landmark_name_kws is _DEFAULT
+           else tuple(landmark_name_kws or ()))
+    hachiko = (HACHIKO_FALLBACK if hachiko_fallback is _DEFAULT else hachiko_fallback)
+
     nodes_ll: dict[int, tuple[float, float]] = {}
     node_tags: dict[int, dict] = {}
     ways_road: list[dict] = []
@@ -293,7 +341,7 @@ def build(raw: dict, bbox: tuple[float, float, float, float],
                 ways_building.append(el)
             elif tags.get("railway") in ("rail", "subway"):
                 ways_rail.append(el)
-            if poi_category(tags):
+            if poi_category(tags, kws):
                 ways_poi.append(el)
 
     # --- 道路: 交差点でウェイを分割してエッジ化(layer 付き)---
@@ -420,7 +468,7 @@ def build(raw: dict, bbox: tuple[float, float, float, float],
 
     # --- ランドマーク名を最寄りノードへ ---
     names: dict[str, tuple[str, str]] = {}
-    for name, lat, lon, poi in LANDMARKS:
+    for name, lat, lon, poi in landmarks:
         lx, ly = project(lat, lon)
         best, best_d = None, 1e9
         for node, (x, y) in node_xy.items():
@@ -515,7 +563,7 @@ def build(raw: dict, bbox: tuple[float, float, float, float],
     seen_poi_names = set()
 
     def add_poi(tags: dict, x: float, y: float, src_id: str) -> None:
-        cat = poi_category(tags)
+        cat = poi_category(tags, kws)
         name = tags.get("name:ja") or tags.get("name")
         if not cat or not name:
             return
@@ -571,16 +619,17 @@ def build(raw: dict, bbox: tuple[float, float, float, float],
         elif "office" in cats:
             b["kind"] = "office"
 
-    # --- ハチ公像フォールバック(OSM で landmark を拾えなかった場合に明示座標で置く)---
-    has_hachiko = any(p["cat"] == "landmark"
-                      and any(kw in p["name"] for kw in ("忠犬", "ハチ公"))
-                      for p in pois)
+    # --- 名所フォールバック(OSM で landmark を拾えなかった場合に明示座標で置く)---
+    #     既定=渋谷のハチ公像。別の街は hachiko_fallback=None で無効(名所が無ければ置かない)。
+    has_hachiko = bool(hachiko) and any(
+        p["cat"] == "landmark" and any(kw in p["name"] for kw in ("忠犬", "ハチ公"))
+        for p in pois)
     hachiko_source = "osm" if has_hachiko else "none"
-    if not has_hachiko:
-        hx, hy = project(HACHIKO_FALLBACK[1], HACHIKO_FALLBACK[2])
+    if hachiko and not has_hachiko:
+        hx, hy = project(hachiko[1], hachiko[2])
         hnode = nearest_node(hx, hy)
         if hnode is not None:
-            pois.append({"id": "p_hachiko_fallback", "name": HACHIKO_FALLBACK[0],
+            pois.append({"id": "p_hachiko_fallback", "name": hachiko[0],
                          "cat": "landmark", "x": round(hx, 1), "y": round(hy, 1),
                          "node": hnode})
             hachiko_source = "fallback"
@@ -598,13 +647,14 @@ def build(raw: dict, bbox: tuple[float, float, float, float],
         railways.append({"name": tags.get("name:ja") or tags.get("name") or "線路",
                          "kind": tags["railway"], "geometry": pts})
 
+    _default_desc = ("OSM 実データ(Overpass)による渋谷駅中心部。"
+                     "全建物+実入口+POI+地下/デッキ層。"
+                     "座標=スクランブル交差点原点ローカル平面(m)。")
     meta = {
-        "version": 6, "name": "shibuya_osm",
-        "description": "OSM 実データ(Overpass)による渋谷駅中心部。"
-                       "全建物+実入口+POI+地下/デッキ層。"
-                       "座標=スクランブル交差点原点ローカル平面(m)。",
+        "version": 6, "name": map_name or "shibuya_osm",
+        "description": description or _default_desc,
         "attribution": "© OpenStreetMap contributors (ODbL)",
-        "origin_latlon": list(ORIGIN), "bbox": list(bbox),
+        "origin_latlon": list(origin_ll), "bbox": list(bbox),
         "crs": "local-m",
     }
     if osm_date:
@@ -647,15 +697,80 @@ def _report(data: dict, out: Path) -> None:
           f"landmark={cats.get('landmark', 0)}  ハチ公={stats.get('hachiko_source', '?')}")
 
 
+def bbox_center(bbox: tuple[float, float, float, float]) -> tuple[float, float]:
+    """bbox(S,W,N,E)の中心(lat, lon)。原点=bbox中心 モード用。"""
+    return ((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0)
+
+
+def find_poi_latlon(raw: dict, name: str) -> tuple[float, float] | None:
+    """OSM 生データから POI 名(name / name:ja 完全一致)の緯度経度を返す。
+
+    ノードは自座標、ウェイは構成ノードの重心。原点=ランドマークPOI名 モード用。
+    見つからなければ None。ネットワーク不使用の純関数(テスト可能)。"""
+    if not name:
+        return None
+    nodes_ll: dict[int, tuple[float, float]] = {}
+    for el in raw.get("elements", []):
+        if el.get("type") == "node":
+            nodes_ll[el["id"]] = (el["lat"], el["lon"])
+    for el in raw.get("elements", []):
+        tags = el.get("tags") or {}
+        nm = tags.get("name:ja") or tags.get("name")
+        if nm != name:
+            continue
+        if el.get("type") == "node" and el["id"] in nodes_ll:
+            return nodes_ll[el["id"]]
+        if el.get("type") == "way":
+            pts = [nodes_ll[i] for i in el.get("nodes", []) if i in nodes_ll]
+            if pts:
+                return (sum(p[0] for p in pts) / len(pts),
+                        sum(p[1] for p in pts) / len(pts))
+    return None
+
+
+def resolve_origin(bbox, raw=None, *, latlon=None, poi=None,
+                   bbox_center_mode=False) -> tuple[tuple[float, float], str]:
+    """原点を3択で決める: (1)指定座標 latlon / (2)ランドマークPOI名 poi / (3)bbox中心。
+
+    どれも未指定なら既定=ORIGIN(渋谷スクランブル交差点)= 現行手順は不変。
+    戻り値: ((lat, lon), モード名)。"""
+    if latlon is not None:
+        return (float(latlon[0]), float(latlon[1])), "latlon"
+    if poi:
+        found = find_poi_latlon(raw or {}, poi)
+        if found is None:
+            raise RuntimeError(f"原点POI '{poi}' が取得データに見つからない(名称一致せず)")
+        return found, f"poi:{poi}"
+    if bbox_center_mode:
+        return bbox_center(bbox), "bbox-center"
+    return ORIGIN, "default(shibuya)"
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="渋谷 OSM 地図ビルダー(bbox/日付指定可)")
+    ap = argparse.ArgumentParser(
+        description="OSM 地図ビルダー(bbox/原点/日付/ランドマーク 指定可・既定=渋谷)")
     ap.add_argument("--bbox", nargs=4, type=float, metavar=("S", "W", "N", "E"),
                     default=list(DEFAULT_BBOX),
-                    help="south west north east(既定=現行範囲 約1.0×0.7km)")
+                    help="south west north east(既定=現行渋谷範囲 約1.0×0.7km)")
     ap.add_argument("--osm-date", default=None,
                     help='過去スナップショット日 "YYYY-MM-DD"(Overpass attic query。既定=最新)')
     ap.add_argument("--out", default=str(REPO_ROOT / "data" / "shibuya_osm.json"),
                     help="出力先 JSON パス(既定=data/shibuya_osm.json)")
+    # ---- 原点の決め方(3択。未指定=既定 ORIGIN=スクランブル交差点=現行不変)----
+    og = ap.add_mutually_exclusive_group()
+    og.add_argument("--origin-latlon", nargs=2, type=float, metavar=("LAT", "LON"),
+                    default=None, help="原点を指定座標に(緯度 経度)")
+    og.add_argument("--origin-poi", default=None,
+                    help="原点を取得データ内のランドマークPOI名(完全一致)に")
+    og.add_argument("--origin-bbox-center", action="store_true",
+                    help="原点を bbox の中心に")
+    ap.add_argument("--name", default=None, help="地図メタ name(既定=shibuya_osm)")
+    ap.add_argument("--landmarks-file", default=None,
+                    help='ランドマーク表 JSON([[name,lat,lon,cat],...])。既定=渋谷14件')
+    ap.add_argument("--no-landmark-kws", action="store_true",
+                    help="名称マッチのランドマーク寄せ(ハチ公/モヤイ等)を無効化")
+    ap.add_argument("--no-hachiko-fallback", action="store_true",
+                    help="名所フォールバック(渋谷ハチ公像)を無効化")
     args = ap.parse_args()
 
     bbox = tuple(args.bbox)
@@ -663,7 +778,20 @@ def main() -> None:
           file=sys.stderr)
     raw = fetch_overpass(bbox, args.osm_date)
     print(f"  elements: {len(raw['elements'])}", file=sys.stderr)
-    data = build(raw, bbox, args.osm_date)
+
+    origin, mode = resolve_origin(
+        bbox, raw, latlon=args.origin_latlon, poi=args.origin_poi,
+        bbox_center_mode=args.origin_bbox_center)
+    print(f"  原点: {origin} (モード={mode})", file=sys.stderr)
+
+    landmarks = None
+    if args.landmarks_file:
+        landmarks = json.loads(Path(args.landmarks_file).read_text(encoding="utf-8"))
+
+    data = build(raw, bbox, args.osm_date, origin=origin, landmarks=landmarks,
+                 landmark_name_kws=(() if args.no_landmark_kws else _DEFAULT),
+                 hachiko_fallback=(None if args.no_hachiko_fallback else _DEFAULT),
+                 map_name=args.name)
     out = Path(args.out)
     if not out.is_absolute():
         out = REPO_ROOT / out

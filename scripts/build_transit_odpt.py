@@ -96,11 +96,13 @@ def weekday_departures(path: Path, direction_part: str | None = None) -> list[in
     return best
 
 
-def gtfs_shibuya_departures(zip_path: Path) -> dict[str, list[dict]]:
-    """静的 GTFS zip → {路線名: [{direction, headsign, times(平日・渋谷発・分・昇順)}]}。
+def gtfs_shibuya_departures(zip_path: Path,
+                            station_filters=("渋谷", "Shibuya")) -> dict[str, list[dict]]:
+    """静的 GTFS zip → {路線名: [{direction, headsign, times(平日・対象駅発・分・昇順)}]}。
 
     平日 = calendar.txt で 月〜金=1 かつ 土日=0 の service。深夜 0-2 時台は +1440
-    (GTFS は本来 24:MM 表記だが、念のため駅時刻表と同じ繰上げを適用)。"""
+    (GTFS は本来 24:MM 表記だが、念のため駅時刻表と同じ繰上げを適用)。
+    station_filters: 対象駅の stop_name 部分一致リスト(既定=渋谷/Shibuya。街ごとに差替可)。"""
     z = zipfile.ZipFile(zip_path)
 
     def rows(name):
@@ -110,7 +112,7 @@ def gtfs_shibuya_departures(zip_path: Path) -> dict[str, list[dict]]:
                         if c.get("monday") == "1" and c.get("friday") == "1"
                         and c.get("saturday") == "0" and c.get("sunday") == "0"}
     shibuya_ids = {s["stop_id"] for s in rows("stops.txt")
-                   if "渋谷" in s.get("stop_name", "") or "Shibuya" in s.get("stop_name", "")}
+                   if any(f in s.get("stop_name", "") for f in station_filters)}
     routes = {r["route_id"]: (r.get("route_long_name") or r.get("route_short_name")
                               or r["route_id"]) for r in rows("routes.txt")}
     trips = {}                                     # trip_id -> (route_id, direction, headsign)
@@ -167,13 +169,51 @@ def _cache_path(key: str) -> tuple[Path, str] | None:
     return None
 
 
-def main() -> None:
-    base = json.loads(BASE.read_text(encoding="utf-8"))
+def _load_keymap(path):
+    """路線識別子表 JSON を読み {"key_to_name": {...}, "directional": {...}} を返す。
+
+    形式: {"key_to_name": {"metro_ginza": "銀座線", ...},
+           "directional": {"jr_yamanote": [["InnerLoop","内回り"], ...]}}。
+    未指定なら組込み既定(現行9路線)。"""
+    if not path:
+        return dict(_KEY_TO_NAME), {k: list(v) for k, v in _DIRECTIONAL.items()}
+    doc = json.loads(Path(path).read_text(encoding="utf-8"))
+    k2n = dict(doc.get("key_to_name", {}))
+    direc = {k: [tuple(pair) for pair in v]
+             for k, v in (doc.get("directional", {}) or {}).items()}
+    if not k2n and not direc:
+        raise ValueError(f"keymap ファイルが空: {path}")
+    return k2n, direc
+
+
+def main(argv: list[str] | None = None) -> None:
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="ODPT/GTFS キャッシュ → transit ファイル変換(駅名・路線識別子 指定可・既定=渋谷9路線)")
+    ap.add_argument("--base", default=str(BASE),
+                    help="基底ダイヤ JSON(既定=data/transit_shibuya.json)")
+    ap.add_argument("--out", default=str(OUT),
+                    help="出力先 JSON(既定=data/transit_odpt.json)")
+    ap.add_argument("--station", nargs="+", default=["渋谷", "Shibuya"],
+                    help="GTFS 停車駅の stop_name 部分一致(既定=渋谷 Shibuya)")
+    ap.add_argument("--station-label", default="渋谷駅",
+                    help="メタ・source 表示用の駅ラベル(既定=渋谷駅)")
+    ap.add_argument("--keymap-file", default=None,
+                    help="路線識別子表 JSON(key_to_name/directional)。既定=現行9路線")
+    args = ap.parse_args(argv)
+
+    base_path = Path(args.base) if Path(args.base).is_absolute() else REPO_ROOT / args.base
+    out_path = Path(args.out) if Path(args.out).is_absolute() else REPO_ROOT / args.out
+    station_filters = tuple(args.station)
+    station_label = args.station_label
+    key_to_name, directional = _load_keymap(args.keymap_file)
+
+    base = json.loads(base_path.read_text(encoding="utf-8"))
     lines = [dict(line) for line in base["lines"]]
     n_real = 0
     # (キャッシュキー, 基底の路線名の部分一致, 方向フィルタ|None)
-    jobs = [(k, n, None) for k, n in sorted(_KEY_TO_NAME.items())] + \
-           [(k, n, d) for k, pairs in sorted(_DIRECTIONAL.items()) for d, n in pairs]
+    jobs = [(k, n, None) for k, n in sorted(key_to_name.items())] + \
+           [(k, n, d) for k, pairs in sorted(directional.items()) for d, n in pairs]
     for key, name_part, direction in jobs:
         label = f"{key}({direction})" if direction else key
         found = _cache_path(key)
@@ -193,7 +233,7 @@ def main() -> None:
         old = (hit["first"], hit["last"], hit["headway_min"])
         hit.update({"first": stats["first"], "last": stats["last"],
                     "headway_min": stats["headway_min"],
-                    "source": f"ODPT実ダイヤ(渋谷駅・平日の駅時刻表・{tier})"})
+                    "source": f"ODPT実ダイヤ({station_label}・平日の駅時刻表・{tier})"})
         n_real += 1
         print(f"  + {hit['name']}: {old[0]}-{old[1]} 間隔{old[2]}分(近似) → "
               f"{stats['first']}-{stats['last']} 間隔{stats['headway_min']}分"
@@ -203,7 +243,7 @@ def main() -> None:
     for gtfs_dir, tier in GTFS_DIRS:
         for zp in sorted(gtfs_dir.glob("*-Train-GTFS.zip")) if gtfs_dir.exists() else []:
             try:
-                by_route = gtfs_shibuya_departures(zp)
+                by_route = gtfs_shibuya_departures(zp, station_filters)
             except (zipfile.BadZipFile, KeyError, OSError) as e:
                 print(f"  - GTFS {zp.name}: 読めない({type(e).__name__})")
                 continue
@@ -237,7 +277,7 @@ def main() -> None:
                     old = (hit["first"], hit["last"], hit["headway_min"])
                     hit.update({"first": stats["first"], "last": stats["last"],
                                 "headway_min": stats["headway_min"],
-                                "source": f"ODPT実ダイヤ(渋谷駅・平日・静的GTFS・{tier})"})
+                                "source": f"ODPT実ダイヤ({station_label}・平日・静的GTFS・{tier})"})
                     n_real += 1
                     print(f"  + {hit['name']}: {old[0]}-{old[1]} 間隔{old[2]}分(近似) → "
                           f"{stats['first']}-{stats['last']} 間隔{stats['headway_min']}分"
@@ -248,11 +288,11 @@ def main() -> None:
 
     out = {
         "meta": {
-            "note": ("渋谷駅の定刻ダイヤ。source に「実ダイヤ」とある路線=ODPT の"
+            "note": (f"{station_label}の定刻ダイヤ。source に「実ダイヤ」とある路線=ODPT の"
                      "駅時刻表(平日)から再構成(オープン枠 or チャレンジ限定データ)、"
                      "他路線=公表値の近似(駅時刻表が非提供のため)。"
                      "ダイヤ乱れは disaster 層(H4)が担う。"),
-            "station": base.get("meta", {}).get("station", "渋谷駅"),
+            "station": base.get("meta", {}).get("station", station_label),
             "generated_by": "scripts/build_transit_odpt.py",
             "generated_at": datetime.date.today().isoformat(),
             "attribution": ("公共交通オープンデータセンター(ODPT)https://www.odpt.org/ "
@@ -261,8 +301,8 @@ def main() -> None:
         "lines": lines,
         "bus_lines": base.get("bus_lines", []),
     }
-    OUT.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
-    print(f"→ {OUT.name}: 実ダイヤ {n_real} 路線 / 近似 {len(lines) - n_real} 路線")
+    out_path.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(f"→ {out_path.name}: 実ダイヤ {n_real} 路線 / 近似 {len(lines) - n_real} 路線")
 
 
 if __name__ == "__main__":

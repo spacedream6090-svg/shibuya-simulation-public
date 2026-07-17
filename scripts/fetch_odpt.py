@@ -60,6 +60,9 @@ for _stream in (sys.stdout, sys.stderr):  # 日本語出力の文字化け対策
 API_BASE = "https://api.odpt.org/api/v4/"
 KEY_ENV = "ODPT_API_KEY"     # main() で --key-env に差し替え可
 _CONSUMER_KEY = ""           # main() で解決。絶対に print/log/保存しない
+# 対象駅の識別子(既定=渋谷)。別の街は main() で --station-title / --station-suffix で差替。
+_STATION_TITLE = "渋谷"       # odpt:Station の dc:title / stationTitle.ja の一致対象
+_STATION_SUFFIX = ".Shibuya"  # odpt:Station owl:sameAs 末尾の一致対象(ローマ字駅名)
 USER_AGENT = "shibuya-simulation-odpt-fetch/1.0 (+offline cache builder)"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUT = REPO_ROOT / "data" / "odpt"
@@ -232,13 +235,15 @@ def _print_plan(targets: list[Target], want_train: bool) -> None:
 
 # ------------------------------------------------------------------ 実取得
 def _find_shibuya_station(stations: list) -> str | None:
-    """Station レコード群から渋谷駅の sameAs を探す(.Shibuya 末尾 or タイトル 渋谷)。"""
+    """Station レコード群から対象駅の sameAs を探す(sameAs 末尾 or タイトル一致)。
+
+    既定は渋谷(_STATION_SUFFIX/_STATION_TITLE)。別の街は main() で差替える。"""
     for s in stations:
         same = s.get("owl:sameAs", "")
-        if same.endswith(".Shibuya"):
+        if same.endswith(_STATION_SUFFIX):
             return same
         title = s.get("dc:title") or (s.get("odpt:stationTitle") or {}).get("ja", "")
-        if title == "渋谷":
+        if title == _STATION_TITLE:
             return same
     return None
 
@@ -258,7 +263,7 @@ def _repair_railway(t: Target, timeout: float) -> tuple[list, str, str | None]:
             shibuya = None
             for st in r.get("odpt:stationOrder", []):
                 sid = st.get("odpt:station", "")
-                if sid.endswith(".Shibuya"):
+                if sid.endswith(_STATION_SUFFIX):
                     shibuya = sid
                     break
             return [r], same, shibuya
@@ -363,15 +368,32 @@ def _run_fetch(targets: list[Target], out_dir: Path, want_train: bool,
 
 
 # ------------------------------------------------------------------ CLI
-def _select(only: str | None) -> list[Target]:
+def _select(only: str | None, targets: list[Target] | None = None) -> list[Target]:
+    targets = list(TARGETS) if targets is None else targets
     if not only:
+        return list(targets)
+    return [t for t in targets if only in t.label or only in t.key]
+
+
+def _load_targets(path: str | None) -> list[Target]:
+    """対象路線表 JSON → [Target]。未指定なら組込み既定(渋谷9路線)。
+
+    形式: [{"key","label","operator","railway","shibuya_station","title_keywords":[...]}]。
+    別の街は駅に乗り入れる路線をこの形式で列挙して差替える。"""
+    if not path:
         return list(TARGETS)
-    sel = [t for t in TARGETS if only in t.label or only in t.key]
-    return sel
+    doc = json.loads(Path(path).read_text(encoding="utf-8"))
+    out = []
+    for d in doc:
+        out.append(Target(
+            key=str(d["key"]), label=str(d["label"]), operator=str(d["operator"]),
+            railway=str(d["railway"]), shibuya_station=str(d["shibuya_station"]),
+            title_keywords=tuple(d.get("title_keywords", []))))
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
-    global API_BASE, KEY_ENV, _CONSUMER_KEY
+    global API_BASE, KEY_ENV, _CONSUMER_KEY, _STATION_TITLE, _STATION_SUFFIX
     p = argparse.ArgumentParser(
         description="ODPT(公共交通オープンデータ)静的キャッシュ取得。"
                     "APIキーは環境変数から読む(既定 ODPT_API_KEY、--key-env で切替)。")
@@ -391,13 +413,22 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--timeout", type=float, default=30.0, help="1リクエストのタイムアウト秒")
     p.add_argument("--pause", type=float, default=0.5,
                    help="リクエスト間の待機秒(API への配慮)")
+    p.add_argument("--targets-file", default=None,
+                   help="対象路線表 JSON(key/label/operator/railway/shibuya_station/"
+                        "title_keywords)。既定=渋谷9路線")
+    p.add_argument("--station-title", default=_STATION_TITLE,
+                   help=f"対象駅の日本語タイトル一致(既定: {_STATION_TITLE})")
+    p.add_argument("--station-suffix", default=_STATION_SUFFIX,
+                   help=f"対象駅の sameAs 末尾一致(既定: {_STATION_SUFFIX})")
     args = p.parse_args(argv)
 
     KEY_ENV = args.key_env
     API_BASE = args.api_base if args.api_base.endswith("/") else args.api_base + "/"
     SOURCE_META["api_base"] = API_BASE
+    _STATION_TITLE = args.station_title
+    _STATION_SUFFIX = args.station_suffix
 
-    targets = _select(args.only)
+    targets = _select(args.only, _load_targets(args.targets_file))
     if not targets:
         print(f"該当路線なし: --only {args.only!r}", file=sys.stderr)
         return 1
