@@ -11,3 +11,5 @@ data/odpt_challenge/
 shibuya　バックアップ/
 # ローカル個人設定
 .claude/settings.local.json
+# PLATEAU 抽出中間ファイル(実データ由来・巨大。plateau_extract.py が再生成)
+data/plateau/

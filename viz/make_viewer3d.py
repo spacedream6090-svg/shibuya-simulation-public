@@ -28,13 +28,17 @@ def _load_export3d():
     return mod
 
 
-def _ensure_scene(run_dir: Path) -> tuple[str, str]:
+def _ensure_scene(run_dir: Path) -> tuple[str, str, str | None]:
     scene_dir = run_dir / "scene3d"
     scene_p = scene_dir / "scene.json"
     tracks_p = scene_dir / "tracks.json"
     if not (scene_p.exists() and tracks_p.exists()):
         _load_export3d().export_run(run_dir)
-    return scene_p.read_text(encoding="utf-8"), tracks_p.read_text(encoding="utf-8")
+    # PLATEAU 実形状(export_3d --plateau の成果物)。無ければ None=従来とバイト同一。
+    pw_p = scene_dir / "plateau_web.json"
+    plateau = pw_p.read_text(encoding="utf-8") if pw_p.exists() else None
+    return (scene_p.read_text(encoding="utf-8"),
+            tracks_p.read_text(encoding="utf-8"), plateau)
 
 
 def _read_vendor() -> tuple[str, str, str]:
@@ -56,7 +60,9 @@ def _json_for_script(text: str) -> str:
     return text.replace("</", "<\\/")
 
 
-def build_html(run_name: str, scene_json: str, tracks_json: str) -> str:
+def build_html(run_name: str, scene_json: str, tracks_json: str,
+               plateau_json: str | None = None,
+               plateau_src: str | None = None) -> str:
     three_js, orbit_js, lic = _read_vendor()
     html = _TEMPLATE
     html = html.replace("__RUN_NAME__", run_name)
@@ -65,7 +71,90 @@ def build_html(run_name: str, scene_json: str, tracks_json: str) -> str:
     html = html.replace("__ORBIT_JS__", orbit_js)
     html = html.replace("__SCENE_JSON__", _json_for_script(scene_json))
     html = html.replace("__TRACKS_JSON__", _json_for_script(tracks_json))
+    if plateau_json is not None or plateau_src is not None:
+        html = _inject_plateau(html, plateau_json, plateau_src)
     return html
+
+
+def _replace_once(html: str, old: str, new: str, what: str) -> str:
+    """テンプレート内アンカーの一意置換。ズレたら黙って壊れず即エラー。"""
+    n = html.count(old)
+    if n != 1:
+        raise SystemExit(f"[make_viewer3d] PLATEAU 注入アンカー '{what}' が {n} 箇所"
+                         "(期待=1)。テンプレート変更時は _inject_plateau を追随させる。")
+    return html.replace(old, new)
+
+
+def _inject_plateau(html: str, plateau_json: str | None,
+                    plateau_src: str | None) -> str:
+    """PLATEAU 実形状メッシュの描画を後付け注入する(データ無し時は呼ばれない=
+    既定出力は従来とバイト同一)。plateau_src 指定時は埋め込みの代わりに
+    <script src> サイドカー参照(file:// でも動く分離版=JSONP 方式)。"""
+    if plateau_src is not None:
+        data_tag = f'<script src="{plateau_src}"></script>'
+    else:
+        data_tag = ('<script type="application/json" id="plateau-data">'
+                    + _json_for_script(plateau_json) + "</script>")
+    # 1) データブロック(scene-data の直前)
+    anchor_data = '<script type="application/json" id="scene-data">'
+    html = _replace_once(html, anchor_data, data_tag + "\n" + anchor_data, "data")
+    # 2) PLATEAU_DATA / PLATEAU_SKIP 宣言(buildBuildings の直前)
+    anchor_decl = "(function buildBuildings(){"
+    html = _replace_once(html, anchor_decl, _PLATEAU_DECL + anchor_decl, "decl")
+    # 3) 照合済み建物は押出しをスキップ
+    anchor_skip = "for(const b of SCENE.buildings){\n    const fp = b.footprint;"
+    html = _replace_once(
+        html, anchor_skip,
+        "for(const b of SCENE.buildings){\n"
+        "    if(PLATEAU_SKIP.has(b.id)) continue;\n"
+        "    const fp = b.footprint;", "skip")
+    # 4) 実形状メッシュの構築(道路セクションの直前)
+    anchor_build = "// ---------- 道路(全ポリラインを 1 本の LineSegments に統合)"
+    html = _replace_once(html, anchor_build, _PLATEAU_BUILD + anchor_build, "build")
+    return html
+
+
+_PLATEAU_DECL = r"""const PLATEAU_DATA = (()=>{ try {
+  const el = document.getElementById('plateau-data');
+  if(el) return JSON.parse(el.textContent);
+  if(typeof PLATEAU_MESH !== 'undefined') return PLATEAU_MESH;
+} catch(e) { console.warn('PLATEAU data parse failed', e); } return null; })();
+const PLATEAU_SKIP = new Set(PLATEAU_DATA ? PLATEAU_DATA.matched_ids : []);
+"""
+
+_PLATEAU_BUILD = r"""// ---------- PLATEAU 実形状建物(照合済み建物の実測メッシュ・出典は data.attribution)
+(function buildPlateau(){
+  if(!PLATEAU_DATA) return;
+  const b64 = s => { const bin = atob(s); const u = new Uint8Array(bin.length);
+    for(let i=0;i<bin.length;i++) u[i] = bin.charCodeAt(i); return u; };
+  const q = PLATEAU_DATA.quant_scale;
+  const pi = new Int16Array(b64(PLATEAU_DATA.positions_b64).buffer);
+  const pos = new Float32Array(pi.length);
+  for(let i=0;i<pi.length;i+=3){                 // local-m (e,n,up) -> three (e,up,-n)
+    pos[i]   =  pi[i]   * q;
+    pos[i+1] =  pi[i+2] * q;
+    pos[i+2] = -pi[i+1] * q;
+  }
+  const idx = new Uint32Array(b64(PLATEAU_DATA.indices_b64).buffer);
+  const cu = b64(PLATEAU_DATA.colors_b64);
+  const col = new Float32Array(cu.length);
+  for(let i=0;i<cu.length;i++) col[i] = cu[i] / 255;
+  const bg = new THREE.BufferGeometry();
+  bg.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  bg.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  bg.setIndex(new THREE.BufferAttribute(idx, 1));
+  bg.computeVertexNormals();
+  const mat = new THREE.MeshLambertMaterial({ vertexColors:true,
+    transparent:true, opacity:1.0 });
+  buildingMats.push(mat);
+  const mesh = new THREE.Mesh(bg, mat);
+  buildingMeshes.push(mesh); scene.add(mesh);
+  try { const s = document.querySelector('#hud .sub');
+    if(s && PLATEAU_DATA.attribution) s.textContent += ' / ' + PLATEAU_DATA.attribution;
+  } catch(e){}
+})();
+
+"""
 
 
 def _strip_traffic(tracks_json: str) -> str:
@@ -83,13 +172,29 @@ def main(argv: list) -> int:
         print(__doc__)
         return 1
     run_dir = Path(args[0]).resolve()
-    scene_json, tracks_json = _ensure_scene(run_dir)
+    scene_json, tracks_json, plateau_json = _ensure_scene(run_dir)
     if "--no-traffic" in flags:
         tracks_json = _strip_traffic(tracks_json)
-    html = build_html(run_dir.name, scene_json, tracks_json)
+    html = build_html(run_dir.name, scene_json, tracks_json,
+                      plateau_json=plateau_json)
     out = run_dir / "viewer3d.html"
     out.write_text(html, encoding="utf-8")
-    print(f"  {out}  ({out.stat().st_size/1024/1024:.2f} MB)")
+    mb = out.stat().st_size / 1024 / 1024
+    print(f"  {out}  ({mb:.2f} MB)")
+    if plateau_json is not None:
+        if mb > 80:
+            print(f"  [warn] 埋め込み版が {mb:.1f} MB > 80MB ゲート。"
+                  " LOD 簡略化か分離版の利用を検討。")
+        # 分離版: 軽量 HTML + サイドカー(同フォルダに置けば file:// で動く)
+        side = run_dir / "plateau_mesh.js"
+        side.write_text("PLATEAU_MESH = " + plateau_json + ";",
+                        encoding="utf-8")
+        lite = build_html(run_dir.name, scene_json, tracks_json,
+                          plateau_src="plateau_mesh.js")
+        lite_p = run_dir / "viewer3d_lite.html"
+        lite_p.write_text(lite, encoding="utf-8")
+        print(f"  {lite_p}  ({lite_p.stat().st_size/1024/1024:.2f} MB)"
+              f"  + {side.name}  ({side.stat().st_size/1024/1024:.2f} MB)")
     return 0
 
 

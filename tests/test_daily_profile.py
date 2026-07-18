@@ -44,10 +44,11 @@ def test_n_agents_is_300():
 
 
 def test_token_calibration():
-    """トークン較正: plan 448 / reflect 2048 / 発話 320 据え置き。"""
+    """トークン較正: plan 448 / reflect 768(第34バッチ A1 右サイズ化=実測max 247tok の
+    ~2.2倍余裕・think=false 前提)/ 発話 320。"""
     model = _cfg().model
     assert int(model.plan_max_tokens) == 448
-    assert int(model.reflect_max_tokens) == 2048
+    assert int(model.reflect_max_tokens) == 768
     assert int(model.max_tokens) == 320
 
 

@@ -2,13 +2,18 @@
 
 使い方:  python scripts/export_3d.py runs/<name> [--map data/shibuya_osm.json]
                                   [--sample-agents N] [--step-stride K]
+                                  [--plateau] [--plateau-dir data/plateau]
   --sample-agents N : tracks の対象を先頭 N エージェントに間引く(大規模ランの LOD 出力)。
   --step-stride K   : K step ごとに1フレームだけ出力する(時間ダウンサンプル)。
-  既定はどちらも全量=現行と完全同一。
+  --plateau         : PLATEAU 実形状(plateau_extract/match_plateau の成果物)で、照合済み建物を
+                      実測メッシュに置換する(glb ハイブリッド+scene.json height 上書き+
+                      viewer3d 用 plateau_web.json)。既定 OFF=従来出力とバイト同一。
+  既定はいずれも全量・OFF=現行と完全同一。
 生成物:  runs/<name>/scene3d/
   scene.json     — 静的シーン(建物押出し情報・道路・線路・POI)。座標系 local-m(X=east,Y=north,Z=up)。
   tracks.json    — 時系列(エージェント位置・移動ポリライン・車トラフィック・sim 時刻)。
   buildings.glb  — 建物押出しプリズムの glTF 2.0 バイナリ(numpy+stdlib 手書き生成、依存追加なし)。
+  plateau_web.json — (--plateau 時のみ)照合建物の量子化メッシュ(int16×0.05m・base64)。
 
 設計方針: sim⇄viz 疎結合(docs/lit/viz__plateau-pipeline-overview.md)。
   本スクリプトは l1_events.parquet を読むだけ。sim 本体には非依存。
@@ -20,6 +25,7 @@ make_viewer.py 自体は変更しない。
 """
 from __future__ import annotations
 
+import base64
 import json
 import struct
 import sys
@@ -137,6 +143,112 @@ def triangulate(ring: list) -> list:
     return tris
 
 
+# ------------------------------------------------------------------ PLATEAU 実形状
+PLATEAU_QUANT = 0.05  # viewer3d 埋め込み量子化 [m/単位](int16 で ±1638m まで表現可)
+PLATEAU_ATTRIBUTION = ("建物形状: 国土交通省 Project PLATEAU "
+                       "3D都市モデル(渋谷区 2025年度)を加工")
+
+
+def _load_plateau(plateau_dir: Path) -> dict:
+    """plateau_extract / match_plateau の成果物を読み、osm建物ID→実形状メッシュにする。
+
+    building_offsets は F(三角形行列)の行オフセット(長さ=建物数+1・末尾=総行数)。
+    照合表に居るが index に無い gml_id は黙ってスキップせず件数を報告する。"""
+    idx_p = plateau_dir / "plateau_index.json"
+    npz_p = plateau_dir / "plateau_mesh.npz"
+    match_p = plateau_dir / "plateau_match.json"
+    missing = [p.name for p in (idx_p, npz_p, match_p) if not p.exists()]
+    if missing:
+        raise SystemExit(
+            f"[export_3d] --plateau: {plateau_dir} に {missing} が無い。"
+            " 先に scripts/plateau_extract.py と scripts/match_plateau.py を実行する。")
+    index = json.loads(idx_p.read_text(encoding="utf-8"))
+    data = np.load(npz_p)
+    V, F, off = data["V"], data["F"], data["building_offsets"]
+    if int(off[-1]) != len(F):
+        raise SystemExit("[export_3d] --plateau: building_offsets の末尾が F 行数と不一致")
+    gml_pos = {b["gml_id"]: i for i, b in enumerate(index["buildings"])}
+    matches = json.loads(match_p.read_text(encoding="utf-8"))["matches"]
+    meshes: dict = {}
+    heights: dict = {}
+    dropped = 0
+    for osm_id, m in matches.items():
+        i = gml_pos.get(m["gml_id"])
+        if i is None:
+            dropped += 1
+            continue
+        Fb = F[int(off[i]):int(off[i + 1])]
+        if len(Fb) == 0:
+            dropped += 1
+            continue
+        vids, inv = np.unique(Fb, return_inverse=True)
+        meshes[osm_id] = (V[vids].astype(np.float32),
+                          inv.reshape(-1, 3).astype(np.int32))
+        heights[osm_id] = float(index["buildings"][i]["height"])
+    if dropped:
+        print(f"  [plateau] 照合表のうち {dropped} 件は index/メッシュ不在でスキップ")
+    return {"meshes": meshes, "heights": heights,
+            "ground0_source": index.get("ground0_source", "?")}
+
+
+def _vertex_normals(V: np.ndarray, F: np.ndarray) -> np.ndarray:
+    """面法線の頂点集約(面積重み)。PLATEAU 面は表面単位で頂点が独立しているため、
+    集約してもほぼフラットシェーディング相当になる。"""
+    n = np.zeros_like(V)
+    tri = V[F]
+    fn = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    for k in range(3):
+        np.add.at(n, F[:, k], fn)
+    L = np.linalg.norm(n, axis=1, keepdims=True)
+    L[L == 0] = 1.0
+    return (n / L).astype(np.float32)
+
+
+def _append_mesh(V, F, color, pos, nrm, col, idxs):
+    """実形状メッシュ(local-m Z-up)を glb 用配列へ追記する。"""
+    n0 = len(pos)
+    N = _vertex_normals(V, F)
+    pos.extend(map(tuple, V))
+    nrm.extend(map(tuple, N))
+    col.extend([color] * len(V))
+    idxs.extend((F.astype(np.int64) + n0).ravel().tolist())
+
+
+def build_plateau_web(buildings: list, plateau: dict) -> dict:
+    """viewer3d 埋め込み用の量子化メッシュ(int16×0.05m・base64・建物色は kind 準拠)。"""
+    Vs, Fs, Cs, matched_ids = [], [], [], []
+    n0 = 0
+    for b in buildings:
+        pm = plateau["meshes"].get(b["id"])
+        if pm is None:
+            continue
+        V, F = pm
+        color = KIND_COLOR.get(b.get("kind"), DEFAULT_COLOR)
+        Vs.append(V)
+        Fs.append(F.astype(np.int64) + n0)
+        Cs.append(np.tile(np.array(color, dtype=np.uint8), (len(V), 1)))
+        matched_ids.append(b["id"])
+        n0 += len(V)
+    if not Vs:
+        raise SystemExit("[export_3d] --plateau: 照合済み建物が 0 件(match 対象の地図と"
+                         " ランの地図が一致しているか確認)")
+    V = np.vstack(Vs)
+    F = np.vstack(Fs)
+    C = np.vstack(Cs)
+    Q = np.clip(np.round(V / PLATEAU_QUANT), -32767, 32767).astype("<i2")
+    return {
+        "quant_scale": PLATEAU_QUANT,
+        "n_vertices": int(len(V)),
+        "n_triangles": int(len(F)),
+        "matched_ids": matched_ids,
+        "positions_b64": base64.b64encode(Q.tobytes()).decode("ascii"),
+        "indices_b64": base64.b64encode(F.astype("<u4").tobytes()).decode("ascii"),
+        "colors_b64": base64.b64encode(C.tobytes()).decode("ascii"),
+        "ground0_source": plateau.get("ground0_source", "?"),
+        "attribution": PLATEAU_ATTRIBUTION,
+    }
+
+
 # ------------------------------------------------------------------ glb 生成
 def _extrude_building(ring, base, top, color, pos, nrm, col, idxs):
     """1 建物の押出しメッシュを配列に追記(座標は local-m Z-up のまま渡す)。"""
@@ -190,15 +302,20 @@ def _pad4(b: bytes, fill: bytes) -> bytes:
     return b + fill * r
 
 
-def build_glb(buildings: list) -> bytes:
+def build_glb(buildings: list, plateau: dict | None = None) -> bytes:
     """建物リスト([{footprint,height,base,kind}]) から glTF 2.0 バイナリを生成。
-    座標系変換: local-m (X=east,Y=north,Z=up) → glTF 標準 (x=east, y=up, z=-north)。"""
+    座標系変換: local-m (X=east,Y=north,Z=up) → glTF 標準 (x=east, y=up, z=-north)。
+    plateau 指定時は照合済み建物を実形状メッシュに置換(未照合は従来押出し)。"""
     pos: list = []
     nrm: list = []
     col: list = []
     idxs: list = []
     for b in buildings:
         color = KIND_COLOR.get(b.get("kind"), DEFAULT_COLOR)
+        pm = plateau["meshes"].get(b["id"]) if plateau else None
+        if pm is not None:
+            _append_mesh(pm[0], pm[1], color, pos, nrm, col, idxs)
+            continue
         base = float(b.get("base", 0.0))
         top = base + float(b.get("height", FLOOR_HEIGHT))
         _extrude_building(b["footprint"], base, top, color, pos, nrm, col, idxs)
@@ -452,7 +569,8 @@ def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
 
 # ------------------------------------------------------------------ top-level
 def export_run(run_dir: Path, map_path: Path | None = None,
-               sample_agents: int | None = None, step_stride: int = 1) -> dict:
+               sample_agents: int | None = None, step_stride: int = 1,
+               plateau_dir: Path | None = None) -> dict:
     run_dir = Path(run_dir)
     import pyarrow.parquet as pq
     events = pq.read_table(run_dir / "l1_events.parquet").to_pylist()
@@ -465,10 +583,16 @@ def export_run(run_dir: Path, map_path: Path | None = None,
     agents_meta = json.loads(am_path.read_text(encoding="utf-8")) if am_path.exists() else []
 
     scene = build_scene(city, buildings)
+    plateau = _load_plateau(plateau_dir) if plateau_dir is not None else None
+    if plateau:
+        for b in scene["buildings"]:
+            if b["id"] in plateau["meshes"]:
+                b["height"] = round(plateau["heights"][b["id"]], 2)  # LOD 実測で上書き
+                b["plateau"] = 1                                     # 追加専用キー
     tracks = reconstruct_tracks(events, buildings, agents_meta,
                                 sample_agents=sample_agents,
                                 step_stride=step_stride)
-    glb = build_glb(scene["buildings"])
+    glb = build_glb(scene["buildings"], plateau)
 
     out_dir = run_dir / "scene3d"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -480,8 +604,15 @@ def export_run(run_dir: Path, map_path: Path | None = None,
     tracks_p.write_text(json.dumps(tracks, ensure_ascii=False, separators=(",", ":")),
                         encoding="utf-8")
     glb_p.write_bytes(glb)
-    return {"scene": scene_p, "tracks": tracks_p, "glb": glb_p,
-            "n_buildings": len(scene["buildings"]), "n_steps": tracks["meta"]["nSteps"]}
+    res = {"scene": scene_p, "tracks": tracks_p, "glb": glb_p,
+           "n_buildings": len(scene["buildings"]), "n_steps": tracks["meta"]["nSteps"]}
+    if plateau:
+        web = build_plateau_web(scene["buildings"], plateau)
+        web_p = out_dir / "plateau_web.json"
+        web_p.write_text(json.dumps(web, separators=(",", ":")), encoding="utf-8")
+        res["plateau_web"] = web_p
+        res["n_plateau"] = len(web["matched_ids"])
+    return res
 
 
 def main(argv: list) -> int:
@@ -498,16 +629,25 @@ def main(argv: list) -> int:
     step_stride = 1
     if "--step-stride" in argv:
         step_stride = int(argv[argv.index("--step-stride") + 1])
+    plateau_dir = None
+    if "--plateau" in argv:
+        plateau_dir = REPO_ROOT / "data" / "plateau"
+    if "--plateau-dir" in argv:
+        plateau_dir = Path(argv[argv.index("--plateau-dir") + 1])
+        if not plateau_dir.is_absolute():
+            plateau_dir = REPO_ROOT / plateau_dir
     res = export_run(run_dir, map_override, sample_agents=sample_agents,
-                     step_stride=step_stride)
-    for k in ("scene", "tracks", "glb"):
+                     step_stride=step_stride, plateau_dir=plateau_dir)
+    keys = ("scene", "tracks", "glb") + (("plateau_web",) if "plateau_web" in res else ())
+    for k in keys:
         sz = res[k].stat().st_size
         try:
             shown = res[k].relative_to(REPO_ROOT)
         except ValueError:
             shown = res[k]
         print(f"  {shown}  ({sz/1024:.1f} KB)")
-    print(f"  buildings={res['n_buildings']}  steps={res['n_steps']}")
+    tail = f"  plateau={res['n_plateau']}" if "n_plateau" in res else ""
+    print(f"  buildings={res['n_buildings']}  steps={res['n_steps']}{tail}")
     return 0
 
 
