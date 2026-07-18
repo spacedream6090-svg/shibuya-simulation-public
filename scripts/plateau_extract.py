@@ -157,6 +157,19 @@ def triangulate_3d(pts):
     else:
         ring2 = [(y, z) for (_x, y, z) in p]
     tris = _triangulate2d(ring2)
+    # 元リング(CityGML の外向き巻き)と三角形の表裏を一致させる。_triangulate2d は
+    # 投影面で CCW に正規化するため、投影軸の符号次第で表裏が反転し「正軸向き」に
+    # 揃ってしまう(→建物の約半数が内向き殻=背面カリングで壁が消える崩れの原因)。
+    for (i, j, k) in tris:
+        (ax0, ay0, az0), (bx, by, bz), (cx, cy, cz) = p[i], p[j], p[k]
+        ux, uy, uz = bx - ax0, by - ay0, bz - az0
+        vx, vy, vz = cx - ax0, cy - ay0, cz - az0
+        d = ((uy * vz - uz * vy) * nx + (uz * vx - ux * vz) * ny
+             + (ux * vy - uy * vx) * nz)
+        if d != 0.0:
+            if d < 0.0:
+                tris = [(a, c, b) for (a, b, c) in tris]
+            break
     return p, tris
 
 

@@ -203,3 +203,34 @@ def test_meshes_for_bbox_center():
     # 中心1km圏の bbox → 4枚(85/86/95/96)を含む
     codes = PE.meshes_for_bbox(35.65465, 139.69334, 35.66385, 139.70766)
     assert {"53393585", "53393586", "53393595", "53393596"} <= codes
+
+
+# ------------------------------------------------------------- 巻き向きの復元
+def _tri_normal(p, tri):
+    (ax, ay, az), (bx, by, bz), (cx, cy, cz) = p[tri[0]], p[tri[1]], p[tri[2]]
+    u = (bx - ax, by - ay, bz - az)
+    v = (cx - ax, cy - ay, cz - az)
+    return (u[1] * v[2] - u[2] * v[1],
+            u[2] * v[0] - u[0] * v[2],
+            u[0] * v[1] - u[1] * v[0])
+
+
+@pytest.mark.parametrize("ring,expect", [
+    # 上向き水平面(CCW を上から見た巻き)→ 法線 +z
+    ([(0, 0, 5), (2, 0, 5), (2, 2, 5), (0, 2, 5)], (0, 0, 1)),
+    # 下向き水平面(同じ頂点の逆順=床)→ 法線 -z が保存されること
+    ([(0, 2, 5), (2, 2, 5), (2, 0, 5), (0, 0, 5)], (0, 0, -1)),
+    # 南向きの壁(-y 向き)→ 投影軸の符号に関わらず -y が保存されること
+    ([(0, 0, 0), (2, 0, 0), (2, 0, 3), (0, 0, 3)], (0, -1, 0)),
+    # 北向きの壁(+y 向き)
+    ([(2, 1, 0), (0, 1, 0), (0, 1, 3), (2, 1, 3)], (0, 1, 0)),
+])
+def test_triangulate_3d_preserves_winding(ring, expect):
+    """三角形の表裏が元リング(CityGML の外向き巻き)と一致する
+    (背面カリングで壁が消える崩れの回帰テスト)。"""
+    p, tris = PE.triangulate_3d(ring)
+    assert tris, "三角形化に失敗"
+    for t in tris:
+        n = _tri_normal(p, t)
+        dot = sum(a * b for a, b in zip(n, expect))
+        assert dot > 0, f"面が反転: tri={t} normal={n} expect={expect}"

@@ -144,8 +144,10 @@ _PLATEAU_BUILD = r"""// ---------- PLATEAU 実形状建物(照合済み建物の
   bg.setAttribute('color', new THREE.BufferAttribute(col, 3));
   bg.setIndex(new THREE.BufferAttribute(idx, 1));
   bg.computeVertexNormals();
+  // DoubleSide: PLATEAU 由来メッシュは面の巻きが局所的に不整合なことがある
+  // (three.js は裏面の法線を自動反転して陰影も正しく出す)
   const mat = new THREE.MeshLambertMaterial({ vertexColors:true,
-    transparent:true, opacity:1.0 });
+    transparent:true, opacity:1.0, side:THREE.DoubleSide });
   buildingMats.push(mat);
   const mesh = new THREE.Mesh(bg, mat);
   buildingMeshes.push(mesh); scene.add(mesh);
