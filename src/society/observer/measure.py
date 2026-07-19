@@ -35,49 +35,87 @@ _SOCIAL_CHANNELS = {"face", "sns", "dm"}
 # --------------------------------------------------------------------------- #
 # ローダ
 # --------------------------------------------------------------------------- #
+# load_events の正準列(順序も従来どおり)。
+_L1_COLUMNS = ("step", "sim_min", "agent_id", "kind", "x", "y", "payload",
+               "rng_stream", "llm_call_id")
+# int へキャストする列(残りはそのまま)。
+_L1_INT_COLUMNS = frozenset({"step", "sim_min", "agent_id"})
+
+
+def stream_events(run_dir: str, columns=None, batch_size: int | None = None):
+    """l1_events.parquet を **row-group / batch 逐次** で読み、イベント dict を yield する。
+
+    P4(観測ストリーミング): 全件を list へ materialize しない有界メモリの読み経路。
+    yield される各 dict は `load_events` の 1 要素と同一形(既定 columns=None)で、
+    行順(= step 昇順の追記順)も完全に保つ。`load_events` はこの生成器の list 版。
+
+    columns:
+      None       -> 従来と同じ 9 列(存在する列だけ射影・欠損の rng_stream/
+                    llm_call_id は None で補完)。
+      イテラブル  -> 指定キーだけを持つ dict を yield(payload を要求したときのみ
+                    JSON を dict 展開)。step/sim_min/agent_id は int へキャスト。
+                    集計側が使う列だけに絞ると batch のデコード面積が下がる。
+    batch_size:
+      None なら pyarrow 既定。行数上限を渡すと 1 batch あたりの Python 実体化量を
+      さらに抑えられる(有界メモリの微調整用)。
+    """
+    import pyarrow.parquet as pq
+
+    path = os.path.join(run_dir, "l1_events.parquet")
+    want = list(_L1_COLUMNS) if columns is None else list(columns)
+    available = set(pq.read_schema(path).names)
+    cols = [c for c in want if c in available]         # 実在する列だけ射影
+    want_payload = "payload" in cols                   # 要求され かつ 実在する時のみ
+    # 欠損しても None で補完して形を保つ列(columns=None の後方互換のため)。
+    fill_none = [c for c in want if c not in available]
+    cols_present = [c for c in cols if c != "payload"]
+    int_cols = [c for c in cols_present if c in _L1_INT_COLUMNS]
+    raw_cols = [c for c in cols_present if c not in _L1_INT_COLUMNS]
+    pf = pq.ParquetFile(path)
+    kwargs = {"columns": cols}
+    if batch_size is not None:
+        kwargs["batch_size"] = int(batch_size)
+    for batch in pf.iter_batches(**kwargs):            # row-group/batch 逐次
+        d = batch.to_pydict()
+        n = batch.num_rows
+        pays = d["payload"] if want_payload else None
+        for i in range(n):
+            row: dict[str, Any] = {}
+            for c in int_cols:
+                row[c] = int(d[c][i])
+            for c in raw_cols:
+                row[c] = d[c][i]
+            for c in fill_none:
+                row[c] = None
+            if want_payload:
+                raw = pays[i]
+                try:
+                    row["payload"] = json.loads(raw) if raw else {}
+                except (json.JSONDecodeError, TypeError):
+                    row["payload"] = {}
+            yield row
+
+
+def count_events(run_dir: str) -> int:
+    """l1_events.parquet の総行数を footer メタから O(1) で返す(全読みしない)。"""
+    import pyarrow.parquet as pq
+
+    path = os.path.join(run_dir, "l1_events.parquet")
+    if not os.path.exists(path):
+        return 0
+    return pq.read_metadata(path).num_rows
+
+
 def load_events(run_dir: str) -> list[dict]:
     """l1_events.parquet を読み、payload(JSON文字列)を dict に展開したイベント列を返す。
 
     返り値の各要素: {step, sim_min, agent_id, kind, x, y, rng_stream,
     llm_call_id, payload(dict)}。行順(=step 昇順の追記順)を保つ。
 
-    B4-lite(スケール): 全テーブルを一括 to_pydict せず、列射影+RecordBatch 逐次で
-    peak メモリを下げる(**返り値・行順は従来と完全同一**)。
+    実体は `stream_events` の list 化(row-group 逐次読み)。全件を RAM に載せるので
+    大規模ランでは `stream_events` を直接回すこと(P4)。返り値・行順は従来と完全同一。
     """
-    import pyarrow.parquet as pq
-
-    path = os.path.join(run_dir, "l1_events.parquet")
-    want = ["step", "sim_min", "agent_id", "kind", "x", "y", "payload",
-            "rng_stream", "llm_call_id"]
-    available = set(pq.read_schema(path).names)
-    cols = [c for c in want if c in available]         # 存在する列だけ射影
-    pf = pq.ParquetFile(path)
-    out: list[dict] = []
-    for batch in pf.iter_batches(columns=cols):        # row-group/batch 逐次
-        d = batch.to_pydict()
-        n = len(d["step"])
-        rng = d.get("rng_stream", [None] * n)
-        lci = d.get("llm_call_id", [None] * n)
-        step, sim_min, agent_id = d["step"], d["sim_min"], d["agent_id"]
-        kind, xs, ys, pays = d["kind"], d["x"], d["y"], d["payload"]
-        for i in range(n):
-            raw = pays[i]
-            try:
-                payload = json.loads(raw) if raw else {}
-            except (json.JSONDecodeError, TypeError):
-                payload = {}
-            out.append({
-                "step": int(step[i]),
-                "sim_min": int(sim_min[i]),
-                "agent_id": int(agent_id[i]),
-                "kind": kind[i],
-                "x": xs[i],
-                "y": ys[i],
-                "rng_stream": rng[i],
-                "llm_call_id": lci[i],
-                "payload": payload,
-            })
-    return out
+    return list(stream_events(run_dir))
 
 
 def load_l2(run_dir: str) -> dict[str, list] | None:

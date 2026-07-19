@@ -16,3 +16,6 @@ dev = ["pytest>=8.0"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+    "slow: 重い合成データ・スケール検証(`-m 'not slow'` でスキップ可)",
+]

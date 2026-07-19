@@ -26,6 +26,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 from society.observer import measure as m  # noqa: E402
+from society.observer import stream as st  # noqa: E402
 
 # Okabe-Ito カラーブラインドセーフ配色
 PALETTE = ["#0072B2", "#E69F00", "#009E73", "#D55E00", "#CC79A7",
@@ -510,25 +511,25 @@ def analyze(run_dir, y_weights=None):
     outdir = os.path.join(run_dir, "analysis")
     os.makedirs(outdir, exist_ok=True)
 
-    events = m.load_events(run_dir)
+    # P4: 観測ストリーミング。全件を RAM に載せず row-group 逐次で同一結果を得る。
     agents = m.load_agents(run_dir)
     l2 = m.load_l2(run_dir)
     traits, tnames, tsrc = m.load_traits(run_dir, agents)
-    n_agents = len(agents) or (max((e["agent_id"] for e in events), default=-1) + 1)
+    n_agents = len(agents) or (st.max_agent_id(run_dir) + 1)
 
-    feats = m.agent_features(events, agents, traits, y_weights=y_weights)
-    cascades = m.item_cascades(events)
-    windows = m.network_windows(events)
-    collective = m.collective_series(events, l2, n_agents)
+    feats = st.agent_features(run_dir, agents, traits, y_weights=y_weights)
+    cascades = st.item_cascades(run_dir)
+    windows = st.network_windows(run_dir)
+    collective = st.collective_series(run_dir, l2, n_agents)
     # D1: y_weights 指定時のみ Y_composite の R² も出す(既定は従来と同一)
     extra = ("Y_composite",) if (feats and "Y_composite" in feats[0]) else ()
     r2 = m.r2_traits(feats, tnames, extra_targets=extra)
     ews_adopt = m.ews(collective["adoption_frac"])
     ews_entropy = m.ews(collective["vocab_entropy"])
-    coinages = coinage_contexts(events)
+    coinages = st.coinage_contexts(run_dir)
     trigger_dist = coinage_trigger_dist(coinages)
-    tools = tool_usage(events)
-    drift = m.drift_metrics(events, n_agents)
+    tools = st.tool_usage(run_dir)
+    drift = st.drift_metrics(run_dir, n_agents)
 
     _dump(os.path.join(outdir, "agent_features.json"), feats)
     _dump(os.path.join(outdir, "items.json"), cascades)
@@ -545,16 +546,19 @@ def analyze(run_dir, y_weights=None):
     _dump(os.path.join(outdir, "r2.json"), r2)
 
     steps = collective["step"]
-    fig_adoption(events, cascades, steps, os.path.join(outdir, "fig_adoption.png"))
-    fig_cascade(events, cascades, os.path.join(outdir, "fig_cascade.png"))
+    # 図も逐次読み(1枚につき使い捨ての生成器を渡す=全件 materialize しない)
+    fig_adoption(m.stream_events(run_dir), cascades, steps,
+                 os.path.join(outdir, "fig_adoption.png"))
+    fig_cascade(m.stream_events(run_dir), cascades,
+                os.path.join(outdir, "fig_cascade.png"))
     fig_network(windows, os.path.join(outdir, "fig_network.png"))
     fig_rhythm(collective, os.path.join(outdir, "fig_rhythm.png"))
-    fig_drive(events, os.path.join(outdir, "fig_drive.png"))
+    fig_drive(m.stream_events(run_dir), os.path.join(outdir, "fig_drive.png"))
 
     write_report(os.path.join(outdir, "report.md"), run_dir, feats, cascades,
                  windows, collective, r2, ews_adopt, ews_entropy, tsrc, tnames,
                  coinages, trigger_dist, tools, drift)
-    return outdir, len(events), len(cascades)
+    return outdir, m.count_events(run_dir), len(cascades)
 
 
 def main():

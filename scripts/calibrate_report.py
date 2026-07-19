@@ -32,7 +32,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import build_panel as bp                       # noqa: E402  (活動復元の再利用=二重実装回避)
-from society.observer.measure import load_events  # noqa: E402
+from society.observer.measure import stream_events  # noqa: E402
 
 MIN_PER_DAY = 1440
 MIN_PER_STEP = 10
@@ -250,9 +250,7 @@ def analyze(run_dir: str) -> dict:
     res_ids = {a["id"] for a in residents}
     n_all, n_res, n_emp = len(agents), len(residents), len(org_employed)
 
-    evs = load_events(run_dir)
-
-    # ---- L1 走査(1パス)----
+    # ---- L1 走査(1パス・P4 row-group 逐次で有界メモリ)----
     sleep_h: list[float] = []
     bed_hours: list[float] = []
     wake_hours: list[float] = []
@@ -273,7 +271,7 @@ def analyze(run_dir: str) -> dict:
     reflect_deep = 0
     crime_thefts = 0
 
-    for e in evs:
+    for e in stream_events(run_dir):
         k = e["kind"]
         p = e["payload"]
         aid = e["agent_id"]
@@ -431,7 +429,7 @@ def analyze(run_dir: str) -> dict:
 
     # ---- ④生活時間配分(第31バッチ W3): build_panel の活動復元を再利用 ----
     try:
-        recon = bp.reconstruct_activity(evs, agents)
+        recon = bp.reconstruct_activity(stream_events(run_dir), agents)
         m["_activity"] = activity_summary(recon)
     except Exception:
         m["_activity"] = None
