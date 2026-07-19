@@ -24,11 +24,23 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import random
+import sys
 from pathlib import Path
+
+# cp932 コンソール(Windows 既定)で Unicode を print しても死なない(devlog-protocol の掟)。
+try:  # pragma: no cover - 環境依存
+    sys.stdout.reconfigure(errors="replace")
+    sys.stderr.reconfigure(errors="replace")
+except Exception:  # pragma: no cover
+    pass
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA = REPO_ROOT / "data"
 DEFAULT_MAP = DATA / "shibuya_osm.json"
+DEFAULT_WIDE_MAP = DATA / "shibuya_osm_wide_v7.json"      # 分布駆動(--dist)の既定広域地図
+DEFAULT_DIST_OUT = DATA / "organizations_shibuya_wide11k.json"  # 分布駆動の既定出力(新ファイル)
+DEFAULT_REPORT = REPO_ROOT / "docs" / "research" / "org-book-11k.md"
 DEFAULT_ROSTERS = [DATA / "personas_80.json", DATA / "personas_100_inflow.json"]
 
 
@@ -533,6 +545,433 @@ def build_assignments(orgs: dict, roster_path: Path, tag: str,
     }
 
 
+# ============================================================================
+# 分布駆動モード(P6: 台帳 52 → ~1.1万。経済センサス分布からの手続き生成)
+# ----------------------------------------------------------------------------
+# 目的(docs/plans/w2-execution-plan.md §4 P6): 従業者ペルソナ生成(P5)の需要源となる
+# ~1.1万組織を、渋谷区の産業大分類×従業者規模帯の分布から seed 付き決定論で手続き生成する。
+#
+# 正直な近似の記録(捏造しない=repo の「実数と偽装しない」掟):
+#   - 産業大分類の *事業所数* 構成比: 東京商工会議所渋谷支部が引く事業所統計(平成18・総数30,572)
+#     の業種別内訳(docs/research/shibuya-organizations.md §1.1)を骨格に採用。IT はビットバレー
+#     集積を反映してやや厚め。
+#   - *規模帯*(従業者規模8区分)の分布: 渋谷区の産業大分類×従業者規模の実クロス表
+#     (e-Stat 経済センサス stat_infid=000031720779)は JavaScript 描画で静的抽出できず
+#     (shibuya-organizations.md §1.4 / shibuya-population.md §9 に記録済み)。よって
+#     「都市部事業所は小規模多数+少数の中〜大規模」という一般構造(全国経済センサスの裾長分布)を
+#     ベースに、渋谷 bbox の実測アンカー(§5: 事業所~1.19万・従業者~25.7万 → 平均~21.6人/所)へ
+#     合うよう裾を補正した *近似分布* を用いる。産業別の規模傾斜(オフィス系=大・小売飲食=小)も
+#     この一般構造に基づく近似であり、実クロス表の再現を主張しない。
+#   - *硬いアンカー*(実数): 事業所数 ~1.1万(目標 count)と従業者総和 ~25.7万
+#     (shibuya-population.md §5・町丁目合算=信頼度高)には ±10% で整合させる。
+#   - 産業別の *従業者シェア* は生成の副産物として meta に記録するが、区の実クロス表からの抽出値
+#     ではない(近似)。令和3年経済センサスの区従業者(IT 106,574 / 卸小売 108,823 等・§5)とは
+#     オーダーで整合するが厳密一致は主張しない。
+#
+# 決定論: (map, seed, count) から random.Random(seed) の固定消費順で一意に決まる。LLM 非使用。
+# ============================================================================
+
+# 従業者規模帯(経済センサス 8 区分)。(表示 label, lo, hi)。300+ は上限を 1200 で近似打切り。
+SIZE_BANDS: list[tuple[str, int, int]] = [
+    ("1-4", 1, 4), ("5-9", 5, 9), ("10-19", 10, 19), ("20-29", 20, 29),
+    ("30-49", 30, 49), ("50-99", 50, 99), ("100-299", 100, 299), ("300+", 300, 1200),
+]
+
+# 規模クラス別の規模帯構成(事業所数シェア=正規化前。裾長。都市部の一般構造+渋谷補正)。
+#   SMALL  平均 ~11 人 / RETAIL ~20 / MED ~26 / LARGE ~50。加重平均 ~23.4 → 総従業者 ~25.7万。
+SIZE_CLASS_DIST: dict[str, list[float]] = {
+    "SMALL":  [0.55, 0.22, 0.12, 0.040, 0.030, 0.020, 0.008, 0.002],
+    "RETAIL": [0.47, 0.22, 0.15, 0.055, 0.045, 0.030, 0.022, 0.008],
+    "MED":    [0.38, 0.20, 0.16, 0.075, 0.065, 0.050, 0.038, 0.008],
+    "LARGE":  [0.24, 0.18, 0.16, 0.090, 0.080, 0.065, 0.062, 0.030],
+}
+
+# 産業大分類。share=事業所数構成比(正規化前)/ cls=規模クラス / cat=職場POIカテゴリ / tier=賃金区分。
+INDUSTRY_SPEC: list[dict] = [
+    dict(key="IT", name="情報通信業", cat="office", tier="会社員", cls="LARGE", share=0.08,
+         details=["業務SaaS", "受託開発/DX", "ゲーム開発", "クラウド/API", "データ分析/AI", "Webメディア"],
+         products=["業務SaaSの開発提供", "Web・業務システムの受託開発", "アプリ/ゲームの開発運営"],
+         roles=["エンジニア", "デザイナー", "プロダクトマネージャー", "営業", "コーポレート"],
+         generalist=["営業", "プロダクトマネージャー", "コーポレート"],
+         output=["software", "service"],
+         words=["システムズ", "ソフトウェア", "テック", "デジタル", "ラボ", "データワークス", "クラウド", "ネットワークス"]),
+    dict(key="WR", name="卸売業・小売業", cat="shop", tier="店員", cls="RETAIL", share=0.28,
+         details=["アパレル小売", "雑貨・ライフスタイル", "セレクトショップ", "コスメ物販", "食品小売", "生活雑貨卸"],
+         products=["衣料・服飾雑貨の小売", "生活雑貨・日用品の販売", "商品の卸売・仕入"],
+         roles=["販売スタッフ", "店長", "バイヤー", "EC運営", "VMD", "在庫管理"],
+         generalist=["店長", "バイヤー", "EC運営", "VMD"],
+         output=["goods", "retail"],
+         words=["商会", "物産", "ストア", "マーケット", "トレーディング", "リテール", "商店", "セレクト"]),
+    dict(key="FB", name="宿泊業・飲食サービス業", cat="food", tier="店員", cls="SMALL", share=0.15,
+         details=["カフェ", "ダイニング", "ベーカリー", "定食・ランチ", "バー", "テイクアウト"],
+         products=["飲食の提供・店舗運営", "テイクアウト・デリバリーの提供"],
+         roles=["バリスタ", "ホール", "キッチン", "店長"],
+         generalist=["店長"],
+         output=["food", "service"],
+         words=["フーズ", "ダイニング", "キッチン", "珈琲", "食堂", "テーブル", "ブリュワリー", "キュイジーヌ"]),
+    dict(key="PS", name="学術研究・専門・技術サービス業", cat="office", tier="会社員", cls="MED", share=0.10,
+         details=["広告運用/制作", "経営/ITコンサル", "税務・会計", "デザイン/ブランディング", "法務", "人材紹介"],
+         products=["広告・クリエイティブの制作運用", "経営・IT・専門コンサルティング", "会計・法務・人材の専門サービス"],
+         roles=["プランナー", "ディレクター", "コンサルタント", "デザイナー", "営業", "制作進行"],
+         generalist=["プランナー", "ディレクター", "営業", "制作進行"],
+         output=["ad", "content", "service"],
+         words=["コンサルティング", "総研", "パートナーズ", "デザイン", "クリエイティブ", "アドワークス", "法務事務所", "会計事務所"]),
+    dict(key="LS", name="生活関連サービス業・娯楽業", cat="shop", tier="店員", cls="SMALL", share=0.07,
+         details=["美容室", "ネイル/エステ", "リラクゼーション", "アミューズメント", "フィットネス", "写真スタジオ"],
+         products=["ヘア・美容・リラクゼーションの提供", "娯楽・レジャーの提供"],
+         roles=["スタイリスト", "アシスタント", "受付", "店長"],
+         generalist=["店長", "受付"],
+         output=["service"],
+         words=["ビューティ", "サロン", "スパ", "ウェルネス", "スタジオ", "リラクゼーション", "ヘアデザイン", "エンタメ"]),
+    dict(key="RE", name="不動産業・物品賃貸業", cat="office", tier="会社員", cls="MED", share=0.09,
+         details=["賃貸仲介/管理", "オフィス仲介", "開発/PM", "物品賃貸"],
+         products=["不動産の仲介・管理", "不動産開発・プロパティマネジメント"],
+         roles=["営業", "事務", "物件管理"],
+         generalist=["営業", "事務", "物件管理"],
+         output=["service"],
+         words=["地所", "不動産", "エステート", "リアルティ", "プロパティ", "開発", "住宅", "レンタル"]),
+    dict(key="SV", name="サービス業(他に分類されないもの)", cat="service", tier="会社員", cls="MED", share=0.06,
+         details=["人材派遣", "施設管理/メンテ", "BPO/事務代行", "警備", "各種代行"],
+         products=["人材派遣・業務請負", "施設管理・メンテナンス・各種代行サービス"],
+         roles=["オペレーション", "営業", "スタッフ", "事務"],
+         generalist=["オペレーション", "営業", "事務"],
+         output=["service"],
+         words=["サービス", "サポート", "ワークス", "エージェンシー", "ソリューションズ", "メンテナンス", "ヒューマンリソース"]),
+    dict(key="MW", name="医療・福祉", cat="service", tier="会社員", cls="MED", share=0.04,
+         details=["クリニック", "歯科", "調剤薬局", "介護/福祉", "治療院"],
+         products=["医療・診療サービス", "介護・福祉サービス"],
+         roles=["医療スタッフ", "受付", "事務", "介護スタッフ"],
+         generalist=["受付", "事務"],
+         output=["service"],
+         words=["クリニック", "ケア", "メディカル", "ヘルスケア", "福祉サービス", "治療院", "調剤"]),
+    dict(key="ED", name="教育・学習支援業", cat="service", tier="会社員", cls="MED", share=0.03,
+         details=["学習塾", "英会話", "音楽教室", "資格スクール", "予備校"],
+         products=["学習指導・教育サービス", "各種スクールの運営"],
+         roles=["講師", "事務", "教室長"],
+         generalist=["事務", "教室長"],
+         output=["service", "content"],
+         words=["ゼミナール", "アカデミー", "スクール", "学習塾", "教育", "カレッジ", "エデュ"]),
+    dict(key="FI", name="金融業・保険業", cat="office", tier="会社員", cls="LARGE", share=0.02,
+         details=["投資/ファンド", "保険代理", "証券", "決済/フィンテック"],
+         products=["金融・投資サービス", "保険・証券の提供"],
+         roles=["アナリスト", "営業", "事務", "コンサルタント"],
+         generalist=["営業", "事務", "コンサルタント"],
+         output=["service"],
+         words=["キャピタル", "フィナンシャル", "ファンド", "保険サービス", "証券", "インベストメント"]),
+    dict(key="CN", name="建設業", cat="office", tier="会社員", cls="MED", share=0.03,
+         details=["建築設計/施工", "内装/リフォーム", "設備工事", "土木"],
+         products=["建築・内装の設計施工", "設備・リフォーム工事"],
+         roles=["施工管理", "設計", "営業", "事務"],
+         generalist=["営業", "事務"],
+         output=["service"],
+         words=["建設", "工務店", "建築", "エンジニアリング", "コンストラクション", "設備"]),
+    dict(key="MF", name="製造業", cat="office", tier="会社員", cls="MED", share=0.03,
+         details=["雑貨企画/本社", "食品加工", "アパレル生産管理", "印刷"],
+         products=["製品の企画・製造(本社機能)", "受託製造・加工"],
+         roles=["企画", "生産管理", "営業", "事務"],
+         generalist=["企画", "営業", "事務"],
+         output=["goods", "service"],
+         words=["製作所", "プロダクツ", "工業", "ファクトリー", "メーカーズ", "製造"]),
+    dict(key="TR", name="運輸業・郵便業", cat="office", tier="会社員", cls="MED", share=0.015,
+         details=["配送/物流", "倉庫", "運送", "宅配拠点"],
+         products=["配送・物流サービス", "倉庫・輸送の受託"],
+         roles=["ドライバー", "オペレーション", "倉庫管理", "事務"],
+         generalist=["オペレーション", "事務"],
+         output=["service"],
+         words=["運輸", "物流", "ロジスティクス", "エクスプレス", "トランスポート", "配送"]),
+    dict(key="CS", name="複合サービス事業・その他", cat="service", tier="会社員", cls="SMALL", share=0.005,
+         details=["協同組合", "郵便局窓口", "複合サービス"],
+         products=["複合サービスの提供", "組合・共同事業の運営"],
+         roles=["スタッフ", "事務", "窓口"],
+         generalist=["事務", "窓口"],
+         output=["service"],
+         words=["サービス", "協同", "コンプレックス", "ユニオン", "エージェント"]),
+]
+IND_BY_KEY: dict[str, dict] = {it["key"]: it for it in INDUSTRY_SPEC}
+
+# 業種別の営業時間・シフト(shift_pattern)。オフィス=平日日勤 / 小売飲食=長時間・週末含む・交代制。
+SHIFT_BY_CAT: dict[str, dict] = {
+    "office":  {"open": "09:00", "close": "18:00", "days": "mon-fri", "shift_hours": 8, "rotates": False},
+    "shop":    {"open": "10:00", "close": "21:00", "days": "all",     "shift_hours": 8, "rotates": True},
+    "food":    {"open": "07:00", "close": "23:00", "days": "all",     "shift_hours": 8, "rotates": True},
+    "service": {"open": "09:00", "close": "19:00", "days": "mon-sat", "shift_hours": 8, "rotates": True},
+}
+
+# 名称の手続き生成トークン(実在地名は可・実在企業名は使わない=R17)。
+_PLACE_TOKENS = [
+    "道玄坂", "宮益坂", "神南", "宇田川", "センター街", "公園通り", "桜丘", "円山", "松濤", "神泉",
+    "南平台", "鶯谷", "渋谷", "ハチ公", "スクランブル", "明治通り", "井の頭通り", "キャットストリート",
+    "奥渋", "富ヶ谷", "渋谷駅前", "文化村通り", "スペイン坂", "宮下", "並木橋", "道玄坂上", "神宮前", "松濤上",
+]
+_CONCEPT_TOKENS = [
+    "ネクスト", "グロース", "アーバン", "ブルーム", "コネクト", "フロンティア", "クレスト", "ソレイユ",
+    "ノヴァ", "ヴェルデ", "ミライ", "つばさ", "あおぞら", "ひまわり", "こだま", "さくら", "まほろば",
+    "リンク", "ステラ", "オルカ", "ゼファー", "トパーズ", "フェリーチェ", "ルミナス",
+]
+_FORM_TOKENS = ["(株)", "(株)", "(株)", "(有)", "合同会社", "(同)"]
+
+# 建物への束ね方(POI割付)。per_floor=1フロアあたりのテナント数の目安・prestige=大組織の優先度。
+_BLD_PER_FLOOR = {
+    "office": 3.0, "public": 2.0, "hotel": 1.0, "station": 2.0,
+    "retail": 2.0, "generic": 1.6, "residential": 1.0,
+}
+_BLD_PRESTIGE = {
+    "office": 6, "station": 5, "public": 5, "hotel": 4,
+    "retail": 3, "generic": 2, "residential": 1, "house?": 0,
+}
+
+
+def _normalize(xs: list[float]) -> list[float]:
+    s = float(sum(xs))
+    return [x / s for x in xs] if s else xs
+
+
+def _quota(total: int, shares: list[float]) -> list[int]:
+    """total を shares(合計1)へ最大剰余法で割付(合計= total を厳守・決定論)。"""
+    raw = [total * s for s in shares]
+    base = [int(x) for x in raw]
+    rem = total - sum(base)
+    order = sorted(range(len(raw)), key=lambda i: (raw[i] - base[i], -i), reverse=True)
+    for k in range(rem):
+        base[order[k % len(order)]] += 1
+    return base
+
+
+def _sample_employees(rng: random.Random, band: tuple[str, int, int]) -> int:
+    """規模帯内の従業者数をサンプル。300+ は log 一様(平均~650)で長い裾を作る。"""
+    _, lo, hi = band
+    if lo >= 300:
+        return int(round(300 * (4.0 ** rng.random())))  # [300,1200], 平均~649
+    return rng.randint(lo, hi)
+
+
+def _gen_company_name(rng: random.Random, it: dict,
+                      real_names: set[str], seen: set[str]) -> str:
+    """架空の社名を手続き生成。実在の建物/POI名(OSM由来)は避ける(R17)。"""
+    words = it["words"]
+    for attempt in range(64):
+        form = _FORM_TOKENS[rng.randrange(len(_FORM_TOKENS))]
+        place = _PLACE_TOKENS[rng.randrange(len(_PLACE_TOKENS))]
+        word = words[rng.randrange(len(words))]
+        mid = _CONCEPT_TOKENS[rng.randrange(len(_CONCEPT_TOKENS))] if rng.random() < 0.6 else ""
+        name = f"{form}{place}{mid}{word}"
+        if name not in seen and name not in real_names:
+            seen.add(name)
+            return name
+    # 万一の衝突は決定論の数字サフィックスで一意化(実在名は依然回避)。
+    n = 2
+    while True:
+        cand = f"{name}・{n}"
+        if cand not in seen and cand not in real_names:
+            seen.add(cand)
+            return cand
+        n += 1
+
+
+def build_companies_dist(real_names: set[str], count: int, seed: int) -> list[dict]:
+    """産業大分類×規模帯の目標分布から count 社を決定論生成(workplace_poi は未割付)。"""
+    rng = random.Random(seed)
+    shares = _normalize([it["share"] for it in INDUSTRY_SPEC])
+    n_by_ind = _quota(count, shares)
+    companies: list[dict] = []
+    seen_names: set[str] = set()
+    seq = 0
+    for it, n_i in zip(INDUSTRY_SPEC, n_by_ind):
+        band_dist = _normalize(SIZE_CLASS_DIST[it["cls"]])
+        n_by_band = _quota(n_i, band_dist)
+        for bidx, n_ib in enumerate(n_by_band):
+            band = SIZE_BANDS[bidx]
+            for _ in range(n_ib):
+                seq += 1
+                emp = _sample_employees(rng, band)
+                name = _gen_company_name(rng, it, real_names, seen_names)
+                detail = it["details"][rng.randrange(len(it["details"]))]
+                companies.append({
+                    "id": f"co_{it['key'].lower()}_{seq:05d}",
+                    "name": name,
+                    "industry": it["name"],
+                    "industry_key": it["key"],
+                    "sector_detail": detail,
+                    "products_services": list(it["products"]),
+                    "size": {"employees": emp, "band": band[0]},
+                    "wage_tier": it["tier"],
+                    "roles": list(it["roles"]),
+                    "generalist_roles": list(it["generalist"]),
+                    "output_kinds": list(it["output"]),
+                    "shift_pattern": dict(SHIFT_BY_CAT[it["cat"]]),
+                })
+    return companies
+
+
+def load_buildings(map_path: Path) -> tuple[list[dict], set[str]]:
+    """地図から建物リストと、実在名(建物+POI名。R17回避用)の集合を返す。"""
+    d = json.loads(map_path.read_text(encoding="utf-8"))
+    buildings = list(d.get("buildings", []))
+    real_names: set[str] = set()
+    for b in buildings:
+        if b.get("name"):
+            real_names.add(str(b["name"]))
+    for p in d.get("pois", []):
+        if p.get("name"):
+            real_names.add(str(p["name"]))
+    return buildings, real_names
+
+
+def _building_slots(buildings: list[dict], kinds: set[str]) -> list[dict]:
+    """kinds に含まれる建物を prestige 降順に並べ、建物×階のテナント枠(slot)を展開。"""
+    pool = [b for b in buildings if b.get("kind") in kinds]
+    pool.sort(key=lambda b: (-_BLD_PRESTIGE.get(b.get("kind", ""), 0),
+                             -int(b.get("levels", 1) or 1), str(b.get("id", ""))))
+    slots: list[dict] = []
+    for b in pool:
+        kind = b.get("kind", "generic")
+        levels = max(1, int(b.get("levels", 1) or 1))
+        cap = max(1, round(_BLD_PER_FLOOR.get(kind, 1.0) * levels))
+        node = str(b.get("entrance") or b.get("id"))
+        x = round(float(b.get("cx", 0.0)), 1)
+        y = round(float(b.get("cy", 0.0)), 1)
+        for k in range(cap):
+            slots.append({"building": str(b["id"]), "node": node,
+                          "floor": 1 + (k % levels), "x": x, "y": y})
+    return slots
+
+
+def place_on_buildings(companies: list[dict], buildings: list[dict]) -> int:
+    """各社を建物×階へ決定論束縛(大組織→高prestige/高層ビル優先)。戻り値=割付済み数。
+
+    商業系建物のテナント枠が不足する場合のみ、住宅系建物(house?)へ溢れ分を割り付ける。
+    """
+    commercial = set(_BLD_PER_FLOOR.keys())
+    slots = _building_slots(buildings, commercial)
+    if len(slots) < len(companies):
+        slots += _building_slots(buildings, {"house?"})  # 溢れ分の予備(prestige最下位)
+    order = sorted(range(len(companies)),
+                   key=lambda j: (-int(companies[j]["size"]["employees"]), companies[j]["id"]))
+    placed = 0
+    for rank, j in enumerate(order):
+        if rank >= len(slots):
+            break
+        sl = slots[rank]
+        cat = IND_BY_KEY[companies[j]["industry_key"]]["cat"]
+        companies[j]["workplace_poi"] = {
+            "cat": cat, "building": sl["building"], "node": sl["node"],
+            "floor": sl["floor"], "x": sl["x"], "y": sl["y"],
+        }
+        placed += 1
+    return placed
+
+
+def _dist_stats(companies: list[dict]) -> dict:
+    """生成台帳の実現分布(産業別件数・従業者・規模帯)を集計(meta記録+検収用)。"""
+    n = len(companies)
+    total_emp = sum(int(c["size"]["employees"]) for c in companies)
+    by_ind: dict[str, dict] = {}
+    by_band: dict[str, int] = {b[0]: 0 for b in SIZE_BANDS}
+    for c in companies:
+        key = c["industry_key"]
+        d = by_ind.setdefault(key, {"industry": c["industry"], "count": 0, "employees": 0})
+        d["count"] += 1
+        d["employees"] += int(c["size"]["employees"])
+        by_band[c["size"]["band"]] += 1
+    for key, d in by_ind.items():
+        d["count_share"] = round(d["count"] / n, 4) if n else 0.0
+        d["employee_share"] = round(d["employees"] / total_emp, 4) if total_emp else 0.0
+    return {
+        "n_companies": n, "employees_total": total_emp,
+        "employees_per_org": round(total_emp / n, 2) if n else 0.0,
+        "by_industry": by_ind,
+        "size_band_counts": by_band,
+        "size_band_shares": {k: (round(v / n, 4) if n else 0.0) for k, v in by_band.items()},
+    }
+
+
+def build_ledger_dist(map_path: Path, count: int, seed: int) -> dict:
+    """分布駆動の組織台帳(会社~count + 学校)を組み立てて返す。"""
+    buildings, real_names = load_buildings(map_path)
+    companies = build_companies_dist(real_names, count, seed)
+    placed = place_on_buildings(companies, buildings)
+    # 学校ブロックは既存の代表校キュレーション(build_orgs)をそのまま再利用(改変なし)。
+    by_cat, _ = load_map(map_path)
+    schools = build_orgs(by_cat, seed)["schools"]
+    stats = _dist_stats(companies)
+    target_ind = {it["key"]: {"industry": it["name"],
+                              "target_count_share": round(s, 4), "size_class": it["cls"]}
+                  for it, s in zip(INDUSTRY_SPEC, _normalize([i["share"] for i in INDUSTRY_SPEC]))}
+    return {
+        "meta": {
+            "generator": "scripts/build_orgs.py --dist",
+            "mode": "distribution-driven",
+            "seed": seed, "target_count": count,
+            "map": str(map_path.relative_to(REPO_ROOT)).replace("\\", "/"),
+            "note": ("架空の組織台帳(R17: 実在企業名・学校名なし)。産業大分類×従業者規模帯の"
+                     "分布から seed 付き決定論で手続き生成。名称は業種語彙×実在地名×概念語の合成で、"
+                     "OSM由来の実在名は回避。組織は建物×階へ束縛(オフィスビル=多数・路面店=少数)。"),
+            "honesty": ("事業所数構成比=東商渋谷支部(平18)骨格 / 規模帯=全国経済センサスの裾長構造を"
+                        "渋谷bbox実測(事業所~1.19万・従業者~25.7万→平均~21.6)へ補正した近似。"
+                        "産業×規模のクロス実表(e-Stat stat_infid=000031720779)は静的抽出不可のため"
+                        "再現を主張しない。産業別従業者シェアは生成の副産物(近似)。"),
+            "sources_doc": "docs/research/shibuya-population.md, docs/research/shibuya-organizations.md",
+            "anchors": {"target_establishments": count, "target_employees": 257000,
+                        "employees_tolerance": "±10%"},
+            "work_hours_standard": WORK_HOURS,
+            "target_industry_distribution": target_ind,
+            "realized": stats,
+            "poi_coverage": round(placed / max(1, len(companies)), 4),
+            "counts": {"companies": len(companies), "schools": len(schools)},
+        },
+        "companies": companies,
+        "schools": schools,
+    }
+
+
+def write_generation_report(ledger: dict, out_path: Path) -> None:
+    """生成レポート(docs)。正直な近似の根拠+実現分布の数値を残す。"""
+    m = ledger["meta"]; st = m["realized"]
+    lines = ["# 組織台帳 ~1.1万 生成レポート(P6・分布駆動)", "",
+             f"- 生成器: `{m['generator']}` / seed={m['seed']} / map=`{m['map']}`",
+             f"- 会社 {st['n_companies']} 社 + 学校 {m['counts']['schools']} 校",
+             f"- 従業者総和: **{st['employees_total']:,}** (目標~257,000・平均 {st['employees_per_org']} 人/社)",
+             f"- POI(建物)割付率: **{m['poi_coverage']:.1%}**", "",
+             "## 産業大分類の分布(目標事業所数シェア → 実現)", "",
+             "| key | 産業 | 規模クラス | 目標件数シェア | 実現件数 | 実現件数シェア | 従業者 | 従業者シェア |",
+             "|---|---|---|---:|---:|---:|---:|---:|"]
+    for key, tgt in m["target_industry_distribution"].items():
+        r = st["by_industry"].get(key, {"count": 0, "count_share": 0, "employees": 0, "employee_share": 0})
+        lines.append(f"| {key} | {tgt['industry']} | {tgt['size_class']} | "
+                     f"{tgt['target_count_share']:.3f} | {r['count']} | {r['count_share']:.3f} | "
+                     f"{r['employees']:,} | {r['employee_share']:.3f} |")
+    lines += ["", "## 従業者規模帯の分布(実現)", "",
+              "| 規模帯 | 件数 | シェア |", "|---|---:|---:|"]
+    for b in SIZE_BANDS:
+        lines.append(f"| {b[0]} | {st['size_band_counts'][b[0]]} | {st['size_band_shares'][b[0]]:.3f} |")
+    lines += ["", "## 正直な近似の記録", "", m["honesty"], ""]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _run_dist_mode(args) -> None:
+    """分布駆動モード(P6): 経済センサス分布から ~1.1万組織を生成し新ファイルへ書き出す。"""
+    map_path = Path(args.map) if args.map else DEFAULT_WIDE_MAP
+    if not map_path.is_absolute():
+        map_path = REPO_ROOT / map_path
+    ledger = build_ledger_dist(map_path, int(args.count), int(args.seed))
+    out = Path(args.orgs_out) if args.orgs_out else DEFAULT_DIST_OUT
+    if not out.is_absolute():
+        out = REPO_ROOT / out
+    out.write_text(json.dumps(ledger, ensure_ascii=False, indent=1), encoding="utf-8")
+    st = ledger["meta"]["realized"]
+    print(f"written: {out}")
+    print(f"  会社 {st['n_companies']} / 学校 {ledger['meta']['counts']['schools']}  "
+          f"従業者総和 {st['employees_total']:,} (平均 {st['employees_per_org']}/社)  "
+          f"POI割付 {ledger['meta']['poi_coverage']:.1%}")
+    if args.report:
+        rep = Path(args.report) if isinstance(args.report, str) else DEFAULT_REPORT
+        if not rep.is_absolute():
+            rep = REPO_ROOT / rep
+        write_generation_report(ledger, rep)
+        print(f"written: {rep}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="架空の組織台帳と配属を生成(バッチE)")
     ap.add_argument("--map", default=str(DEFAULT_MAP), help="地図 JSON(既定 shibuya_osm.json)")
@@ -543,7 +982,21 @@ def main() -> None:
                     help="台帳の出力先(既定 data/organizations_shibuya.json。広域地図用に"
                          "別ファイルへ出すときに指定=正準台帳を上書きしない)")
     ap.add_argument("--seed", type=int, default=42)
+    # --- 分布駆動モード(P6。既存の呼び出し方は不変) ---
+    ap.add_argument("--dist", action="store_true",
+                    help="分布駆動モード: 経済センサス分布から ~1.1万組織を生成し"
+                         " data/organizations_shibuya_wide11k.json へ出力(既存台帳は上書きしない)")
+    ap.add_argument("--count", type=int, default=11000, help="--dist で生成する組織数(既定 11000)")
+    ap.add_argument("--report", action="store_true",
+                    help="--dist の生成レポートを docs/research/org-book-11k.md へ出力")
     args = ap.parse_args()
+
+    if args.dist:
+        # 分布駆動モードは既定 --map を広域地図へ切替(明示指定があればそれを優先)。
+        if args.map == str(DEFAULT_MAP):
+            args.map = None
+        _run_dist_mode(args)
+        return
 
     map_path = Path(args.map)
     if not map_path.is_absolute():
