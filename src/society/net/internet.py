@@ -143,16 +143,20 @@ class Internet:
         fresh = [p for p in self.posts[start_idx:] if p["author"] != aid]
         self.read_marks[aid] = self._post_offset + len(self.posts)
         follows = self.follows.get(aid, set())
+        # post は id 一意なので dict の線形 in 判定(O(新着×フォロー)の辞書比較)を
+        # id 集合の O(1) 判定に置換(選ばれる集合・順序は完全同一)。
         followed = [p for p in fresh if p["author"] in follows
                     or p["author"] == MEDIA_ID]
-        rest = [p for p in fresh if p not in followed]
+        followed_ids = {p["id"] for p in followed}
+        rest = [p for p in fresh if p["id"] not in followed_ids]
         prio = self.priority.get(aid)
         if not prio:
             return (followed + rest)[-self.feed_size:]   # 旧ロジック完全一致
         # 優先著者の新着を必ず含める(多すぎれば直近 feed_size 件)。
         prio_posts = [p for p in fresh if p["author"] in prio][-self.feed_size:]
+        prio_ids = {p["id"] for p in prio_posts}
         remaining = self.feed_size - len(prio_posts)
-        conv = [p for p in (followed + rest) if p not in prio_posts]
+        conv = [p for p in (followed + rest) if p["id"] not in prio_ids]
         conv_keep = conv[-remaining:] if remaining > 0 else []
         return conv_keep + prio_posts
 
