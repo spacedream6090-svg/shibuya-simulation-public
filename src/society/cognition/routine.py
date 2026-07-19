@@ -14,6 +14,7 @@ import math
 
 import numpy as np
 
+from . import drive as _drive
 from .. import commerce as _commerce
 from .. import disaster as _disaster
 from .. import diversity as _diversity
@@ -218,6 +219,72 @@ def _gumbel_destination(agent, dests: list, sim, step: int, scfg,
         if u > best_u:
             best_u, best = u, d
     return best
+
+
+# ============================================================
+# 好奇心/退屈の内発ドライブ = P2 スライス S5(interstitial-life §4.4-a)。ゲージ本体は
+# cognition/drive.py(boredom_tick/ready/fire。silence と同じ作法)。ここは「閾値超えで LLM
+# なしの内発的探索を発火する」出力側。行き先=近傍の未訪問/低頻度 POI(=知らない店/ふらっと
+# 歩く)。S4 Gumbel 機構があれば再利用(温度は discretionary)し、なければ決定論近傍選択。
+# 新 stream は "boredom" 1本のみ(Gumbel 乱数もこの stream から引く=stream を増やさない)。
+# 既定 OFF(drivecfg['boredom'] 無効)は stream を一切引かず boredom_explore 0 件=バイト一致。
+# 入力は物理量(現在地・近傍 POI・訪問回数)のみ=因子・k を見ない(no-fingerprint / R1)。
+def _dest_kind(sim, node) -> str:
+    """探索先ノードの種別(先頭 POI のカテゴリ、無ければ 'street')。boredom_explore payload 用。"""
+    pois = sim.city.pois_at_node(node)
+    if pois:
+        return pois[0].get("cat", "poi") or "poi"
+    return "street"
+
+
+def _boredom_destination(agent, sim, scfg, bc, rng):
+    """退屈探索の行き先ノード: 近傍(radius_m)の未訪問/低頻度 POI。未訪問があれば最優先。
+    S4 Gumbel(scfg あり & 有効)なら V=-log1p(訪問回数)(未訪問/低頻度ほど高)+ ε の確率選択を
+    boredom stream で行い、なければ決定論選択(訪問回数↑距離↑node の辞書順)。候補なしは None。"""
+    cands = _nearby_pois(agent, sim, agent.node, bc["radius_m"])   # 現在地・重複ノードは _nearby_pois 側で除外
+    if not cands:
+        return None
+    unseen = [n for n in cands if agent.visits[n] == 0]
+    pool = unseen if unseen else cands
+    if scfg is not None and scfg["gumbel_enabled"]:               # S4 Gumbel 機構の再利用(温度=discretionary)
+        temp = max(1e-6, scfg["gumbel_temp"]["discretionary"])
+        best, best_u = None, -math.inf
+        for n in pool:
+            v = -math.log1p(float(agent.visits[n]))               # 未訪問/低頻度ほど高スコア(novelty 志向)
+            eps = -math.log(-math.log(max(1e-12, float(rng.random()))))
+            u = v / temp + eps
+            if u > best_u:
+                best_u, best = u, n
+        return best
+    ax, ay = sim.city.node_xy(agent.node)                        # 決定論近傍選択(乱数を引かない)
+    return min(pool, key=lambda n: (int(agent.visits[n]),
+                                    math.hypot(ax - sim.city.node_xy(n)[0],
+                                               ay - sim.city.node_xy(n)[1]),
+                                    str(n)))
+
+
+def _maybe_boredom_explore(agent, sim, step: int, sim_min: int, from_act: str = ""):
+    """退屈ゲージが閾値超え+cooldown 明けなら内発的探索(近傍の未訪問/低頻度 POI への move)を
+    LLM なしで発火する。発火時は boredom_explore を1件記録しゲージをリセット+cooldown を張る。
+    既定 OFF・非候補・非発火・行き先なし はいずれも None=既定挙動(stream を引かない)。"""
+    bc = sim.drivecfg["boredom"]
+    if not bc["enabled"] or not _drive.boredom_ready(agent, sim.drivecfg, step):
+        return None
+    rng = sim.hub.stream("boredom", agent.id, step)              # 新 stream(発火抽選 + Gumbel 乱数を兼ねる)
+    if float(rng.random()) >= bc["fire_prob"]:
+        return None
+    dest = _boredom_destination(agent, sim, _stochastic_cfg(sim), bc, rng)
+    if dest is None or dest == agent.node:
+        return None
+    gauge = round(float(getattr(agent, "_boredom", 0.0)), 3)
+    _drive.boredom_fire(agent, sim.drivecfg, step)              # ゲージリセット + cooldown
+    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                         kind="boredom_explore", x=agent.x, y=agent.y,
+                         payload={"from": from_act or "free",
+                                  "to_kind": _dest_kind(sim, dest), "gauge": gauge}))
+    # 近傍(radius_m<既定の car/bicycle しきい 400m)なので徒歩固定=乱数を引かず _choose_mode と同結果。
+    return {"type": "move_to", "dest": dest, "stay_steps": bc["stay_steps"],
+            "mode": "walk"}
 
 
 def _minutes_of_day(sim_min: int) -> int:
@@ -742,8 +809,15 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
                 "mode": _choose_mode(agent, sim, pt["node"], rng),
                 "activity": "commuting"}
 
-    # ---- 滞在中(L3 中断: flexible 活動のみ確率的に途中離脱。既定 OFF=常に stay)----
+    # ---- 滞在中(退屈探索 S5 + L3 中断 S4: flexible 活動のみ。既定 OFF=常に stay)----
     if step < agent.stay_until:
+        # 好奇心/退屈ドライブ(P2 S5): 同じ場所への長居でゲージが閾値超え → 内発的探索へ(LLM なし)。
+        explore = _maybe_boredom_explore(agent, sim, step, sim_min,
+                                         from_act=getattr(agent, "activity", "") or "stay")
+        if explore is not None:
+            agent.stay_until = step                  # 滞在を切り上げて近傍の未訪問先へ
+            agent.activity = ""
+            return explore
         if scfg is not None and _maybe_interrupt(agent, sim, step, sim_min, scfg):
             agent.stay_until = step                  # 滞在打ち切り=離脱 → 以降の分岐(次の行動)へ
             agent.activity = ""

@@ -184,6 +184,8 @@ register_event_kind("day_plan_compiled", "日課計画のコンパイル要約(�
 # ---- 確率的実行 L3(P2 S4。routine.stochastic ON のみ・既定 OFF=0件。設計: docs/plans/p2-interstitial-design.md §1 S4)----
 register_event_kind("detour",        "確率的実行 L3: 寄り道=目的地手前で近傍 POI に立ち寄り(P2 S4){act, to, from_dest}")
 register_event_kind("interrupt",     "確率的実行 L3: 活動途中の中断=離脱(P2 S4){act}")
+# ---- 好奇心/退屈の内発ドライブ(P2 S5。drive.boredom ON のみ・既定 OFF=0件。設計: docs/plans/p2-interstitial-design.md §1 S5)----
+register_event_kind("boredom_explore", "好奇心/退屈ドライブの内発的探索=近傍の未訪問/低頻度 POI へ移動(LLM なし。P2 S5){from, to_kind, gauge}")
 
 
 @dataclass

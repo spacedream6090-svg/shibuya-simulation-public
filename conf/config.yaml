@@ -391,6 +391,26 @@ drive:
     sens_rate: 0.02             # 鋭敏化の基準率(発火1回=−sens_rate。新奇は × 顕著さ)
     recovery_rate: 0.01         # 自発回復の基準率(毎 step theta_drift を 0 へ)
     max_abs: 0.15               # |theta_drift| の可動域(clip[0.30,0.85] と二重で暴走防止)
+  # ---- 好奇心/退屈の内発ドライブ(P2 スライス S5。既定 OFF=現行と完全同一)----
+  # 設計: docs/plans/p2-interstitial-design.md §1 S5 / docs/research/interstitial-life.md §4.4-a。
+  # 「同じ場所への長居・単調な入力の継続」で退屈ゲージが溜まり(silence ゲージと同じ作法)、
+  # 閾値超えで LLM なしの内発的探索(近傍の未訪問/低頻度 POI へ移動=知らない店/ふらっと歩く)を
+  # 発火する=ボトムアップ創発の種(自然界志向と整合)。行き先選択は S4 の Gumbel 機構があれば
+  # 再利用し、なければ決定論近傍選択。到達先が新奇なら既存 drive の novel_place(鋭敏化=顕著性)に
+  # 自然接続し、そこで何かが起きれば既存予算内で C1 熟慮へ(接続点を作るだけ)。
+  # 入力は物理量(現在地・移動中か・近傍 POI・訪問回数)のみ=beliefs/k を見ない(no-fingerprint)。
+  # R1: 新 stream は "boredom" 1本のみ・追加 LLM 呼ゼロ=呼数 k 非依存・enabled=false で
+  #     boredom_explore 0 件=ゴールデン L1 バイト一致。production.yaml は触らない。
+  boredom:
+    enabled: false              # ★本番はユーザー判断で ON。false=現行の routine と完全同一
+    accrual: 0.06               # 同じ場所への長居 1step あたりのゲージ蓄積(0-1)
+    decay: 0.10                 # 移動中・新奇な場所での減衰率
+    novelty_relief: 0.20        # 新しい場所に着いたときの追加減衰(脱馴化の入口)
+    threshold: 0.60             # 探索発火の閾値(ゲージがこれ以上で発火候補)
+    fire_prob: 0.5              # 閾値超え時に実際に探索へ動く確率(stream "boredom")
+    cooldown_steps: 6           # 探索発火後に次の退屈探索へ入れるまでの step 数(連発の抑制)
+    radius_m: 300               # 探索先を探す現在地の近傍半径(m)。周辺 POI 密度がそのまま重み
+    stay_steps: 2               # 探索先での滞在 step 数
 
 # ---- 会話3層 C2/C3(P2 スライス S3。docs/plans/p2-interstitial-design.md §1 S3)----
 # 「記録に残る会話」を LLM コスト0 で大量に生む主レバー(interstitial-life.md §4.3)。既定 OFF。

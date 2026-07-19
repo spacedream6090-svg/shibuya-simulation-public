@@ -29,6 +29,24 @@ DEFAULT_WEIGHTS = {
 }
 
 
+def _boredom_cfg(raw: dict | None) -> dict:
+    """好奇心/退屈の内発ドライブ(P2 S5)の生 cfg を数値へ正規化。既定 enabled=False=OFF で
+    現行と完全同一(ゲージを一切触らない=バイト一致)。設計: docs/plans/p2-interstitial-design.md §1 S5。"""
+    b = dict(raw or {})
+    return {
+        # 既定 OFF = ゲージ機構が完全 no-op(boredom_* が agent に一切触れない=バイト一致)。
+        "enabled": bool(b.get("enabled", False)),
+        "accrual": float(b.get("accrual", 0.06)),          # 同じ場所への長居 1step の蓄積
+        "decay": float(b.get("decay", 0.10)),              # 移動・新奇での減衰率
+        "novelty_relief": float(b.get("novelty_relief", 0.20)),  # 新しい場所到達の追加減衰(脱馴化の入口)
+        "threshold": float(b.get("threshold", 0.60)),      # 探索発火の閾値(ゲージがこれ以上で候補)
+        "fire_prob": float(b.get("fire_prob", 0.5)),       # 閾値超え時に実際に探索へ動く確率(stream "boredom")
+        "cooldown_steps": int(b.get("cooldown_steps", 6)), # 探索発火後の不応期(step)
+        "radius_m": float(b.get("radius_m", 300.0)),       # 探索先を探す近傍半径(m)
+        "stay_steps": int(b.get("stay_steps", 2)),         # 探索先での滞在 step 数
+    }
+
+
 def build_cfg(raw: dict | None) -> dict:
     raw = dict(raw or {})
     weights = dict(DEFAULT_WEIGHTS)
@@ -55,6 +73,7 @@ def build_cfg(raw: dict | None) -> dict:
         "slope": float(raw.get("slope", 8.0)),
         "weights": weights,
         "drift": drift,
+        "boredom": _boredom_cfg(raw.get("boredom", {})),
     }
 
 
@@ -160,6 +179,7 @@ def step_tick(agent, cfg: dict, step: int) -> None:
     add(agent, "silence", cfg)          # 沈黙=低顕著の単調入力 → 馴化(add 内で処理)
     if agent.conv_turns_left <= 0 and step >= agent.conv_cooldown_until:
         agent.conv_turns_left = cfg["conv_max_turns"]
+    boredom_tick(agent, cfg, step)      # P2 S5: 退屈/好奇心ゲージ(既定 OFF=no-op=バイト一致)
 
 
 def top_reason(agent) -> str:
@@ -179,3 +199,58 @@ def on_fire(agent, step: int, cfg: dict) -> None:
 def on_reject(agent, cfg: dict) -> None:
     """抽選に外れた: ゲージを数十%減衰(ユーザー仕様)。理由は保持(再申請に備える)。"""
     agent.drive *= (1.0 - cfg["fail_decay"])
+
+
+# ---------------------------------------------------------------- 好奇心/退屈ドライブ P2 S5
+# 内発的探索の種(interstitial-life.md §4.4-a)。silence ゲージと同じ「毎 step の物理入力で
+# 溜まり・減衰する」作法。入力は物理量のみ(現在ノード・移動中か)=beliefs/k を一切見ない(R1)。
+# 発火(探索行動)は routine 側(cognition/routine.py の _maybe_boredom_explore)が担い、
+# ここはゲージの蓄積・閾値判定・リセットだけを持つ(silence/drive と drive.py に同居)。
+# 既定 OFF(cfg['boredom']['enabled']=False)は agent に一切触れない=ゴールデン L1 バイト一致。
+_BORE_UNSET = object()
+
+
+def boredom_tick(agent, cfg: dict, step: int) -> None:
+    """毎 step のゲージ更新: 同じ場所への長居・単調入力で蓄積、移動・新奇な場所で減衰。
+
+    - 移動中(route あり)= 単調でない → 緩やかに減衰。
+    - 同じノードに留まる(長居)→ accrual だけ蓄積(clip 1.0)。
+    - 新しいノードに着いた → 減衰 + novelty_relief(脱馴化の入口。到達先で novel_place が
+      起きれば既存 drive の鋭敏化=顕著性に自然接続する)。
+    OFF or 初回観測は agent フィールドを触るだけで蓄積せず、OFF は完全 no-op(バイト一致)。"""
+    bc = cfg["boredom"]
+    if not bc["enabled"]:
+        return
+    node = getattr(agent, "node", None)
+    last = getattr(agent, "_bore_node", _BORE_UNSET)
+    if last is _BORE_UNSET:                     # 初回: ゲージ0で観測開始(まだ蓄積しない)
+        agent._boredom = 0.0
+        agent._bore_node = node
+        agent._bore_cooldown = 0
+        return
+    cur = agent._boredom
+    if getattr(agent, "route", None):          # 移動中=単調でない → 緩やかに減衰
+        cur *= (1.0 - bc["decay"])
+    elif node == last:                         # 同じ場所に留まる(長居)→ 蓄積
+        cur = min(1.0, cur + bc["accrual"])
+    else:                                      # 新しい場所に着いた → 新奇で減衰(脱馴化)
+        cur = max(0.0, cur * (1.0 - bc["decay"]) - bc["novelty_relief"])
+    agent._boredom = cur
+    agent._bore_node = node
+
+
+def boredom_ready(agent, cfg: dict, step: int) -> bool:
+    """探索発火の候補か: ゲージが閾値超え & cooldown 明け。OFF/未観測なら False(=探索しない)。"""
+    bc = cfg["boredom"]
+    if not bc["enabled"]:
+        return False
+    return getattr(agent, "_boredom", 0.0) >= bc["threshold"] \
+        and step >= getattr(agent, "_bore_cooldown", 0)
+
+
+def boredom_fire(agent, cfg: dict, step: int) -> None:
+    """探索へ動いた後の後処理: ゲージをリセット + cooldown を張る(連続探索の抑制)。"""
+    bc = cfg["boredom"]
+    agent._boredom = 0.0
+    agent._bore_node = getattr(agent, "node", None)
+    agent._bore_cooldown = step + bc["cooldown_steps"]
