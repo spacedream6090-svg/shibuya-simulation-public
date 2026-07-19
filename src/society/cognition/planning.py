@@ -46,6 +46,7 @@ def build_plan_prompt(agent, *, place_name: str, sim_min: int, step: int,
                       date_line: str | None = None,
                       weather_line: str | None = None,
                       schedule_line: str | None = None,
+                      interstitial_digest: str | None = None,
                       city_name: str = "") -> str:
     """build_prompt の文脈(ペルソナ・記憶・日記・信念)+ 所持金 + 計画タスク。
 
@@ -53,12 +54,14 @@ def build_plan_prompt(agent, *, place_name: str, sim_min: int, step: int,
       計画用の追記(所持金・タスク)はここで後ろに足す(APC の prefix 一致も保たれる)。
     date_line/weather_line は当日の暦・天気(既定 None=注入せず従来と完全一致)。
     schedule_line は当日の予定(schedule 有効時のみ。None=注入せず不変)。
+    interstitial_digest は前回発火以降の客観ダイジェスト(P2 S2。既定 None=注入せず不変)。
     """
     base = build_prompt(agent, place_name=place_name, surprise=None,
                         nearby_names=[], sim_min=sim_min, step=step,
                         city_name=city_name,
                         date_line=date_line, weather_line=weather_line,
-                        schedule_line=schedule_line)
+                        schedule_line=schedule_line,
+                        interstitial_digest=interstitial_digest)
     money_line = f"\n今の所持金: 約{int(getattr(agent, 'money', 0.0))}円"
     return base + money_line + _PLAN_TASK
 
@@ -76,11 +79,13 @@ def _normalize(items: list, max_items: int) -> list:
     return out
 
 
-def make_plan(sim, agent, step: int, sim_min: int, place_name: str) -> None:
+def make_plan(sim, agent, step: int, sim_min: int, place_name: str,
+              interstitial_digest: str | None = None) -> None:
     """1回の LLM 呼び出しで今日の計画を生成し、agent.day_plan に格納する。
 
     失敗・空でも day_plan=[](従来ルーチン)にし、day_plan イベントは必ず1件出す
     (1人1日1回の観測・R1 監査のため)。翌朝はこの関数がまた呼ばれて上書きする。
+    interstitial_digest は前回発火以降の客観ダイジェスト(P2 S2。既定 None=注入せず不変)。
     """
     max_items = int(sim.planningcfg.get("max_items", 5))
     prompt = build_plan_prompt(agent, place_name=place_name, sim_min=sim_min,
@@ -88,7 +93,8 @@ def make_plan(sim, agent, step: int, sim_min: int, place_name: str) -> None:
                               city_name=getattr(sim, "place_name", ""),
                               date_line=getattr(sim, "today_date_line", None),
                               weather_line=getattr(sim, "today_weather_line", None),
-                              schedule_line=_today_schedule_line(sim, agent, sim_min))
+                              schedule_line=_today_schedule_line(sim, agent, sim_min),
+                              interstitial_digest=interstitial_digest)
     # 朝の計画だけ上限を分けられる seam(model.plan_max_tokens)。
     # 未設定 or 0/null は model.max_tokens にフォールバック=既定挙動は完全不変。
     _plan_mt = int(sim.cfg.model.get("plan_max_tokens", 0) or 0)

@@ -126,6 +126,17 @@ assert _ORIG_BELIEF_DESC in _REFLECT_TASK and _ORIG_BELIEF_DESC in _DEEP_REFLECT
 assert _JSON_HEAD in _REFLECT_TASK and _JSON_HEAD in _DEEP_REFLECT_TASK
 
 
+# ---------------------------------------------------------------- ナラティブ補間の物語化(P2 S2)
+# 機械ダイジェスト(前回発火以降の客観列挙。build_prompt が interstitial_digest として注入)は
+# 「意味づけをしない」。意味づけ=一人称の物語化は夜内省の LLM の仕事という二段分離
+# (docs/research/interstitial-life.md §4.2)。prompts.interstitial.enabled=true のときだけ
+# 内省タスク文の末尾に「今日一日を一人称の短い物語として振り返る」1文を足す(追加 LLM 呼なし・
+# JSON 契約キー不変=既存 summary に綴る)。既定 OFF は _REFLECT_TASK とバイト一致(ゴールデン不変)。
+_STORY_NOTE = (
+    "\nまた、今日一日を振り返り、実際にあった出来事の流れ(行った場所・会った人・"
+    "起きたこと)を、順を追って一人称の短い物語として summary に綴ってください。")
+
+
 def _reflect_task(*, deep: bool, variety: bool, agent_id: int, day: int) -> str:
     """内省タスク文を返す。variety=False は従来定数とバイト一致(既定 OFF=ゴールデン不変)。
 
@@ -246,6 +257,8 @@ def maybe_reflect(agent, *, step: int, sim_min: int, writeback: str, alpha: floa
                   weather_line: str | None = None,
                   reflect_cfg: dict | None = None,
                   reflect_variety: bool = False,
+                  interstitial_digest: str | None = None,
+                  interstitial: bool = False,
                   city_name: str = "") -> None:
     """就寝中で reflect_step に達していれば内省(1睡眠につき1回)。
 
@@ -296,9 +309,12 @@ def maybe_reflect(agent, *, step: int, sim_min: int, writeback: str, alpha: floa
     deep = deep_event or bool(period > 0 and day >= 1 and day % period == 0)
     task = _reflect_task(deep=deep, variety=reflect_variety,
                          agent_id=agent.id, day=day)   # A4: 既定 OFF=従来定数と同一
+    if interstitial:                     # P2 S2: 物語化の1文を足す(ON時のみ=OFFは従来定数と同一)
+        task = task + _STORY_NOTE
     prompt = (build_prompt(agent, place_name=place_name, surprise=None,
                            nearby_names=[], step=step, city_name=city_name,
-                           date_line=date_line, weather_line=weather_line)
+                           date_line=date_line, weather_line=weather_line,
+                           interstitial_digest=interstitial_digest)
               + (f"\n思い出したこと: {' / '.join(recalled)}" if recalled else "")
               + (f"\n{recall_fail}" if recall_fail else "")   # ACT-R OFF は None=1行も足さない
               + task)

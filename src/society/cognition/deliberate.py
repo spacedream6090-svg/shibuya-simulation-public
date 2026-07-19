@@ -128,6 +128,7 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
                  hobby_line: str | None = None,
                  norm_line: str | None = None,
                  digest_line: str | None = None,
+                 interstitial_digest: str | None = None,
                  variety_hint: bool = False,
                  labeling_mode: str = "constrained",
                  open_actions: bool = False,
@@ -189,6 +190,8 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
         lines.append(norm_line)
     if digest_line:                      # 再帰性: 昨日の街の動き(客観カウント。全員共通・k非依存)
         lines.append(digest_line)
+    if interstitial_digest:              # 行間補間(P2 S2): 前回発火以降の客観ダイジェスト。
+        lines.append(interstitial_digest)  # 既定 None=1行も足さない=バイト一致(digest_line と同型)
     if wv_norm_line:                     # 記述規範: 新しいことを始める人がいる街か(worldview 有効時のみ。全員共通)
         lines.append(wv_norm_line)
     act = _ACTIVITY_JP.get(agent.activity)

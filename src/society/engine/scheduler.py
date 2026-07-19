@@ -648,7 +648,9 @@ def _phase_planning(sim, step: int, sim_min: int) -> None:
         agent.plan_step = -1
         if agent.loc == "outside" or agent.sleeping:
             continue
-        planning.make_plan(sim, agent, step, sim_min, _place_of(sim, agent))
+        # 行間補間(P2 S2): 前回発火以降の客観ダイジェスト。OFF は None=注入せず不変。
+        planning.make_plan(sim, agent, step, sim_min, _place_of(sim, agent),
+                           interstitial_digest=_isl_take(sim, agent))
 
 
 def _phase_wake_and_returns(sim, step: int, sim_min: int) -> None:
@@ -1075,6 +1077,113 @@ def _dialog_get(agent, partner_id) -> list | None:
     return list(turns) if turns else None
 
 
+# ---------------------------------------------------------------- ナラティブ補間(P2 S2)
+# 各 LLM 発火(計画/発話/内省)のプロンプトに、前回発火以降のその個体の客観的な出来事を機械
+# ダイジェスト(意味づけをしない列挙=立ち寄った場所・会った人・起きたこと)として注入する。
+# 蓄積は engine 側の実行時リングバッファ(agent._isl_buf・有界=最大30件)。observer への記録とは
+# 別建てで、ディスクは読まない(run_step 末に in-memory の logger.events の増分だけを走査して振り分け)。
+# 追加 LLM 呼はゼロ=呼数 k 非依存(R1)。既定 OFF=バッファも作らず・digest=None=1行も足さない=バイト一致。
+# 決定論(乱数不使用)。テンプレに構成概念名・地名リテラルは置かない(場所名は arrive 等の payload=実行時値)。
+_ISL_BUF_MAX = 30                    # リングバッファの上限(有界)
+
+# 出来事 kind → ダイジェストの「起きたこと」1句(客観・意味づけしない)。arrive/hear は別扱い。
+_ISL_ACT = {
+    "spend":       "買い物や支払いをした",
+    "appointment": "予定ができた",
+    "sns_post":    "SNSに投稿した",
+    "sns_read":    "SNSを見た",
+    "news_read":   "ニュースを見た",
+    "dm":          "メッセージを送った",
+    "ride":        "乗り物で移動した",
+    "speak":       "人と話した",
+}
+
+
+def _interstitial_on(sim) -> bool:
+    """ナラティブ補間が有効か(prompts.interstitial.enabled=true)。既定 OFF=状態も増やさない。"""
+    try:
+        isl = (sim.cfg.get("prompts", {}) or {}).get("interstitial", {}) or {}
+        return bool(isl.get("enabled", False))
+    except Exception:
+        return False
+
+
+def _isl_record(sim, kind: str, payload: dict):
+    """1イベントを実行時バッファ用の軽量レコード (cat, val) に写す(該当なしは None)。決定論。"""
+    if kind == "arrive":
+        name = str((payload or {}).get("name") or "")
+        return ("place", name) if name else None
+    if kind == "hear":
+        sid = (payload or {}).get("speaker")
+        other = sim.agent_by_id.get(int(sid)) if sid is not None else None
+        return ("person", other.name) if other is not None else None
+    act = _ISL_ACT.get(kind)
+    return ("act", act) if act else None
+
+
+def _isl_accumulate(sim, since_idx: int) -> None:
+    """run_step 末: この step で新規に記録されたイベント(logger.events[since_idx:])を、
+    各個体の実行時リングバッファへ振り分ける(有界=先頭を捨てる)。決定論・乱数不使用。"""
+    a_by = sim.agent_by_id
+    for e in sim.logger.events[since_idx:]:
+        aid = e.agent_id
+        if aid < 0:                      # 世界イベント(agent_id=-1)は個体バッファに入れない
+            continue
+        rec = _isl_record(sim, e.kind, e.payload)
+        if rec is None:
+            continue
+        agent = a_by.get(aid)
+        if agent is None:
+            continue
+        buf = getattr(agent, "_isl_buf", None)
+        if buf is None:
+            buf = []
+            agent._isl_buf = buf
+        buf.append(rec)
+        if len(buf) > _ISL_BUF_MAX:      # リングバッファ: 上限超は最古を捨てる
+            del buf[0]
+
+
+def _isl_digest(agent) -> str | None:
+    """個体のバッファ+当日計画から客観ダイジェストを組む(意味づけしない)。空なら None。
+
+    「計画との差分・立ち寄った場所・会った人・起きたこと」を客観列挙するだけ(なぜ印象に
+    残ったか等の意味づけは夜内省の LLM の仕事=二段分離)。順序保持の重複畳みで決定論。"""
+    buf = getattr(agent, "_isl_buf", None) or []
+    places: list[str] = []
+    persons: list[str] = []
+    acts: list[str] = []
+    for cat, val in buf:
+        bucket = places if cat == "place" else persons if cat == "person" else acts
+        if val and val not in bucket:    # 重複は畳む(先出し順を保つ=決定論)
+            bucket.append(val)
+    facts: list[str] = []
+    plan = getattr(agent, "day_plan", None) or []
+    done = sum(1 for it in plan if isinstance(it, dict) and it.get("done"))
+    if plan and done:                    # 計画との差分(客観カウント)
+        facts.append(f"今日の予定は{len(plan)}件中{done}件を済ませた")
+    if places:
+        facts.append("・".join(places[:3]) + "に立ち寄った")
+    if persons:
+        facts.append("・".join(persons[:3]) + "と会った")
+    facts.extend(acts[:3])
+    if not facts:
+        return None
+    return "この間のこと: " + "。".join(facts)
+
+
+def _isl_take(sim, agent) -> str | None:
+    """発火時: ダイジェストを組んで返し、バッファを空にする(次の「前回発火以降」を仕切り直す)。
+    OFF は None(build_prompt が1行も足さない=バイト一致)。"""
+    if not _interstitial_on(sim):
+        return None
+    dig = _isl_digest(agent)
+    buf = getattr(agent, "_isl_buf", None)
+    if buf:
+        buf.clear()
+    return dig
+
+
 # ---------------------------------------------------------------- LLM 発話
 def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
                dm_target: str | None = None,
@@ -1168,6 +1277,9 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
             p = _select_partner(sim, agent, company)
             pid = p.id if p is not None else None
         dialog_history = _dialog_get(agent, pid)
+    # 行間補間(P2 S2): 前回発火以降の客観ダイジェスト。OFF は None=1行も足さない=バイト一致。
+    # 発火のたびに1度だけ組み、バッファを仕切り直す(=次の「前回発火以降」の起点)。
+    interstitial_digest = _isl_take(sim, agent)
     prompt = deliberate.build_prompt(agent, place_name=place,
                                      surprise=trigger,
                                      nearby_names=[a.name for a in company],
@@ -1201,6 +1313,7 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
                                      hobby_line=hobby_line,
                                      norm_line=norm_line,
                                      digest_line=digest_line,
+                                     interstitial_digest=interstitial_digest,
                                      variety_hint=variety_hint,
                                      labeling_mode=sim.labels.mode,
                                      open_actions=bool(getattr(sim, "freedomcfg", None)
@@ -3154,6 +3267,9 @@ def run_step(sim, step: int) -> None:
     sim.budget.reset()
     sim.freedom_stats = {"choice_points": 0, "exercised": 0}  # 自由度観測(P2)の step 境界。OFF は L2 で列不在
     sim_min = sim.clock.sim_min(step)
+    # 行間補間(P2 S2): この step 開始時点の logger.events 長を控える(末で増分を各個体バッファへ
+    # 振り分ける)。OFF は -1 で以降の蓄積を完全にスキップ=状態も出力もバイト一致。
+    _isl_idx = len(sim.logger.events) if _interstitial_on(sim) else -1
     _ensure_orgs(sim)                              # 組織台帳の遅延初期化(既定OFF=no-op)
     for agent in sim.agents:
         agent.now_step = step                      # remember() の時刻付け
@@ -3223,7 +3339,15 @@ def run_step(sim, step: int) -> None:
                           weather_line=getattr(sim, "today_weather_line", None),
                           reflect_cfg=getattr(sim, "reflectcfg", None),
                           reflect_variety=bool(getattr(sim, "promptscfg", {})
-                                               .get("reflect_variety", False)))
+                                               .get("reflect_variety", False)),
+                          interstitial=_interstitial_on(sim),
+                          interstitial_digest=_isl_take(sim, agent))
+
+    # 行間補間(P2 S2): この step で新規に記録されたイベントを各個体のバッファへ振り分ける
+    # (OFF は _isl_idx=-1 で完全 no-op=バッファも作らない=バイト一致)。発火時の _isl_take が
+    # バッファを空にしているので、以降はこの step 分から「前回発火以降」が積み直る。
+    if _isl_idx >= 0:
+        _isl_accumulate(sim, _isl_idx)
 
     sim.logger.log_metrics(step, collect(sim))
     if step % int(sim.cfg.observer.snapshot_every) == 0:
