@@ -112,6 +112,8 @@ def make_plan(sim, agent, step: int, sim_min: int, place_name: str,
         max_tokens=plan_max_tokens)
     sim.logger.log_llm_call({"llm_call_id": call_id, "agent_id": agent.id,
                              "purpose": "plan", "step": step, "cached": cached})
+    from . import routine as _routine                 # 遅延 import(循環回避)
+    _routine.maybe_roll_motif(sim, agent, step)       # P2 S4 L1: 朝の計画確定後に骨格 motif を1日1回抽選(既定 OFF=no-op)
     if framework is not None:                        # 日課計画フレームワーク経路(P2 S1)
         _make_plan_framework(sim, agent, step, sim_min, prompt, response, call_id,
                              framework, max_items, plan_max_tokens)

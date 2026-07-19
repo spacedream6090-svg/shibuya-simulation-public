@@ -448,6 +448,40 @@ planning:
       maintenance: 45
       discretionary: 60
 
+# ---- 確率的実行=行動のゆらぎ(P2 スライス S4。docs/plans/p2-interstitial-design.md §1 S4 /
+#      docs/research/interstitial-life.md §4.1 の実証3層 L1/L2/L3 + Gumbel)。既定 OFF=現行と完全同一 ----
+# LLM 非駆動の routine 実行に「人間らしいランダム性」を実証値で較正して注入する。摂動は専用 stream
+# (motif/jitter_time/detour/interrupt/gumbel)にだけ載せ、既存 routine の乱数(choose_destination 等)の
+# draw 順は汚さない(crowd/curfew/media が確立した作法)。入力は物理量・時刻・活動種別のみ(因子・k を
+# 見ない=no-fingerprint)。追加 LLM 呼はゼロ=呼数 k 非依存。
+# R1: enabled=false で新 stream を一切引かず・detour/interrupt 0 件=ゴールデン L1 バイト一致。
+# 較正ターゲット(interstitial-life §4.1): 日次逸脱 25〜35% / per-move 寄り道 10〜20% / 予測可能性≈93%。
+routine:
+  stochastic:
+    enabled: false              # ★本番はユーザー判断で ON。false=現行の決定論 routine と完全同一
+    # ---- L1 骨格 motif(stream "motif"): 朝1回、その日の行動骨格を確率抽選 ----
+    novelty_prob: 0.15          # 「いつもと違う一日」を引く確率(1-これ=routine 日)。Schneider: 17motif で90%
+    novelty_scale: 1.6          # novelty 日に L2/L3 の強度(ジッター幅・逸脱率)へ掛ける倍率
+    # ---- L2 時刻ジッター(stream "jitter_time"): flexible 活動の開始/継続を一様 ±jitter_min ----
+    jitter_min: 30              # 片側幅(分)。MATSim mutationRange=1800s=±30分・一様・affectsDuration。fixed アンカーは不変
+    # ---- L3 逸脱イベント(stream "detour"/"interrupt"): 活動種別で確率可変(mandatory 低・discretionary 高)----
+    detour_prob:                # per-move 寄り道確率(目的地手前で近傍 POI に立ち寄り)
+      mandatory: 0.05
+      maintenance: 0.12
+      discretionary: 0.18
+    detour_radius_m: 300        # 寄り道先を探す現在地の近傍半径(m)。周辺スポット密度がそのまま重みになる
+    interrupt_prob:             # 滞在中の活動を途中で中断=離脱する確率/step
+      mandatory: 0.0
+      maintenance: 0.06
+      discretionary: 0.10
+    # ---- Gumbel ロジット化(stream "gumbel"): 行き先 argmax を U=V+ε の確率選択へ置換(ON 時のみ)----
+    gumbel:
+      enabled: false            # true で自由時間の行き先選択を Gumbel-max 化(温度は活動3分類で固定)
+      temperature:              # 低温=いつもの行き先(≒決定論)/ 高温=多様化(気まぐれ)
+        mandatory: 0.3
+        maintenance: 0.8
+        discretionary: 1.5
+
 # ---- プロンプト調整(改善 P3 第9バッチ。既定 OFF=注入なし=バイト一致)----
 # 発話の定型化対策(sim-improvement-analysis.md P3: 冒頭句「この時間の渋谷…」が発話の5〜9.5%)。
 # ON で social/reply/solo の状況文に「決まり文句で始めない」注意書きを1行足す(内容のみ=呼数不変=R1)。

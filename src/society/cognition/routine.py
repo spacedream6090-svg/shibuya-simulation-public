@@ -30,6 +30,196 @@ GAMMA = 0.21
 MEAL_WINDOWS = [(11 * 60 + 30, 13 * 60 + 30), (18 * 60, 21 * 60)]
 
 
+# ============================================================
+# 確率的実行(行動のゆらぎ)= P2 スライス S4。既定 OFF=新 stream を一切引かず
+# ゴールデン L1 バイト一致。実証3層(interstitial-life §4.1):
+#   L1 骨格 motif(stream "motif"): 朝1回、その日の行動骨格を確率抽選(routine=高確率・
+#     「いつもと違う一日」=低確率)。novelty 日は L2/L3 の強度を増幅する。
+#   L2 時刻ジッター(stream "jitter_time"): flexible 活動の開始/継続を一様 ±jitter_min ずらす
+#     (MATSim mutationRange=1800s=±30分・一様・affectsDuration)。fixed アンカーは対象外。
+#   L3 逸脱(stream "detour"/"interrupt"): 寄り道=目的地手前で近傍 POI に立ち寄り(per-move・
+#     活動種別で可変)/ 中断=活動途中で離脱。
+#   Gumbel(stream "gumbel"): 行き先 argmax を U=V+ε(ε=-log(-log(uniform)))の確率選択へ置換
+#     (ON 時のみ)。温度は活動3分類で固定(mandatory=低温≒決定論・discretionary=高温)。
+# 摂動は専用 stream にだけ載せ、既存 routine の乱数(choose_destination 等)は既定 stream の
+# まま触らない(crowd/curfew/media の作法)。入力は物理量・時刻・活動種別のみ(因子・k を見ない)。
+_CATS3 = ("mandatory", "maintenance", "discretionary")
+_FIXED_ACTS = frozenset({"working", "commuting"})   # fixed アンカー由来(ゆらぎ・中断の対象外)
+# 実行時 activity ラベル → 3分類。未知/自由行動は discretionary(最も揺らぐ)。
+_ACT_CAT = {"working": "mandatory", "commuting": "mandatory",
+            "eating": "maintenance", "shopping": "maintenance"}
+# 計画語彙 what → 3分類(plan item の cat 推定用。plan_schema と同一マップ)。
+_WHAT_CAT = {"work": "mandatory", "study": "mandatory",
+             "meal": "maintenance", "shop": "maintenance", "personal": "maintenance",
+             "escort": "maintenance", "home": "maintenance",
+             "leisure": "discretionary", "park": "discretionary",
+             "walk": "discretionary", "visit": "discretionary", "meetup": "discretionary"}
+_STOCH_UNSET = object()
+
+
+def _catmap(raw, default: dict) -> dict:
+    raw = raw or {}
+    return {c: float(raw.get(c, default[c])) for c in _CATS3}
+
+
+def _build_stochastic_cfg(raw) -> dict:
+    """routine.stochastic の生 cfg を数値へ正規化する(enabled 済み前提)。"""
+    gum = raw.get("gumbel", {}) or {}
+    return {
+        "novelty_prob": float(raw.get("novelty_prob", 0.15)),
+        "novelty_scale": float(raw.get("novelty_scale", 1.6)),
+        "jitter_min": float(raw.get("jitter_min", 30.0)),
+        "detour_prob": _catmap(raw.get("detour_prob"),
+                               {"mandatory": 0.05, "maintenance": 0.12,
+                                "discretionary": 0.18}),
+        "detour_radius_m": float(raw.get("detour_radius_m", 300.0)),
+        "interrupt_prob": _catmap(raw.get("interrupt_prob"),
+                                  {"mandatory": 0.0, "maintenance": 0.06,
+                                   "discretionary": 0.10}),
+        "gumbel_enabled": bool(gum.get("enabled", False)),
+        "gumbel_temp": _catmap(gum.get("temperature"),
+                               {"mandatory": 0.3, "maintenance": 0.8,
+                                "discretionary": 1.5}),
+    }
+
+
+def _stochastic_cfg(sim):
+    """routine.stochastic 設定を sim に一度だけキャッシュ。無効/未設定なら None(=既定挙動で
+    新 stream を一切引かない)。既存 _media_settings と同じ遅延キャッシュ作法。"""
+    cached = getattr(sim, "_stoch_cfg", _STOCH_UNSET)
+    if cached is not _STOCH_UNSET:
+        return cached
+    raw = (sim.cfg.get("routine", {}) or {}).get("stochastic", {}) or {}
+    cfg = _build_stochastic_cfg(raw) if raw.get("enabled", False) else None
+    sim._stoch_cfg = cfg
+    return cfg
+
+
+def _cat_of(activity: str = "", what: str = "") -> str:
+    """activity ラベル or 計画語彙 what を3分類へ写す(既定=discretionary)。"""
+    if what:
+        return _WHAT_CAT.get(what, "discretionary")
+    return _ACT_CAT.get(activity or "", "discretionary")
+
+
+def _motif_scale(agent, scfg) -> float:
+    """novelty 日は L2/L3 の強度を novelty_scale 倍(routine 日は等倍)。"""
+    return scfg["novelty_scale"] \
+        if getattr(agent, "_motif", "routine") == "novelty" else 1.0
+
+
+def maybe_roll_motif(sim, agent, step: int) -> None:
+    """L1: その日の行動骨格 motif を専用 stream で1日1回抽選する(冪等)。既定 OFF は
+    何も引かず何も生やさない。朝の計画確定後(planning)/ その日の初回 routine 決定のいずれか
+    早い方で1回だけ確定する。motif は (agent, day) で決まるので確定タイミングに依存しない。"""
+    scfg = _stochastic_cfg(sim)
+    if scfg is None:
+        return
+    day = sim.clock.sim_min(step) // 1440
+    if getattr(agent, "_motif_day", -1) == day:
+        return
+    agent._motif_day = day
+    r = float(sim.hub.stream("motif", agent.id, day).random())
+    agent._motif = "novelty" if r < scfg["novelty_prob"] else "routine"
+
+
+def _jitter_stay(agent, sim, base_steps: int, step: int, scfg,
+                 activity: str = "", what: str = "") -> int:
+    """L2: flexible 活動の stay_steps(継続時間)を一様 ±jitter_min ずらす。fixed アンカー
+    (勤務・通勤=mandatory)は揺らさない。1 step=10 分。専用 stream 'jitter_time'。"""
+    if activity in _FIXED_ACTS or _cat_of(activity, what) == "mandatory":
+        return base_steps
+    span = scfg["jitter_min"] * _motif_scale(agent, scfg) / 10.0   # 分→step
+    if span <= 0.0:
+        return base_steps
+    rng = sim.hub.stream("jitter_time", agent.id, step)
+    return max(0, base_steps + int(round(float(rng.uniform(-span, span)))))
+
+
+def _jitter_band_min(agent, sim, sim_min: int, step: int, scfg) -> int:
+    """L2: 予定消化の判定時刻(開始時刻)を一様 ±jitter_min ずらす。専用 stream 'jitter_time'
+    の別キー(既存 stay ジッターと独立)。"""
+    span = scfg["jitter_min"] * _motif_scale(agent, scfg)
+    if span <= 0.0:
+        return sim_min
+    rng = sim.hub.stream("jitter_time", agent.id, step, "band")
+    return int(sim_min + round(float(rng.uniform(-span, span))))
+
+
+def _nearby_pois(agent, sim, dest, radius_m: float) -> list:
+    """現在地の半径内 POI ノード(現在地・目的地は除く)。周辺スポット密度がそのまま重み
+    (同一ノードに複数 POI があれば重複=魅力度スケール)。"""
+    ax, ay = sim.city.node_xy(agent.node)
+    out = []
+    for p in sim.city.poi_list:
+        node = p["node"]
+        if node == agent.node or node == dest:
+            continue
+        px, py = sim.city.node_xy(node)
+        if math.hypot(ax - px, ay - py) <= radius_m:
+            out.append(node)
+    return out
+
+
+def _maybe_detour(agent, sim, dest, step: int, sim_min: int, scfg,
+                  activity: str = "", what: str = ""):
+    """L3 寄り道: 目的地手前で近傍 POI に立ち寄る寄り先ノードを返す(しなければ None)。
+    per-move 確率は活動種別で可変(mandatory 低・discretionary 高)・motif で変調。専用 stream
+    'detour'。発火時は軽量 detour イベントを1件記録する(種別=元活動・寄り先・元目的地)。"""
+    p = scfg["detour_prob"][_cat_of(activity, what)] * _motif_scale(agent, scfg)
+    if p <= 0.0:
+        return None
+    rng = sim.hub.stream("detour", agent.id, step)
+    if float(rng.random()) >= p:
+        return None
+    cands = _nearby_pois(agent, sim, dest, scfg["detour_radius_m"])
+    if not cands:
+        return None
+    to = cands[int(rng.integers(len(cands)))]
+    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                         kind="detour", x=agent.x, y=agent.y,
+                         payload={"act": activity or what or "free",
+                                  "to": to, "from_dest": dest}))
+    return to
+
+
+def _maybe_interrupt(agent, sim, step: int, sim_min: int, scfg) -> bool:
+    """L3 中断: 滞在中の活動を途中で離脱するか。fixed アンカー由来(勤務・通勤)は中断しない。
+    活動種別で可変・motif で変調。専用 stream 'interrupt'。発火時は interrupt を1件記録する。"""
+    act = getattr(agent, "activity", "") or ""
+    if act in _FIXED_ACTS:
+        return False
+    p = scfg["interrupt_prob"][_cat_of(act)] * _motif_scale(agent, scfg)
+    if p <= 0.0:
+        return False
+    if float(sim.hub.stream("interrupt", agent.id, step).random()) >= p:
+        return False
+    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                         kind="interrupt", x=agent.x, y=agent.y,
+                         payload={"act": act or "free"}))
+    return True
+
+
+def _gumbel_destination(agent, dests: list, sim, step: int, scfg,
+                        activity: str = "", what: str = "") -> str:
+    """Gumbel-max: argmax_d(V_d/T + ε_d)、ε=-log(-log(uniform))、V=log1p(訪問回数)。温度 T は
+    活動3分類で固定(低温=いつもの行き先が argmax を支配・高温=ε 支配で多様化)。専用 stream
+    'gumbel'。候補が無ければ現在地(=stay)。"""
+    cands = [d for d in dests if d != agent.node]
+    if not cands:
+        return agent.node
+    temp = max(1e-6, scfg["gumbel_temp"][_cat_of(activity, what)])
+    rng = sim.hub.stream("gumbel", agent.id, step)
+    best, best_u = agent.node, -math.inf
+    for d in cands:
+        v = math.log1p(float(agent.visits[d]))
+        eps = -math.log(-math.log(max(1e-12, float(rng.random()))))
+        u = v / temp + eps
+        if u > best_u:
+            best_u, best = u, d
+    return best
+
+
 def _minutes_of_day(sim_min: int) -> int:
     return sim_min % 1440
 
@@ -198,15 +388,19 @@ def _resolve_plan_dest(agent, sim, item, rng, sim_min: int):
     return choose_destination(agent, sim.dests, rng)
 
 
-def _plan_move(agent, sim, sim_min: int, step: int, rng) -> dict | None:
+def _plan_move(agent, sim, sim_min: int, step: int, rng, scfg=None) -> dict | None:
     """現在の時間帯に一致する未消化の予定があれば、その行き先への move を組む。
 
     day_plan が空(=計画なし。planning 無効時も含む)のときは乱数を一切引かずに None
-    を返す(既定挙動の再現性を保つ)。1項目は1回だけ消化する(解決可否に関わらず)。"""
+    を返す(既定挙動の再現性を保つ)。1項目は1回だけ消化する(解決可否に関わらず)。
+    scfg(P2 S4)= None のときは新 stream を一切引かず既定挙動とバイト一致。ON のときのみ
+    L2 開始/継続ジッター・L3 寄り道を専用 stream で重ねる(既存の rng draw 順は不変)。"""
     plan = getattr(agent, "day_plan", None)
     if not plan:
         return None
-    band = _time_band(sim_min)
+    band_min = sim_min if scfg is None \
+        else _jitter_band_min(agent, sim, sim_min, step, scfg)   # L2 開始ジッター
+    band = _time_band(band_min)
     item = next((it for it in plan
                  if not it.get("done") and it.get("when") == band), None)
     if item is None:
@@ -215,10 +409,16 @@ def _plan_move(agent, sim, sim_min: int, step: int, rng) -> dict | None:
     dest = _resolve_plan_dest(agent, sim, item, rng, sim_min)
     if not dest or dest == agent.node:
         return None
-    action = {"type": "move_to", "dest": dest,
-              "stay_steps": int(rng.integers(2, 5)),
+    what = str(item.get("what") or "")
+    base_stay = int(rng.integers(2, 5))
+    if scfg is not None:
+        detour = _maybe_detour(agent, sim, dest, step, sim_min, scfg, what=what)  # L3 寄り道
+        if detour is not None:
+            dest = detour
+        base_stay = _jitter_stay(agent, sim, base_stay, step, scfg, what=what)    # L2 継続ジッター
+    action = {"type": "move_to", "dest": dest, "stay_steps": base_stay,
               "mode": _choose_mode(agent, sim, dest, rng)}
-    activity = _PLAN_ACTIVITY.get(str(item.get("what") or ""), "")
+    activity = _PLAN_ACTIVITY.get(what, "")
     if activity:
         action["activity"] = activity
     return _augment_ride(agent, sim, action, step, sim_min)
@@ -436,6 +636,9 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
     sim_min = sim.clock.sim_min(step)
     m = _minutes_of_day(sim_min)
     cal = _cal(sim)                         # 暦(weekday_work ゲート用。既定 OFF=不変)
+    scfg = _stochastic_cfg(sim)             # 確率的実行 P2 S4(None=既定=新 stream を一切引かない)
+    if scfg is not None:
+        maybe_roll_motif(sim, agent, step)  # L1 骨格 motif(1日1回・冪等)
 
     # ---- 娯楽メディア(在宅の TV/動画/ゲーム。既定 OFF)。就寝より優先し在宅を占有 ----
     media_action = _media_action(agent, sim, sim_min, step)
@@ -539,9 +742,13 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
                 "mode": _choose_mode(agent, sim, pt["node"], rng),
                 "activity": "commuting"}
 
-    # ---- 滞在中 ----
+    # ---- 滞在中(L3 中断: flexible 活動のみ確率的に途中離脱。既定 OFF=常に stay)----
     if step < agent.stay_until:
-        return {"type": "stay"}
+        if scfg is not None and _maybe_interrupt(agent, sim, step, sim_min, scfg):
+            agent.stay_until = step                  # 滞在打ち切り=離脱 → 以降の分岐(次の行動)へ
+            agent.activity = ""
+        else:
+            return {"type": "stay"}
 
     # ---- 食事時間帯: 実在の飲食店へ(残高が価格に満たない店は避ける=経済 v0)----
     if in_meal_window(sim_min) \
@@ -554,14 +761,22 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
             p = foods[int(rng.integers(len(foods)))]
             if _curfew_suppressed(agent, sim, p["node"], sim_min, step):
                 return {"type": "stay"}              # 制度DSL: 時間帯×カテゴリの抑制
+            dest = p["node"]
+            base_stay = int(rng.integers(2, 5))      # 2-4 step(短縮)
+            if scfg is not None:                     # L3 寄り道 + L2 継続ジッター(maintenance)
+                detour = _maybe_detour(agent, sim, dest, step, sim_min, scfg,
+                                       activity="eating")
+                if detour is not None:
+                    dest = detour
+                base_stay = _jitter_stay(agent, sim, base_stay, step, scfg,
+                                         activity="eating")
             return _augment_ride(agent, sim, {
-                "type": "move_to", "dest": p["node"],
-                "stay_steps": int(rng.integers(2, 5)),   # 2-4 step(短縮)
-                "mode": _choose_mode(agent, sim, p["node"], rng),
+                "type": "move_to", "dest": dest, "stay_steps": base_stay,
+                "mode": _choose_mode(agent, sim, dest, rng),
                 "activity": "eating"}, step, sim_min)
 
     # ---- 朝の一日計画(土台): 現在の時間帯に一致する未消化の予定へ向かう ----
-    plan_move = _plan_move(agent, sim, sim_min, step, rng)
+    plan_move = _plan_move(agent, sim, sim_min, step, rng, scfg)
     if plan_move is not None:
         return plan_move
 
@@ -605,15 +820,24 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
         dest = boost                                 # 制度DSL: 定期イベントの場所へ寄せる
     elif sim.psychcfg["lynch"]["enabled"] and getattr(sim, "landmark_score", None):
         dest = _lynch_destination(agent, sim, sim.hub.stream("lynch", agent.id, step))
+    elif scfg is not None and scfg["gumbel_enabled"]:
+        # Gumbel ロジット化(ON 時のみ): 行き先 argmax を U=V+ε の確率選択へ置換(discretionary)。
+        dest = _gumbel_destination(
+            agent, _diversity.safe_dests(sim, agent, sim.dests), sim, step, scfg)
     else:
         dest = choose_destination(agent, _diversity.safe_dests(sim, agent, sim.dests), rng)
     if dest == agent.node:
         return {"type": "stay"}
     if _curfew_suppressed(agent, sim, dest, sim_min, step):
         return {"type": "stay"}                      # 制度DSL: 時間帯×カテゴリの抑制
+    base_stay = int(rng.integers(1, 4))              # 1-3 step(短縮)
+    if scfg is not None:                             # L3 寄り道 + L2 継続ジッター(discretionary)
+        detour = _maybe_detour(agent, sim, dest, step, sim_min, scfg)
+        if detour is not None:
+            dest = detour
+        base_stay = _jitter_stay(agent, sim, base_stay, step, scfg)
     return _augment_ride(agent, sim, {
-        "type": "move_to", "dest": dest,
-        "stay_steps": int(rng.integers(1, 4)),       # 1-3 step(短縮)
+        "type": "move_to", "dest": dest, "stay_steps": base_stay,
         "mode": _choose_mode(agent, sim, dest, rng)}, step, sim_min)
 
 

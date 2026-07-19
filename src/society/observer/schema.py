@@ -181,6 +181,9 @@ register_event_kind("memory_fail",     "想起の失敗(活性化が閾値未達
 register_event_kind("conversation",    "構造化会話 C2(実文なし・機械効果のみ。1会話1件){with, topic, tone, outcome, acts}")
 # ---- 日課計画フレームワーク(P2 S1。planning.framework ON のみ・1日1件。設計: docs/research/daily-plan-framework.md)----
 register_event_kind("day_plan_compiled", "日課計画のコンパイル要約(型スキーマ→アンカー先置き→充填){n, cats, anchors, path}")
+# ---- 確率的実行 L3(P2 S4。routine.stochastic ON のみ・既定 OFF=0件。設計: docs/plans/p2-interstitial-design.md §1 S4)----
+register_event_kind("detour",        "確率的実行 L3: 寄り道=目的地手前で近傍 POI に立ち寄り(P2 S4){act, to, from_dest}")
+register_event_kind("interrupt",     "確率的実行 L3: 活動途中の中断=離脱(P2 S4){act}")
 
 
 @dataclass
