@@ -223,3 +223,76 @@ def on_purchase(sim, agent, cat: str, base_amount: float, step: int,
                              payload={"poi": _poi_name(sim, agent.node, cat),
                                       "cat": cat, "ratio": round(coef, 3)}))
     return float(base_amount) * coef
+
+
+# ==================================================================== E-W2 VC/出資
+# 第37バッチ 2026-07-19。docs/research/economy-abm-research.md §4。既存 venture(出店)への
+# 出資判定。判定は観測可能な代理変数のみ = traction(累計売上)/ market(在館数=occupancy)/
+# network(関係網の次数)。efficacy 等の内部構成概念は使わない(§7【要注意 B】= k 非依存・R1)。
+# ここは commerce.occupancy(市場代理)と同居させる。config は economy.build_vc_cfg(economy["vc"])。
+#
+# ★純ロジック(ログしない・sim を触らない)。イベント記録(vc_investment)・乱数・
+#   sim.vc_fund の遅延構築・出資の入金(owner.account)は tools/scheduler スチュワードが配線する。
+#   出資は「起業意図(LLM の open_venture)」を評価するだけのルール主体=LLM 呼数 0 追加(R1)。
+
+
+def vc_score(sales_total: float, occ: int, network_degree: int, cfg: dict) -> float:
+    """出資スコア(§4、決定論・観測量のみ)。戻り値 [0,1](weights の総和=1 前提)。
+
+    traction=venture の累計売上 sales_total / market=出店ノードの在館数 occupancy(sim, node) /
+    network=owner の関係網の次数 len(agent.mem.relations)。各 ref で正規化し重み付き和。"""
+    w = cfg["weights"]
+    nt = _clip(float(sales_total) / (float(cfg["traction_ref"]) or 1.0), 0.0, 1.0)
+    nm = _clip(float(occ) / (float(cfg["market_ref"]) or 1.0), 0.0, 1.0)
+    nn = _clip(float(network_degree) / (float(cfg["network_ref"]) or 1.0), 0.0, 1.0)
+    return w["traction"] * nt + w["market"] * nm + w["network"] * nn
+
+
+def vc_candidates(scored: list, cfg: dict) -> list:
+    """[(key, score), ...] から threshold 超を上位 n_deals_per_review 件選ぶ(決定論・同点はキー昇順)。
+
+    key は owner_id 等の安定キー(決定論の tie-break)。閾値未満は出資しない=希少性(競争)を作る。"""
+    passing = [(k, float(s)) for (k, s) in scored if float(s) >= float(cfg["threshold"])]
+    passing.sort(key=lambda ks: (-ks[1], ks[0]))          # スコア降順・同点キー昇順=決定論
+    return passing[:int(cfg["n_deals_per_review"])]
+
+
+def vc_dividend(sale_amount: float, equity_share: float, cfg: dict) -> float:
+    """出資後の売上から差し引く配当 = 売上 × 持分 × dividend_rate(§7 E-W2「以後の売上から配当」)。"""
+    return float(sale_amount) * float(equity_share) * float(cfg["dividend_rate"])
+
+
+class VCFund:
+    """VC ファンドの会計主体(economy.Bank と同型)。scheduler/tools が遅延構築(sim.vc_fund)。
+
+    原資 balance(枯れると出資停止=希少性)・持分 equity(owner_id→持分)・累計を持つ。ログはしない
+    (vc_investment はスチュワードが記録)。中央制御でない局所の資金供給者(§4「institution/agent」)。"""
+
+    def __init__(self, cfg: dict):
+        self.cfg = dict(cfg)
+        self.balance = float(cfg["fund_initial"])
+        self.equity: dict[int, float] = {}                # owner_id -> 累計持分
+        self.invested_total = 0.0
+        self.dividends_total = 0.0
+
+    def can_invest(self) -> bool:
+        return self.balance >= float(self.cfg["ticket"])
+
+    def invest(self, owner_id: int) -> float:
+        """1件出資(ticket を支出・持分を加算)。戻り: 出資額。呼び出し前に can_invest を確認。"""
+        ticket = float(self.cfg["ticket"])
+        self.balance -= ticket
+        self.invested_total += ticket
+        self.equity[int(owner_id)] = (self.equity.get(int(owner_id), 0.0)
+                                      + float(self.cfg["equity_share"]))
+        return ticket
+
+    def collect_dividend(self, owner_id: int, sale_amount: float) -> float:
+        """出資先の売上から配当を回収(持分がある owner のみ)。戻り: 配当額(0=非出資先)。"""
+        eq = self.equity.get(int(owner_id), 0.0)
+        if eq <= 0.0:
+            return 0.0
+        d = vc_dividend(sale_amount, eq, self.cfg)
+        self.balance += d
+        self.dividends_total += d
+        return d

@@ -132,7 +132,8 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
                  labeling_mode: str = "constrained",
                  open_actions: bool = False,
                  city_name: str = "",
-                 p2_offers: str | None = None) -> str:
+                 p2_offers: str | None = None,
+                 dialog_history: list | None = None) -> str:
     """個別文脈(時刻・場所・活動・気分・記憶・直近発話)を渡し、内容の固定化を防ぐ。
 
     pull_query が渡された時だけ(agentic_pull=true)、その文で決定論の記憶想起を
@@ -247,6 +248,13 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
                      "今の時刻・場所・気分・出来事に根ざした新しい内容を話す。")
     if feed_texts:
         lines.append(f"タイムライン: {' / '.join(feed_texts[:_feed_n])}")
+    # 対話履歴の注入(会話強化・prompts.dialog_history=true のときだけ scheduler が渡す)。
+    # 相手との直近やりとり(最大2往復=4発話)を1行で。既定 OFF は None=1行も足さない
+    # =バイト一致(ゴールデン維持)。行数は最大1行増(2往復を「→」で連結)。
+    if dialog_history:
+        turns = dialog_history[-4:]          # 直近2往復=最大4発話
+        lines.append("直前のやりとり: "
+                     + " → ".join(f"{spk}「{txt}」" for spk, txt in turns))
     if surprise == "social":
         lines.append("状況: 近くにいる人と自然に会話する。今この場所・この時間ならではの"
                      "話題(店、時間帯、出来事、気分)で、あなたらしい一言を speak で。")

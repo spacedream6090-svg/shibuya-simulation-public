@@ -842,11 +842,87 @@ def _record_appointments(sim, speaker, text: str, party_ids: list[int],
                                       "with": others}))
 
 
+# ---------------------------------------------------------------- 会話強化(会話品質の構造改善)
+# 2機構とも新 conf キー(prompts.dialog_history / prompts.reply_partner)・既定 OFF=ゴールデン完全維持。
+# 設定は cfg.get 既定値で読む(schema 非依存)。乱数は一切引かない(全決定論・R1・新 stream なし)。
+_DIALOG_MAX_TURNS = 4        # 相手あたりに保持する発話数(=直近2往復)
+_DIALOG_MAX_PARTNERS = 8     # 全体で保持する相手数(LRU 上限)
+
+
+def _dialog_on(sim) -> bool:
+    """対話履歴の注入が有効か(prompts.dialog_history=true)。既定 OFF=状態も増やさない。"""
+    try:
+        return bool((sim.cfg.get("prompts", {}) or {}).get("dialog_history", False))
+    except Exception:
+        return False
+
+
+def _reply_partner_mode(sim) -> str:
+    """返答宛先の選び方(prompts.reply_partner)。既定 "nearest"=現行と完全同一の選択。"""
+    try:
+        return str((sim.cfg.get("prompts", {}) or {}).get("reply_partner", "nearest"))
+    except Exception:
+        return "nearest"
+
+
+def _select_partner(sim, agent, hearers):
+    """発話の返答権/宛先を決定論選択する(乱数なし・R1)。hearer 集合は不変=聞く人は
+    変わらない。返す人(宛先)だけが変わる。
+
+    "nearest"(既定): 最寄り1人(距離同点は id 小)=現行の min() と一字一句同一。
+    "closeness": score = closeness(話者→候補)·10.0 − dist_m·0.1 の argmax(同点は id 昇順)。"""
+    if not hearers:
+        return None
+    if _reply_partner_mode(sim) == "closeness":
+        rels = agent.mem.relations
+
+        def _score(h):
+            c = float((rels.get(h.id) or {}).get("closeness", 0.0))
+            dist = math.hypot(h.x - agent.x, h.y - agent.y)
+            return (c * 10.0 - dist * 0.1, -h.id)   # 同点は id 最小(-id が最大)を選ぶ
+
+        return max(hearers, key=_score)
+    # 既定 nearest: 現行の min() と一字一句同一(ゴールデン維持)。
+    return min(hearers, key=lambda h: (
+        math.hypot(h.x - agent.x, h.y - agent.y), h.id))
+
+
+def _dialog_push(agent, partner_id: int, speaker_name: str, text: str) -> None:
+    """相手別リングバッファへ1発話を追記(ON 時のみ呼ばれる)。相手あたり最大4発話・
+    全体最大8相手 LRU(最古の相手を退避)。バッファは動的属性 _dialog_hist に持つ
+    ので、OFF では一度も生成されない=状態変化なし=構造的にバイト一致。"""
+    hist = getattr(agent, "_dialog_hist", None)
+    if hist is None:
+        hist = {}
+        agent._dialog_hist = hist
+    turns = hist.pop(partner_id, None)          # pop+再挿入で最新利用へ更新(LRU)
+    if turns is None:
+        turns = []
+    turns.append((speaker_name, text))
+    if len(turns) > _DIALOG_MAX_TURNS:
+        turns = turns[-_DIALOG_MAX_TURNS:]
+    hist[partner_id] = turns
+    while len(hist) > _DIALOG_MAX_PARTNERS:
+        del hist[next(iter(hist))]              # 挿入順先頭=LRU 最古の相手を退避
+
+
+def _dialog_get(agent, partner_id) -> list | None:
+    """相手 partner_id との直近対話(最大4発話=2往復)を返す。無ければ None。"""
+    if partner_id is None:
+        return None
+    hist = getattr(agent, "_dialog_hist", None)
+    if not hist:
+        return None
+    turns = hist.get(partner_id)
+    return list(turns) if turns else None
+
+
 # ---------------------------------------------------------------- LLM 発話
 def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
                dm_target: str | None = None,
                feed_texts: list[str] | None = None,
-               reply_to: tuple[str, str] | None = None) -> dict | None:
+               reply_to: tuple[str, str] | None = None,
+               partner_id: int | None = None) -> dict | None:
     """LLM に発話/行動を生成させる。解釈不能なら None(沈黙)。
     予算は欲求フェーズ(_phase_drive)で消費済み(発火権を得た者だけが来る)。"""
     radius = float(sim.cfg.world.perception_radius_m)
@@ -924,6 +1000,16 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
     wv_expect_line = worldview_mod.expect_line(sim, agent, sim_min)
     wv_self_line = worldview_mod.ctrl_line(agent, wvcfg)
     wv_norm_line = worldview_mod.norm_line(sim, wvcfg)
+    # 対話履歴の注入(会話強化・prompts.dialog_history=true のみ)。相手=reply は話者
+    # (partner_id)、social は同席者からの決定論選択。OFF は None=1行も足さない=バイト一致。
+    # 呼数不変=R1(注入はプロンプト内容のみ=キャッシュキーは変わってよい)。
+    dialog_history = None
+    if _dialog_on(sim) and trigger in ("social", "reply"):
+        pid = partner_id
+        if pid is None and trigger == "social":
+            p = _select_partner(sim, agent, company)
+            pid = p.id if p is not None else None
+        dialog_history = _dialog_get(agent, pid)
     prompt = deliberate.build_prompt(agent, place_name=place,
                                      surprise=trigger,
                                      nearby_names=[a.name for a in company],
@@ -961,7 +1047,8 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
                                      labeling_mode=sim.labels.mode,
                                      open_actions=bool(getattr(sim, "freedomcfg", None)
                                                        and sim.freedomcfg["open_actions"]),
-                                     p2_offers=p2_offers)
+                                     p2_offers=p2_offers,
+                                     dialog_history=dialog_history)
     rng_key = f"deliberate/{agent.id}/{step}"
     response, call_id, cached = sim.llm.generate(
         prompt, rng_key=rng_key,
@@ -1161,7 +1248,7 @@ def _decide(sim, agent, step: int, sim_min: int) -> dict:
             speaker = sim.agent_by_id.get(speaker_id)
             reply_to = (speaker.name, said) if speaker is not None else None
             action = _llm_speak(sim, agent, "reply", step, sim_min,
-                                reply_to=reply_to)
+                                reply_to=reply_to, partner_id=speaker_id)
             agent.conv_turns_left -= 1
             if agent.conv_turns_left <= 0:         # セッション上限 → クールダウン
                 agent.conv_cooldown_until = step + sim.drivecfg["conv_cooldown_steps"]
@@ -1564,13 +1651,20 @@ def _apply(sim, agent, action: dict, step: int, sim_min: int) -> None:
     if kind == "speak":
         radius = float(sim.cfg.world.perception_radius_m)
         hearers = hearers_of(agent, sim.agents, radius)
-        # 返答保証: 最も近い同席者(距離同点は id 小)に返答権を渡す。
+        # 返答保証: 返答権を渡す相手を決定論選択(既定 nearest=最寄り1人=現行と同一。
+        # prompts.reply_partner=closeness で関係加重の宛先へ)。hearer 集合は不変=聞く人は
+        # 変わらない・返す人だけが変わる。乱数なし=R1。
         if hearers:
-            partner = min(hearers, key=lambda h: (
-                math.hypot(h.x - agent.x, h.y - agent.y), h.id))
+            partner = _select_partner(sim, agent, hearers)
             if (not partner.sleeping and partner.conv_turns_left > 0
                     and step >= partner.conv_cooldown_until):
                 partner._reply_to = (agent.id, action["text"])
+            # 対話履歴(prompts.dialog_history=true のみ)。話者と相手の相手別バッファへ同一発話を
+            # 積む(次回 social/reply のプロンプトに直近2往復を注入)。OFF は _dialog_on=false →
+            # 一切触らない=状態変化なし=バイト一致。
+            if _dialog_on(sim):
+                _dialog_push(agent, partner.id, agent.name, action["text"])
+                _dialog_push(partner, agent.id, agent.name, action["text"])
         words = [w for w in action.get("use_items", []) if w in agent.adopted]
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                              kind="speak", x=agent.x, y=agent.y,

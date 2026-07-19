@@ -28,7 +28,7 @@ def _load_export3d():
     return mod
 
 
-def _ensure_scene(run_dir: Path) -> tuple[str, str, str | None]:
+def _ensure_scene(run_dir: Path) -> tuple[str, str, str | None, str | None]:
     scene_dir = run_dir / "scene3d"
     scene_p = scene_dir / "scene.json"
     tracks_p = scene_dir / "tracks.json"
@@ -37,8 +37,11 @@ def _ensure_scene(run_dir: Path) -> tuple[str, str, str | None]:
     # PLATEAU 実形状(export_3d --plateau の成果物)。無ければ None=従来とバイト同一。
     pw_p = scene_dir / "plateau_web.json"
     plateau = pw_p.read_text(encoding="utf-8") if pw_p.exists() else None
+    # 地形(並行生成の terrain_web.json)。無ければ None=地形なし=完全従来動作。
+    tw_p = scene_dir / "terrain_web.json"
+    terrain = tw_p.read_text(encoding="utf-8") if tw_p.exists() else None
     return (scene_p.read_text(encoding="utf-8"),
-            tracks_p.read_text(encoding="utf-8"), plateau)
+            tracks_p.read_text(encoding="utf-8"), plateau, terrain)
 
 
 def _read_vendor() -> tuple[str, str, str]:
@@ -62,7 +65,10 @@ def _json_for_script(text: str) -> str:
 
 def build_html(run_name: str, scene_json: str, tracks_json: str,
                plateau_json: str | None = None,
-               plateau_src: str | None = None) -> str:
+               plateau_src: str | None = None,
+               terrain_json: str | None = None,
+               has_extras: bool = False,
+               mode_legend: dict | None = None) -> str:
     three_js, orbit_js, lic = _read_vendor()
     html = _TEMPLATE
     html = html.replace("__RUN_NAME__", run_name)
@@ -71,8 +77,15 @@ def build_html(run_name: str, scene_json: str, tracks_json: str,
     html = html.replace("__ORBIT_JS__", orbit_js)
     html = html.replace("__SCENE_JSON__", _json_for_script(scene_json))
     html = html.replace("__TRACKS_JSON__", _json_for_script(tracks_json))
+    # 以降は「データ存在時のみ注入」。無ければ一切触らない=データ無しラン同士はバイト同一。
     if plateau_json is not None or plateau_src is not None:
         html = _inject_plateau(html, plateau_json, plateau_src)
+    if has_extras:                      # plateau_web.extras(地下街/歩道橋)
+        html = _inject_extras(html)
+    if terrain_json is not None:        # terrain_web.json(地形起伏+接地)
+        html = _inject_terrain(html, terrain_json)
+    if mode_legend:                     # tracks.meta.mode_legend(移動手段)
+        html = _inject_modes(html)
     return html
 
 
@@ -146,14 +159,191 @@ _PLATEAU_BUILD = r"""// ---------- PLATEAU 実形状建物(照合済み建物の
   bg.computeVertexNormals();
   // DoubleSide: PLATEAU 由来メッシュは面の巻きが局所的に不整合なことがある
   // (three.js は裏面の法線を自動反転して陰影も正しく出す)
-  const mat = new THREE.MeshLambertMaterial({ vertexColors:true,
+  // 既定は無彩色(vertexColors=false + NEUTRAL)。「分類色」ON で applyBuildingPalette が頂点色へ。
+  const mat = new THREE.MeshLambertMaterial({ vertexColors:false, color:NEUTRAL_BLD,
     transparent:true, opacity:1.0, side:THREE.DoubleSide });
+  mat.userData.plateau = true;
   buildingMats.push(mat);
   const mesh = new THREE.Mesh(bg, mat);
   buildingMeshes.push(mesh); scene.add(mesh);
   try { const s = document.querySelector('#hud .sub');
     if(s && PLATEAU_DATA.attribution) s.textContent += ' / ' + PLATEAU_DATA.attribution;
   } catch(e){}
+})();
+
+"""
+
+
+# ============================================================ 地形(terrain_web.json)
+def _inject_terrain(html: str, terrain_json: str) -> str:
+    """terrain_web.json 注入。TERRAIN を張り地形メッシュ生成+OSM をドレープ。
+    無注入時は groundAt≡0 なので道路/エージェントの座標は従来と数値一致(接地は no-op)。"""
+    data_tag = ('<script type="application/json" id="terrain-data">'
+                + _json_for_script(terrain_json) + "</script>")
+    anchor_data = '<script type="application/json" id="scene-data">'
+    html = _replace_once(html, anchor_data, data_tag + "\n" + anchor_data, "terrain-data")
+    # buildOsmGround の直後(= buildBuildings の直前)。ここで TERRAIN を張れば
+    # 後続の buildRoads / placeAgents が地表高を拾い、OSM.mesh も既に在るのでドレープできる。
+    anchor_setup = "// ---------- 建物(kind ごとにジオメトリを統合 = 少ないドローコール)"
+    html = _replace_once(html, anchor_setup, _TERRAIN_SETUP + anchor_setup, "terrain-setup")
+    return html
+
+
+_TERRAIN_SETUP = r"""// ---------- 地形起伏(terrain_web.json)。TERRAIN を張り、地形サーフェスと OSM ドレープを作る。
+(function setupTerrain(){
+  const el = document.getElementById('terrain-data'); if(!el) return;
+  let T; try { T = JSON.parse(el.textContent); } catch(e){ console.warn('terrain parse failed', e); return; }
+  const b64 = s => { const bin = atob(s); const u = new Uint8Array(bin.length);
+    for(let i=0;i<bin.length;i++) u[i] = bin.charCodeAt(i); return u; };
+  const H = new Int16Array(b64(T.heights_b64).buffer);
+  TERRAIN = { x0:T.x0, y0:T.y0, cell:T.cell_m, nx:T.nx, ny:T.ny, quant:(T.quant||0.1), H:H };
+  const nx=T.nx, ny=T.ny, cell=T.cell_m;
+  const cx = T.x0 + (nx-1)*cell/2, cy = T.y0 + (ny-1)*cell/2;
+  // 起伏サーフェス(OSM オフでも地形が見えるニュートラルな地面)
+  const geo = new THREE.PlaneGeometry((nx-1)*cell, (ny-1)*cell, nx-1, ny-1);
+  geo.rotateX(-Math.PI/2);
+  const pa = geo.attributes.position;
+  for(let k=0;k<pa.count;k++){ const wx=cx+pa.getX(k), wy=cy-pa.getZ(k); pa.setY(k, groundAt(wx,wy)); }
+  pa.needsUpdate = true; geo.computeVertexNormals();
+  const tmesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ color:0x4a5468 }));
+  tmesh.position.set(cx, 0, -cy); tmesh.renderOrder = -3;
+  window.terrainMesh = tmesh; scene.add(tmesh);
+  if(flatGround) flatGround.visible = false;   // 平面地面は起伏へ置換
+  // OSM 地図テクスチャを地形にドレープ(既存 OSM 平面を細分化+変位)
+  try { if(OSM.mesh && OSM.mesh.geometry.parameters){
+    const p = OSM.mesh.geometry.parameters;
+    const segx = Math.min(240, Math.max(1, Math.round(p.width/cell)));
+    const segy = Math.min(240, Math.max(1, Math.round(p.height/cell)));
+    const og = new THREE.PlaneGeometry(p.width, p.height, segx, segy); og.rotateX(-Math.PI/2);
+    const ocx = OSM.mesh.position.x, ocz = OSM.mesh.position.z, oa = og.attributes.position;
+    for(let k=0;k<oa.count;k++){ const wx=ocx+oa.getX(k), wy=-(ocz+oa.getZ(k));
+      oa.setY(k, groundAt(wx,wy) + 0.05); }   // 地表のわずか上(z-fight 回避)
+    oa.needsUpdate = true; og.computeVertexNormals();
+    OSM.mesh.geometry.dispose(); OSM.mesh.geometry = og;
+  } } catch(e){ console.warn('OSM drape failed', e); }
+})();
+
+"""
+
+
+# ============================================================ 地下街/歩道橋(extras)
+def _inject_extras(html: str) -> str:
+    """plateau_web.extras(ubld=地下街・brid=歩道橋)を注入。実行時 PLATEAU_DATA.extras
+    が無ければメッシュ 0 個。パネルにトグル「地下街」「歩道橋」を追加し applyExtras で配線。"""
+    anchor_panel = ('      <label class="chk"><input type="checkbox" id="lyLabels" checked>'
+                    ' ラベル(建物名)</label>')
+    panel_add = ('      <label class="chk"><input type="checkbox" id="lyUgai" checked>'
+                 ' 地下街</label>\n'
+                 '      <label class="chk"><input type="checkbox" id="lyBridge" checked>'
+                 ' 歩道橋</label>\n')
+    html = _replace_once(html, anchor_panel, panel_add + anchor_panel, "extras-panel")
+    anchor_build = "// ---------- 道路(全ポリラインを 1 本の LineSegments に統合)"
+    html = _replace_once(html, anchor_build, _EXTRAS_BUILD + anchor_build, "extras-build")
+    anchor_wire = "// ---------- ループ"
+    html = _replace_once(html, anchor_wire, _EXTRAS_WIRE + anchor_wire, "extras-wire")
+    return html
+
+
+_EXTRAS_BUILD = r"""// ---------- 地下街(半透明)/ 歩道橋(不透明)= plateau_web.extras(int16×0.05m・<u4)
+const ugaiMeshes = [], bridgeMeshes = [];
+(function buildExtras(){
+  if(!(typeof PLATEAU_DATA !== 'undefined' && PLATEAU_DATA && PLATEAU_DATA.extras)) return;
+  const ex = PLATEAU_DATA.extras;
+  const b64 = s => { const bin=atob(s); const u=new Uint8Array(bin.length);
+    for(let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i); return u; };
+  function meshOf(part, color, opacity){
+    if(!part || !part.positions_b64 || !part.indices_b64) return null;
+    const q = part.quant_scale || 0.05;
+    const pi = new Int16Array(b64(part.positions_b64).buffer);
+    const pos = new Float32Array(pi.length);
+    for(let i=0;i<pi.length;i+=3){ pos[i]=pi[i]*q; pos[i+1]=pi[i+2]*q; pos[i+2]=-pi[i+1]*q; }
+    const idx = new Uint32Array(b64(part.indices_b64).buffer);
+    const bg = new THREE.BufferGeometry();
+    bg.setAttribute('position', new THREE.BufferAttribute(pos,3));
+    bg.setIndex(new THREE.BufferAttribute(idx,1)); bg.computeVertexNormals();
+    const mat = new THREE.MeshLambertMaterial({ color:color, side:THREE.DoubleSide,
+      transparent:(opacity<1.0), opacity:opacity, depthWrite:(opacity>=1.0) });
+    return new THREE.Mesh(bg, mat);
+  }
+  const u = meshOf(ex.ubld, 0x6f7fa8, 0.35);   // 地下街=地下色・半透明
+  if(u){ ugaiMeshes.push(u); scene.add(u); }
+  const br = meshOf(ex.brid, 0xb8bec7, 1.0);    // 歩道橋=無彩色・不透明
+  if(br){ bridgeMeshes.push(br); scene.add(br); }
+})();
+
+"""
+
+_EXTRAS_WIRE = r"""// 地下街/歩道橋トグルの配線(applyLayers を触らず独立関数で)
+(function wireExtras(){
+  function applyExtras(){
+    const eu=document.getElementById('lyUgai'), eb=document.getElementById('lyBridge');
+    if(eu) ugaiMeshes.forEach(o=> o.visible = eu.checked);
+    if(eb) bridgeMeshes.forEach(o=> o.visible = eb.checked);
+  }
+  ['lyUgai','lyBridge'].forEach(id=>{ const el=document.getElementById(id);
+    if(el) el.onchange = ()=>{ applyExtras(); }; });
+  applyExtras();
+})();
+"""
+
+
+# ============================================================ 移動手段(mode_legend)
+def _inject_modes(html: str) -> str:
+    """tracks.meta.mode_legend がある時のみ: 移動中エージェントを手段別に色/形分け
+    (徒歩=カプセル現行 / 自転車=緑 / 車・タクシー=箱グリフ)。HUD に凡例+電車人数。"""
+    anchor_hud = '  <div class="hint">ドラッグ=回転'
+    hud_add = ('  <div id="modeLegend" style="margin-top:8px; font-size:11px;'
+               ' line-height:1.6;"></div>\n')
+    html = _replace_once(html, anchor_hud, hud_add + anchor_hud, "mode-hud")
+    anchor_build = "// ---------- ループ"
+    html = _replace_once(html, anchor_build, _MODES_BUILD + anchor_build, "mode-build")
+    return html
+
+
+_MODES_BUILD = r"""// ---------- 移動手段(feature5)。TRACKS.meta.mode_legend がある時だけ動く。
+(function setupModes(){
+  const LEG = (TRACKS.meta && TRACKS.meta.mode_legend) || null; if(!LEG) return;
+  const MC = { 0:0x54a0ff, 1:0x22c55e, 2:0xf2b134, 3:0xe0559d };  // 徒歩/自転車/車/タクシー
+  const veh = new THREE.InstancedMesh(new THREE.BoxGeometry(4.6,2.2,2.4),
+    new THREE.MeshLambertMaterial({ color:0xffffff }), NA);
+  veh.instanceMatrix.setUsage(THREE.DynamicDrawUsage); veh.count = NA; scene.add(veh);
+  const _cc=new THREE.Color(), _mm=new THREE.Matrix4(), _pp=new THREE.Vector3(),
+        _qq=new THREE.Quaternion(), _ss=new THREE.Vector3(1,1,1), _hh=new THREE.Vector3(0,0,0);
+  function modeAt3(t,i){ const s0=Math.floor(t);
+    const nm=(s0+1<NS)? TRACKS.moves[s0+1][i] : null; return nm? nm[0] : -1; }
+  modeTick = function(t){
+    const pos = posAt(t);
+    for(let i=0;i<NA;i++){
+      const w = pos[i][2], moving = (w===0), m = moving? modeAt3(t,i) : -1;
+      if(moving && (m===2 || m===3)){                 // 車/タクシー: カプセルを隠し箱で描画
+        _mm.compose(_pp.set(0,-9999,0),_qq,_hh); agents.setMatrixAt(i,_mm);
+        const x=pos[i][0], y=pos[i][1];
+        _pp.set(x, groundAt(x,y)+1.1, -y); _mm.compose(_pp,_qq,_ss); veh.setMatrixAt(i,_mm);
+        _cc.setHex(MC[m]); veh.setColorAt(i,_cc);
+      } else {                                         // 徒歩/自転車/静止: 箱を隠しカプセルを着色
+        _mm.compose(_pp.set(0,-9999,0),_qq,_hh); veh.setMatrixAt(i,_mm);
+        _cc.setHex(m===1 ? MC[1] : agentColor(i)); agents.setColorAt(i,_cc);
+      }
+    }
+    agents.instanceMatrix.needsUpdate = true;
+    if(agents.instanceColor) agents.instanceColor.needsUpdate = true;
+    veh.instanceMatrix.needsUpdate = true;
+    if(veh.instanceColor) veh.instanceColor.needsUpdate = true;
+  };
+  const legEl = document.getElementById('modeLegend'); let _hn = 0;
+  hudTick = function(t){
+    if(!legEl || (_hn++ % 15) !== 0) return;          // HUD は ~4回/秒に間引き
+    const pos = posAt(t); let train=0; const cnt={0:0,1:0,2:0,3:0};
+    for(let i=0;i<NA;i++){ const w=pos[i][2];
+      if(w===-3){ train++; continue; }
+      if(w===0){ const m=modeAt3(t,i); if(cnt[m]!==undefined) cnt[m]++; } }
+    let h='<div style="color:#9aa4b2;margin-bottom:2px">移動手段(移動中)</div>';
+    for(const k of Object.keys(LEG)){ const c='#'+_cc.setHex(MC[k]||0xffffff).getHexString();
+      h+='<div><span style="display:inline-block;width:10px;height:10px;border-radius:2px;'
+        +'background:'+c+';margin-right:6px;vertical-align:-1px"></span>'+LEG[k]+' '+(cnt[k]||0)+'</div>'; }
+    if(train>0) h+='<div style="margin-top:3px;color:#c7cdd6">🚃 電車移動中 '+train+'人</div>';
+    legEl.innerHTML = h;
+  };
 })();
 
 """
@@ -174,11 +364,24 @@ def main(argv: list) -> int:
         print(__doc__)
         return 1
     run_dir = Path(args[0]).resolve()
-    scene_json, tracks_json, plateau_json = _ensure_scene(run_dir)
+    scene_json, tracks_json, plateau_json, terrain_json = _ensure_scene(run_dir)
     if "--no-traffic" in flags:
         tracks_json = _strip_traffic(tracks_json)
+    # データ存在フラグ(注入するか=バイト同一を崩すか の判定)。パースは 1 回だけ。
+    has_extras = False
+    if plateau_json is not None:
+        try:
+            has_extras = bool(json.loads(plateau_json).get("extras"))
+        except Exception:
+            has_extras = False
+    mode_legend = None
+    try:
+        mode_legend = json.loads(tracks_json).get("meta", {}).get("mode_legend")
+    except Exception:
+        mode_legend = None
     html = build_html(run_dir.name, scene_json, tracks_json,
-                      plateau_json=plateau_json)
+                      plateau_json=plateau_json, terrain_json=terrain_json,
+                      has_extras=has_extras, mode_legend=mode_legend)
     out = run_dir / "viewer3d.html"
     out.write_text(html, encoding="utf-8")
     mb = out.stat().st_size / 1024 / 1024
@@ -192,7 +395,8 @@ def main(argv: list) -> int:
         side.write_text("PLATEAU_MESH = " + plateau_json + ";",
                         encoding="utf-8")
         lite = build_html(run_dir.name, scene_json, tracks_json,
-                          plateau_src="plateau_mesh.js")
+                          plateau_src="plateau_mesh.js", terrain_json=terrain_json,
+                          has_extras=has_extras, mode_legend=mode_legend)
         lite_p = run_dir / "viewer3d_lite.html"
         lite_p.write_text(lite, encoding="utf-8")
         print(f"  {lite_p}  ({lite_p.stat().st_size/1024/1024:.2f} MB)"
@@ -280,6 +484,7 @@ __THREE_LICENSE__
       <label class="chk"><input type="checkbox" id="lyOsm" checked> OSM地図(地面)</label>
       <div class="op">不透明度 <input type="range" id="osmOp" min="0" max="1" step="0.05" value="0.9"><span id="osmOpV">90%</span></div>
       <label class="chk"><input type="checkbox" id="lyBld" checked> 建物</label>
+      <label class="chk"><input type="checkbox" id="lyClass"> 分類色(建物を用途で色分け)</label>
       <label class="chk"><input type="checkbox" id="lyAgent" checked> エージェント</label>
       <label class="chk"><input type="checkbox" id="lyCars" checked> 車</label>
       <label class="chk"><input type="checkbox" id="lyRoad" checked> 道路</label>
@@ -332,17 +537,43 @@ const KIND_COLOR = {
 // ---------- 座標写像: world (east=x, north=y, up=z) -> three.js (x, up, -north)
 function V(x, y, z){ return new THREE.Vector3(x, z, -y); }
 
+// ---------- 地形(terrain_web.json 注入時のみ TERRAIN が入る。無ければ groundAt=0=完全従来動作)
+// TERRAIN = {x0,y0,cell,nx,ny,quant,H:Int16Array}。格子(j,i)→世界(x0+i*cell, y0+j*cell)。
+let TERRAIN = null;
+function groundAt(x, y){          // 世界(x,y)での地表高[m]。地形なし=0。双一次補間。
+  if(!TERRAIN) return 0;
+  const nx = TERRAIN.nx, ny = TERRAIN.ny;
+  let gx = (x - TERRAIN.x0) / TERRAIN.cell, gy = (y - TERRAIN.y0) / TERRAIN.cell;
+  let i0 = Math.floor(gx), j0 = Math.floor(gy);
+  if(i0 < 0) i0 = 0; else if(i0 > nx - 2) i0 = nx - 2;
+  if(j0 < 0) j0 = 0; else if(j0 > ny - 2) j0 = ny - 2;
+  const fx = Math.min(1, Math.max(0, gx - i0)), fy = Math.min(1, Math.max(0, gy - j0));
+  const H = TERRAIN.H;
+  const h00 = H[j0*nx+i0], h10 = H[j0*nx+i0+1], h01 = H[(j0+1)*nx+i0], h11 = H[(j0+1)*nx+i0+1];
+  const a = h00 + (h10 - h00)*fx, b = h01 + (h11 - h01)*fx;
+  return (a + (b - a)*fy) * TERRAIN.quant;
+}
+// フレーム毎フック(注入時のみ設定・データ無しでは常に null=従来動作)
+let modeTick = null;    // feature5: 移動手段別の色/形の更新
+let hudTick  = null;    // feature5: HUD の電車人数など
+
 // ---------- Three 基本
 const app = document.getElementById('app');
 const renderer = new THREE.WebGLRenderer({ antialias:true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.shadowMap.enabled = false;
+// 物理ベースに近い自然な階調(白飛び抑制)。ライト強度は updateSky/freezeDaylight で再バランス。
+renderer.outputEncoding = THREE.sRGBEncoding;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
 app.appendChild(renderer.domElement);
 
+const NEUTRAL_BLD = 0xd0d4da;   // 建物の無彩色(既定)。「分類色」トグル ON で kind 色/頂点色へ。
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0a0e14);
-scene.fog = new THREE.Fog(0x0a0e14, 900, 2600);
+// 薄い Fog(遠景を空色に溶かす)。色は updateSky/freezeDaylight が空と連動させる。
+scene.fog = new THREE.Fog(0x0a0e14, 1100, 3200);
 
 const camera = new THREE.PerspectiveCamera(52, window.innerWidth/window.innerHeight, 1, 8000);
 const CAM0 = new THREE.Vector3(360, 420, 520);
@@ -366,16 +597,16 @@ const ambient = new THREE.AmbientLight(0xffffff, 0.25);
 scene.add(ambient);
 
 // ---------- 地面
-let gridHelper = null;
+let gridHelper = null, flatGround = null;
 {
   const g = new THREE.PlaneGeometry(6000, 6000);
   g.rotateX(-Math.PI/2);
   const m = new THREE.MeshLambertMaterial({ color:0x141922,
     transparent:true, opacity:0.55, depthWrite:false });
-  const ground = new THREE.Mesh(g, m);
-  ground.position.y = -0.05;
-  ground.renderOrder = -2;
-  scene.add(ground);
+  flatGround = new THREE.Mesh(g, m);
+  flatGround.position.y = -0.05;
+  flatGround.renderOrder = -2;
+  scene.add(flatGround);
   gridHelper = new THREE.GridHelper(2400, 48, 0x2a3242, 0x1c2330);
   scene.add(gridHelper);
 }
@@ -416,6 +647,7 @@ const OSM = { mesh:null, opacity:0.9, loaded:false, load:null, ensureLoaded:null
   const canvas = document.createElement('canvas'); canvas.width=nx*256; canvas.height=ny*256;
   const g2d = canvas.getContext('2d');
   const tex = new THREE.CanvasTexture(canvas);
+  tex.encoding = THREE.sRGBEncoding;   // outputEncoding=sRGB 下で地図の色を正しく表示
   tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter;
   tex.generateMipmaps = false; tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
   try { const maxA = renderer.capabilities.getMaxAnisotropy(); tex.anisotropy = Math.min(8, maxA||1); } catch(e){}
@@ -458,7 +690,7 @@ const buildingMeshes = [];
     let geo;
     try { geo = new THREE.ExtrudeGeometry(shape, { depth:h, bevelEnabled:false, steps:1 }); }
     catch(e){ continue; }
-    geo.translate(0, 0, b.base || 0);
+    geo.translate(0, 0, (b.base || 0) + (b.gz || 0));   // gz(地表高)があれば地形に接地
     geo.applyMatrix4(rot);
     const kind = KIND_COLOR[b.kind] !== undefined ? b.kind : 'generic';
     const a = acc[kind] || (acc[kind] = { pos:[], norm:[] });
@@ -474,13 +706,27 @@ const buildingMeshes = [];
     const bg = new THREE.BufferGeometry();
     bg.setAttribute('position', new THREE.Float32BufferAttribute(a.pos, 3));
     bg.setAttribute('normal',   new THREE.Float32BufferAttribute(a.norm, 3));
-    const mat = new THREE.MeshLambertMaterial({ color:KIND_COLOR[kind],
+    const mat = new THREE.MeshLambertMaterial({ color:NEUTRAL_BLD,
       transparent:true, opacity:1.0 });
+    mat.userData.kindColor = KIND_COLOR[kind];   // 「分類色」トグルで復元する kind 色
     buildingMats.push(mat);
     const mesh = new THREE.Mesh(bg, mat);
     buildingMeshes.push(mesh); scene.add(mesh);
   }
 })();
+
+// 建物パレット: 既定=無彩色 / 「分類色」ON で kind 色(押出し)・頂点色(PLATEAU)へ
+function applyBuildingPalette(useClass){
+  for(const m of buildingMats){
+    if(m.userData.plateau){                 // PLATEAU 実形状: 頂点色の on/off
+      m.vertexColors = !!useClass;
+      m.color.setHex(useClass ? 0xffffff : NEUTRAL_BLD);
+    } else if(m.userData.kindColor !== undefined){
+      m.color.setHex(useClass ? m.userData.kindColor : NEUTRAL_BLD);
+    }
+    m.needsUpdate = true;
+  }
+}
 
 // ---------- 道路(全ポリラインを 1 本の LineSegments に統合)
 let roadObj = null;
@@ -489,8 +735,8 @@ let roadObj = null;
   for(const r of SCENE.roads){
     const g = r.g;
     for(let i=1;i<g.length;i++){
-      pos.push(g[i-1][0], 0.4, -g[i-1][1]);
-      pos.push(g[i][0],   0.4, -g[i][1]);
+      pos.push(g[i-1][0], groundAt(g[i-1][0], g[i-1][1]) + 0.4, -g[i-1][1]);
+      pos.push(g[i][0],   groundAt(g[i][0],   g[i][1])   + 0.4, -g[i][1]);
     }
   }
   const bg = new THREE.BufferGeometry();
@@ -650,9 +896,10 @@ function updateSky(min){
   // 太陽色: 正午=白, 地平線=橙
   _sun.copy(C_DUSK).lerp(new THREE.Color(0xffffff), Math.min(1, daylight*1.8));
   sun.color.copy(_sun);
-  sun.intensity = 0.25 + daylight*1.15;
-  hemi.intensity = 0.25 + daylight*0.5;
-  ambient.intensity = 0.18 + daylight*0.15;
+  // ACES + sRGB 下で白飛びしない強度に再バランス(hemi/ambient を厚めにして陰を持ち上げる)
+  sun.intensity = 0.18 + daylight*0.95;
+  hemi.intensity = 0.30 + daylight*0.45;
+  ambient.intensity = 0.14 + daylight*0.12;
 }
 
 // ---------- 毎フレームのエージェント/車の配置
@@ -662,9 +909,9 @@ function placeAgents(t){
   const pos = posAt(t);
   for(let i=0;i<NA;i++){
     const [x,y,w] = pos[i];
-    if(w === -1 || w === -2){  // 範囲外・睡眠は隠す
+    if(w === -1 || w === -2 || w === -3){  // 範囲外・睡眠・電車圏外は隠す
       _m.compose(_p.set(0,-9999,0), _q, _hide); agents.setMatrixAt(i,_m); continue; }
-    _p.set(x, upOf(w), -y);
+    _p.set(x, groundAt(x, y) + upOf(w), -y);   // 地形があれば地表高に接地
     _m.compose(_p, _q, _s); agents.setMatrixAt(i, _m);
   }
   agents.instanceMatrix.needsUpdate = true;
@@ -675,7 +922,7 @@ function placeCars(t){
   const n = Math.min(segs.length, CAR_CAP);
   for(let i=0;i<CAR_CAP;i++){
     if(i < n){ const p = alongPath(segs[i], f);
-      _p.set(p[0], 0.9, -p[1]); _m.compose(_p, _q, _s); }
+      _p.set(p[0], groundAt(p[0], p[1]) + 0.9, -p[1]); _m.compose(_p, _q, _s); }
     else { _m.compose(_p.set(0,-9999,0), _q, _hide); }
     cars.setMatrixAt(i, _m);
   }
@@ -714,6 +961,7 @@ const L3 = id => document.getElementById(id).checked;
 const osmOp = document.getElementById('osmOp'), osmOpV = document.getElementById('osmOpV');
 function applyLayers(){
   buildingMeshes.forEach(m=> m.visible = L3('lyBld'));
+  applyBuildingPalette(L3('lyClass'));
   agents.visible = L3('lyAgent');
   cars.visible = L3('lyCars');
   if(roadObj) roadObj.visible = L3('lyRoad');
@@ -726,7 +974,7 @@ function applyLayers(){
   if(gridHelper) gridHelper.visible = !osmOn;
   document.getElementById('osmAttr').style.display = osmOn ? 'block' : 'none';
 }
-['lyBld','lyAgent','lyCars','lyRoad','lyRail','lyUnder','lyLabels','lyDayNight','lyOsm'].forEach(id=>{
+['lyBld','lyClass','lyAgent','lyCars','lyRoad','lyRail','lyUnder','lyLabels','lyDayNight','lyOsm'].forEach(id=>{
   const el = document.getElementById(id);
   if(el) el.onchange = ()=>{ applyLayers(); saveSettings(); };
 });
@@ -740,8 +988,8 @@ document.getElementById('lyHdr').onclick = ()=>{ const b = document.getElementBy
 // 昼夜ライティング OFF = 均一な昼光で全体を見やすく固定
 function freezeDaylight(){
   sun.position.set(420, 720, 260); sun.target.position.set(0,0,0);
-  sun.color.set(0xffffff); sun.intensity = 1.1;
-  hemi.intensity = 0.78; ambient.intensity = 0.5;
+  sun.color.set(0xffffff); sun.intensity = 0.95;
+  hemi.intensity = 0.55; ambient.intensity = 0.32;
   const c = new THREE.Color(0x223047); scene.background.copy(c); scene.fog.color.copy(c);
 }
 function setDayNight(on){ dayNight = on; if(!on) freezeDaylight(); }
@@ -749,12 +997,12 @@ function setDayNight(on){ dayNight = on; if(!on) freezeDaylight(); }
 // 設定を localStorage にラン別保持(再訪時に維持)
 const LS_KEY = 'shibuya3d:__RUN_NAME__';
 function saveSettings(){ try{ localStorage.setItem(LS_KEY, JSON.stringify({
-  lyBld:L3('lyBld'), lyAgent:L3('lyAgent'), lyCars:L3('lyCars'), lyRoad:L3('lyRoad'),
+  lyBld:L3('lyBld'), lyClass:L3('lyClass'), lyAgent:L3('lyAgent'), lyCars:L3('lyCars'), lyRoad:L3('lyRoad'),
   lyRail:L3('lyRail'), lyUnder:L3('lyUnder'), lyLabels:L3('lyLabels'),
   lyDayNight:L3('lyDayNight'), lyOsm:L3('lyOsm'), osmOp:OSM.opacity,
   xray:document.getElementById('xray').checked, colorMode })); }catch(e){} }
 function loadSettings(){ try{ const s = JSON.parse(localStorage.getItem(LS_KEY) || 'null'); if(!s) return;
-  ['lyBld','lyAgent','lyCars','lyRoad','lyRail','lyUnder','lyLabels','lyDayNight','lyOsm','xray'].forEach(k=>{
+  ['lyBld','lyClass','lyAgent','lyCars','lyRoad','lyRail','lyUnder','lyLabels','lyDayNight','lyOsm','xray'].forEach(k=>{
     const el = document.getElementById(k); if(el && typeof s[k] === 'boolean') el.checked = s[k]; });
   if(typeof s.osmOp === 'number'){ OSM.opacity = s.osmOp; osmOp.value = s.osmOp; }
   if(s.colorMode){ colorMode = s.colorMode;
@@ -837,6 +1085,8 @@ function animate(now){
   clockEl.textContent = fmtClock(min);
   placeAgents(t);
   placeCars(t);
+  if(modeTick) modeTick(t);   // feature5: 移動手段別の色/形(注入時のみ)
+  if(hudTick)  hudTick(t);    // feature5: HUD の電車人数など(注入時のみ)
   controls.update();
   renderer.render(scene, camera);
 }

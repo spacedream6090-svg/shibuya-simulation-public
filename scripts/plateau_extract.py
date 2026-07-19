@@ -435,6 +435,310 @@ def compute_ground0_dem(dem_files, lat0, lon0, axis, radius=50.0):
     return None, 0
 
 
+# =============================================================== 新 stage: terrain
+def collect_tin_points(dem_files, lat0, lon0, axis, rect, progress=True):
+    """DEM の dem:TINRelief 内 gml:Triangle(gml:posList)頂点を iterparse で読み、
+    local-m 矩形 rect=[xmin,ymin,xmax,ymax](+margin)内に落ちる頂点だけを収集する。
+
+    重い全走査を避けるため、posList 先頭トークン(緯度)による粗プレフィルタで帯外の
+    三角形を早期スキップ(既存 dem スキャンと同方式)。処理済み三角形はコンテナ単位で
+    clear してメモリを一定に保つ。戻り値: (P[(e,n,z_raw)...] float64, n_points)。
+    z は生標高(ground0 差引きは呼び出し側)。cm 量子化で重複頂点を除去。"""
+    lat_i, lon_i = axis
+    mlon = M_PER_DEG_LON_EQ * math.cos(math.radians(lat0))
+    xmin, ymin, xmax, ymax = rect
+    marg = 20.0
+    latlo = lat0 + (ymin - marg) / M_PER_DEG_LAT
+    lathi = lat0 + (ymax + marg) / M_PER_DEG_LAT
+    lonlo = lon0 + (xmin - marg) / mlon
+    lonhi = lon0 + (xmax + marg) / mlon
+    pts = []
+    for path in dem_files:
+        t0 = time.time()
+        kept = 0
+        container = None
+        cnt = 0
+        for ev, el in ET.iterparse(str(path), events=("start", "end")):
+            name = _ln(el.tag)
+            if ev == "start":
+                if name in ("trianglePatches", "TriangulatedSurface"):
+                    container = el
+                continue
+            if name == "posList" and el.text:
+                sp = el.text.split()
+                if len(sp) >= 3:
+                    try:
+                        first = float(sp[lat_i])
+                    except ValueError:
+                        first = None
+                    if first is not None and latlo - 0.002 <= first <= lathi + 0.002:
+                        for i in range(0, len(sp) - 2, 3):
+                            lat = float(sp[i + lat_i])
+                            lon = float(sp[i + lon_i])
+                            if latlo <= lat <= lathi and lonlo <= lon <= lonhi:
+                                e = (lon - lon0) * mlon
+                                n = (lat - lat0) * M_PER_DEG_LAT
+                                if (xmin - marg <= e <= xmax + marg
+                                        and ymin - marg <= n <= ymax + marg):
+                                    pts.append((e, n, float(sp[i + 2])))
+                                    kept += 1
+                el.clear()
+            elif name in ("Triangle", "Polygon"):
+                cnt += 1
+                if container is not None and cnt % 50000 == 0:
+                    container.clear()
+        if progress:
+            print(f"  [terrain] {Path(path).name}  tin_pts_kept={kept}  "
+                  f"{time.time() - t0:.1f}s", flush=True)
+    if pts:
+        P = np.asarray(pts, dtype=np.float64)
+        rk = np.round(P[:, :2] / 0.01).astype(np.int64)
+        _, ui = np.unique(rk, axis=0, return_index=True)
+        P = P[ui]
+    else:
+        P = np.zeros((0, 3), dtype=np.float64)
+    return P, P.shape[0]
+
+
+def _index_runs(arr):
+    """単調非減少な整数配列 arr を (値, start, end) の連続ラン列へ。"""
+    runs = []
+    n = len(arr)
+    if n == 0:
+        return runs
+    start = 0
+    for i in range(1, n):
+        if arr[i] != arr[i - 1]:
+            runs.append((int(arr[start]), start, i))
+            start = i
+    runs.append((int(arr[start]), start, n))
+    return runs
+
+
+def rasterize_tin_to_grid(points, x0, y0, cell_m, nx, ny, bucket_m=12.0, k=3):
+    """TIN 頂点群 points[(x,y,z)...] を規則格子へラスタ化した標高グリッド (ny,nx) を返す。
+
+    手法(単純化・docstring 明記): 各格子点 (i,j) の座標 (x0+i*cell, y0+j*cell) について、
+    一様バケット空間ハッシュで近傍 TIN 頂点を集め、**最近傍 k(=3)頂点の距離加重平均**
+    (重み w=1/(distance+eps))で標高を推定する。平面 TIN(定数勾配)なら格子点を
+    ±0.2m 程度で復元できる。近傍が全く得られないセルは nan(呼び出し側で 0 埋め)。
+
+    バケット近傍は 1 リングから開始し、候補が k 未満なら最大 8 リングまで拡張する。
+    格子点は列 i・行 j の連続ランごとにまとめて cdist をベクトル化評価する。"""
+    H = np.full((ny, nx), np.nan, dtype=np.float64)
+    P = np.asarray(points, dtype=np.float64)
+    if P.shape[0] == 0 or nx <= 0 or ny <= 0:
+        return H
+    px, py, pz = P[:, 0], P[:, 1], P[:, 2]
+    pbi = np.floor((px - x0) / bucket_m).astype(np.int64)
+    pbj = np.floor((py - y0) / bucket_m).astype(np.int64)
+    order = np.lexsort((pbj, pbi))
+    sbi, sbj = pbi[order], pbj[order]
+    change = np.empty(order.shape[0], dtype=bool)
+    change[0] = True
+    if order.shape[0] > 1:
+        change[1:] = (sbi[1:] != sbi[:-1]) | (sbj[1:] != sbj[:-1])
+    starts = np.flatnonzero(change)
+    ends = np.append(starts[1:], order.shape[0])
+    buckets = {}
+    for s, e in zip(starts, ends):
+        buckets[(int(sbi[s]), int(sbj[s]))] = order[s:e]
+
+    idx_x = np.arange(nx)
+    idx_y = np.arange(ny)
+    sample_x = x0 + idx_x * cell_m
+    sample_y = y0 + idx_y * cell_m
+    col_b = np.floor(idx_x * cell_m / bucket_m).astype(np.int64)
+    row_b = np.floor(idx_y * cell_m / bucket_m).astype(np.int64)
+    col_runs = _index_runs(col_b)
+    row_runs = _index_runs(row_b)
+    for (bcx, ci0, ci1) in col_runs:
+        cx = sample_x[ci0:ci1]
+        for (bcy, rj0, rj1) in row_runs:
+            r = 1
+            cand = np.zeros(0, dtype=np.int64)
+            while True:
+                idx_list = []
+                for bx in range(bcx - r, bcx + r + 1):
+                    for by in range(bcy - r, bcy + r + 1):
+                        a = buckets.get((bx, by))
+                        if a is not None:
+                            idx_list.append(a)
+                cand = np.concatenate(idx_list) if idx_list else np.zeros(0, np.int64)
+                if cand.size >= k or r >= 8:
+                    break
+                r += 1
+            if cand.size == 0:
+                continue
+            cy = sample_y[rj0:rj1]
+            CX, CY = np.meshgrid(cx, cy)
+            flatx = CX.ravel()
+            flaty = CY.ravel()
+            cpx = px[cand]
+            cpy = py[cand]
+            cpz = pz[cand]
+            dx = flatx[:, None] - cpx[None, :]
+            dy = flaty[:, None] - cpy[None, :]
+            d2 = dx * dx + dy * dy
+            kk = min(k, cand.size)
+            nn = np.argpartition(d2, kk - 1, axis=1)[:, :kk]
+            rows = np.arange(d2.shape[0])[:, None]
+            dsel = np.sqrt(d2[rows, nn])
+            zsel = cpz[nn]
+            w = 1.0 / (dsel + 1e-6)
+            zval = (w * zsel).sum(axis=1) / w.sum(axis=1)
+            H[rj0:rj1, ci0:ci1] = zval.reshape(CY.shape)
+    return H
+
+
+# =============================================================== 新 stage: extras
+def stream_feature_geoms(path, feature_tags):
+    """stream_building_geoms の一般化。feature_tags(localname 集合)で feature 要素を切り出す。
+    ubld=uro:UndergroundBuilding / brid=brid:Bridge など Building 以外の地物に対応する。
+    ネストした部分要素(brid:BridgeConstructionElement 等)は feature_tags に含めず、親
+    feature の文脈で幾何を集約する(cur が None のときだけ新規 feature を開始)。
+    幾何抽出のロジック(LOD 判定・穴無視・SURFACE_TAGS)は building 版と同一。"""
+    ctx = ET.iterparse(str(path), events=("start", "end"))
+    stack = []
+    cur = None
+    root = None
+    for ev, el in ctx:
+        name = _ln(el.tag)
+        if ev == "start":
+            if root is None:
+                root = el
+            stack.append(name)
+            if name in feature_tags and cur is None:
+                cur = {"gml_id": el.get(GML_ID), "lod2": [], "lod1": [], "n_holes": 0}
+            continue
+        if name == "posList":
+            if cur is not None and el.text:
+                lod = None
+                for t in reversed(stack):
+                    if t in LOD2_TAGS:
+                        lod = "lod2"
+                        break
+                    if t in LOD1_TAGS:
+                        lod = "lod1"
+                        break
+                    if t in LOD0_TAGS:
+                        lod = "lod0"
+                        break
+                if lod in ("lod2", "lod1"):
+                    if "interior" in stack:
+                        cur["n_holes"] += 1
+                    else:
+                        surf = None
+                        for t in stack:
+                            if t in SURFACE_TAGS:
+                                surf = t
+                                break
+                        pts = _parse_poslist(el.text)
+                        if len(pts) >= 3:
+                            cur[lod].append((surf, pts))
+            stack.pop()
+            el.clear()
+            continue
+        if name in feature_tags and cur is not None:
+            yield cur
+            cur = None
+            stack.pop()
+            el.clear()
+            continue
+        stack.pop()
+        el.clear()
+        if root is not None and len(stack) <= 1:
+            root.clear()
+
+
+def extract_features(files, lat0, lon0, feature_tags, clip_rect=None, axis=None,
+                     progress=False, label=""):
+    """ubld/brid 等の地物を building と同じ経路で抽出(LOD2 優先→LOD1・triangulate_3d
+    の巻き向き修正込み・重心 bbox クリップ)。戻り値: {structures, axis, counts}。
+    structures[i] = {gml_id, lod, verts(Nx3 float64, z=生標高), tris, zmin, zmax, n_tris}。"""
+    counts = {"skipped_no_geom": 0, "skipped_clip": 0, "holes_ignored": 0,
+              "lod1": 0, "lod2": 0}
+    structures = []
+    for path in files:
+        t0 = time.time()
+        n_here = 0
+        for raw in stream_feature_geoms(path, feature_tags):
+            counts["holes_ignored"] += raw["n_holes"]
+            if raw["lod2"]:
+                polys, lod = raw["lod2"], "LOD2"
+            elif raw["lod1"]:
+                polys, lod = raw["lod1"], "LOD1"
+            else:
+                counts["skipped_no_geom"] += 1
+                continue
+            if axis is None:
+                a, b, _z = polys[0][1][0]
+                axis = sniff_axis_order(a, b)
+            lat_i, lon_i = axis
+            bverts = []
+            btris = []
+            for surf, pts in polys:
+                pts3 = []
+                for tup in pts:
+                    e, n = latlon_to_local(tup[lat_i], tup[lon_i], lat0, lon0)
+                    pts3.append((e, n, tup[2]))
+                dedup, tris = triangulate_3d(pts3)
+                if not dedup:
+                    continue
+                base = len(bverts)
+                bverts.extend(dedup)
+                for (i, j, kk) in tris:
+                    btris.append((base + i, base + j, base + kk))
+            if not bverts:
+                counts["skipped_no_geom"] += 1
+                continue
+            V = np.asarray(bverts, dtype=np.float64)
+            cx = float(V[:, 0].mean())
+            cy = float(V[:, 1].mean())
+            if clip_rect is not None and not (
+                    clip_rect[0] <= cx <= clip_rect[2]
+                    and clip_rect[1] <= cy <= clip_rect[3]):
+                counts["skipped_clip"] += 1
+                continue
+            structures.append({
+                "gml_id": raw["gml_id"], "lod": lod, "verts": V, "tris": btris,
+                "zmin": float(V[:, 2].min()), "zmax": float(V[:, 2].max()),
+                "n_tris": len(btris),
+            })
+            counts["lod2" if lod == "LOD2" else "lod1"] += 1
+            n_here += 1
+        if progress:
+            print(f"  [{label}] {Path(path).name}  kept={n_here}  "
+                  f"{time.time() - t0:.1f}s", flush=True)
+    return {"structures": structures, "axis": axis, "counts": counts}
+
+
+def _assemble_mesh(structures, ground0):
+    """structures → (V float32 (z-ground0), F int32 (Nx3), offsets int32 (len+1))。
+    build_outputs と同じオフセット規約(offsets[i]..offsets[i+1] が構造 i の面範囲)。"""
+    V_parts = []
+    F_rows = []
+    offsets = []
+    vbase = 0
+    for s in structures:
+        offsets.append(len(F_rows))
+        V_parts.append(s["verts"])
+        for (i, j, k) in s["tris"]:
+            F_rows.append((vbase + i, vbase + j, vbase + k))
+        vbase += s["verts"].shape[0]
+    offsets.append(len(F_rows))
+    if V_parts:
+        V = np.vstack(V_parts).astype(np.float64)
+    else:
+        V = np.zeros((0, 3), dtype=np.float64)
+    V[:, 2] -= ground0
+    Vf = V.astype(np.float32)
+    F = np.asarray(F_rows, dtype=np.int32).reshape(-1, 3) if F_rows \
+        else np.zeros((0, 3), dtype=np.int32)
+    offs = np.asarray(offsets, dtype=np.int32)
+    return Vf, F, offs
+
+
 # --------------------------------------------------------------- 組立 / 出力
 def _load_city(map_path):
     return json.loads(Path(map_path).read_text(encoding="utf-8"))
@@ -640,6 +944,172 @@ def run(citygml_dir, map_path, out_dir, dem_dir, origin, buffer_m, radius,
             "npz_mb": npz_mb, "counts": c}
 
 
+# --------------------------------------------------------------- 新 stage 実行系
+def _select_by_mesh(directory, glob_pat, codes):
+    """directory 内 glob_pat のうち、ファイル名先頭のメッシュコードが codes に入るものだけ。"""
+    out = []
+    for p in sorted(Path(directory).glob(glob_pat)):
+        if p.name.split("_", 1)[0] in codes:
+            out.append(p)
+    return out
+
+
+def _resolve_ground0(out_dir, dem_dir, origin, radius, codes):
+    """新 stage の z 基準 ground0 を解決する。既存 plateau_index.json があればその値を
+    そのまま用い(bldg 抽出と同一基準=15.18 を保証)、無ければ DEM から再計算する。"""
+    idx = Path(out_dir) / "plateau_index.json"
+    if idx.exists():
+        try:
+            g = json.loads(idx.read_text(encoding="utf-8")).get("ground0")
+            if g is not None:
+                return float(g), "plateau_index.json"
+        except Exception:
+            pass
+    dem_files = _select_by_mesh(dem_dir, "*_dem_*_op.gml", {c[:6] for c in codes})
+    g, _n = compute_ground0_dem(dem_files, origin[0], origin[1], (0, 1),
+                                radius=radius)
+    return (float(g) if g is not None else 0.0), "dem"
+
+
+def run_terrain(citygml_dir, map_path, out_dir, dem_dir, origin, buffer_m, radius,
+                cell_m=2.0, terrain_buffer=300.0):
+    """terrain stage: 両 DEM の TIN を local-m 矩形(シミュ bbox+terrain_buffer)へクリップし、
+    2m 格子の高さグリッドへラスタ化。z=標高-ground0[m] を float32(量子化しない)で保存。
+    下流(export_3d の terrain_web 書き出し)が int16 量子化を担うため生メートルで渡す。"""
+    city = _load_city(map_path)
+    xs, ys = _collect_local_coords(city)
+    if not xs:
+        raise SystemExit("shibuya_osm.json に座標が見つからない")
+    xmin, xmax = min(xs), max(xs)
+    ymin, ymax = min(ys), max(ys)
+    x0 = xmin - terrain_buffer
+    y0 = ymin - terrain_buffer
+    x1 = xmax + terrain_buffer
+    y1 = ymax + terrain_buffer
+    nx = int(math.ceil((x1 - x0) / cell_m)) + 1
+    ny = int(math.ceil((y1 - y0) / cell_m)) + 1
+    rect = [x0, y0, x1, y1]
+    axis = (0, 1)
+
+    codes = set(_sim_mesh_codes(city, citygml_dir, origin, buffer_m))
+    ground0, g0_src = _resolve_ground0(out_dir, dem_dir, origin, radius, codes)
+    dem_files = sorted(Path(dem_dir).glob("*_dem_*_op.gml"))
+    print(f"[terrain] rect(local-m)={[round(v, 1) for v in rect]}  "
+          f"grid nx={nx} ny={ny} cell={cell_m}m  ground0={ground0:.3f}({g0_src})",
+          flush=True)
+    print(f"[terrain] scanning DEM: {[p.name for p in dem_files]}", flush=True)
+
+    P, n_tin = collect_tin_points(dem_files, origin[0], origin[1], axis, rect)
+    print(f"[terrain] tin_points(dedup)={n_tin}  rasterizing...", flush=True)
+    t0 = time.time()
+    H_elev = rasterize_tin_to_grid(P, x0, y0, cell_m, nx, ny)
+    Hz = H_elev - ground0
+    covered = np.isfinite(Hz)
+    n_nan = int((~covered).sum())
+    if n_nan:
+        Hz = np.where(covered, Hz, 0.0)
+    heights = Hz.astype(np.float32)  # (ny,nx) row-major・単位=メートル・量子化なし
+    print(f"[terrain] raster done {time.time() - t0:.1f}s  "
+          f"uncovered_cells={n_nan}", flush=True)
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    npz_path = out_dir / "terrain.npz"
+    json_path = out_dir / "terrain.json"
+    np.savez_compressed(npz_path, heights=heights)
+    zc = Hz[covered] if covered.any() else np.zeros(1)
+    meta = {
+        "x0": round(float(x0), 4), "y0": round(float(y0), 4),
+        "cell_m": cell_m, "nx": nx, "ny": ny,
+        "ground0": round(float(ground0), 4), "n_tin_points": int(n_tin),
+        "z_min_m": round(float(zc.min()), 3), "z_max_m": round(float(zc.max()), 3),
+        "uncovered_cells": n_nan, "ground0_source": g0_src,
+    }
+    json_path.write_text(json.dumps(meta, ensure_ascii=False, separators=(",", ":")),
+                         encoding="utf-8")
+    npz_mb = npz_path.stat().st_size / (1024 * 1024)
+    print(f"[terrain] z range = [{meta['z_min_m']}, {meta['z_max_m']}] m", flush=True)
+    print(f"       {npz_path}  ({npz_mb:.2f} MB)  {json_path}", flush=True)
+    return {"npz": npz_path, "json": json_path, "nx": nx, "ny": ny,
+            "z_min": meta["z_min_m"], "z_max": meta["z_max_m"],
+            "n_tin_points": n_tin, "npz_mb": npz_mb}
+
+
+def _sim_mesh_codes(city, citygml_dir, origin, buffer_m):
+    _sel, meta = select_tiles(city, citygml_dir, origin, buffer_m)
+    return meta["mesh_codes"]
+
+
+def run_extras(citygml_dir, map_path, out_dir, dem_dir, ubld_dir, brid_dir,
+               origin, buffer_m, radius):
+    """extras stage: ubld(地下街)+brid(橋梁)を building 同様に抽出し、それぞれ
+    U_V/U_F/U_off・B_V/B_F/B_off として extras.npz に保存。ubld は地下なので z<0 が正常。"""
+    city = _load_city(map_path)
+    selected, sel_meta = select_tiles(city, citygml_dir, origin, buffer_m)
+    codes = set(sel_meta["mesh_codes"])
+    clip_rect = sel_meta["clip_rect"]
+    ubld_files = _select_by_mesh(ubld_dir, "*_ubld_*_op.gml", codes)
+    brid_files = _select_by_mesh(brid_dir, "*_brid_*_op.gml", codes)
+    ground0, g0_src = _resolve_ground0(out_dir, dem_dir, origin, radius, codes)
+    print(f"[extras] ubld tiles={[p.name for p in ubld_files]}  "
+          f"brid tiles={[p.name for p in brid_files]}", flush=True)
+    print(f"[extras] ground0={ground0:.3f}({g0_src})  clip_rect={clip_rect}",
+          flush=True)
+
+    ures = extract_features(ubld_files, origin[0], origin[1],
+                            {"UndergroundBuilding"}, clip_rect=clip_rect,
+                            axis=(0, 1), progress=True, label="ubld")
+    bres = extract_features(brid_files, origin[0], origin[1],
+                            {"Bridge"}, clip_rect=clip_rect,
+                            axis=(0, 1), progress=True, label="brid")
+    # V=float32(n,3)・F=int32(m,3)。F はカテゴリ内 0-based(_assemble_mesh の vbase は
+    # カテゴリ先頭から 0 で積むため、ubld_F は ubld_V を、brid_F は brid_V を指す)。
+    ubld_V, ubld_F, U_off = _assemble_mesh(ures["structures"], ground0)
+    brid_V, brid_F, B_off = _assemble_mesh(bres["structures"], ground0)
+
+    def _zrange(V):
+        if V.shape[0]:
+            return [round(float(V[:, 2].min()), 3), round(float(V[:, 2].max()), 3)]
+        return [0.0, 0.0]
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    npz_path = out_dir / "extras.npz"
+    json_path = out_dir / "extras.json"
+    # 契約キー: ubld_V/ubld_F/brid_V/brid_F。オフセットは任意(下流未使用)で併記。
+    np.savez_compressed(npz_path, ubld_V=ubld_V, ubld_F=ubld_F,
+                        brid_V=brid_V, brid_F=brid_F,
+                        ubld_off=U_off, brid_off=B_off)
+    meta = {
+        "ubld": {
+            "n_structures": len(ures["structures"]),
+            "n_tris": int(ubld_F.shape[0]),
+            "n_vertices": int(ubld_V.shape[0]),
+            "z_range": _zrange(ubld_V),
+            "counts": ures["counts"],
+        },
+        "brid": {
+            "n_structures": len(bres["structures"]),
+            "n_tris": int(brid_F.shape[0]),
+            "n_vertices": int(brid_V.shape[0]),
+            "z_range": _zrange(brid_V),
+            "counts": bres["counts"],
+        },
+        "ground0": round(float(ground0), 4),
+        "ground0_source": g0_src,
+        "crs": "local-m", "axes": "X=east,Y=north,Z=up",
+    }
+    json_path.write_text(json.dumps(meta, ensure_ascii=False, separators=(",", ":")),
+                         encoding="utf-8")
+    npz_mb = npz_path.stat().st_size / (1024 * 1024)
+    print(f"[extras] ubld: structures={meta['ubld']['n_structures']} "
+          f"tris={meta['ubld']['n_tris']} z={meta['ubld']['z_range']}", flush=True)
+    print(f"[extras] brid: structures={meta['brid']['n_structures']} "
+          f"tris={meta['brid']['n_tris']} z={meta['brid']['z_range']}", flush=True)
+    print(f"       {npz_path}  ({npz_mb:.2f} MB)  {json_path}", flush=True)
+    return {"npz": npz_path, "json": json_path, "meta": meta, "npz_mb": npz_mb}
+
+
 def main(argv):
     # cp932 コンソールでの印字死対策(en-dash 等)。必須。
     try:
@@ -656,10 +1126,41 @@ def main(argv):
     ap.add_argument("--buffer", type=float, default=150.0)
     ap.add_argument("--radius", type=float, default=50.0)
     ap.add_argument("--no-dem", action="store_true")
+    # 追加 stage(既定=従来の bldg 抽出のみで完全互換)
+    ap.add_argument("--terrain", action="store_true",
+                    help="DEM TIN → 2m 高さグリッド(terrain.npz/json)")
+    ap.add_argument("--extras", action="store_true",
+                    help="ubld+brid → extras.npz/json")
+    ap.add_argument("--all", action="store_true",
+                    help="bldg + terrain + extras を全実行")
+    ap.add_argument("--ubld-dir", default=None,
+                    help="既定は citygml-dir と同階層の ubld/")
+    ap.add_argument("--brid-dir", default=None,
+                    help="既定は citygml-dir と同階層の brid/")
+    ap.add_argument("--cell", type=float, default=2.0, help="terrain 格子間隔[m]")
+    ap.add_argument("--terrain-buffer", type=float, default=300.0,
+                    help="terrain クリップ矩形のシミュ bbox 外周[m]")
     a = ap.parse_args(argv)
-    dem_dir = a.dem_dir or str(Path(a.citygml_dir).parent / "dem")
-    run(a.citygml_dir, a.map, a.out_dir, dem_dir, DEFAULT_ORIGIN,
-        a.buffer, a.radius, use_dem=not a.no_dem)
+    parent = Path(a.citygml_dir).parent
+    dem_dir = a.dem_dir or str(parent / "dem")
+    ubld_dir = a.ubld_dir or str(parent / "ubld")
+    brid_dir = a.brid_dir or str(parent / "brid")
+
+    do_terrain = a.terrain or a.all
+    do_extras = a.extras or a.all
+    # 既定(stage フラグ無し)は従来通り bldg のみ。--all は 3 stage 全実行。
+    do_bldg = a.all or not (a.terrain or a.extras)
+
+    if do_bldg:
+        run(a.citygml_dir, a.map, a.out_dir, dem_dir, DEFAULT_ORIGIN,
+            a.buffer, a.radius, use_dem=not a.no_dem)
+    if do_terrain:
+        run_terrain(a.citygml_dir, a.map, a.out_dir, dem_dir, DEFAULT_ORIGIN,
+                    a.buffer, a.radius, cell_m=a.cell,
+                    terrain_buffer=a.terrain_buffer)
+    if do_extras:
+        run_extras(a.citygml_dir, a.map, a.out_dir, dem_dir, ubld_dir, brid_dir,
+                   DEFAULT_ORIGIN, a.buffer, a.radius)
     return 0
 
 

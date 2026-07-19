@@ -92,6 +92,11 @@ class Government:
         self.day_rev: dict[str, float] = {lv: 0.0 for lv in self.LEVELS}
         self.day_exp: dict[str, float] = {lv: 0.0 for lv in self.LEVELS}
         self.last_day = -1
+        # 予算執行の係数(議会現実化 realism ON の予算承認フック。既定 1.0=従来と完全同一)。
+        # 議会が区(ward)の期次予算を否決すると tools 側が cut_ratio(既定0.8)を書き込み、以後の
+        # 区の歳出執行がその倍率に絞られる。区以外(都・国)は対象外。1.0 のときは expense が
+        # amount を一切いじらない=バイト一致(ゴールデン維持)。
+        self.exec_ratio: float = 1.0
 
     # ------------------------------------------------------------------ 会計
     def collect(self, level: str, amount: float) -> None:
@@ -102,9 +107,15 @@ class Government:
         self.day_rev[level] += amount
 
     def expense(self, level: str, amount: float) -> None:
-        """歳出(公務員給与・給付)を計上: 残高 − / 当日歳出 +。"""
+        """歳出(公務員給与・給付)を計上: 残高 − / 当日歳出 +。
+
+        予算執行フック(議会現実化 realism ON): 区(ward)の歳出は議会の予算承認で決まる
+        exec_ratio を掛ける(否決なら cut_ratio へ絞られる)。既定 exec_ratio==1.0 のときは
+        amount を一切変えない(amount×1.0 のバイト一致は避け、乗算そのものをスキップ)=従来と完全同一。"""
         if amount <= 0:
             return
+        if level == "ward" and self.exec_ratio != 1.0:
+            amount = amount * self.exec_ratio
         self.balance[level] -= amount
         self.day_exp[level] += amount
 

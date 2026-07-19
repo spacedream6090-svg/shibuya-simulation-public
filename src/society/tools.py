@@ -69,6 +69,7 @@ def build_routes_cfg(raw) -> dict:
     enf = dict(raw.get("enforcement", {}) or {})
     delib = dict(raw.get("deliberation", {}) or {})
     asm = dict(raw.get("assembly", {}) or {})
+    asm_real = dict(asm.get("realism", {}) or {})
     return {
         "labor": {"enabled": bool(labor.get("enabled", False))},
         "vote": {
@@ -107,6 +108,24 @@ def build_routes_cfg(raw) -> dict:
             "enabled": bool(asm.get("enabled", False)),
             "size": int(asm.get("size", 9)),                # 議席数
             "term_days": int(asm.get("term_days", 30)),     # 任期(日)。満了で改選
+            # 議会選挙の現実化(渋谷区議会準拠。制度深化3 batch37。既定 OFF=現行の意見最近傍選挙と
+            # 完全同一=ゴールデン維持)。ON: 告示→自発的立候補(供託金)→SNTV開票→予算承認/条例議決/
+            # 住民署名。すべて決定論(新規乱数 stream を引かない)。設計根拠 docs/research/council-vs-reality.md。
+            "realism": {
+                "enabled": bool(asm_real.get("enabled", False)),
+                "announce_days": int(asm_real.get("announce_days", 5)),   # 告示期間(任期満了の何日前から)
+                "deposit": float(asm_real.get("deposit", 300000.0)),      # 供託金(公選法30万円)
+                "candidate_age_min": int(asm_real.get("candidate_age_min", 25)),  # 被選挙権(満25歳)
+                "voter_age_min": int(asm_real.get("voter_age_min", 18)),  # 選挙権(満18歳)
+                "w_op": float(asm_real.get("w_op", 1.0)),                 # SNTV効用: 意見距離の重み
+                "w_cl": float(asm_real.get("w_cl", 0.5)),                 #   親密度(closeness)の重み
+                "w_rep": float(asm_real.get("w_rep", 0.3)),               #   評判(reputation)の重み
+                "legal_divisor": float(asm_real.get("legal_divisor", 10.0)),  # 法定得票=有効投票÷定数÷これ
+                "cut_ratio": float(asm_real.get("cut_ratio", 0.8)),       # 予算否決時の歳出執行係数
+                "grievance_threshold": float(asm_real.get("grievance_threshold", 0.5)),  # 予算承認の議員判定
+                "signature_divisor": int(asm_real.get("signature_divisor", 50)),  # 住民提案=署名(有権者÷これ)
+                "signature_min": int(asm_real.get("signature_min", 0)),   # 明示閾値(>0 なら優先)
+            },
         },
     }
 
@@ -144,6 +163,9 @@ def elect_assembly(sim, step: int, sim_min: int) -> None:
     asm = routes["assembly"]
     if not asm["enabled"]:
         return
+    if asm["realism"]["enabled"]:                      # 議会選挙の現実化(batch37。既定 OFF=下は不変)
+        _assembly_realism(sim, step, sim_min, asm)
+        return
     day = sim_min // 1440
     cur = getattr(sim, "council", None)
     if cur is not None and day < cur["elected_day"] + max(1, int(asm["term_days"])):
@@ -171,6 +193,212 @@ def elect_assembly(sim, step: int, sim_min: int) -> None:
         a = sim.agent_by_id.get(aid)
         if a is not None:
             a.remember("議会の議員に選ばれた", importance_bonus=0.4)
+
+
+# ================================================================ 議会選挙の現実化(batch37・realism ON)
+# 渋谷区議会準拠: 告示→自発的立候補(供託金)→SNTV開票→予算承認/条例議決/住民署名。すべて決定論・
+# 非LLM・新規乱数 stream なし。realism OFF では下の関数はどれも呼ばれない(elect_assembly の分岐で return)。
+def _is_voter(agent, realism) -> bool:
+    """有権者か(選挙権): 非来街者かつ満 voter_age_min(既定18)歳以上。"""
+    return (not agent.visitor
+            and int(getattr(agent, "age", 0)) >= int(realism["voter_age_min"]))
+
+
+def _is_eligible_candidate(agent, realism) -> bool:
+    """被選挙権+供託資力の資格ゲート: 満 candidate_age_min(既定25)歳以上・非来街者・
+    所持金+口座 ≥ deposit(既定30万円)。k 非依存の客観条件のみ(R1)。"""
+    if agent.visitor:
+        return False
+    if int(getattr(agent, "age", 0)) < int(realism["candidate_age_min"]):
+        return False
+    funds = float(getattr(agent, "money", 0.0)) + float(getattr(agent, "account", 0.0))
+    return funds >= float(realism["deposit"])
+
+
+def _nn_ranked(sim) -> list:
+    """現行の意見最近傍方式の得票順(フォールバック/縮退補充の補助)。elect_assembly の OFF 本体と
+    同一ロジックだが本体には触れない(ゴールデンを守る)。決定論・乱数なし・id 昇順で同点解決。"""
+    residents = [a for a in sim.agents if not a.visitor]
+    if len(residents) < 2:
+        return [a.id for a in residents]
+    order = sorted(residents, key=lambda a: (a.opinion, a.id))
+    votes: dict[int, int] = {}
+    for i, voter in enumerate(order):
+        cands = [order[j] for j in (i - 1, i + 1) if 0 <= j < len(order)]
+        best = min(cands, key=lambda c: (abs(c.opinion - voter.opinion), c.id))
+        votes[best.id] = votes.get(best.id, 0) + 1
+    ranked = sorted(votes.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [aid for aid, _ in ranked]
+
+
+def _seat_council(sim, members, step) -> None:
+    """当選者を議員として着任(ニュース+本人の記憶)。OFF 本体の着任と同型。"""
+    sim.net.publish_news("区議会の改選", f"新しい区議 {len(members)} 人が決まった", [], step)
+    for aid in members:
+        a = sim.agent_by_id.get(aid)
+        if a is not None:
+            a.remember("区議会議員に選ばれた", importance_bonus=0.4)
+
+
+def _settle_candidacy_deposit(sim, agent, deposit, step, sim_min, *, refund) -> None:
+    """立候補供託金の返還/没収(SNTV開票で1回)。没収は government ON なら区歳入へ(_settle_deposit と同型)。"""
+    if deposit <= 0.0:
+        return
+    if refund:
+        agent.money += deposit
+        sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                             kind="deposit", x=agent.x, y=agent.y,
+                             payload={"candidacy": True, "amount": round(deposit, 1),
+                                      "phase": "refund", "balance": round(agent.money, 1)}))
+        return
+    gov = getattr(sim, "government", None)
+    if gov is not None and getattr(gov, "enabled", True):
+        try:
+            gov.collect("ward", deposit)               # 没収=区の歳入(government ON 時)
+        except Exception:
+            pass
+    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                         kind="deposit", x=agent.x, y=agent.y,
+                         payload={"candidacy": True, "amount": round(deposit, 1),
+                                  "phase": "forfeit"}))
+
+
+def _council_budget(sim, step, sim_min, asm, cur) -> None:
+    """(a) 予算承認: 現議会が government の区(ward)期次予算を日次で承認/減額(gov ON 時のみ)。
+
+    各議員 yes/no は _vote_yes と同型の決定論(不満=grievance が閾値以上の議員は減額に回る)。
+    否決(過半 no)なら government.exec_ratio を cut_ratio(既定0.8)へ=区の歳出執行が絞られる。
+    council_budget イベントに承認可否・倍率・賛否を記録。1日1回(同日再実行しない)。"""
+    gov = getattr(sim, "government", None)
+    if gov is None or not bool(gov.cfg.get("enabled", False)):
+        return                                          # government OFF なら予算承認は起きない
+    day = sim_min // 1440
+    if getattr(sim, "_council_budget_day", -1) == day:
+        return
+    sim._council_budget_day = day
+    realism = asm["realism"]
+    members = list(cur.get("members", []))
+    if not members:
+        return
+    thr = float(realism["grievance_threshold"])
+    yes = no = 0
+    for aid in members:                                 # 各議員 yes/no(決定論・_vote_yes 同型)
+        a = sim.agent_by_id.get(aid)
+        if a is None:
+            continue
+        approve = float(a.states.get("grievance", 0.0)) < thr   # 高不満の議員は執行減額へ
+        yes += 1 if approve else 0
+        no += 0 if approve else 1
+    total = yes + no
+    approved = bool(total > 0 and (yes / total) > 0.5)  # 過半 yes で承認(否決=減額)
+    gov.exec_ratio = 1.0 if approved else float(realism["cut_ratio"])
+    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
+                         kind="council_budget", x=0.0, y=0.0,
+                         payload={"term": int(cur.get("term", 0)), "day": day,
+                                  "approved": approved,
+                                  "amount": round(float(gov.balance.get("ward", 0.0)), 1),
+                                  "ratio": round(gov.exec_ratio, 3),
+                                  "yes": yes, "no": no}))
+
+
+def _run_sntv(sim, step, sim_min, asm, day) -> None:
+    """SNTV(単記非移譲式)開票=任期満了日の改選。有権者(18歳以上住民)が全候補から効用最大の
+    1人へ1票: score = -|opinion差|·w_op + closeness·w_cl + reputation·w_rep(同点は id 昇順)。
+    上位 size 人当選。法定得票(有効投票÷定数÷legal_divisor)未満は供託金没収。候補が定数未満なら
+    全候補当選+不足分は現行方式で補充(縮退)。候補0なら現行の全住民方式へフォールバック(fallback:true)。"""
+    realism = asm["realism"]
+    size = max(1, int(asm["size"]))
+    camp = getattr(sim, "council_campaign", None)
+    deposits = dict(camp["candidates"]) if camp and camp.get("candidates") else {}
+    sim.council_campaign = None                         # 開票で立候補受付を締める
+    cur = getattr(sim, "council", None)
+    term = (int(cur["term"]) + 1) if cur else 1
+    cand_ids = sorted(deposits)                         # 候補(id 昇順=決定論の同点解決基準)
+    cand_agents = [(cid, sim.agent_by_id.get(cid)) for cid in cand_ids]
+    cand_agents = [(cid, a) for cid, a in cand_agents if a is not None]
+    if not cand_agents:                                 # 候補0 → 現行の全住民方式へフォールバック
+        elected = _nn_ranked(sim)[:size]
+        sim.council = {"members": elected, "elected_day": day, "term": term}
+        sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
+                             kind="election_result", x=0.0, y=0.0,
+                             payload={"day": day, "term": term, "votes": {},
+                                      "elected": elected, "forfeited": [],
+                                      "fallback": True}))
+        _seat_council(sim, elected, step)
+        return
+    w_op = float(realism["w_op"])
+    w_cl = float(realism["w_cl"])
+    w_rep = float(realism["w_rep"])
+    votes = {cid: 0 for cid, _ in cand_agents}
+    voters = [a for a in sim.agents if _is_voter(a, realism)]
+    for voter in sorted(voters, key=lambda a: a.id):    # id 昇順=決定論
+        best_id = None
+        best_key = None
+        for cid, cand in cand_agents:                   # cand_agents は id 昇順
+            closeness = float((voter.mem.relations.get(cid) or {}).get("closeness", 0.0))
+            rep = float(getattr(cand, "_reputation", 0.0))
+            score = (-abs(float(cand.opinion) - float(voter.opinion)) * w_op
+                     + closeness * w_cl + rep * w_rep)
+            key = (score, -cid)                         # 効用最大、同点は id 昇順(=-cid が大きい方)
+            if best_key is None or key > best_key:
+                best_key = key
+                best_id = cid
+        if best_id is not None:
+            votes[best_id] += 1
+    total = sum(votes.values())                         # 有効投票=投票した有権者数
+    legal = (total / size / float(realism["legal_divisor"])) if size > 0 else 0.0
+    ranked = sorted(votes.items(), key=lambda kv: (-kv[1], kv[0]))
+    elected = [cid for cid, _ in ranked[:size]]
+    filled = []
+    if len(cand_agents) < size:                         # 候補<定数: 全候補当選+現行方式で不足分補充(縮退)
+        elected = [cid for cid, _ in ranked]
+        for aid in _nn_ranked(sim):
+            if len(elected) >= size:
+                break
+            if aid not in elected:
+                elected.append(aid)
+                filled.append(aid)
+    forfeited = []
+    for cid, cand in cand_agents:                       # 法定得票未満は供託金没収、それ以外は返還
+        below = votes[cid] < legal
+        if below:
+            forfeited.append(cid)
+        _settle_candidacy_deposit(sim, cand, float(deposits.get(cid, 0.0)),
+                                  step, sim_min, refund=not below)
+    sim.council = {"members": elected, "elected_day": day, "term": term}
+    payload = {"day": day, "term": term, "votes": votes, "elected": elected,
+               "forfeited": forfeited}
+    if filled:                                          # 縮退補充を明記(現行方式で埋めた分)
+        payload["filled"] = filled
+    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
+                         kind="election_result", x=0.0, y=0.0, payload=payload))
+    _seat_council(sim, elected, step)
+
+
+def _assembly_realism(sim, step, sim_min, asm) -> None:
+    """議会選挙の現実化の日次ドライバ(elect_assembly から realism ON 時のみ呼ばれる)。
+
+    毎 step 呼ばれるが、各処理は日/期でゲートして冪等: (a) 現議会が区予算を承認/減額、
+    告示期間に入れば立候補受付を1度だけ開く、任期満了日(or 初回=議会不在)に SNTV 開票。決定論。"""
+    realism = asm["realism"]
+    day = sim_min // 1440
+    term_days = max(1, int(asm["term_days"]))
+    announce_days = max(1, int(realism["announce_days"]))
+    cur = getattr(sim, "council", None)
+    if cur is not None and cur.get("members"):          # (a) 予算承認(gov ON 時のみ・1日1回)
+        _council_budget(sim, step, sim_min, asm, cur)
+    if cur is not None:                                 # 告示: 任期満了の announce_days 前から受付開始
+        term_end = int(cur["elected_day"]) + term_days
+        if term_end - announce_days <= day < term_end:
+            camp = getattr(sim, "council_campaign", None)
+            if camp is None or camp.get("term_end") != term_end:
+                sim.council_campaign = {"term_end": term_end, "open": True,
+                                        "candidates": {}}
+                sim.net.publish_news(
+                    "区議会議員選挙の告示",
+                    f"立候補の受付が始まった(供託金 {int(realism['deposit'])} 円)", [], step)
+    if cur is None or day >= int(cur["elected_day"]) + term_days:   # 開票(満了 or 初回)
+        _run_sntv(sim, step, sim_min, asm, day)
 
 
 def _is_employee(agent) -> bool:
@@ -242,7 +470,75 @@ class Tools:
         ]
         if agent.money >= self.cfg["venture_cost"] and agent.id not in self.ventures:
             offers.append('{"action":"open_venture","name":"…","offer":"…"}')
+        # 議会選挙の現実化(realism ON): 告示期間中の資格者にだけ「立候補」を1件追加(既定 OFF=一字も
+        # 足さない=ゴールデン維持)。誰が立候補するかは LLM 判断=ファウンダー観察の一部(勧めない)。
+        cand = self._candidacy_offer(sim, agent)
+        if cand:
+            offers.append(cand)
         return "他にできること(使っても使わなくてもよい): " + " / ".join(offers)
+
+    # -------------------------------------------------- 議会選挙の現実化: 立候補(realism ON)
+    def _candidacy_offer(self, sim, agent) -> str | None:
+        """告示期間中の資格者にだけ返す「立候補」提示文(それ以外は None=一字も足さない)。
+
+        既存 tools 提示と同型の JSON(propose 形式+rule 印)。realism OFF・告示期間外・立候補済み・
+        資格なし(年齢/来街者/供託金)のいずれかなら None(=OFF ではメニュー文字列が完全不変)。"""
+        asm = routes_of(sim)["assembly"]
+        if not (asm["enabled"] and asm["realism"]["enabled"]):
+            return None
+        camp = getattr(sim, "council_campaign", None)
+        if not camp or not camp.get("open"):
+            return None
+        if agent.id in camp.get("candidates", {}):
+            return None
+        if not _is_eligible_candidate(agent, asm["realism"]):
+            return None
+        return ('{"action":"propose","text":"区議会議員に立候補します",'
+                '"rule":{"type":"candidacy"}}')
+
+    def _is_candidacy_action(self, sim, action) -> bool:
+        """propose アクションが「立候補」印つきか(realism ON かつ rule.type=="candidacy")。"""
+        asm = routes_of(sim)["assembly"]
+        if not (asm["enabled"] and asm["realism"]["enabled"]):
+            return False
+        rule = action.get("rule")
+        return isinstance(rule, dict) and str(rule.get("type", "")) == "candidacy"
+
+    def declare_candidacy(self, sim, agent, step, sim_min) -> None:
+        """自発的立候補の受理(realism ON・告示期間中・資格者)。供託金を納付(money→不足分は口座)し
+        candidacy を記録。強制しない=誰が立つかはファウンダー観察の一部。資格外/期間外は静かに no-op。"""
+        asm = routes_of(sim)["assembly"]
+        if not (asm["enabled"] and asm["realism"]["enabled"]):
+            return
+        camp = getattr(sim, "council_campaign", None)
+        if not camp or not camp.get("open"):
+            return                                      # 告示期間外
+        if agent.id in camp.get("candidates", {}):
+            return                                      # 既に立候補済み
+        realism = asm["realism"]
+        if not _is_eligible_candidate(agent, realism):
+            return                                      # 資格ゲート(年齢/来街者/供託金)不合格
+        deposit = float(realism["deposit"])
+        pay = min(float(agent.money), deposit)          # 供託金納付: 所持金→不足分は口座
+        agent.money -= pay
+        rem = deposit - pay
+        if rem > 0.0:
+            agent.account = float(getattr(agent, "account", 0.0)) - rem
+        camp["candidates"][agent.id] = deposit
+        self._log(sim, step, sim_min, agent, "candidacy",
+                  {"day": sim_min // 1440, "deposit": round(deposit, 1),
+                   "age": int(getattr(agent, "age", 0)),
+                   "balance": round(agent.money, 1)})
+        sim.net.post(agent.id, "区議会議員選挙に立候補します。", [], step)
+        agent.remember("区議会議員選挙に立候補した")
+
+    def _signature_threshold(self, sim, realism) -> int:
+        """住民提案の署名閾値(realism ON): 明示 signature_min>0 があれば優先、なければ ceil(有権者/50)。"""
+        if int(realism.get("signature_min", 0)) > 0:    # 現行キー(明示閾値)があれば優先
+            return int(realism["signature_min"])
+        voters = sum(1 for a in sim.agents if _is_voter(a, realism))
+        div = max(1, int(realism["signature_divisor"]))
+        return (voters + div - 1) // div                # ceil(有権者 / signature_divisor)
 
     def membership_names(self, agent) -> list[str] | None:
         gids = self.member_of.get(agent.id)
@@ -267,7 +563,13 @@ class Tools:
         elif kind == "found_group":
             self._found_group(sim, agent, action, step, sim_min)
         elif kind == "propose":
-            self._propose(sim, agent, action, step, sim_min)
+            # 議会選挙の現実化(realism ON): 「立候補」はメニュー上 propose 形式で提示し、rule 印
+            # {"type":"candidacy"} で判別する(既存 tools 行使経路=deliberate の parse_action→_apply→
+            # tools.apply にそのまま乗る)。印つきかつ realism ON のときだけ立候補として処理。
+            if self._is_candidacy_action(sim, action):
+                self.declare_candidacy(sim, agent, step, sim_min)
+            else:
+                self._propose(sim, agent, action, step, sim_min)
         elif kind == "open_venture":
             self._open_venture(sim, agent, action, step, sim_min)
 
@@ -733,8 +1035,14 @@ class Tools:
 
     def _proposal_support(self, sim, step, sim_min) -> None:
         n = len(sim.agents)
-        thr = self.cfg["proposal_threshold"] * n
         routes = routes_of(sim)                         # 3ルート設定(既定 OFF=現行挙動)
+        asm = routes["assembly"]
+        # (c) 住民提案=署名モデル(議会現実化 realism ON): 成立閾値を「署名=有権者の1/50」で解釈する。
+        # OFF は従来どおり proposal_threshold×人口(バイト一致=ゴールデン維持)。
+        if asm["enabled"] and asm["realism"]["enabled"]:
+            thr = self._signature_threshold(sim, asm["realism"])
+        else:
+            thr = self.cfg["proposal_threshold"] * n
         labor_on = routes["labor"]["enabled"]
         vote_on = routes["vote"]["enabled"]
         for pid in sorted(self.proposals):
@@ -918,6 +1226,15 @@ class Tools:
             res["by"] = "council"
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=pr["author"],
                              kind="vote_result", x=ax, y=ay, payload=res))
+        # (b) 条例議決の明示化(議会現実化 realism ON): 議会採決の終端を ordinance_vote としても記録する
+        # (既存 vote_result は不変=追加専用)。OFF は一切足さない=バイト一致。
+        asm = routes_of(sim)["assembly"]
+        if asm["enabled"] and asm["realism"]["enabled"]:
+            op = {"proposal_id": pr["id"], "passed": passed, "yes": yes, "no": no}
+            if by_council:
+                op["by"] = "council"
+            sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=pr["author"],
+                                 kind="ordinance_vote", x=ax, y=ay, payload=op))
         # 供託金の清算(制度深化 第9バッチ・既定 0=不変): 可決 or 得票率 >= refund_share で返還、
         # 未満は没収(公選法の没収ラインのモデル。政治参入の実費リスク)。
         share = (yes / total) if total else 0.0

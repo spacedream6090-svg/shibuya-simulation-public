@@ -167,6 +167,16 @@ register_event_kind("long_goal",     "長期目標・人生設計の設定/変�
 # ---- 宿泊・ホテル滞在(第9バッチ 2026-07-07。来街者・観光客の夜間宿泊。既定 OFF)----
 register_event_kind("lodging_checkin",  "ホテルへのチェックイン(宿泊費の支払い・夜間滞在){poi, node, price, nights}")
 register_event_kind("lodging_checkout", "ホテルからのチェックアウト(滞在終了・活動再開){poi, nights_stayed}")
+# ---- 第37バッチ(2026-07-19。選挙現実化 S1・経済深化 E・記憶 M。全て既定 OFF)----
+register_event_kind("candidacy",       "議会選挙への自発的立候補(供託金納付・告示期間中のみ){day, deposit, age}")
+register_event_kind("election_result", "選挙の開票結果(SNTV。世界イベント agent_id=-1){day, votes, elected, forfeited}")
+register_event_kind("council_budget",  "議会の予算承認・否決(government接続){term, day, approved, amount}")
+register_event_kind("ordinance_vote",  "議会の条例議決(住民署名→審議→採決の終端){rule_id?, passed, yes, no}")
+register_event_kind("loan_grant",      "銀行融資の実行(与信スコア審査通過){amount, rate, term_days, score}")
+register_event_kind("loan_repay",      "融資の返済(定期返済・完済・延滞){amount, remaining, status}")
+register_event_kind("interest_paid",   "預金利息の付与(日次/週次){amount, balance}")
+register_event_kind("vc_investment",   "ベンチャー出資の実行(トラクション/ネットワーク審査){venture, amount, equity}")
+register_event_kind("memory_fail",     "想起の失敗(活性化が閾値未達=思い出せない){query, activation, tau}")
 
 
 @dataclass

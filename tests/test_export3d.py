@@ -6,11 +6,13 @@
 """
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import struct
 from pathlib import Path
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -250,3 +252,219 @@ def test_export_run_mock(tmp_path):
     glb = res["glb"].read_bytes()
     magic, ver, length = struct.unpack("<4sII", glb[:12])
     assert magic == b"glTF" and ver == 2 and length == len(glb)
+
+
+# ================================================================ --rich-tracks
+def _write_events_run(tmp_path: Path, name: str, events: list, n_agents: int):
+    """任意イベント列で mock ラン一式(map/config/agents/parquet)を書く。"""
+    run_dir = tmp_path / name
+    run_dir.mkdir()
+    map_path = tmp_path / f"{name}_map.json"
+    map_path.write_text(json.dumps(_synthetic_map(), ensure_ascii=False), encoding="utf-8")
+    (run_dir / "config.yaml").write_text(
+        f"world:\n  map: {map_path.as_posix()}\n", encoding="utf-8")
+    agents = [{"id": i, "name": f"住民{i}", "age": 20 + i, "gender": "男",
+               "occupation": "会社員", "visitor": False,
+               "has_bicycle": (i == 5), "has_car": (i in (0, 1))} for i in range(n_agents)]
+    (run_dir / "agents.json").write_text(json.dumps(agents, ensure_ascii=False),
+                                         encoding="utf-8")
+    cols = {k: [r[k] for r in events] for k in events[0]}
+    schema = pa.schema([
+        ("step", pa.int32()), ("sim_min", pa.int32()), ("agent_id", pa.int32()),
+        ("kind", pa.string()), ("x", pa.float32()), ("y", pa.float32()),
+        ("payload", pa.string()), ("rng_stream", pa.string()), ("llm_call_id", pa.string())])
+    pq.write_table(pa.table(cols, schema=schema), run_dir / "l1_events.parquet")
+    return run_dir, map_path
+
+
+def _rich_events():
+    """taxi ride(car / walk 記録)・train/walk exit を含む代表イベント。"""
+    rows = []
+
+    def add(step, aid, kind, x, y, payload):
+        rows.append({"step": step, "sim_min": 7 * 60 + step * 10, "agent_id": aid,
+                     "kind": kind, "x": float(x), "y": float(y),
+                     "payload": json.dumps(payload, ensure_ascii=False),
+                     "rng_stream": "", "llm_call_id": ""})
+
+    for a in range(6):
+        add(0, a, "arrive", a * 5, 0, {"name": "路上"})
+    # agent0: タクシー乗車(car 区間)+ ride(taxi) 同一 step → rich で mode 3
+    add(2, 0, "move_segment", 30, 40, {"mode": "car", "pts": [[0, 0], [15, 20], [30, 40]]})
+    add(2, 0, "ride", 30, 40, {"mode": "taxi", "from": "n1", "to": "n2", "fare": 800.0})
+    # agent1: 自家用車(ride 無し)→ rich でも mode 2 のまま
+    add(2, 1, "move_segment", 10, 10, {"mode": "car", "pts": [[0, 0], [10, 10]]})
+    # agent2: taxi ride だが移動が walk 記録 → mode=car のみ振替なので walk(0) のまま
+    add(2, 2, "move_segment", 5, 5, {"mode": "walk", "pts": [[0, 0], [5, 5]]})
+    add(2, 2, "ride", 5, 5, {"mode": "taxi", "from": "n1", "to": "n2", "fare": 700.0})
+    # agent3: 電車で圏外(via=train)→ rich で w=-3
+    add(3, 3, "exit_area", 200, 200, {"gateway": "n1", "via": "train", "homing": False})
+    # agent4: 徒歩で圏外(via=walk)→ w=-1(両方)
+    add(3, 4, "exit_area", 300, 300, {"gateway": "n1", "via": "walk", "homing": False})
+    # agent5: 自転車 → mode 1
+    add(1, 5, "move_segment", 8, 0, {"mode": "bicycle", "pts": [[0, 0], [8, 0]]})
+    return rows
+
+
+def test_rich_tracks_default_byte_identical(tmp_path):
+    """--rich-tracks OFF: 同一入力で 2 回実行し scene/tracks/glb がバイト同一(既定不変)。"""
+    run_dir, map_path = _write_events_run(tmp_path, "e_rich0", _rich_events(), 6)
+    res1 = E3D.export_run(run_dir, map_path, rich_tracks=False)
+    b1 = {k: res1[k].read_bytes() for k in ("scene", "tracks", "glb")}
+    res2 = E3D.export_run(run_dir, map_path, rich_tracks=False)
+    b2 = {k: res2[k].read_bytes() for k in ("scene", "tracks", "glb")}
+    for k in b1:
+        assert b1[k] == b2[k], f"{k} not byte-identical across runs"
+
+    tracks = json.loads(b1["tracks"].decode("utf-8"))
+    idx = {a: i for i, a in enumerate(tracks["ids"])}
+    # 既定: タクシー car 区間は mode 2 のまま・train 圏外は w=-1・legend 無し
+    assert tracks["moves"][2][idx[0]][0] == 2
+    assert tracks["positions"][3][idx[3]][2] == -1
+    assert "mode_legend" not in tracks["meta"]
+    assert "away_train" not in tracks["meta"]
+
+
+def test_rich_tracks_reassigns_taxi_and_train(tmp_path):
+    run_dir, map_path = _write_events_run(tmp_path, "e_rich1", _rich_events(), 6)
+    res = E3D.export_run(run_dir, map_path, rich_tracks=True)
+    tracks = json.loads(res["tracks"].read_text(encoding="utf-8"))
+    idx = {a: i for i, a in enumerate(tracks["ids"])}
+    # agent0: ride(taxi)同一 step の car 区間 → mode 3
+    assert tracks["moves"][2][idx[0]][0] == 3
+    # agent1: ride 無しの自家用車 → mode 2 のまま
+    assert tracks["moves"][2][idx[1]][0] == 2
+    # agent2: taxi ride だが walk 記録 → walk(0) のまま(car のみ振替)
+    assert tracks["moves"][2][idx[2]][0] == 0
+    # agent5: bicycle → mode 1
+    assert tracks["moves"][1][idx[5]][0] == 1
+    # agent3: 電車で圏外 → w=-3
+    assert tracks["positions"][3][idx[3]][2] == -3
+    # agent4: 徒歩で圏外 → w=-1
+    assert tracks["positions"][3][idx[4]][2] == -1
+    # meta legend
+    assert tracks["meta"]["mode_legend"]["3"] == "タクシー"
+    assert tracks["meta"]["away_train"] == -3
+
+
+# ================================================================ terrain / extras
+def _make_terrain(a=0.3, b=-0.2, d=12.0, x0=-5.0, y0=3.0, cell=10.0, nx=8, ny=6):
+    """平面 z = a*x + b*y + d の地表グリッド(双一次補間で厳密再現できる)。"""
+    xs = x0 + np.arange(nx) * cell
+    ys = y0 + np.arange(ny) * cell
+    H = np.zeros((ny, nx), dtype=np.float64)
+    for iy in range(ny):
+        for ix in range(nx):
+            H[iy, ix] = a * xs[ix] + b * ys[iy] + d
+    return {"x0": x0, "y0": y0, "cell_m": cell, "nx": nx, "ny": ny, "H": H,
+            "_plane": (a, b, d)}
+
+
+def test_terrain_web_quant_roundtrip():
+    terr = _make_terrain()
+    web = E3D.build_terrain_web(terr)
+    assert web["quant"] == 0.1
+    assert web["nx"] == terr["nx"] and web["ny"] == terr["ny"]
+    assert web["x0"] == terr["x0"] and web["cell_m"] == terr["cell_m"]
+    raw = base64.b64decode(web["heights_b64"])
+    q = np.frombuffer(raw, dtype="<i2")
+    assert q.size == terr["nx"] * terr["ny"]
+    # row-major (ny, nx) で復元し量子化ラウンドトリップ(誤差 < 0.05m)
+    H_back = q.reshape(terr["ny"], terr["nx"]).astype(np.float64) * 0.1
+    assert np.max(np.abs(H_back - terr["H"])) < 0.05
+
+
+def test_terrain_gz_bilinear_exact_on_plane():
+    terr = _make_terrain()
+    a, b, d = terr["_plane"]
+    # 平面 z=ax+by+d は双一次補間で厳密再現 → 量子化(0.1m 丸め)後も真値と半量子内で一致。
+    for (x, y) in [(0.0, 5.0), (12.3, 8.7), (23.4, 33.3), (-2.0, 40.0), (50.0, 3.0),
+                   (13.0, 8.0), (33.0, 41.0)]:
+        gz = E3D._sample_terrain_gz(terr, x, y)
+        assert abs(gz - (a * x + b * y + d)) <= 0.05 + 1e-9
+    # 1桁で割り切れる点は丸め後も厳密一致(補間の正しさを直接確認)
+    for (x, y, expect) in [(10.0, 5.0, 14.0), (13.0, 8.0, 14.3), (33.0, 41.0, 13.7)]:
+        assert E3D._sample_terrain_gz(terr, x, y) == pytest.approx(expect, abs=1e-9)
+
+
+def test_extras_web_roundtrip():
+    V_u = np.array([[0, 0, -5], [10, 0, -5], [10, 10, -5], [0, 10, -5]], dtype=np.float64)
+    F_u = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+    V_b = np.array([[1.23, 2.34, 3.45], [4.56, 5.67, 6.78], [7.89, 8.9, 9.01]], dtype=np.float64)
+    F_b = np.array([[0, 1, 2]], dtype=np.int32)
+    web = E3D.build_extras_web({"ubld": (V_u, F_u), "brid": (V_b, F_b)})
+    assert set(web) == {"ubld", "brid"}
+    assert web["ubld"]["n_vertices"] == 4 and web["ubld"]["n_triangles"] == 2
+    assert web["brid"]["n_vertices"] == 3 and web["brid"]["n_triangles"] == 1
+    # 位置量子化ラウンドトリップ(int16 × 0.05m)
+    q = np.frombuffer(base64.b64decode(web["brid"]["positions_b64"]), dtype="<i2")
+    V_back = q.reshape(-1, 3).astype(np.float64) * 0.05
+    assert np.max(np.abs(V_back - V_b)) < 0.05
+    # index は <u4
+    iu = np.frombuffer(base64.b64decode(web["ubld"]["indices_b64"]), dtype="<u4")
+    assert iu.tolist() == [0, 1, 2, 0, 2, 3]
+
+
+def _write_min_plateau(pdir: Path):
+    """最小 plateau 一式(1 建物 bA を実測メッシュ化)を書く。"""
+    pdir.mkdir(parents=True, exist_ok=True)
+    V = np.array([[0, 0, 0], [10, 0, 0], [10, 10, 35]], dtype=np.float32)
+    F = np.array([[0, 1, 2]], dtype=np.int32)
+    off = np.array([0, 1], dtype=np.int32)
+    np.savez(pdir / "plateau_mesh.npz", V=V, F=F, building_offsets=off)
+    (pdir / "plateau_index.json").write_text(json.dumps({
+        "ground0_source": "test",
+        "buildings": [{"gml_id": "g0", "height": 35.0, "base": 0.0,
+                       "footprint": [[0, 0], [10, 0], [10, 10]], "n_tris": 1, "lod": 2}],
+    }), encoding="utf-8")
+    (pdir / "plateau_match.json").write_text(
+        json.dumps({"matches": {"bA": {"gml_id": "g0"}}}), encoding="utf-8")
+
+
+def test_export_plateau_terrain_extras_integration(tmp_path):
+    """--plateau + terrain.npz/json + extras.npz の一式書き出し(gz/terrain_web/extras)。"""
+    run_dir, map_path = _write_events_run(tmp_path, "e_pl", _rich_events(), 6)
+    pdir = tmp_path / "plateau"
+    _write_min_plateau(pdir)
+    # terrain(平面)を保存
+    terr = _make_terrain(nx=40, ny=40, x0=-50.0, y0=-50.0, cell=5.0)
+    a, b, d = terr["_plane"]
+    (pdir / "terrain.json").write_text(json.dumps({
+        "x0": terr["x0"], "y0": terr["y0"], "cell_m": terr["cell_m"],
+        "nx": terr["nx"], "ny": terr["ny"]}), encoding="utf-8")
+    np.savez(pdir / "terrain.npz", heights=terr["H"].astype(np.float32))
+    # extras(地下街 1 面・橋 1 面)
+    np.savez(pdir / "extras.npz",
+             ubld_V=np.array([[0, 0, -6], [4, 0, -6], [4, 4, -6]], dtype=np.float32),
+             ubld_F=np.array([[0, 1, 2]], dtype=np.int32),
+             brid_V=np.array([[0, 0, 8], [4, 0, 8], [4, 4, 8]], dtype=np.float32),
+             brid_F=np.array([[0, 1, 2]], dtype=np.int32))
+
+    res = E3D.export_run(run_dir, map_path, plateau_dir=pdir, rich_tracks=True)
+    assert "terrain_web" in res and "plateau_web" in res
+
+    scene = json.loads(res["scene"].read_text(encoding="utf-8"))
+    # 全建物に gz が付与され、平面上の重心高と一致
+    for bl in scene["buildings"]:
+        assert "gz" in bl
+        assert bl["gz"] == pytest.approx(round(a * bl["cx"] + b * bl["cy"] + d, 1), abs=1e-9)
+
+    tw = json.loads(res["terrain_web"].read_text(encoding="utf-8"))
+    assert tw["quant"] == 0.1 and tw["nx"] == 40 and tw["ny"] == 40
+
+    web = json.loads(res["plateau_web"].read_text(encoding="utf-8"))
+    assert "extras" in web and set(web["extras"]) == {"ubld", "brid"}
+    assert web["extras"]["ubld"]["n_triangles"] == 1
+
+
+def test_export_plateau_without_terrain_extras_no_new_keys(tmp_path):
+    """--plateau だが terrain/extras 無し: gz 無し・terrain_web 無し・extras キー無し。"""
+    run_dir, map_path = _write_events_run(tmp_path, "e_pl2", _rich_events(), 6)
+    pdir = tmp_path / "plateau2"
+    _write_min_plateau(pdir)
+    res = E3D.export_run(run_dir, map_path, plateau_dir=pdir)
+    assert "terrain_web" not in res
+    scene = json.loads(res["scene"].read_text(encoding="utf-8"))
+    assert all("gz" not in bl for bl in scene["buildings"])
+    web = json.loads(res["plateau_web"].read_text(encoding="utf-8"))
+    assert "extras" not in web

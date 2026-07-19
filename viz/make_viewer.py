@@ -287,7 +287,8 @@ def build_data(run_dir: Path, include_traffic: bool = True) -> dict:
         by_step.setdefault(e["step"], []).append(e)
 
     # 位置 [x,y,w](w: 0=路上 -1=範囲外 -2=睡眠 1000+bIdx*100+floor=屋内)
-    mode_code = {"walk": 0, "bicycle": 1, "car": 2}
+    # taxi=3 は rich-tracks 由来。move に taxi が無ければ .get 結果は不変=既存ランはバイト同一。
+    mode_code = {"walk": 0, "bicycle": 1, "car": 2, "taxi": 3}
     positions, moves, traffic = [], [], []
     occ_per_step: list[dict[int, int]] = []
     cur = [[0.0, 0.0, 0] for _ in agent_ids]
@@ -449,6 +450,10 @@ def build_data(run_dir: Path, include_traffic: bool = True) -> dict:
     comm = load_communities(run_dir)
     if comm is not None:
         out["communities"] = comm
+    # 移動手段(rich-tracks): taxi(mode 3)が現れる時「だけ」mode_legend を埋め込む。
+    # 無ければ out は不変=既存ラン(徒歩/自転車/車のみ)はビューワー再生成でバイト同一。
+    if any(m is not None and m[0] == 3 for step in moves for m in step):
+        out["mode_legend"] = {"0": "徒歩", "1": "自転車", "2": "車", "3": "タクシー"}
     return out
 
 
@@ -777,6 +782,28 @@ function communityColor(i, s0){
 }"""
 
 
+# ============================================================ 移動手段の凡例(mode_legend)
+# rich-tracks(taxi=mode 3)が現れた時「だけ」main() が注入する凡例1行。colorBy='移動' の
+# 時だけ表示。色は colorOf の mode 分岐(徒歩/自転車/車/タクシー)と一致させる。
+# 無いランでは main() が空文字へ置換するため、viewer.html は従来とバイト同一。
+_MODE_LEGEND_JS = r"""(function(){
+  const LEG = D.mode_legend; if(!LEG) return;
+  const MC = {0:'#60a5fa',1:'#6ee7b7',2:'#f59e0b',3:'#a855f7'};   // colorOf の mode 色と一致
+  const el = document.createElement('div'); el.className='glass';
+  el.style.cssText='position:fixed;left:12px;bottom:70px;z-index:6;display:none;'
+    +'padding:5px 10px;font-size:11px;white-space:nowrap;';
+  let h='<b style="margin-right:5px">移動</b>';
+  for(const k of Object.keys(LEG)) h+='<span style="margin-right:9px">'
+    +'<span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:'
+    +(MC[k]||'#8a97a5')+';margin-right:3px"></span>'+LEG[k]+'</span>';
+  el.innerHTML=h; document.body.appendChild(el);
+  const cb=document.getElementById('colorBy');
+  const upd=()=>{ el.style.display=(cb&&cb.value==='mode')?'block':'none'; };
+  if(cb) cb.addEventListener('change', upd); upd();
+})();
+"""
+
+
 # ============================================================ 地図ビューア
 MAP_HTML = r"""<!DOCTYPE html>
 <html lang="ja"><head><meta charset="utf-8">
@@ -1026,7 +1053,7 @@ function colorOf(i, s0){
   if(mode==='gender') return a.gender==='女'? '#f472b6' : a.gender==='男'? '#60a5fa':'#999';
   if(mode==='age'){ const g=a.age||0; return g<25?'#6ee7b7':g<40?'#ffd166':g<60?'#fb923c':'#a78bfa'; }
   if(mode==='occ'){ if(!(a.occupation in OCC_COLORS)){ let h=0; for(const c of a.occupation||'') h=(h*31+c.charCodeAt(0))%360; OCC_COLORS[a.occupation]=h; } return `hsl(${OCC_COLORS[a.occupation]} 65% 62%)`; }
-  if(mode==='mode'){ const m=modeAt(s0,i); return m===2?'#f59e0b':m===1?'#6ee7b7':m===0?'#60a5fa':'#8a97a5'; }
+  if(mode==='mode'){ const m=modeAt(s0,i); __MODE_TAXI__return m===2?'#f59e0b':m===1?'#6ee7b7':m===0?'#60a5fa':'#8a97a5'; }
   if(mode==='vocab'){ const n=agentWords(D.ids[i],s0).length; return n===0?'#5b6572':n<3?'#d9c26a':'#ffd166'; }
   return `hsl(${hue(i)} 70% 60%)`;
 }
@@ -1349,7 +1376,7 @@ function loop(ts){
 document.getElementById('play').onclick=()=>{ playing=!playing;
   document.getElementById('play').textContent=playing?'⏸':'▶'; };
 seek.oninput=()=>{ cur=Number(seek.value); };
-fit(); lastT=performance.now(); requestAnimationFrame(loop);
+__MODE_LEGEND_JS__fit(); lastT=performance.now(); requestAnimationFrame(loop);
 </script></body></html>
 """
 
@@ -1890,11 +1917,18 @@ def main() -> None:
     comm_hook = ("\n  if(mode==='community') return communityColor(i, s0);"
                  if has_comm else "")
     comm_js = _COMMUNITY_JS if has_comm else ""
+    # 移動手段(mode_legend)が有る時「だけ」タクシー色と凡例1行を注入。無ければ両トークン
+    # とも空文字→ MAP_HTML はバイト同一(後方互換の合格条件)。
+    has_ml = "mode_legend" in data
+    mode_taxi = "if(m===3) return '#a855f7'; " if has_ml else ""
+    mode_legend_js = _MODE_LEGEND_JS if has_ml else ""
     for name, template in (("viewer.html", MAP_HTML), ("dashboard.html", DASH_HTML)):
         html = (template
                 .replace("__COMMUNITY_OPTION__", comm_option)
                 .replace("__COMMUNITY_HOOK__", comm_hook)
                 .replace("__COMMUNITY_JS__", comm_js)
+                .replace("__MODE_TAXI__", mode_taxi)
+                .replace("__MODE_LEGEND_JS__", mode_legend_js)
                 .replace("__BASE_CSS__", _BASE_CSS)
                 .replace("__ERR_JS__", _ERR_JS)
                 .replace("__TIME_JS__", _TIME_JS)

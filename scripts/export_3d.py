@@ -3,11 +3,16 @@
 使い方:  python scripts/export_3d.py runs/<name> [--map data/shibuya_osm.json]
                                   [--sample-agents N] [--step-stride K]
                                   [--plateau] [--plateau-dir data/plateau]
+                                  [--rich-tracks]
   --sample-agents N : tracks の対象を先頭 N エージェントに間引く(大規模ランの LOD 出力)。
   --step-stride K   : K step ごとに1フレームだけ出力する(時間ダウンサンプル)。
   --plateau         : PLATEAU 実形状(plateau_extract/match_plateau の成果物)で、照合済み建物を
                       実測メッシュに置換する(glb ハイブリッド+scene.json height 上書き+
                       viewer3d 用 plateau_web.json)。既定 OFF=従来出力とバイト同一。
+                      terrain.npz/json があれば地表グリッド(terrain_web.json)と建物 gz、
+                      extras.npz があれば地下街/橋メッシュ(plateau_web.extras)も書き出す。
+  --rich-tracks     : tracks.json の移動手段を細分化(タクシー=mode 3・電車で圏外=w -3)。
+                      既定 OFF=tracks.json はバイト同一。--plateau と併用可。
   既定はいずれも全量・OFF=現行と完全同一。
 生成物:  runs/<name>/scene3d/
   scene.json     — 静的シーン(建物押出し情報・道路・線路・POI)。座標系 local-m(X=east,Y=north,Z=up)。
@@ -249,6 +254,112 @@ def build_plateau_web(buildings: list, plateau: dict) -> dict:
     }
 
 
+# ------------------------------------------------------------------ terrain / extras
+TERRAIN_QUANT = 0.1   # terrain_web 量子化 [m/単位](int16 で ±3276.7m まで=標高十分)
+
+
+def _load_terrain(plateau_dir: Path) -> dict | None:
+    """地表グリッド(terrain.npz + terrain.json)を読む。無ければ None(従来どおり)。
+
+    契約(並行エージェントの成果物と合わせる想定):
+    - terrain.json : {"x0","y0","cell_m","nx","ny"} グリッド原点[local-m]・セル幅[m]・格子数。
+    - terrain.npz  : 標高配列 H。key は "heights"(無ければ "z"、それも無ければ先頭配列)。
+                     形状 (ny, nx)・row-major(H[iy][ix] = (x0+ix*cell_m, y0+iy*cell_m) の地表高[m])。
+    """
+    npz_p = plateau_dir / "terrain.npz"
+    json_p = plateau_dir / "terrain.json"
+    if not (npz_p.exists() and json_p.exists()):
+        return None
+    meta = json.loads(json_p.read_text(encoding="utf-8"))
+    data = np.load(npz_p)
+    if "heights" in data:
+        H = data["heights"]
+    elif "z" in data:
+        H = data["z"]
+    else:
+        H = data[data.files[0]]
+    H = np.ascontiguousarray(np.asarray(H, dtype=np.float64))
+    if H.ndim != 2:
+        raise SystemExit("[export_3d] terrain: 標高配列 H は 2次元(ny,nx)である必要がある")
+    ny, nx = H.shape
+    return {
+        "x0": float(meta["x0"]), "y0": float(meta["y0"]),
+        "cell_m": float(meta["cell_m"]),
+        "nx": int(meta.get("nx", nx)), "ny": int(meta.get("ny", ny)),
+        "H": H,
+    }
+
+
+def _sample_terrain_gz(terrain: dict, x: float, y: float) -> float:
+    """双一次補間で (x,y) の地表高を返す(小数1桁)。格子外は端セルにクランプ(外挿しない)。
+    平面グリッド(z=ax+by+c)では格子内で厳密に平面値を返す。"""
+    H = terrain["H"]
+    c = terrain["cell_m"]
+    nx, ny = terrain["nx"], terrain["ny"]
+    fx = (x - terrain["x0"]) / c
+    fy = (y - terrain["y0"]) / c
+    ix = int(np.floor(fx))
+    iy = int(np.floor(fy))
+    ix = min(max(ix, 0), max(nx - 2, 0))
+    iy = min(max(iy, 0), max(ny - 2, 0))
+    tx = min(max(fx - ix, 0.0), 1.0)
+    ty = min(max(fy - iy, 0.0), 1.0)
+    ix1 = min(ix + 1, nx - 1)
+    iy1 = min(iy + 1, ny - 1)
+    h00 = float(H[iy][ix]);  h10 = float(H[iy][ix1])
+    h01 = float(H[iy1][ix]); h11 = float(H[iy1][ix1])
+    h = (h00 * (1 - tx) * (1 - ty) + h10 * tx * (1 - ty)
+         + h01 * (1 - tx) * ty + h11 * tx * ty)
+    return round(h, 1)
+
+
+def build_terrain_web(terrain: dict) -> dict:
+    """viewer3d 用の量子化地表グリッド(int16×0.1m LE row-major・base64)。"""
+    H = np.ascontiguousarray(terrain["H"], dtype=np.float64)
+    Q = np.clip(np.round(H / TERRAIN_QUANT), -32768, 32767).astype("<i2")
+    return {
+        "x0": terrain["x0"], "y0": terrain["y0"],
+        "cell_m": terrain["cell_m"],
+        "nx": terrain["nx"], "ny": terrain["ny"],
+        "quant": TERRAIN_QUANT,
+        "heights_b64": base64.b64encode(np.ascontiguousarray(Q).tobytes()).decode("ascii"),
+    }
+
+
+def _load_extras(plateau_dir: Path) -> dict | None:
+    """地下街(ubld)/橋(brid)の付帯メッシュ(extras.npz)を読む。無ければ None。
+
+    契約: extras.npz は各カテゴリの頂点/面を "<cat>_V"(float (n,3))・"<cat>_F"(int (m,3)・
+    カテゴリ内 0-based)で持つ。存在するカテゴリのみ採用(両キーが揃い非空のもの)。"""
+    npz_p = plateau_dir / "extras.npz"
+    if not npz_p.exists():
+        return None
+    data = np.load(npz_p)
+    out: dict = {}
+    for cat in ("ubld", "brid"):
+        vk, fk = f"{cat}_V", f"{cat}_F"
+        if vk in data and fk in data:
+            V = np.asarray(data[vk], dtype=np.float64)
+            F = np.asarray(data[fk])
+            if len(V) and len(F):
+                out[cat] = (V, F)
+    return out or None
+
+
+def build_extras_web(extras: dict) -> dict:
+    """plateau_web.extras 用(既存メッシュと同じ int16×0.05m 量子化・<u4 index・建物色なし)。"""
+    web: dict = {}
+    for cat, (V, F) in extras.items():
+        Q = np.clip(np.round(V / PLATEAU_QUANT), -32767, 32767).astype("<i2")
+        web[cat] = {
+            "positions_b64": base64.b64encode(np.ascontiguousarray(Q).tobytes()).decode("ascii"),
+            "indices_b64": base64.b64encode(F.astype("<u4").tobytes()).decode("ascii"),
+            "n_vertices": int(len(V)),
+            "n_triangles": int(len(F)),
+        }
+    return web
+
+
 # ------------------------------------------------------------------ glb 生成
 def _extrude_building(ring, base, top, color, pos, nrm, col, idxs):
     """1 建物の押出しメッシュを配列に追記(座標は local-m Z-up のまま渡す)。"""
@@ -461,14 +572,19 @@ def build_scene(city: dict, buildings: list) -> dict:
 # ------------------------------------------------------------------ tracks.json
 def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
                        sample_agents: int | None = None,
-                       step_stride: int = 1) -> dict:
+                       step_stride: int = 1, rich_tracks: bool = False) -> dict:
     """viz/make_viewer.py build_data の位置再構成を移植・整理。
     positions[step][i] = [x, y, w]  (w: 0=路上 -1=範囲外 -2=睡眠 1000+bIdx*100+floor=屋内)
     moves[step][i] = [mode, pts] または None,  traffic[step] = {n, segs}
 
     B4-lite(スケール): sample_agents/step_stride で LOD 出力(既定=全量・現行と同一)。
     - sample_agents=N: 対象を先頭 N エージェントに絞る(位置配列の幅を N に)。
-    - step_stride=K: 状態は毎 step 更新しつつ、K step ごとに1フレームだけ出力する。"""
+    - step_stride=K: 状態は毎 step 更新しつつ、K step ごとに1フレームだけ出力する。
+
+    rich_tracks(--rich-tracks・既定 OFF=現行とバイト同一):
+    - moves の mode に 3=タクシー を追加(ride イベントと同一 agent×step の car 区間を振替)。
+    - positions の w に -3=電車で圏外 を追加(exit_area payload via=="train" のとき)。
+    - meta に mode_legend / away_train を追加。"""
     n_steps = max((e["step"] for e in events), default=-1) + 1
     bld_idx = {b["id"]: i for i, b in enumerate(buildings)}
 
@@ -496,6 +612,18 @@ def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
             step_min.setdefault(e["step"], int(sm))
 
     mode_code = {"walk": 0, "bicycle": 1, "car": 2}
+    # --rich-tracks 用: taxi 乗車(ride イベント, payload mode=="taxi")の (agent_id, step) 集合。
+    # 対応付け: ride と同一 agent×step の move_segment(mode=car)がタクシー乗車区間。
+    # 実データ runs/demo_event_200a3d では ride 79件すべてが同一 step の move_segment 終点と
+    # (x,y)一致し、うち mode=car は 33件(残り46件は sim が walk で記録=car ではないため非対象)。
+    # 既定 OFF では空集合=振替なし=現行と完全同一。
+    taxi_steps: set = set()
+    if rich_tracks:
+        for e in events:
+            if e["kind"] == "ride":
+                pr = json.loads(e["payload"]) if e.get("payload") else {}
+                if pr.get("mode") == "taxi":
+                    taxi_steps.add((e["agent_id"], e["step"]))
     positions, moves, traffic = [], [], []
     cur = [[0.0, 0.0, 0] for _ in agent_ids]
     for step in range(n_steps):
@@ -516,7 +644,12 @@ def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
                 cur[i][0], cur[i][1] = round(float(e["x"]), 1), round(float(e["y"]), 1)
             if kind == "move_segment" and p.get("pts"):
                 pts = [[round(float(a), 1), round(float(b), 1)] for a, b in p["pts"]]
-                mv[i] = [mode_code.get(p.get("mode", "walk"), 0), pts]
+                code = mode_code.get(p.get("mode", "walk"), 0)
+                # rich_tracks: 同一 agent×step に taxi ride がある car 区間(2)→タクシー(3)。
+                # 既定は taxi_steps 空・rich_tracks False なので code 不変=現行と同一。
+                if rich_tracks and code == 2 and (e["agent_id"], step) in taxi_steps:
+                    code = 3
+                mv[i] = [code, pts]
             elif kind == "enter_building":
                 bi = bld_idx.get(p.get("building"), 0)
                 cur[i] = [round(float(e["x"]), 1), round(float(e["y"]), 1),
@@ -527,7 +660,10 @@ def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
             elif kind == "exit_building":
                 cur[i] = [round(float(e["x"]), 1), round(float(e["y"]), 1), 0]
             elif kind == "exit_area":
-                cur[i][2] = -1
+                # rich_tracks: 退出手段が電車(payload via=="train")なら -3(電車で圏外)。
+                # exit_area payload は via("train"/"walk")を権威情報として持つ(city nodes に
+                # 駅種別はほぼ無く=3499中1件、近傍判定より確実)。既定 OFF=従来どおり -1。
+                cur[i][2] = -3 if (rich_tracks and p.get("via") == "train") else -1
             elif kind == "enter_area":
                 cur[i] = [round(float(e["x"]), 1), round(float(e["y"]), 1), 0]
             elif kind == "sleep_start":
@@ -556,6 +692,9 @@ def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
             "start_min": start_min, "floor_height": FLOOR_HEIGHT}
     if stride > 1:                                  # 追加専用: 全量時は出さない=現行と同一
         meta["step_stride"] = stride
+    if rich_tracks:                                 # 追加専用: 既定 OFF=現行と同一
+        meta["mode_legend"] = {"0": "徒歩", "1": "自転車", "2": "車", "3": "タクシー"}
+        meta["away_train"] = -3
     return {
         "meta": meta,
         "agents": agents_slim,
@@ -570,7 +709,7 @@ def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
 # ------------------------------------------------------------------ top-level
 def export_run(run_dir: Path, map_path: Path | None = None,
                sample_agents: int | None = None, step_stride: int = 1,
-               plateau_dir: Path | None = None) -> dict:
+               plateau_dir: Path | None = None, rich_tracks: bool = False) -> dict:
     run_dir = Path(run_dir)
     import pyarrow.parquet as pq
     events = pq.read_table(run_dir / "l1_events.parquet").to_pylist()
@@ -589,9 +728,14 @@ def export_run(run_dir: Path, map_path: Path | None = None,
             if b["id"] in plateau["meshes"]:
                 b["height"] = round(plateau["heights"][b["id"]], 2)  # LOD 実測で上書き
                 b["plateau"] = 1                                     # 追加専用キー
+    # 地表グリッド(--plateau 時・terrain.npz/json がある場合のみ)。無ければ従来どおり gz なし。
+    terrain = _load_terrain(plateau_dir) if plateau_dir is not None else None
+    if terrain is not None:
+        for b in scene["buildings"]:
+            b["gz"] = _sample_terrain_gz(terrain, b["cx"], b["cy"])  # 追加専用キー
     tracks = reconstruct_tracks(events, buildings, agents_meta,
                                 sample_agents=sample_agents,
-                                step_stride=step_stride)
+                                step_stride=step_stride, rich_tracks=rich_tracks)
     glb = build_glb(scene["buildings"], plateau)
 
     out_dir = run_dir / "scene3d"
@@ -608,10 +752,20 @@ def export_run(run_dir: Path, map_path: Path | None = None,
            "n_buildings": len(scene["buildings"]), "n_steps": tracks["meta"]["nSteps"]}
     if plateau:
         web = build_plateau_web(scene["buildings"], plateau)
+        extras = _load_extras(plateau_dir)                # extras.npz があれば地下街/橋を同梱
+        if extras:                                        # 無ければ "extras" キー自体を出さない
+            web["extras"] = build_extras_web(extras)
         web_p = out_dir / "plateau_web.json"
         web_p.write_text(json.dumps(web, separators=(",", ":")), encoding="utf-8")
         res["plateau_web"] = web_p
         res["n_plateau"] = len(web["matched_ids"])
+        if extras:
+            res["n_extras"] = {k: v["n_triangles"] for k, v in web["extras"].items()}
+    if terrain is not None:
+        tw_p = out_dir / "terrain_web.json"
+        tw_p.write_text(json.dumps(build_terrain_web(terrain), separators=(",", ":")),
+                        encoding="utf-8")
+        res["terrain_web"] = tw_p
     return res
 
 
@@ -636,9 +790,13 @@ def main(argv: list) -> int:
         plateau_dir = Path(argv[argv.index("--plateau-dir") + 1])
         if not plateau_dir.is_absolute():
             plateau_dir = REPO_ROOT / plateau_dir
+    rich_tracks = "--rich-tracks" in argv
     res = export_run(run_dir, map_override, sample_agents=sample_agents,
-                     step_stride=step_stride, plateau_dir=plateau_dir)
-    keys = ("scene", "tracks", "glb") + (("plateau_web",) if "plateau_web" in res else ())
+                     step_stride=step_stride, plateau_dir=plateau_dir,
+                     rich_tracks=rich_tracks)
+    keys = (("scene", "tracks", "glb")
+            + (("plateau_web",) if "plateau_web" in res else ())
+            + (("terrain_web",) if "terrain_web" in res else ()))
     for k in keys:
         sz = res[k].stat().st_size
         try:
@@ -647,6 +805,8 @@ def main(argv: list) -> int:
             shown = res[k]
         print(f"  {shown}  ({sz/1024:.1f} KB)")
     tail = f"  plateau={res['n_plateau']}" if "n_plateau" in res else ""
+    if "n_extras" in res:
+        tail += f"  extras={res['n_extras']}"
     print(f"  buildings={res['n_buildings']}  steps={res['n_steps']}{tail}")
     return 0
 

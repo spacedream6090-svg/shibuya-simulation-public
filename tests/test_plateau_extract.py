@@ -5,6 +5,8 @@
 - 局所接平面変換の数値検証(既知の緯度経度 → 期待 E/N ±0.5m)
 - ear clipping: 凹五角形 → 三角形数 = n-2
 - 3次メッシュコード: (35.6595,139.70062) → 53393596
+- terrain: 合成平面 TIN → 2m 格子ラスタ化で定数勾配を ±0.2m 復元
+- extras: 合成 ubld(uro:UndergroundBuilding・z<0 の箱)→ 抽出と z 範囲
 """
 from __future__ import annotations
 
@@ -12,6 +14,7 @@ import importlib.util
 import math
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -234,3 +237,253 @@ def test_triangulate_3d_preserves_winding(ring, expect):
         n = _tri_normal(p, t)
         dot = sum(a * b for a, b in zip(n, expect))
         assert dot > 0, f"面が反転: tri={t} normal={n} expect={expect}"
+
+
+# ------------------------------------------------------------- terrain ラスタ化
+def test_rasterize_planar_tin_recovers_gradient():
+    """平面 TIN(z=a*x+b*y+c)を格子点群として与え、2m 格子へ最近傍3頂点距離加重
+    ラスタ化 → 内部セルで定数勾配を ±0.2m で復元することを確認。"""
+    a, b, c = 0.02, -0.01, 30.0
+    step = 4.0
+    coords = np.arange(-40.0, 40.0 + step, step)
+    pts = [(float(x), float(y), a * x + b * y + c) for x in coords for y in coords]
+    P = np.asarray(pts, dtype=np.float64)
+
+    x0, y0, cell = -30.0, -30.0, 2.0
+    nx = int(round((30.0 - x0) / cell)) + 1
+    ny = nx
+    H = PE.rasterize_tin_to_grid(P, x0, y0, cell, nx, ny, bucket_m=12.0, k=3)
+
+    assert np.isfinite(H).all()
+    max_err = 0.0
+    for j in range(2, ny - 2):
+        for i in range(2, nx - 2):
+            x = x0 + i * cell
+            y = y0 + j * cell
+            expect = a * x + b * y + c
+            max_err = max(max_err, abs(H[j, i] - expect))
+    assert max_err < 0.2, f"平面復元誤差が大きい: {max_err:.3f} m"
+
+
+def test_rasterize_empty_points_returns_nan():
+    H = PE.rasterize_tin_to_grid(np.zeros((0, 3)), 0.0, 0.0, 2.0, 5, 5)
+    assert H.shape == (5, 5)
+    assert np.isnan(H).all()
+
+
+# ------------------------------------------------------------- extras (ubld)
+def _ubld_xml(gml_id, surfaces):
+    """uro:UndergroundBuilding + bldg:lod1Solid(CompositeSurface)の合成 XML。"""
+    parts = [f'<uro:UndergroundBuilding gml:id="{gml_id}">',
+             "<bldg:lod1Solid><gml:Solid><gml:exterior><gml:CompositeSurface>"]
+    for _surf_type, pts in surfaces:
+        txt = " ".join(f"{lat} {lon} {z}" for (lat, lon, z) in pts)
+        parts.append(
+            "<gml:surfaceMember><gml:Polygon><gml:exterior><gml:LinearRing>"
+            f"<gml:posList>{txt}</gml:posList>"
+            "</gml:LinearRing></gml:exterior></gml:Polygon></gml:surfaceMember>")
+    parts.append("</gml:CompositeSurface></gml:exterior></gml:Solid></bldg:lod1Solid>")
+    parts.append("</uro:UndergroundBuilding>")
+    return "".join(parts)
+
+
+def _write_ubld(tmp_path, bodies):
+    header = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<core:CityModel '
+        'xmlns:core="http://www.opengis.net/citygml/2.0" '
+        'xmlns:bldg="http://www.opengis.net/citygml/building/2.0" '
+        'xmlns:uro="https://www.geospatial.jp/iur/uro/3.2" '
+        'xmlns:gml="http://www.opengis.net/gml">')
+    body = "".join(
+        f"<core:cityObjectMember>{b}</core:cityObjectMember>" for b in bodies)
+    p = tmp_path / "53393596_ubld_6697_op.gml"
+    p.write_text(header + body + "</core:CityModel>", encoding="utf-8")
+    return p
+
+
+def test_extract_ubld_underground_box(tmp_path):
+    # 原点近くの LOD1 直方体(z=[0,12] 生標高)。ground0=15 差引きで z<0 が正常。
+    surf = _cuboid_surfaces(35.6600, 139.7010, 0.0002, 0.0002, 12.0)
+    gml = _write_ubld(tmp_path, [_ubld_xml("ubld_test_A", surf)])
+
+    res = PE.extract_features([gml], LAT0, LON0, {"UndergroundBuilding"},
+                              clip_rect=None, axis=None)
+    structs = res["structures"]
+    assert len(structs) == 1
+    assert res["axis"] == (0, 1)               # 緯度先の sniff
+    s = structs[0]
+    assert s["gml_id"] == "ubld_test_A"
+    assert s["lod"] == "LOD1"                   # lod1Solid → LOD1
+    assert s["n_tris"] == 12                    # 6面×2
+    assert s["verts"].shape == (24, 3)
+    assert res["counts"]["lod1"] == 1
+
+    U_V, U_F, U_off = PE._assemble_mesh(structs, ground0=15.0)
+    assert U_V.dtype == np.float32 and U_F.dtype == np.int32
+    assert U_V.shape == (24, 3)
+    assert U_F.shape == (12, 3)
+    assert U_off.tolist() == [0, 12]           # 1 構造・offset 規約
+    # ground0=15 差引きで全頂点 z<0(地下)
+    assert U_V[:, 2].max() < 0.0
+    assert float(U_V[:, 2].min()) == pytest.approx(-15.0, abs=1e-3)
+    assert float(U_V[:, 2].max()) == pytest.approx(-3.0, abs=1e-3)
+
+
+def test_extract_features_clip_excludes_far(tmp_path):
+    near = _cuboid_surfaces(35.6600, 139.7010, 0.0002, 0.0002, 12.0)
+    far = _cuboid_surfaces(35.6800, 139.7010, 0.0002, 0.0002, 12.0)
+    gml = _write_ubld(tmp_path, [_ubld_xml("near", near), _ubld_xml("far", far)])
+    clip = [-300.0, -300.0, 300.0, 300.0]
+    res = PE.extract_features([gml], LAT0, LON0, {"UndergroundBuilding"},
+                              clip_rect=clip, axis=(0, 1))
+    assert [s["gml_id"] for s in res["structures"]] == ["near"]
+    assert res["counts"]["skipped_clip"] == 1
+
+
+# ------------------------------------------------------------- 出力ファイル契約
+def _brid_xml(gml_id, surfaces):
+    """brid:Bridge + boundedBy 各面 lod2MultiSurface(実データと同じ幾何経路)。"""
+    parts = [f'<brid:Bridge gml:id="{gml_id}">']
+    for surf_type, pts in surfaces:
+        txt = " ".join(f"{lat} {lon} {z}" for (lat, lon, z) in pts)
+        parts.append(
+            f"<brid:boundedBy><brid:{surf_type}>"
+            "<brid:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember>"
+            "<gml:Polygon><gml:exterior><gml:LinearRing>"
+            f"<gml:posList>{txt}</gml:posList>"
+            "</gml:LinearRing></gml:exterior></gml:Polygon>"
+            "</gml:surfaceMember></gml:MultiSurface></brid:lod2MultiSurface>"
+            f"</brid:{surf_type}></brid:boundedBy>")
+    parts.append("</brid:Bridge>")
+    return "".join(parts)
+
+
+def _write_gml(tmp_path, name, bodies, extra_ns=""):
+    header = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<core:CityModel '
+        'xmlns:core="http://www.opengis.net/citygml/2.0" '
+        'xmlns:bldg="http://www.opengis.net/citygml/building/2.0" '
+        'xmlns:brid="http://www.opengis.net/citygml/bridge/2.0" '
+        'xmlns:dem="http://www.opengis.net/citygml/relief/2.0" '
+        'xmlns:uro="https://www.geospatial.jp/iur/uro/3.2" '
+        f'{extra_ns}'
+        'xmlns:gml="http://www.opengis.net/gml">')
+    body = "".join(
+        f"<core:cityObjectMember>{b}</core:cityObjectMember>" for b in bodies)
+    p = tmp_path / name
+    p.write_text(header + body + "</core:CityModel>", encoding="utf-8")
+    return p
+
+
+def _write_map(tmp_path, nodes):
+    import json
+    m = {"meta": {"crs": "local-m"}, "nodes": nodes,
+         "edges": [], "buildings": [], "pois": []}
+    p = tmp_path / "map.json"
+    p.write_text(json.dumps(m), encoding="utf-8")
+    return p
+
+
+def _write_index(out_dir, ground0):
+    import json
+    (out_dir / "plateau_index.json").write_text(
+        json.dumps({"ground0": ground0}), encoding="utf-8")
+
+
+def test_run_extras_npz_contract(tmp_path):
+    """run_extras が契約キー ubld_V/ubld_F/brid_V/brid_F を V=float32(n,3)・
+    F=int32(m,3)・カテゴリ内 0-based で書き出すことを検証(下流契約の固定)。"""
+    citygml_dir = tmp_path / "bldg"      # bldg タイル無しでも mesh_codes は算出される
+    ubld_dir = tmp_path / "ubld"
+    brid_dir = tmp_path / "brid"
+    dem_dir = tmp_path / "dem"
+    out_dir = tmp_path / "out"
+    for d in (citygml_dir, ubld_dir, brid_dir, dem_dir, out_dir):
+        d.mkdir()
+    _write_index(out_dir, 15.0)
+    map_path = _write_map(tmp_path, [{"x": 0.0, "y": 0.0}, {"x": 40.0, "y": 40.0}])
+
+    usurf = _cuboid_surfaces(35.6600, 139.7010, 0.0002, 0.0002, 12.0)  # z[0,12]
+    _write_gml(ubld_dir, "53393596_ubld_6697_op.gml",
+               [_ubld_xml("ubld_A", usurf)])
+    bsurf = _cuboid_surfaces(35.6598, 139.7008, 0.0002, 0.0002, 20.0)  # z[0,20]
+    _write_gml(brid_dir, "53393596_brid_6697_op.gml",
+               [_brid_xml("brid_A", bsurf)])
+
+    PE.run_extras(str(citygml_dir), str(map_path), str(out_dir), str(dem_dir),
+                  str(ubld_dir), str(brid_dir), (LAT0, LON0), 150.0, 50.0)
+
+    npz = np.load(out_dir / "extras.npz")
+    assert {"ubld_V", "ubld_F", "brid_V", "brid_F"} <= set(npz.files)
+    for vkey, fkey in (("ubld_V", "ubld_F"), ("brid_V", "brid_F")):
+        V, F = npz[vkey], npz[fkey]
+        assert V.dtype == np.float32 and V.shape[1] == 3
+        assert F.dtype == np.int32 and F.shape[1] == 3
+        # カテゴリ内 0-based: 全 F インデックスが該当 V の範囲内
+        assert F.min() >= 0 and F.max() < V.shape[0]
+    # ubld は地下(ground0=15 差引きで z<0)
+    assert npz["ubld_V"][:, 2].max() < 0.0
+
+
+def test_run_terrain_npz_contract(tmp_path):
+    """run_terrain が契約キー heights を float32・単位メートル・(ny,nx) で書き出し、
+    terrain.json に quant を含めない(x0/y0/cell_m/nx/ny/ground0/n_tin_points)ことを検証。"""
+    import json
+    citygml_dir = tmp_path / "bldg"
+    dem_dir = tmp_path / "dem"
+    out_dir = tmp_path / "out"
+    for d in (citygml_dir, dem_dir, out_dir):
+        d.mkdir()
+    _write_index(out_dir, 15.0)
+    map_path = _write_map(tmp_path, [{"x": 0.0, "y": 0.0}, {"x": 20.0, "y": 20.0}])
+
+    # 原点周りの平面 DEM: elev = 15 + 0.02*x - 0.01*y(local-m を lat/lon へ戻して posList 化)
+    tris = []
+    step = 8.0
+    xs = np.arange(-80.0, 120.0 + step, step)
+    ys = np.arange(-80.0, 120.0 + step, step)
+
+    def node(x, y):
+        lat, lon = PE.local_to_latlon(x, y, LAT0, LON0)
+        return (lat, lon, 15.0 + 0.02 * x - 0.01 * y)
+
+    for xi in range(len(xs) - 1):
+        for yi in range(len(ys) - 1):
+            a = node(xs[xi], ys[yi])
+            b = node(xs[xi + 1], ys[yi])
+            c = node(xs[xi + 1], ys[yi + 1])
+            d = node(xs[xi], ys[yi + 1])
+            tris.append((a, b, c))
+            tris.append((a, c, d))
+
+    tri_xml = ["<gml:Triangle><gml:exterior><gml:LinearRing><gml:posList>"
+               + " ".join(f"{la} {lo} {z}" for (la, lo, z) in (t[0], t[1], t[2], t[0]))
+               + "</gml:posList></gml:LinearRing></gml:exterior></gml:Triangle>"
+               for t in tris]
+    relief = ('<dem:ReliefFeature gml:id="dem_r"><dem:reliefComponent>'
+              '<dem:TINRelief gml:id="dem_t"><dem:tin><gml:TriangulatedSurface>'
+              '<gml:trianglePatches>' + "".join(tri_xml)
+              + '</gml:trianglePatches></gml:TriangulatedSurface></dem:tin>'
+              '</dem:TINRelief></dem:reliefComponent></dem:ReliefFeature>')
+    _write_gml(dem_dir, "533935_dem_6697_op.gml", [relief])
+
+    PE.run_terrain(str(citygml_dir), str(map_path), str(out_dir), str(dem_dir),
+                   (LAT0, LON0), 150.0, 50.0, cell_m=2.0, terrain_buffer=50.0)
+
+    meta = json.loads((out_dir / "terrain.json").read_text(encoding="utf-8"))
+    assert set(meta) >= {"x0", "y0", "cell_m", "nx", "ny", "ground0",
+                         "n_tin_points"}
+    assert "quant" not in meta
+    assert meta["n_tin_points"] > 0
+
+    npz = np.load(out_dir / "terrain.npz")
+    assert "heights" in npz.files
+    H = npz["heights"]
+    assert H.dtype == np.float32
+    assert H.shape == (meta["ny"], meta["nx"])
+    # 原点セル(x0+i*cell≈0, y0+j*cell≈0)は z=elev-ground0≈0
+    i0 = int(round((0.0 - meta["x0"]) / meta["cell_m"]))
+    j0 = int(round((0.0 - meta["y0"]) / meta["cell_m"]))
+    assert abs(float(H[j0, i0])) < 0.3
