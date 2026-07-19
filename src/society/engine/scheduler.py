@@ -12,6 +12,7 @@ import math
 
 from .. import annual as annual_mod
 from .. import commerce as commerce_mod
+from .. import conversation as conversation_mod
 from .. import disaster as disaster_mod
 from .. import diversity as diversity_mod
 from .. import freedom_p2 as freedom_p2_mod
@@ -1447,6 +1448,16 @@ def _phase_drive(sim, step: int, sim_min: int) -> None:
         if granted and null_series:                # 対照: 発火に紐付けたダミー呼び出し
             _null_calls(sim, agent, step, sim_min)
     sim.drive_stats = stats
+
+
+def _phase_c2(sim, step: int, sim_min: int) -> None:
+    """会話3層 C2/C3(P2 S3)。既定 OFF=完全 no-op(新 stream c2_meet を引かず・conversation 0 件)。
+
+    _phase_drive とは独立の新フェーズ。空間索引(sim.percept_index)で同席・会話可能な対を
+    決定論列挙し、専用 stream で構造化会話(LLMなし)を成立させる。オーケストレータ本体は
+    src/society/conversation.py(関係/意見/語彙/drive を呼ぶだけ=追加 LLM 呼ゼロ)。C2→C1 昇格は
+    drive ゲージを押し上げ、次以降の step の _phase_drive が既存経路でフル発話を発火する。"""
+    conversation_mod.run_phase(sim, step, sim_min)
 
 
 def _feed_texts(sim, agent, step: int, sim_min: int) -> list[str]:
@@ -3312,6 +3323,8 @@ def run_step(sim, step: int) -> None:
         sim.agents, float(sim.cfg.world.perception_radius_m))
     worldview_mod.phase(sim, step, sim_min)        # 主観的世界モデル: 期待の検証と更新(既定OFF=no-op。第20バッチ)
     _phase_drive(sim, step, sim_min)               # 欲求→申請→抽選→発火権
+    _phase_c2(sim, step, sim_min)                  # 会話3層 C2/C3(既定OFF=no-op。P2 S3)。
+                                                   # drive 押し上げは次 step の _phase_drive が拾う
 
     active = [a for a in sim.agents
               if a.loc != "outside" and not a.sleeping]   # 外・睡眠中=計算しない

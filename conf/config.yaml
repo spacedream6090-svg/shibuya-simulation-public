@@ -392,6 +392,29 @@ drive:
     recovery_rate: 0.01         # 自発回復の基準率(毎 step theta_drift を 0 へ)
     max_abs: 0.15               # |theta_drift| の可動域(clip[0.30,0.85] と二重で暴走防止)
 
+# ---- 会話3層 C2/C3(P2 スライス S3。docs/plans/p2-interstitial-design.md §1 S3)----
+# 「記録に残る会話」を LLM コスト0 で大量に生む主レバー(interstitial-life.md §4.3)。既定 OFF。
+# ON 時: 空間索引で同席・会話可能な対を決定論列挙し、専用 stream `c2_meet` で構造化会話(挨拶→話題
+#   →スタンス→同意/反論→別れの Dialogue Act 遷移。実文は作らない)を成立させる。話題・トーン・帰結は
+#   両者の状態(関係値・opinion・共有語彙)からの決定論写像。機械効果は既存資産を呼ぶだけ:
+#   関係更新(relations)・意見更新(opinion の FJ・k 非依存)・語彙接触(labels の complex contagion)・
+#   drive ゲージ加算(addressed)。1 会話 1 件の conversation イベント(軽量)を記録。帰結が顕著
+#   (強い意見差・関係の転機・未知語接触)なら drive を余分に押し上げ、次 step の _phase_drive が
+#   フル LLM 発話(C1)を自然に発火する(C2→C1 昇格)。C3=すれ違いは会話イベントを作らず日次カウンタのみ。
+# c2 パラメータ(成立確率・cooldown・1日上限/人)で密度を調整する。初期値は mock 24step 実測で
+#   「ON 時 ~30 会話/人日」を狙って置いた(在場密度依存=較正値。密な本番では下げて調整する)。
+# R1: 新 stream は c2_meet 1本のみ・既定 OFF で conversation 0 件=ゴールデン L1 バイト一致・追加 LLM 呼
+#   ゼロ(呼数 k 非依存)・no-fingerprint(opinion/relations の不透明値のみ)。production.yaml は触らない。
+conversation:
+  enabled: false                # ★ON 推奨(本番): true(記録に残る会話密度=C2 を有効化)
+  c2:
+    meet_prob: 0.8              # 同席・会話可能な1対あたり毎step の会話成立確率(c2_meet 抽選)
+    cooldown_steps: 2           # 会話後にその個体が次の C2 に入れるまでの step 数(連発の抑制)
+    daily_cap: 40               # 1人1日あたりの C2 会話の上限(暴走防止・現実レンジ上限側)
+    align_agree: 0.72           # opinion 整合度がこれ以上=同意スタンス
+    align_oppose: 0.38          # opinion 整合度がこれ以下=反論スタンス(強い意見差=昇格材料)
+    tier_friendly: 1            # 関係 tier がこれ以上(または count>=2)で友好トーン寄り
+
 # ---- 朝の一日計画(ユーザー要望 2026-07-06)----
 # 起床(来街者は帰還)直後に1回、LLM で「今日一日の予定(2〜5個)」を立て、それが
 # LLM 非駆動時のルールベース行動(routine)の行き先の土台になる。呼数は k 非依存(R1)。

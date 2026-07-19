@@ -177,6 +177,8 @@ register_event_kind("loan_repay",      "融資の返済(定期返済・完済・
 register_event_kind("interest_paid",   "預金利息の付与(日次/週次){amount, balance}")
 register_event_kind("vc_investment",   "ベンチャー出資の実行(トラクション/ネットワーク審査){venture, amount, equity}")
 register_event_kind("memory_fail",     "想起の失敗(活性化が閾値未達=思い出せない){query, activation, tau}")
+# ---- 会話3層 C2(P2 S3。構造化会話=LLMなし。既定 OFF。設計: docs/plans/p2-interstitial-design.md §1 S3)----
+register_event_kind("conversation",    "構造化会話 C2(実文なし・機械効果のみ。1会話1件){with, topic, tone, outcome, acts}")
 
 
 @dataclass
