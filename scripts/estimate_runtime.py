@@ -20,6 +20,17 @@
         [--calib runs/demo_event_200a3d [runs/...]] \
         [--sec-per-call 3.1] [--overhead 0.15] [--start "09:00"]
 
+    # 本選フリート(7GPU vLLM)+ 予算ゲート + LOD + 非LLM を織り込んだ試算:
+    python scripts/estimate_runtime.py --agents 10000 --days 1 \
+        --calib runs/demo_event_200a3d --fleet vllm-7gpu-a100 \
+        [--speculative] [--prefix-cache] [--lod-fg-ratio 0.1] [--nonllm-profile full]
+
+フリート(--fleet)は「フリートの実効並列 req/s」から sec/呼を導く(呼数/日 ÷ req/s =
+秒/シミュ日)。予算ゲート(--cap-per-step)は deliberate を step 上限で飽和させ、素の α を
+大 N へ外挿したときの桁違いの過大評価を防ぐ。LOD(--lod-fg-ratio)は前景=フルLLM・背景=
+軽量として実効 LLM 呼数を割り引く(非LLM 物理 step は割引かない)。数値の根拠と不確実性は
+docs/research/scale-feasibility.md。
+
 依存: numpy + pyarrow + 標準ライブラリのみ(pandas/duckdb 不使用)。
 """
 from __future__ import annotations
@@ -57,6 +68,69 @@ BUILTIN_G = 0.05
 # 実測でカバーしている範囲(これを超える外挿には警告を出す)
 MEASURED_AGENT_RANGE = (15, 200)
 MEASURED_DAY_RANGE = (1, 3)
+
+# ── 予算ゲート(deliberate 飽和)と呼種内訳 ────────────────────────────────
+# conf/config.yaml lod.max_llm_per_step。deliberate 系(reply/social/…)は step
+# あたりこの上限で頭打ち。plan/reflect は budget を通らず N にほぼ線形に伸びる。
+DEFAULT_CAP_PER_STEP = 300
+# runs/demo_event_200a3d の purpose 内訳: 予算ゲート対象(deliberate 系合計=
+# llm_deliberate=12229)/ 非ゲート(plan 419 + reflect 513 = 932)/ 総 13161。
+DELIB_FRACTION = 12229 / 13161        # ≈ 0.929(実測)= 予算ゲートで飽和しうる割合
+UNCAPPED_ALPHA = 1.0                  # plan+reflect は体あたり概ね一定=線形近似
+
+# ── 非LLM(Python 側 step 処理)コスト ────────────────────────────────────
+# LLM 呼と別に、全 agent の物理 step(知覚/欲求/移動/イベント記録)が毎 step 走る。
+# LOD(前景比率)では減らない(背景個体も物理 step は回る)。2 つの実測アンカー:
+#   LEAN: mock 300体×100日=132分(compute-efficiency.md)→ 0.00183 秒/agent-step。
+#         LLM をスタブ化した軽量ラン=Python 下限。
+#   FULL: runs/demo_event_200a3d(200体・全チャネル)の実測 wall からの分離推定。
+#         ckpt144→ckpt432=515.7分(2シミュ日)/ LLM逐次=(4493+4375)×3.1=458.2分 →
+#         非LLM ≈ 28.7分/シミュ日 = 0.060 秒/agent-step(全チャネル+イベント記録IO)。
+# 両者は 33 倍開く。真値は有効チャネル数と観測IOの最適化度に依存(scale-feasibility.md §4)。
+NONLLM_SEC_PER_AGENT_STEP_LEAN = 0.00183
+NONLLM_SEC_PER_AGENT_STEP_FULL = 0.060
+NONLLM_PROFILES = {
+    "none": 0.0,
+    "lean": NONLLM_SEC_PER_AGENT_STEP_LEAN,
+    "full": NONLLM_SEC_PER_AGENT_STEP_FULL,
+}
+
+# ── LOD(agent-tier)既定 ─────────────────────────────────────────────────
+DEFAULT_LOD_BG_FACTOR = 0.1           # 背景個体の呼数=前景の 1/10(agent-lod-deepdive.md)
+
+# ── フリート(推論バックエンド)プリセット ────────────────────────────────
+# req/s は「プロンプト ~1,300tok 入力 + ~320tok 生成」という本シミュ呼形状での
+# 1GPU あたり実効リクエスト毎秒。qwen3:4b 級(dense, bf16)を仮定。
+# ★重要(捏造回避): 4B×1300/320 の *measured* 公開値は存在しない。A100/H100 の
+#   req/s は近傍実測(Gemma-3-4B ≈ 3,385 out tok/s @ A100-40GB・100/600・databasemart)
+#   + FLOP/帯域モデルからの **推定**。本選前に必ず実測で置換すること:
+#     vllm bench serve --random-input-len 1300 --random-output-len 320 で数点。
+#   出典と不確実性の詳細は docs/research/scale-feasibility.md §2。
+# spec_mult: 高並列 regime の現実値 1.0〜1.3(vLLM spec-decode blog は QPS≈1 で最大2.8x
+#   だが本シミュの飽和運転は逆 regime=減速もあり得る)。apc_mult: ペルソナ+履歴の
+#   共有接頭辞キャッシュ 1.8〜3.0(SqueezeBits・共有が無いと逆に −37%)。
+FLEET_PRESETS = {
+    "ollama-local": {
+        "kind": "sequential", "n_gpus": 1, "sec_per_call": 3.1,
+        "spec_mult": 1.0, "apc_mult": 1.0,
+        "note": "ローカル ollama 逐次(実測 3.1 秒/呼・並列なし)",
+    },
+    "vllm-7gpu-a100": {
+        "kind": "throughput", "n_gpus": 7, "req_per_s_per_gpu": 8.0,  # 推定 range 6–12
+        "spec_mult": 1.15, "apc_mult": 2.2,
+        "note": "A100 80GB×7・4B bf16・1300in/320out 推定 8 req/s/GPU(range 6–12)",
+    },
+    "vllm-7gpu-h100": {
+        "kind": "throughput", "n_gpus": 7, "req_per_s_per_gpu": 14.0,  # 推定 range 10–20
+        "spec_mult": 1.15, "apc_mult": 2.2,
+        "note": "H100 80GB×7・A100比~1.7x(HBM3)推定 14 req/s/GPU(range 10–20)",
+    },
+    "vllm-7gpu-a5000": {
+        "kind": "throughput", "n_gpus": 7, "req_per_s_per_gpu": 3.0,  # 推定 range 2–5
+        "spec_mult": 1.15, "apc_mult": 2.2,
+        "note": "A5000 24GB×7(本選想定機)・4bit・A100比~0.35x 推定 3 req/s/GPU(range 2–5)",
+    },
+}
 
 
 # ── 較正データ読み取り ────────────────────────────────────────────────────
@@ -149,6 +223,50 @@ def predict_calls(c1: float, n_calib: float, alpha: float, g: float,
     return [float(c1) * scale * (1.0 + float(g)) ** (d - 1) for d in range(1, days + 1)]
 
 
+def predict_calls_capped(c1: float, n_calib: float, alpha: float, g: float,
+                         agents: float, days: int, *,
+                         steps_per_day: int = DEFAULT_STEPS_PER_DAY,
+                         cap_per_step: int = DEFAULT_CAP_PER_STEP,
+                         delib_fraction: float = DELIB_FRACTION,
+                         uncapped_alpha: float = UNCAPPED_ALPHA,
+                         lod_mult: float = 1.0) -> list[float]:
+    """予算ゲート(deliberate 飽和)を織り込んだ日別予測呼数。
+
+    呼を 2 成分に分ける(内訳は runs/demo_event_200a3d 実測):
+      ・deliberate 系(delib_fraction)= budget ゲート。N^α で伸びるが 1 step あたり
+        cap_per_step で頭打ち → 大 N では飽和(N 非依存)。
+      ・plan/reflect 系(1 − delib_fraction)= 非ゲート。N^uncapped_alpha(≈線形)。
+    lod_mult は両成分の *需要* を割り引く(背景個体の呼数減)。cap は割引後の需要に掛かる。
+    cap_per_step<=0 なら上限なし = 素の α 外挿(過大評価=上限値)。
+
+    ★これが素の predict_calls との決定的差: α=1.209 を 1万体超へ素で外挿すると
+      deliberate を桁で過大評価する(200体で ~28/step → cap 300 は ~1,500体で binding)。
+    """
+    scale_d = (float(agents) / float(n_calib)) ** float(alpha)
+    scale_u = (float(agents) / float(n_calib)) ** float(uncapped_alpha)
+    delib1 = float(c1) * float(delib_fraction) * scale_d * float(lod_mult)
+    uncap1 = float(c1) * (1.0 - float(delib_fraction)) * scale_u * float(lod_mult)
+    cap_day = (float(cap_per_step) * float(steps_per_day)
+               if cap_per_step and cap_per_step > 0 else math.inf)
+    out = []
+    for d in range(1, days + 1):
+        gm = (1.0 + float(g)) ** (d - 1)
+        delib = min(delib1 * gm, cap_day)
+        uncap = uncap1 * gm
+        out.append(delib + uncap)
+    return out
+
+
+def lod_call_multiplier(fg_ratio: float, bg_factor: float = DEFAULT_LOD_BG_FACTOR) -> float:
+    """前景比率と背景係数から実効呼数倍率を返す。
+
+    前景 = フル LLM(1.0)、背景 = 呼数 bg_factor(既定 1/10)。
+    mult = fg + (1−fg)×bg_factor。fg=1 で 1.0(=LOD なし)、fg=0 で bg_factor。
+    """
+    fg = min(max(float(fg_ratio), 0.0), 1.0)
+    return fg + (1.0 - fg) * float(bg_factor)
+
+
 def format_hms(seconds: float) -> str:
     """秒を「X時間Y分」(1 時間未満は「Y分」)へ。四捨五入分。"""
     total_min = int(round(seconds / 60.0))
@@ -229,6 +347,44 @@ def build_calibration(calib_dirs: list[Path], *, steps_per_day: int = DEFAULT_ST
                        n_runs=len(runs), points=points)
 
 
+# ── フリート(推論バックエンド)解決 ──────────────────────────────────────
+@dataclass
+class Fleet:
+    name: str
+    kind: str            # "sequential" | "throughput"
+    n_gpus: int
+    sec_per_call: float  # 実効 秒/呼(throughput は 1/実効 req_s)
+    req_per_s: float     # 実効 集約 req/s(sequential は 1/sec_per_call)
+    speculative: bool
+    prefix_cache: bool
+    note: str
+
+
+def resolve_fleet(name: str, *, speculative: bool = False,
+                  prefix_cache: bool = False) -> Fleet:
+    """プリセット名から実効 sec/呼(=1/実効 req_s)を導く。
+
+    throughput: 実効 req_s = req_per_s_per_gpu × n_gpus ×(spec)×(apc)。
+    sequential: 実測 sec_per_call をそのまま(並列なし)。
+    """
+    if name not in FLEET_PRESETS:
+        raise ValueError(f"未知のフリート: {name}(選択肢: {', '.join(FLEET_PRESETS)})")
+    p = FLEET_PRESETS[name]
+    if p["kind"] == "sequential":
+        spc = float(p["sec_per_call"])
+        return Fleet(name, "sequential", int(p["n_gpus"]), spc, 1.0 / spc,
+                     False, False, p["note"])
+    base = float(p["req_per_s_per_gpu"]) * int(p["n_gpus"])
+    mult = 1.0
+    if speculative:
+        mult *= float(p["spec_mult"])
+    if prefix_cache:
+        mult *= float(p["apc_mult"])
+    req_s = base * mult
+    return Fleet(name, "throughput", int(p["n_gpus"]), 1.0 / req_s, req_s,
+                 bool(speculative), bool(prefix_cache), p["note"])
+
+
 # ── 外挿警告 ──────────────────────────────────────────────────────────────
 def extrapolation_warnings(agents: int, days: int, calib: Calibration) -> list[str]:
     """実測範囲(15〜200体・1〜3日)を超える外挿への警告リスト。"""
@@ -252,25 +408,59 @@ def extrapolation_warnings(agents: int, days: int, calib: Calibration) -> list[s
 def build_report(agents: int, days: int, calib: Calibration, *,
                  sec_per_call: float = DEFAULT_SEC_PER_CALL,
                  overhead: float = DEFAULT_OVERHEAD,
-                 start: datetime | None = None) -> dict:
-    """予測の全数値をまとめた dict を返す(表示にも試験にも使う)。"""
-    calls = predict_calls(calib.c1, calib.n_calib, calib.alpha, calib.g, agents, days)
+                 start: datetime | None = None,
+                 steps_per_day: int = DEFAULT_STEPS_PER_DAY,
+                 cap_per_step: int | None = None,
+                 lod_call_mult: float = 1.0,
+                 delib_fraction: float = DELIB_FRACTION,
+                 uncapped_alpha: float = UNCAPPED_ALPHA,
+                 nonllm_sec_per_agent_step: float = 0.0,
+                 fleet: Fleet | None = None) -> dict:
+    """予測の全数値をまとめた dict を返す(表示にも試験にも使う)。
+
+    cap_per_step が真: 予算ゲート付き(predict_calls_capped)。None/0: 素の α 外挿。
+    lod_call_mult: LOD 実効呼数倍率(LLM 呼のみ割引・非LLM 物理 step は割引かない)。
+    nonllm_sec_per_agent_step: 1 agent・1 step あたりの非LLM(Python)壁時間。
+    既定(cap=None, lod=1.0, nonllm=0.0)は従来と同一挙動(後方互換)。
+    """
+    if cap_per_step and cap_per_step > 0:
+        calls = predict_calls_capped(
+            calib.c1, calib.n_calib, calib.alpha, calib.g, agents, days,
+            steps_per_day=steps_per_day, cap_per_step=cap_per_step,
+            delib_fraction=delib_fraction, uncapped_alpha=uncapped_alpha,
+            lod_mult=lod_call_mult)
+    else:
+        base = predict_calls(calib.c1, calib.n_calib, calib.alpha, calib.g, agents, days)
+        calls = [c * float(lod_call_mult) for c in base]
     per_call = sec_per_call * (1.0 + overhead)
+    nonllm_day = float(steps_per_day) * float(agents) * float(nonllm_sec_per_agent_step)
     rows = []
     cum = 0.0
+    llm_total = 0.0
+    nonllm_total = 0.0
     for d, cd in enumerate(calls, start=1):
-        day_sec = cd * per_call
+        llm_sec = cd * per_call
+        day_sec = llm_sec + nonllm_day
+        llm_total += llm_sec
+        nonllm_total += nonllm_day
         cum += day_sec
         eta = (start + timedelta(seconds=cum)) if start is not None else None
-        rows.append({"day": d, "calls": cd, "day_sec": day_sec,
-                     "cum_sec": cum, "eta": eta})
+        rows.append({"day": d, "calls": cd, "llm_sec": llm_sec, "nonllm_sec": nonllm_day,
+                     "day_sec": day_sec, "cum_sec": cum, "eta": eta})
     total_calls = float(sum(calls))
     total_sec = cum
+    # 1 シミュ日あたり代表値(day1)と「24h で回せるシミュ日数」。
+    per_simday_sec = rows[0]["day_sec"] if rows else 0.0
+    sim_days_per_24h = (86400.0 / per_simday_sec) if per_simday_sec > 0 else float("inf")
     return {
         "agents": agents, "days": days, "rows": rows,
         "total_calls": total_calls, "total_sec": total_sec,
+        "llm_sec": llm_total, "nonllm_sec": nonllm_total,
+        "per_simday_sec": per_simday_sec, "sim_days_per_24h": sim_days_per_24h,
         "sec_per_call": sec_per_call, "overhead": overhead,
-        "calib": calib,
+        "cap_per_step": cap_per_step, "lod_call_mult": float(lod_call_mult),
+        "nonllm_sec_per_agent_step": float(nonllm_sec_per_agent_step),
+        "fleet": fleet, "calib": calib,
         "warnings": extrapolation_warnings(agents, days, calib),
     }
 
@@ -286,8 +476,28 @@ def render_report(rep: dict) -> str:
                f"  C1(day1呼数)={calib.c1:.0f}")
     out.append(f"   α = {calib.alpha:.3f}  [{calib.alpha_method}]")
     out.append(f"   g = {calib.g*100:.2f}%/日  [{calib.g_method}]")
-    out.append(f"   sec/call = {rep['sec_per_call']:.2f}  overhead = {rep['overhead']*100:.0f}%"
-               f"  (実効 {rep['sec_per_call']*(1+rep['overhead']):.2f} 秒/呼)")
+    fleet: Fleet | None = rep.get("fleet")
+    if fleet is not None and fleet.kind == "throughput":
+        levers = []
+        if fleet.speculative:
+            levers.append("spec")
+        if fleet.prefix_cache:
+            levers.append("apc")
+        lv = ("+" + "+".join(levers)) if levers else ""
+        out.append(f"   fleet = {fleet.name}{lv}  {fleet.n_gpus}GPU"
+                   f"  実効 {fleet.req_per_s:.1f} req/s"
+                   f"  (= {rep['sec_per_call']:.4f} 秒/呼)")
+    else:
+        out.append(f"   sec/call = {rep['sec_per_call']:.2f}  overhead = {rep['overhead']*100:.0f}%"
+                   f"  (実効 {rep['sec_per_call']*(1+rep['overhead']):.3f} 秒/呼)")
+    if rep.get("cap_per_step"):
+        out.append(f"   予算ゲート = {rep['cap_per_step']}/step  "
+                   f"(deliberate {DELIB_FRACTION*100:.0f}% は飽和・plan+reflect は α={UNCAPPED_ALPHA} 線形)")
+    if rep.get("lod_call_mult", 1.0) != 1.0:
+        out.append(f"   LOD 実効呼数倍率 = {rep['lod_call_mult']:.3f}  (前景=フルLLM・背景=1/10 等)")
+    if rep.get("nonllm_sec_per_agent_step", 0.0) > 0:
+        out.append(f"   非LLM = {rep['nonllm_sec_per_agent_step']:.5f} 秒/agent-step"
+                   f"  (全 {rep['agents']} 体の物理 step・LOD で減らない)")
     out.append("-" * 64)
     has_eta = rep["rows"] and rep["rows"][0]["eta"] is not None
     header = f" {'日':>3} | {'予測呼数':>9} | {'日所要':>10} | {'累積所要':>11}"
@@ -304,6 +514,14 @@ def render_report(rep: dict) -> str:
     out.append("-" * 64)
     out.append(f" 総呼数 {rep['total_calls']:.0f}  総所要 {format_hms(rep['total_sec'])}"
                f"  ({rep['total_sec']/3600:.1f} 時間)")
+    if rep.get("nonllm_sec", 0.0) > 0:
+        out.append(f"   内訳: LLM {format_hms(rep['llm_sec'])}"
+                   f"  +  非LLM {format_hms(rep['nonllm_sec'])}"
+                   f"  (非LLM {rep['nonllm_sec']/max(rep['total_sec'],1e-9)*100:.0f}%)")
+    sd = rep.get("sim_days_per_24h", float("inf"))
+    sd_str = "∞" if sd == float("inf") else f"{sd:.1f}"
+    out.append(f"   1シミュ日 ≈ {format_hms(rep['per_simday_sec'])}"
+               f"  → 24h で {sd_str} シミュ日/日")
     if rep["warnings"]:
         out.append("-" * 64)
         out.append(" [外挿警告]")
@@ -339,12 +557,28 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--days", type=int, required=True, help="試算したい日数")
     ap.add_argument("--calib", type=str, nargs="*", default=[],
                     help="較正ラン dir(複数可)。未指定なら内蔵既定値で試算")
-    ap.add_argument("--sec-per-call", type=float, default=DEFAULT_SEC_PER_CALL,
-                    help=f"1 呼あたり秒(既定 {DEFAULT_SEC_PER_CALL}・qwen3:4b 実測)")
+    ap.add_argument("--fleet", type=str, default=None, choices=list(FLEET_PRESETS),
+                    help="推論バックエンドのプリセット(sec/呼を実効 req/s から導出)")
+    ap.add_argument("--speculative", action="store_true",
+                    help="speculative decoding を適用(フリートの spec_mult)")
+    ap.add_argument("--prefix-cache", action="store_true",
+                    help="prefix cache(APC)を適用(フリートの apc_mult・共有接頭辞前提)")
+    ap.add_argument("--sec-per-call", type=float, default=None,
+                    help=f"1 呼あたり秒を明示(既定: --fleet か {DEFAULT_SEC_PER_CALL}・qwen3:4b 実測)")
     ap.add_argument("--overhead", type=float, default=DEFAULT_OVERHEAD,
                     help=f"オーバーヘッド率(既定 {DEFAULT_OVERHEAD})")
     ap.add_argument("--alpha", type=float, default=None, help="体数スケール指数 α を明示指定")
     ap.add_argument("--g", type=float, default=None, help="日成長率 g を明示指定(0.05 等)")
+    ap.add_argument("--cap-per-step", type=int, default=DEFAULT_CAP_PER_STEP,
+                    help=f"deliberate の step 上限(既定 {DEFAULT_CAP_PER_STEP}=config.yaml。0 で上限なし=素の α 外挿)")
+    ap.add_argument("--lod-fg-ratio", type=float, default=1.0,
+                    help="前景エージェント比率(1.0=全員フルLLM。0.1 等で背景を割引)")
+    ap.add_argument("--lod-bg-factor", type=float, default=DEFAULT_LOD_BG_FACTOR,
+                    help=f"背景個体の呼数係数(既定 {DEFAULT_LOD_BG_FACTOR}=前景の1/10)")
+    ap.add_argument("--nonllm-profile", type=str, default="lean", choices=list(NONLLM_PROFILES),
+                    help="非LLM(Python step)コスト: none/lean(mock 0.00183)/full(実測 0.060 秒/agent-step)")
+    ap.add_argument("--nonllm-sec-per-agent-step", type=float, default=None,
+                    help="非LLM秒/agent-step を明示(--nonllm-profile より優先)")
     ap.add_argument("--steps-per-day", type=int, default=DEFAULT_STEPS_PER_DAY,
                     help=f"1 日のステップ数(既定 {DEFAULT_STEPS_PER_DAY})")
     ap.add_argument("--start", type=str, default=None,
@@ -369,9 +603,32 @@ def main(argv: list[str]) -> int:
         except ValueError:
             print(f"[警告] --start の形式が不正(HH:MM): {args.start}", file=sys.stderr)
 
+    # フリート解決 → 実効 sec/呼(明示 --sec-per-call が最優先)。
+    fleet = None
+    if args.fleet:
+        fleet = resolve_fleet(args.fleet, speculative=args.speculative,
+                              prefix_cache=args.prefix_cache)
+    if args.sec_per_call is not None:
+        sec_per_call = args.sec_per_call
+    elif fleet is not None:
+        sec_per_call = fleet.sec_per_call
+    else:
+        sec_per_call = DEFAULT_SEC_PER_CALL
+
+    # 非LLM 秒/agent-step(明示 > プロファイル)。
+    if args.nonllm_sec_per_agent_step is not None:
+        nonllm = args.nonllm_sec_per_agent_step
+    else:
+        nonllm = NONLLM_PROFILES[args.nonllm_profile]
+
+    lod_mult = lod_call_multiplier(args.lod_fg_ratio, args.lod_bg_factor)
+    cap = args.cap_per_step if args.cap_per_step and args.cap_per_step > 0 else None
+
     rep = build_report(args.agents, args.days, calib,
-                       sec_per_call=args.sec_per_call, overhead=args.overhead,
-                       start=start)
+                       sec_per_call=sec_per_call, overhead=args.overhead,
+                       start=start, steps_per_day=args.steps_per_day,
+                       cap_per_step=cap, lod_call_mult=lod_mult,
+                       nonllm_sec_per_agent_step=nonllm, fleet=fleet)
     print(render_report(rep))
     return 0
 

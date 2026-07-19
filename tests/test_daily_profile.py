@@ -62,11 +62,12 @@ def test_uses_300_rosters():
 
 def test_production_profile_unchanged_by_comparison():
     """土台の production.yaml の較正値が生きている= daily とは別物であることの担保。
-    term_days は第37バッチで 30→90(選挙フル現実化: 30日3期制を廃止し、100日ランで
-    告示→立候補→SNTV改選を1回観測する圧縮。council-vs-reality.md 参照)。"""
+    assembly は第38バッチで名簿制へ(ユーザー決定 2026-07-19: 本番ラン内で選挙はしない。
+    議員は persona で事前決定・realism 選挙は実験用に温存)。"""
     prod = load_config(profile=REPO / "conf" / "production.yaml")
     assert prod.disaster.enabled is True
-    assert int(prod.institution_routes.assembly.term_days) == 90
-    assert prod.institution_routes.assembly.realism.enabled is True
+    assert prod.institution_routes.assembly.from_roster is True
+    assert int(prod.institution_routes.assembly.term_days) == 99999
+    assert prod.institution_routes.assembly.realism.enabled is False
     assert int(prod.economy.accounts.eviction_days) == 30
     assert int(prod.run.n_agents) == 100

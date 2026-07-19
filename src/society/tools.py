@@ -107,6 +107,11 @@ def build_routes_cfg(raw) -> dict:
         # size 人の議会を選び、提案の採決は露出者でなく議会が行う=代表による意思決定の歪みが入る。
         "assembly": {
             "enabled": bool(asm.get("enabled", False)),
+            # 名簿制議会(ユーザー決定 2026-07-19・既定 False=現行の選挙挙動と完全同一=ゴールデン維持)。
+            # True: 選挙をせず persona の occupation が議員(下の COUNCILOR_OCCS)の住民を id 昇順で
+            # size 人まで議会に据え、ラン内は改選しない(term_days を無視=任期継続=議員として生活する)。
+            # 名簿に議員が0人なら警告のうえ従来の選挙へフォールバック(正直な縮退)。
+            "from_roster": bool(asm.get("from_roster", False)),
             "size": int(asm.get("size", 9)),                # 議席数
             "term_days": int(asm.get("term_days", 30)),     # 任期(日)。満了で改選
             # 議会選挙の現実化(渋谷区議会準拠。制度深化3 batch37。既定 OFF=現行の意見最近傍選挙と
@@ -152,6 +157,12 @@ def routes_of(sim) -> dict:
     return cfg
 
 
+# 名簿制議会(ユーザー決定 2026-07-19: 本番シミュ内で選挙は行わない。あらかじめ persona で議員と
+# 決まっている住民が議員として生活する)。persona の occupation がこれらのいずれかなら議員と見なす
+# (scheduler の POLICE_OCCS と同じ「occupation 文字列一致」の流儀。同義語も拾う)。
+COUNCILOR_OCCS = ("議員", "区議会議員", "区議", "市議会議員", "市議", "councilor", "councillor")
+
+
 def elect_assembly(sim, step: int, sim_min: int) -> None:
     """代表制議会の改選(制度深化3 2026-07-08。既定 OFF=完全 no-op)。
 
@@ -164,6 +175,10 @@ def elect_assembly(sim, step: int, sim_min: int) -> None:
     asm = routes["assembly"]
     if not asm["enabled"]:
         return
+    if asm["from_roster"]:                              # 名簿制議会(選挙をせず名簿から組成・改選しない)
+        if _seat_from_roster(sim, step, sim_min, asm):
+            return                                      # 組成した or 既に名簿制で着席=以後改選しない
+        # 名簿に議員が0人 → 警告済み。従来動作(下の選挙)へフォールバック(正直な縮退)
     if asm["realism"]["enabled"]:                      # 議会選挙の現実化(batch37。既定 OFF=下は不変)
         _assembly_realism(sim, step, sim_min, asm)
         return
@@ -194,6 +209,44 @@ def elect_assembly(sim, step: int, sim_min: int) -> None:
         a = sim.agent_by_id.get(aid)
         if a is not None:
             a.remember("議会の議員に選ばれた", importance_bonus=0.4)
+
+
+def _seat_from_roster(sim, step, sim_min, asm) -> bool:
+    """名簿制議会(ユーザー決定 2026-07-19)= 選挙をせず persona の occupation が議員(COUNCILOR_OCCS)の
+    住民をそのまま議会に据える。決定論・非LLM・乱数なし。
+
+    - 議員は id 昇順・size 超過分は切り捨て・不足でもそのまま(補充選挙はしない)。
+    - from_roster ON の間は一度組成したら**改選しない**(term_days を無視して任期継続=議員として生活)。
+    - council_elected は互換のため出す(payload に from_roster:true)。
+    戻り値: 組成した or 既に名簿制で着席済みなら True(呼び出し側はここで return=以後改選なし)。
+    名簿に議員が0人なら一度だけ警告 print し False を返す(呼び出し側で従来の選挙へフォールバック)。"""
+    cur = getattr(sim, "council", None)
+    if cur is not None and cur.get("from_roster"):
+        return True                                     # 既に名簿制で着席=改選しない(任期継続)
+    council_ids = sorted(a.id for a in sim.agents
+                         if not a.visitor
+                         and str(getattr(a, "occupation", "")) in COUNCILOR_OCCS)
+    if not council_ids:                                 # 名簿に議員0人 → 従来の選挙へフォールバック
+        if not getattr(sim, "_roster_warned", False):
+            print("[assembly] from_roster が ON ですが persona に occupation=議員 の住民が0人のため、"
+                  "従来の選挙へフォールバックします(名簿を確認してください)。")
+            sim._roster_warned = True
+        return False
+    size = max(1, int(asm["size"]))
+    members = council_ids[:size]                        # id 昇順・size 超過は切り捨て・不足でもそのまま
+    day = sim_min // 1440
+    sim.council = {"members": members, "elected_day": day, "term": 1, "from_roster": True}
+    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
+                         kind="council_elected", x=0.0, y=0.0,
+                         payload={"term": 1, "day": day, "members": members,
+                                  "from_roster": True, "n_candidates": len(council_ids)}))
+    sim.net.publish_news("区議会の構成",
+                         f"名簿の区議 {len(members)} 人が議員として街で暮らしている", [], step)
+    for aid in members:
+        a = sim.agent_by_id.get(aid)
+        if a is not None:
+            a.remember("区議会議員として街で暮らしている", importance_bonus=0.4)
+    return True
 
 
 # ================================================================ 議会選挙の現実化(batch37・realism ON)

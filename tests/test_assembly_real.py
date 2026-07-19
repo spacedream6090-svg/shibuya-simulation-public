@@ -293,3 +293,95 @@ def test_realism_on_deterministic(tmp_path):
         sim.run()
         return _l1(sim)
     assert run("det_a") == run("det_b"), "realism ON で非決定論(イベント列が一致しない)"
+
+
+# ===================================================================== 名簿制議会(from_roster)
+# ユーザー決定 2026-07-19: 本番シミュ内で選挙は行わない。あらかじめ persona で議員と決まっている
+# 住民が議員として生活する。realism 実装は資産として温存し、名簿制(from_roster)を別途足す。
+def _seat_roster(sim, occ_by_index):
+    """全 agent を住民(非来街者)にし、指定 index を議員 occupation・他を非議員にする合成名簿。"""
+    for a in sim.agents:
+        a.visitor = False
+        a.occupation = "会社員"
+    for idx, occ in occ_by_index.items():
+        sim.agents[idx].occupation = occ
+
+
+def test_from_roster_cfg_default_false():
+    """from_roster は正準化で既定 False(=現行の選挙挙動を触らない=ゴールデン維持)。"""
+    from society.tools import build_routes_cfg
+    assert build_routes_cfg(None)["assembly"]["from_roster"] is False
+
+
+def test_from_roster_seats_councilors_without_election(tmp_path):
+    """from_roster ON + 議員2人の合成名簿 → 選挙なしで2人が id 昇順で議会入り。
+    council_elected の payload に from_roster:true。改選しない(再呼び出しで議会不変)。"""
+    from society.tools import elect_assembly
+    sim = _sim(tmp_path, "roster_on", n=8,
+               **{"institution_routes.assembly.enabled": "true",
+                  "institution_routes.assembly.from_roster": "true",
+                  "institution_routes.assembly.size": "9"})
+    sim.run()                                              # day0=名簿に議員0人→フォールバック選挙
+    _seat_roster(sim, {0: "議員", 1: "区議会議員"})        # 同義語(区議会議員)も議員として拾う
+    want = sorted([sim.agents[0].id, sim.agents[1].id])
+    sim.council = None
+    n_before = len(_kind(sim, "council_elected"))
+    elect_assembly(sim, step=0, sim_min=0)
+    ce = _kind(sim, "council_elected")
+    assert len(ce) == n_before + 1, "名簿制で council_elected が出ていない"
+    assert ce[-1].payload["from_roster"] is True, "payload に from_roster:true が無い"
+    assert ce[-1].payload["members"] == want, "議員2人が id 昇順で議会入りしていない"
+    assert sim.council["members"] == want
+    assert sim.council.get("from_roster") is True
+    assert not _kind(sim, "candidacy"), "名簿制なのに立候補(選挙)が発生している"
+    # 改選しない: term_days を無視し、後日呼んでも council_elected は増えない(任期継続)
+    elect_assembly(sim, step=200 * 144, sim_min=200 * 1440)
+    assert len(_kind(sim, "council_elected")) == n_before + 1, "名簿制で改選が起きた(任期継続でない)"
+    assert sim.council["members"] == want
+
+
+def test_from_roster_truncates_to_size(tmp_path):
+    """議員が size を超えたら id 昇順で size 人に切り捨て(補充選挙はしない)。"""
+    from society.tools import elect_assembly
+    sim = _sim(tmp_path, "roster_trunc", n=8,
+               **{"institution_routes.assembly.enabled": "true",
+                  "institution_routes.assembly.from_roster": "true",
+                  "institution_routes.assembly.size": "2"})
+    sim.run()
+    _seat_roster(sim, {0: "議員", 1: "議員", 2: "議員"})   # 議員3人・定数2
+    ids = sorted([sim.agents[0].id, sim.agents[1].id, sim.agents[2].id])
+    sim.council = None
+    elect_assembly(sim, step=0, sim_min=0)
+    assert sim.council["members"] == ids[:2], "size 超過分が id 昇順で切り捨てられていない"
+    assert sim.council.get("from_roster") is True
+
+
+def test_from_roster_falls_back_when_no_councilors(tmp_path, capsys):
+    """名簿に議員0人 → 警告 print のうえ従来の選挙へフォールバック(council が座る・candidacy は出ない)。"""
+    sim = _sim(tmp_path, "roster_none", n=8,
+               **{"institution_routes.assembly.enabled": "true",
+                  "institution_routes.assembly.from_roster": "true",
+                  "institution_routes.assembly.size": "3"})
+    sim.run()                                             # day0=議員0人→警告+フォールバック選挙
+    out = capsys.readouterr().out
+    assert "from_roster" in out and "フォールバック" in out, "0人時の警告 print が出ていない"
+    assert sim.council and sim.council["members"], "フォールバック選挙で議会が座っていない"
+    assert sim.council.get("from_roster") is not True, "0人なのに名簿制で座っている(縮退が不正直)"
+    assert _kind(sim, "council_elected"), "フォールバックで従来の council_elected が出ていない"
+    assert not _kind(sim, "candidacy"), "選挙 realism OFF なので candidacy は出ないはず"
+
+
+def test_from_roster_off_matches_plain_assembly(tmp_path):
+    """from_roster 既定/明示 OFF は素の議会と L1 完全一致(seam が no-op=既存挙動不変)。"""
+    plain = _sim(tmp_path, "roster_off_plain", n=12, steps=40,
+                 **{"institution_routes.assembly.enabled": "true",
+                    "institution_routes.assembly.size": "5"})
+    plain.run()
+    off = _sim(tmp_path, "roster_off_explicit", n=12, steps=40,
+               **{"institution_routes.assembly.enabled": "true",
+                  "institution_routes.assembly.size": "5",
+                  "institution_routes.assembly.from_roster": "false"})
+    off.run()
+    assert _l1(plain) == _l1(off), "from_roster 明示 OFF が素の議会と不一致(seam が no-op でない)"
+    for k in ("candidacy", "election_result"):
+        assert not _kind(plain, k), f"from_roster OFF 素の議会で {k} が出ている"

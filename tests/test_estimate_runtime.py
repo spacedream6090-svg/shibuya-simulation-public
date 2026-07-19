@@ -191,6 +191,112 @@ def test_no_extrapolation_warning_in_range(tmp_path):
     assert warns == []
 
 
+# ── フリート解決 ──────────────────────────────────────────────────────────
+def test_resolve_fleet_sequential():
+    f = er.resolve_fleet("ollama-local")
+    assert f.kind == "sequential" and f.n_gpus == 1
+    assert f.sec_per_call == pytest.approx(3.1)
+    assert f.req_per_s == pytest.approx(1.0 / 3.1)
+
+
+def test_resolve_fleet_throughput_and_levers():
+    f = er.resolve_fleet("vllm-7gpu-a100")
+    assert f.kind == "throughput" and f.n_gpus == 7
+    assert f.req_per_s == pytest.approx(8.0 * 7)        # 56 req/s
+    assert f.sec_per_call == pytest.approx(1.0 / 56.0)
+    # speculative / prefix cache は乗算で効く
+    assert er.resolve_fleet("vllm-7gpu-a100", speculative=True).req_per_s \
+        == pytest.approx(56.0 * 1.15)
+    assert er.resolve_fleet("vllm-7gpu-a100", prefix_cache=True).req_per_s \
+        == pytest.approx(56.0 * 2.2)
+    both = er.resolve_fleet("vllm-7gpu-a100", speculative=True, prefix_cache=True)
+    assert both.req_per_s == pytest.approx(56.0 * 1.15 * 2.2)
+    assert both.speculative and both.prefix_cache
+
+
+def test_resolve_fleet_unknown_raises():
+    with pytest.raises(ValueError):
+        er.resolve_fleet("does-not-exist")
+
+
+# ── LOD 呼数倍率 ──────────────────────────────────────────────────────────
+def test_lod_call_multiplier():
+    assert er.lod_call_multiplier(1.0) == pytest.approx(1.0)          # 全員前景
+    assert er.lod_call_multiplier(0.0, 0.1) == pytest.approx(0.1)     # 全員背景=bg_factor
+    assert er.lod_call_multiplier(0.1, 0.1) == pytest.approx(0.19)    # 前景10%
+    assert er.lod_call_multiplier(0.03, 0.1) == pytest.approx(0.03 + 0.97 * 0.1)
+    assert er.lod_call_multiplier(2.0) == pytest.approx(1.0)          # クランプ(>1)
+    assert er.lod_call_multiplier(-1.0, 0.2) == pytest.approx(0.2)    # クランプ(<0)
+
+
+# ── 予算ゲート付き予測 ────────────────────────────────────────────────────
+def test_predict_calls_capped_saturates():
+    c1, ncal, alpha = 4293.0, 200.0, 1.209
+    calls = er.predict_calls_capped(c1, ncal, alpha, 0.0, 100_000, 1,
+                                    steps_per_day=144, cap_per_step=300,
+                                    delib_fraction=er.DELIB_FRACTION, uncapped_alpha=1.0)
+    cap_day = 300 * 144
+    uncap = c1 * (1.0 - er.DELIB_FRACTION) * (100_000 / 200.0)  # 線形成分
+    assert calls[0] == pytest.approx(cap_day + uncap)
+    # 素の α 外挿より大幅に小さい(deliberate が飽和するため)
+    assert calls[0] < er.predict_calls(c1, ncal, alpha, 0.0, 100_000, 1)[0]
+
+
+def test_predict_calls_capped_uncapped_matches_naive():
+    # cap 無効 + delib_fraction=1(全部 α 成分)+ lod=1 → 素の predict_calls と一致
+    naive = er.predict_calls(1000, 100, 1.3, 0.05, 500, 3)
+    capped = er.predict_calls_capped(1000, 100, 1.3, 0.05, 500, 3,
+                                     cap_per_step=0, delib_fraction=1.0, lod_mult=1.0)
+    assert capped == pytest.approx(naive)
+
+
+def test_predict_calls_capped_lod_scales_below_cap():
+    # cap 無効なら lod_mult は線形に効く
+    full = er.predict_calls_capped(4293, 200, 1.209, 0.0, 1000, 1,
+                                   cap_per_step=0, delib_fraction=1.0, lod_mult=1.0)
+    half = er.predict_calls_capped(4293, 200, 1.209, 0.0, 1000, 1,
+                                   cap_per_step=0, delib_fraction=1.0, lod_mult=0.5)
+    assert half[0] == pytest.approx(full[0] * 0.5)
+
+
+# ── build_report: 非LLM / cap / LOD / fleet 配線 ──────────────────────────
+def test_build_report_nonllm_and_simdays(tmp_path):
+    rd = _write_run(tmp_path / "r", 100, [1000])
+    calib = er.build_calibration([rd])
+    rep = er.build_report(100, 1, calib, sec_per_call=1.0, overhead=0.0,
+                          steps_per_day=144, nonllm_sec_per_agent_step=0.01)
+    # N=N_calib → 呼数 1000。LLM=1000s / 非LLM=144×100×0.01=144s / 総=1144s
+    assert rep["llm_sec"] == pytest.approx(1000.0)
+    assert rep["nonllm_sec"] == pytest.approx(144.0)
+    assert rep["total_sec"] == pytest.approx(1144.0)
+    assert rep["per_simday_sec"] == pytest.approx(1144.0)
+    assert rep["sim_days_per_24h"] == pytest.approx(86400.0 / 1144.0)
+
+
+def test_build_report_cap_and_lod_reduce_calls(tmp_path):
+    rd = _write_run(tmp_path / "r", 200, [4293])
+    calib = er.build_calibration([rd])
+    capped = er.build_report(50_000, 1, calib, cap_per_step=300, steps_per_day=144)
+    naive = er.build_report(50_000, 1, calib, cap_per_step=None)
+    assert capped["total_calls"] < naive["total_calls"]   # 予算ゲートで頭打ち
+    lod = er.build_report(50_000, 1, calib, cap_per_step=300, steps_per_day=144,
+                          lod_call_mult=er.lod_call_multiplier(0.1))
+    assert lod["total_calls"] < capped["total_calls"]      # LOD で更に減
+
+
+def test_build_report_fleet_wiring(tmp_path):
+    fleet = er.resolve_fleet("vllm-7gpu-a100")
+    rd = _write_run(tmp_path / "r", 200, [4293])
+    calib = er.build_calibration([rd])
+    rep = er.build_report(10_000, 1, calib, sec_per_call=fleet.sec_per_call,
+                          overhead=er.DEFAULT_OVERHEAD, cap_per_step=300,
+                          steps_per_day=144, fleet=fleet)
+    # 秒/呼 = (1/56)×(1+overhead)。総所要 = 総呼数 × 秒/呼(非LLM=0)
+    per_call = (1.0 / 56.0) * (1.0 + er.DEFAULT_OVERHEAD)
+    assert rep["total_sec"] == pytest.approx(rep["total_calls"] * per_call)
+    assert rep["fleet"].name == "vllm-7gpu-a100"
+
+
 # ══════════════════════════════ make_hub ══════════════════════════════════
 def test_md_to_html():
     md = "# 見出し\n\n- 項目**強調**\n\n---\n本文 `code` です"
