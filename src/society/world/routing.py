@@ -10,6 +10,11 @@ import networkx as nx
 
 from .map import DRIVABLE, NO_BICYCLE, CityMap
 
+# networkx 3.x は astar_path を dispatch 層(サードパーティバックエンドの有無を毎呼
+# 走査する)で包む。素の実装 __wrapped__ を直接呼べば同一アルゴリズム・同一経路の
+# まま走査コストを丸ごと省ける。__wrapped__ が無い版はそのまま使う。
+_ASTAR = getattr(nx.astar_path, "__wrapped__", nx.astar_path)
+
 
 def _allowed(mode: str, klass: str) -> bool:
     if mode == "car":
@@ -62,13 +67,16 @@ class Router:
                 if src not in g or dst not in g:
                     self._cache[key] = None
                 else:
+                    node_xy = self.city.node_xy
+                    hypot = math.hypot
+
                     def h(a: str, b: str) -> float:
-                        ax, ay = self.city.node_xy(a)
-                        bx, by = self.city.node_xy(b)
-                        return math.hypot(ax - bx, ay - by)
+                        ax, ay = node_xy(a)
+                        bx, by = node_xy(b)
+                        return hypot(ax - bx, ay - by)
                     try:
-                        self._cache[key] = nx.astar_path(g, src, dst,
-                                                         heuristic=h, weight="length")
+                        self._cache[key] = _ASTAR(g, src, dst,
+                                                  heuristic=h, weight="length")
                     except nx.NetworkXNoPath:
                         self._cache[key] = None
             if self._cache[key] is not None:

@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import json
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict
 
@@ -88,11 +89,14 @@ def _load() -> Dict[str, int]:
     return _LEXICON
 
 
+@lru_cache(maxsize=65536)
 def valence(text: str) -> float:
     """日本語短文の感情価を [-1, 1] で返す(決定論・純標準ライブラリ)。
 
     正なら肯定的、負なら否定的、0.0 は中立(または感情語なし)。
     同一入力に対し常に同一値を返す。例外は送出しない。
+    同一入力に冪等なため有界メモ化している(タイムライン順位付けが同一投稿を
+    繰り返し採点する構造で呼数が桁で減る。辞書はプロセス内で1回ロード=不変)。
     """
     if not text:
         return 0.0
