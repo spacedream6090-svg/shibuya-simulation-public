@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 
+from . import commerce as commerce_mod
 from . import status as status_mod
 from .cognition import drive
 from .factors import update as factor_update
@@ -721,8 +722,22 @@ class Tools:
     # -- 5. open_venture ---------------------------------------------------
     def _open_venture(self, sim, agent, action, step, sim_min) -> None:
         cost = self.cfg["venture_cost"]
-        if agent.money < cost or agent.id in self.ventures:
-            return                                     # 所持金不足/1人1店(防御)
+        if agent.id in self.ventures:
+            return                                     # 1人1店(防御)
+        from .engine import scheduler
+        bank_funded = False
+        if agent.money < cost:
+            # 出店費の現金不足点(E-W1・既定 OFF): bank ON なら不足分を融資(口座へ)。以後は
+            # money+account から出店費を充当する。bank OFF は所持金不足=従来どおり出店しない(不変)。
+            if scheduler._bank_on(sim):
+                need = cost - (agent.money + agent.account)
+                if need > 0.0:
+                    scheduler._maybe_loan(sim, agent, need, step, sim_min)
+                if agent.money + agent.account + 1e-9 < cost:
+                    return                             # 融資後も不足=出店できない
+                bank_funded = True
+            else:
+                return                                 # 所持金不足(従来と完全同一)
         name = str(action.get("name", "")).strip()
         if not name:
             return
@@ -752,7 +767,12 @@ class Tools:
                           {"name": name, "outcome": "denied"})
                 agent.remember(f"「{name}」の出店許可が下りなかった")
                 return
-        agent.money = max(0.0, agent.money - cost)
+        if bank_funded:                                # money を先に使い、不足分を口座から充当(E-W1 融資)
+            from_acc = max(0.0, cost - agent.money)
+            agent.money = max(0.0, agent.money - cost)
+            agent.account = max(0.0, agent.account - from_acc)
+        else:
+            agent.money = max(0.0, agent.money - cost)
         venture = {"owner": agent.id, "node": agent.node, "name": name,
                    "offer": offer, "price": self.cfg["venture_price"],
                    "opened_step": step, "last_sale_step": step + permit_steps,
@@ -784,6 +804,7 @@ class Tools:
         self._flyers_expire(sim, step, sim_min)
         self._ventures_close(sim, step, sim_min)
         self._ventures_fulltime(sim, step, sim_min)   # 起業転換(Wave G5・既定 OFF=no-op)
+        self._vc_review(sim, step, sim_min)           # E-W2 VC 定期審査(既定 OFF=no-op)
         self._group_joins(sim, step, sim_min)
         self._proposal_support(sim, step, sim_min)
 
@@ -1001,6 +1022,62 @@ class Tools:
             self._log_node(sim, step, sim_min, owner, v["node"], "venture_fulltime",
                            {"name": v["name"], "node": v["node"]})
             agent.remember(f"「{v['name']}」を本業にした")
+
+    def _vc_fund(self, sim, vccfg):
+        """VC ファンド VCFund を遅延構築して返す(_bank/_gov と同型)。原資が枯れると出資停止。"""
+        fund = getattr(sim, "vc_fund", None)
+        if fund is None:
+            fund = commerce_mod.VCFund(vccfg)
+            sim.vc_fund = fund
+        return fund
+
+    def _vc_review(self, sim, step, sim_min) -> None:
+        """E-W2 VC 定期審査(§4・既定 OFF=vc_investment 0 件=バイト一致)。review_period_days ごとに
+        開店中の全 venture を traction(累計売上)/ market(在館数)/ network(関係次数)で決定論
+        スコアリングし、閾値超の上位 n_deals へ ticket を出資(owner.account へ入金)。判定は
+        observables のみ=k 非依存(R1)。出資は口座前提(accounts ON)。乱数を引かない(決定論)。"""
+        econ = getattr(sim, "economy", {}) or {}
+        vccfg = econ.get("vc") or {}
+        if not vccfg.get("enabled"):
+            return
+        from .engine import scheduler
+        if not scheduler._accounts_on(sim):            # 出資は owner.account へ入金=accounts 前提
+            return
+        day = sim_min // 1440
+        period = max(1, int(vccfg["review_period_days"]))
+        if day % period != 0 or getattr(sim, "_vc_review_day", -1) == day:
+            return
+        sim._vc_review_day = day
+        fund = self._vc_fund(sim, vccfg)
+        scored = []
+        for owner in sorted(self.ventures):
+            v = self.ventures[owner]
+            if step < int(v.get("open_at", 0)):        # 営業許可待ち=審査対象外
+                continue
+            if owner in fund.equity:                    # 既に出資済み=対象外(1店1回)
+                continue
+            agent = sim.agent_by_id.get(owner)
+            if agent is None:
+                continue
+            occ = commerce_mod.occupancy(sim, v["node"])           # market 代理(在館数)
+            deg = len(agent.mem.relations)                          # network 代理(関係次数)
+            s = commerce_mod.vc_score(v.get("sales_total", 0.0), occ, deg, vccfg)
+            scored.append((owner, s))
+        for owner, s in commerce_mod.vc_candidates(scored, vccfg):
+            if not fund.can_invest():
+                break                                   # 原資枯渇=出資停止(§4 希少性=競争)
+            agent = sim.agent_by_id.get(owner)
+            v = self.ventures.get(owner)
+            if agent is None or v is None:
+                continue
+            amount = fund.invest(owner)                 # ticket を支出・持分を加算
+            agent.account += amount
+            self._log_node(sim, step, sim_min, owner, v["node"], "vc_investment",
+                           {"venture": v["name"], "amount": round(amount, 1),
+                            "equity": round(fund.equity.get(owner, 0.0), 3),
+                            "score": round(s, 4),
+                            "account": round(agent.account, 1)})
+            agent.remember(f"「{v['name']}」に出資を受けた")
 
     def _group_joins(self, sim, step, sim_min) -> None:
         prob = self.cfg["group_join_prob"]
@@ -1411,21 +1488,32 @@ class Tools:
             p = min(1.0, self.cfg["buy_prob"] * mult) if mult != 1.0 else self.cfg["buy_prob"]
             if rng.random() >= p:
                 continue
-            scheduler._spend(sim, agent, v["price"], "venture", step, sim_min)
+            # E-W3 消費行動(既定 OFF): 買い手の支払額を予算制約で置換(venture は budget_shares 外=
+            # 既定/consumption ON とも不変=会計保存)。買い手の払った額=店主の売上に一致させる。
+            sale = scheduler._budget_amount(sim, agent, "venture", v["price"])
+            scheduler._spend(sim, agent, sale, "venture", step, sim_min)
             owner = sim.agent_by_id.get(v["owner"])
             if owner is not None:
+                # E-W2 VC(既定 OFF): 出資先なら売上から配当を回収し、店主の取り分から差し引く。
+                div = 0.0
+                fund = getattr(sim, "vc_fund", None)
+                if fund is not None:
+                    div = fund.collect_dividend(v["owner"], sale)
+                net = sale - div
                 # 売上は口座へ入金(口座 E5 ON 時)。OFF 時は現金=従来と完全一致。
                 if scheduler._accounts_on(sim):
-                    owner.account += v["price"]
-                    owner.period_income += v["price"]
+                    owner.account += net
+                    owner.period_income += net
                 else:
-                    owner.money += v["price"]
+                    owner.money += net
                 v["last_sale_step"] = step
-                v["sales_total"] = v.get("sales_total", 0.0) + v["price"]  # 起業転換(G5)の累計
+                v["sales_total"] = v.get("sales_total", 0.0) + sale  # 起業転換(G5)/VC の traction 累計
+                sale_payload = {"amount": round(sale, 1),
+                                "balance": round(owner.money, 1), "buyer": agent.id}
+                if div > 0.0:                            # VC 出資先のみ配当を明記(既定 OFF=payload 不変)
+                    sale_payload["dividend"] = round(div, 1)
                 self._log_node(sim, step, sim_min, owner.id, v["node"],
-                               "venture_sale",
-                               {"amount": round(v["price"], 1),
-                                "balance": round(owner.money, 1), "buyer": agent.id})
+                               "venture_sale", sale_payload)
                 owner.remember(f"「{v['name']}」が売れた")
             agent.remember(f"「{v['name']}」で買い物した")
             return                                     # 1 到着につき1 購入

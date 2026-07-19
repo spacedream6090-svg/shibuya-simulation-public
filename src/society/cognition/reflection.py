@@ -192,12 +192,15 @@ def update_implicit_self(agent, ema: float) -> None:
 def _recall_query(agent, *, step: int, sim_min: int, llm, place_name: str,
                   logger: ObserverLogger, date_line: str | None = None,
                   weather_line: str | None = None,
-                  city_name: str = "") -> list[str]:
+                  city_name: str = "") -> tuple[list[str], str | None]:
     """agentic pull 第1段: 何を思い出したいかを LLM に出させ、mem.query で想起する。
 
     LLM 呼び出しを1本足す(R1: writeback 条件に依らず一定)。想起自体は決定論。
     date_line/weather_line は当日の暦・天気(既定 None=注入せず従来と完全一致)。
     city_name はプロンプト冒頭の街名(envpack。基盤に地名を残さない)。
+    戻り = (hits, fail_line)。ACT-R 有効かつ「手掛かりはあるが全候補が閾値未達」なら
+    memory_fail イベントを発火し「思い出そうとして失敗」の1行を fail_line で返す(ACT-R OFF
+    では query_ex.failed が常に False=fail_line None=memory_recall のみ=バイト一致)。
     """
     prompt = (build_prompt(agent, place_name=place_name, surprise=None,
                            nearby_names=[], step=step, city_name=city_name,
@@ -212,12 +215,27 @@ def _recall_query(agent, *, step: int, sim_min: int, llm, place_name: str,
                          "purpose": "recall", "step": step, "cached": cached})
     action = parse_action(response)
     query_text = action.get("query", "") if action and action.get("type") == "recall" else ""
-    hits = agent.mem.query(step, query_text, n=3) if query_text else []
+    fail_line: str | None = None
+    if query_text:
+        res = agent.mem.query_ex(step, query_text, n=3, agent_id=agent.id)
+        hits = res.hits
+        if res.failed:                   # 手掛かりはあるが全候補が閾値未達=思い出そうとして失敗
+            fail_line = f"({res.cue}のことを思い出そうとしたが、はっきりしない…)"
+            best = res.best_activation
+            logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                             kind="memory_fail", x=agent.x, y=agent.y,
+                             llm_call_id=call_id,
+                             payload={"query": res.cue,
+                                      "activation": (round(best, 3)
+                                                     if best is not None else None),
+                                      "tau": res.tau}))
+    else:
+        hits = []
     logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                      kind="memory_recall", x=agent.x, y=agent.y,
                      llm_call_id=call_id,
                      payload={"query": query_text, "n_hits": len(hits)}))
-    return hits
+    return hits, fail_line
 
 
 def maybe_reflect(agent, *, step: int, sim_min: int, writeback: str, alpha: float,
@@ -260,11 +278,13 @@ def maybe_reflect(agent, *, step: int, sim_min: int, writeback: str, alpha: floa
 
     # ---- agentic pull 第1段(常に+1呼。R1: writeback 条件に依らず一定)----
     recalled: list[str] = []
+    recall_fail: str | None = None       # ACT-R 有効時のみ「思い出そうとして失敗」の1行
     if agentic_pull:
-        recalled = _recall_query(agent, step=step, sim_min=sim_min, llm=llm,
-                                 place_name=place_name, logger=logger,
-                                 date_line=date_line, weather_line=weather_line,
-                                 city_name=city_name)
+        recalled, recall_fail = _recall_query(
+            agent, step=step, sim_min=sim_min, llm=llm,
+            place_name=place_name, logger=logger,
+            date_line=date_line, weather_line=weather_line,
+            city_name=city_name)
 
     # 深い内省の夜か。(1) 出来事誘発(第12バッチ・主経路): 衝撃ゲージの閾値超えが予約した
     # deep_due_day 以降の最初の夜(侵入的→熟慮的の遅延)。(2) レガシー固定周期(対照用)。
@@ -280,6 +300,7 @@ def maybe_reflect(agent, *, step: int, sim_min: int, writeback: str, alpha: floa
                            nearby_names=[], step=step, city_name=city_name,
                            date_line=date_line, weather_line=weather_line)
               + (f"\n思い出したこと: {' / '.join(recalled)}" if recalled else "")
+              + (f"\n{recall_fail}" if recall_fail else "")   # ACT-R OFF は None=1行も足さない
               + task)
     rng_key = f"reflect/{agent.id}/{step}"
     response, call_id, cached = llm.generate(
@@ -296,7 +317,8 @@ def maybe_reflect(agent, *, step: int, sim_min: int, writeback: str, alpha: floa
     if not discard:
         agent.mem.consolidate(step,
                               action.get("summary") if action else None,
-                              action.get("salient") if action else None)
+                              action.get("salient") if action else None,
+                              agent_id=agent.id)
 
     # ---- belief の書き戻し(k のゲート)。discard は書き戻さない ----
     written = False

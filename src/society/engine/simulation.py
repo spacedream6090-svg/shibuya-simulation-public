@@ -211,6 +211,8 @@ class Simulation:
         mcfg = cfg.get("memory", {}) or {}
         self.agentic_pull = bool(mcfg.get("agentic_pull", False))  # 内省の pull 想起
         self.relations_max = int(mcfg.get("relations_max", 0) or 0)  # B6: 関係台帳の上限(0=無制限)
+        # M-W(第37バッチ): ACT-R 活性化記憶。既定 OFF=agent.mem.actr は None のまま=バイト一致。
+        self.actrcfg = dict(mcfg.get("actr", {}) or {})
         # 社会関係の質(Wave G2 2026-07-07。既定 OFF=現行挙動と完全同一)。関係の深化段階(tier)・
         # 断絶/悪化(decay)・評判(reputation)・派閥(軽量)。決定論・RNG不要(既存 draw 順は不変)。
         from .. import relations as _relations_mod
@@ -466,6 +468,13 @@ class Simulation:
             agent.conv_turns_left = int(self.drivecfg["conv_max_turns"])
             agent.conv_cooldown_until = 0
             agent.mem.relations_max = self.relations_max   # B6: 台帳上限(既定0=無制限)
+            if self.actrcfg.get("enabled", False):
+                # 個体別シードは run.seed から決定論導出(専用streamのみで消費=既存draw順不変)
+                overrides = {k: v for k, v in self.actrcfg.items()
+                             if k not in ("enabled", "seed")}
+                base = int(self.actrcfg.get("seed", cfg.run.seed))
+                agent.mem.actr = agent.mem.actr_config(
+                    seed=base * 1_000_003 + agent.id, **overrides)
             self.agents.append(agent)
         self.agent_by_id = {a.id: a for a in self.agents}
         # 流入通勤者を朝の到着前=範囲外に置く(既存 visitor 帰還機構で朝 enter_area)。

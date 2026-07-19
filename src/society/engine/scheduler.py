@@ -28,6 +28,7 @@ from ..net import infoenv as infoenv_mod
 from ..cognition import deliberate, drive, planning, routine
 from ..cognition.reflection import maybe_reflect
 from ..economy import CIVIL_SERVANTS, civil_servant_pay, gig_profile, price_of
+from .. import economy as economy_mod
 from ..government import Government, build_government_cfg
 from .. import organizations, schedule, weather
 from ..world import calendar
@@ -140,6 +141,152 @@ def _accounts_on(sim) -> bool:
     """口座(銀行)概念 E5 が有効か(経済有効 かつ economy.accounts.enabled)。"""
     econ = getattr(sim, "economy", {}) or {}
     return bool(econ.get("enabled")) and bool(econ.get("accounts", {}).get("enabled"))
+
+
+# -------------------------------------------------------------- 経済深化 E(第37バッチ配線)
+# economy.py 冒頭 E セクションの純ロジック(consumption/payment/bank/vc・全て既定 OFF)を配線する。
+# 全機能 OFF 時は新経路を一切通さず・新 stream("payment")も引かない=バイト一致(ゴールデン)。
+# 判定は observables のみ(money/account/period_income/sales_total/occupancy/relations)= k 非依存(R1)。
+def _consumption_on(sim) -> bool:
+    """E-W3 消費行動が有効か(economy.consumption.enabled)。既定 OFF=budget 圧縮なし=消費額不変。"""
+    econ = getattr(sim, "economy", {}) or {}
+    return bool(econ.get("consumption", {}).get("enabled"))
+
+
+def _payment_on(sim) -> bool:
+    """E-W3 決済手段が有効か(economy.payment.enabled)。既定 OFF=spend payload に method を足さない。"""
+    econ = getattr(sim, "economy", {}) or {}
+    return bool(econ.get("payment", {}).get("enabled"))
+
+
+def _bank_on(sim) -> bool:
+    """E-W1 銀行が有効か(口座有効 かつ economy.bank.enabled)。融資/利息は口座前提。既定 OFF=完全 no-op。"""
+    econ = getattr(sim, "economy", {}) or {}
+    return bool(_accounts_on(sim) and econ.get("bank", {}).get("enabled"))
+
+
+def _bank(sim):
+    """銀行会計主体 Bank を遅延構築して返す(_gov と同型)。構築は乱数を引かず・ログもしない。"""
+    bank = getattr(sim, "bank", None)
+    if bank is None:
+        bank = economy_mod.Bank(sim.economy["bank"])
+        sim.bank = bank
+    return bank
+
+
+def _has_group(sim, agent) -> bool:
+    """連帯保証グループに属すか(§3 社会的担保=与信スコア加点の条件)。tools 無し/未所属は False。"""
+    tools = getattr(sim, "tools", None)
+    if tools is None:
+        return False
+    return bool(tools.member_of.get(agent.id))
+
+
+_BUDGET_CAT = {"taxi": "transport", "bus": "transport"}   # 消費カテゴリ→家計調査費目(§5)への写像
+
+
+def _budget_amount(sim, agent, cat: str, base_amount: float) -> float:
+    """E-W3 消費行動(既定 OFF): consumption.enabled なら個体の予算制約で base_amount を置換する。
+
+    OFF は base_amount をそのまま返す(乱数を引かない=決定論=バイト一致)。budget_shares に無い
+    カテゴリ(venture/fixed_cost 等)は budget_amount が base_amount を返す=不変(会計保存)。
+    交通(taxi/bus)は budget_shares の transport 費目へ写像する。income=period_income(月収相当)。"""
+    if not _consumption_on(sim):
+        return base_amount
+    ccfg = sim.economy["consumption"]
+    bcat = _BUDGET_CAT.get(cat, cat)
+    traits = getattr(agent, "traits", None) or {}
+    income = float(getattr(agent, "period_income", 0.0))
+    profile = economy_mod.consumption_profile(traits, income, ccfg)
+    return economy_mod.budget_amount(profile, bcat, base_amount, income,
+                                     float(sim.economy.get("fixed_cost_daily", 0.0)), ccfg)
+
+
+def _maybe_loan(sim, agent, need: float, step: int, sim_min: int,
+                *, income: float | None = None) -> float:
+    """E-W1 融資(既定 OFF): 現金不足点で銀行融資を試みる。承認され need≤loan_limit なら need を
+    口座へ入金し loan_grant をログして入金額を返す。OFF/非承認/上限超/既存融資あり/来街者は 0.0(不変)。
+
+    与信は observables のみ(income=period_income / assets=money+account / arrears_days /
+    グループ所属)= k 非依存(R1)。返済履歴は neutral 0.5。乱数を引かない=既存 draw 順を乱さない。
+    income を明示で渡せる(家賃引落は period_income を 0 にした後に呼ぶため、控除前の値を渡す)。"""
+    if not _bank_on(sim) or need <= 0.0 or agent.visitor:
+        return 0.0
+    bank = _bank(sim)
+    if agent.id in bank.loans:                          # 返済中の融資が残るなら重複融資しない
+        return 0.0
+    bcfg = sim.economy["bank"]
+    inc = float(agent.period_income if income is None else income)
+    assets = float(agent.money) + float(agent.account)
+    arrears = float(getattr(agent, "arrears_days", 0))
+    score = bank.score(inc, assets, 0.5, arrears, _has_group(sim, agent))
+    if not economy_mod.loan_approved(score, bcfg):
+        return 0.0
+    if float(need) > economy_mod.loan_limit(inc, bcfg):
+        return 0.0
+    day = sim_min // 1440
+    loan = bank.grant(agent.id, float(need), score, day)
+    agent.account += float(need)
+    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                         kind="loan_grant", x=agent.x, y=agent.y,
+                         payload={"amount": round(float(need), 1),
+                                  "rate": round(loan["rate"], 4),
+                                  "term_days": loan["term_days"],
+                                  "score": round(score, 4),
+                                  "account": round(agent.account, 1),
+                                  "total_due": round(loan["total_due"], 1)}))
+    return float(need)
+
+
+def _phase_bank_day(sim, step: int, sim_min: int) -> None:
+    """E-W1 融資の日次返済フェーズ(bank ON 時のみ)。loan_due の融資を repay_installment で回収し
+    口座から控除(loan_repay)。完済で loans から除去。延滞が default_arrears_days に達したら
+    bank.write_off + 未回収残を家賃滞納(rent_due)へ積んで既存 accounts の破産サイクルへ接続する。
+    OFF/融資なしは完全 no-op(loan_repay 0 件=バイト一致)。決定論(乱数なし)。"""
+    if not _bank_on(sim):
+        return
+    bank = _bank(sim)
+    if not bank.loans:
+        return
+    day = sim_min // 1440
+    if day == getattr(sim, "_bank_day", -1):
+        return
+    sim._bank_day = day
+    bcfg = sim.economy["bank"]
+    for aid in sorted(bank.loans):                      # id 昇順=決定論(sorted は snapshot=途中 pop 安全)
+        loan = bank.loans[aid]
+        agent = sim.agent_by_id.get(aid)
+        if agent is None or not economy_mod.loan_due(loan, day):
+            continue
+        paid, status = economy_mod.repay_installment(loan, agent.account, day)
+        if paid > 0.0:
+            agent.account -= paid
+            bank.receive(paid)
+            sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=aid,
+                                 kind="loan_repay", x=agent.x, y=agent.y,
+                                 payload={"amount": round(paid, 1),
+                                          "remaining": round(loan["remaining"], 1),
+                                          "account": round(agent.account, 1),
+                                          "status": status}))
+            if status == "complete":
+                bank.loans.pop(aid, None)
+            continue
+        sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=aid,   # 返済不能=延滞を記録
+                             kind="loan_repay", x=agent.x, y=agent.y,
+                             payload={"amount": 0.0,
+                                      "remaining": round(loan["remaining"], 1),
+                                      "account": round(agent.account, 1),
+                                      "arrears": int(loan["arrears_days"]),
+                                      "status": "arrears"}))
+        if economy_mod.loan_defaulted(loan, bcfg):      # 延滞閾値到達→貸倒→破産サイクルへ接続
+            loss = bank.write_off(aid)
+            agent.rent_due += loss                      # 未回収残を滞納へ=既存の破産処理が引き取る
+            sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=aid,
+                                 kind="loan_repay", x=agent.x, y=agent.y,
+                                 payload={"amount": 0.0, "remaining": 0.0,
+                                          "account": round(agent.account, 1),
+                                          "status": "defaulted",
+                                          "write_off": round(loss, 1)}))
 
 
 def _money_median(sim) -> float:
@@ -362,8 +509,15 @@ def _spend(sim, agent, amount: float, cat: str, step: int, sim_min: int,
             _record_consumption_tax(sim, agent, amount, cat, step, sim_min)
         return
     acc = sim.economy["accounts"]
-    if amount >= float(acc["card_threshold"]) and agent.account >= amount:
-        agent.account -= amount                # カード払い(口座から直接)
+    method = None
+    use_account = amount >= float(acc["card_threshold"]) and agent.account >= amount
+    if _payment_on(sim):                       # E-W3 決済(既定 OFF=method なし・card_threshold 分岐不変)
+        method = economy_mod.choose_payment(
+            float(amount), economy_mod.payment_pref(getattr(agent, "traits", None) or {}),
+            sim.hub.stream("payment", agent.id, step), sim.economy["payment"])
+        use_account = (method == "cashless") and agent.account >= amount   # cashless=口座
+    if use_account:
+        agent.account -= amount                # 口座から(カード/キャッシュレス)
         src = "card"
     else:
         if agent.money < amount:               # 現金不足 → ATM 引き出し
@@ -373,6 +527,8 @@ def _spend(sim, agent, amount: float, cat: str, step: int, sim_min: int,
     payload = {"amount": round(float(amount), 1),
                "balance": round(agent.money, 1), "cat": cat,
                "src": src, "account": round(agent.account, 1)}
+    if method is not None:                      # 決済 ON のみ payload に method(貨幣は新生しない=会計不変)
+        payload["method"] = method
     if chosen:
         payload["chosen"] = True
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
@@ -423,6 +579,7 @@ def _charge_meal(sim, agent, step: int, sim_min: int) -> None:
         amount = commerce_mod.on_purchase(sim, agent, cat, amount, step, sim_min)
         if amount is None:                         # 品切れ/行列 → 購入抑制(spend を出さない)
             return
+    amount = _budget_amount(sim, agent, cat, amount)   # E-W3 消費行動(既定 OFF=不変)
     _spend(sim, agent, amount, cat, step, sim_min)
 
 
@@ -432,6 +589,7 @@ def _charge_ride(sim, agent, ride: dict, step: int, sim_min: int) -> None:
     cat は乗り物の種別(taxi/bus)。経済が無効なら _spend が no-op(残高は 0 のまま)。"""
     mode = str(ride.get("mode", "taxi"))
     fare = float(ride.get("fare", 0.0))
+    fare = _budget_amount(sim, agent, mode, fare)   # E-W3 消費行動(既定 OFF=不変。ride.fare と spend を整合)
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                          kind="ride", x=agent.x, y=agent.y,
                          payload={"mode": mode, "fare": round(fare, 1),
@@ -1795,8 +1953,11 @@ def _phase_accounts_day(sim, step: int, sim_min: int) -> None:
             _pay_wage(sim, agent, salary, step, sim_min, source="salary")
         if dom == rent_dom and not agent.evicted:      # 立退き中=住居なし→家賃は発生しない
             rent = agent.period_income * share         # 月収相当 × rent_share
+            inc0 = agent.period_income                 # 控除前の月収(与信の income に使う)
             agent.period_income = 0.0
             if rent > 0.0:
+                if agent.account < rent:               # 現金不足点: 不足分を融資で補填(bank ON 時)
+                    _maybe_loan(sim, agent, rent - agent.account, step, sim_min, income=inc0)
                 pay = min(agent.account, rent)
                 agent.account -= pay
                 agent.rent_due += (rent - pay)         # 残高不足=翌日繰越
@@ -1898,6 +2059,8 @@ def _phase_daily(sim, step: int, sim_min: int) -> None:
     rd_coef = factor_update.relative_deprivation_coef(sim.mags)      # 相対的剥奪係数(既定0=OFF)
     # 参照集団の所持金中央値(coef>0 のときだけ算出=OFF なら完全 no-op・決定論)。
     ref_median = _money_median(sim) if rd_coef > 0.0 else None
+    bank_on = _bank_on(sim)                                          # E-W1 預金利息(既定 OFF=付与なし)
+    bcfg = sim.economy["bank"]
     for agent in sim.agents:
         # 相対的剥奪: 参照中央値を下回る量(正規化差)に応じた不満。当日の稼ぎ・固定費控除の前の
         # 所持金で判定=中央値と同一基準(rd_coef==0 なら ref_median=None でこのブロックごとスキップ)。
@@ -1916,6 +2079,15 @@ def _phase_daily(sim, step: int, sim_min: int) -> None:
                 grng = sim.hub.stream("gig", agent.id, step)
                 _pay_wage(sim, agent, prof["daily_base"] * float(grng.uniform(0.2, 1.4)),
                           step, sim_min, source="gig")
+        # E-W1 預金利息(bank ON かつ居住者のみ): 口座残高に日次利息を付与(interest_paid)。OFF=no-op。
+        if bank_on and not agent.visitor:
+            itr = economy_mod.daily_interest(agent.account, bcfg)
+            if itr > 0.0:
+                agent.account += itr
+                sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                                     kind="interest_paid", x=agent.x, y=agent.y,
+                                     payload={"amount": round(itr, 2),
+                                              "balance": round(agent.account, 1)}))
         # 固定費(光熱費・サブスク等): 家賃以外の恒常的生活圧。来街者は街の外に住居=対象外
         # (既存 rent と同じ扱い)。既定 0.0=控除ゼロ=spend イベントなし=バイト一致。
         if fixed_cost > 0.0 and not agent.visitor:
@@ -2182,8 +2354,10 @@ def _apply_move_home(sim, agent, action, step, sim_min, p2) -> None:
     deposit = float(p2["deposit"])
     accounts_on = _accounts_on(sim)
     total = agent.money + (agent.account if accounts_on else 0.0)
-    if total < deposit:                                # 敷金が払えない=引っ越せない(客観条件)
-        return
+    if total < deposit:                                # 敷金不足=現金不足点: 融資で補填(bank ON 時)
+        total += _maybe_loan(sim, agent, deposit - total, step, sim_min)
+        if total < deposit:                            # 融資後も払えない=引っ越せない(客観条件)
+            return
     rng = sim.hub.stream("move_home", agent.id, step)  # 新 stream(既存 draw 順に不干渉)
     bld = freedom_p2_mod.pick_home(sim, agent, action.get("area"), rng)
     if bld is None:                                    # 空き住戸なし
@@ -2994,6 +3168,7 @@ def run_step(sim, step: int) -> None:
     sim.scenario.on_step(sim, step)                # 摂動シナリオ(baseline=即 return)
     _phase_government(sim, step, sim_min)          # 日次境界: 行政会計・公務員給与・給付(既定OFF)
     _phase_daily(sim, step, sim_min)               # 日次境界: 経済的逼迫の心理圧
+    _phase_bank_day(sim, step, sim_min)            # 日次境界: 融資の定期返済・延滞→破産接続(既定OFF=no-op。E-W1)
     _phase_career(sim, step, sim_min)              # 日次境界: 失業/求職/転職(既定OFF=no-op。Wave G5)
     _phase_health(sim, step, sim_min)              # 日次境界: 病気の発症/回復・受診・メンタル(既定OFF=no-op。H1)
     _phase_disaster(sim, step, sim_min)            # 日次境界: 災害・交通遅延/運休・インフラ障害(既定OFF=no-op。H4)

@@ -33,6 +33,11 @@ world:
     enabled: true
     start_date: "auto"    # 本番開始日=実行当日を初日にする(具体日付 "2026-10-31" 等を書けば固定も可)
     weekday_work: true    # 平日のみ勤務・登校(土日祝は休み)
+  # ---- 第37バッチ 都市リアリズムパック ----
+  vision:
+    enabled: true         # 壁による視線遮蔽(建物内の壁越し会話が消える)。outdoor は重いので据え置き
+  traffic:
+    mode: od              # 信号69基・車線・一方通行295区間が初結線(監査: 従来は全ラン ambient)
 
 # ---- 電車ダイヤ(第10バッチ: ODPT 実ダイヤ)----
 #  東京メトロ3路線=ODPT 駅時刻表(平日)からの実ダイヤ、他6路線=公表値の近似。
@@ -47,6 +52,8 @@ transit:
 transit_ride:
   taxi:
     prob: 0.02
+  bus:
+    enabled: true         # 第37バッチ: 簡易バス路線(fare 230円)
 
 # ---- 天気 ----
 weather:
@@ -109,12 +116,24 @@ economy:
     enabled: true                          # 給料日25日に月給まとめ支給→翌日家賃引落し(月収×0.3)
     eviction_days: 30                      # 滞納30日で立退き(実法の「3ヶ月滞納で解除」を100日ランに圧縮)
     bankruptcy_days: 60                    # 滞納60日で自己破産(免責+自由財産以外の圧縮+出店制限30日)
+  # 第37バッチ 経済深化(docs/research/economy-abm-research.md 較正)
+  consumption:
+    enabled: true                          # 家計調査2024の費目配分(個体差つき予算制約)
+  payment:
+    enabled: true                          # 決済手段(キャッシュレス42.8%基準・spend に method)
+  bank:
+    enabled: true                          # 預金利息・与信スコア・融資・返済→破産接続
+  vc:
+    enabled: true                          # venture 出資(トラクション/ネットワーク審査・持分・配当)
 rules:
   allow_declare: true                      # 制度深化: 権利創設・宣言型 rule(パートナーシップ条例モデル)
 prompts:
   variety_hint: true                       # P3 発話の定型化対策(決まり文句で始めない注意書き)
   # A4 reflect_variety: 実LLM検収で丸写し(placeholder echo)33% → 正味悪化のため当面 OFF(daily.yaml と同判断)。
   reflect_variety: false
+  # 第37バッチ 会話強化(構造要因の修正: docs/research/conversation-pipeline.md)
+  dialog_history: true                     # 相手との直近2往復をプロンプト注入(従来=直前1発話のみ)
+  reply_partner: closeness                 # 返答宛先=closeness×距離(従来=最寄りのみ)
 relations:
   enabled: true                            # G2 社会関係の質(深化段階/断絶/評判/派閥)
 institution_routes:                        # G3 制度改変の3ルート + 制度深化(第9バッチ)
@@ -129,9 +148,16 @@ institution_routes:                        # G3 制度改変の3ルート + 制�
   deliberation:
     enabled: true                          # 審議・パブコメ段階(否決されうる熟議=制度改変の摩擦)
   assembly:
-    enabled: true                          # 制度深化3: 代表制議会(30日ごと改選・採決は議会が行う)
+    enabled: true                          # 制度深化3: 代表制議会(採決は議会が行う)
     size: 9                                # 議席数(渋谷区議会34議席を100体スケールに圧縮)
-    term_days: 30                          # 任期(100日ランで3期=改選も観測できる)
+    # 第37バッチ フル現実化(docs/research/council-vs-reality.md): 30日3期制を廃止。
+    # 90日=ラン内で告示→自発的立候補→SNTV改選を1回観測(現実の4年任期は100日ランでは
+    # 観測不能のため圧縮。day0の初回選出は候補0=従来方式フォールバックが正常動作)。
+    term_days: 90
+    realism:
+      enabled: true
+      deposit: 300000                      # 渋谷区議選の実供託金(法定得票未満で没収)
+      announce_days: 5                     # 告示期間(立候補=ファウンダー行動の観察点)
 annual_events:
   enabled: true                            # G4 文化カレンダー・ハロウィン型群集
 career:
@@ -237,3 +263,50 @@ model:
   reflect_think: false
   reflect_max_tokens: 768   # 右サイズ化(A1 実測根拠は daily.yaml の注記参照。think=false 前提・
                             # think=true に戻すなら 1600 以上へ)。vLLM では KV スロット予約が縮み高並列が改善。
+
+# ==== 第37バッチ(2026-07-19)本番ON編成 — ユーザー決定: 3パック全ON+選挙フル現実化 ====
+# 全機能は既定OFFで実装済み(ゴールデン無傷)。ここで本番プロファイルにのみ投入する。
+# 一次資料: docs/research/off-features-inventory.md / docs/plans/batch37.md
+# 注意: world/transit_ride/prompts/institution_routes/economy は本ファイル上部の既存ブロックに
+# 統合済み(YAMLの重複トップレベルキーは後勝ちで前を消すため)。ここは新規トップレベルのみ。
+
+# ---- 都市リアリズムパック(vision/traffic/bus は上部ブロックに統合済み)----
+ads:
+  enabled: true              # 街頭広告OOH(掲出地点は daily.yaml の検証済みセットを流用)
+  large: ["QFRONT", "SHIBUYA 109", "ハチ公前広場"]
+  slots: ["渋谷マークシティ"]
+crowd_visual:
+  enabled: true              # 同席者の視覚要約1行(記述的規範。呼数不変)
+sns_geo:
+  enabled: true              # 伝播に物理距離を記録(分析列のみ)
+
+# ---- 自由度・創発パック(ファウンダー観察の核)----
+freedom:
+  open_actions: true         # LLM自由記述の行動 "do"+価値4軸観測
+  satiation_gain: 0          # 純観測(ゲージ変調なし=k掃引との整合を優先)
+  p2:
+    move_home: true          # 転居(敷金=現金障壁)
+    buy: true                # 発火時の消費意思決定
+    study: true              # 聴講(記録のみ)
+    partnership: true        # 交際の申込/別れ
+    deviance: true           # 無許可出店(摘発=enforcement接続。ファウンダー前駆の観察点)
+
+# ---- 認知深化パック ----
+memory:
+  agentic_pull: true         # 発火/内省の能動記憶検索(固定2段=呼数不変)
+  actr:
+    enabled: true            # 第37バッチ M-W: ACT-R活性化記憶(忘却・想起失敗・再強化・fan干渉)
+worldview:
+  enabled: true              # 主観的世界モデル(期待/可制御性/規範予期の日次観測)
+psych:
+  sdt:
+    enabled: true            # 自己決定理論(内発/外発の個体差)
+  collective:
+    enabled: true            # 集団効力感・SIMCA(組織形成の観察と相性)
+  lynch:
+    enabled: true            # 都市イメージ(ランドマーク重みの行き先)
+lod:
+  input_res:
+    enabled: true            # 世界解像度の個体差(呼数不変=R1安全)
+
+# (会話強化 prompts / 選挙現実化 assembly / 経済深化 economy は上部の既存ブロックに統合済み)

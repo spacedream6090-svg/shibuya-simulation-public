@@ -217,13 +217,19 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
     if recent:
         lines.append(f"直近の出来事: {' / '.join(recent)}")
     recalled = agent.mem.retrieve(step, [place_name] + list(nearby_names or []),
-                                  n=_retrieve_n)
+                                  n=_retrieve_n, agent_id=agent.id)
     if recalled:
         lines.append(f"記憶に残っていること: {' / '.join(recalled)}")
     if pull_query:                       # agentic pull(発火時。決定論・呼び出しは増やさない)
-        pulled = agent.mem.query(step, pull_query, n=2)
-        if pulled:
-            lines.append(f"ふと思い出したこと: {' / '.join(pulled)}")
+        # ACT-R OFF(actr is None)は failed 常に False=hits は従来 query と同一=バイト一致。
+        # ON のとき、手掛かりはあるが全候補が閾値未達なら「思い出そうとして失敗」を1行にする
+        # (ここは build_prompt=logger 不在の非意図的な "ふと思い出す" 経路なので memory_fail
+        #  イベントは出さず1行のみ。意図的な内省 pull は reflection 側でイベントも発火する)。
+        res = agent.mem.query_ex(step, pull_query, n=2, agent_id=agent.id)
+        if res.hits:
+            lines.append(f"ふと思い出したこと: {' / '.join(res.hits)}")
+        elif res.failed:
+            lines.append(f"({res.cue}のことを思い出そうとしたが、はっきりしない…)")
     # 間柄: relations 有効時は tier/派閥つきの拡張行(scheduler が事前構築)。既定 OFF は
     # relation_line=None で従来の count ベース relation_line に後退=バイト一致。
     rel = relation_line if relation_line is not None \
