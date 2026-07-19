@@ -179,6 +179,8 @@ register_event_kind("vc_investment",   "ベンチャー出資の実行(トラク
 register_event_kind("memory_fail",     "想起の失敗(活性化が閾値未達=思い出せない){query, activation, tau}")
 # ---- 会話3層 C2(P2 S3。構造化会話=LLMなし。既定 OFF。設計: docs/plans/p2-interstitial-design.md §1 S3)----
 register_event_kind("conversation",    "構造化会話 C2(実文なし・機械効果のみ。1会話1件){with, topic, tone, outcome, acts}")
+# ---- 日課計画フレームワーク(P2 S1。planning.framework ON のみ・1日1件。設計: docs/research/daily-plan-framework.md)----
+register_event_kind("day_plan_compiled", "日課計画のコンパイル要約(型スキーマ→アンカー先置き→充填){n, cats, anchors, path}")
 
 
 @dataclass

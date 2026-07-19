@@ -74,6 +74,40 @@ class MockBackend(LLMBackend):
                 raw = line.split(":", 1)[1].strip()
                 known_terms = [t for t in raw.split("、") if t]
 
+        # 日課計画フレームワーク(P2 S1・planning.framework=true のときだけ prompt に
+        # "計画スキーマ:" マーカーが載る)。スキーマ準拠の決定論応答を返す=mock でも
+        # コンパイラが通る。OFF ではこのマーカーが無い=下の従来分岐へ=バイト一致。
+        if "計画スキーマ:" in prompt:
+            nearby = []
+            for line in prompt.splitlines():
+                if line.startswith("周りにある店・場所:"):
+                    nearby = [t for t in line.split(":", 1)[1].strip().split("、")
+                              if t]
+            bands = ["朝", "昼", "午後", "夕方", "夜"]
+            # mandatory(勤務・就学)はアンカー系統=シフト窓が担うので mock は出さない。
+            maint = ["shop", "personal", "escort", "meal"]
+            discr = ["leisure", "park", "walk", "visit"]
+            n = int(rng.integers(2, 5))                    # 2-4 個
+            picks = sorted(int(i) for i in
+                           rng.choice(len(bands), size=n, replace=False))
+            items = []
+            for bi in picks:
+                if rng.random() < 0.5:
+                    cat, what = "maintenance", maint[int(rng.integers(len(maint)))]
+                else:
+                    cat, what = "discretionary", discr[int(rng.integers(len(discr)))]
+                where = ""
+                if nearby and rng.random() < 0.5:
+                    where = nearby[int(rng.integers(len(nearby)))]
+                elif place != "この辺" and rng.random() < 0.4:
+                    where = place
+                band = bands[bi]
+                items.append({"intent": f"{band}に{what}をする", "cat": cat,
+                              "what": what, "place": where, "when": band,
+                              "flex": "fixed" if cat == "maintenance" else "flexible"})
+            return json.dumps({"action": "plan", "items": items},
+                              ensure_ascii=False)
+
         # 朝の一日計画(planning.make_plan の計画タスク)。routine の土台になる予定を
         # rng で 2-4 個。時間帯は重複なし、内容はカテゴリからランダム、場所は周辺 POI や
         # 現在地名を一部に採用(place 部分一致の解決を機構として動かすため)。

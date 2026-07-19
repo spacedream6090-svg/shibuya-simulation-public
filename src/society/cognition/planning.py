@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from .. import schedule as _schedule
 from ..observer.schema import Event
+from . import plan_schema as _pf
 from .deliberate import build_prompt, parse_action
 
 
@@ -47,7 +48,8 @@ def build_plan_prompt(agent, *, place_name: str, sim_min: int, step: int,
                       weather_line: str | None = None,
                       schedule_line: str | None = None,
                       interstitial_digest: str | None = None,
-                      city_name: str = "") -> str:
+                      city_name: str = "",
+                      framework: dict | None = None) -> str:
     """build_prompt の文脈(ペルソナ・記憶・日記・信念)+ 所持金 + 計画タスク。
 
     ★ build_prompt の出力は既存の呼び出し(発話・内省)と共有するため一切変えない。
@@ -55,6 +57,8 @@ def build_plan_prompt(agent, *, place_name: str, sim_min: int, step: int,
     date_line/weather_line は当日の暦・天気(既定 None=注入せず従来と完全一致)。
     schedule_line は当日の予定(schedule 有効時のみ。None=注入せず不変)。
     interstitial_digest は前回発火以降の客観ダイジェスト(P2 S2。既定 None=注入せず不変)。
+    framework は日課計画フレームワーク設定(P2 S1)。None=既定 OFF=スキーマ指示を足さない
+    =従来のプロンプトとバイト一致。有効時のみ末尾にスキーマ指示を1ブロック足す。
     """
     base = build_prompt(agent, place_name=place_name, surprise=None,
                         nearby_names=[], sim_min=sim_min, step=step,
@@ -63,7 +67,8 @@ def build_plan_prompt(agent, *, place_name: str, sim_min: int, step: int,
                         schedule_line=schedule_line,
                         interstitial_digest=interstitial_digest)
     money_line = f"\n今の所持金: 約{int(getattr(agent, 'money', 0.0))}円"
-    return base + money_line + _PLAN_TASK
+    task = _PLAN_TASK if framework is None else _PLAN_TASK + _pf.schema_prompt(framework)
+    return base + money_line + task
 
 
 def _normalize(items: list, max_items: int) -> list:
@@ -88,13 +93,15 @@ def make_plan(sim, agent, step: int, sim_min: int, place_name: str,
     interstitial_digest は前回発火以降の客観ダイジェスト(P2 S2。既定 None=注入せず不変)。
     """
     max_items = int(sim.planningcfg.get("max_items", 5))
+    framework = _pf.framework_cfg(sim)               # None=既定 OFF=現行経路(バイト一致)
     prompt = build_plan_prompt(agent, place_name=place_name, sim_min=sim_min,
                               step=step,
                               city_name=getattr(sim, "place_name", ""),
                               date_line=getattr(sim, "today_date_line", None),
                               weather_line=getattr(sim, "today_weather_line", None),
                               schedule_line=_today_schedule_line(sim, agent, sim_min),
-                              interstitial_digest=interstitial_digest)
+                              interstitial_digest=interstitial_digest,
+                              framework=framework)
     # 朝の計画だけ上限を分けられる seam(model.plan_max_tokens)。
     # 未設定 or 0/null は model.max_tokens にフォールバック=既定挙動は完全不変。
     _plan_mt = int(sim.cfg.model.get("plan_max_tokens", 0) or 0)
@@ -105,6 +112,10 @@ def make_plan(sim, agent, step: int, sim_min: int, place_name: str,
         max_tokens=plan_max_tokens)
     sim.logger.log_llm_call({"llm_call_id": call_id, "agent_id": agent.id,
                              "purpose": "plan", "step": step, "cached": cached})
+    if framework is not None:                        # 日課計画フレームワーク経路(P2 S1)
+        _make_plan_framework(sim, agent, step, sim_min, prompt, response, call_id,
+                             framework, max_items, plan_max_tokens)
+        return
     action = parse_action(response)
     items = _normalize(action["items"], max_items) \
         if action is not None and action.get("type") == "plan" else []
@@ -115,3 +126,54 @@ def make_plan(sim, agent, step: int, sim_min: int, place_name: str,
                          payload={"n": len(items),
                                   "plan": [{"when": it["when"], "what": it["what"],
                                             "place": it["place"]} for it in items]}))
+
+
+def _parse_plan_items(response: str, framework: dict, max_items: int):
+    """応答 → 正規化済みスキーマ items(不成立なら None)。parse_action が決定論修復
+    (_loads_lenient)を内包するので、ここは F3 第1段(修復)を通した結果を受ける。"""
+    action = parse_action(response)
+    if action is None or action.get("type") != "plan":
+        return None
+    items = _pf.normalize_items(action["items"], framework, max_items)
+    return items or None
+
+
+def _make_plan_framework(sim, agent, step: int, sim_min: int, prompt: str,
+                         response: str, call_id: str | None, framework: dict,
+                         max_items: int, plan_max_tokens: int) -> None:
+    """フレームワーク経路(ON)。失敗の階段(F3): 決定論修復(_parse_plan_items 内)→
+    再試行1回 → 前日計画流用 → 初日は職業別デフォルト骨格。コンパイル結果は day_plan へ
+    降格写像し、要約を day_plan_compiled(ON のみ・1日1件)へ記録する。"""
+    items, path = _parse_plan_items(response, framework, max_items), "llm"
+    if items is None:                                # 修復しても不成立 → 再試行1回
+        retry, rcall_id, rcached = sim.llm.generate(
+            prompt, rng_key=f"plan/{agent.id}/{step}/retry",
+            temperature=float(sim.cfg.model.temperature),
+            max_tokens=plan_max_tokens)
+        sim.logger.log_llm_call({"llm_call_id": rcall_id, "agent_id": agent.id,
+                                 "purpose": "plan_retry", "step": step,
+                                 "cached": rcached})
+        items, path, call_id = _parse_plan_items(retry, framework, max_items), \
+            "retry", rcall_id
+    if items is None:                                # 再試行も不成立 → 前日計画流用
+        prev = getattr(agent, "_plan_prev_day", None)
+        if prev:
+            items, path = _pf.normalize_items(prev, framework, max_items), "prev_day"
+        else:                                        # 初日: 職業別デフォルト骨格
+            items, path = _pf.default_skeleton(agent, framework), "default"
+    schedule, day_plan, summary = _pf.compile_plan(agent, sim, items, sim_min,
+                                                    framework)
+    agent.day_plan = day_plan
+    agent.day_schedule = schedule                    # 観測・S4/S6 実行接続の受け皿
+    agent._plan_prev_day = [it for it in items if not it.get("anchor")]  # 翌日の流用元
+    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                         kind="day_plan", x=agent.x, y=agent.y,
+                         llm_call_id=call_id,
+                         payload={"n": len(day_plan),
+                                  "plan": [{"when": it["when"], "what": it["what"],
+                                            "place": it["place"]} for it in day_plan]}))
+    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                         kind="day_plan_compiled", x=agent.x, y=agent.y,
+                         llm_call_id=call_id,
+                         payload={"n": summary["n"], "cats": summary["cats"],
+                                  "anchors": summary["anchors"], "path": path}))

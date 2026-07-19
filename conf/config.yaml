@@ -421,6 +421,32 @@ conversation:
 planning:
   enabled: true                 # 既定 ON = 新しい標準挙動。false で完全に旧挙動へ戻る
   max_items: 5                  # 1日の予定の最大件数(2〜max_items を採用)
+  # ---- 日課計画フレームワーク(P2 S1。既定 OFF=現行の計画経路・プロンプト・mock と完全一致)----
+  # ON で計画を型スキーマ(自由文 intent 先頭 + 3分類 cat + 語彙 what + 時間窓 + 柔軟性 flex)へ
+  # 拡張し、計画コンパイラ(勤務・就学アンカー先置き→残り時間窓に裁量活動充填)を通す。実行側
+  # (routine)は触らず、結果は現行 day_plan へ降格写像する。設計: docs/research/daily-plan-framework.md
+  framework:
+    enabled: false              # false=現行どおり。true でスキーマ+コンパイラを有効化
+    # 活動タイプ語彙(EnvPack 思想: 街ごとに差し替え可能。既定=現行8語彙 + 学業/用足し/送迎)
+    vocab: [work, study, meal, shop, leisure, park, walk, home, visit, personal, escort]
+    # what → 3分類 cat の既定導出(LLM が cat を明示しないときに使う)
+    cat_map:
+      work: mandatory
+      study: mandatory
+      meal: maintenance
+      shop: maintenance
+      personal: maintenance
+      escort: maintenance
+      home: maintenance
+      leisure: discretionary
+      park: discretionary
+      walk: discretionary
+      visit: discretionary
+    # cat → 既定所要(分)。start/dur_min 省略時のフォールバック
+    dur_min:
+      mandatory: 240
+      maintenance: 45
+      discretionary: 60
 
 # ---- プロンプト調整(改善 P3 第9バッチ。既定 OFF=注入なし=バイト一致)----
 # 発話の定型化対策(sim-improvement-analysis.md P3: 冒頭句「この時間の渋谷…」が発話の5〜9.5%)。
