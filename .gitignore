@@ -13,3 +13,5 @@ shibuya　バックアップ/
 .claude/settings.local.json
 # PLATEAU 抽出中間ファイル(実データ由来・巨大。plateau_extract.py が再生成)
 data/plateau/
+# ペルソナ100万プール(数百MB級・build_persona_pool.py が再生成。議員名簿と統計サマリのみコミット)
+data/persona_pool/
