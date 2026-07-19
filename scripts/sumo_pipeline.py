@@ -57,6 +57,7 @@ import argparse
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -77,7 +78,15 @@ SECONDS_PER_HOUR = 3600     # hour_bin(0..23)→ SUMO 秒時刻の展開幅
 
 # ─────────────────────────────────────────────── SUMO 探索(バイナリ / tools / typemap)
 def sumo_home() -> str | None:
-    """SUMO_HOME を返す。eclipse-sumo(pip)の `sumo.SUMO_HOME` を最優先、無ければ環境変数。"""
+    """SUMO_HOME を返す。環境変数を最優先(公式 winget/MSI 版=XML I/O 正常)、次に公式既定パス、
+    最後に eclipse-sumo(pip)の `sumo.SUMO_HOME`(pip 版 exe は Windows で XML 読込が
+    即クラッシュする既知バグがあるため最後の手段)。"""
+    h = os.environ.get("SUMO_HOME")
+    if h and os.path.isdir(h):
+        return h
+    for cand in (r"C:\Program Files (x86)\Eclipse\Sumo", r"C:\Program Files\Eclipse\Sumo"):
+        if os.path.isdir(cand):
+            return cand
     try:
         import sumo  # type: ignore
         h = getattr(sumo, "SUMO_HOME", None)
@@ -85,8 +94,7 @@ def sumo_home() -> str | None:
             return h
     except Exception:
         pass
-    h = os.environ.get("SUMO_HOME")
-    return h if h and os.path.isdir(h) else None
+    return None
 
 
 def ensure_tools_on_path() -> str | None:
@@ -614,6 +622,14 @@ def stage_demand(run_dir: Path, mp: dict, seed: int, district_m: float,
         cmd_od += ["--scale", str(scale)]
     if run_cmd(cmd_od, log) != 0 or not trips_file.exists():
         return {"ok": False, "reason": "od2trips 失敗"}
+
+    # od2trips(1.27)は interval id(h0..h23)を車種 type= に書くが vType 定義は生成されず、
+    # sumo が未知車種エラーで停止する → type 属性を除去して既定車種へ(決定論の純テキスト変換)
+    txt = trips_file.read_text(encoding="utf-8")
+    txt2 = re.sub(r'\s+type="h\d+"', "", txt)
+    if txt2 != txt:
+        trips_file.write_text(txt2, encoding="utf-8")
+        log("  trips: interval 由来の type=hN 属性を除去(既定車種で走行)")
 
     cmd_dua = [dua, "-n", str(net), "-r", str(trips_file), "-o", str(routes_file),
                "--seed", str(seed), "--ignore-errors", "--no-warnings", "--repair"]
