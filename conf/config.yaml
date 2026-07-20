@@ -180,6 +180,9 @@ world:
   scenario_params: {}           # 既定は空(baseline では読まれない)
   perception_radius_m: 40.0     # この距離内で会話が聞こえる(建物内=同じ階のみ)
   edge_capacity: 20             # 混雑=この人数を超えると減速(grievance 源)
+  elevation:                    # 3D Phase 0: 標高 z 列(3d-movement.md §7)。ON で move_segment/arrive payload に z[m](DEM 双一次・export_3d と同値)を追加
+    enabled: false              # 既定 OFF=イベント不変(バイト一致)。表示・観測専用=移動判定・認知・LLM 呼数は不変
+    dir: data/plateau           # terrain.npz + terrain.json のフォルダ(scripts/plateau_extract.py の出力)
   modes:                        # 移動手段(1 step = 10分 で進める距離 m)
     speeds: { walk: 800.0, bicycle: 2000.0, car: 3500.0 }
   exit_prob: 0.02               # 暇なとき範囲外へ出かける確率/step

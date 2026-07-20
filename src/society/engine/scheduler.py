@@ -813,6 +813,7 @@ def _phase_move(sim, step: int, sim_min: int) -> None:
 
     capacity = int(sim.cfg.world.edge_capacity)
     speeds = sim.cfg.world.modes.speeds
+    elev = getattr(sim, "elevation", None)     # 3D Phase 0(無効時 None=payload 不変)
     for agent in sim.agents:
         agent._arrived_new = False
         if agent.loc != "street" or agent.sleeping or not agent.route:
@@ -848,13 +849,16 @@ def _phase_move(sim, step: int, sim_min: int) -> None:
             agent.x, agent.y = sim.city.node_xy(agent.node)
         # 経路ポリライン(道なりの見た目再現用)。形状を保って間引く(RDP)。
         pts = rdp(pts, epsilon=4.0, max_points=20)
+        seg_payload = {"dist_m": round(moved, 1),
+                       "mode": agent.trip_mode,
+                       "congestion": round(factor, 3),
+                       "pts": [[round(p[0], 1), round(p[1], 1)]
+                               for p in pts]}
+        if elev is not None:
+            seg_payload["z"] = elev.height_at(agent.x, agent.y)
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                              kind="move_segment", x=agent.x, y=agent.y,
-                             payload={"dist_m": round(moved, 1),
-                                      "mode": agent.trip_mode,
-                                      "congestion": round(factor, 3),
-                                      "pts": [[round(p[0], 1), round(p[1], 1)]
-                                              for p in pts]}))
+                             payload=seg_payload))
         delta = factor_update.on_congestion(agent, factor, mags=sim.mags,
                                             step=step, sim_min=sim_min,
                                             logger=sim.logger)
@@ -889,11 +893,14 @@ def _phase_move(sim, step: int, sim_min: int) -> None:
                                       sim_min=sim_min, logger=sim.logger)
                 apply_bonus(getattr(sim, "rulebook", None), sim, agent, "park",
                             step, sim_min)
+            arr_payload = {"node": agent.node,
+                           "name": sim.city.node_name(agent.node),
+                           "first_visit": first}
+            if elev is not None:
+                arr_payload["z"] = elev.height_at(agent.x, agent.y)
             sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                                  kind="arrive", x=agent.x, y=agent.y,
-                                 payload={"node": agent.node,
-                                          "name": sim.city.node_name(agent.node),
-                                          "first_visit": first}))
+                                 payload=arr_payload))
             tools = getattr(sim, "tools", None)        # イベント参加確定/ビラ閲覧/屋台購入
             if tools is not None:
                 tools.on_arrive(sim, agent, step, sim_min)

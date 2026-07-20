@@ -56,6 +56,16 @@ class Simulation:
             map_path,
             underground_label=self.envpackcfg["lexicon"]["underground_name"])
         self.router = Router(self.city)
+        # 標高 z 列(3D Phase 0)。既定 OFF=イベント payload 不変=バイト一致。
+        # ON でも読み出しは純関数(乱数なし)・記録専用=認知経路と LLM 呼数は不変(R1)。
+        ecfg = cfg.world.get("elevation", None)
+        self.elevation = None
+        if ecfg is not None and bool(ecfg.get("enabled", False)):
+            from ..world.elevation import ElevationGrid
+            edir = Path(str(ecfg.get("dir", "data/plateau")))
+            if not edir.is_absolute():
+                edir = REPO_ROOT / edir
+            self.elevation = ElevationGrid.load(edir)
         self.clock = Clock()
         self.logger = ObserverLogger(self.out_dir)
         self.items = ItemStore()
