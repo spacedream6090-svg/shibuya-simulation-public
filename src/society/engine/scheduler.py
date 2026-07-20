@@ -1278,6 +1278,12 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
             p = _select_partner(sim, agent, company)
             pid = p.id if p is not None else None
         dialog_history = _dialog_get(agent, pid)
+    # 方針キャッシュ(P2 S7): 類似状況の熟慮を再利用し LLM をスキップ(既定 OFF は即 None)。
+    # ダイジェスト消費(_isl_take)より前に置く=再利用時は「実際の LLM 発火」ではないので
+    # 行間バッファを仕切り直さない。
+    reused = deliberate.maybe_reuse_action(sim, agent, step, sim_min, trigger)
+    if reused is not None:
+        return reused
     # 行間補間(P2 S2): 前回発火以降の客観ダイジェスト。OFF は None=1行も足さない=バイト一致。
     # 発火のたびに1度だけ組み、バッファを仕切り直す(=次の「前回発火以降」の起点)。
     interstitial_digest = _isl_take(sim, agent)
@@ -1336,6 +1342,8 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                              kind="fallback", x=agent.x, y=agent.y,
                              payload={"reason": "parse_error"}))
+    else:
+        deliberate.store_action(sim, agent, step, sim_min, trigger, action)
     return action
 
 

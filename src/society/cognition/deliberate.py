@@ -307,6 +307,27 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
     return "\n".join(lines)
 
 
+# ---- 行動方針キャッシュ P2 S7: 日中熟慮の cognition 層の関数入口 ----------------- #
+# scheduler の熟慮ディスパッチ(build_prompt→generate→parse_action)へ主計画者が差し込む
+# 薄い seam。既定 OFF は policy_cache 側が完全 no-op(cache も stream も作らず=バイト一致)。
+#   使い方(主計画者の統合時):
+#     action = maybe_reuse_action(sim, agent, step, sim_min, trigger)
+#     if action is None:
+#         ... build_prompt → generate → parse_action で action を得る ...
+#         store_action(sim, agent, step, sim_min, trigger, action)
+def maybe_reuse_action(sim, agent, step: int, sim_min: int, trigger: str):
+    """熟慮の再利用を試みる。命中+ゲート通過なら action(dict)を返し LLM をスキップ、
+    そうでなければ None(=通常どおり LLM 生成)。既定 OFF は即 None=バイト一致。"""
+    from . import policy_cache as _policy_cache      # 遅延 import(循環回避)
+    return _policy_cache.reuse_action(sim, agent, step, sim_min, trigger)
+
+
+def store_action(sim, agent, step: int, sim_min: int, trigger: str, action) -> None:
+    """LLM 生成した熟慮 action をキャッシュへ格納(既定 OFF は no-op)。"""
+    from . import policy_cache as _policy_cache      # 遅延 import(循環回避)
+    _policy_cache.store_action(sim, agent, step, sim_min, trigger, action)
+
+
 def _loads_lenient(response: str) -> dict | None:
     """途中で切れた JSON を軽く修復して読む(トークン上限での閉じ括弧欠落など)。"""
     if not isinstance(response, str):

@@ -19,6 +19,7 @@ from __future__ import annotations
 from .. import schedule as _schedule
 from ..observer.schema import Event
 from . import plan_schema as _pf
+from . import policy_cache as _policy_cache
 from .deliberate import build_prompt, parse_action
 
 
@@ -94,6 +95,23 @@ def make_plan(sim, agent, step: int, sim_min: int, place_name: str,
     """
     max_items = int(sim.planningcfg.get("max_items", 5))
     framework = _pf.framework_cfg(sim)               # None=既定 OFF=現行経路(バイト一致)
+    # ---- 行動方針キャッシュ P2 S7(既定 OFF=no-op=バイト一致)。simple 計画経路のみ対象 ----
+    # framework 経路(P2 S1)はコンパイル/再試行を伴うため本スライスでは対象外(cache 不介入)。
+    if framework is None:
+        reused = _policy_cache.reuse_plan(sim, agent, step, sim_min)
+        if reused is not None:                       # キャッシュ命中+ゲート通過 → LLM をスキップ
+            from . import routine as _routine        # 遅延 import(循環回避)
+            _routine.maybe_roll_motif(sim, agent, step)   # L1 骨格 motif(既定 OFF=no-op)
+            agent.day_plan = reused
+            sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                                 kind="day_plan", x=agent.x, y=agent.y,
+                                 llm_call_id=None,
+                                 payload={"n": len(reused),
+                                          "plan": [{"when": it["when"],
+                                                    "what": it["what"],
+                                                    "place": it["place"]}
+                                                   for it in reused]}))
+            return
     prompt = build_plan_prompt(agent, place_name=place_name, sim_min=sim_min,
                               step=step,
                               city_name=getattr(sim, "place_name", ""),
@@ -122,6 +140,7 @@ def make_plan(sim, agent, step: int, sim_min: int, place_name: str,
     items = _normalize(action["items"], max_items) \
         if action is not None and action.get("type") == "plan" else []
     agent.day_plan = items
+    _policy_cache.store_plan(sim, agent, step, sim_min, items)   # P2 S7(既定 OFF=no-op)
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                          kind="day_plan", x=agent.x, y=agent.y,
                          llm_call_id=call_id,

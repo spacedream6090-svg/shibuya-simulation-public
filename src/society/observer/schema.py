@@ -186,6 +186,8 @@ register_event_kind("detour",        "確率的実行 L3: 寄り道=目的地手
 register_event_kind("interrupt",     "確率的実行 L3: 活動途中の中断=離脱(P2 S4){act}")
 # ---- 好奇心/退屈の内発ドライブ(P2 S5。drive.boredom ON のみ・既定 OFF=0件。設計: docs/plans/p2-interstitial-design.md §1 S5)----
 register_event_kind("boredom_explore", "好奇心/退屈ドライブの内発的探索=近傍の未訪問/低頻度 POI へ移動(LLM なし。P2 S5){from, to_kind, gauge}")
+# ---- 行動方針キャッシュ(P2 S7。cognition.policy_cache ON のみ・既定 OFF=0件。設計: docs/research/interstitial-life.md §4.4/§7)----
+register_event_kind("policy_reuse", "行動方針キャッシュの再利用=LLM 呼をスキップ(P2 S7){kind, relax, saved}")
 
 
 @dataclass

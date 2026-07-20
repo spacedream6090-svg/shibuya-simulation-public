@@ -558,6 +558,17 @@ lod:
   input_res:
     enabled: false
 
+# ---- 方針キャッシュ(P2-S7・既定OFF=バイト一致)。docs/research/interstitial-life.md §4.4-b ----
+# 朝計画・日中熟慮の出力を k 非依存の物理量キー(職業/年代/曜日型/時間帯/場所種別/天気/活動cat)で
+# キャッシュし、類似状況の再訪で LLM 呼をスキップ。本番採否はブラインドA/B比較で決定(既定OFF運用)。
+cognition:
+  policy_cache:
+    enabled: false
+    reuse_rate_cap: 0.6   # 再利用の確率ゲート兼ハード上限(多様性の下限を保証)
+    per_agent_max: 16     # 個体あたりキャッシュ上限
+    global_max: 4096      # 全体 LRU 上限
+    max_relax: 2          # near-match 緩和の最大段(0=完全一致/1=+場所種別/2=+時間帯)
+
 # ---- 開放行動+価値の4軸(第17バッチ 2026-07-10。既定 OFF=現行と完全同一)----
 # LLM 自身が自由記述で行動を決める "do" をメニューに追加し、価値(実用/感情/社会/認識)で
 # 観測する(決定論辞書+中立自己申告のブレンド)。接地: docs/research/desire-value-theory.md。

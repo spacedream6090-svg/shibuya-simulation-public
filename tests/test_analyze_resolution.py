@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from collections import Counter
@@ -16,6 +17,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from analyze_resolution import distinct_n, entropy  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
+
+# 子プロセスの stdio を UTF-8 に固定し、親も UTF-8 でデコードする。
+# 親シェルの PYTHONIOENCODING 有無(cp932/utf-8 のロケール差)に依らず決定的にするため。
+_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8"}
 
 
 def test_distinct_n_known_values():
@@ -59,7 +64,8 @@ def test_off_run_is_rejected(tmp_path):
     """input_res 未記録(OFFラン)は明示終了=捏造回避。"""
     run = _write_run(tmp_path, with_level=False)
     r = subprocess.run([sys.executable, str(REPO / "scripts/analyze_resolution.py"),
-                        str(run)], capture_output=True, text=True)
+                        str(run)], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", env=_ENV)
     assert r.returncode != 0
     assert "対象外" in (r.stdout + r.stderr)
 
@@ -68,7 +74,7 @@ def test_level_separation_and_outputs(tmp_path):
     run = _write_run(tmp_path, with_level=True)
     r = subprocess.run([sys.executable, str(REPO / "scripts/analyze_resolution.py"),
                         str(run)], capture_output=True, text=True,
-                       encoding="utf-8", errors="replace")
+                       encoding="utf-8", errors="replace", env=_ENV)
     assert r.returncode == 0, r.stderr
     tbl = pq.read_table(run / "panel" / "resolution_agents.parquet").to_pylist()
     by_id = {row["agent_id"]: row for row in tbl}
