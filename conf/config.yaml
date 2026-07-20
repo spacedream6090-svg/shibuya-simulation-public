@@ -221,6 +221,19 @@ world:
     enabled: false
     outdoor: false
 
+  # ---- 構造化シーン記述 v0(エージェント視覚 B。既定 OFF=プロンプト/イベント不変=バイト一致)----
+  # ON 時: 発火プロンプトに「見え」の 2〜4 行を注入(方向つき視界=正面/右手/左手の近傍施設・
+  #   注視対象リスト=近傍の人+地点を距離で決定論選抜・垂直関係=レイヤ+標高)。追加 LLM 呼ゼロ・
+  #   乱数ゼロの純関数集計(crowd_visual と同型の seam)。地名は実行時に世界データから取る。
+  #   件数は入力解像度 LOD(lod.input_res.scene_n)対象。設計: docs/research/agent-vision.md §4 v0。
+  #   注視の人ソースは同席者(壁 LOS 済み)。垂直は elevation 有効時のみ標高を使う(None ガード)。
+  scene_desc:
+    enabled: false
+    radius_m: 60.0        # 視界・注視に含める近傍地点までの距離(crowd/ads と同レンジ)
+    scene_n: 3            # 記述の既定件数(input_res.scene_n 未設定時のフォールバック)
+    fov_deg: 100.0        # 「正面」と判定する視野角(全幅)
+    vertical: true        # 垂直関係の 1 行(レイヤ/標高)を出すか
+
   # ---- 日付・カレンダー(第7バッチ 2026-07-07。既定 OFF=現行挙動と完全同一)----
   # ON 時: 全発火/計画/内省プロンプトに「今日は◯年◯月◯日(曜)です。」を1行注入(全員共通・k非依存)。
   #   weekday_work=true にすると本業勤務・登校を平日(非休日)だけに絞る(バイトの曜日挙動は不変)。
@@ -656,6 +669,33 @@ ads:
   target_cats: [food, cafe, shop, leisure, nightlife]   # 広告主になれる POI カテゴリ
 crowd_visual:
   enabled: false                # 群衆の視覚情報1行(同席者の決定論要約=記述的規範)。OFF=不変
+
+# ---- エージェント視覚 v1: 顕著性駆動の POV 画像(休眠・全プロファイル OFF)----
+# 設計: docs/research/agent-vision.md §4 v1。本番初日に採否決定=当面 OFF のまま。
+# 骨格のみ配線: 顕著性ゲート(客観量のみ=R1: k 由来量・traits は絶対に入れない)→ CPU 決定論
+# POV レンダ(viz/render_pov.py・同一入力→同一バイト PNG)→ サイドカー画像ストア(runs/<name>/pov/)+
+# pov_image イベント参照キー。専用 stream "pov_salience" 1 本のみ(既存 draw 順に挿入しない)。
+# 追加 LLM 呼はゼロ(VLM は別 tier=text LLM 呼数に非依存)。既定 OFF=stream を引かず・
+# イベント 0 件・画像 0 枚・agent に新フィールドを生やさない=バイト一致(ゴールデン維持)。
+pov:
+  enabled: false
+  salience:                     # ゲートは客観量のみ(物理位置・訪問履歴・世界イベント現場・人数)
+    first_visit: true           # 初訪問ノードで発火候補
+    crowd_min: 12               # 近傍(同席者)人数がこれ以上で発火候補
+    world_event: true           # 世界イベントの現場(当 step の world_event/disaster 等)で発火候補
+    prob_cap: 0.05              # ゲート通過者のうち実際に撮る確率上限(stream "pov_salience")
+  render:
+    width: 96                   # POV 画像の幅 px(低解像度セマンティック)
+    height: 72                  # 高さ px
+    fov_deg: 90.0               # 水平画角
+    max_dist_m: 200.0           # レイキャストの最大距離
+  store:
+    enabled: true               # runs/<name>/pov/ に PNG を保存(pov.enabled=false なら無効)
+    dir: pov                    # サイドカー画像フォルダ(out_dir 相対)
+  vlm:
+    backend: none               # none | mock | <実VLM>。stub 配線(実 VLM は本選 Day-0)。
+                                # mock はテストで経路を通すだけ(text LLM 呼数に影響しない)
+
 sns_geo:
   enabled: false                # SNS/DM 伝播に両者の物理距離 dist_m を記録(第22バッチ P2)。
                                 # ON でも乱数・LLM呼数は不変(transmission payload にキーを足すだけ)。OFF=バイト一致

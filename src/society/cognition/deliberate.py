@@ -129,6 +129,7 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
                  norm_line: str | None = None,
                  digest_line: str | None = None,
                  interstitial_digest: str | None = None,
+                 scene_lines: list[str] | None = None,
                  variety_hint: bool = False,
                  labeling_mode: str = "constrained",
                  open_actions: bool = False,
@@ -182,6 +183,8 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
               f"場所: {place_name}"]
     if nearby_pois:
         lines.append(f"周りにある店・場所: {'、'.join(nearby_pois[:_poi_n])}")
+    if scene_lines:                      # 構造化シーン記述 v0(scene_desc 有効時のみ。方向つき視界/
+        lines.extend(scene_lines)        # 注視対象/垂直関係。既定 OFF は None=1行も足さない=バイト一致)
     if wv_expect_line:                   # 場所の期待vs実際(worldview 有効かつ差が大きい時のみ。第20バッチ)
         lines.append(wv_expect_line)
     if institutions:                     # Searle 制度化(ON時のみ。全員平等・k非依存の1行)

@@ -35,6 +35,9 @@ world:
     enabled: true
     start_date: "auto"    # 開始日=実行当日を初日にする(具体日付 "2026-10-31" 等を書けば固定も可)
     weekday_work: true    # 平日のみ勤務・登校(土日祝は休み)
+  # ---- エージェント視覚 v0(B: 構造化シーン記述。当面 v0 のみ作動。v1 POV は全 OFF)----
+  scene_desc:
+    enabled: true
 
 # ---- 電車ダイヤ(第10バッチ: ODPT 実ダイヤ)----
 transit:

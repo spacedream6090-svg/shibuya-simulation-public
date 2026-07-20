@@ -29,6 +29,7 @@ from .cognition import drive as drive_mod
 from . import opinion as opinion_mod
 from . import relations as relations_mod
 from .observer.schema import Event
+from .world import scene_desc as scene_desc_mod
 from .world.perception import hearers_of
 
 # ---- 既定値(conf/config.yaml の conversation ブロックが上書き)----
@@ -302,12 +303,20 @@ def run_phase(sim, step: int, sim_min: int) -> None:
             # --- 成立 ---: 会話内容を決定論写像し、機械効果を適用、conversation を 1 件記録。
             plan = plan_conversation(a, b, sim.opinioncfg, cfg)
             _apply_effects(sim, a, b, plan, step, sim_min)
+            payload = {"with": b.id, "topic": plan["topic"],
+                       "tone": plan["tone"], "outcome": plan["outcome"],
+                       "acts": plan["acts"]}
+            # 行間レイヤ配線(v0-2 S3): scene_desc ON なら「場所×注視対象」の中立要約を
+            # payload メタに反映(実文は作らない)。OFF は key を足さない=従来 payload と同一。
+            _scenecfg = getattr(sim, "scenecfg", None)
+            if scene_desc_mod.enabled(_scenecfg):
+                _meta = scene_desc_mod.conversation_meta(a, city=sim.city,
+                                                         cfg=_scenecfg)
+                if _meta:
+                    payload["scene"] = _meta
             sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=a.id,
                                  kind="conversation", x=a.x, y=a.y,
-                                 payload={"with": b.id, "topic": plan["topic"],
-                                          "tone": plan["tone"],
-                                          "outcome": plan["outcome"],
-                                          "acts": plan["acts"]}))
+                                 payload=payload))
             a._c3_greet.add(b.id)
             b._c3_greet.add(a.id)
             a._c2_count += 1

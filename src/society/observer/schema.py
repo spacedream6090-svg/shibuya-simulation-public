@@ -191,6 +191,9 @@ register_event_kind("policy_reuse", "行動方針キャッシュの再利用=LLM
 # ---- 日次ローテーション/presence(W2 P3。pool.enabled ON のみ・既定 OFF=0件。日境界で1件。
 #      agent_id=-1 の世界イベント。設計: docs/plans/w2-execution-plan.md §4 P3 / persona-pool.md §5)----
 register_event_kind("presence_change", "日次ローテーションの在場入替(日境界で1件){day, n_enter, n_exit, n_present}")
+# ---- エージェント視覚 v1(pov.enabled ON のみ・既定 OFF=0件。顕著性ゲート→POVレンダ→画像ストア。
+#      専用 stream "pov_salience"・追加LLM呼ゼロ。設計: docs/research/agent-vision.md §4 v1)----
+register_event_kind("pov_image", "顕著時のPOV画像を撮影・保存(サイドカー画像への参照キー){ref, w, h, trigger, vlm?}")
 
 
 @dataclass

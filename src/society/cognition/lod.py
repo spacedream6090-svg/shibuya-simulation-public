@@ -21,15 +21,17 @@ from __future__ import annotations
 # mid = 現行の定数(poi[:3]・recent(4)・retrieve(n=3)・feed[:3]・人は全列挙)と完全一致
 # = ON でも全員 mid なら注入内容は現行と同じ。people_n 0 / salience_k 0 は「現行のまま」。
 # 下限側(narrow)を細かく振る(入力は増やす側の効果が飽和する=リサーチ §3.3)。
+# scene_n = 構造化シーン記述(world/scene_desc)の記述件数。scene_desc OFF では誰も読まない
+# =注入に影響しない(既定 OFF の scene seam と直交)。mid は現行相当=3。
 INPUT_RES_DEFAULTS = {
     "enabled": False,
     "levels": {
         "narrow": {"share": 0.33, "poi_n": 1, "people_n": 2, "recent_n": 2,
-                   "retrieve_n": 1, "feed_n": 1, "salience_k": 2},
+                   "retrieve_n": 1, "feed_n": 1, "salience_k": 2, "scene_n": 2},
         "mid":    {"share": 0.34, "poi_n": 3, "people_n": 0, "recent_n": 4,
-                   "retrieve_n": 3, "feed_n": 3, "salience_k": 0},
+                   "retrieve_n": 3, "feed_n": 3, "salience_k": 0, "scene_n": 3},
         "wide":   {"share": 0.33, "poi_n": 5, "people_n": 0, "recent_n": 6,
-                   "retrieve_n": 5, "feed_n": 5, "salience_k": 0},
+                   "retrieve_n": 5, "feed_n": 5, "salience_k": 0, "scene_n": 4},
     },
 }
 

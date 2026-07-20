@@ -22,6 +22,7 @@ from .. import inner_life as inner_life_mod
 from .. import lodging as lodging_mod
 from .. import opinion as opinion_mod
 from .. import relations as relations_mod
+from .. import pov as pov_mod
 from .. import status as status_mod
 from .. import street as street_mod
 from .. import worldview as worldview_mod
@@ -36,6 +37,7 @@ from .. import organizations, schedule, weather
 from ..world import calendar
 from ..world import presence as presence_mod
 from ..world import pool as pool_mod
+from ..world import scene_desc as scene_desc_mod
 from ..lang.sentiment import valence
 from ..factors import affect
 from ..factors import update as factor_update
@@ -1290,13 +1292,22 @@ def _isl_digest(agent) -> str | None:
 
 def _isl_take(sim, agent) -> str | None:
     """発火時: ダイジェストを組んで返し、バッファを空にする(次の「前回発火以降」を仕切り直す)。
-    OFF は None(build_prompt が1行も足さない=バイト一致)。"""
+    OFF は None(build_prompt が1行も足さない=バイト一致)。
+
+    行間レイヤ配線(v0-2): scene_desc も ON なら「客観の見え」1文を足す(意味づけしない客観記述の
+    規律を守る=解釈は夜内省の LLM の仕事)。scene_desc OFF は 1 文字も足さない=バイト一致。"""
     if not _interstitial_on(sim):
         return None
     dig = _isl_digest(agent)
     buf = getattr(agent, "_isl_buf", None)
     if buf:
         buf.clear()
+    scfg = getattr(sim, "scenecfg", None)
+    if scene_desc_mod.enabled(scfg):
+        sline = scene_desc_mod.digest_line(
+            agent, city=sim.city, cfg=scfg, elevation=getattr(sim, "elevation", None))
+        if sline:
+            dig = (dig + "。" + sline) if dig else sline
     return dig
 
 
@@ -1377,6 +1388,15 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
     # 直近接触1行(中立提示)、群衆視覚=同席者の決定論要約(記述的規範)。呼数不変=R1。
     ads_line = street_mod.ads_line(agent, getattr(sim, "adscfg", None), step)
     crowd_line = street_mod.crowd_line(company, getattr(sim, "crowdcfg", None))
+    # 構造化シーン記述 v0(scene_desc 有効時のみ。方向つき視界/注視対象/垂直関係の 2〜4 行)。
+    # 決定論・追加 LLM 呼ゼロ・乱数ゼロの純関数。company(同席者=LOS 済み)を注視の人ソースに
+    # 使う。OFF は None=1行も足さない=バイト一致(crowd_line と同型 seam)。
+    scene_lines = None
+    _scenecfg = getattr(sim, "scenecfg", None)
+    if scene_desc_mod.enabled(_scenecfg):
+        scene_lines = scene_desc_mod.scene_lines(
+            agent, city=sim.city, company=company, cfg=_scenecfg,
+            elevation=getattr(sim, "elevation", None)) or None
     # 主観的世界モデル(第20バッチ・既定 OFF は None=不変)。期待/可制御性/規範予期の
     # 自然文(閾値を超えたときだけ=トークン節約)。決定論・呼数不変=R1。
     wvcfg = getattr(sim, "worldviewcfg", None)
@@ -1436,6 +1456,7 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
                                      norm_line=norm_line,
                                      digest_line=digest_line,
                                      interstitial_digest=interstitial_digest,
+                                     scene_lines=scene_lines,
                                      variety_hint=variety_hint,
                                      labeling_mode=sim.labels.mode,
                                      open_actions=bool(getattr(sim, "freedomcfg", None)
@@ -3497,6 +3518,8 @@ def run_step(sim, step: int) -> None:
     _phase_drive(sim, step, sim_min)               # 欲求→申請→抽選→発火権
     _phase_c2(sim, step, sim_min)                  # 会話3層 C2/C3(既定OFF=no-op。P2 S3)。
                                                    # drive 押し上げは次 step の _phase_drive が拾う
+    pov_mod.run_phase(sim, step, sim_min)          # エージェント視覚 v1: 顕著性POV(既定OFF=no-op)。
+                                                   # 専用stream "pov_salience"・追加LLM呼ゼロ・画素決定
 
     active = [a for a in sim.agents
               if a.loc != "outside" and not a.sleeping]   # 外・睡眠中=計算しない

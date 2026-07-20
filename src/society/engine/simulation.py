@@ -540,6 +540,13 @@ class Simulation:
         raw_crowd = (OmegaConf.to_container(raw_crowd, resolve=True)
                      if OmegaConf.is_config(raw_crowd) else raw_crowd)
         self.crowdcfg = _street_mod.build_crowd_cfg(raw_crowd)
+        # 構造化シーン記述 v0(world.scene_desc・既定 OFF=プロンプト/イベント不変=バイト一致)。
+        # 決定論・追加 LLM 呼ゼロ・乱数ゼロの純関数集計(方向つき視界/注視対象/垂直関係)。
+        from ..world import scene_desc as _scene_desc_mod
+        raw_scene = cfg.world.get("scene_desc", None)
+        raw_scene = (OmegaConf.to_container(raw_scene, resolve=True)
+                     if OmegaConf.is_config(raw_scene) else raw_scene)
+        self.scenecfg = _scene_desc_mod.build_cfg(raw_scene)
         # SNS/DM 架橋距離の記録(第22バッチ P2・旧 shibuya-sim 由来)。bool 1個=OFF で完全 no-op。
         raw_snsgeo = cfg.get("sns_geo", None)
         raw_snsgeo = (OmegaConf.to_container(raw_snsgeo, resolve=True)
