@@ -650,6 +650,31 @@ worldview:
   norm_hi: 0.02                 # C6: 1人日あたり率がこれ以上で「珍しくない」
   snapshot: true                # 日次 worldview イベント(観測の要)
 
+# ---- 群のオントロジー(文化圏×経験の世界観共有群。2026-07-21。既定 OFF=属性なし=バイト一致)----
+# 「地震に慣れた人と、地震をほとんど経験しない旅行者では行動が大きく異なる」という外部助言を受け、
+# 各エージェントに「文化圏×経験」の群を1つ割り当てる。割当は安定ハッシュ(seed, persona id)=run.seed
+# 非依存(同一設定なら全ランで同一人物は同一群=比較実験の要)・乱数ゼロ・traits/k 非参照(因子と直交)。
+# 行動分岐はルールで書かず、群の「経験の事実」1行(groups.*.line)だけをプロンプトに注入して LLM に委ねる
+# (nature-like 方針)。群の割合(composition)を振る A/B で「地震慣れ層の割合→街の反応」を精密に予測する。
+# 本番 ON はユーザーが割合を決めてから(daily/production は触らない=既定 OFF のまま)。
+ontology:
+  enabled: false                # 既定 OFF=属性なし・プロンプト不変=ゴールデン L1 バイト一致
+  seed: 20260721                # 群割当の安定ハッシュ種(run.seed と独立=ラン間で同一人物は同一群)
+  groups:                       # 群の定義はデータ駆動(基盤コードに文化名・地名リテラルを書かない)
+    jp_metro:   { label: "都市圏在住の日本人",   line: "長く都市部で暮らし、地震や混雑した街には慣れている。", quake_exp: high, city_exp: high, ja: native }
+    jp_other:   { label: "国内他地域からの来街者", line: "国内の別の地域から来ており、地震には慣れているがこの街の土地勘は薄い。", quake_exp: high, city_exp: mid, ja: native }
+    asia_visit: { label: "アジア圏からの旅行者",  line: "海外からの旅行者で、大都市には慣れているが地震の経験は少なく、日本語は限定的だ。", quake_exp: low, city_exp: high, ja: partial, wv_offsets: { controllability: -0.05 } }
+    west_visit: { label: "欧米圏からの旅行者",   line: "海外からの旅行者で、地震をほとんど経験したことがなく、日本語はほぼ話せない。", quake_exp: none, city_exp: mid, ja: none, wv_offsets: { controllability: -0.1 } }
+  # 層別の群構成比(合計は正規化されるので厳密に 1.0 でなくてよい)。tier は P3 presence の実層名:
+  #   resident / duty / workday_shift / cadence / stochastic(world/presence.py)+ 直接ラン用 default。
+  composition:
+    resident:      { jp_metro: 1.0 }                                              # L1 住民/L5 議員
+    duty:          { jp_metro: 1.0 }                                              # L5 役割(駅員/運転士/警察/配信者)
+    workday_shift: { jp_metro: 0.85, jp_other: 0.15 }                             # L2 域内従業者
+    cadence:       { jp_metro: 0.7,  jp_other: 0.3 }                              # L3 定期来街(学生/常連)
+    stochastic:    { jp_metro: 0.45, jp_other: 0.40, asia_visit: 0.10, west_visit: 0.05 }  # L4 非定期来街
+    default:       { jp_metro: 0.8,  jp_other: 0.2 }                              # プール非使用の直接ラン(n_agents 生成)用
+
 # ---- 街路の環境情報(第18バッチ 2026-07-11。既定 OFF=現行と完全同一)----
 # 街頭広告(OOH)=掲出地点の視認判定→ad_exposure+発火時の中立1行(広告主=シミュ内 POI で
 # 接触→来店→購買のファネルが閉じる)。効果量の接地: docs/research/commercial-analytics.md §7。

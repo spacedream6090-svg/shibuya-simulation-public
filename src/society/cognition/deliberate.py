@@ -152,6 +152,11 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
     _retrieve_n = int(_ir.get("retrieve_n", 3))
     _feed_n = int(_ir.get("feed_n", 3))
     lines = [_header(labeling_mode, open_actions, city_name), agent.persona]
+    # 群のオントロジー(文化圏×経験の「経験の事実」1行。ontology 有効時のみ agent に設定される。
+    # 文言は config 由来=基盤に文化名リテラルなし。OFF は属性なし=行なし=バイト一致)。
+    onto = getattr(agent, "ontology_line", None)
+    if onto:
+        lines.append(onto)
     # 反射=自己モデル(第11バッチ 2026-07-08。深い内省の産物。OFF は None=行なし=バイト一致)。
     # persona(固定の自己紹介)の直後に「経験から更新される自己理解」を置く=自己認識の再帰。
     sm = getattr(agent, "self_model", None)

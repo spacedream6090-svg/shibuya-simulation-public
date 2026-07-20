@@ -455,6 +455,16 @@ class Simulation:
                 personas_path = REPO_ROOT / personas_path
             roster = json.loads(personas_path.read_text(encoding="utf-8"))["personas"]
         self.agents = []
+        # ---- 群のオントロジー(文化圏×経験の世界観共有群。2026-07-21・既定 OFF=属性なし=バイト一致)----
+        # 各エージェントに「文化圏×経験」の群を安定ハッシュ(ontology.seed, persona id)で1つ割り当てる。
+        # run.seed 非依存=同一設定なら全ランで同一人物は同一群(比較実験の要)。乱数ゼロ(RngHub 無風)・
+        # traits/k 非参照(因子と直交)。ON 時のみ agent.ontology_group / ontology_line を据える。
+        # agents 構築(下の pool day0 着席・直接ラン loop)より前に cfg を用意する必要がある。
+        from .. import ontology as _ontology_mod
+        raw_onto = cfg.get("ontology", None)
+        raw_onto = (OmegaConf.to_container(raw_onto, resolve=True)
+                    if OmegaConf.is_config(raw_onto) else raw_onto)
+        self.ontologycfg = _ontology_mod.build_cfg(raw_onto)
         # ---- 日次ローテーション/presence(W2 P3・既定 OFF=n_agents 固定=バイト一致)----
         # pool.enabled=true で 100万プールから day0 の present を決定論選択して着席させる。
         # OFF(pool is None)なら従来どおり run.n_agents 固定の名簿サイクリック割当(挙動不変)。
@@ -486,6 +496,8 @@ class Simulation:
                                     reflection=self.reflectcfg,
                                     place_name=self.place_name)
                 self._init_agent_runtime(agent)
+                # 群のオントロジー(既定 OFF=no-op)。直接ランは tier=default(プール非使用)。
+                self._apply_ontology(agent, "default")
                 self.agents.append(agent)
         self.agent_by_id = {a.id: a for a in self.agents}
         # S6a: pool ON かつ N 比例予算なら、当日の在場数を N に使う(1行の接続)。
@@ -622,7 +634,9 @@ class Simulation:
               "part_time_name": (a.part_time["name"] if a.part_time else None),
               **({"sdt": a.drive_mods} if a.drive_mods else {}),
               **({"input_res": a.input_res["level"]}
-                 if getattr(a, "input_res", None) else {})}
+                 if getattr(a, "input_res", None) else {}),
+              **({"ontology_group": a.ontology_group}
+                 if getattr(a, "ontology_group", None) else {})}
              for a in self.agents],
             ensure_ascii=False), encoding="utf-8")
 
@@ -777,6 +791,31 @@ class Simulation:
             agent.mem.actr = agent.mem.actr_config(
                 seed=base * 1_000_003 + agent.id, **overrides)
 
+    # ---- 群のオントロジー(文化圏×経験の世界観共有群。2026-07-21)------------------
+    def _apply_ontology(self, agent, tier: str) -> None:
+        """群を安定ハッシュで割り当て、経験1行と worldview 初期オフセットを据える(既定 OFF=no-op)。
+
+        既定 OFF(ontology.enabled=false)は属性を1つも作らない=プロンプト・状態とも不変=バイト一致。
+        割当は persona id(pool は pool_pid・直接ランは agent.id)のみの関数=k/trait 非参照・run.seed
+        非依存・RngHub 無風。pool の再来街(hydrate)でも build_pool_agent が同一 pid から同一群を再導出。"""
+        from .. import ontology as _ontology_mod
+        cfg = self.ontologycfg
+        if not cfg["enabled"]:
+            return
+        pid = getattr(agent, "pool_pid", None)
+        if pid is None:
+            pid = str(agent.id)
+        gid = _ontology_mod.assign_group(cfg, pid, tier)
+        if gid is None:
+            return
+        agent.ontology_group = gid
+        line = _ontology_mod.group_line(cfg, gid)
+        if line:                                       # 「経験の事実」1行(build_prompt が注入)
+            agent.ontology_line = line
+        c0 = _ontology_mod.initial_controllability(cfg, gid)
+        if c0 is not None:                             # S-b: 可制御性の起点を群で1回だけずらす
+            agent.controllability = c0
+
     # ---- 日次ローテーション/presence(W2 P3)------------------------------------
     def _pool_weekday(self, day: int) -> int:
         """当日の曜日(0=Mon..6=Sun)。presence を暦 config に結合させず day のみの純関数に保つ
@@ -798,6 +837,8 @@ class Simulation:
                             place_name=self.place_name)
         agent.pool_pid = pid
         self._init_agent_runtime(agent)
+        # 群のオントロジー(既定 OFF=no-op)。tier=P5 record の presence 層(resident/duty/…)。
+        self._apply_ontology(agent, str(record.get("presence", "resident")))
         return agent
 
     def _pool_update_budget(self) -> None:
