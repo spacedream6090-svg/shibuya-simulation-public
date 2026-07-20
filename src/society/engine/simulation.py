@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 from omegaconf import DictConfig, OmegaConf
@@ -59,7 +60,14 @@ class Simulation:
         self.labels = LabelSystem(self.items,
                                   adopt_threshold=cfg.labeling.adopt_threshold,
                                   mode=str(cfg.labeling.get("mode", "constrained")))
-        self.budget = LodBudget(cfg.lod.max_llm_per_step)
+        npro = cfg.lod.get("n_proportional", None)
+        if npro is not None and bool(npro.get("enabled", False)):
+            dens = float(npro.get("density", 0.15))
+            # round(…,9) は 0.15×40=6.000000000000001 のような float 誤差での繰り上げ事故を防ぐ
+            cap = max(1, math.ceil(round(dens * int(cfg.run.n_agents), 9)))
+        else:
+            cap = cfg.lod.max_llm_per_step
+        self.budget = LodBudget(cap)
         self.pois = self.city.pois()
         self.dests = self.city.destinations()
         transit_path = Path(str(cfg.transit.file))

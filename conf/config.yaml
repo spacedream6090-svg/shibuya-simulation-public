@@ -543,6 +543,14 @@ transit:
 lod:
   max_llm_per_step: 300         # LLM 発火の step 上限(実機実測で更新)
   congestion_surprise: 0.5      # 混雑係数がこれ未満なら「驚き」
+  # ---- 予算のN比例化(P2-S6a・既定OFF=バイト一致)。docs/plans/million-scale.md §2.3 ----
+  # 全員思考の「200体相当の思考密度をNに比例して維持」: ON で step 上限を
+  # ceil(density × run.n_agents) に置換(固定 max_llm_per_step は使わない)。
+  # density=0.15 は 200体較正 day1 実測(4,293呼/144step/200体)。P3 ローテーション導入後は
+  # N を「思考層の在場数」に差し替える(presence ゲートとセットで拡張)。
+  n_proportional:
+    enabled: false
+    density: 0.15
   # ---- 入力解像度LOD(第30バッチ・既定OFF=バイト一致)。docs/plans/input-resolution-lod.md ----
   # 「世界に対する解像度」の個体差: 知覚/記憶/フィードの注入件数を水準別に振る(呼数不変=R1安全)。
   # 割当は cognition/lod.py の共通軸機構(trait非依存・軸専用 stream "lod_input_res")。
