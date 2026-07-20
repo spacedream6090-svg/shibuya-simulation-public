@@ -28,6 +28,56 @@ def _load_export3d():
     return mod
 
 
+def _load_notable():
+    """viz/notable_events.py を場所非依存で読み込む(_load_export3d と同じ流儀)。"""
+    spec = importlib.util.spec_from_file_location(
+        "notable_events", REPO_ROOT / "viz" / "notable_events.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _ensure_notable(run_dir: Path, tracks_json: str) -> str | None:
+    """顕著イベントを l1_events.parquet(scene/tracks と同一入力源)から抽出。
+
+    notable が 0 件 / parquet 不在なら None を返す = 注入されない = 従来とバイト同一。
+    成果は scene3d/notable_events.json に書き出し(透明性)、注入用テキストを返す。
+    抽出は決定論(乱数なし)。間引き件数は stdout に明記(silent cap 禁止)。
+    """
+    ev_p = run_dir / "l1_events.parquet"
+    if not ev_p.exists():
+        return None
+    try:
+        meta = json.loads(tracks_json).get("meta", {})
+    except Exception:
+        meta = {}
+    n_steps = int(meta.get("nSteps", 0) or 0)
+    stride = int(meta.get("step_stride", 1) or 1)
+    nb = _load_notable()
+    try:
+        data = nb.extract_from_run(ev_p, n_steps=n_steps, stride=stride)
+    except Exception as e:                       # 抽出失敗は静かに従来動作へ退避
+        print(f"  [notable] 抽出をスキップ({type(e).__name__}: {e})")
+        return None
+    if not data.get("events"):
+        return None
+    text = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    try:
+        out_p = run_dir / "scene3d" / "notable_events.json"
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        out_p.write_text(text, encoding="utf-8")
+    except Exception:
+        pass
+    # kind 別件数と間引きの明示(silent cap 禁止)
+    caps = data.get("caps", {})
+    print(f"  [notable] {data['n_kept']}件を採用(候補 {data['n_total']}件)")
+    for kind in sorted(caps, key=lambda k: (-caps[k]["kept"], k)):
+        c = caps[kind]
+        cap_note = f"  ← 間引き {c['dropped']}件" if c["dropped"] else ""
+        print(f"    {kind:18s} {c['kept']:4d}/{c['total']:<5d}{cap_note}")
+    return text
+
+
 def _ensure_scene(run_dir: Path) -> tuple[str, str, str | None, str | None]:
     scene_dir = run_dir / "scene3d"
     scene_p = scene_dir / "scene.json"
@@ -68,7 +118,8 @@ def build_html(run_name: str, scene_json: str, tracks_json: str,
                plateau_src: str | None = None,
                terrain_json: str | None = None,
                has_extras: bool = False,
-               mode_legend: dict | None = None) -> str:
+               mode_legend: dict | None = None,
+               notable_json: str | None = None) -> str:
     three_js, orbit_js, lic = _read_vendor()
     html = _TEMPLATE
     html = html.replace("__RUN_NAME__", run_name)
@@ -86,6 +137,8 @@ def build_html(run_name: str, scene_json: str, tracks_json: str,
         html = _inject_terrain(html, terrain_json)
     if mode_legend:                     # tracks.meta.mode_legend(移動手段)
         html = _inject_modes(html)
+    if notable_json is not None:        # notable_events.json(顕著イベントパネル)
+        html = _inject_notable(html, notable_json)
     return html
 
 
@@ -349,6 +402,98 @@ _MODES_BUILD = r"""// ---------- 移動手段(feature5)。TRACKS.meta.mode_legen
 """
 
 
+# ============================================================ 顕著イベント(notable)
+def _inject_notable(html: str, notable_json: str) -> str:
+    """顕著イベントパネルを後付け注入(データ無し時は呼ばれない=既定出力はバイト同一)。
+    ①notable-data ②CSS ③右スタックのパネル ④リスト構築+クリック配線 の 4 箇所を一意置換。"""
+    data_tag = ('<script type="application/json" id="notable-data">'
+                + _json_for_script(notable_json) + "</script>")
+    anchor_data = '<script type="application/json" id="scene-data">'
+    html = _replace_once(html, anchor_data, data_tag + "\n" + anchor_data, "notable-data")
+    anchor_css = "</style>"
+    html = _replace_once(html, anchor_css, _NOTABLE_CSS + anchor_css, "notable-css")
+    anchor_panel = '  <div id="legend" class="panel"></div>'
+    html = _replace_once(html, anchor_panel, anchor_panel + "\n" + _NOTABLE_PANEL,
+                         "notable-panel")
+    anchor_build = "// ---------- ループ"
+    html = _replace_once(html, anchor_build, _NOTABLE_BUILD + anchor_build, "notable-build")
+    return html
+
+
+_NOTABLE_CSS = r"""  #notable { position:relative; }
+  #notable .hdr { font-size:10.5px; letter-spacing:.12em; text-transform:uppercase; color:#9aa4b2;
+    cursor:pointer; margin-bottom:8px; user-select:none; display:flex; align-items:center; gap:6px; }
+  #notable .hdr #ntCaret { margin-left:auto; }
+  #notable #ntCount { color:#c7cdd6; letter-spacing:0; text-transform:none; }
+  #notable #ntList { max-height:320px; overflow-y:auto; margin:-2px -4px; padding:0 2px; }
+  #notable .nt-row { display:flex; align-items:center; gap:6px; padding:3px 4px; border-radius:5px;
+    cursor:pointer; font-size:11px; line-height:1.35; }
+  #notable .nt-row:hover { background:rgba(255,255,255,.08); }
+  #notable .nt-row.on { background:rgba(59,130,246,.30); }
+  #notable .nt-dot { width:8px; height:8px; border-radius:50%; flex:0 0 auto; }
+  #notable .nt-t { color:#9aa4b2; font-variant-numeric:tabular-nums; flex:0 0 auto; }
+  #notable .nt-k { color:#e6e9ee; flex:0 0 auto; font-weight:600; }
+  #notable .nt-x { color:#c7cdd6; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+"""
+
+_NOTABLE_PANEL = r"""  <div id="notable" class="panel">
+    <div class="hdr" id="ntHdr">顕著イベント <span id="ntCount"></span><span id="ntCaret">&#9662;</span></div>
+    <div id="ntBody"><div id="ntList"></div></div>
+  </div>"""
+
+_NOTABLE_BUILD = r"""// ========== 顕著イベント(notable-data 注入時のみ動く)。クリックで時間ジャンプ+カメラ移動。
+(function setupNotable(){
+  const el = document.getElementById('notable-data'); if(!el) return;
+  let ND; try { ND = JSON.parse(el.textContent); } catch(e){ console.warn('notable parse failed', e); return; }
+  const evs = (ND && ND.events) || []; if(!evs.length) return;
+  const listEl = document.getElementById('ntList'); if(!listEl) return;
+  const cntEl = document.getElementById('ntCount'); if(cntEl) cntEl.textContent = evs.length + '件';
+  const IMP_COLOR = { 5:'#ef4444', 4:'#f59e0b', 3:'#eab308', 2:'#60a5fa', 1:'#9aa4b2' };
+  const esc = s => String(s == null ? '' : s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const playBtn = document.getElementById('play');
+  function jump(ev){
+    // ① 時間スライダをそのフレームへ(自動再生は止める)
+    t = Math.max(0, Math.min(NS-1, ev.frame|0));
+    playing = false; if(playBtn) playBtn.textContent = '▶︎';
+    timeline.value = String(t);
+    const min = simMinAt(t); clockEl.textContent = fmtClock(min);
+    if(dayNight) updateSky(min);
+    placeAgents(t); placeCars(t);
+    // ② カメラをイベント発生位置へ(位置があるものだけ)
+    if(ev.has_pos){
+      const gx = ev.x, gy = ev.y, gz = groundAt(gx, gy);
+      controls.target.set(gx, gz + 6, -gy);
+      camera.position.set(gx + 95, gz + 135, -gy + 95);
+      controls.update();
+    }
+  }
+  let h = '';
+  for(let i=0;i<evs.length;i++){
+    const ev = evs[i];
+    const c = IMP_COLOR[ev.importance] || '#9aa4b2';
+    const txt = ev.text ? (' — ' + esc(ev.text)) : '';
+    h += '<div class="nt-row" data-i="'+i+'" title="'+esc(ev.label)+esc(txt)+'">'
+      + '<span class="nt-dot" style="background:'+c+'"></span>'
+      + '<span class="nt-t">'+esc(fmtClock(ev.sim_min))+'</span>'
+      + '<span class="nt-k">'+esc(ev.label)+'</span>'
+      + '<span class="nt-x">'+txt+'</span></div>';
+  }
+  listEl.innerHTML = h;
+  const rows = listEl.querySelectorAll('.nt-row');
+  rows.forEach(row=>{ row.onclick = ()=>{
+    jump(evs[Number(row.dataset.i)]);
+    rows.forEach(r=> r.classList.remove('on')); row.classList.add('on'); }; });
+  // ヘッダで折り畳み
+  const hdr = document.getElementById('ntHdr'), caret = document.getElementById('ntCaret');
+  if(hdr) hdr.onclick = ()=>{ const b = document.getElementById('ntBody');
+    const off = b.style.display === 'none'; b.style.display = off ? 'block' : 'none';
+    if(caret) caret.innerHTML = off ? '&#9662;' : '&#9656;'; };
+})();
+
+"""
+
+
 def _strip_traffic(tracks_json: str) -> str:
     # 長期ラン(例 100日=14400step)は背景交通の軌跡だけで数百MBになりブラウザで開けない。
     # --no-traffic で traffic を空にする(人物・建物は従来どおり)。JS は traffic[s] 不在で車0台。
@@ -379,9 +524,12 @@ def main(argv: list) -> int:
         mode_legend = json.loads(tracks_json).get("meta", {}).get("mode_legend")
     except Exception:
         mode_legend = None
+    # 顕著イベント(scene/tracks と同一入力=l1_events.parquet から抽出。無ければ None=バイト同一)
+    notable_json = _ensure_notable(run_dir, tracks_json)
     html = build_html(run_dir.name, scene_json, tracks_json,
                       plateau_json=plateau_json, terrain_json=terrain_json,
-                      has_extras=has_extras, mode_legend=mode_legend)
+                      has_extras=has_extras, mode_legend=mode_legend,
+                      notable_json=notable_json)
     out = run_dir / "viewer3d.html"
     out.write_text(html, encoding="utf-8")
     mb = out.stat().st_size / 1024 / 1024
@@ -396,7 +544,8 @@ def main(argv: list) -> int:
                         encoding="utf-8")
         lite = build_html(run_dir.name, scene_json, tracks_json,
                           plateau_src="plateau_mesh.js", terrain_json=terrain_json,
-                          has_extras=has_extras, mode_legend=mode_legend)
+                          has_extras=has_extras, mode_legend=mode_legend,
+                          notable_json=notable_json)
         lite_p = run_dir / "viewer3d_lite.html"
         lite_p.write_text(lite, encoding="utf-8")
         print(f"  {lite_p}  ({lite_p.stat().st_size/1024/1024:.2f} MB)"
