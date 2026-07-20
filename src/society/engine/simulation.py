@@ -20,6 +20,8 @@ from ..world.clock import Clock
 from ..world.map import CityMap
 from ..world.routing import Router
 from ..world.transit import Transit
+from ..world import presence as presence_mod
+from ..world import pool as pool_mod
 from . import checkpoint, scheduler
 
 
@@ -443,48 +445,41 @@ class Simulation:
                 personas_path = REPO_ROOT / personas_path
             roster = json.loads(personas_path.read_text(encoding="utf-8"))["personas"]
         self.agents = []
-        for agent_id in range(int(cfg.run.n_agents)):
-            entry = roster[agent_id % len(roster)] if roster else None
-            agent = build_agent(agent_id, self.hub.stream("persona", agent_id),
-                                nodes, self.city, entry=entry,
-                                economy=self.economy,
-                                threshold_dist=self.threshold_dist,
-                                drift=self.drivecfg["drift"],
-                                reflection=self.reflectcfg,
-                                place_name=self.place_name)
-            agent.x, agent.y = self.city.node_xy(agent.node)
-            agent.visits[agent.node] += 1
-            agent._heard_unknown = False
-            agent._arrived_new = False
-            agent._congestion = 1.0
-            agent._pending_stay = 2
-            agent._pending_activity = ""
-            agent._ride_pending = None             # 交通機関の乗車(到着時に運賃を払う)
-            agent._search_queue = []
-            agent._drive_reasons = {}
-            # 無意識層(第12バッチ): 感情価の生カウントを貯めるか(deep か implicit のどちらか
-            # 有効なら True)。両OFF なら False=factors._impact_note が即 return=バイト一致。
-            agent._impact_on = bool(self.reflectcfg["deep"]["enabled"]
-                                    or self.reflectcfg["implicit_self"]["enabled"])
-            agent._fire_reason = ""
-            agent._last_fire_reason = ""           # 造語の発生きっかけの記録用
-            agent._last_dm_from = None
-            agent._reply_to = None
-            agent._known_events = set()             # 参加告知を受けたイベント id
-            agent._attending_event = None           # 会場へ向かっているイベント id
-            agent.arousal = float(self.affectcfg["arousal_baseline"])  # 覚醒度の初期値=baseline
-            agent.conv_turns_left = int(self.drivecfg["conv_max_turns"])
-            agent.conv_cooldown_until = 0
-            agent.mem.relations_max = self.relations_max   # B6: 台帳上限(既定0=無制限)
-            if self.actrcfg.get("enabled", False):
-                # 個体別シードは run.seed から決定論導出(専用streamのみで消費=既存draw順不変)
-                overrides = {k: v for k, v in self.actrcfg.items()
-                             if k not in ("enabled", "seed")}
-                base = int(self.actrcfg.get("seed", cfg.run.seed))
-                agent.mem.actr = agent.mem.actr_config(
-                    seed=base * 1_000_003 + agent.id, **overrides)
-            self.agents.append(agent)
+        # ---- 日次ローテーション/presence(W2 P3・既定 OFF=n_agents 固定=バイト一致)----
+        # pool.enabled=true で 100万プールから day0 の present を決定論選択して着席させる。
+        # OFF(pool is None)なら従来どおり run.n_agents 固定の名簿サイクリック割当(挙動不変)。
+        self._pool = None                   # PoolStore(ON 時のみ)。OFF は None=全 seam が no-op
+        self._dormant = None                # DormantStore(退場者のスリム状態退避)
+        self._pool_day = 0                  # 日境界ローテーションの進行管理(day0 は init で着席済み)
+        self._pool_nodes = nodes            # rotation の build_pool_agent が使う出発ノード候補
+        poolcfg = cfg.get("pool", {}) or {}
+        if bool(poolcfg.get("enabled", False)):
+            pool_dir = Path(str(poolcfg.get("dir", "data/persona_pool")))
+            if not pool_dir.is_absolute():
+                pool_dir = REPO_ROOT / pool_dir
+            self._pool = pool_mod.PoolStore(pool_dir)
+            self._pool_present_cap = int(poolcfg.get("present_cap", 300))
+            self._dormant = pool_mod.DormantStore(cap=int(poolcfg.get("dormant_cap", 0)))
+            weekday = self._pool_weekday(0)
+            day0 = presence_mod.present_for_day(
+                self._pool.presence_records(), 0, self._pool_present_cap, self.hub, weekday)
+            for pid in day0:
+                self.agents.append(self.build_pool_agent(pid, self._pool.get(pid)))
+        else:
+            for agent_id in range(int(cfg.run.n_agents)):
+                entry = roster[agent_id % len(roster)] if roster else None
+                agent = build_agent(agent_id, self.hub.stream("persona", agent_id),
+                                    nodes, self.city, entry=entry,
+                                    economy=self.economy,
+                                    threshold_dist=self.threshold_dist,
+                                    drift=self.drivecfg["drift"],
+                                    reflection=self.reflectcfg,
+                                    place_name=self.place_name)
+                self._init_agent_runtime(agent)
+                self.agents.append(agent)
         self.agent_by_id = {a.id: a for a in self.agents}
+        # S6a: pool ON かつ N 比例予算なら、当日の在場数を N に使う(1行の接続)。
+        self._pool_update_budget()
         # 流入通勤者を朝の到着前=範囲外に置く(既存 visitor 帰還機構で朝 enter_area)。
         # commuter が居ない名簿(既定・procedural)では完全 no-op=既定挙動バイト一致。
         self._init_inflow_commuters()
@@ -727,6 +722,133 @@ class Simulation:
             b.mem.observe(0, f"{a.name}と初めて話した", kind="event")
             self.net.add_contact(a.id, b.id)       # 知り合い(DM 可・自動フォロー)
 
+    # ---- エージェント生成時のランタイム属性初期化(名簿経路とプール経路で共有)----
+    def _init_agent_runtime(self, agent) -> None:
+        """build_agent が返した agent に step ループが要る transient 属性を据える。
+
+        名簿経路(既定)と pool ローテーション経路の両方から呼ぶ共通初期化。既定挙動は
+        従来の init ループと**完全に同一**(抽出リファクタのみ・draw/値とも不変=バイト一致)。"""
+        agent.x, agent.y = self.city.node_xy(agent.node)
+        agent.visits[agent.node] += 1
+        agent._heard_unknown = False
+        agent._arrived_new = False
+        agent._congestion = 1.0
+        agent._pending_stay = 2
+        agent._pending_activity = ""
+        agent._ride_pending = None             # 交通機関の乗車(到着時に運賃を払う)
+        agent._search_queue = []
+        agent._drive_reasons = {}
+        # 無意識層(第12バッチ): 感情価の生カウントを貯めるか(deep か implicit のどちらか
+        # 有効なら True)。両OFF なら False=factors._impact_note が即 return=バイト一致。
+        agent._impact_on = bool(self.reflectcfg["deep"]["enabled"]
+                                or self.reflectcfg["implicit_self"]["enabled"])
+        agent._fire_reason = ""
+        agent._last_fire_reason = ""           # 造語の発生きっかけの記録用
+        agent._last_dm_from = None
+        agent._reply_to = None
+        agent._known_events = set()             # 参加告知を受けたイベント id
+        agent._attending_event = None           # 会場へ向かっているイベント id
+        agent.arousal = float(self.affectcfg["arousal_baseline"])  # 覚醒度の初期値=baseline
+        agent.conv_turns_left = int(self.drivecfg["conv_max_turns"])
+        agent.conv_cooldown_until = 0
+        agent.mem.relations_max = self.relations_max   # B6: 台帳上限(既定0=無制限)
+        if self.actrcfg.get("enabled", False):
+            # 個体別シードは run.seed から決定論導出(専用streamのみで消費=既存draw順不変)
+            overrides = {k: v for k, v in self.actrcfg.items()
+                         if k not in ("enabled", "seed")}
+            base = int(self.actrcfg.get("seed", self.cfg.run.seed))
+            agent.mem.actr = agent.mem.actr_config(
+                seed=base * 1_000_003 + agent.id, **overrides)
+
+    # ---- 日次ローテーション/presence(W2 P3)------------------------------------
+    def _pool_weekday(self, day: int) -> int:
+        """当日の曜日(0=Mon..6=Sun)。presence を暦 config に結合させず day のみの純関数に保つ
+        ため day % 7(day0=Monday)で決める(k 非依存・resume 不変)。"""
+        return int(day) % 7
+
+    def build_pool_agent(self, pid: str, record: dict):
+        """P5 の full record から present エージェントを1体構築する(id はペルソナ id 安定)。
+
+        agent.id = self._pool.id_of(pid)(密で安定=日を跨いで同一人物=k*/founder 分析の前提)。
+        元のペルソナ id 文字列は agent.pool_pid に保持する(観測 agent_id からの逆引き・突合に使う)。"""
+        aid = self._pool.id_of(pid)
+        agent = build_agent(aid, self.hub.stream("persona", aid),
+                            self._pool_nodes, self.city, entry=record,
+                            economy=self.economy,
+                            threshold_dist=self.threshold_dist,
+                            drift=self.drivecfg["drift"],
+                            reflection=self.reflectcfg,
+                            place_name=self.place_name)
+        agent.pool_pid = pid
+        self._init_agent_runtime(agent)
+        return agent
+
+    def _pool_update_budget(self) -> None:
+        """S6a の N 比例 cap を、pool ON 時は当日の在場数 len(self.agents) で更新する(1行の接続)。
+
+        n_proportional OFF のときは何もしない(固定 lod.max_llm_per_step のまま=バイト一致)。"""
+        if self._pool is None:
+            return
+        npro = self.cfg.lod.get("n_proportional", None)
+        if npro is not None and bool(npro.get("enabled", False)):
+            dens = float(npro.get("density", 0.15))
+            self.budget.max_per_step = max(1, math.ceil(round(dens * len(self.agents), 9)))
+
+    def _pool_sidecar_path(self, step: int) -> Path:
+        return self.out_dir / "checkpoint" / f"dormant-{int(step):06d}.pkl.gz"
+
+    def _save_pool_sidecar(self, step: int) -> None:
+        """checkpoint と対で、pool の状態を同 step の sidecar に保存する(pool ON 時のみ)。
+
+        checkpoint.py 本体は触らず(掟)、pool 固有の状態だけを持たせる:
+          - ドーマント退避ストア(再来街の記憶源)。
+          - 日境界の進行(_pool_day)。
+          - **退場済み個体**(agent_by_id にあり sim.agents に無い個体)= 造語の作者名・DM 送信者名等
+            の**過去参照**の解決先。checkpoint は present 個体しか保存しないので、ここで補完する。
+        presence 自体は純関数=保存不要(day から再計算)。"""
+        if self._pool is None:
+            return
+        import gzip
+        import os
+        import pickle
+        present_ids = {a.id for a in self.agents}
+        departed = {aid: a for aid, a in self.agent_by_id.items()
+                    if aid not in present_ids}
+        blob = {"pool_day": int(self._pool_day),
+                "dormant": self._dormant._d,
+                "dormant_cap": self._dormant.cap,
+                "departed": departed}
+        path = self._pool_sidecar_path(step)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with gzip.open(tmp, "wb") as f:
+            f.write(pickle.dumps(blob, protocol=pickle.HIGHEST_PROTOCOL))
+        os.replace(tmp, path)
+
+    def _restore_pool_resume(self, start: int) -> None:
+        """resume 時に pool の状態を復元する(pool ON 時のみ)。sim.agents は checkpoint.load が復元済み。
+
+        sidecar があれば: ドーマントストア・日境界・退場者参照を復元 → straight run と同じ状態で続行
+        (退場者参照が全て解決=reply/造語作者名などの reference が落ちない)。無ければラン内一貫性のみ。"""
+        if self._pool is None:
+            return
+        from collections import OrderedDict
+        self.agent_by_id = {a.id: a for a in self.agents}
+        prev_min = self.clock.sim_min(max(0, int(start) - 1))
+        self._pool_day = prev_min // 1440 if start > 0 else 0
+        path = self._pool_sidecar_path(start)
+        if path.exists():
+            import gzip
+            import pickle
+            with gzip.open(path, "rb") as f:
+                blob = pickle.loads(f.read())
+            self._dormant = pool_mod.DormantStore(cap=int(blob.get("dormant_cap", 0)))
+            self._dormant._d = OrderedDict(blob.get("dormant", {}))
+            self._pool_day = int(blob.get("pool_day", self._pool_day))
+            for aid, agent in blob.get("departed", {}).items():
+                self.agent_by_id.setdefault(aid, agent)   # 退場者参照を復元(present は上書きしない)
+        self._pool_update_budget()
+
     def run(self, resume_from: Path | str | None = None) -> dict:
         # D16: checkpoint_every>0 で該当 step ごとに完全状態を保存 + ログを part 化。
         # 既定 0 = 無効(part を作らず出力・挙動は従来と完全同一)。
@@ -742,6 +864,7 @@ class Simulation:
                 raise FileNotFoundError(
                     f"resume 元に checkpoint が無い: {Path(resume_from) / 'checkpoint'}")
             start = checkpoint.load(self, ckpt)
+            self._restore_pool_resume(start)      # pool ON 時のみ: ドーマント/日境界の復元
         if every > 0:
             save_config(self.cfg, self.out_dir)   # 途中再開に備え config を先出しする
         for step in range(start, int(self.cfg.run.n_steps)):
@@ -751,6 +874,7 @@ class Simulation:
                 checkpoint.save(self, step + 1,
                                 self.out_dir / "checkpoint"
                                 / f"ckpt-{step + 1:06d}.pkl.gz")
+                self._save_pool_sidecar(step + 1)  # pool ON 時のみ: ドーマント退避の対保存
                 self.logger.flush_segment()
                 did_flush = True
             if flush_every > 0 and not did_flush \

@@ -34,6 +34,8 @@ from .. import economy as economy_mod
 from ..government import Government, build_government_cfg
 from .. import organizations, schedule, weather
 from ..world import calendar
+from ..world import presence as presence_mod
+from ..world import pool as pool_mod
 from ..lang.sentiment import valence
 from ..factors import affect
 from ..factors import update as factor_update
@@ -3387,11 +3389,60 @@ def _phase_inner_life(sim, step: int, sim_min: int) -> None:
     inner_life_mod.precompute(sim, step, sim_min)
 
 
+# ---------------------------------------------------------------- 日次ローテーション/presence(W2 P3)
+def _phase_pool_rotation(sim, step: int, sim_min: int) -> None:
+    """日境界で presence を引き直し、退場者をドーマント化・入場者を実体化する(pool ON 時のみ)。
+
+    - presence は stream("presence", pid, day) の純関数(k/trait 非依存・resume 不変)。
+    - 退場者(present→absent): dehydrate してスリム状態を DormantStore へ退避し sim.agents から除去。
+    - 入場者(absent→present): P5 record から build_pool_agent で実体化。退避済み状態があれば hydrate
+      (再来街=同一実体の記憶・信念・所持金・関係が続く)。agent.id はペルソナ id で安定。
+    - S6a の N 比例 cap を当日の在場数で更新。日境界で presence_change を1件記録(agent_id=-1)。
+
+    pool 無効(sim._pool is None)なら即 return=既定挙動バイト一致(新経路を1本も通さない)。"""
+    pool = getattr(sim, "_pool", None)
+    if pool is None:
+        return
+    day = sim_min // 1440
+    if day == getattr(sim, "_pool_day", 0):        # 同一日の再入場を防ぐ(日境界でのみ実行)
+        return
+    sim._pool_day = day
+    weekday = sim._pool_weekday(day)
+    new_ids = set(presence_mod.present_for_day(
+        pool.presence_records(), day, sim._pool_present_cap, sim.hub, weekday))
+    cur = {getattr(a, "pool_pid", None): a for a in sim.agents}
+    cur.pop(None, None)
+    old_ids = set(cur)
+    exits = old_ids - new_ids
+    enters = new_ids - old_ids
+    for pid in sorted(exits):                       # 退場者 → ドーマント化(コストゼロ・記憶保持)
+        sim._dormant.save(pid, pool_mod.dehydrate(cur[pid]))
+    kept = [a for a in sim.agents if getattr(a, "pool_pid", None) in new_ids]
+    for pid in sorted(enters):                      # 入場者 → 実体化(+ 退避済みなら hydrate)
+        agent = sim.build_pool_agent(pid, pool.get(pid))
+        saved = sim._dormant.pop(pid)
+        if saved is not None:
+            pool_mod.hydrate(agent, saved)
+        kept.append(agent)
+    sim.agents = kept
+    # agent_by_id は「これまで実体化した全個体」の id→参照(退場者を消さない)。造語の作者名・
+    # DM 送信者名・関係台帳など**過去の参照**が退場後も解決できるようにする(present 個体は
+    # hydrate 済みの最新実体で上書き)。tick(計算)対象は sim.agents(present)だけ=コストは在場分。
+    for a in kept:
+        sim.agent_by_id[a.id] = a
+    sim._pool_update_budget()                       # S6a: N=当日の在場数(1行の接続)
+    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
+                         kind="presence_change", x=0.0, y=0.0,
+                         payload={"day": int(day), "n_enter": len(enters),
+                                  "n_exit": len(exits), "n_present": len(sim.agents)}))
+
+
 # ---------------------------------------------------------------- 1 step
 def run_step(sim, step: int) -> None:
     sim.budget.reset()
     sim.freedom_stats = {"choice_points": 0, "exercised": 0}  # 自由度観測(P2)の step 境界。OFF は L2 で列不在
     sim_min = sim.clock.sim_min(step)
+    _phase_pool_rotation(sim, step, sim_min)       # 日次境界: 在場ローテーション(既定OFF=no-op。W2 P3)
     # 行間補間(P2 S2): この step 開始時点の logger.events 長を控える(末で増分を各個体バッファへ
     # 振り分ける)。OFF は -1 で以降の蓄積を完全にスキップ=状態も出力もバイト一致。
     _isl_idx = len(sim.logger.events) if _interstitial_on(sim) else -1

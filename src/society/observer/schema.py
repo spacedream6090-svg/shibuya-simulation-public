@@ -188,6 +188,9 @@ register_event_kind("interrupt",     "確率的実行 L3: 活動途中の中断=
 register_event_kind("boredom_explore", "好奇心/退屈ドライブの内発的探索=近傍の未訪問/低頻度 POI へ移動(LLM なし。P2 S5){from, to_kind, gauge}")
 # ---- 行動方針キャッシュ(P2 S7。cognition.policy_cache ON のみ・既定 OFF=0件。設計: docs/research/interstitial-life.md §4.4/§7)----
 register_event_kind("policy_reuse", "行動方針キャッシュの再利用=LLM 呼をスキップ(P2 S7){kind, relax, saved}")
+# ---- 日次ローテーション/presence(W2 P3。pool.enabled ON のみ・既定 OFF=0件。日境界で1件。
+#      agent_id=-1 の世界イベント。設計: docs/plans/w2-execution-plan.md §4 P3 / persona-pool.md §5)----
+register_event_kind("presence_change", "日次ローテーションの在場入替(日境界で1件){day, n_enter, n_exit, n_present}")
 
 
 @dataclass

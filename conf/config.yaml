@@ -558,6 +558,19 @@ lod:
   input_res:
     enabled: false
 
+# ---- ペルソナプール / 日次ローテーション(W2 P3・既定 OFF=run.n_agents 固定=ゴールデンバイト一致)----
+# docs/plans/w2-execution-plan.md §4 P3 / docs/plans/persona-pool.md §5「presence 純関数」・§9。
+# enabled=true で 100万ペルソナプール(data/persona_pool: L1-L5 シャード + meta.json)から日ごとに
+# 「今日この街にいる人(present)」を決定論選択し、いない人はドーマント化(コストゼロ・記憶保持)。
+# 再来街時は同一実体として記憶が続く。presence は stream("presence", persona_id, day) の純関数
+# (k 非依存・trait 非依存・resume 不変)。false=現行の run.n_agents 固定=挙動バイト一致(掟)。
+# ON 時は S6a の N 比例 cap の N を「当日の在場数 len(sim.agents)」に自動で差し替える。
+pool:
+  enabled: false
+  dir: data/persona_pool     # P5 生成物(L1-L5 シャード + meta.json)のルート
+  present_cap: 300           # 日次の総在場数の上限(層優先で充足)。ON 時は N=在場数
+  dormant_cap: 0             # ドーマント退避ストアの上限(0=無制限)。>0 で LRU 退避(有界=persona-pool §3.3)
+
 # ---- LLM一括発行(P2-S6b・既定OFF=バイト一致)----
 # 個体間で独立なLLMフェーズ(朝計画。夜内省は次段)を「build id順→未命中のみ並行発行→
 # id順apply」に切替。イベント列・カウンタ・キャッシュは逐次と完全同一(test_batch_llm)。
