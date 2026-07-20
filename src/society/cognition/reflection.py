@@ -200,30 +200,69 @@ def update_implicit_self(agent, ema: float) -> None:
     agent.implicit_self = "、".join(parts)
 
 
-def _recall_query(agent, *, step: int, sim_min: int, llm, place_name: str,
-                  logger: ObserverLogger, date_line: str | None = None,
-                  weather_line: str | None = None,
-                  city_name: str = "") -> tuple[list[str], str | None]:
-    """agentic pull 第1段: 何を思い出したいかを LLM に出させ、mem.query で想起する。
+class DirectSink:
+    """観測出力の直結先(逐次経路)。log_llm_call / log をその場で呼ぶ。"""
+    def __init__(self, logger: ObserverLogger):
+        self.logger = logger
 
-    LLM 呼び出しを1本足す(R1: writeback 条件に依らず一定)。想起自体は決定論。
-    date_line/weather_line は当日の暦・天気(既定 None=注入せず従来と完全一致)。
-    city_name はプロンプト冒頭の街名(envpack。基盤に地名を残さない)。
-    戻り = (hits, fail_line)。ACT-R 有効かつ「手掛かりはあるが全候補が閾値未達」なら
-    memory_fail イベントを発火し「思い出そうとして失敗」の1行を fail_line で返す(ACT-R OFF
-    では query_ex.failed が常に False=fail_line None=memory_recall のみ=バイト一致)。
+    def call(self, d: dict) -> None:
+        self.logger.log_llm_call(d)
+
+    def event(self, e: Event) -> None:
+        self.logger.log(e)
+
+
+class BufferSink:
+    """観測出力の遅延バッファ(P2 S6b 一括発行用)。
+
+    バッチ経路では recall の解決を全個体まとめて行うが、イベント列は逐次実行と
+    同一の並び(個体ごとに [recall 系 → reflect 系])を保ちたい。ここに溜めて
+    最終 apply ループの各個体の先頭で flush する。
     """
+    def __init__(self):
+        self.items: list[tuple[str, object]] = []
+
+    def call(self, d: dict) -> None:
+        self.items.append(("call", d))
+
+    def event(self, e: Event) -> None:
+        self.items.append(("event", e))
+
+    def flush(self, logger: ObserverLogger) -> None:
+        for kind, x in self.items:
+            if kind == "call":
+                logger.log_llm_call(x)
+            else:
+                logger.log(x)
+        self.items.clear()
+
+
+def build_recall_request(agent, *, step: int, place_name: str,
+                         date_line: str | None = None,
+                         weather_line: str | None = None,
+                         city_name: str = "") -> dict:
+    """agentic pull 第1段の LLM 要求(P2 S6b: build/resolve 分割)。generate_many 互換。"""
     prompt = (build_prompt(agent, place_name=place_name, surprise=None,
                            nearby_names=[], step=step, city_name=city_name,
                            date_line=date_line, weather_line=weather_line)
               + "\n今日の内省を始める前に、まず今日のことで思い出したいことを一つ挙げてください。"
               + "\n出力は次の JSON 1個のみ:"
               + '\n{"action": "recall", "query": "思い出したい事柄を短く"}')
-    response, call_id, cached = llm.generate(
-        prompt, rng_key=f"recall/{agent.id}/{step}", temperature=0.7,
-        max_tokens=100, think=False)
-    logger.log_llm_call({"llm_call_id": call_id, "agent_id": agent.id,
-                         "purpose": "recall", "step": step, "cached": cached})
+    return {"prompt": prompt, "rng_key": f"recall/{agent.id}/{step}",
+            "temperature": 0.7, "max_tokens": 100, "think": False}
+
+
+def resolve_recall(agent, *, step: int, sim_min: int, response: str,
+                   call_id: str | None, cached: bool,
+                   sink) -> tuple[list[str], str | None]:
+    """recall 応答の解決(想起は決定論)。観測出力は sink 経由(直結/遅延を差し替え可)。
+
+    戻り = (hits, fail_line)。ACT-R 有効かつ「手掛かりはあるが全候補が閾値未達」なら
+    memory_fail イベントを発火し「思い出そうとして失敗」の1行を fail_line で返す(ACT-R OFF
+    では query_ex.failed が常に False=fail_line None=memory_recall のみ=バイト一致)。
+    """
+    sink.call({"llm_call_id": call_id, "agent_id": agent.id,
+               "purpose": "recall", "step": step, "cached": cached})
     action = parse_action(response)
     query_text = action.get("query", "") if action and action.get("type") == "recall" else ""
     fail_line: str | None = None
@@ -233,7 +272,7 @@ def _recall_query(agent, *, step: int, sim_min: int, llm, place_name: str,
         if res.failed:                   # 手掛かりはあるが全候補が閾値未達=思い出そうとして失敗
             fail_line = f"({res.cue}のことを思い出そうとしたが、はっきりしない…)"
             best = res.best_activation
-            logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+            sink.event(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                              kind="memory_fail", x=agent.x, y=agent.y,
                              llm_call_id=call_id,
                              payload={"query": res.cue,
@@ -242,11 +281,33 @@ def _recall_query(agent, *, step: int, sim_min: int, llm, place_name: str,
                                       "tau": res.tau}))
     else:
         hits = []
-    logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+    sink.event(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                      kind="memory_recall", x=agent.x, y=agent.y,
                      llm_call_id=call_id,
                      payload={"query": query_text, "n_hits": len(hits)}))
     return hits, fail_line
+
+
+def _recall_query(agent, *, step: int, sim_min: int, llm, place_name: str,
+                  logger: ObserverLogger, date_line: str | None = None,
+                  weather_line: str | None = None,
+                  city_name: str = "") -> tuple[list[str], str | None]:
+    """agentic pull 第1段: 何を思い出したいかを LLM に出させ、mem.query で想起する。
+
+    LLM 呼び出しを1本足す(R1: writeback 条件に依らず一定)。想起自体は決定論。
+    date_line/weather_line は当日の暦・天気(既定 None=注入せず従来と完全一致)。
+    city_name はプロンプト冒頭の街名(envpack。基盤に地名を残さない)。
+    build_recall_request + generate + resolve_recall の合成(処理順は分割前と完全同一)。
+    """
+    req = build_recall_request(agent, step=step, place_name=place_name,
+                               date_line=date_line, weather_line=weather_line,
+                               city_name=city_name)
+    response, call_id, cached = llm.generate(
+        req["prompt"], rng_key=req["rng_key"], temperature=req["temperature"],
+        max_tokens=req["max_tokens"], think=req["think"])
+    return resolve_recall(agent, step=step, sim_min=sim_min, response=response,
+                          call_id=call_id, cached=cached,
+                          sink=DirectSink(logger))
 
 
 def maybe_reflect(agent, *, step: int, sim_min: int, writeback: str, alpha: float,
@@ -280,14 +341,10 @@ def maybe_reflect(agent, *, step: int, sim_min: int, writeback: str, alpha: floa
     決定論ローテーション(_reflect_task)+定型句回避の1行を足す。belief の雛形復唱対策。
     既定 OFF はプロンプト・呼数・乱数消費とも従来と完全同一(R1・ゴールデン不変)。
     """
-    if step != agent.reflect_step:
+    st = begin_reflect(agent, step=step, writeback=writeback, controls=controls)
+    if st is None:
         return
-    compute_matched = (controls == "compute_matched")
-    # off かつ compute_matched 以外 = 現状動作(内省自体を行わない)
-    if writeback == "off" and not compute_matched:
-        return
-    agent.reflect_step = -1                        # 1睡眠(1帰宅)につき1回
-    discard = (writeback == "off")                 # compute_matched の off: 計算のみ・全破棄
+    discard = st["discard"]
 
     # ---- agentic pull 第1段(常に+1呼。R1: writeback 条件に依らず一定)----
     recalled: list[str] = []
@@ -299,6 +356,45 @@ def maybe_reflect(agent, *, step: int, sim_min: int, writeback: str, alpha: floa
             date_line=date_line, weather_line=weather_line,
             city_name=city_name)
 
+    req = build_reflect_request(
+        agent, step=step, sim_min=sim_min, place_name=place_name,
+        date_line=date_line, weather_line=weather_line,
+        reflect_cfg=reflect_cfg, reflect_variety=reflect_variety,
+        interstitial_digest=interstitial_digest, interstitial=interstitial,
+        city_name=city_name, max_tokens=max_tokens, think=think,
+        recalled=recalled, recall_fail=recall_fail)
+    response, call_id, cached = llm.generate(
+        req["prompt"], rng_key=req["rng_key"], temperature=req["temperature"],
+        max_tokens=req["max_tokens"], think=req["think"])
+    apply_reflect_response(agent, step=step, sim_min=sim_min,
+                           writeback=writeback, alpha=alpha, rng=rng,
+                           logger=logger, controls=controls, req=req,
+                           response=response, call_id=call_id, cached=cached,
+                           discard=discard)
+
+
+def begin_reflect(agent, *, step: int, writeback: str,
+                  controls: str = "none") -> dict | None:
+    """内省の発火ゲート(P2 S6b: 分割)。発火しないなら None。発火するなら
+    reflect_step を消費し {"discard": bool} を返す(処理順は分割前と完全同一)。"""
+    if step != agent.reflect_step:
+        return None
+    compute_matched = (controls == "compute_matched")
+    # off かつ compute_matched 以外 = 現状動作(内省自体を行わない)
+    if writeback == "off" and not compute_matched:
+        return None
+    agent.reflect_step = -1                        # 1睡眠(1帰宅)につき1回
+    return {"discard": (writeback == "off")}       # compute_matched の off: 計算のみ・全破棄
+
+
+def build_reflect_request(agent, *, step: int, sim_min: int, place_name: str,
+                          date_line: str | None, weather_line: str | None,
+                          reflect_cfg: dict | None, reflect_variety: bool,
+                          interstitial_digest: str | None, interstitial: bool,
+                          city_name: str, max_tokens: int, think: bool,
+                          recalled: list[str],
+                          recall_fail: str | None) -> dict:
+    """内省本体の LLM 要求を組み立てる(P2 S6b)。generate_many 互換+apply 用メタ。"""
     # 深い内省の夜か。(1) 出来事誘発(第12バッチ・主経路): 衝撃ゲージの閾値超えが予約した
     # deep_due_day 以降の最初の夜(侵入的→熟慮的の遅延)。(2) レガシー固定周期(対照用)。
     day = sim_min // 1440
@@ -318,10 +414,19 @@ def maybe_reflect(agent, *, step: int, sim_min: int, writeback: str, alpha: floa
               + (f"\n思い出したこと: {' / '.join(recalled)}" if recalled else "")
               + (f"\n{recall_fail}" if recall_fail else "")   # ACT-R OFF は None=1行も足さない
               + task)
-    rng_key = f"reflect/{agent.id}/{step}"
-    response, call_id, cached = llm.generate(
-        prompt, rng_key=rng_key, temperature=0.7, max_tokens=max_tokens,
-        think=think)
+    return {"prompt": prompt, "rng_key": f"reflect/{agent.id}/{step}",
+            "temperature": 0.7, "max_tokens": max_tokens, "think": think,
+            "deep": deep, "deep_event": deep_event, "day": day, "rcfg": rcfg}
+
+
+def apply_reflect_response(agent, *, step: int, sim_min: int, writeback: str,
+                           alpha: float, rng, logger: ObserverLogger,
+                           controls: str, req: dict, response: str,
+                           call_id: str | None, cached: bool,
+                           discard: bool) -> None:
+    """内省応答の適用(build_reflect_request と対・P2 S6b)。"""
+    deep, deep_event = req["deep"], req["deep_event"]
+    day, rcfg = req["day"], req["rcfg"]
     logger.log_llm_call({"llm_call_id": call_id, "agent_id": agent.id,
                          "purpose": "reflect", "step": step, "cached": cached})
     action = parse_action(response)

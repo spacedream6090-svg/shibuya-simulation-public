@@ -57,3 +57,61 @@ class CachedLLM:
                     f.write(json.dumps({"key": key, "response": response},
                                        ensure_ascii=False) + "\n")
         return response, key[:16], False
+
+    def generate_many(self, requests: list[dict], *,
+                      workers: int = 1) -> list[tuple[str, str, bool]]:
+        """独立な要求の一括発行(P2 S6b)。要求順の [(response, call_id, cached), ...] を返す。
+
+        requests の各要素: {"prompt", "rng_key", "temperature", "max_tokens",
+        "think"(省略=False)}。逐次に generate を回した場合と結果・カウンタ・キャッシュ
+        内容が一致するよう、共有状態(calls/hits/_mem/ファイル追記)は**逐次フェーズでのみ**
+        更新する(ロック不要・決定論)。workers>1 のときだけ、キャッシュ未命中分の
+        backend.generate を並行発行する(vLLM 等の継続バッチングを充填する目的。
+        重複キーは初出の1回だけ生成し、2個目以降は逐次実行時と同じく cached=True)。
+        """
+        n = len(requests)
+        results: list[tuple[str, str, bool] | None] = [None] * n
+        self.calls += n
+        # --- フェーズ1(逐次): キャッシュ解決と未命中の列挙(初出順) ---
+        keys = [self._key(r["prompt"], r["temperature"], r["max_tokens"],
+                          bool(r.get("think", False))) for r in requests]
+        miss_order: list[int] = []          # 初出ミスの requests 添字(この順で生成・格納)
+        first_of: dict[str, int] = {}       # key -> 初出ミスの requests 添字
+        for i, key in enumerate(keys):
+            if self.enabled and key in self._mem:
+                self.hits += 1
+                results[i] = (self._mem[key], key[:16], True)
+            elif self.enabled and key in first_of:
+                self.hits += 1              # 逐次なら初出が埋めた直後に命中する分
+                results[i] = None           # フェーズ3で初出の応答を充填
+            else:
+                if self.enabled:
+                    first_of[key] = i
+                miss_order.append(i)
+        # --- フェーズ2: 未命中の生成(workers>1 のみ並行。共有状態は触らない) ---
+        def _gen(i: int) -> str:
+            r = requests[i]
+            return self.backend.generate(r["prompt"], rng_key=r["rng_key"],
+                                         temperature=r["temperature"],
+                                         max_tokens=r["max_tokens"],
+                                         think=bool(r.get("think", False)))
+        if workers > 1 and len(miss_order) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=int(workers)) as ex:
+                responses = list(ex.map(_gen, miss_order))
+        else:
+            responses = [_gen(i) for i in miss_order]
+        # --- フェーズ3(逐次): 格納(初出順=決定論)と結果充填 ---
+        for i, response in zip(miss_order, responses):
+            key = keys[i]
+            if self.enabled:
+                self._mem[key] = response
+                if self.path:
+                    with self.path.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps({"key": key, "response": response},
+                                           ensure_ascii=False) + "\n")
+            results[i] = (response, key[:16], False)
+        for i, key in enumerate(keys):
+            if results[i] is None:          # 重複キーの2個目以降
+                results[i] = (self._mem[key], key[:16], True)
+        return results

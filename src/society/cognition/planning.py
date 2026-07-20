@@ -93,6 +93,25 @@ def make_plan(sim, agent, step: int, sim_min: int, place_name: str,
     (1人1日1回の観測・R1 監査のため)。翌朝はこの関数がまた呼ばれて上書きする。
     interstitial_digest は前回発火以降の客観ダイジェスト(P2 S2。既定 None=注入せず不変)。
     """
+    req = build_plan_request(sim, agent, step, sim_min, place_name,
+                             interstitial_digest=interstitial_digest)
+    if req is None:                                  # キャッシュ命中(適用済み)
+        return
+    response, call_id, cached = sim.llm.generate(
+        req["prompt"], rng_key=req["rng_key"],
+        temperature=req["temperature"], max_tokens=req["max_tokens"])
+    apply_plan_response(sim, agent, step, sim_min, req, response, call_id, cached)
+
+
+def build_plan_request(sim, agent, step: int, sim_min: int, place_name: str,
+                       interstitial_digest: str | None = None) -> dict | None:
+    """朝計画の LLM 要求を組み立てる(P2 S6b: 一括発行のための build/apply 分割)。
+
+    返り値は generate_many 互換の要求 dict(+apply 用メタ framework/max_items)。
+    方針キャッシュ命中時はここで適用まで済ませ None を返す(=LLM 要求なし)。
+    make_plan は本関数+generate+apply_plan_response の合成で、逐次経路の処理順は
+    分割前と完全同一(バイト一致)。
+    """
     max_items = int(sim.planningcfg.get("max_items", 5))
     framework = _pf.framework_cfg(sim)               # None=既定 OFF=現行経路(バイト一致)
     # ---- 行動方針キャッシュ P2 S7(既定 OFF=no-op=バイト一致)。simple 計画経路のみ対象 ----
@@ -111,7 +130,7 @@ def make_plan(sim, agent, step: int, sim_min: int, place_name: str,
                                                     "what": it["what"],
                                                     "place": it["place"]}
                                                    for it in reused]}))
-            return
+            return None
     prompt = build_plan_prompt(agent, place_name=place_name, sim_min=sim_min,
                               step=step,
                               city_name=getattr(sim, "place_name", ""),
@@ -124,17 +143,23 @@ def make_plan(sim, agent, step: int, sim_min: int, place_name: str,
     # 未設定 or 0/null は model.max_tokens にフォールバック=既定挙動は完全不変。
     _plan_mt = int(sim.cfg.model.get("plan_max_tokens", 0) or 0)
     plan_max_tokens = _plan_mt if _plan_mt > 0 else int(sim.cfg.model.max_tokens)
-    response, call_id, cached = sim.llm.generate(
-        prompt, rng_key=f"plan/{agent.id}/{step}",
-        temperature=float(sim.cfg.model.temperature),
-        max_tokens=plan_max_tokens)
+    return {"prompt": prompt, "rng_key": f"plan/{agent.id}/{step}",
+            "temperature": float(sim.cfg.model.temperature),
+            "max_tokens": plan_max_tokens,
+            "framework": framework, "max_items": max_items}
+
+
+def apply_plan_response(sim, agent, step: int, sim_min: int, req: dict,
+                        response: str, call_id: str | None, cached: bool) -> None:
+    """朝計画の LLM 応答を適用する(build_plan_request と対・P2 S6b)。"""
+    framework, max_items = req["framework"], req["max_items"]
     sim.logger.log_llm_call({"llm_call_id": call_id, "agent_id": agent.id,
                              "purpose": "plan", "step": step, "cached": cached})
     from . import routine as _routine                 # 遅延 import(循環回避)
     _routine.maybe_roll_motif(sim, agent, step)       # P2 S4 L1: 朝の計画確定後に骨格 motif を1日1回抽選(既定 OFF=no-op)
     if framework is not None:                        # 日課計画フレームワーク経路(P2 S1)
-        _make_plan_framework(sim, agent, step, sim_min, prompt, response, call_id,
-                             framework, max_items, plan_max_tokens)
+        _make_plan_framework(sim, agent, step, sim_min, req["prompt"], response,
+                             call_id, framework, max_items, req["max_tokens"])
         return
     action = parse_action(response)
     items = _normalize(action["items"], max_items) \

@@ -558,6 +558,15 @@ lod:
   input_res:
     enabled: false
 
+# ---- LLM一括発行(P2-S6b・既定OFF=バイト一致)----
+# 個体間で独立なLLMフェーズ(朝計画。夜内省は次段)を「build id順→未命中のみ並行発行→
+# id順apply」に切替。イベント列・カウンタ・キャッシュは逐次と完全同一(test_batch_llm)。
+# 実LLMサーバでは並行発行が継続バッチングを充填=スループットがper-callレイテンシから解放。
+engine:
+  batch_llm:
+    enabled: false
+    workers: 8                # 並行発行数(実LLM時。mock/1では逐次=同一経路)
+
 # ---- 方針キャッシュ(P2-S7・既定OFF=バイト一致)。docs/research/interstitial-life.md §4.4-b ----
 # 朝計画・日中熟慮の出力を k 非依存の物理量キー(職業/年代/曜日型/時間帯/場所種別/天気/活動cat)で
 # キャッシュし、類似状況の再訪で LLM 呼をスキップ。本番採否はブラインドA/B比較で決定(既定OFF運用)。

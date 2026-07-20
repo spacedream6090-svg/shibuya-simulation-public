@@ -27,6 +27,7 @@ from .. import street as street_mod
 from .. import worldview as worldview_mod
 from ..net import infoenv as infoenv_mod
 from ..cognition import deliberate, drive, planning, routine
+from ..cognition import reflection as reflection_mod
 from ..cognition.reflection import maybe_reflect
 from ..economy import CIVIL_SERVANTS, civil_servant_pay, gig_profile, price_of
 from .. import economy as economy_mod
@@ -643,6 +644,11 @@ def _phase_planning(sim, step: int, sim_min: int) -> None:
     1回(R1)。外・睡眠中はスキップ(その日は予約済み扱いのまま=二重生成しない)。"""
     if not sim.planningcfg["enabled"]:
         return
+    bl = (sim.cfg.get("engine", {}) or {}).get("batch_llm", {}) or {}
+    if bool(bl.get("enabled", False)):
+        _phase_planning_batched(sim, step, sim_min,
+                                workers=int(bl.get("workers", 8)))
+        return
     for agent in sim.agents:
         if agent.plan_step != step:
             continue
@@ -652,6 +658,106 @@ def _phase_planning(sim, step: int, sim_min: int) -> None:
         # 行間補間(P2 S2): 前回発火以降の客観ダイジェスト。OFF は None=注入せず不変。
         planning.make_plan(sim, agent, step, sim_min, _place_of(sim, agent),
                            interstitial_digest=_isl_take(sim, agent))
+
+
+def _phase_planning_batched(sim, step: int, sim_min: int, workers: int) -> None:
+    """朝計画の一括発行(P2 S6b・engine.batch_llm)。
+
+    計画は個体間で独立(自分の状態・環境のみ参照・同 step の他者の計画に依存しない)
+    ため、build を id 順に済ませてから未命中分だけを並行発行し、応答を id 順に適用する。
+    イベント列・カウンタ・キャッシュ内容は逐次経路と完全同一(mock で test_batch_llm が
+    バイト一致を固定)。実 LLM サーバでは並行発行が継続バッチングを充填し
+    スループットが per-call レイテンシから解放される。
+    """
+    pending: list[tuple[object, dict]] = []
+    for agent in sim.agents:
+        if agent.plan_step != step:
+            continue
+        agent.plan_step = -1
+        if agent.loc == "outside" or agent.sleeping:
+            continue
+        req = planning.build_plan_request(
+            sim, agent, step, sim_min, _place_of(sim, agent),
+            interstitial_digest=_isl_take(sim, agent))
+        if req is not None:
+            pending.append((agent, req))
+    if not pending:
+        return
+    results = sim.llm.generate_many([r for _a, r in pending], workers=workers)
+    for (agent, req), (response, call_id, cached) in zip(pending, results):
+        planning.apply_plan_response(sim, agent, step, sim_min, req,
+                                     response, call_id, cached)
+
+
+def _phase_reflect_batched(sim, step: int, sim_min: int, workers: int) -> None:
+    """夜内省の一括発行(P2 S6b・engine.batch_llm)。
+
+    agentic pull 有効時は1体2呼(recall→本呼)が依存連鎖するため2ラウンドで発行する:
+    ①発火ゲート(id順)→ recall 要求を一括発行 → 解決(観測出力は BufferSink に遅延)
+    ②本呼要求を組んで一括発行 → id 順に「recall の遅延イベント→内省適用」の順で放出。
+    = イベント列・カウンタは逐次実行と完全同一(test_batch_llm がバイト一致を固定)。
+    個体間の独立性: 内省は自分の記憶・状態のみ参照(他者の同 step 内省に依存しない)。
+    """
+    wb = str(sim.cfg.k.writeback)
+    alpha = float(sim.cfg.k.degraded_alpha)
+    controls = getattr(sim, "controls_mode", "none")
+    agentic_pull = getattr(sim, "agentic_pull", False)
+    city = getattr(sim, "place_name", "")
+    date_line = getattr(sim, "today_date_line", None)
+    weather_line = getattr(sim, "today_weather_line", None)
+    rcfg = getattr(sim, "reflectcfg", None)
+    variety = bool(getattr(sim, "promptscfg", {}).get("reflect_variety", False))
+    isl_on = _interstitial_on(sim)
+    mt = int(sim.cfg.model.reflect_max_tokens)
+    think = bool(sim.cfg.model.reflect_think)
+
+    due: list[dict] = []
+    for agent in sim.agents:
+        if agent.reflect_step != step:
+            continue
+        # 逐次経路の引数評価と同順(rng 派生→ダイジェスト消費)を保つ
+        rng = sim.hub.stream("writeback", agent.id, step)
+        digest = _isl_take(sim, agent)
+        st = reflection_mod.begin_reflect(agent, step=step, writeback=wb,
+                                          controls=controls)
+        if st is None:
+            continue
+        due.append({"agent": agent, "rng": rng, "digest": digest,
+                    "discard": st["discard"], "recalled": [],
+                    "recall_fail": None, "sink": None})
+    if not due:
+        return
+
+    if agentic_pull:                     # ラウンド1: recall(常に+1呼=R1)
+        rreqs = [reflection_mod.build_recall_request(
+                     d["agent"], step=step, place_name="自宅",
+                     date_line=date_line, weather_line=weather_line,
+                     city_name=city) for d in due]
+        rres = sim.llm.generate_many(rreqs, workers=workers)
+        for d, (response, call_id, cached) in zip(due, rres):
+            sink = reflection_mod.BufferSink()
+            d["recalled"], d["recall_fail"] = reflection_mod.resolve_recall(
+                d["agent"], step=step, sim_min=sim_min, response=response,
+                call_id=call_id, cached=cached, sink=sink)
+            d["sink"] = sink
+
+    reqs = [reflection_mod.build_reflect_request(   # ラウンド2: 内省本体
+                d["agent"], step=step, sim_min=sim_min, place_name="自宅",
+                date_line=date_line, weather_line=weather_line,
+                reflect_cfg=rcfg, reflect_variety=variety,
+                interstitial_digest=d["digest"], interstitial=isl_on,
+                city_name=city, max_tokens=mt, think=think,
+                recalled=d["recalled"], recall_fail=d["recall_fail"])
+            for d in due]
+    results = sim.llm.generate_many(reqs, workers=workers)
+    for d, req, (response, call_id, cached) in zip(due, reqs, results):
+        if d["sink"] is not None:        # recall 系イベントを逐次と同じ並びで放出
+            d["sink"].flush(sim.logger)
+        reflection_mod.apply_reflect_response(
+            d["agent"], step=step, sim_min=sim_min, writeback=wb, alpha=alpha,
+            rng=d["rng"], logger=sim.logger, controls=controls, req=req,
+            response=response, call_id=call_id, cached=cached,
+            discard=d["discard"])
 
 
 def _phase_wake_and_returns(sim, step: int, sim_min: int) -> None:
@@ -3343,26 +3449,31 @@ def run_step(sim, step: int) -> None:
     _phase_crowd(sim, step, sim_min)               # 群集(大規模行事型)の集中を観測(既定OFF=no-op)
     infoenv_mod.phase(sim, step, sim_min)          # 情報環境: バイラル加重・誤情報/炎上(既定OFF=no-op。Wave G6)
 
-    for agent in sim.agents:      # 内省(就寝直後 or 来街者の帰路。個別時刻に分散)
-        if agent.reflect_step == step:
-            maybe_reflect(agent, step=step, sim_min=sim_min,
-                          writeback=str(sim.cfg.k.writeback),
-                          alpha=float(sim.cfg.k.degraded_alpha), llm=sim.llm,
-                          place_name="自宅",
-                          city_name=getattr(sim, "place_name", ""),
-                          rng=sim.hub.stream("writeback", agent.id, step),
-                          logger=sim.logger,
-                          max_tokens=int(sim.cfg.model.reflect_max_tokens),
-                          think=bool(sim.cfg.model.reflect_think),
-                          controls=getattr(sim, "controls_mode", "none"),
-                          agentic_pull=getattr(sim, "agentic_pull", False),
-                          date_line=getattr(sim, "today_date_line", None),
-                          weather_line=getattr(sim, "today_weather_line", None),
-                          reflect_cfg=getattr(sim, "reflectcfg", None),
-                          reflect_variety=bool(getattr(sim, "promptscfg", {})
-                                               .get("reflect_variety", False)),
-                          interstitial=_interstitial_on(sim),
-                          interstitial_digest=_isl_take(sim, agent))
+    _bl = (sim.cfg.get("engine", {}) or {}).get("batch_llm", {}) or {}
+    if bool(_bl.get("enabled", False)):
+        _phase_reflect_batched(sim, step, sim_min,
+                               workers=int(_bl.get("workers", 8)))
+    else:
+        for agent in sim.agents:  # 内省(就寝直後 or 来街者の帰路。個別時刻に分散)
+            if agent.reflect_step == step:
+                maybe_reflect(agent, step=step, sim_min=sim_min,
+                              writeback=str(sim.cfg.k.writeback),
+                              alpha=float(sim.cfg.k.degraded_alpha), llm=sim.llm,
+                              place_name="自宅",
+                              city_name=getattr(sim, "place_name", ""),
+                              rng=sim.hub.stream("writeback", agent.id, step),
+                              logger=sim.logger,
+                              max_tokens=int(sim.cfg.model.reflect_max_tokens),
+                              think=bool(sim.cfg.model.reflect_think),
+                              controls=getattr(sim, "controls_mode", "none"),
+                              agentic_pull=getattr(sim, "agentic_pull", False),
+                              date_line=getattr(sim, "today_date_line", None),
+                              weather_line=getattr(sim, "today_weather_line", None),
+                              reflect_cfg=getattr(sim, "reflectcfg", None),
+                              reflect_variety=bool(getattr(sim, "promptscfg", {})
+                                                   .get("reflect_variety", False)),
+                              interstitial=_interstitial_on(sim),
+                              interstitial_digest=_isl_take(sim, agent))
 
     # 行間補間(P2 S2): この step で新規に記録されたイベントを各個体のバッファへ振り分ける
     # (OFF は _isl_idx=-1 で完全 no-op=バッファも作らない=バイト一致)。発火時の _isl_take が
