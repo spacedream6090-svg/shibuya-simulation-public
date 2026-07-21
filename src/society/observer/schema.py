@@ -209,6 +209,11 @@ register_event_kind("stock_low",     "在庫僅少=発注点 s 以下(補充発�
 # ---- 関係性の再現 第44バッチ(共同行動エンジン S-R3 + 世帯の夕食共食 S-R1。既定 OFF=0件。
 #      決定論・LLM/generate ゼロ増。実装 src/society/joint.py + household.py。設計: docs/research/relationships-activities.md §4)----
 register_event_kind("joint_activity", "共同行動の成立=同伴グループ/世帯が同一POI・home で2人以上同席(1グループ1日1回){type, with, place, tier}")
+# ---- 関係性パッケージ完結 第45バッチ(友人グラフ S-R2 / 職場会食 S-R4 / 来街者 party S-R5。既定 OFF=0件。
+#      決定論・LLM/generate ゼロ増。実装 src/society/friends.py + joint.py + party.py。設計: docs/research/relationships-activities.md §4)----
+register_event_kind("friend_graph_built", "初期友人グラフの生成統計(homophily+所属+Dunbar。起動時1回・世界イベント agent_id=-1){n_edges, mean_degree}")
+# ★ S-R4(職場の会食・飲み会)は joint_activity{type:colleague_lunch|colleague_dinner} を再利用(schema変更なし)。
+# ★ S-R5(来街者 party)は joint_activity{type:party} を再利用(schema変更なし)。
 
 
 @dataclass

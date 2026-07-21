@@ -840,6 +840,32 @@ relations:
   rep_known_threshold: 3.0      # 評判がこれ以上で「街で名が知られている」文脈をプロンプトに
   faction: true                 # 同じグループ所属を「同じ仲間」1行に(軽量。重い分極は後続波)
 
+# ---- 友人グラフ生成(関係性パッケージ完結 第45バッチ S-R2。ユーザー要望 2026-07-21。既定 OFF=現行挙動と完全同一)----
+# 現状の初期関係は「同建物の顔なじみ最大3人」のみ=地理的共在だけが源泉。本ブロックは起動時1回、居住者の
+# 現実的な友人ネットワークを決定論で張る: homophily(McPherson: 年齢>職業)+共有所属(同 work org_id=
+# 職場友人34.0% / 学生同士=学生時代友人31.6%)+同地区近接、次数は Dunbar の入れ子層(親友~3-5=tier3 /
+# 友人~10-15=tier2 / 知人=tier1)で較正して relations の closeness/tier(閾値 2.0/5.0/12.0)へ直接注入する。
+# 実装 src/society/friends.py(較正値・所属ロジックはここと friends.py にのみ=no-fingerprint 契約)。
+# 決定論・run.seed 非依存: 辺は (persona id ペア, seed) の安定ハッシュ+属性の純関数=乱数 stream ゼロ
+# (RngHub 無風)=別ランでも同一人物ペアは同一の間柄(比較実験の要)。来街者は対象外(圏外=household と整合)。
+# 既定 OFF=何も張らず・relations 台帳不変・friend_graph_built も出さない=バイト一致(ゴールデンを守る)。
+friend_graph:
+  enabled: false                # ★ON 推奨(本番): true(現実的な友人ネットワークを有効化。要 relations.enabled=true で質が活きる)
+  seed: 20260722                # 安定ハッシュ種(run.seed と独立=別ランで同一人物ペアは同一辺)
+  w_age: 1.0                    # homophily 年齢近接の重み(McPherson で最強)
+  w_occ: 0.5                    # homophily 職業一致の重み(年齢の次点)
+  w_same_work: 1.2              # 共有所属: 同 work org_id(職場友人34.0%)
+  w_same_school: 1.0            # 共有所属: 学生同士かつ同 org_id(学生時代友人31.6%)
+  w_same_area: 0.4              # 同地区近接(同一住宅建物=近所)
+  age_scale: 15.0               # 年齢差の正規化スケール(歳。この差で年齢類似度が 0)
+  noise: 0.3                    # スコアの決定論ノイズ幅(タイ破り・多様性=run.seed 非依存)
+  close_min: 3                  # 親友層(tier3)の下限次数(Dunbar 支援クリーク~5)
+  close_max: 5                  # 親友層の上限次数
+  friend_min: 7                 # 友人層(tier2)の追加次数下限(親友+友人で~10-15)
+  friend_max: 12                # 友人層の追加次数上限
+  acq_extra: 20                 # 知人層(tier1)の追加次数(弱い紐帯を薄く)
+  margin: 0.5                   # 注入 closeness の上乗せ(閾値+margin=その tier に確実に載る)
+
 # ---- 社会的ヒエラルキー(地位・信用・名声。第11バッチ 2026-07-08。既定 OFF=現行挙動と完全同一)----
 # 調査: docs/research/hierarchy.md(採択候補 #2 観測 + #1 評判→動員 + #3 優先的選択)。
 # 理論: マタイ効果/累積優位(Merton, DiPrete)= 信用のある人に人とリソースが集まる正のフィードバック。
@@ -1291,22 +1317,53 @@ joint:
   min_group: 2                  # 成立に必要な最小人数(自分含む)
   max_group: 4                  # グループ最大人数(自分含む。2-4人)
   friend_tier: 2                # 同伴候補の最小 relations tier(2=友人)
+  # ---- 職場の会食・飲み会の階層依存(第45バッチ S-R4。§2.5: 飲みニケーション忌避は"上司同席・義務的"に
+  #      集中=上司ありの飲み会「苦手」66.7% だが同世代なら「好き」50.8%)。組織台帳に役職(rank/founder)
+  #      データは無い(org_role は職種名で階層でない)ため、上司/同世代の代理指標は年齢差>boss_age_gap 歳。----
+  hierarchy_penalty: 0.35       # hierarchical=true の活動で、年齢差>boss_age_gap の相手の承諾を下げる幅
+  boss_age_gap: 10              # これを超える年齢差を上司/部下(階層)の代理指標に(役職データ不在の近似)
   # 活動カタログ(渋谷較正=レジャー白書 参加率)。poi_cat は routine の food/leisure/shop と整合。
   # band=下の bands の名前。activity_tag=routine 活動タグ(eating で既存 _charge_meal が飲食費を課金)。
+  # companion_type=同伴の関係タイプ(friend=友人 tier≥friend_tier[既定] / housemate=同居人 / colleague=同 org_id)。
+  # hierarchical=true で上司同席(年齢差>boss_age_gap)の承諾に hierarchy_penalty(飲み会に付す)。
+  # ★ 職場の会食(第45バッチ S-R4)は既定の activities マップを変えないため**コメントアウトで同梱**する
+  #   (map に足すと活動名の並び=ランデブー POI ハッシュが動き既存 joint ON 挙動が変わるため)。有効化=下の
+  #   colleague_* 行のコメントを外し weight を上げる(要 organizations.enabled=true で org_id が付く)。較正
+  #   (§2.5): 同僚ランチ14.4%[単独60.4%が主]=weight~0.02、飲み会 月0回64%=weight~0.03(いずれも低頻度)。
   activities:
     meal_cafe: {weight: 0.39, poi_cat: food, band: night, activity_tag: eating}    # 外食・カフェ(参加率39.2%)
     cinema:    {weight: 0.34, poi_cat: leisure, band: day, activity_tag: ""}        # 映画(33.7%)
     karaoke:   {weight: 0.20, poi_cat: leisure, band: night, activity_tag: ""}      # カラオケ(20.2%)
     shopping:  {weight: 0.15, poi_cat: shop, band: day, activity_tag: ""}           # ショッピング(渋谷若年で高頻度)
-  # 時間帯(分 of day の [開始, 終了))。day=昼〜夕方、night=夕〜夜。
+    # colleague_lunch:  {weight: 0.02, poi_cat: food, band: lunch, activity_tag: eating, companion_type: colleague}                    # 同僚ランチ(昼・低確率=単独が主)
+    # colleague_dinner: {weight: 0.03, poi_cat: food, band: night, activity_tag: eating, companion_type: colleague, hierarchical: true}  # 飲み会=居酒屋相当(夜・上司同席で承諾↓)
+  # 時間帯(分 of day の [開始, 終了))。day=昼〜夕方、night=夕〜夜、lunch=昼食帯(同僚ランチ有効化時に使用)。
   bands:
     day: [660, 1020]            # 11:00-17:00
     night: [1020, 1320]         # 17:00-22:00
+    lunch: [690, 810]           # 11:30-13:30(同僚ランチ)
   # 年齢条件付き重み倍率(キー=年代下限の文字列)。渋谷=若年で友人遊び高(カラオケ/買い物/映画↑)。
   age_weights:
     "0":  {karaoke: 1.6, shopping: 1.4, cinema: 1.2, meal_cafe: 1.0}
     "35": {karaoke: 0.8, shopping: 0.9, cinema: 1.0, meal_cafe: 1.0}
     "55": {karaoke: 0.4, shopping: 0.7, cinema: 0.8, meal_cafe: 1.0}
+
+# ---- 来街者 party の実体化(関係性パッケージ完結 第45バッチ S-R5。ユーザー要望 2026-07-21。既定 OFF=現行挙動と完全同一)----
+# プールの L4 来街者 record に party_size 1-5(build_persona_pool.py=同行人数)が実在するが sim 内で未使用
+# だった。本ブロックは present な来街者を party_size でグループ化=「同席の連れ」にする: 同一初期ノードへ寄せ・
+# 連れ相互に relations 注入・回遊先を代表と共有(party_dest。新 stream "party")。観測は joint_activity{type:party}
+# を再利用(過剰な新 kind なし)。実装 src/society/party.py(較正値・グループ化はここと party.py にのみ)。
+# presence 整合: presence(P3 純関数)の draw 順に一切触れず、present 実体化の後にグループ化するだけ=rotation の
+# 決定論・resume バイト一致(test_pool_rotation)を保つ。乱数は新 stream "party" のみ(回遊バイアス抽選)。
+# 既定 OFF=グループ化せず・party_today も付かず・"party" stream も引かず・joint_activity 0 件=バイト一致。
+party:
+  enabled: false                # ★ON 推奨(本番・pool ON 時): true(来街グループを同席の連れとして実体化)
+  max_party: 5                  # party_size の上限(プールは1-5)
+  closeness: 5.0                # 連れ相互に注入する closeness(relations の友人 tier2 相当)
+  tier: 2                       # 注入する relations tier(2=友人)
+  roam_bias: 0.5                # 回遊帯に共有 POI へ寄せる確率/step(新 stream "party")
+  band_start_min: 600           # 回遊帯の開始(分 of day)= 10:00
+  band_end_min: 1320            # 回遊帯の終了(分 of day)= 22:00
 
 # ---- 商業・店舗のダイナミクス(現実ギャップ 後続波 H3 2026-07-07。すべて既定 OFF=現行挙動と完全同一)----
 # 現状 POI(店・会社)は静的で常時営業・価格固定。商業の動きを最小・非LLM・決定論で載せる

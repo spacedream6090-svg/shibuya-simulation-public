@@ -126,3 +126,39 @@ def test_joint_call_count_k_invariant(tmp_path):
     assert free.llm.calls == off.llm.calls and free.llm.calls > 0, \
         f"joint の呼数が k に依存(R1 違反): free={free.llm.calls} off={off.llm.calls}"
     assert _kind(free, "joint_activity"), "joint ON なのに joint_activity が出ていない(機構が不発)"
+
+
+# --------------------------------------------------------------------- 職場の会食(S-R4)
+from society import joint as _joint  # noqa: E402
+
+
+def test_accept_prob_hierarchy_penalty():
+    """上司同席(hierarchical かつ年齢差>boss_age_gap)で承諾確率が下がる=同世代/非階層では下がらない。"""
+    cfg = _joint.build_cfg({"accept_base": 0.5, "tier_bonus": 0.3,
+                            "hierarchy_penalty": 0.35, "boss_age_gap": 10})
+    same_gen = _joint.accept_prob(cfg, tier=2, hierarchical=True, age_gap=5)     # 同世代の飲み会
+    boss = _joint.accept_prob(cfg, tier=2, hierarchical=True, age_gap=20)        # 上司同席の飲み会
+    lunch = _joint.accept_prob(cfg, tier=2, hierarchical=False, age_gap=20)      # 非階層(ランチ)は年齢差無関係
+    assert boss < same_gen, "上司同席(年齢差大)でも承諾率が下がっていない(階層依存が効いていない)"
+    assert lunch == same_gen, "非階層の活動で年齢差ペナルティが掛かっている(§2.5=ランチは許容)"
+    assert abs(boss - (0.5 - 0.35)) < 1e-9, "hierarchy_penalty の適用値が式と一致しない"
+    # 親友(tier3)への tier_bonus は上乗せされる(階層とは独立)。
+    assert _joint.accept_prob(cfg, tier=3, hierarchical=True, age_gap=5) > same_gen
+
+
+def test_colleague_companion_selection(tmp_path):
+    """companion_type=colleague は同 org_id の同僚(非来街者)だけを同伴候補にする(友人/同居人経路と別)。"""
+    sim = _sim(tmp_path, "colle", n=20, steps=1)
+    a, b, c, d = sim.agents[0], sim.agents[1], sim.agents[2], sim.agents[3]
+    for x in (a, b, c, d):
+        x.visitor = False
+    a.org_id = b.org_id = "orgX"     # a,b は同僚
+    c.org_id = "orgY"                # c は別組織
+    d.org_id = None                  # d は未配属
+    cands = _joint._companions(sim, a, sim.jointcfg, set(), "colleague")
+    assert b.id in cands, "同 org_id の同僚が候補に入っていない"
+    assert c.id not in cands and d.id not in cands, "別組織/未配属が同僚候補に混入している"
+    # 来街者は除外される
+    b.visitor = True
+    assert b.id not in _joint._companions(sim, a, sim.jointcfg, set(), "colleague"), \
+        "来街者の同僚が候補に残っている"

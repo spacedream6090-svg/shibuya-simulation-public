@@ -23,6 +23,7 @@ from .. import inner_life as inner_life_mod
 from .. import joint as joint_mod
 from .. import lodging as lodging_mod
 from .. import opinion as opinion_mod
+from .. import party as party_mod
 from .. import relations as relations_mod
 from .. import pov as pov_mod
 from .. import status as status_mod
@@ -3665,6 +3666,9 @@ def _phase_pool_rotation(sim, step: int, sim_min: int) -> None:
                          kind="presence_change", x=0.0, y=0.0,
                          payload={"day": int(day), "n_enter": len(enters),
                                   "n_exit": len(exits), "n_present": len(sim.agents)}))
+    # 来街者 party の実体化(第45バッチ S-R5。既定 OFF=no-op)。presence 純関数の後=当日 present な
+    # 来街者だけをグループ化(presence の draw 順・resume 不変=test_pool_rotation を守る)。
+    party_mod.form_parties(sim, step, sim_min)
 
 
 # ---------------------------------------------------------------- 1 step

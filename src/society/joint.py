@@ -58,14 +58,21 @@ DEFAULTS = {
     "min_group": 2,           # 成立に必要な最小人数(自分含む)
     "max_group": 4,           # グループ最大人数(自分含む。2-4人)
     "friend_tier": 2,         # 同伴候補の最小 relations tier(2=友人)
+    # ---- 職場の会食・飲み会の階層依存(S-R4。§2.5: 飲みニケーション忌避は"上司同席・義務的"に集中。
+    #      SHIBUYA109 lab.: 上司ありの飲み会「苦手」66.7% だが同世代なら「好き」50.8%)。組織台帳に
+    #      役職(rank/seniority/founder)データは無い(org_role は職種名=デザイナー/エンジニア等で階層で
+    #      ない)ため、上司/同世代の代理指標は **年齢差>boss_age_gap 歳**(正直な近似)。hierarchical=true
+    #      の活動(colleague_dinner)でのみ、年齢差の大きい相手の承諾に hierarchy_penalty を課す。----
+    "hierarchy_penalty": 0.35,  # 上司同席(年齢差>boss_age_gap)の飲み会の承諾ペナルティ
+    "boss_age_gap": 10,         # これを超える年齢差を上司/部下(階層)の代理指標にする(役職データ不在の近似)
     "activities": _DEFAULT_ACTIVITIES,
     "bands": _DEFAULT_BANDS,
     "age_weights": _DEFAULT_AGE_WEIGHTS,
 }
 
 _BOOL_KEYS = ("enabled",)
-_INT_KEYS = ("min_group", "max_group", "friend_tier")
-_FLOAT_KEYS = ("daily_rate", "accept_base", "tier_bonus")
+_INT_KEYS = ("min_group", "max_group", "friend_tier", "boss_age_gap")
+_FLOAT_KEYS = ("daily_rate", "accept_base", "tier_bonus", "hierarchy_penalty")
 
 
 def build_cfg(raw) -> dict:
@@ -106,6 +113,11 @@ def _norm_activities(raw) -> dict:
             "poi_cat": str(spec.get("poi_cat", "")),
             "band": str(spec.get("band", "day")),
             "activity_tag": str(spec.get("activity_tag", "")),
+            # S-R4: 同伴者の関係タイプ(friend=友人 tier≥friend_tier / housemate=同居人 /
+            #   colleague=同 org_id の同僚)。未指定は従来どおり友人経路。
+            "companion_type": str(spec.get("companion_type", "friend")),
+            # S-R4: 階層依存(true=上司同席で承諾↓。colleague_dinner=飲み会に付す)。
+            "hierarchical": bool(spec.get("hierarchical", False)),
         }
     return out
 
@@ -202,9 +214,28 @@ def _resolve_with(sim, agent) -> list:
     return out
 
 
-def _companions(sim, agent, cfg: dict, assigned: set) -> list:
-    """同伴候補を決定論で順序付け(planning の `with` 解決を先頭 → 友人 tier≥friend_tier を
-    closeness 降順→id 昇順 → 友人ゼロなら housemates)。来街者・既割当・自分は除外。"""
+def _colleagues(sim, agent, assigned: set) -> list:
+    """同 org_id の同僚 id を id 昇順で返す(S-R4)。org_id 無し/来街者/自分/既割当は除外。"""
+    self_org = getattr(agent, "org_id", None)
+    if not self_org:
+        return []
+    out: list = []
+    for o in sorted(sim.agents, key=lambda a: a.id):
+        if o.id == agent.id or o.id in assigned or o.visitor:
+            continue
+        if getattr(o, "org_id", None) == self_org:
+            out.append(o.id)
+    return out
+
+
+def _companions(sim, agent, cfg: dict, assigned: set,
+                companion_type: str = "friend") -> list:
+    """同伴候補を決定論で順序付ける。関係タイプ(companion_type)で経路を分ける(S-R4):
+      friend    = planning の `with` 解決を先頭 → 友人 tier≥friend_tier を closeness 降順→id 昇順
+                  → 友人ゼロなら housemates(既存 S-R3 挙動。未指定の既定)。
+      housemate = 同居人(housemates)のみ。
+      colleague = 同 org_id の同僚のみ(会食・飲み会)。
+    来街者・既割当・自分は除外。"""
     out: list = []
     seen: set = set()
 
@@ -217,6 +248,15 @@ def _companions(sim, agent, cfg: dict, assigned: set) -> list:
         out.append(oid)
         seen.add(oid)
 
+    if companion_type == "colleague":
+        for oid in _colleagues(sim, agent, assigned):
+            _add(oid)
+        return out
+    if companion_type == "housemate":
+        for oid in (getattr(agent, "housemates", None) or []):
+            _add(oid)
+        return out
+    # friend(既定)
     for cid in _resolve_with(sim, agent):        # S-R3(7): `with` 名の解決相手を先頭に
         _add(cid)
     ft = int(cfg["friend_tier"])
@@ -230,6 +270,18 @@ def _companions(sim, agent, cfg: dict, assigned: set) -> list:
         for oid in (getattr(agent, "housemates", None) or []):
             _add(oid)
     return out
+
+
+def accept_prob(cfg: dict, tier: int, hierarchical: bool, age_gap: int) -> float:
+    """誘いの承諾確率(決定論の式)= accept_base + tier_bonus(親友) − hierarchy_penalty(上司同席)。
+
+    §2.5 の階層依存: hierarchical=true(飲み会)かつ相手との年齢差が boss_age_gap を超える(=上司/
+    部下の代理指標。組織台帳に役職データが無いための正直な近似)とき承諾を hierarchy_penalty 下げる。
+    同世代(年齢差小)・非階層活動(ランチ)ではペナルティ無し=許容。"""
+    p = float(cfg["accept_base"]) + (float(cfg["tier_bonus"]) if tier >= 3 else 0.0)
+    if hierarchical and int(age_gap) > int(cfg["boss_age_gap"]):
+        p -= float(cfg["hierarchy_penalty"])
+    return p
 
 
 def _rendezvous_poi(sim, group: list, day: int, act: str, cfg: dict) -> str | None:
@@ -276,16 +328,21 @@ def plan_day(sim, step: int, sim_min: int) -> None:
         act = _pick_activity(cfg, getattr(a, "age", 0), rng)
         if act is None:
             continue
-        cands = _companions(sim, a, cfg, assigned)
+        spec = cfg["activities"][act]
+        ctype = spec.get("companion_type", "friend")   # S-R4: 友人/同居人/同僚
+        hier = bool(spec.get("hierarchical", False))   # S-R4: 上司同席で承諾↓(飲み会)
+        cands = _companions(sim, a, cfg, assigned, ctype)
         if not cands:
             continue
         group = [a.id]
         max_g = int(cfg["max_group"])
+        a_age = int(getattr(a, "age", 0) or 0)
         for cid in cands:
             if len(group) >= max_g:
                 break
-            p = float(cfg["accept_base"]) + (
-                float(cfg["tier_bonus"]) if _tier(sim, a, cid) >= 3 else 0.0)
+            other = sim.agent_by_id.get(cid)
+            age_gap = abs(a_age - int(getattr(other, "age", 0) or 0)) if other else 0
+            p = accept_prob(cfg, _tier(sim, a, cid), hier, age_gap)  # S-R4: 階層依存
             if float(rng.random()) < p:               # 誘い→承諾(決定論・新 stream)
                 group.append(cid)
         if len(group) < int(cfg["min_group"]):

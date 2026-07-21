@@ -310,6 +310,24 @@ class Simulation:
         self._joint_day = -1                    # 日境界(共同行動の編成)の進行管理
         self._joint_groups: list = []           # 当日の成立グループ(observe が同席で1件記録)
         self._joint_total = 0                   # joint_activity の累積件数(L2 集計用)
+        # 友人グラフ生成(関係性パッケージ完結 第45バッチ S-R2。既定 OFF=現行挙動と完全同一)。起動時1回、
+        # 居住者に homophily+所属+Dunbar 次数の友人辺を張る(relations の closeness/tier へ注入)。辺は安定
+        # ハッシュ(friend_graph.seed)+ペルソナ属性の純関数=run.seed 非依存・乱数 stream ゼロ(RngHub 無風)。
+        # OFF=何も張らず・relations 台帳不変・friend_graph_built も出さない=バイト一致(ゴールデンを守る)。
+        from .. import friends as _friends_mod
+        raw_friend = cfg.get("friend_graph", None)
+        raw_friend = (OmegaConf.to_container(raw_friend, resolve=True)
+                      if OmegaConf.is_config(raw_friend) else raw_friend)
+        self.friendcfg = _friends_mod.build_cfg(raw_friend)
+        # 来街者 party の実体化(第45バッチ S-R5。既定 OFF=現行挙動と完全同一)。present な来街者を
+        # party_size でグループ化=同一初期ノード・相互 relations・共有回遊 POI。presence 純関数(P3)には
+        # 触れず present 実体化の後にグループ化するだけ=rotation の決定論・resume 不変を保つ。乱数は新
+        # stream "party" のみ。OFF=グループ化せず・party_today も付かず・joint_activity 0 件=バイト一致。
+        from .. import party as _party_mod
+        raw_party = cfg.get("party", None)
+        raw_party = (OmegaConf.to_container(raw_party, resolve=True)
+                     if OmegaConf.is_config(raw_party) else raw_party)
+        self.partycfg = _party_mod.build_cfg(raw_party)
         # 閾値分布の seam(手続き生成経路のみ。名簿値優先=現状のまま)
         self.threshold_dist = str(cfg.get("factors", {}).get("threshold_dist",
                                                              "normal") or "normal")
@@ -675,6 +693,11 @@ class Simulation:
                     self.net.add_contact(a.id, b.id)
                     a.mem.record_contact(b.id, b.name, 0, "顔なじみ")
                     b.mem.record_contact(a.id, a.name, 0, "顔なじみ")
+        # 友人グラフ生成(第45バッチ S-R2。顔なじみブロックの直後に中立な1呼び出し)。既定 OFF=no-op。
+        # ON=homophily+所属+Dunbar 次数で居住者の友人辺を relations へ注入(乱数 stream ゼロ=バイト一致)。
+        _friends_mod.build_friend_graph(self)
+        # 来街者 party の実体化(第45バッチ S-R5。起動時=day0 の present 来街者をグループ化)。既定 OFF=no-op。
+        _party_mod.form_parties(self, 0, 0)
         # 初期関係のアイスブレイク(実験前の初対面会話。build_icebreak.py 生成物)。
         # ★全 k 条件で同一ファイルを読む=初期関係が条件間で同一(交絡の排除)。
         self._load_icebreak(cfg)
@@ -986,6 +1009,8 @@ class Simulation:
                             reflection=self.reflectcfg,
                             place_name=self.place_name)
         agent.pool_pid = pid
+        # party_size(L4 来街者 record に実在=同行人数)を保持(S-R5 party の実体化が読む。無ければ None)。
+        agent.party_size = record.get("party_size")
         self._init_agent_runtime(agent)
         # 群のオントロジー(既定 OFF=no-op)。tier=P5 record の presence 層(resident/duty/…)。
         # party_size(L4 来街者の record に実在=同行人数)は同行者構成軸のデータ駆動割当に使う(無ければ None)。
