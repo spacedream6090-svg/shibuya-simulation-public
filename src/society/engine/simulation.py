@@ -25,6 +25,24 @@ from ..world import pool as pool_mod
 from . import checkpoint, scheduler
 
 
+def _parse_start_tod(v) -> int:
+    """run.start_tod → day0 step0 の分 of day(0..1439)。既定 "07:00"=420 分=現行値(バイト一致)。
+
+    "HH:MM" 文字列を第一に解釈する。YAML/OmegaConf が 60 進(07:00→420)や数値へ丸めた場合も
+    そのまま分として受け付ける(どちらでも既定は 420=07:00 に落ちる)。乱数を一切引かない純関数。"""
+    if v is None:
+        return 7 * 60
+    if isinstance(v, bool):                       # True/False の誤設定は既定へ倒す
+        return 7 * 60
+    if isinstance(v, (int, float)):               # 既に分(または 60 進で丸められた値)
+        return int(v) % 1440
+    s = str(v).strip()
+    if ":" in s:
+        hh, mm = s.split(":", 1)
+        return (int(hh) * 60 + int(mm)) % 1440
+    return int(s) % 1440
+
+
 def _natural_wake_step(start_tod: int, bedtime_min: int, sleep_steps: int) -> int | None:
     """開始時刻(分 of day)が自然な睡眠区間 [bedtime, bedtime+sleep) に入るなら、残りの睡眠を
     step 数(1 step=STEP_MINUTES 分)へ切り上げて返す。区間外(=開始時に覚醒しているべき)は
@@ -81,7 +99,10 @@ class Simulation:
             if not edir.is_absolute():
                 edir = REPO_ROOT / edir
             self.elevation = ElevationGrid.load(edir)
-        self.clock = Clock()
+        # 開始時刻(run.start_tod="HH:MM"。既定 "07:00"=420 分=現行値=バイト一致)。分 of day へ
+        # 解釈して Clock へ渡す。day 境界・時刻表示・夜内省/朝計画・natural_start は全て clock 由来の
+        # sim_min から決定論導出するので、この 1 点の配線だけで開始時刻の仮定が全経路へ波及する。
+        self.clock = Clock(start_min=_parse_start_tod(cfg.run.get("start_tod", "07:00")))
         self.logger = ObserverLogger(self.out_dir)
         self.items = ItemStore()
         self.labels = LabelSystem(self.items,
@@ -415,7 +436,9 @@ class Simulation:
             for ev in raw_ev.get("events", []):
                 h, m = str(ev.get("time", "12:00")).split(":")
                 minute = int(ev.get("day", 0)) * 1440 + int(h) * 60 + int(m)
-                step = (minute - 7 * 60) // 10      # シミュは day0 07:00 開始
+                # event の day/time は絶対 sim 分(day*1440+時刻)。step = (sim分 - 開始分)/STEP。
+                # 開始分は clock.start_min(run.start_tod。既定 420=07:00 で従来の 7*60 とバイト一致)。
+                step = (minute - self.clock.start_min) // STEP_MINUTES
                 if step >= 0:
                     self.world_events.append({**ev, "step": step})
         # 摂動シナリオ(#8: 封鎖/イベント注入)。既定 baseline = 完全 no-op。

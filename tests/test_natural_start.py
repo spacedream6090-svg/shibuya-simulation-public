@@ -39,8 +39,10 @@ from society.world.clock import Clock as _Clock, STEP_MINUTES   # noqa: E402
 
 # ------------------------------------------------------------ ヘルパ
 def _midnight(monkeypatch):
-    """Clock を 00:00 開始へ差し替える(深夜開始=本ノブの主対象を再現)。構築時の着席で使われる。"""
-    monkeypatch.setattr(sim_mod, "Clock", lambda: _Clock(start_hour=0))
+    """Clock を 00:00 開始へ差し替える(深夜開始=本ノブの主対象を再現)。構築時の着席で使われる。
+    Simulation は run.start_tod を分へ解釈して Clock(start_min=...) を呼ぶため、渡される引数を
+    無視して常に 00:00 を返すスタブにする(深夜開始の強制は据え置き=このガードの意図は不変)。"""
+    monkeypatch.setattr(sim_mod, "Clock", lambda *a, **k: _Clock(start_hour=0))
 
 
 def _sim(tmp_path, name, n=15, steps=96, seed=42, **ov):
