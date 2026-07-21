@@ -756,3 +756,63 @@ def tool_usage(run_dir: str) -> dict:
         "proposals": list(proposals_map.values()),
         "ventures": list(ventures_map.values()),
     }
+
+
+# --------------------------------------------------------------------------- #
+# 物流・在庫の集計(スライス①+②。在庫水準・品切れ率・補充回数・商品別売上)
+# --------------------------------------------------------------------------- #
+_GOODS_KINDS = ("delivery_trip", "restock", "stock_low", "stock_out")
+
+
+def goods_usage(run_dir: str) -> dict:
+    """物流の実体化(goods)の逐次集計を 1 パスで。集計は kind/cat/item で有界(生イベント列を保持しない)。
+
+    - totals: delivery_trip(配送)/restock(補充到着)/stock_low(在庫僅少)/stock_out(品切れ)件数。
+    - restock_qty: 補充で戻した総数量。restock_failed: 発注(配送)されたが到着しなかった数(封鎖=補充失敗の代理)。
+    - stockout_rate: 品切れ / (品切れ + 商品つき spend)= 実在庫由来の購入不成立率。
+    - by_cat: カテゴリ別の各件数 + 商品つき売上(sold)。
+    - top_items: 商品別売上(spend.item)の上位。
+    stock_out は実在庫版(payload src=inventory)のみ数える(commerce の在館数代理は除外=意味の混線回避)。"""
+    totals = {k: 0 for k in _GOODS_KINDS}
+    restock_qty = 0
+    by_cat: dict = defaultdict(lambda: {"delivery_trip": 0, "restock": 0,
+                                        "stock_low": 0, "stock_out": 0, "sold": 0})
+    items_sold: Counter = Counter()
+    sold_total = 0
+
+    for e in _events(run_dir, ["agent_id", "kind", "payload"]):
+        k, p = e["kind"], e["payload"]
+        if k == "stock_out":
+            if p.get("src") != "inventory":         # 実在庫版のみ(commerce の在館数代理は除外)
+                continue
+            totals["stock_out"] += 1
+            cat = p.get("cat")
+            if cat is not None:
+                by_cat[cat]["stock_out"] += 1
+        elif k in totals:
+            totals[k] += 1
+            cat = p.get("cat")
+            if cat is not None:
+                by_cat[cat][k] += 1
+            if k == "restock":
+                restock_qty += int(p.get("qty", 0) or 0)
+        elif k == "spend":
+            item = p.get("item")
+            if item is None:
+                continue
+            items_sold[item] += 1
+            sold_total += 1
+            cat = p.get("cat")
+            if cat is not None:
+                by_cat[cat]["sold"] += 1
+
+    denom = totals["stock_out"] + sold_total
+    return {
+        "totals": totals,
+        "restock_qty": restock_qty,
+        "restock_failed": max(0, totals["delivery_trip"] - totals["restock"]),
+        "stockout_rate": round(totals["stock_out"] / denom, 4) if denom else 0.0,
+        "by_cat": {c: dict(v) for c, v in sorted(by_cat.items())},
+        "items_sold_total": sold_total,
+        "top_items": sorted(items_sold.items(), key=lambda kv: (-kv[1], kv[0]))[:10],
+    }

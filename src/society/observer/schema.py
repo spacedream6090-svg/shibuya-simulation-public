@@ -198,6 +198,12 @@ register_event_kind("pov_image", "顕著時のPOV画像を撮影・保存(サイ
 #      設計: docs/research/l2-work-reality.md)----
 register_event_kind("serve",      "接客業務の帰属(客の消費と同一 work_node の勤務中スタッフに応対を帰属。不在時は agent_id=-1 の記録){cat, label, customer, node, unstaffed?}")
 register_event_kind("org_output", "オフィス系職場の日次産出集計(出勤者数×role重み。会社が『何かを作っている』の最小観測形){org, output, n, kind}")
+# ---- 物流の実体化 スライス①+②(commerce.inventory ON のみ・既定 OFF=0件。決定論・LLM/乱数ゼロ。
+#      実装 src/society/goods.py。設計: docs/research/economy-goods-services.md §7 ①②)----
+register_event_kind("delivery_trip", "補充の配送トリップ(depot=最寄りゲートウェイ→店。(s,S)発注。世界イベント agent_id=-1){from, to, cat, qty, eta}")
+register_event_kind("restock",       "補充トリップの到着=在庫が上限 S へ回復(封鎖時は失敗=不発){poi, cat, qty, from}")
+register_event_kind("stock_low",     "在庫僅少=発注点 s 以下(補充発注のトリガ。世界イベント agent_id=-1){poi, cat, level}")
+# ★ stock_out は commerce 既存 kind を再利用(意味を在館数の代理→実在庫の枯渇に拡張。src="inventory")
 
 
 @dataclass

@@ -1252,6 +1252,30 @@ commerce:
   # ---- 在庫/品切れ・行列(在館数が stock_threshold 以上で品切れ/行列=購入抑制+不満)----
   stock_threshold: 6            # これ以上の在館で品切れ/行列(0 以下=在庫機構 無効)
   stock_grievance: 0.02         # ★ON 推奨: 例 0.02。品切れ/行列に遭遇→不満(factors 経由。0.0=観測のみ=grievance 不変)
+  # ---- 物流の実体化 スライス①+②(実装 src/society/goods.py。設計 docs/research/economy-goods-services.md §7 ①②)----
+  # 店舗在庫((s,S) 方策)+ 日次補充トリップ(depot=最寄りゲートウェイ→店=delivery_trip→到着で restock)+
+  # 商品実体(何を買ったか=spend.item)。決定論・非LLM・乱数ゼロ(R1: 品切れは spend 抑制のみ・補充は
+  # agent_id=-1 の世界イベント=個体位置を変えない・新 stream を引かない)。封鎖(災害の運休/摂動 shock_closure)で
+  # 補充失敗→欠品波及。上記 commerce.enabled とは独立に効く(inventory.enabled のみで判定)。
+  # 既定 OFF=在庫実体なし・delivery_trip/restock/stock_low/stock_out(実在庫版)0 件・所持も生えない=バイト一致。
+  inventory:
+    enabled: false              # ★ON 推奨(本番): true(実在庫・日次補充トリップ・商品実体を有効化)
+    # (s,S) 方策: 在庫が発注点 s(reorder_point)以下で上限 S(capacity=order-up-to)まで補充発注(正典 §3.2/§3.4 較正)
+    capacity:      { food: 40, cafe: 40, shop: 30, nightlife: 30 }   # 上限 S = 初期在庫(生鮮 food は回転が速い=厚め)
+    reorder_point: { food: 12, cafe: 12, shop: 8,  nightlife: 8 }    # 下限 s = 発注点(food は高め=補充が早く走る)
+    default_capacity: 30        # capacity 未掲載カテゴリの既定 S
+    default_reorder_point: 8    # reorder_point 未掲載カテゴリの既定 s
+    consume_units: 1            # 1購入あたりの在庫消費単位
+    lead_time_steps: 3          # 発注→到着(配送トリップの走行時間)のリードタイム(step)
+    restock_hour: 4             # 日次補充レビューの時刻(時。物流が街を走る時間帯=正典 §3.4)
+    stockout_grievance: 0.02    # 実在庫の品切れで購入不成立に遭遇→不満(factors on_scarcity。0.0=観測のみ)
+    belongings_max: 8           # 本人の所持(直近購入)の有界リスト長
+    # 商品カタログ(カテゴリ→具体商品テキスト=家計調査費目と整合する粒度。日替わり巡回で決定論に選ぶ)
+    catalog:
+      food:      [ラーメン, 定食, カレー, 寿司]
+      cafe:      [コーヒー, 紅茶, ケーキ, サンドイッチ]
+      shop:      [Tシャツ, 雑貨, 文房具, 日用品]
+      nightlife: [カクテル, ビール, ハイボール]
 
 # ---- 都市・環境インフラのショック(現実ギャップ 後続波 H4 2026-07-07。すべて既定 OFF=現行挙動と完全同一)----
 # 生活を麻痺させる外生ショック=集団的 grievance の源。既存の scenario/transit の最小拡張(独立 phase。

@@ -16,6 +16,7 @@ from .. import conversation as conversation_mod
 from .. import disaster as disaster_mod
 from .. import diversity as diversity_mod
 from .. import freedom_p2 as freedom_p2_mod
+from .. import goods as goods_mod
 from .. import health as health_mod
 from .. import household as household_mod
 from .. import inner_life as inner_life_mod
@@ -495,13 +496,15 @@ def _atm_withdraw(sim, agent, need: float, step: int, sim_min: int) -> None:
 
 
 def _spend(sim, agent, amount: float, cat: str, step: int, sim_min: int,
-           chosen: bool = False) -> None:
+           chosen: bool = False, item: str | None = None) -> None:
     """消費(食事・買い物・nightlife・taxi・bus)。残高は 0 未満にしない。
 
     口座 ON(E5): 金額 ≥ card_threshold は口座から(カード)。未満は現金で、現金が
     足りなければ最寄り ATM で自動引き出し(withdraw)してから支払う。
     chosen(P2 #7 buy・既定 False=既存呼び出しは payload 不変=バイト一致): LLM が発火時に
-    能動選択した消費に payload へ chosen:true を添える(非発火の抽選消費と区別する観測用)。"""
+    能動選択した消費に payload へ chosen:true を添える(非発火の抽選消費と区別する観測用)。
+    item(物流②・既定 None=既存呼び出しは payload 不変=バイト一致): 買った物(商品実体)を
+    payload へ添える(会計不変=金額は変えない)。"""
     if amount <= 0:
         return
     if not _accounts_on(sim):
@@ -510,6 +513,8 @@ def _spend(sim, agent, amount: float, cat: str, step: int, sim_min: int,
                    "balance": round(agent.money, 1), "cat": cat}
         if chosen:
             payload["chosen"] = True
+        if item is not None:
+            payload["item"] = item
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                              kind="spend", x=agent.x, y=agent.y, payload=payload))
         if _government_on(sim):                 # 消費税を内訳計上(価格は名目不変)
@@ -538,6 +543,8 @@ def _spend(sim, agent, amount: float, cat: str, step: int, sim_min: int,
         payload["method"] = method
     if chosen:
         payload["chosen"] = True
+    if item is not None:                        # 物流②: 買った物(会計不変=金額は変えない)
+        payload["item"] = item
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                          kind="spend", x=agent.x, y=agent.y, payload=payload))
     if _government_on(sim):                     # 消費税を内訳計上(価格は名目不変)
@@ -586,8 +593,13 @@ def _charge_meal(sim, agent, step: int, sim_min: int) -> None:
         amount = commerce_mod.on_purchase(sim, agent, cat, amount, step, sim_min)
         if amount is None:                         # 品切れ/行列 → 購入抑制(spend を出さない)
             return
+    item = None
+    if _goods_on(sim):                             # 物流①②: 実在庫を1単位消費・買った物を付与(決定論)
+        ok, item = goods_mod.on_purchase(sim, agent, cat, step, sim_min)
+        if not ok:                                 # 実在庫の品切れ → 購入不成立(spend を出さない)
+            return
     amount = _budget_amount(sim, agent, cat, amount)   # E-W3 消費行動(既定 OFF=不変)
-    _spend(sim, agent, amount, cat, step, sim_min)
+    _spend(sim, agent, amount, cat, step, sim_min, item=item)
 
 
 def _charge_ride(sim, agent, ride: dict, step: int, sim_min: int) -> None:
@@ -1291,6 +1303,11 @@ def _isl_digest(agent) -> str | None:
     wf = work_mod.digest_line(agent)
     if wf:
         facts.append(wf)
+    # 物流②(商品実体): この間に買った物を1事実として供給(OFF/非該当は None=1行も足さない=バイト一致)。
+    # テキストは goods モジュール/config に閉じる(engine には商品名を書かない)。
+    gf = goods_mod.digest_line(agent)
+    if gf:
+        facts.append(gf)
     if not facts:
         return None
     return "この間のこと: " + "。".join(facts)
@@ -1309,6 +1326,7 @@ def _isl_take(sim, agent) -> str | None:
     if buf:
         buf.clear()
     work_mod.clear_digest(agent)                   # L2 業務の実体: 当日業務の仕切り直し(OFF/非該当は no-op)
+    goods_mod.clear_digest(agent)                  # 物流②: 当日購入の仕切り直し(OFF/非該当は no-op)
     scfg = getattr(sim, "scenecfg", None)
     if scene_desc_mod.enabled(scfg):
         sline = scene_desc_mod.digest_line(
@@ -2065,8 +2083,13 @@ def _apply(sim, agent, action: dict, step: int, sim_min: int) -> None:
             price = price_of(cat, sim.economy, getattr(sim, "rulebook", None))
             if _commerce_on(sim):                  # 動的価格/在庫を消費額に反映(既存 draw の外・決定論)
                 price = commerce_mod.on_purchase(sim, agent, cat, price, step, sim_min)
+            item = None
+            if price is not None and _goods_on(sim):   # 物流①②: 実在庫を消費・買った物を付与(決定論)
+                ok, item = goods_mod.on_purchase(sim, agent, cat, step, sim_min)
+                if not ok:                         # 実在庫の品切れ → 購入不成立
+                    price = None
             if price is not None and agent.money >= price:   # 品切れ(None)= 購入抑制
-                _spend(sim, agent, price, cat, step, sim_min)
+                _spend(sim, agent, price, cat, step, sim_min, item=item)
         cx, cy = bld["centroid"]
         agent.x = cx + float(rng.uniform(-8, 8))
         agent.y = cy + float(rng.uniform(-8, 8))
@@ -3347,6 +3370,22 @@ def _phase_commerce(sim, step: int, sim_min: int) -> None:
     commerce_mod.tick_shop_state(sim, step, sim_min)
 
 
+def _goods_on(sim) -> bool:
+    """物流の実体化(店舗在庫・日次補充・商品実体)が有効か。既定 OFF=新経路を一切通さない(バイト一致)。"""
+    cfg = getattr(sim, "goodscfg", None)
+    return bool(cfg and cfg["enabled"])
+
+
+def _phase_goods(sim, step: int, sim_min: int) -> None:
+    """毎step: 補充トリップの到着処理 + 日次 (s,S) レビュー(既定OFF=no-op。物流①)。
+
+    在庫は購入点(_charge_meal / 建物内消費)で decrement される(ここでは補充=物流のみ)。到着は毎step、
+    レビューは日次(restock_hour 以降の最初の step)。封鎖(災害の運休/shock_closure)で補充失敗→欠品波及。
+    決定論・乱数ゼロ=新 stream を引かない。既存の scenario/disaster が確定した後に呼ぶ(その日の封鎖を読む)。
+    goods OFF なら完全 no-op(delivery_trip/restock/stock_low 0 件=乱数消費不変=ゴールデンを守る)。"""
+    goods_mod.tick(sim, step, sim_min)
+
+
 # ---------------------------------------------------------------- 都市・環境ショック(後続波 H4)
 def _phase_disaster(sim, step: int, sim_min: int) -> None:
     """日次境界: 災害(台風/地震/大雪)・交通の遅延/運休・インフラ障害(停電/通信断/断水)(既定 OFF=no-op。H4)。
@@ -3594,6 +3633,8 @@ def run_step(sim, step: int) -> None:
     _phase_career(sim, step, sim_min)              # 日次境界: 失業/求職/転職(既定OFF=no-op。Wave G5)
     _phase_health(sim, step, sim_min)              # 日次境界: 病気の発症/回復・受診・メンタル(既定OFF=no-op。H1)
     _phase_disaster(sim, step, sim_min)            # 日次境界: 災害・交通遅延/運休・インフラ障害(既定OFF=no-op。H4)
+    _phase_goods(sim, step, sim_min)               # 物流: 補充トリップ到着+日次(s,S)レビュー(既定OFF=no-op。①)。
+                                                   # disaster/scenario 確定後=その日の封鎖(運休/shock_closure)を読む
     _phase_rules(sim, step, sim_min)               # 日次境界: 制度DSL(期限失効・定期イベント)
     _phase_recursion(sim, step, sim_min)           # 日次境界: 再帰性(昨日の街の動き。既定OFF=no-op)
     _phase_assembly(sim, step, sim_min)            # 日次境界: 代表制議会の改選(既定OFF=no-op。制度深化3)

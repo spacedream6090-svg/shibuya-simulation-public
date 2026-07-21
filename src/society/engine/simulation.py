@@ -318,6 +318,16 @@ class Simulation:
                         if OmegaConf.is_config(raw_commerce) else raw_commerce)
         self.commercecfg = _commerce_mod.build_cfg(raw_commerce)
         self._commerce_open: dict = {}             # 営業時間の開閉遷移(shop_state)の進行管理
+        # 物流の実体化 スライス①+②(commerce.inventory。既定 OFF=現行挙動と完全同一)。店舗在庫((s,S) 方策)+
+        # 日次補充トリップ(depot→店=delivery_trip→到着で restock)+ 商品実体(何を買ったか=spend.item)。
+        # 決定論・非LLM・乱数ゼロ(R1: 品切れは spend 抑制のみ・補充は agent_id=-1 の世界イベント=個体位置を
+        # 変えない=compute_matched 下の k 不変性で担保)。封鎖(災害の運休/shock_closure)で補充失敗→欠品波及。
+        # OFF=在庫実体なし・delivery_trip/restock/stock_low/stock_out(実在庫版)0 件・所持も生えない=バイト一致。
+        from .. import goods as _goods_mod
+        self.goodscfg = _goods_mod.build_cfg(raw_commerce)
+        self._goods_stock: dict = {}               # (node, cat) -> 在庫数(遅延初期化=購入が起きた POI のみ)
+        self._goods_pending: dict = {}             # (node, cat) -> 到着 step(補充トリップの在庫。多重発注抑止)
+        self._goods_review_day: int = -1           # 日次 (s,S) レビューの進行管理
         # 都市・環境インフラのショック(現実ギャップ 後続波 H4 2026-07-07。既定 OFF=現行挙動と完全同一)。
         # 災害(台風/地震/大雪→交通麻痺=運休+外出抑制=在宅+強い grievance)+ 交通の遅延/運休(定刻ダイヤを
         # 新 stream "disaster" で乱す)+ インフラ障害(停電/通信断/断水→在宅娯楽・スマホ抑制+grievance)。
