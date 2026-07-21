@@ -16,13 +16,28 @@ from ..llm.mock import MockBackend
 from ..observer.logger import ObserverLogger
 from ..observer.provenance import ItemStore
 from ..rng import RngHub
-from ..world.clock import Clock
+from ..world.clock import Clock, STEP_MINUTES
 from ..world.map import CityMap
 from ..world.routing import Router
 from ..world.transit import Transit
 from ..world import presence as presence_mod
 from ..world import pool as pool_mod
 from . import checkpoint, scheduler
+
+
+def _natural_wake_step(start_tod: int, bedtime_min: int, sleep_steps: int) -> int | None:
+    """開始時刻(分 of day)が自然な睡眠区間 [bedtime, bedtime+sleep) に入るなら、残りの睡眠を
+    step 数(1 step=STEP_MINUTES 分)へ切り上げて返す。区間外(=開始時に覚醒しているべき)は
+    None。1440 分の円環で判定し、乱数を一切使わない決定論導出(初日コールドスタート改善の核)。
+    夜勤者(bedtime が日中側)や日中開始(将来 start 時刻をずらした場合)でも同じ式で自然に働く。"""
+    dur = int(sleep_steps) * STEP_MINUTES
+    if dur <= 0:
+        return None
+    since = (int(start_tod) - int(bedtime_min)) % 1440    # 就寝からの経過分(円環)
+    if since >= dur:
+        return None                                        # もう起きているべき時刻=覚醒開始
+    remain = dur - since                                   # 残りの睡眠(分)。since<dur なので >=1
+    return (remain + STEP_MINUTES - 1) // STEP_MINUTES      # step 数へ切り上げ(>=1)
 
 
 class Simulation:
@@ -608,6 +623,9 @@ class Simulation:
         # 初期関係のアイスブレイク(実験前の初対面会話。build_icebreak.py 生成物)。
         # ★全 k 条件で同一ファイルを読む=初期関係が条件間で同一(交絡の排除)。
         self._load_icebreak(cfg)
+        # 初日コールドスタート改善(run.natural_start・既定 OFF=no-op=バイト一致)。home_building は
+        # ここまでで確定(household 等の後段割当を含む)なので、着席の最後にまとめて自然な睡眠状態へ。
+        self._apply_natural_start()
         # Lynch: landmark_score を研究者frame の静的データとして書き出す(ON 時のみ)。
         if self.landmark_score is not None:
             (self.out_dir / "landmark_score.json").write_text(
@@ -712,6 +730,46 @@ class Simulation:
             agent.return_gateway = gw
             agent.x, agent.y = self.city.node_xy(gw)
             agent.return_at = max(0, (arr_min - start_min) // 10)
+
+    def _apply_natural_start(self) -> None:
+        """初日コールドスタート改善(run.natural_start・既定 false=バイト一致)。
+
+        既定は全員 sleeping=False で開始するため、開始時刻が深夜でも起きたまま過ごし初日の朝の
+        起床(wake_up)と朝計画(day_plan)がほぼ発火しない(2日目以降は正常)。ON 時は run 開始
+        時刻が本人の自然な睡眠時間帯に入っている居住者を、就寝状態・自宅(home_node/home_building)・
+        自然な起床 step で着席させる。self.agents を1回走査するので通常経路の init ループと pool
+        経路の day0 着席の両方をまとめて覆う(2日目以降の途中日 enter には掛からない=day0 のみ)。
+
+        起床は既存 _phase_wake_and_returns の wake_up→_schedule_plan にそのまま乗る(新しい起床
+        経路を作らない=朝計画が初日から全員分出る)。判定・起床 step は bedtime_min / sleep_steps /
+        開始時刻からの決定論導出(_natural_wake_step。乱数を一切引かない=stream 不使用=バイト一致
+        の前提)。開始時に覚醒しているべき個体(夜勤者を含む)は従来どおり覚醒で着席。来街者・流入
+        通勤者(自宅が圏外)は対象外(初日入場は presence/流入機構の管轄)。既定 OFF は 1体も触らない。"""
+        if not bool(self.cfg.run.get("natural_start", False)):
+            return
+        start_tod = self.clock.sim_min(0) % 1440           # 開始時刻(分 of day。通常 07:00→420)
+        for agent in self.agents:
+            if agent.visitor or agent.commute:             # 自宅が圏外 = 対象外
+                continue
+            wake_step = _natural_wake_step(start_tod, agent.bedtime_min,
+                                           agent.sleep_steps)
+            if wake_step is None:                          # 覚醒しているべき→従来どおり覚醒で着席
+                continue
+            home = agent.home_node or ""
+            if not home and not agent.home_building:        # 帰る家が無い(念のため)=触らない
+                continue
+            agent.sleeping = True
+            agent.sleep_until = wake_step                   # step0 起点なので step 番号そのもの
+            agent.node = home or agent.node
+            if agent.home_building and self.city.has_building(agent.home_building):
+                bld = self.city.building(agent.home_building)
+                agent.building = bld["id"]
+                agent.floor = agent.home_floor
+                agent.x, agent.y = bld["centroid"]         # 実在の住宅建物内で就寝(go_to_bed と同じ位置)
+            else:
+                agent.building = None
+                agent.floor = 0
+                agent.x, agent.y = self.city.node_xy(agent.node)
 
     def _build_landmark_score(self) -> dict:
         """Lynch 都市イメージ: 目的地ノードごとの imageability 近似スコア(POI 数 + 名前つき

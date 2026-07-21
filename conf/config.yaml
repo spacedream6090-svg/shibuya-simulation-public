@@ -9,6 +9,15 @@ run:
   n_steps: 144          # 144 step = シミュ内1日(1 step = 10分)
   out_dir: runs         # 実行ごとに runs/<name>/ が作られる
   name: null            # null なら seed から自動命名
+  # ---- 初日コールドスタート改善(統合リハーサルの発見。既定 false=完全従来挙動=バイト一致)----
+  # 既定は全員 sleeping=False で開始→開始時刻が深夜でも起きたまま過ごし初日の朝の起床(wake_up)と
+  # 朝計画(day_plan)がほぼ出ない(2日目以降は正常)。true にすると run 開始時の着席で、開始時刻が
+  # 本人の自然な睡眠時間帯(bedtime_min〜+sleep_steps から決定論導出・乱数なし)に入っている居住者を
+  # 就寝状態・自宅・自然な起床 step で初期化する(既存の起床機構に乗る=朝計画が初日から全員分出る)。
+  # 開始時に覚醒しているべき個体(夜勤者等)は従来どおり覚醒で着席。来街者・流入通勤者(自宅が圏外)は
+  # 対象外。本番 ON はユーザー判断(production/daily は触らない)。ON の効果はイベント時系列に現れるが
+  # LLM 呼数は k 非依存のまま(発火ゲートに k/traits を入れない=既存機構に乗るだけ)。
+  natural_start: false
 
 # ---- state 更新則の magnitude(OPEN#2: 因果構造は factors/update.py、量はここで調律)----
 factors:
