@@ -189,6 +189,15 @@ class Simulation:
                 getattr(self.transit, "bus_lines", []), self.city,
                 stop_radius_m=self.ridecfg["bus"]["stop_radius_m"],
                 headway_steps=self.ridecfg["bus"]["headway_steps"])
+        # SUMO ライブ連成タクシー配車 v-Ride-1(既定 OFF=None=SUMO を一切起動しない=バイト一致)。
+        # ON 時のみ TaxiLive を生成(backend=mock は SUMO 不要の純関数 / traci は実 SUMO を起動し、
+        # 不在・失敗なら None へ後退=従来挙動)。設計: src/society/transit_live.py。
+        from .. import transit_live as _transit_live_mod
+        origin = self.city.meta.get("origin_latlon", None)
+        _live_raw = (cfg.get("transit_ride", {}) or {}).get("live", {}) or {}
+        self.taxi_live = _transit_live_mod.make_taxi_live(
+            cfg, net_hint=_live_raw.get("net"),
+            origin=(tuple(origin) if origin else None), log=print)
         # 背景交通(エージェント以外の通過車両)
         from ..world.traffic import TrafficFlow
         tcfg = cfg.world.get("traffic", {})

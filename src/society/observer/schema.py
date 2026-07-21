@@ -54,7 +54,9 @@ register_event_kind("withdraw",      "現金不足→口座から自動引き出
 register_event_kind("rent",          "家賃の口座引き落とし(給料日翌日・不足は翌日繰越){amount, paid, carry, account, phase}")
 # ---- 朝の一日計画 / 交通機関(ユーザー要望 2026-07-06)----
 register_event_kind("day_plan",      "朝の一日計画(LLM。ルールベース行動の土台){n, plan}")
-register_event_kind("ride",          "交通機関の乗車(タクシー/簡易バス){mode, fare, from, to}")
+register_event_kind("ride",          "交通機関の乗車(タクシー/簡易バス){mode, fare, from, to, wait_s?, ride_s?, delay_s?}")
+# ---- SUMO ライブ連成タクシー v-Ride-1(transit_ride.live ON のみ・既定 OFF=0件。設計: docs/research/sumo-live-transit.md)----
+register_event_kind("taxi_unmatched", "SUMO ライブ配車が捕まらない(未配車=満車/max_wait 超過→徒歩フォールバック){from, to}")
 register_event_kind("free_action",   "開放行動(第17バッチ: LLM の自由記述行動+価値4軸の観測){what, category, tags, match, report, minutes, cost, dest, sat}")
 # ---- 生活の自己決定 P2(D3 棚卸し。freedom.p2.*。既定 全 OFF)----
 register_event_kind("move_home",       "住居移転(#6: 空き住戸へ転居。敷金=現金障壁){from, to, deposit}")

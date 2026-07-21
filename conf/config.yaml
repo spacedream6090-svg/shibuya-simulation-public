@@ -560,6 +560,18 @@ transit_ride:
     fare: 230                   # 運賃(円)
     stop_radius_m: 100          # 出発/目的ノードが停留所からこの距離内なら乗車可
     headway_steps: 1            # 便の間隔(step。1 step = 10分)
+  # ---- SUMO ライブ連成タクシー配車 v-Ride-1(既定 OFF=SUMO プロセスを一切起動しない=完全従来挙動=
+  #      ゴールデン L1 バイト一致)。正典: docs/research/sumo-live-transit.md / traffic-indirect-effects.md。
+  #      ON 時: エージェントが taxi を選んだ瞬間だけ SUMO(taxi device・dispatch=traci)へ予約を注入し、
+  #      配車待ち wait_s / 乗車時間 ride_s を到着 step の追加待ちへ量子化する(到着 step が実際に変わる=
+  #      別ゴールデン)。乗車判断は既存の非LLM _ride_extra のまま=LLM 呼数を1本も足さない(k 非依存)。----
+  live:
+    enabled: false
+    backend: traci              # traci=実 SUMO(TraCI) / mock=純関数ブリッジ(SUMO 不要・テスト用)
+    n_taxis: 8                  # taxi fleet 台数(ソート済みエッジへ決定論配置)
+    seed: 42                    # SUMO seed(固定・--random 禁止=決定論)
+    max_wait_s: 900             # この秒内に配車できなければ未配車(捕まらない)=徒歩フォールバック
+    net: null                   # 車道網 net.xml(null=runs 配下の *_car.net.xml を自動探索)
 
 transit:
   file: data/transit_shibuya.json  # 定刻ダイヤ(乱れなし)。GTFS 実ダイヤに差し替え可

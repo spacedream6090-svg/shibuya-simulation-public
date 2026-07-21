@@ -609,11 +609,49 @@ def _charge_ride(sim, agent, ride: dict, step: int, sim_min: int) -> None:
     mode = str(ride.get("mode", "taxi"))
     fare = float(ride.get("fare", 0.0))
     fare = _budget_amount(sim, agent, mode, fare)   # E-W3 消費行動(既定 OFF=不変。ride.fare と spend を整合)
+    payload = {"mode": mode, "fare": round(fare, 1),
+               "from": ride.get("from"), "to": ride.get("to")}
+    # SUMO ライブ連成(v-Ride-1): 配車待ち/乗車時間/自由流超過を必ず記録(観測可能性=間接影響を
+    # L2 で事後に測れる状態にする。traffic-indirect-effects.md §5 条件(5))。live OFF は付かない=バイト一致。
+    for _k in ("wait_s", "ride_s", "delay_s"):
+        if _k in ride:
+            payload[_k] = ride[_k]
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
-                         kind="ride", x=agent.x, y=agent.y,
-                         payload={"mode": mode, "fare": round(fare, 1),
-                                  "from": ride.get("from"), "to": ride.get("to")}))
+                         kind="ride", x=agent.x, y=agent.y, payload=payload))
     _spend(sim, agent, fare, mode, step, sim_min)
+
+
+def _taxi_live_dispatch(sim, agent, dest, step: int, sim_min: int) -> None:
+    """SUMO ライブ連成タクシー配車 v-Ride-1 の本体側フック(_apply move_to から呼ぶ)。
+
+    既定 OFF(sim.taxi_live is None)は即 return=何も起きない=SUMO を起動しない=ゴールデン L1
+    バイト一致。ON かつ乗車が taxi のときだけ:予約を SUMO へ注入 → 配車待ち wait_s/乗車時間 ride_s を
+    取得 → 到着 step の追加待ち hold_steps へ量子化する。捕まらない(未配車)なら乗車を取消して徒歩
+    フォールバック(taxi_unmatched を記録)。乗車判断そのものは routine._ride_extra(非LLM)のまま=
+    LLM 呼数を1本も足さない・k/belief を配車へ入れない(no-fingerprint / R1)。"""
+    tl = getattr(sim, "taxi_live", None)
+    if tl is None:
+        return
+    ride = getattr(agent, "_ride_pending", None)
+    if not ride or ride.get("mode") != "taxi":
+        return
+    fx, fy = sim.city.node_xy(agent.node)
+    tx, ty = sim.city.node_xy(dest)
+    res = tl.request(agent_id=agent.id, from_node=agent.node, to_node=dest,
+                     from_xy=(fx, fy), to_xy=(tx, ty), step=step, sim_min=sim_min)
+    if not res.get("matched"):                     # 捕まらない → 乗車取消・徒歩へフォールバック
+        agent._ride_pending = None
+        agent.trip_mode = "walk"
+        sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                             kind="taxi_unmatched", x=agent.x, y=agent.y,
+                             payload={"from": agent.node, "to": dest}))
+        return
+    ride["wait_s"] = res["wait_s"]                  # payload 観測(_charge_ride が記録)
+    ride["ride_s"] = res["ride_s"]
+    ride["delay_s"] = res["delay_s"]
+    hold = int(res["hold_steps"])
+    if hold > 0:                                    # 配車待ち+超過を到着 step の追加待ちへ(車が来るまで動かない)
+        agent._taxi_hold_until = step + hold
 
 
 # ---------------------------------------------------------------- マイクロ移動
@@ -822,7 +860,10 @@ def _phase_wake_and_returns(sim, step: int, sim_min: int) -> None:
 def _phase_move(sim, step: int, sim_min: int) -> None:
     occupancy: dict[tuple[str, str], int] = {}
     for agent in sim.agents:
-        if agent.loc == "street" and not agent.sleeping and agent.route:
+        # SUMO ライブ連成の配車待ち(_taxi_hold_until>step)は移動しない=占有にも数えない(既定 OFF:
+        # フラグ未設定→getattr=-1→常に含める=バイト一致)。
+        if agent.loc == "street" and not agent.sleeping and agent.route \
+                and getattr(agent, "_taxi_hold_until", -1) <= step:
             key = _edge_key(agent.node, agent.route[0])
             occupancy[key] = occupancy.get(key, 0) + 1
 
@@ -831,6 +872,11 @@ def _phase_move(sim, step: int, sim_min: int) -> None:
     elev = getattr(sim, "elevation", None)     # 3D Phase 0(無効時 None=payload 不変)
     for agent in sim.agents:
         agent._arrived_new = False
+        # 配車待ち: 車が来る step(_taxi_hold_until)まで原地で待つ(車道は塞がない=移動なし)。
+        # ON 時のみのフラグ=既定 OFF は素通り=バイト一致。到来 step 以降はフラグを解除して通常移動。
+        if getattr(agent, "_taxi_hold_until", -1) > step:
+            agent._congestion = 1.0
+            continue
         if agent.loc != "street" or agent.sleeping or not agent.route:
             agent._congestion = 1.0
             continue
@@ -2049,11 +2095,14 @@ def _apply(sim, agent, action: dict, step: int, sim_min: int) -> None:
         agent._pending_activity = str(action.get("activity", ""))
         agent._ride_pending = action.get("ride")   # 交通機関の乗車(到着時に課金)。無ければ None
         agent.activity = "commuting" if action.get("activity") == "commuting" else ""
+        # SUMO ライブ連成タクシー配車 v-Ride-1(既定 OFF=None=no-op=used_mode 不変=バイト一致)。
+        # ON 時のみ予約注入→配車待ち/超過を到着 step へ反映。未配車なら trip_mode を walk へ差し替える。
+        _taxi_live_dispatch(sim, agent, action["dest"], step, sim_min)
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                              kind="route_start", x=agent.x, y=agent.y,
                              payload={"dest": action["dest"],
                                       "dest_name": sim.city.node_name(action["dest"]),
-                                      "mode": used_mode,
+                                      "mode": agent.trip_mode,
                                       "exit": agent.exit_intent,
                                       "homing": agent.homing,
                                       "n_nodes": len(path),
