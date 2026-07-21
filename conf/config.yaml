@@ -1038,6 +1038,21 @@ work:
       poi_cats: [office]        # オフィス系職場と見なす職場 POI カテゴリ
       base_weight: 1.0          # role 重みの既定(1人=1.0 → 産出は出勤者数に比例)
       role_weights: {}          # occupation/role → 産出重み(空=全員 base_weight)
+  # ---- 職場束ね直し(第49バッチ。既定 OFF=現行の work_node 付与と完全同一=バイト一致)----
+  # pool 経路の L2/L3 は occupation(role)が persona._pick_workplace の _WORK_CAT に載らないと
+  # work_node を持たない=接客(serve)/産出(org_output)の帰属から漏れる(coverage の穴)。ON 時:
+  # 台帳 organizations の workplace_poi.node へ org_id で直束ね(organizations.commute_to_poi の pool 版)。
+  # 台帳ノードが現行地図に無い時は POI カテゴリ + 安定ハッシュで決定論マッチ(ontology 流儀)。束ねは
+  # (pool_pid, 固定属性)の純関数=run.seed 非依存=hydrate 再入で同一 work_node(P3 ローテーション不変)。
+  bind_workplace:
+    enabled: false              # ★ON 推奨(本番): true(L2 の work_node coverage 拡大=serve/org_output の網羅率↑)
+    book: data/organizations_shibuya_wide11k.json  # org_id が参照する台帳(100万プールの母体)
+    rebind_bound: false         # 既に work_node を持つ個体も実 POI へ束ね直すか(既定=未束のみ=coverage 拡大に限定)
+    poi_match_fallback: true    # 台帳ノードが現行地図に無い時、POI カテゴリ + 安定ハッシュで決定論マッチ
+    seed: 20260722              # 決定論マッチの安定ハッシュ seed(run.seed 非依存)
+    default_open: "09:00"       # 勤務窓の既定(台帳/record の shift_pattern が無い時の後退値)
+    default_close: "18:00"
+    occ_cat: {}                 # occupation/role → 職場 POI カテゴリ(org_id が無い層=L5 等を束ねたい時。既定=空)
 
 # ---- 欲求プロファイルの個人差 W2-2(文献: docs/lit/needs__individual-differences.md)----
 # ON 時: traits・年齢・職業から5次元の価値プロファイル(刺激/安全/関係/有能/自律)を決定論生成し、

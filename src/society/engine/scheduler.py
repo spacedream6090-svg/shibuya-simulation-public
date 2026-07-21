@@ -3735,11 +3735,27 @@ def _phase_pool_rotation(sim, step: int, sim_min: int) -> None:
 
 
 # ---------------------------------------------------------------- 1 step
+def _phase_workplace_bound_report(sim, step: int, sim_min: int) -> None:
+    """職場束ね直し(work.bind_workplace)の day0 coverage 統計を起動時 1 件で記録する。
+
+    step0 でのみ発火(resume は start>0 で素通り=一気 run の segment に既出=二重記録なし)。
+    既定 OFF(_workbind_stat is None)は 1 件も出さない=イベント列バイト一致。世界イベント agent_id=-1。"""
+    if step != 0:
+        return
+    stat = getattr(sim, "_workbind_stat", None)
+    if not stat or getattr(sim, "_workbind_reported", False):
+        return
+    sim._workbind_reported = True
+    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
+                         kind="workplace_bound", x=0.0, y=0.0, payload=dict(stat)))
+
+
 def run_step(sim, step: int) -> None:
     sim.budget.reset()
     sim.freedom_stats = {"choice_points": 0, "exercised": 0}  # 自由度観測(P2)の step 境界。OFF は L2 で列不在
     sim_min = sim.clock.sim_min(step)
     _phase_pool_rotation(sim, step, sim_min)       # 日次境界: 在場ローテーション(既定OFF=no-op。W2 P3)
+    _phase_workplace_bound_report(sim, step, sim_min)  # 起動時1回: 職場束ね直しの coverage 統計(既定OFF=no-op)
     # 行間補間(P2 S2): この step 開始時点の logger.events 長を控える(末で増分を各個体バッファへ
     # 振り分ける)。OFF は -1 で以降の蓄積を完全にスキップ=状態も出力もバイト一致。
     _isl_idx = len(sim.logger.events) if _interstitial_on(sim) else -1

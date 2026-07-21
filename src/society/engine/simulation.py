@@ -487,6 +487,17 @@ class Simulation:
                     if OmegaConf.is_config(raw_work) else raw_work)
         self.workcfg = _work_mod.build_cfg(raw_work)
         self._work_day = -1                        # 日次境界(オフィス産出集計)の進行管理
+        # 職場束ね直し(work.bind_workplace。既定 OFF=現行の work_node 付与と完全同一=バイト一致)。
+        # ON 時: pool 経路の L2/L3(occupation が persona._WORK_CAT に載らず work_node を持たない個体)を
+        # 台帳 workplace_poi.node へ org_id で束ね直し、接客(serve)/産出(org_output)の網羅率を上げる。
+        # 束ねは build_pool_agent 内で決定論(pool_pid の純関数=run.seed 非依存=hydrate 再入不変)に行う。
+        self._workbind_cfg = self.workcfg["bind_workplace"]
+        self._workbind_book = None                 # org_id → 職場情報(ON 時のみ 1 回読む)
+        self._workbind_stat = None                 # day0 present の coverage 統計(起動時 1 件で記録)
+        self._workbind_agg = {"n_total": 0, "n_unbound_before": 0,
+                              "n_bound": 0, "n_unbound_after": 0}
+        if self._workbind_cfg["enabled"]:
+            self._workbind_book = _work_mod.load_bind_book(self._workbind_cfg, REPO_ROOT)
         # 「世界を変える」ツール群(host_event/post_flyer/found_group/propose/open_venture)
         from ..tools import Tools, build_tools_cfg
         self.tools = Tools(build_tools_cfg(cfg.get("tools", {})))
@@ -628,6 +639,9 @@ class Simulation:
                 self._pool.presence_records(), 0, self._pool_present_cap, self.hub, weekday)
             for pid in day0:
                 self.agents.append(self.build_pool_agent(pid, self._pool.get(pid)))
+            # 職場束ね直しの day0 coverage 統計を控える(起動時 1 件で記録=run_step step0)。
+            if self._workbind_book is not None:
+                self._workbind_stat = dict(self._workbind_agg)
         else:
             for agent_id in range(int(cfg.run.n_agents)):
                 entry = roster[agent_id % len(roster)] if roster else None
@@ -1062,7 +1076,31 @@ class Simulation:
         # party_size(L4 来街者の record に実在=同行人数)は同行者構成軸のデータ駆動割当に使う(無ければ None)。
         self._apply_ontology(agent, str(record.get("presence", "resident")),
                              party_size=record.get("party_size"))
+        # 職場束ね直し(work.bind_workplace。既定 OFF は no-op=work_node の付与状況とも不変)。
+        self._bind_pool_workplace(agent, record)
         return agent
+
+    def _bind_pool_workplace(self, agent, record: dict) -> None:
+        """pool 個体の work_node を台帳 workplace_poi へ束ね直す(ON 時のみ・決定論・乱数ゼロ)。
+
+        既定 OFF(_workbind_book is None)は一切触らない=work_node の付与状況・イベント列とも
+        バイト一致。ON 時は build_pool_agent(day0 着席 + 日境界ローテーション + hydrate 再入)の
+        各実体化で同一 pool_pid が同一 work_node へ束ねられる(run.seed 非依存=resume 不変)。"""
+        if self._workbind_book is None:
+            return
+        from .. import work as _work_mod
+        if not _work_mod.bind_eligible(record, self._workbind_cfg):
+            return                                 # 勤務地を持たない層(L1/L4/org_id 無し L5)は対象外
+        had, has = _work_mod.bind_workplace(agent, record, self.city,
+                                            self._workbind_book, self._workbind_cfg)
+        agg = self._workbind_agg
+        agg["n_total"] += 1
+        if not had:
+            agg["n_unbound_before"] += 1
+        if not has:
+            agg["n_unbound_after"] += 1
+        if has and not had:
+            agg["n_bound"] += 1
 
     def _pool_update_budget(self) -> None:
         """S6a の N 比例 cap を、pool ON 時は当日の在場数 len(self.agents) で更新する(1行の接続)。
