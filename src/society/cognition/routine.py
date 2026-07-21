@@ -23,6 +23,7 @@ from .. import inner_life as _inner
 from .. import joint as _joint
 from .. import media
 from .. import party as _party
+from .. import services as _services
 from ..factors import update as factor_update
 from ..observer.schema import Event
 from ..world import calendar as _calendar
@@ -885,6 +886,7 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
     # EPR の行き先候補は危険地帯(犯罪履歴ノード=治安回避 H5)を除いたリストにする(OFF=全候補で不変)。
     crowd = _crowd_dest(agent, sim, step)
     joint_act = ""                                   # 共同行動の活動タグ(cost 用。既定 ""=既定不変)
+    service_act = ""                                 # サービス来店タグ(到着時 charge_service 用。既定 ""=不変)
     if crowd is not None:
         dest = crowd                                 # 群集日: 地図原点付近の集会ノードへ寄せる
     elif (tour := _diversity.tourist_dest(agent, sim, step, sim_min)) is not None:
@@ -898,6 +900,9 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
         joint_act = _joint.route_activity(agent)     # meal_cafe→eating(既存 _charge_meal で課金)/他→""
     elif (party := _party.party_dest(agent, sim, step, sim_min)) is not None:
         dest = party                                 # 来街者 party: 連れと共有の回遊 POI へ収束(第45バッチ S-R5)
+    elif (svc := _services.service_dest(agent, sim, step, sim_min)) is not None:
+        dest = svc                                   # サービス来店: 近傍の service/education POI へ寄せる(第46バッチ ③)
+        service_act = "service"                      # 到着時 activity=="service" で受給(charge_service)
     elif (hobby := _inner.hobby_dest(agent, sim, step, sim_min)) is not None:
         dest = hobby                                 # 趣味: 余暇の行き先を趣味の場所へ寄せる(後続波 H6)
     elif (boost := _weekly_boost_dest(agent, sim, step)) is not None:
@@ -920,10 +925,14 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
         if detour is not None:
             dest = detour
         base_stay = _jitter_stay(agent, sim, base_stay, step, scfg)
+    if service_act:                                  # サービス来店: 定義の滞在 step を使う(到着で受給)
+        base_stay = int(getattr(agent, "_service_stay", base_stay) or base_stay)
     action = {"type": "move_to", "dest": dest, "stay_steps": base_stay,
               "mode": _choose_mode(agent, sim, dest, rng)}
     if joint_act:                                    # 共同行動の活動タグ(cost 用。既定 ""=未設定=不変)
         action["activity"] = joint_act
+    elif service_act:                                # サービス来店タグ(到着時 charge_service。既定 ""=不変)
+        action["activity"] = service_act
     return _augment_ride(agent, sim, action, step, sim_min)
 
 

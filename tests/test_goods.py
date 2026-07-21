@@ -17,6 +17,7 @@ import json
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from society import b2b as b2b_mod
 from society import goods as goods_mod
 from society.config import load_config
 from society.engine import scheduler
@@ -361,3 +362,140 @@ def test_goods_usage_aggregation(tmp_path):
     assert out["stockout_rate"] == 0.25 and out["items_sold_total"] == 3
     assert out["by_cat"]["food"]["sold"] == 2 and out["by_cat"]["shop"]["sold"] == 1
     assert out["top_items"][0] == ("ラーメン", 2)
+
+
+# ==================================================================== スライス⑤ B2B(卸→小売)
+# 正典 §7 ⑤。①の補充供給元を外生 depot から卸 org へ内生化(org 間で金+物が移転・保存)。卸在庫不足=
+# 補充失敗(封鎖時と同じ経路=欠品波及)。全決定論・乱数ゼロ・LLM 呼ゼロ。既定 OFF=b2b_trade 0 件=バイト一致。
+_B2B_ON = {"commerce.inventory.enabled": "true",
+           "commerce.inventory.b2b.enabled": "true",
+           "organizations.enabled": "true"}
+
+
+def _shop_node(sim):
+    return sim.city.pois_by_cat("shop")[0]["node"]
+
+
+def test_b2b_schema_registered():
+    assert "b2b_trade" in EVENT_KINDS, "b2b_trade が schema 未登録"
+
+
+def test_b2b_off_uses_gateway_no_trade(tmp_path):
+    """inventory ON・b2b OFF では補充供給元は外生 depot のまま=b2b_trade 0 件・restock は成立(挙動不変)。"""
+    sim = _sim(tmp_path, "b2boff", **_ON)
+    node = _food_node(sim)
+    sim._goods_stock[(node, "food")] = goods_mod._reorder(sim.goodscfg, "food")
+    goods_mod.review_and_order(sim, 10, 700)
+    assert _kind(sim, "delivery_trip")
+    goods_mod.deliver_arrivals(sim, 10 + sim.goodscfg["lead_time_steps"], 730)
+    assert _kind(sim, "restock") and not _kind(sim, "b2b_trade")
+
+
+def test_b2b_wholesale_selection(tmp_path):
+    """卸 org 選定: 小売 cat の supply_kind(food系→food・shop→goods)に一致する org を返す(実データ実査)。"""
+    sim = _sim(tmp_path, "b2bsel", **_B2B_ON)
+    scheduler._ensure_orgs(sim)
+    org_f = b2b_mod.wholesale_for(sim, _food_node(sim), "food")
+    assert org_f is not None and "food" in (org_f.get("output_kinds") or [])
+    org_s = b2b_mod.wholesale_for(sim, _shop_node(sim), "shop")
+    assert org_s is not None and "goods" in (org_s.get("output_kinds") or [])
+
+
+def test_b2b_production_grows_stock(tmp_path):
+    """卸/製造 org(素材/製品 産出)は生産で在庫が増え、非卸 org は増えない(is_wholesale)。"""
+    sim = _sim(tmp_path, "b2bprod", **_B2B_ON)
+    scheduler._ensure_orgs(sim)
+    wh = next(o for o in sim.orgs.values() if b2b_mod.is_wholesale(o))
+    nonwh = next(o for o in sim.orgs.values() if not b2b_mod.is_wholesale(o))
+    b = b2b_mod._state(sim)
+    u = sim.b2bcfg["production_units"]
+    b2b_mod.on_production(sim, wh, 5, 700)
+    b2b_mod.on_production(sim, wh, 6, 710)
+    assert b["stock"][str(wh["id"])] == 2 * u
+    b2b_mod.on_production(sim, nonwh, 5, 700)
+    assert str(nonwh["id"]) not in b["stock"], "非卸 org の在庫が増えている"
+
+
+def test_b2b_fulfill_conservation(tmp_path):
+    """小売補充が卸在庫から引かれ、org 間で金+物が保存する(買い側仕入費=売り側売上・卸在庫が qty 減)。"""
+    sim = _sim(tmp_path, "b2bcons", **_B2B_ON)
+    scheduler._ensure_orgs(sim)
+    node = _shop_node(sim)
+    org = b2b_mod.wholesale_for(sim, node, "shop")
+    oid = str(org["id"])
+    b = b2b_mod._state(sim)
+    b["stock"][oid] = 100
+    cap = goods_mod._capacity(sim.goodscfg, "shop")
+    price = b2b_mod._wholesale_price(sim.b2bcfg, "shop")
+    sim._goods_stock[(node, "shop")] = 0
+    sim._goods_pending[(node, "shop")] = 12
+    goods_mod.deliver_arrivals(sim, 12, 800)
+    trades = _kind(sim, "b2b_trade")
+    assert len(trades) == 1
+    tr = trades[0].payload
+    assert tr["from_org"] == oid and tr["to_poi"] == node and tr["cat"] == "shop"
+    assert tr["qty"] == cap and trades[0].agent_id == -1
+    assert abs(tr["amount"] - cap * price) < 1e-6
+    # 物の保存: 卸在庫が qty だけ減った / 小売は上限 S へ補充された
+    assert b["stock"][oid] == 100 - cap
+    assert sim._goods_stock[(node, "shop")] == cap and _kind(sim, "restock")
+    # 金の保存: 売り側=売上 == 買い側=仕入費 == amount(二重計上なし)
+    assert abs(b["revenue"][oid] - cap * price) < 1e-6
+    assert abs(b["procurement"] - cap * price) < 1e-6
+    assert b["sold_qty"][oid] == cap and b["trades"] == 1
+
+
+def test_b2b_depletion_blocks_restock(tmp_path):
+    """卸在庫が仕入れ量に満たない → 補充失敗=在庫回復なし・b2b_trade 0 件(欠品が川上へ波及)。"""
+    sim = _sim(tmp_path, "b2bdeplete", **_B2B_ON)
+    scheduler._ensure_orgs(sim)
+    node = _shop_node(sim)
+    org = b2b_mod.wholesale_for(sim, node, "shop")
+    oid = str(org["id"])
+    b = b2b_mod._state(sim)
+    b["stock"][oid] = 5                                   # < 補充量(cap=30)=卸在庫不足
+    sim._goods_stock[(node, "shop")] = 0
+    sim._goods_pending[(node, "shop")] = 12
+    goods_mod.deliver_arrivals(sim, 12, 800)
+    assert not _kind(sim, "b2b_trade") and not _kind(sim, "restock")
+    assert sim._goods_stock[(node, "shop")] == 0, "卸在庫不足なのに補充が成立した(欠品波及せず)"
+    assert b["stock"][oid] == 5, "取引不成立なのに卸在庫が減っている"
+
+
+def test_b2b_graceful_without_orgs(tmp_path):
+    """b2b ON でも organizations OFF(卸 org 不在)なら外生 depot 扱いで graceful=restock 成立・b2b_trade 0 件。"""
+    sim = _sim(tmp_path, "b2bnoorg",
+               **{"commerce.inventory.enabled": "true",
+                  "commerce.inventory.b2b.enabled": "true"})   # organizations は OFF
+    node = _shop_node(sim)
+    cap = goods_mod._capacity(sim.goodscfg, "shop")
+    sim._goods_stock[(node, "shop")] = 0
+    sim._goods_pending[(node, "shop")] = 12
+    goods_mod.deliver_arrivals(sim, 12, 800)
+    assert not _kind(sim, "b2b_trade")
+    assert _kind(sim, "restock") and sim._goods_stock[(node, "shop")] == cap
+
+
+def test_b2b_deterministic(tmp_path):
+    """b2b ON 同士 2 回で L1 完全一致(生産・仕入・清算は全決定論・乱数ゼロ)。"""
+    a = _sim(tmp_path, "b2bdet_a", steps=30, **{**_B2B_ON, **_ISL})
+    a.run()
+    b = _sim(tmp_path, "b2bdet_b", steps=30, **{**_B2B_ON, **_ISL})
+    b.run()
+    assert _l1(a) == _l1(b), "b2b ON の決定論が崩れている"
+
+
+def test_b2b_flow_aggregation(tmp_path):
+    """streaming 集計 b2b_flow が取引件数・数量・金額・卸別を有界1パスで出す。"""
+    ev = [
+        _ev(0, -1, "b2b_trade", from_org="co_ap_01", to_poi="n1", cat="shop", qty=30, amount=9000),
+        _ev(1, -1, "b2b_trade", from_org="co_ap_01", to_poi="n2", cat="shop", qty=10, amount=3000),
+        _ev(2, -1, "b2b_trade", from_org="co_ca_06", to_poi="n3", cat="food", qty=20, amount=5000),
+    ]
+    rd = tmp_path / "b2bagg"
+    _write_run(rd, ev)
+    out = st.b2b_flow(str(rd))
+    assert out["n_trade"] == 3 and out["qty_total"] == 60
+    assert out["amount_total"] == 17000.0
+    assert out["by_org"]["co_ap_01"] == {"qty": 40, "amount": 12000.0}
+    assert out["by_org"]["co_ca_06"] == {"qty": 20, "amount": 5000.0}

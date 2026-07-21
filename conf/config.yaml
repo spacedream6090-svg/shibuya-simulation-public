@@ -1420,6 +1420,52 @@ commerce:
       cafe:      [コーヒー, 紅茶, ケーキ, サンドイッチ]
       shop:      [Tシャツ, 雑貨, 文房具, 日用品]
       nightlife: [カクテル, ビール, ハイボール]
+    # ---- B2B 卸→小売の仕入れ スライス⑤(実装 src/society/b2b.py。設計 §7 ⑤)----
+    # ON 時: 上の補充(restock)の供給元を「外生 depot(街の外のゲートウェイ)」から **卸 org** へ内生化する。
+    #   卸/製造 org(organizations の output_kinds に素材/製品=goods/food を持つ org)が勤務完遂ごとに生産で
+    #   在庫を積み(production_units)、小売の補充がその在庫から引かれ、org 間で金+物が移転(卸=売上・小売=
+    #   仕入費。org_ledger の会計流儀=買い側支出=売り側売上で保存)。卸在庫不足=補充失敗(封鎖時と同じ経路=
+    #   欠品波及)。物流トリップ(delivery_trip)は再利用(出発地=卸 org の所在ノード)。全決定論・乱数ゼロ。
+    #   要 organizations.enabled=true(卸 org が居ないと外生 depot 扱いで graceful=b2b_trade 0 件)。
+    # 既定 OFF=補充供給元は外生 depot のまま・b2b_trade 0 件・卸在庫台帳も生えない=バイト一致。
+    b2b:
+      enabled: false            # ★ON 推奨(本番): true(要 organizations.enabled=true。供給網の内生化=組織創発)
+      supply_kind:              # 小売カテゴリ → 卸が供給する output_kind(実データ実査: food系→food・shop→goods)
+        food: food
+        cafe: food
+        nightlife: food
+        shop: goods
+      production_units: 8       # 卸 org の勤務完遂1回で増える在庫量(生産)
+      initial_stock: 0          # 卸の起動時在庫(0=生産で立ち上げ。>0 で即出荷可能)
+      default_wholesale_price: 300  # 1単位あたりの仕入単価(卸値。cat 別に wholesale_price で上書き可)
+      wholesale_price: {}       # 例: { food: 250, shop: 800 }(未掲載は default_wholesale_price)
+
+# ---- サービスの実体化 スライス③(実装 src/society/services.py。設計 docs/research/economy-goods-services.md §7 ③)----
+# service/education カテゴリの POI で「滞在して効果を受ける」最小形。来店=自由時間の行き先バイアス(routine の
+# dest チェーン中立1分岐=date/joint と同型)+ 受給=課金(_spend)+ 効果(factors on_service へ帯 band と不透明
+# magnitude)+ 記憶 + service_use。来店抽選は専用 stream "service"(既存 draw 順に不干渉)、利用率は現実頻度に桁を
+# 合わせて較正(理美容=月1-2回・ジム/塾=週1-2回・クリーニング=週1回・任意受診=年数回)。R1: generate() を1本も
+# 足さない(来店は既存 routine 発火に相乗り)。判定は年齢・所持金・時刻・物理位置・config のみ=k 非依存。
+# 供給側 serve(work.service)との seam: 受給の spend は cat=spend_cat(既定 "service")で出る=work.serve_by_cat に
+#   "service" を写像すれば同一 work_node の勤務中スタッフに serve が帰属し需要側 service_use と対になる。
+# 既定 OFF=来店せず・"service" stream も引かない・service_use/効果とも 0 件=ゴールデン golden_baseline_l1.json をバイト一致で守る。
+services:
+  enabled: false                # ★ON 推奨(本番): true(service/education POI を経済的に起こす=ユーザー要望・渋谷再現)
+  spend_cat: service            # 受給の _spend の cat(work.serve_by_cat と対の seam。消費税等は既存経路)
+  open_from: 9                  # サービス営業帯の開始(時)
+  open_to: 20                   # サービス営業帯の終了(時)
+  radius_m: 700                 # 来店先を探す現在地の近傍半径(m)
+  free_steps_ref: 48            # 日次利用率→per-step 化の基準自由 step 数(1日の自由行動 step の目安。桁較正の分母)
+  # サービス定義テーブル(cats=ホスト POI カテゴリ / hints=POI 名の部分一致=空なら当該カテゴリの任意 POI /
+  #   price=料金 / stay=滞在step / band=効果の帯(mood=気分/vitality=活力/learning=学習素地)/ magnitude=効果の
+  #   不透明量(0.0=観測のみ)/ daily_rate=日次利用率(較正)/ age=[min,max] 該当年齢帯 / remember=記憶1行)
+  services:
+    grooming: {cats: [service], hints: [美容, 理容, 床屋, サロン, ヘア, ネイル], price: 4000, stay: 3, band: mood,     magnitude: 0.03,  daily_rate: 0.05,  age: [12, 90],  remember: 髪を整えて気分が上がった}
+    clinic:   {cats: [service], hints: [クリニック, 医院, 診療, 歯科, 内科, 眼科], price: 3000, stay: 2, band: vitality, magnitude: 0.02,  daily_rate: 0.012, age: [0, 120],  remember: 健康のために受診してきた}
+    lesson:   {cats: [education, service], hints: [塾, スクール, 教室, 予備校, アカデミー], price: 5000, stay: 3, band: learning, magnitude: 0.02, daily_rate: 0.20, age: [8, 35], remember: 習い事で新しいことを学んだ}
+    gym:      {cats: [service, leisure], hints: [ジム, フィットネス, スポーツ, ヨガ, プール], price: 2000, stay: 4, band: vitality, magnitude: 0.025, daily_rate: 0.20, age: [15, 75], remember: ジムで汗を流してすっきりした}
+    laundry:  {cats: [service], hints: [クリーニング, ランドリー, 洗濯], price: 1200, stay: 1, band: mood, magnitude: 0.015, daily_rate: 0.14, age: [18, 90], remember: 衣類を整えてもらった}
+    service:  {cats: [service], hints: [], price: 2000, stay: 2, band: mood, magnitude: 0.015, daily_rate: 0.03, age: [12, 100], remember: 用事を済ませてきた}
 
 # ---- 都市・環境インフラのショック(現実ギャップ 後続波 H4 2026-07-07。すべて既定 OFF=現行挙動と完全同一)----
 # 生活を麻痺させる外生ショック=集団的 grievance の源。既存の scenario/transit の最小拡張(独立 phase。

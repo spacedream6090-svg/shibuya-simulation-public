@@ -253,6 +253,26 @@ def _nearest_gateway(sim, node: str) -> str | None:
     return min(gws, key=lambda g: (_dist2(sim.city.node_xy(g), p), g))
 
 
+def _delivery_origin(sim, node: str, cat: str) -> str | None:
+    """補充トリップの出発地。B2B ⑤ ON なら卸 org の所在ノード(内生化)、それ以外は最寄り depot(従来)。
+
+    b2b OFF/卸不在では従来どおり最寄りゲートウェイ=外生 depot(挙動不変=バイト一致)。"""
+    from . import b2b as _b2b
+    if _b2b.enabled(sim):
+        org_node = _b2b.origin_node(sim, node, cat)
+        if org_node is not None:
+            return org_node
+    return _nearest_gateway(sim, node)
+
+
+def _b2b_fulfill(sim, node: str, cat: str, qty: int, step: int, sim_min: int) -> bool:
+    """B2B ⑤ ON なら小売の仕入れを卸 org 在庫から満たす(不足=補充失敗=欠品波及)。OFF/卸不在は常に True。"""
+    from . import b2b as _b2b
+    if not _b2b.enabled(sim):
+        return True
+    return _b2b.fulfill(sim, node, cat, qty, step, sim_min)
+
+
 def _delivery_blocked(sim, node: str) -> bool:
     """補充トリップの経路が封鎖されているか(災害の運休 / 摂動シナリオ shock_closure)。
 
@@ -288,7 +308,7 @@ def review_and_order(sim, step: int, sim_min: int) -> None:
         level = st[key]
         if level > _reorder(cfg, cat):
             continue
-        frm = _nearest_gateway(sim, node)
+        frm = _delivery_origin(sim, node, cat)       # b2b ON=卸 org の所在ノード / OFF=最寄り depot
         qty = max(0, _capacity(cfg, cat) - level)
         arrive = step + lead
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
@@ -319,6 +339,8 @@ def deliver_arrivals(sim, step: int, sim_min: int) -> None:
         cap = _capacity(cfg, cat)
         level = st.get(key, cap)
         qty = max(0, cap - level)
+        if not _b2b_fulfill(sim, node, cat, qty, step, sim_min):   # ⑤ 卸在庫不足→仕入れ失敗=欠品波及
+            continue                                      # (b2b OFF/卸不在は常に True=挙動不変)
         st[key] = cap
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
                              kind="restock", x=0.0, y=0.0,

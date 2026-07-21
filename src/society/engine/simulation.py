@@ -389,6 +389,24 @@ class Simulation:
         self._goods_stock: dict = {}               # (node, cat) -> 在庫数(遅延初期化=購入が起きた POI のみ)
         self._goods_pending: dict = {}             # (node, cat) -> 到着 step(補充トリップの在庫。多重発注抑止)
         self._goods_review_day: int = -1           # 日次 (s,S) レビューの進行管理
+        # B2B 卸→小売の仕入れ スライス⑤(commerce.inventory.b2b。既定 OFF=補充供給元は外生 depot のまま)。
+        # 卸/製造 org(output_kinds に素材/製品)が生産で在庫を積み、小売補充が卸在庫から引かれ org 間で金+物が
+        # 移転(会計保存)。卸在庫不足=補充失敗=欠品波及。決定論・乱数ゼロ・LLM 呼ゼロ。OFF=b2b_trade 0 件=
+        # バイト一致(organizations OFF なら ON でも卸不在=外生 depot 扱いで graceful)。
+        from .. import b2b as _b2b_mod
+        self.b2bcfg = _b2b_mod.build_cfg(raw_commerce)
+        self._b2b: dict = {}                       # 卸在庫・売上・仕入費の台帳(遅延構築)
+        self._b2b_total: int = 0                   # b2b_trade 件数(aggregator 用)
+        # サービスの実体化 スライス③(services。既定 OFF=来店せず・"service" stream も引かない=バイト一致)。
+        # 理美容/クリニック/塾/ジム/クリーニング等の service/education POI で「滞在して効果を受ける」最小形。
+        # 来店=自由時間の行き先バイアス(routine の dest チェーン中立1分岐)+ 受給=課金(_spend)+ 効果(factors
+        # on_service へ不透明 magnitude)+ 記憶 + service_use。決定論・新 stream "service" のみ・LLM 呼ゼロ。
+        from .. import services as _services_mod
+        raw_services = cfg.get("services", None)
+        raw_services = (OmegaConf.to_container(raw_services, resolve=True)
+                        if OmegaConf.is_config(raw_services) else raw_services)
+        self.servicescfg = _services_mod.build_cfg(raw_services)
+        self._service_total: int = 0               # service_use 件数(aggregator 用)
         # 都市・環境インフラのショック(現実ギャップ 後続波 H4 2026-07-07。既定 OFF=現行挙動と完全同一)。
         # 災害(台風/地震/大雪→交通麻痺=運休+外出抑制=在宅+強い grievance)+ 交通の遅延/運休(定刻ダイヤを
         # 新 stream "disaster" で乱す)+ インフラ障害(停電/通信断/断水→在宅娯楽・スマホ抑制+grievance)。

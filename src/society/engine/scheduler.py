@@ -26,6 +26,8 @@ from .. import opinion as opinion_mod
 from .. import party as party_mod
 from .. import relations as relations_mod
 from .. import pov as pov_mod
+from .. import b2b as b2b_mod
+from .. import services as services_mod
 from .. import status as status_mod
 from .. import street as street_mod
 from .. import work as work_mod
@@ -397,6 +399,7 @@ def _log_org_output(sim, agent, step: int, sim_min: int) -> None:
         wage = float(sim.economy["wages"].get(str(org.get("wage_tier", "")), 0.0))
         led["revenue_est"] += wage * float(sim.orgscfg["revenue_margin"])
         led["wage_paid"] += wage
+    b2b_mod.on_production(sim, org, step, sim_min)    # B2B ⑤: 卸/製造 org は生産で在庫が増える(既定OFF=no-op)
 
 
 def _log_tax(sim, agent, tax: str, amount: float, to: str, base: float,
@@ -602,6 +605,22 @@ def _charge_meal(sim, agent, step: int, sim_min: int) -> None:
             return
     amount = _budget_amount(sim, agent, cat, amount)   # E-W3 消費行動(既定 OFF=不変)
     _spend(sim, agent, amount, cat, step, sim_min, item=item)
+
+
+def _services_on(sim) -> bool:
+    """サービスの実体(来店+効果。第46バッチ ③)が有効か。既定 OFF=新経路を一切通さない(バイト一致)。"""
+    return services_mod.enabled(sim)
+
+
+def _charge_service(sim, agent, step: int, sim_min: int) -> None:
+    """サービス POI 到着時の受給(第46バッチ ③): 課金(_spend)+ 効果(factors on_service)+ 記憶 + service_use。
+
+    経済無効なら受給しない(_charge_meal と同型)。実体は services.charge_service に閉じる(engine は
+    サービス名・効果・因子を書かない=no-fingerprint)。課金は既存 _spend 経路(会計不変)。RNG は引かない。"""
+    if not _economy_on(sim):
+        agent._service_pending = None
+        return
+    services_mod.charge_service(sim, agent, step, sim_min, _spend)
 
 
 def _charge_ride(sim, agent, ride: dict, step: int, sim_min: int) -> None:
@@ -937,6 +956,8 @@ def _phase_move(sim, step: int, sim_min: int) -> None:
             agent._pending_activity = ""
             if agent.activity == "eating":         # 飲食 POI 到着 → 代金を払う(経済 v0)
                 _charge_meal(sim, agent, step, sim_min)
+            elif agent.activity == "service" and _services_on(sim):  # サービス POI 到着 → 受給(第46バッチ ③)
+                _charge_service(sim, agent, step, sim_min)
             ride = getattr(agent, "_ride_pending", None)
             if ride:                               # 交通機関で来た → 到着時に運賃を払う
                 _charge_ride(sim, agent, ride, step, sim_min)

@@ -816,3 +816,64 @@ def goods_usage(run_dir: str) -> dict:
         "items_sold_total": sold_total,
         "top_items": sorted(items_sold.items(), key=lambda kv: (-kv[1], kv[0]))[:10],
     }
+
+
+# --------------------------------------------------------------------------- #
+# サービス受給の集計(スライス③。件数・支出・サービス別内訳)
+# --------------------------------------------------------------------------- #
+def service_usage(run_dir: str) -> dict:
+    """サービスの実体化(services)の逐次集計を 1 パスで(kind/service で有界)。
+
+    - n_use: 受給件数 / cost_total: サービス支出合計 / by_service: サービス別 {n, cost}。"""
+    n_use = 0
+    cost_total = 0.0
+    by_service: dict = defaultdict(lambda: {"n": 0, "cost": 0.0})
+    for e in _events(run_dir, ["kind", "payload"]):
+        if e["kind"] != "service_use":
+            continue
+        p = e["payload"]
+        n_use += 1
+        cost = float(p.get("cost", 0) or 0)
+        cost_total += cost
+        svc = p.get("service")
+        if svc is not None:
+            by_service[svc]["n"] += 1
+            by_service[svc]["cost"] += cost
+    return {
+        "n_use": n_use,
+        "cost_total": round(cost_total, 1),
+        "by_service": {s: {"n": v["n"], "cost": round(v["cost"], 1)}
+                       for s, v in sorted(by_service.items())},
+    }
+
+
+# --------------------------------------------------------------------------- #
+# B2B 卸→小売の集計(スライス⑤。取引件数・金額・数量・卸別)
+# --------------------------------------------------------------------------- #
+def b2b_flow(run_dir: str) -> dict:
+    """B2B(卸→小売)の逐次集計を 1 パスで(kind/org で有界)。
+
+    - n_trade: 取引件数 / qty_total: 移転数量 / amount_total: 移転金額(買い側支出=売り側売上) /
+    - by_org: 卸 org 別 {qty, amount}(供給網の可視化)。"""
+    n_trade = 0
+    qty_total = 0
+    amount_total = 0.0
+    by_org: dict = defaultdict(lambda: {"qty": 0, "amount": 0.0})
+    for e in _events(run_dir, ["kind", "payload"]):
+        if e["kind"] != "b2b_trade":
+            continue
+        p = e["payload"]
+        n_trade += 1
+        qty_total += int(p.get("qty", 0) or 0)
+        amount_total += float(p.get("amount", 0) or 0)
+        org = p.get("from_org")
+        if org is not None:
+            by_org[org]["qty"] += int(p.get("qty", 0) or 0)
+            by_org[org]["amount"] += float(p.get("amount", 0) or 0)
+    return {
+        "n_trade": n_trade,
+        "qty_total": qty_total,
+        "amount_total": round(amount_total, 1),
+        "by_org": {o: {"qty": v["qty"], "amount": round(v["amount"], 1)}
+                   for o, v in sorted(by_org.items())},
+    }

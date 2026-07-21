@@ -373,6 +373,29 @@ def _n_joint_activity(sim):
     return int(getattr(sim, "_joint_total", 0))
 
 
+# ---- サービスの実体化 第46バッチ ③(services)。OFF は None=列なし=L2 不変 ----
+@register_aggregator("n_service_use")
+def _n_service_use(sim):
+    """サービス受給(理美容/クリニック/塾/ジム/クリーニング等)の累積件数。services 無効なら
+    None=列なし(L2 バイト不変)。ON 時のみ service_use の累積を出す。"""
+    sc = getattr(sim, "servicescfg", None)
+    if not (sc and sc.get("enabled")):
+        return None
+    return int(getattr(sim, "_service_total", 0))
+
+
+# ---- B2B 卸→小売 第46バッチ ⑤(commerce.inventory.b2b)。OFF は None=列なし=L2 不変 ----
+@register_aggregator("n_b2b_trade")
+def _n_b2b_trade(sim):
+    """会社間取引(卸→小売の仕入れ)の累積件数。inventory または b2b が無効なら None=列なし
+    (L2 バイト不変)。ON 時のみ b2b_trade の累積を出す。"""
+    gc = getattr(sim, "goodscfg", None)
+    bc = getattr(sim, "b2bcfg", None)
+    if not (gc and gc.get("enabled") and bc and bc.get("enabled")):
+        return None
+    return int(getattr(sim, "_b2b_total", 0))
+
+
 @register_aggregator("n_active_rules")
 def _n_active_rules(sim):
     """制度DSL: 現在アクティブな実効ルール数(rules 無効時は None=列なし=L2 不変)。"""

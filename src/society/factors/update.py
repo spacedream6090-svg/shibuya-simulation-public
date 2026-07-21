@@ -327,6 +327,28 @@ def on_scarcity(agent, magnitude: float, *, step: int, sim_min: int,
                  step=step, sim_min=sim_min, logger=logger)
 
 
+def on_service(agent, band: str, magnitude: float, *, step: int, sim_min: int,
+               logger: ObserverLogger) -> float:
+    """サービス受給(散髪=気分/ジム=活力/塾=学習素地)の効果。band で対象 state を選ぶ。第46バッチ ③。
+
+    サービスルート(現実ギャップ): 理美容/クリニック/塾/ジム/クリーニング等で「滞在して効果を受ける」。R9:
+    呼び出し側(src/society/services.py)は効果の帯 band(mood/vitality/learning)と重み=**不透明な magnitude**
+    だけを渡し、この関数は traits もサービス種別も店も見ない(on_scarcity/on_work_done と同型)。band は帯ラベル
+    にすぎず(構成概念ではない)、対象 state の選択はここ(factors)だけが行う=society 側は state 名を書かない
+    (no-fingerprint)。mood/vitality=気分回復(grievance−)、learning=学習素地(efficacy+)。magnitude=0.0
+    (services 効果係数=0.0)なら _bump が state を触らず記録もしない=バイト一致。発火系(drive)には接続しない
+    (呼び出し側は返り値で drive.add しない)=R1: サービス効果は generate 呼数を1本も動かさない。"""
+    mag = abs(float(magnitude))
+    if mag == 0.0:
+        return 0.0
+    if band == "learning":
+        return _bump(agent, "efficacy", mag, "service_learning",
+                     step=step, sim_min=sim_min, logger=logger)
+    cause = "service_vitality" if band == "vitality" else "service_mood"
+    return _bump(agent, "grievance", -mag, cause,
+                 step=step, sim_min=sim_min, logger=logger)
+
+
 def on_disaster(agent, magnitude: float, *, cause: str = "disaster", step: int,
                 sim_min: int, logger: ObserverLogger) -> float:
     """都市・環境ショック(災害・交通運休/遅延・インフラ障害)を受けた人の不満(grievance+)。後続波 H4。
