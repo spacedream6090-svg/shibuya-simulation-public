@@ -69,11 +69,14 @@ def build_cfg(raw: dict | None) -> dict:
     # 各軸: groups(label/line + 素通しメタ)/ composition.<tier>(age 不明時の全体分布)/
     #        bands.<age_lo>(年代条件付き構成比。agent.age がある時に優先)/ seed_offset。
     # 既定 OFF・軸未指定でも空 dict=現行と割当・注入とも完全同一(assign_group は axes を読まない)。
+    # 各軸: groups / composition.<tier> / bands.<age_lo>(年代条件付き) / seed_offset に加え、
+    #        party_map(実人数→群 id のデータ駆動写像=ハッシュ不要)/ day_varying(準静的=day を混ぜる)。
     cfg["axes"] = {}
     for name, ax in (raw.get("axes") or {}).items():
         ax = dict(ax or {})
         axc: dict = {"seed_offset": int(ax.get("seed_offset", 0)),
-                     "groups": {}, "composition": {}, "bands": {}}
+                     "groups": {}, "composition": {}, "bands": {},
+                     "party_map": {}, "day_varying": bool(ax.get("day_varying", False))}
         for gid, g in (ax.get("groups") or {}).items():
             g = dict(g or {})
             e: dict = {"label": str(g.get("label", gid))}
@@ -88,6 +91,10 @@ def build_cfg(raw: dict | None) -> dict:
         for lo, mix in (ax.get("bands") or {}).items():
             axc["bands"][int(lo)] = {
                 str(k): float(v) for k, v in dict(mix or {}).items()}
+        # party_map: 実人数(文字列キー "1"/"2"…)→群 id。'default' キーは上限超(例 3人以上)の受け皿。
+        # キーを文字列に統一する(混在型キーだと config_hash の json.dumps(sort_keys=True) が壊れる)。
+        for k, v in (ax.get("party_map") or {}).items():
+            axc["party_map"][str(k)] = str(v)
         cfg["axes"][str(name)] = axc
     # ---- 訓練経験行(方式A)。文化圏群の drill_line を別行として付加(既定 line は不変)----
     cfg["drill_enabled"] = bool((raw.get("drill") or {}).get("enabled", False))
@@ -149,17 +156,42 @@ def _band_for_age(bands: dict, age) -> dict | None:
     return chosen
 
 
-def assign_axis(cfg: dict, axis_name: str, pid, tier: str, age=None) -> str | None:
+def _party_bucket(pmap: dict, size) -> str | None:
+    """実人数 party_size を群 id に写像する(1→solo/2→pair/3+→'default'群=データ駆動・ハッシュ不要)。
+
+    正の整数のみ扱う。厳密一致キー(int)優先、無ければ 'default'(上限超の受け皿)。0/負/非数は
+    None を返し呼び出し側の composition 後退に委ねる(=party_size を持たない個体と同じ扱い)。"""
+    try:
+        n = int(size)
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    key = str(n)                                         # party_map キーは文字列(build_cfg で統一)
+    if key in pmap:
+        return pmap[key]
+    return pmap.get("default")
+
+
+def assign_axis(cfg: dict, axis_name: str, pid, tier: str, age=None,
+                day=None, party_size=None) -> str | None:
     """第2軸以降(方式B)の群割当。文化圏軸と独立な一様値(seed + seed_offset)で決定論割当。
 
-    age がある(人口統計 P0 属性)なら bands で年代条件付き構成比を優先(SNS→公式の年代勾配)。
-    age 不明は composition[tier](未知 tier は default)= 全体分布。traits/k は一切読まない=R1 直交。
-    seed_offset により第1軸(文化圏)ハッシュと無相関=同一 pid でも軸間の割当は独立(直交)。"""
+    party_size(実人数)がある個体は party_map で**データ駆動**に確定(ハッシュ不要=最優先・固定)。
+    無い個体は age があれば bands で年代条件付き構成比を優先、無ければ composition[tier](未知 tier は
+    default)= 全体分布を hashlib で分割。day_varying=true の軸は (pid, day) の純関数(day を混ぜて
+    日ごとに変わるが決定論=同一 day・同一 pid は同一群=resume/hydrate 安定)。traits/k は一切読まない
+    =R1 直交。seed_offset により他軸(文化圏=seed のみ)ハッシュと無相関=軸間の割当は独立(直交)。"""
     if not cfg.get("enabled"):
         return None
     axis = (cfg.get("axes") or {}).get(str(axis_name))
     if not axis:
         return None
+    pmap = axis.get("party_map")                          # party_size 由来=最優先・固定(day 非依存)
+    if pmap and party_size is not None:
+        gid = _party_bucket(pmap, party_size)
+        if gid is not None and gid in axis["groups"]:
+            return gid
     comp = None
     if age is not None and axis.get("bands"):
         comp = _band_for_age(axis["bands"], age)
@@ -170,7 +202,10 @@ def assign_axis(cfg: dict, axis_name: str, pid, tier: str, age=None) -> str | No
     if not comp:
         return None
     off = int(axis.get("seed_offset", 0))
-    return _choose(comp, _stable_uniform(int(cfg["seed"]) + off, str(pid)))
+    key = str(pid)
+    if axis.get("day_varying") and day is not None:      # 準静的: (pid, day) 純関数=日ごとに変わる
+        key = f"{pid}\x1f{int(day)}"
+    return _choose(comp, _stable_uniform(int(cfg["seed"]) + off, key))
 
 
 def group_line(cfg: dict, gid: str | None) -> str | None:

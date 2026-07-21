@@ -169,3 +169,62 @@ class Crowd:
         """目標到達(距離 < arrive_radius)した個体の bool 配列 (N,)。"""
         d = np.linalg.norm(self.goal - self.pos, axis=1)
         return d < self.arrive_radius
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 歩行者信号ゲート(描画専用・決定論。docs/research/pedestrian-signals.md §3.2 案a)
+# ─────────────────────────────────────────────────────────────────────────────
+class SignalGate:
+    """歩行者信号の決定論ゲート(赤=停止線で待機・青=一斉横断=スクランブルの見せ場)。
+
+    信号は周期関数で、位相は【絶対時刻(秒)】から決定論計算できる(乱数ゼロ)。
+    サイクル C = 歩行者青 g + 青点滅 f + 赤 r。位相 φ(t) = (t + offset) mod C。
+    横断可能(go)= φ < g + f(青+青点滅。青点滅は「渡り始めたら渡り切る」許容窓として
+    横断可能に含める。docs/research/pedestrian-signals.md §3.1 の g=47s 相当)。
+
+    SFM 連携(§3.2): 赤の間に停止線(=横断の手前)へ着いた個体を active=False で滞留させ、
+    青で一斉に active=True へ解放する。Crowd.active(False の個体は力を及ぼさず・受けず・
+    動かない)機構をそのまま使うため、curb での赤待ち→青での一斉横断が自然に出る。
+
+    スクランブル(全方向横断)は「全歩行者信号が同相で青になる特殊ケース」= 同一 gate
+    (同 offset)で領域内の全歩行者を一括ゲートすることで表現する。
+
+    位相・秒数はすべて config or サイドカー由来の固定値。内部で乱数を一切引かない
+    (同一入力 → 同一 bool =決定論)。
+    """
+
+    def __init__(self, cycle_s, green_s, flash_s=0.0, offset_s=0.0):
+        self.cycle_s = float(cycle_s)
+        self.green_s = float(green_s)
+        self.flash_s = float(flash_s)
+        self.offset_s = float(offset_s)
+        if self.cycle_s <= 0.0:
+            raise ValueError("cycle_s must be > 0")
+        if not (0.0 <= self.green_s <= self.cycle_s):
+            raise ValueError("green_s must be within [0, cycle_s]")
+        if self.green_s + self.flash_s > self.cycle_s:
+            raise ValueError("green_s + flash_s must be <= cycle_s")
+
+    def phase(self, sim_sec):
+        """絶対時刻 sim_sec [s] における位相 [0, cycle_s)。"""
+        return (float(sim_sec) + self.offset_s) % self.cycle_s
+
+    def is_green(self, sim_sec):
+        """歩行者(全方向)青(点灯)か = φ < green_s。"""
+        return self.phase(sim_sec) < self.green_s
+
+    def is_flashing(self, sim_sec):
+        """青点滅(横断中は渡り切れるが新規開始は本来抑制)か = green_s ≤ φ < green_s+flash_s。"""
+        p = self.phase(sim_sec)
+        return self.green_s <= p < self.green_s + self.flash_s
+
+    def can_cross(self, sim_sec):
+        """横断してよい(青 or 青点滅)か = φ < green_s + flash_s(残りは赤=待機)。
+
+        SFM ゲートの「解放」判定に使う(赤で curb 滞留 → 青で一斉横断)。"""
+        return self.phase(sim_sec) < self.green_s + self.flash_s
+
+    @classmethod
+    def scramble(cls, cycle_s, green_s, flash_s=0.0):
+        """スクランブル(offset 0 = 全方向同相で一斉に青)の gate を作る。"""
+        return cls(cycle_s, green_s, flash_s, offset_s=0.0)

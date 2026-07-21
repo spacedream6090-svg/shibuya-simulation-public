@@ -720,6 +720,30 @@ ontology:
         60: { info_sns: 0.15, info_mixed: 0.20, info_official: 0.65 }   # 60~: 公式/放送 優位
       composition:              # age 不明時の全体分布(tier 別に振れる)。渋谷=若年濃い
         default: { info_sns: 0.45, info_mixed: 0.30, info_official: 0.25 }
+    # ---- 第3軸=同行者構成(単独/連れ)。第42バッチ 2026-07-21。文化圏・情報行動いずれとも直交。
+    #      根拠: 2人組は単独より約30%遅い・合議による避難開始遅延・はぐれ待ち(Moussaïd 2010 ほか)。
+    #      準静的=当日の同行者構成 (pid, day) の純関数(day_varying=true で day を混ぜる=日ごとに
+    #      変わるが決定論・run.seed 非依存)。プールの party_size(L4 来街者に実在=同行人数)がある個体は
+    #      party_map でデータ駆動に確定(ハッシュ不要・day 非依存で固定)。無い個体(住民/従業者等)は
+    #      tier 別 composition。将来 seam: S-R3 共同行動エンジンが承認されたら pair/group が実同伴者と結ぶ。
+    companions:
+      seed_offset: 202          # 文化圏軸(seed)・info_behavior(seed+101)と独立なハッシュ=軸間直交
+      day_varying: true         # 同行者構成は日単位で変わりうる=day を混ぜる(同一 day=同一割当=resume 安定)
+      party_map:                # party_size(実人数)→群 id。データ駆動・最優先(ハッシュ不要・固定)
+        "1": solo               # キーは文字列(config_hash の JSON sort_keys が混在型キーで壊れないため)
+        "2": pair
+        default: group          # 3人以上(party_size>=3)
+      groups:                   # 「一人称の行動の事実」規律(配偶断定なし・自分で改善可・断定禁止)
+        solo:  { label: "単独で動いている人",        line: "今日は一人で動いている。" }
+        pair:  { label: "連れと2人で動いている人",    line: "今日は連れと2人で動いていて、行き先は相談しながら決める。" }
+        group: { label: "3人以上のグループで動く人",  line: "今日は3人以上のグループで動いていて、はぐれないよう互いを気にかけている。" }
+      composition:              # party_size 不明の個体(住民/従業者/L3常連)の tier 別構成比
+        resident:      { solo: 0.82, pair: 0.15, group: 0.03 }   # 住民=単独支配
+        duty:          { solo: 0.90, pair: 0.08, group: 0.02 }   # 役割従事(駅員/運転士等)=単独支配
+        workday_shift: { solo: 0.80, pair: 0.16, group: 0.04 }   # 域内従業者=単独支配
+        cadence:       { solo: 0.55, pair: 0.33, group: 0.12 }   # L3 定期来街(学生/常連)
+        stochastic:    { solo: 0.30, pair: 0.46, group: 0.24 }   # L4 非定期(連れ厚め=女友達同伴54%と整合)
+        default:       { solo: 0.55, pair: 0.30, group: 0.15 }   # プール非使用の直接ラン用
 
 # ---- 街路の環境情報(第18バッチ 2026-07-11。既定 OFF=現行と完全同一)----
 # 街頭広告(OOH)=掲出地点の視認判定→ad_exposure+発火時の中立1行(広告主=シミュ内 POI で

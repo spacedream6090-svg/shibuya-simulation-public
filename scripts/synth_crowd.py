@@ -106,6 +106,46 @@ def derive_center(map_path: Path | None) -> tuple[float, float] | None:
     return cands[0][0], cands[0][1]
 
 
+# ─────────────────────────────────────────────── 横断歩道サイドカー(P0)→ 信号ゲート
+def load_crossings_sidecar(path: Path) -> dict | None:
+    """scripts/build_crossings.py が生成したサイドカー(crossings_shibuya.json)を読む。
+
+    見つからなければ None(呼び出し側は「信号ゲートなし=従来挙動」で続行)。
+    """
+    if path is None or not Path(path).exists():
+        return None
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def gate_from_sidecar(sidecar: dict, cx: float, cy: float, r: float,
+                      offset_s: float = 0.0):
+    """サイドカーの中心近傍の信号横断から SFM 信号ゲートを作る(スクランブル=同相)。
+
+    領域(中心 (cx,cy)・半径 r)に入る信号付き横断を集め、その代表周期(スクランブルが
+    あればスクランブル、無ければ最寄り信号横断)から SignalGate を作る。周期パラメータは
+    サイドカー由来の固定値=乱数ゼロ。領域内に信号横断が無ければ None。
+    """
+    from sfm import SignalGate  # 遅延 import(sfm パスは実行時に sys.path 済み)
+    if not sidecar:
+        return None
+    r2 = r * r
+    in_region = [c for c in sidecar.get("crossings", [])
+                 if c.get("signal")
+                 and (float(c["x"]) - cx) ** 2 + (float(c["y"]) - cy) ** 2 <= r2]
+    if not in_region:
+        return None
+    # スクランブル横断を最優先(全方向同相)。無ければ中心最寄りの信号横断。
+    scram = [c for c in in_region if c.get("scramble")]
+    pick = (min(scram, key=lambda c: (c["x"] - cx) ** 2 + (c["y"] - cy) ** 2)
+            if scram else
+            min(in_region, key=lambda c: (c["x"] - cx) ** 2 + (c["y"] - cy) ** 2))
+    dflt = sidecar.get("meta", {}).get("signal_defaults", {})
+    cycle_s = float(pick.get("cycle_s", dflt.get("cycle_s", 140.0)))
+    green_s = float(pick.get("green_s", dflt.get("green_s", 37.0)))
+    flash_s = float(pick.get("flash_s", dflt.get("flash_s", 10.0)))
+    return SignalGate(cycle_s, green_s, flash_s, offset_s=offset_s)
+
+
 # ─────────────────────────────────────────────── 円領域の通過区間抽出
 def _cumlen(pts: list) -> tuple[list, float]:
     cum = [0.0]
@@ -247,11 +287,15 @@ def _window_seed(run_name: str, window: int) -> int:
 
 
 def simulate_window(run_name: str, window: int, crossers: list,
-                    dt: float, out_dt: float) -> dict:
+                    dt: float, out_dt: float, gate=None) -> dict:
     """1 step(=1 窓)の通過集団を SFM 積分し、軌跡サンプルと統計を返す。
 
     決定論: seed = sha256(run_name+'|'+window)。エージェントは agent_id 昇順に整列
     してから半径抽選・積分するため、順序も固定。
+
+    gate: viz.sfm.SignalGate | None。None(既定)なら現行と完全に同一の出力
+        (バイト一致)。指定時は歩行者信号ゲート(赤=停止線 curb で滞留・青で一斉横断)を
+        適用する(描画専用・決定論=乱数を一切追加しない)。窓の絶対時刻 = window×600s + t。
     """
     crossers = sorted(crossers, key=lambda c: c["agent_id"])
     n = len(crossers)
@@ -284,16 +328,37 @@ def simulate_window(run_name: str, window: int, crossers: list,
     done = np.zeros(n, dtype=bool)
     t_exit_meso = t_enter + ptime
     t_sim = float(t_exit_meso.max()) + 5.0 if n else 0.0
+    gated = gate is not None
+    if gated and n:
+        # 赤で最大 ~(cycle−green) 待たされてから渡る個体まで窓内で描き切るため 1 サイクル延長。
+        t_sim = float(t_enter.max()) + gate.cycle_s + float(ptime.max()) + 5.0
+    base_sec = window * STEP_SECONDS         # 窓の絶対時刻の基準(位相計算に使う)
     n_sub = int(round(t_sim / dt))
     out_stride = max(1, int(round(out_dt / dt)))
+
+    released = np.zeros(n, dtype=bool)       # 一度でも青で解放されたら赤でも渡り切る(gated 時のみ)
+    t_release = np.full(n, np.inf)           # 各体の青解放時刻(gated の安全弁基準)
+    n_green = 0                              # 青(横断可)だったサブステップ数(統計)
 
     samples: list[tuple] = []   # (t_s, agent_id, x, y)
     for i in range(n_sub + 1):
         t = i * dt
-        active = (t >= t_enter) & (~done)
+        entered = (t >= t_enter) & (~done)   # 円領域に到達済み(赤なら curb 待機・青なら横断中)
+        if gated:
+            go = gate.can_cross(base_sec + t)   # スカラー(領域=同相スクランブル)
+            if go:
+                n_green += 1
+                newly = entered & (~released)
+                if np.any(newly):
+                    t_release[newly] = t        # 今 step で解放された個体の解放時刻
+                released |= entered
+            active = entered & released         # 動くのは解放済みだけ(赤の未解放=curb 停止)
+        else:
+            active = entered
         crowd.active = active
-        if i % out_stride == 0 and np.any(active):
-            idx = np.nonzero(active)[0]
+        # サンプルは entered(=curb で待つ個体も含む)。None 経路では entered==active=旧挙動。
+        if i % out_stride == 0 and np.any(entered):
+            idx = np.nonzero(entered)[0]
             for j in idx:
                 samples.append((round(t, 3), int(aid[j]),
                                 round(float(crowd.pos[j, 0]), 3),
@@ -301,9 +366,12 @@ def simulate_window(run_name: str, window: int, crossers: list,
         crowd.step(dt)
         arr = crowd.arrived()
         done |= (active & arr)
-        done |= (t > t_enter + 3.0 * ptime)   # 安全弁(詰まった体の打ち切り)
+        if gated:                            # 安全弁は「解放後」からの経過で測る(赤待ちを打ち切らない)
+            done |= (released & (t > t_release + 3.0 * ptime))
+        else:
+            done |= (t > t_enter + 3.0 * ptime)   # 安全弁(詰まった体の打ち切り)
 
-    return {
+    out = {
         "window": window,
         "n_crossers": n,
         "n_points": len(samples),
@@ -313,6 +381,10 @@ def simulate_window(run_name: str, window: int, crossers: list,
         "samples": samples,
         "seed": seed,
     }
+    if gated:                                # 追加キーのみ(既存契約キーは不変)
+        out["gated"] = True
+        out["green_frac"] = round(n_green / (n_sub + 1), 4) if n_sub >= 0 else 0.0
+    return out
 
 
 # ─────────────────────────────────────────────── 出力(parquet / html)
@@ -512,7 +584,12 @@ if(D.windows.length){ setWin(wi); } else {
 # ─────────────────────────────────────────────── main
 def synth(run_dir: Path, cx: float, cy: float, r: float,
           start_step: int, end_step: int, dt: float, out_dt: float,
-          out_path: Path) -> dict:
+          out_path: Path, gate=None) -> dict:
+    """スクランブル領域の微視軌跡を合成。gate=None(既定)で従来と完全同一(バイト一致)。
+
+    gate: viz.sfm.SignalGate | None。指定時は信号ゲート(赤=curb 滞留・青で一斉横断)を
+        全窓に適用する(描画専用・決定論)。
+    """
     run_name = run_dir.name
     by_step = load_crossings(run_dir, cx, cy, r, start_step, end_step)
     windows, empty_windows = [], []
@@ -521,7 +598,7 @@ def synth(run_dir: Path, cx: float, cy: float, r: float,
         if not crossers:
             empty_windows.append(step)   # データ不足(通過0)
             continue
-        windows.append(simulate_window(run_name, step, crossers, dt, out_dt))
+        windows.append(simulate_window(run_name, step, crossers, dt, out_dt, gate=gate))
 
     n_rows = write_parquet(out_path, windows)
     html = build_html(run_name, cx, cy, r, windows, empty_windows,
@@ -559,6 +636,18 @@ def main(argv: list) -> int:
     ap.add_argument("--dt", type=float, default=0.1)
     ap.add_argument("--out-dt", type=float, default=0.5)
     ap.add_argument("--out", type=Path, default=None)
+    # ---- 歩行者信号ゲート(案a・描画専用)。未指定=従来挙動=バイト一致 ----
+    ap.add_argument("--signals", action="store_true",
+                    help="信号ゲートを有効化(赤=curb 滞留・青で一斉横断)。未指定=従来挙動")
+    ap.add_argument("--crossings-file", type=Path,
+                    default=_ROOT / "data" / "crossings_shibuya.json",
+                    help="横断歩道サイドカー(build_crossings.py 生成)。周期の由来")
+    ap.add_argument("--cycle-s", type=float, default=None,
+                    help="信号サイクル秒(指定でサイドカーの周期を上書き)")
+    ap.add_argument("--green-s", type=float, default=None, help="歩行者青の秒")
+    ap.add_argument("--flash-s", type=float, default=None, help="青点滅の秒")
+    ap.add_argument("--offset-s", type=float, default=0.0,
+                    help="位相オフセット秒(0=スクランブル同相。既定 0)")
     args = ap.parse_args(argv)
 
     run_dir = args.run_dir if args.run_dir.is_absolute() else (_ROOT / args.run_dir)
@@ -585,8 +674,29 @@ def main(argv: list) -> int:
     elif not out_path.is_absolute():
         out_path = _ROOT / out_path
 
+    # ---- 信号ゲートの構築(--signals 指定時のみ。未指定=gate=None=従来挙動)----
+    gate = None
+    if args.signals:
+        if args.cycle_s is not None and args.green_s is not None:
+            from sfm import SignalGate
+            gate = SignalGate(args.cycle_s, args.green_s,
+                              args.flash_s or 0.0, offset_s=args.offset_s)
+            print(f"  信号ゲート(CLI): cycle={gate.cycle_s:.0f}s 青={gate.green_s:.0f}s "
+                  f"点滅={gate.flash_s:.0f}s offset={gate.offset_s:.0f}s")
+        else:
+            sidecar = load_crossings_sidecar(args.crossings_file)
+            gate = gate_from_sidecar(sidecar, cx, cy, args.radius_m,
+                                     offset_s=args.offset_s)
+            if gate is None:
+                print("  警告: 領域内に信号付き横断が無い(サイドカー未取得?)ため "
+                      "信号ゲートなしで合成します。", file=sys.stderr)
+            else:
+                print(f"  信号ゲート(サイドカー): cycle={gate.cycle_s:.0f}s "
+                      f"青={gate.green_s:.0f}s 点滅={gate.flash_s:.0f}s "
+                      f"offset={gate.offset_s:.0f}s")
+
     res = synth(run_dir, cx, cy, args.radius_m, start_step, end_step,
-                args.dt, args.out_dt, out_path)
+                args.dt, args.out_dt, out_path, gate=gate)
     print(f"  中心=({cx:.1f},{cy:.1f}) 半径={args.radius_m}m  step {start_step}–{end_step}")
     print(f"  合成窓={res['n_windows']}  データ不足窓={res['n_empty']}")
     print(f"  総通過={res['total_crossers']}人  軌跡点={res['total_points']}  "

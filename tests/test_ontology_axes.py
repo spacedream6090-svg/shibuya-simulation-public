@@ -378,3 +378,263 @@ def test_pool_hydrate_reentry_same_axis(small_pool, tmp_path):
     assert "__ax_mark__" in live[x].beliefs                     # hydrate を通った証拠
     assert live[x].ontology_axes.get("info_behavior") == expect, \
         "hydrate 経由で軸群が変わった(pid+age 純関数が崩れている)"
+
+
+# ======================================================= 第3軸=同行者構成(companions・第42バッチ)
+# 機構は多軸にもう1本足すだけ(Wave2 構造の再利用)。差分は(i)party_size 由来のデータ駆動割当を最優先、
+# (ii)day_varying=true で (pid, day) 純関数(準静的=日ごとに変わるが決定論・run.seed 非依存)。
+def _cfg_comp(enabled=True):
+    """companions(同行者構成)+ info_behavior を持つ cfg(直交性テスト用に2軸)。文言はダミー。"""
+    return ontology.build_cfg({
+        "enabled": enabled, "seed": 20260721,
+        "groups": {"jp_metro": {"label": "a", "line": "L"},
+                   "jp_other": {"label": "b", "line": "L2"}},
+        "composition": {"stochastic": {"jp_metro": 0.5, "jp_other": 0.5},
+                        "default": {"jp_metro": 1.0}},
+        "axes": {
+            "info_behavior": {
+                "seed_offset": 101,
+                "groups": {"info_sns": {"label": "s", "line": "AX_sns"},
+                           "info_official": {"label": "o", "line": "AX_official"}},
+                "composition": {"default": {"info_sns": 0.5, "info_official": 0.5}}},
+            "companions": {
+                "seed_offset": 202, "day_varying": True,
+                "party_map": {1: "solo", 2: "pair", "default": "group"},
+                "groups": {"solo":  {"label": "一人", "line": "C_solo"},
+                           "pair":  {"label": "二人", "line": "C_pair"},
+                           "group": {"label": "三人以上", "line": "C_group"}},
+                "composition": {
+                    "resident":   {"solo": 0.82, "pair": 0.15, "group": 0.03},
+                    "stochastic": {"solo": 0.30, "pair": 0.46, "group": 0.24},
+                    "default":    {"solo": 0.55, "pair": 0.30, "group": 0.15}}},
+        }})
+
+
+def test_build_cfg_parses_party_map_and_day_varying():
+    """build_cfg: party_map(int キー+ default)と day_varying を正準化。既定は空 dict / False(後方互換)。"""
+    oc = _cfg_comp()
+    ax = oc["axes"]["companions"]
+    assert ax["party_map"] == {"1": "solo", "2": "pair", "default": "group"}  # キーは文字列に統一
+    assert ax["day_varying"] is True
+    # party_map/day_varying を持たない軸(info_behavior)は空 dict / False=従来と同一構造(後方互換)
+    assert oc["axes"]["info_behavior"]["party_map"] == {}
+    assert oc["axes"]["info_behavior"]["day_varying"] is False
+
+
+def test_companions_party_size_priority():
+    """party_size(実人数)がある個体はデータ駆動で確定: 1→solo/2→pair/3+→group(ハッシュ・composition 非依存)。"""
+    oc = _cfg_comp()
+    for pid in ("L4_1", "abc", "42", "L2_00099"):
+        assert ontology.assign_axis(oc, "companions", pid, "stochastic", 30,
+                                    day=0, party_size=1) == "solo"
+        assert ontology.assign_axis(oc, "companions", pid, "stochastic", 30,
+                                    day=0, party_size=2) == "pair"
+        for ps in (3, 4, 5):
+            assert ontology.assign_axis(oc, "companions", pid, "stochastic", 30,
+                                        day=0, party_size=ps) == "group"
+    # party_size 由来は day を変えても固定(準静的だが実人数個体は day 非依存で不変)
+    a0 = ontology.assign_axis(oc, "companions", "L4_9", "stochastic", 30, day=0, party_size=2)
+    a1 = ontology.assign_axis(oc, "companions", "L4_9", "stochastic", 30, day=7, party_size=2)
+    assert a0 == a1 == "pair"
+    # party_size 不明(None)や 0 は party_map を使わず composition 後退(群のどれか)
+    g = ontology.assign_axis(oc, "companions", "L4_9", "stochastic", 30, day=0, party_size=None)
+    assert g in oc["axes"]["companions"]["groups"]
+    assert ontology._party_bucket({1: "solo", "default": "group"}, 0) is None
+
+
+def test_companions_tier_composition_converges():
+    """party_size 無し個体は tier 別 composition に収束(±0.02): 住民=solo 支配・stochastic=連れ厚め。"""
+    oc = _cfg_comp()
+    N = 40000
+    res = Counter(ontology.assign_axis(oc, "companions", f"R_{i}", "resident", None, day=0)
+                  for i in range(N))
+    rf = {k: v / N for k, v in res.items()}
+    assert abs(rf["solo"] - 0.82) < 0.02 and abs(rf.get("group", 0.0) - 0.03) < 0.02
+    sto = Counter(ontology.assign_axis(oc, "companions", f"S_{i}", "stochastic", None, day=0)
+                  for i in range(N))
+    sf = {k: v / N for k, v in sto.items()}
+    assert abs(sf["solo"] - 0.30) < 0.02
+    assert abs(sf["pair"] - 0.46) < 0.02
+    assert abs(sf["group"] - 0.24) < 0.02
+    assert (sf["pair"] + sf["group"]) > sf["solo"], "stochastic は連れ厚め(渋谷実態)であるべき"
+
+
+def test_companions_day_varying_and_deterministic():
+    """day_varying: day0 と day1 で割当が異なる個体が存在(日ごとに変わる)+ 同 day 同一(決定論=resume 安定)。"""
+    oc = _cfg_comp()
+    N = 3000
+    changed = 0
+    for i in range(N):
+        pid = f"D_{i}"
+        g0 = ontology.assign_axis(oc, "companions", pid, "stochastic", None, day=0)
+        g0b = ontology.assign_axis(oc, "companions", pid, "stochastic", None, day=0)
+        g1 = ontology.assign_axis(oc, "companions", pid, "stochastic", None, day=1)
+        assert g0 == g0b                              # 同 day・同 pid=同一(決定論・resume/hydrate 安定)
+        if g0 != g1:
+            changed += 1
+    assert changed > 0, "day0 と day1 で割当が変わる個体が1体も無い(day が効いていない)"
+    # 分布は day に依らず composition と一致(day は割当を混ぜるだけ=比率不変)
+    c1 = Counter(ontology.assign_axis(oc, "companions", f"D_{i}", "stochastic", None, day=1)
+                 for i in range(40000))
+    assert abs(c1["pair"] / 40000 - 0.46) < 0.02
+
+
+def test_companions_orthogonal_to_culture_and_info():
+    """直交: companions が文化圏軸・情報行動軸のどちらとも独立(同時分布≈周辺積・偏差<0.01)。"""
+    oc = _cfg_comp()
+    N = 60000
+    cult, comp, info = [], [], []
+    for i in range(N):
+        pid = f"P_{i}"
+        cult.append(ontology.assign_group(oc, pid, "stochastic"))
+        comp.append(ontology.assign_axis(oc, "companions", pid, "stochastic", None, day=0))
+        info.append(ontology.assign_axis(oc, "info_behavior", pid, "stochastic", 30))
+    for other in (cult, info):
+        cm, om = Counter(comp), Counter(other)
+        jm = Counter(zip(comp, other))
+        max_dev = max(abs(jm.get((c, o), 0) / N - (cm[c] / N) * (om[o] / N))
+                      for c in cm for o in om)
+        assert max_dev < 0.01, f"companions が他軸と独立でない(max_dev={max_dev:.4f})"
+
+
+def test_companions_run_seed_invariant():
+    """割当は run.seed を引数に取らない=種を変えても不変(companions も hashlib 純関数=比較実験の要)。"""
+    oc = _cfg_comp()
+    for pid in ("D_1", "D_2", "D_3"):
+        g = ontology.assign_axis(oc, "companions", pid, "stochastic", None, day=2)
+        assert g == ontology.assign_axis(oc, "companions", pid, "stochastic", None, day=2)
+
+
+# ------------------------------------------------------------------ プロンプト注入(最大4行)
+def test_four_line_injection_order(tmp_path):
+    """文化圏行→軸行(companions, info_behavior のソート順)→訓練行を persona 直後に順に注入(最大4行)。"""
+    sim = _sim(tmp_path, "fourline", steps=1)
+    sim.run()
+    a = sim.agents[0]
+    a.ontology_line = "文化圏の経験行。"
+    a.ontology_axis_lines = ["同行者の行。", "情報行動の行。", "訓練経験の行。"]
+    p = deliberate.build_prompt(a, place_name="路上", surprise="solo",
+                                nearby_names=[], sim_min=600, step=3)
+    assert (p.index(a.persona) < p.index("文化圏の経験行。") < p.index("同行者の行。")
+            < p.index("情報行動の行。") < p.index("訓練経験の行。"))
+
+
+def test_on_records_companions_axis(tmp_path):
+    """ON: 直接ランで companions 軸が agents.json/agent.ontology_axes に載り、行が注入行に含まれる。"""
+    on = _sim(tmp_path, "compjson", n=40, **_ON)
+    on.run()
+    comp_groups = on.ontologycfg["axes"]["companions"]["groups"]
+    meta = json.loads((on.out_dir / "agents.json").read_text(encoding="utf-8"))
+    got = [m for m in meta
+           if "ontology_axes" in m and "companions" in m["ontology_axes"]]
+    assert got, "companions 軸が1体も記録されていない"
+    for m in got:
+        assert m["ontology_axes"]["companions"] in comp_groups
+    lines = {ontology.axis_line(on.ontologycfg, "companions", g) for g in comp_groups}
+    seen = any(al in lines
+               for a in on.agents
+               for al in (getattr(a, "ontology_axis_lines", None) or []))
+    assert seen, "companions の行が注入行(ontology_axis_lines)に一度も載っていない"
+
+
+def test_apply_ontology_companions_party_size_wiring(tmp_path):
+    """_apply_ontology(party_size=…) が companions をデータ駆動で据える(3+→group / 1→solo)。配線検証。"""
+    sim = _sim(tmp_path, "applyps", n=5, **_ON)
+    a = sim.agents[0]
+    a.ontology_axes = None
+    sim._apply_ontology(a, "stochastic", party_size=3)
+    assert a.ontology_axes.get("companions") == "group"
+    a.ontology_axes = None
+    sim._apply_ontology(a, "stochastic", party_size=1)
+    assert a.ontology_axes.get("companions") == "solo"
+
+
+def test_off_no_companions_attributes(tmp_path):
+    """OFF は companions 軸も1つも作らない(既定 OFF=完全 no-op・現行 config に companions を足しても不変)。"""
+    off = _sim(tmp_path, "offcomp", n=15, steps=144, **_OFF)
+    off.run()
+    assert all(getattr(a, "ontology_axes", None) is None for a in off.agents)
+    pure = _sim(tmp_path, "purecomp", n=15, steps=144)
+    pure.run()
+    assert _l1(pure) == _l1(off)                       # companions 追加後も OFF=純粋既定と L1 バイト一致
+
+
+def test_companions_call_count_k_invariant(tmp_path):
+    """R1: companions ON のまま k(writeback)を free/off に振っても LLM 呼数が不変(追加呼ゼロ)。"""
+    free = _sim(tmp_path, "compk_free", **{**_ON, "k.writeback": "free"})
+    free.run()
+    off = _sim(tmp_path, "compk_off", **{**_ON, "k.writeback": "off"})
+    off.run()
+    assert len(free.logger.llm_calls) == len(off.logger.llm_calls)
+
+
+# ------------------------------------------------------------------ analyze_groups --axis companions
+def test_analyze_groups_companions_axis(tmp_path):
+    """analyze_groups --axis companions: ontology_axes[companions] で群別集計・axes.companions.groups からラベル解決。"""
+    import yaml
+
+    import analyze_groups
+    rows = [
+        {"id": 0, "ontology_group": "jp_metro",
+         "ontology_axes": {"info_behavior": "info_sns", "companions": "pair"}},
+        {"id": 1, "ontology_group": "west_visit",
+         "ontology_axes": {"info_behavior": "info_official", "companions": "solo"}},
+        {"id": 2, "ontology_group": "jp_metro",
+         "ontology_axes": {"info_behavior": "info_sns"}},      # companions 未設定の個体
+    ]
+    (tmp_path / "agents.json").write_text(json.dumps(rows, ensure_ascii=False),
+                                          encoding="utf-8")
+    doc = {"ontology": {"axes": {"companions": {"groups": {
+        "solo": {"label": "単独で動いている人"},
+        "pair": {"label": "連れと2人で動いている人"}}}}}}
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(doc, allow_unicode=True),
+                                          encoding="utf-8")
+    m, _ = analyze_groups.load_group_map(str(tmp_path), "companions")
+    assert m == {0: "pair", 1: "solo"}                 # id2 は companions 未設定=除外
+    defs = analyze_groups.load_group_defs(str(tmp_path), "companions")
+    assert defs.get("pair", {}).get("label") == "連れと2人で動いている人"
+
+
+# ------------------------------------------------------------------ pool 経路(party_size 優先 + hydrate)
+def test_pool_companions_party_size_priority(small_pool, tmp_path):
+    """pool ON day0: 全 present 個体の companions=assign_axis(pid,tier,age,day=0,party_size)。party_size 個体は party_map 値。"""
+    sim = Simulation(_pool_cfg("cpp", small_pool, n_steps=1, **_ON), out_dir=tmp_path / "cpp")
+    oc = sim.ontologycfg
+    assert sim.agents
+    seen_party = 0
+    for a in sim.agents:
+        rec = sim._pool.get(a.pool_pid)
+        tier = str(rec.get("presence", "resident"))
+        ps = rec.get("party_size")
+        expect = ontology.assign_axis(oc, "companions", a.pool_pid, tier, a.age,
+                                      day=0, party_size=ps)
+        assert a.ontology_axes.get("companions") == expect
+        if ps is not None:                             # party_size 個体はデータ駆動の直接写像
+            direct = {1: "solo", 2: "pair"}.get(int(ps), "group")
+            assert a.ontology_axes.get("companions") == direct
+            seen_party += 1
+    assert seen_party > 0, "party_size を持つ来街者(L4)が day0 present に1体も居ない"
+
+
+def test_pool_companions_hydrate_stable(small_pool, tmp_path):
+    """P3 再来街(hydrate): party_size 個体の companions は day 非依存で固定=hydrate を跨いで不変。"""
+    ps = pool_mod.PoolStore(small_pool)
+    recs = ps.presence_records()
+    hub = RngHub(42)
+    s0 = set(present_for_day(recs, 0, 400, hub, 0))
+    s1 = set(present_for_day(recs, 1, 400, hub, 1))
+    entrants = [x for x in sorted(s1 - s0)
+                if ps.get(x).get("party_size") is not None]
+    assert entrants, "party_size を持つ day1 再来街候補が見つからない"
+    x = entrants[0]
+    ps_val = int(ps.get(x)["party_size"])
+    expect = {1: "solo", 2: "pair"}.get(ps_val, "group")
+
+    sim = Simulation(_pool_cfg("chy", small_pool, n_steps=210, **_ON), out_dir=tmp_path / "chy")
+    sim._dormant.save(x, {"beliefs": ["__comp_mark__"], "money": 555.0})
+    sim.run()
+    live = {a.pool_pid: a for a in sim.agents}
+    assert x in live, "再来街者 x が day1 に present になっていない"
+    assert "__comp_mark__" in live[x].beliefs                   # hydrate を通った証拠
+    assert live[x].ontology_axes.get("companions") == expect, \
+        "hydrate 経由で同行者構成(party_size 固定)が変わった"

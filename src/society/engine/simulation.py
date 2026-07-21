@@ -880,12 +880,13 @@ class Simulation:
                 seed=base * 1_000_003 + agent.id, **overrides)
 
     # ---- 群のオントロジー(文化圏×経験の世界観共有群。2026-07-21)------------------
-    def _apply_ontology(self, agent, tier: str) -> None:
+    def _apply_ontology(self, agent, tier: str, party_size=None) -> None:
         """群を安定ハッシュで割り当て、経験1行と worldview 初期オフセットを据える(既定 OFF=no-op)。
 
         既定 OFF(ontology.enabled=false)は属性を1つも作らない=プロンプト・状態とも不変=バイト一致。
         割当は persona id(pool は pool_pid・直接ランは agent.id)のみの関数=k/trait 非参照・run.seed
-        非依存・RngHub 無風。pool の再来街(hydrate)でも build_pool_agent が同一 pid から同一群を再導出。"""
+        非依存・RngHub 無風。pool の再来街(hydrate)でも build_pool_agent が同一 pid から同一群を再導出。
+        party_size(プール record の同行人数。無い個体は None)は同行者構成軸のデータ駆動割当に使う。"""
         from .. import ontology as _ontology_mod
         cfg = self.ontologycfg
         if not cfg["enabled"]:
@@ -903,14 +904,18 @@ class Simulation:
         c0 = _ontology_mod.initial_controllability(cfg, gid)
         if c0 is not None:                             # S-b: 可制御性の起点を群で1回だけずらす
             agent.controllability = c0
-        # ---- 直交する第2軸(方式B)+ 訓練経験行(方式A)。既定は axes 空・drill OFF=完全 no-op。
+        # ---- 直交する第2軸以降(方式B)+ 訓練経験行(方式A)。既定は axes 空・drill OFF=完全 no-op。
         # 各軸は独立ハッシュ(seed+seed_offset)で文化圏軸と無相関=直交。age(人口統計 P0)がある時は
-        # 年代条件付き構成比を使う(traits/k は読まない=R1)。追加 LLM 呼・乱数はゼロ(hashlib 自前)。
+        # 年代条件付き構成比を使う(traits/k は読まない=R1)。同行者構成軸は準静的=(pid, day) 純関数
+        # (day は日境界ローテーションで進む _pool_day。直接ラン/day0 は 0)+ party_size 由来はデータ駆動
+        # で確定(ハッシュ不要)。追加 LLM 呼・乱数はゼロ(hashlib 自前=RngHub 無風)。
         age = getattr(agent, "age", None)
+        day = int(getattr(self, "_pool_day", 0))
         axis_groups: dict = {}
         axis_lines: list = []
         for axis_name in sorted(cfg.get("axes") or {}):
-            ag = _ontology_mod.assign_axis(cfg, axis_name, pid, tier, age)
+            ag = _ontology_mod.assign_axis(cfg, axis_name, pid, tier, age,
+                                           day=day, party_size=party_size)
             if ag is None:
                 continue
             axis_groups[axis_name] = ag
@@ -947,7 +952,9 @@ class Simulation:
         agent.pool_pid = pid
         self._init_agent_runtime(agent)
         # 群のオントロジー(既定 OFF=no-op)。tier=P5 record の presence 層(resident/duty/…)。
-        self._apply_ontology(agent, str(record.get("presence", "resident")))
+        # party_size(L4 来街者の record に実在=同行人数)は同行者構成軸のデータ駆動割当に使う(無ければ None)。
+        self._apply_ontology(agent, str(record.get("presence", "resident")),
+                             party_size=record.get("party_size"))
         return agent
 
     def _pool_update_budget(self) -> None:
