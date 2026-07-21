@@ -1,6 +1,8 @@
 """実行結果 → HTML ビューア v5(sim⇄viz 疎結合: ログを読むだけ)。
 
-使い方:  python viz/make_viewer.py runs/day80
+使い方:  python viz/make_viewer.py runs/day80 [--no-traffic] [--start-tod HH:MM]
+  --start-tod : 壁時計の開始時刻を明示上書き(既定は run の sim_min 列から復元。
+                sim_min 列が無い旧ランのフォールバック値でもある。未指定既定 07:00)。
 生成物(2ファイル分離、ユーザー要望 2026-07-04):
   viewer.html    — 地図ビューア(OSM タイル・レイヤー・再生・フォーカス・フロアビュー)
   dashboard.html — 情報ダッシュボード(出来事 / ネット[X風SNS・LINE風DM・検索] /
@@ -20,6 +22,41 @@ import pyarrow.parquet as pq
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+STEP_MINUTES = 10           # 1 step = 10 分(sim クロック Clock と同一)
+DEFAULT_START_MIN = 7 * 60  # 既定開始 07:00(sim_min 列が無いランのフォールバック=従来値)
+
+
+def _parse_start_tod(v) -> int:
+    """"HH:MM"(または分 int)を分 of day(0..1439)へ。None/不正は既定 07:00。
+    ビューア CLI --start-tod 用の局所パーサ(sim 本体 society.* には依存しない)。"""
+    if v is None:
+        return DEFAULT_START_MIN
+    if isinstance(v, (int, float)):
+        return int(v) % 1440
+    s = str(v).strip()
+    if ":" in s:
+        try:
+            h, m = s.split(":")
+            return (int(h) * 60 + int(m)) % 1440
+        except ValueError:
+            return DEFAULT_START_MIN
+    try:
+        return int(s) % 1440
+    except ValueError:
+        return DEFAULT_START_MIN
+
+
+def _derive_start_min(events: list) -> int | None:
+    """events の sim_min 列から壁時計の原点(day0 step0 の分 of day)を復元する。
+    sim_min = start_min + step*STEP_MINUTES の不変量から、任意のイベント 1 件で復元できる
+    (全イベントで同値)。sim_min 列が無い/空なら None(呼び出し側が既定 07:00 へ退避)。
+    既定 07:00 開始のランは step0 の sim_min=420 → 420 を返し従来 startMin とバイト同一。"""
+    for e in events:
+        sm = e.get("sim_min")
+        if sm is not None:
+            return int(sm) - int(e["step"]) * STEP_MINUTES
+    return None
 
 
 # ============================================================ 線路→運行路線の構築
@@ -229,9 +266,18 @@ def build_rail_lines(city: dict, transit: dict) -> list:
     return out
 
 
-def build_data(run_dir: Path, include_traffic: bool = True) -> dict:
+def build_data(run_dir: Path, include_traffic: bool = True,
+               start_min: int | None = None) -> dict:
     events = pq.read_table(run_dir / "l1_events.parquet").to_pylist()
     n_steps = max(e["step"] for e in events) + 1
+
+    # 壁時計の原点(day0 step0 の分 of day)。run.start_tod で可変。
+    # 明示 start_min(CLI --start-tod)が最優先 → 無ければ events の sim_min 列から復元
+    # → それも無ければ既定 07:00。既定 07:00 のランは 420 に戻り従来出力とバイト同一。
+    if start_min is None:
+        start_min = _derive_start_min(events)
+    if start_min is None:
+        start_min = DEFAULT_START_MIN
 
     cfg = yaml.safe_load((run_dir / "config.yaml").read_text(encoding="utf-8"))
     map_path = Path(cfg["world"]["map"])
@@ -444,7 +490,7 @@ def build_data(run_dir: Path, include_traffic: bool = True) -> dict:
             "stateSeries": {str(k): v for k, v in state_series.items()},
             "places": place_series,
             "origin": city.get("meta", {}).get("origin_latlon"),
-            "nSteps": n_steps, "startMin": 7 * 60, "runName": run_dir.name}
+            "nSteps": n_steps, "startMin": start_min, "runName": run_dir.name}
     # 第18バッチ①: communities.json が「有る時だけ」自然コミュニティ対応を埋め込む。
     # 無ければ out は一切変わらない=既存ランのビューワー再生成でバイト同一(後方互換)。
     comm = load_communities(run_dir)
@@ -1900,15 +1946,24 @@ render(true); requestAnimationFrame(loop);
 
 
 def main() -> None:
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    flags = {a for a in sys.argv[1:] if a.startswith("--")}
+    argv = sys.argv[1:]
+    # --start-tod "HH:MM" を明示指定した時だけ壁時計原点を上書き(既定=run から復元)。
+    # フラグと値を argv から除去してから run_dir/フラグ判定へ(値が run_dir と誤認されないように)。
+    start_min = None
+    if "--start-tod" in argv:
+        i = argv.index("--start-tod")
+        if i + 1 < len(argv):
+            start_min = _parse_start_tod(argv[i + 1])
+            argv = argv[:i] + argv[i + 2:]
+    args = [a for a in argv if not a.startswith("--")]
+    flags = {a for a in argv if a.startswith("--")}
     run_dir = Path(args[0]) if args else REPO_ROOT / "runs" / "day80"
     if not run_dir.is_absolute():
         run_dir = REPO_ROOT / run_dir
     # 長期ラン(例: 100日=14400step)は背景交通の軌跡だけで数百MBになりブラウザで開けない。
     # --no-traffic で背景交通レイヤーを外す(エージェント・分析・ネットは全て従来どおり)。
     include_traffic = "--no-traffic" not in flags
-    data = build_data(run_dir, include_traffic=include_traffic)
+    data = build_data(run_dir, include_traffic=include_traffic, start_min=start_min)
     payload = json.dumps(data, ensure_ascii=False)
     # 第18バッチ①: communities.json が有る時だけ色分け「コミュニティ」を追加。
     # 無ければ3トークンとも空文字へ→ MAP_HTML はバイト同一(後方互換の合格条件)。
