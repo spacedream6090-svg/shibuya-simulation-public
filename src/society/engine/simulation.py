@@ -346,6 +346,15 @@ class Simulation:
         raw_lodging = (OmegaConf.to_container(raw_lodging, resolve=True)
                        if OmegaConf.is_config(raw_lodging) else raw_lodging)
         self.lodgingcfg = _lodging_mod.build_cfg(raw_lodging)
+        # L2 業務の実体(work.service。既定 OFF=現行挙動と完全同一)。勤務中エージェントへ
+        # 接客(serve)/オフィス産出(org_output)の実体イベントを与える決定論機構(LLM/乱数ゼロ)。
+        # OFF は _phase_work_service が即 return=イベント 0 件・状態も増やさない=バイト一致。
+        from .. import work as _work_mod
+        raw_work = cfg.get("work", None)
+        raw_work = (OmegaConf.to_container(raw_work, resolve=True)
+                    if OmegaConf.is_config(raw_work) else raw_work)
+        self.workcfg = _work_mod.build_cfg(raw_work)
+        self._work_day = -1                        # 日次境界(オフィス産出集計)の進行管理
         # 「世界を変える」ツール群(host_event/post_flyer/found_group/propose/open_venture)
         from ..tools import Tools, build_tools_cfg
         self.tools = Tools(build_tools_cfg(cfg.get("tools", {})))

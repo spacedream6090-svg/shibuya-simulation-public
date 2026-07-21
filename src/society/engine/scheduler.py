@@ -25,6 +25,7 @@ from .. import relations as relations_mod
 from .. import pov as pov_mod
 from .. import status as status_mod
 from .. import street as street_mod
+from .. import work as work_mod
 from .. import worldview as worldview_mod
 from ..net import infoenv as infoenv_mod
 from ..cognition import deliberate, drive, planning, routine
@@ -1285,6 +1286,11 @@ def _isl_digest(agent) -> str | None:
     if persons:
         facts.append("・".join(persons[:3]) + "と会った")
     facts.extend(acts[:3])
+    # L2 業務の実体(work.service): 勤務中に積んだ接客の要約を1事実として供給(OFF/非該当は
+    # アキュムレータ不在=None=1行も足さない=バイト一致)。テキストは work モジュールに閉じる。
+    wf = work_mod.digest_line(agent)
+    if wf:
+        facts.append(wf)
     if not facts:
         return None
     return "この間のこと: " + "。".join(facts)
@@ -1302,6 +1308,7 @@ def _isl_take(sim, agent) -> str | None:
     buf = getattr(agent, "_isl_buf", None)
     if buf:
         buf.clear()
+    work_mod.clear_digest(agent)                   # L2 業務の実体: 当日業務の仕切り直し(OFF/非該当は no-op)
     scfg = getattr(sim, "scenecfg", None)
     if scene_desc_mod.enabled(scfg):
         sline = scene_desc_mod.digest_line(
@@ -1309,6 +1316,99 @@ def _isl_take(sim, agent) -> str | None:
         if sline:
             dig = (dig + "。" + sline) if dig else sline
     return dig
+
+
+# ---------------------------------------------------------------- L2 業務の実体(work.service。既定 OFF)
+def _work_service_on(sim) -> bool:
+    """L2 業務の実体(接客 serve / オフィス産出 org_output)が有効か。既定 OFF=新経路を通さない。"""
+    cfg = getattr(sim, "workcfg", None)
+    return bool(cfg and cfg["enabled"])
+
+
+def _work_office_output(sim, step: int, sim_min: int, cfg: dict) -> None:
+    """日次境界: オフィス系職場に在場・在職の出勤者を職場単位で束ね、出勤者数×role重みを
+    org_output として1件記録(会社が『何かを作っている』の最小観測形)。決定論・乱数なし・非LLM。
+
+    出勤者=work_node がオフィス系(poi_cats)かつ在職(work_start_min>=0)の present 個体。職場単位=
+    work_building(無ければ work_node)。pool ローテーションで present が変われば出勤者数=産出が変わる。"""
+    ocfg = cfg["office"]
+    if not ocfg["enabled"]:
+        return
+    day = sim_min // 1440
+    if day == getattr(sim, "_work_day", -1):
+        return
+    sim._work_day = day
+    units: dict[str, list] = {}
+    for a in sim.agents:
+        wn = getattr(a, "work_node", "")
+        if not wn or getattr(a, "work_start_min", -1) < 0:
+            continue
+        if not work_mod.is_office_node(sim.city, wn, ocfg):
+            continue
+        key = getattr(a, "work_building", "") or wn
+        units.setdefault(key, []).append(a)
+    for key in sorted(units):
+        workers = sorted(units[key], key=lambda a: a.id)
+        output = round(sum(work_mod.role_weight(a, cfg) for a in workers), 3)
+        sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
+                             kind="org_output", x=0.0, y=0.0,
+                             payload={"org": str(key), "output": output,
+                                      "n": len(workers), "kind": "office"}))
+
+
+def _phase_work_service(sim, step: int, sim_min: int, since_idx: int) -> None:
+    """L2 業務の実体(work.service。既定 OFF=即 return=バイト一致)。
+
+    run_step 末で呼ぶ。(1) 日次境界にオフィス産出を集計。(2) この step の客の消費(spend の
+    接客カテゴリ)を走査し、同一 work_node に在場・勤務中のスタッフに serve を帰属する
+    (決定論・乱数ゼロ・LLM 呼ゼロ)。客側の既存イベントは不変(新イベントを足すだけ)。"""
+    cfg = getattr(sim, "workcfg", None)
+    if not (cfg and cfg["enabled"]):
+        return
+    _work_office_output(sim, step, sim_min, cfg)   # 日次境界: オフィス系の産出
+    if since_idx < 0:                              # この step の増分イベントが無ければ接客帰属なし
+        return
+    # 勤務中スタッフを work_node で索引(在場=node==work_node かつ 勤務時間帯)。id 昇順で決定論。
+    cal = getattr(sim, "calendarcfg", None)
+    staff_by_node: dict[str, list] = {}
+    for a in sim.agents:
+        wn = getattr(a, "work_node", "")
+        if not wn or a.node != wn:
+            continue
+        if not routine.in_work_window(a, sim_min, cal):
+            continue
+        staff_by_node.setdefault(wn, []).append(a)
+    for lst in staff_by_node.values():
+        lst.sort(key=lambda a: a.id)
+    max_serve = cfg["max_serve_per_event"]
+    # ダイジェスト供給は interstitial の消費者があるときだけ(OFF なら業務アキュムレータを作らない)
+    to_digest = cfg["digest"] and _interstitial_on(sim)
+    for e in sim.logger.events[since_idx:]:         # スライスはコピー=帰属 serve の追記中も安全
+        if e.kind != "spend":
+            continue
+        cat = (e.payload or {}).get("cat")
+        label = work_mod.serve_label(cfg, cat)
+        if label is None:                          # 接客対象外(taxi/bus 等)
+            continue
+        customer = sim.agent_by_id.get(e.agent_id)
+        if customer is None:
+            continue
+        node = customer.node
+        staff = [s for s in staff_by_node.get(node, []) if s.id != e.agent_id]
+        if staff:
+            for s in staff[:max_serve]:
+                sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=s.id,
+                                     kind="serve", x=s.x, y=s.y,
+                                     payload={"cat": str(cat), "label": label,
+                                              "customer": int(e.agent_id),
+                                              "node": node}))
+                if to_digest:
+                    work_mod.note_serve(s, label)
+        elif cfg["record_unstaffed"]:              # 不在=記録のみ(挙動変更なし)
+            sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
+                                 kind="serve", x=customer.x, y=customer.y,
+                                 payload={"cat": str(cat), "node": node,
+                                          "unstaffed": True}))
 
 
 # ---------------------------------------------------------------- LLM 発話
@@ -3474,6 +3574,8 @@ def run_step(sim, step: int) -> None:
     # 行間補間(P2 S2): この step 開始時点の logger.events 長を控える(末で増分を各個体バッファへ
     # 振り分ける)。OFF は -1 で以降の蓄積を完全にスキップ=状態も出力もバイト一致。
     _isl_idx = len(sim.logger.events) if _interstitial_on(sim) else -1
+    # L2 業務の実体(work.service。既定OFF=-1でこの step の接客帰属を完全スキップ=バイト一致)。
+    _work_idx = len(sim.logger.events) if _work_service_on(sim) else -1
     _ensure_orgs(sim)                              # 組織台帳の遅延初期化(既定OFF=no-op)
     for agent in sim.agents:
         agent.now_step = step                      # remember() の時刻付け
@@ -3529,6 +3631,7 @@ def run_step(sim, step: int) -> None:
     _phase_jitter(sim, step, sim_min)              # 路上滞在の完全静止を解消(微移動)
     _phase_crowd(sim, step, sim_min)               # 群集(大規模行事型)の集中を観測(既定OFF=no-op)
     infoenv_mod.phase(sim, step, sim_min)          # 情報環境: バイラル加重・誤情報/炎上(既定OFF=no-op。Wave G6)
+    _phase_work_service(sim, step, sim_min, _work_idx)  # L2業務: 接客serve/オフィスorg_output(既定OFF=no-op)
 
     _bl = (sim.cfg.get("engine", {}) or {}).get("batch_llm", {}) or {}
     if bool(_bl.get("enabled", False)):

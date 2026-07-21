@@ -897,6 +897,29 @@ organizations:
                                 # workplace_poi(実在ノード)へ束縛=実際にそこへ通勤・通学する。
                                 # false(既定)なら work_node は上書きしない=既存挙動とバイト一致。
 
+# ---- L2 域内従業者の「業務の実体」(work.service。既定 OFF。設計: docs/research/l2-work-reality.md)----
+# 勤務中(work_node に在場・勤務時間帯)のエージェントへ「業務の実体」を与える決定論機構(LLM/乱数ゼロ)。
+#  接客系(小売27%/対人サービス14.5%/飲食7%): 客の消費 spend と同一 work_node の勤務中スタッフに serve を帰属。
+#  オフィス系(office 51.5%): 日次境界に「出勤者数×role重み」を org_output として集計(会社が何かを作る最小形)。
+# 業務が本人に残る: serve 要約を interstitial(S2)ダイジェストに1行供給→夜内省の材料へ自然合流(ONでもLLM呼数不変)。
+# 既定 OFF=イベント 0 件・状態も増やさない=ゴールデン L1 とバイト一致(R1)。業種→業務は POI カテゴリ駆動。
+work:
+  service:
+    enabled: false              # ★ON 推奨(本番): true(L2 の業務の実体を有効化=ユーザー要望)
+    serve_by_cat:               # 客の消費カテゴリ(spend.cat)→ 接客業務ラベル(業務名は config 由来)
+      food: 飲食の接客
+      cafe: 飲食の接客
+      nightlife: 接客・サービス
+      shop: 販売・レジ対応
+    max_serve_per_event: 1      # 1消費あたり帰属するスタッフ数の上限(id 昇順で先頭から)
+    record_unstaffed: true      # スタッフ不在の消費を agent_id=-1 の記録として残す(挙動変更なし・観測のみ)
+    digest: true                # interstitial ON 時、スタッフの S2 ダイジェストに業務要約を1行供給
+    office:
+      enabled: true             # オフィス系の日次 org_output を出すか
+      poi_cats: [office]        # オフィス系職場と見なす職場 POI カテゴリ
+      base_weight: 1.0          # role 重みの既定(1人=1.0 → 産出は出勤者数に比例)
+      role_weights: {}          # occupation/role → 産出重み(空=全員 base_weight)
+
 # ---- 欲求プロファイルの個人差 W2-2(文献: docs/lit/needs__individual-differences.md)----
 # ON 時: traits・年齢・職業から5次元の価値プロファイル(刺激/安全/関係/有能/自律)を決定論生成し、
 # 欲求ゲージ入力(novel_place/congestion/silence 等)への個人別感度倍率に変換(「何を欲し・

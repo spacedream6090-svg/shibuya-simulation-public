@@ -194,6 +194,10 @@ register_event_kind("presence_change", "日次ローテーションの在場入�
 # ---- エージェント視覚 v1(pov.enabled ON のみ・既定 OFF=0件。顕著性ゲート→POVレンダ→画像ストア。
 #      専用 stream "pov_salience"・追加LLM呼ゼロ。設計: docs/research/agent-vision.md §4 v1)----
 register_event_kind("pov_image", "顕著時のPOV画像を撮影・保存(サイドカー画像への参照キー){ref, w, h, trigger, vlm?}")
+# ---- L2 業務の実体(work.service ON のみ・既定 OFF=0件。決定論・LLM/乱数ゼロ。
+#      設計: docs/research/l2-work-reality.md)----
+register_event_kind("serve",      "接客業務の帰属(客の消費と同一 work_node の勤務中スタッフに応対を帰属。不在時は agent_id=-1 の記録){cat, label, customer, node, unstaffed?}")
+register_event_kind("org_output", "オフィス系職場の日次産出集計(出勤者数×role重み。会社が『何かを作っている』の最小観測形){org, output, n, kind}")
 
 
 @dataclass
