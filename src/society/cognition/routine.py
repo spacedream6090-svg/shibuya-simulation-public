@@ -20,6 +20,7 @@ from .. import disaster as _disaster
 from .. import diversity as _diversity
 from .. import household as _household
 from .. import inner_life as _inner
+from .. import joint as _joint
 from .. import media
 from ..factors import update as factor_update
 from ..observer.schema import Event
@@ -882,12 +883,18 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
     # 引かず None=以降は従来通り(不変)。観光回遊は観光客のランドマーク巡り(tourist_visit)へ寄せる。
     # EPR の行き先候補は危険地帯(犯罪履歴ノード=治安回避 H5)を除いたリストにする(OFF=全候補で不変)。
     crowd = _crowd_dest(agent, sim, step)
+    joint_act = ""                                   # 共同行動の活動タグ(cost 用。既定 ""=既定不変)
     if crowd is not None:
         dest = crowd                                 # 群集日: 地図原点付近の集会ノードへ寄せる
     elif (tour := _diversity.tourist_dest(agent, sim, step, sim_min)) is not None:
         dest = tour                                  # 観光客: ランドマークへ回遊(後続波 H5)
     elif (date := _household.date_dest(agent, sim, step, sim_min)) is not None:
         dest = date                                  # デート: パートナーとの共有目的地へ(後続波 H2)
+    elif (dinner := _household.dinner_dest(agent, sim, step, sim_min)) is not None:
+        dest = dinner                                # 夕食の共食: 夜帯に世帯 home へ収束(第44バッチ S-R1)
+    elif (rendez := _joint.joint_dest(agent, sim, step, sim_min)) is not None:
+        dest = rendez                                # 共同行動: 同伴グループの共有 POI へ収束(第44バッチ S-R3)
+        joint_act = _joint.route_activity(agent)     # meal_cafe→eating(既存 _charge_meal で課金)/他→""
     elif (hobby := _inner.hobby_dest(agent, sim, step, sim_min)) is not None:
         dest = hobby                                 # 趣味: 余暇の行き先を趣味の場所へ寄せる(後続波 H6)
     elif (boost := _weekly_boost_dest(agent, sim, step)) is not None:
@@ -910,9 +917,11 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
         if detour is not None:
             dest = detour
         base_stay = _jitter_stay(agent, sim, base_stay, step, scfg)
-    return _augment_ride(agent, sim, {
-        "type": "move_to", "dest": dest, "stay_steps": base_stay,
-        "mode": _choose_mode(agent, sim, dest, rng)}, step, sim_min)
+    action = {"type": "move_to", "dest": dest, "stay_steps": base_stay,
+              "mode": _choose_mode(agent, sim, dest, rng)}
+    if joint_act:                                    # 共同行動の活動タグ(cost 用。既定 ""=未設定=不変)
+        action["activity"] = joint_act
+    return _augment_ride(agent, sim, action, step, sim_min)
 
 
 def _poi_price(sim, poi: dict) -> float:

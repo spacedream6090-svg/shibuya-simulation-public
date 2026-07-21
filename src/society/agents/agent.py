@@ -123,8 +123,13 @@ class Agent:
     #  すべて中立(OFF 不変)。household.enabled=false ではどれも設定されず=挙動バイト一致。
     household_id: str | None = None   # 所属世帯 id(同一世帯は home を共有)。None=世帯なし=個人
     household_kind: str = ""          # "family"(家族)/ "roommate"(同居人)。""=世帯なし
+    household_role: str = ""          # 続柄(現実化 S-R1: 夫/妻/親/子/同居人)。""=未割当(既定・非現実化)
     housemates: list = field(default_factory=list)  # 同居者の id(自分を除く)。既定は空
     partner_id: int | None = None     # 恋人の id(相互の強い親密度から決定論成立)。None=独身
+    # ---- 共同行動エンジン(関係性の再現 S-R3、既定 OFF。src/society/joint.py)----
+    #  中立(OFF 不変)。joint.enabled=false では設定されず=挙動バイト一致。日次境界で当日分を編成し
+    #  クリアする。{poi, band, activity, activity_tag, tier}。None=当日の共同行動なし。
+    joint_today: dict | None = None
     # ---- 宿泊・ホテル滞在(後続波 Wave L、既定 OFF。src/society/lodging.py)----
     #  すべて中立(OFF 不変)。lodging.enabled=false ではどれも設定されず=挙動バイト一致。visitor が
     #  夜に範囲外退出する代わりにホテルへ泊まる物理機構(移動→チェックイン→就寝→checkout_hour に退館)。

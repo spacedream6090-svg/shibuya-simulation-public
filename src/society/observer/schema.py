@@ -206,6 +206,9 @@ register_event_kind("delivery_trip", "補充の配送トリップ(depot=最寄�
 register_event_kind("restock",       "補充トリップの到着=在庫が上限 S へ回復(封鎖時は失敗=不発){poi, cat, qty, from}")
 register_event_kind("stock_low",     "在庫僅少=発注点 s 以下(補充発注のトリガ。世界イベント agent_id=-1){poi, cat, level}")
 # ★ stock_out は commerce 既存 kind を再利用(意味を在館数の代理→実在庫の枯渇に拡張。src="inventory")
+# ---- 関係性の再現 第44バッチ(共同行動エンジン S-R3 + 世帯の夕食共食 S-R1。既定 OFF=0件。
+#      決定論・LLM/generate ゼロ増。実装 src/society/joint.py + household.py。設計: docs/research/relationships-activities.md §4)----
+register_event_kind("joint_activity", "共同行動の成立=同伴グループ/世帯が同一POI・home で2人以上同席(1グループ1日1回){type, with, place, tier}")
 
 
 @dataclass

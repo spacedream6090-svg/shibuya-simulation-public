@@ -358,6 +358,21 @@ def _freedom_exercised(sim):
     return int(getattr(sim, "freedom_stats", {}).get("exercised", 0))
 
 
+# ---- 共同行動エンジン(関係性の再現 第44バッチ)。OFF(joint も家族夕食も無効)は None=列なし=L2 不変 ----
+@register_aggregator("n_joint_activity")
+def _n_joint_activity(sim):
+    """共同行動(友人系 joint + 世帯の夕食共食)の累積成立件数。joint も family_dinner も
+    無効なら None=列なし(L2 バイト不変)。ON 時のみ joint_activity の累積を出す。"""
+    jc = getattr(sim, "jointcfg", None)
+    hc = getattr(sim, "householdcfg", None)
+    joint_on = bool(jc and jc.get("enabled"))
+    dinner_on = bool(hc and hc.get("enabled")
+                     and hc.get("family_dinner", {}).get("enabled"))
+    if not (joint_on or dinner_on):
+        return None
+    return int(getattr(sim, "_joint_total", 0))
+
+
 @register_aggregator("n_active_rules")
 def _n_active_rules(sim):
     """制度DSL: 現在アクティブな実効ルール数(rules 無効時は None=列なし=L2 不変)。"""

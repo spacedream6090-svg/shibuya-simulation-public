@@ -297,6 +297,19 @@ class Simulation:
                   if OmegaConf.is_config(raw_hh) else raw_hh)
         self.householdcfg = _household_mod.build_cfg(raw_hh)
         self._partner_day = -1                 # 日境界(パートナー形成)の進行管理
+        self._dinner_logged: set = set()       # 夕食共食の記録済み (household_id, day)(S-R1)
+        # 共同行動エンジン(関係性の再現 第44バッチ S-R3。既定 OFF=現行挙動と完全同一)。日次編成
+        # (日境界・新 stream "joint")+ 収束(routine 分岐)+ 同席観測(joint_activity)。決定論・
+        # LLM 非増(呼数不変は compute_matched 下の k 不変性で担保)。OFF=何も編成せず・イベント 0 件・
+        # 新 stream も引かない=乱数消費不変(ゴールデン golden_baseline_l1.json を守る)。
+        from .. import joint as _joint_mod
+        raw_joint = cfg.get("joint", None)
+        raw_joint = (OmegaConf.to_container(raw_joint, resolve=True)
+                     if OmegaConf.is_config(raw_joint) else raw_joint)
+        self.jointcfg = _joint_mod.build_cfg(raw_joint)
+        self._joint_day = -1                    # 日境界(共同行動の編成)の進行管理
+        self._joint_groups: list = []           # 当日の成立グループ(observe が同席で1件記録)
+        self._joint_total = 0                   # joint_activity の累積件数(L2 集計用)
         # 閾値分布の seam(手続き生成経路のみ。名簿値優先=現状のまま)
         self.threshold_dist = str(cfg.get("factors", {}).get("threshold_dist",
                                                              "normal") or "normal")

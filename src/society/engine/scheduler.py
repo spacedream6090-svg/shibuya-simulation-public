@@ -20,6 +20,7 @@ from .. import goods as goods_mod
 from .. import health as health_mod
 from .. import household as household_mod
 from .. import inner_life as inner_life_mod
+from .. import joint as joint_mod
 from .. import lodging as lodging_mod
 from .. import opinion as opinion_mod
 from .. import relations as relations_mod
@@ -3234,6 +3235,19 @@ def _phase_household(sim, step: int, sim_min: int) -> None:
     household_mod.form_partners(sim, step, sim_min)
 
 
+# ---------------------------------------------------------------- 共同行動エンジン(第44バッチ S-R3)
+def _phase_joint(sim, step: int, sim_min: int) -> None:
+    """日次境界: 当日の共同行動を編成する(誘い→承諾→ランデブー POI。既定 OFF=no-op。第44バッチ S-R3)。
+
+    joint 無効なら完全 no-op(joint_activity 0 件・"joint" stream も引かない=バイト一致)。
+    R1: plan_day は generate() を1本も足さず、k・内面状態(構成概念)を読まず、名簿・config・
+    relations の closeness(観測イベント由来=k 非依存の観測量)・housemates・物理位置のみ参照する
+    (呼数は k 非依存)。合流(同一 POI 収束)は物理位置=対面 co-location を変えうる(career/health/
+    household と同型で許容)→ 呼数不変は compute_matched 下の k 不変性で担保する。編成は日境界のみ・
+    実際の同席観測(joint_activity)は毎 step の joint_mod.observe が担う。"""
+    joint_mod.plan_day(sim, step, sim_min)
+
+
 # ---------------------------------------------------------------- キャリア転換(Wave G5)
 def _career_on(sim) -> bool:
     """キャリア転換(失業/求職/転職)が有効か。既定 OFF=新経路を一切通さない(バイト一致)。"""
@@ -3673,6 +3687,7 @@ def run_step(sim, step: int) -> None:
     _phase_schedule_gc(sim, step, sim_min)         # 日次境界: 過去予定の GC(既定OFF=no-op)
     _phase_relations_day(sim, step, sim_min)       # 日次境界: 関係の断絶/評判の風化(既定OFF=no-op)
     _phase_household(sim, step, sim_min)           # 日次境界: パートナー形成(既定OFF=no-op。後続波 H2)
+    _phase_joint(sim, step, sim_min)               # 日次境界: 共同行動の編成(既定OFF=no-op。第44バッチ S-R3)
     _phase_commerce(sim, step, sim_min)            # 毎step: 店舗の開閉遷移 shop_state(既定OFF=no-op。後続波 H3)
 
     sim.scenario.on_step(sim, step)                # 摂動シナリオ(baseline=即 return)
@@ -3696,6 +3711,10 @@ def run_step(sim, step: int) -> None:
     _phase_planning(sim, step, sim_min)            # 起床/帰還の直後 step に朝の一日計画
     _phase_tools(sim, step, sim_min)               # イベント開始で会場へ発つ→次の移動で反映
     _phase_move(sim, step, sim_min)
+    # 位置確定後: 共同行動/夕食共食の同席観測(既定OFF=no-op。第44バッチ)。編成→収束は済み、
+    # ここで実際に POI/home で2人以上同席したグループを joint_activity で1件記録する。
+    joint_mod.observe(sim, step, sim_min)          # 共同行動(S-R3)
+    household_mod.observe_dinner(sim, step, sim_min)  # 夕食の共食(S-R1)
     _phase_traffic(sim, step, sim_min)
     _phase_enforcement(sim, step, sim_min)         # 執行ルート: 警察官が近傍の違反者を執行(既定OFF)
     _phase_diversity(sim, step, sim_min)           # 毎step: 犯罪・迷惑行為(近傍警察官で抑止。既定OFF=no-op。後続波 H5)

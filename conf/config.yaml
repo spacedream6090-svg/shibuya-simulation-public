@@ -1260,9 +1260,53 @@ household:
   sizes: [1, 2, 3, 4]           # 取りうる世帯サイズ(1=単身は世帯を組まない=個人のまま)
   size_weights: [0.35, 0.30, 0.22, 0.13]  # サイズの相対重み(合計は正規化)
   family_ratio: 0.7             # 2人以上世帯が「家族」の割合(残りはルームシェア=同居人)
+  # ---- 世帯の現実化(第44バッチ S-R1。false=現行の id 順機械束ねと完全同一)----
+  realistic: false              # ★ON 推奨(本番): true(地理×年齢の整合束ね+続柄=夫/妻/親/子+渋谷 size_weights)
+  # 渋谷区の現実(令和2国勢調査: 単身64.5%・2人以上35.5%を全国分布で 2/3/4 に按分)。realistic=true 時のみ使用。
+  size_weights_realistic: [0.645, 0.176, 0.104, 0.075]
   # ---- 恋愛・パートナー形成(日次。G2 closeness から決定論。要 relations.enabled=true)----
   partner_closeness: 15.0       # 相互 closeness がこれ以上でパートナー成立(親友 relations.tier_close の上位)
   date_bias: 0.5                # 自由時間にパートナーとの共有デート先へ寄せる確率/step(stream "date")
+  # ---- 夕食の共食(第44バッチ S-R1。夜帯に世帯 home へ収束し2人以上同席で joint_activity 記録。新 stream "dinner")----
+  family_dinner:
+    enabled: false              # ★ON 推奨(本番): true(家族の夕食共食を有効化。要 household.enabled=true)
+    prob: 0.69                  # 夕食帯の home 収束バイアス/step(農水省 食育調査 令和5=家族と夕食「ほぼ毎日」68.7%)
+    band_start_min: 1080        # 夕食帯の開始(分 of day)= 18:00
+    band_end_min: 1260          # 夕食帯の終了(分 of day)= 21:00
+
+# ---- 共同行動エンジン(関係性の再現 第44バッチ S-R3。ユーザー要望 2026-07-21。既定 OFF=現行挙動と完全同一)----
+# 関係(友人 relations tier≥2 / 同居人 housemates)を起点に「N人が同一(POI,時刻)へ独立に収束+合流は
+# 決定論」で共同行動(外食・カフェ/映画/カラオケ/買い物)を発生させる。誘い→承諾→合流は全決定論=
+# LLM 呼を1本も増やさない(既存 household.date_dest の一般化)。合流後の会話は既存の対面会話予算内。
+# 実装 src/society/joint.py(較正値・活動名リテラルはここと joint.py にのみ書く=no-fingerprint 契約)。
+# R1: 日次編成(新 stream "joint")・同伴選択(relations closeness/housemates=k 非依存)・誘い承諾
+#   (新 stream "joint")・ランデブー POI(グループ最小 id/day/活動タイプの純関数=乱数ゼロ)。合流=物理
+#   位置=対面 co-location の変化は career/health/household と同型で許容(呼数不変は compute_matched 下の
+#   k 不変性で担保)。既定 OFF=何も編成せず・joint_activity 0 件・"joint" stream も引かない(ゴールデンを守る)。
+joint:
+  enabled: false                # ★ON 推奨(本番): true(友人・同居人の共同行動を有効化。友人には要 relations.enabled=true)
+  daily_rate: 0.15              # 1人1日あたりの共同外出の発生確率(学生時代友人と月1=~0.03/特定相手と桁が合う集約率≈週1)
+  accept_base: 0.5              # 誘いの基礎承諾確率(host_event の attend_base 相当)
+  tier_bonus: 0.3               # 親友(relations tier 3)への承諾加算(関係の強さで参加率↑)
+  min_group: 2                  # 成立に必要な最小人数(自分含む)
+  max_group: 4                  # グループ最大人数(自分含む。2-4人)
+  friend_tier: 2                # 同伴候補の最小 relations tier(2=友人)
+  # 活動カタログ(渋谷較正=レジャー白書 参加率)。poi_cat は routine の food/leisure/shop と整合。
+  # band=下の bands の名前。activity_tag=routine 活動タグ(eating で既存 _charge_meal が飲食費を課金)。
+  activities:
+    meal_cafe: {weight: 0.39, poi_cat: food, band: night, activity_tag: eating}    # 外食・カフェ(参加率39.2%)
+    cinema:    {weight: 0.34, poi_cat: leisure, band: day, activity_tag: ""}        # 映画(33.7%)
+    karaoke:   {weight: 0.20, poi_cat: leisure, band: night, activity_tag: ""}      # カラオケ(20.2%)
+    shopping:  {weight: 0.15, poi_cat: shop, band: day, activity_tag: ""}           # ショッピング(渋谷若年で高頻度)
+  # 時間帯(分 of day の [開始, 終了))。day=昼〜夕方、night=夕〜夜。
+  bands:
+    day: [660, 1020]            # 11:00-17:00
+    night: [1020, 1320]         # 17:00-22:00
+  # 年齢条件付き重み倍率(キー=年代下限の文字列)。渋谷=若年で友人遊び高(カラオケ/買い物/映画↑)。
+  age_weights:
+    "0":  {karaoke: 1.6, shopping: 1.4, cinema: 1.2, meal_cafe: 1.0}
+    "35": {karaoke: 0.8, shopping: 0.9, cinema: 1.0, meal_cafe: 1.0}
+    "55": {karaoke: 0.4, shopping: 0.7, cinema: 0.8, meal_cafe: 1.0}
 
 # ---- 商業・店舗のダイナミクス(現実ギャップ 後続波 H3 2026-07-07。すべて既定 OFF=現行挙動と完全同一)----
 # 現状 POI(店・会社)は静的で常時営業・価格固定。商業の動きを最小・非LLM・決定論で載せる

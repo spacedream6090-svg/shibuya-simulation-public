@@ -37,14 +37,41 @@ DEFAULTS = {
     "sizes": [1, 2, 3, 4],                 # 取りうる世帯サイズ(1=単身は世帯を組まない)
     "size_weights": [0.35, 0.30, 0.22, 0.13],  # サイズの相対重み(合計は正規化される)
     "family_ratio": 0.7,                   # 2人以上世帯が「家族」の割合(残りはルームシェア=同居人)
+    # ---- 世帯の現実化(S-R1。既定 false=現行の id 順機械束ねと完全同一)----
+    "realistic": False,                    # true で人口統計整合の束ね(地理×年齢)+続柄付与+渋谷 size_weights
+    # 渋谷区の現実(令和2国勢調査 §2.1: 単身64.5%・2人以上35.5%)。2人以上は全国分布(2/3/4=28.1/16.6/11.9)で按分。
+    "size_weights_realistic": [0.645, 0.176, 0.104, 0.075],
     # ---- 恋愛・パートナー形成(日次。G2 closeness から決定論)----
     "partner_closeness": 15.0,             # 相互 closeness がこれ以上でパートナー成立(親友 tier_close の上位)
     "date_bias": 0.5,                      # 自由時間にパートナーとの共有デート先へ寄せる確率/step(stream "date")
+    # ---- 夕食の共食(S-R1。夜帯に世帯メンバの自由時間行き先を home へ寄せ、2人以上同席で joint_activity 記録)----
+    #  prob=農水省 食育調査 令和5(§2.4: 家族と夕食「ほぼ毎日」68.7%)。band=18:00-21:00(分 int)。
+    "family_dinner": {"enabled": False, "prob": 0.69,
+                      "band_start_min": 1080, "band_end_min": 1260},
 }
 
-_BOOL_KEYS = ("enabled",)
+_BOOL_KEYS = ("enabled", "realistic")
 _LIST_INT_KEYS = ("sizes",)
-_LIST_FLOAT_KEYS = ("size_weights",)
+_LIST_FLOAT_KEYS = ("size_weights", "size_weights_realistic")
+
+# 続柄ラベル(現実化 S-R1)。中立な家族語のみ(構成概念名・地名を含まない)。
+_ROLE_SPOUSE = {"男": "夫", "女": "妻"}
+
+
+def _fd_cfg(raw) -> dict:
+    """family_dinner サブブロックを型強制つきで正準化(band は分 int)。"""
+    base = dict(DEFAULTS["family_dinner"])
+    raw = dict(raw or {})
+    for k, v in raw.items():
+        if k not in base:
+            continue
+        if k == "enabled":
+            base[k] = bool(v)
+        elif k == "prob":
+            base[k] = float(v)
+        else:
+            base[k] = int(v)
+    return base
 
 
 def build_cfg(raw) -> dict:
@@ -67,6 +94,8 @@ def build_cfg(raw) -> dict:
             cfg[k] = [int(x) for x in v]
         elif k in _LIST_FLOAT_KEYS:
             cfg[k] = [float(x) for x in v]
+        elif k == "family_dinner":
+            cfg[k] = _fd_cfg(v)
         else:
             cfg[k] = float(v)
     return cfg
@@ -91,38 +120,86 @@ def _pick_size(cfg: dict, rng) -> int:
     return int(sizes[-1])
 
 
+def _assign_household(members: list, is_family: bool, hh_id: str,
+                      roles: list | None = None) -> None:
+    """世帯メンバに household_id/kind/housemates/共有 home を付す(代表=最小 id の住居を共有)。"""
+    rep = members[0]
+    for i, m in enumerate(members):
+        m.household_id = hh_id
+        m.household_kind = "family" if is_family else "roommate"
+        m.household_role = roles[i] if roles else ""
+        m.housemates = [o.id for o in members if o.id != m.id]
+        m.home_building = rep.home_building
+        m.home_node = rep.home_node
+        m.home_floor = rep.home_floor
+
+
+def _family_roles(members_by_age: list) -> list:
+    """年齢昇順のメンバ列に続柄を割り当てる(決定論・現実化 S-R1)。
+
+    2人=年齢近接ペア(夫婦): 性別で夫/妻(同性・不明は同居人)。3-4人=親子: 年長の2人を親
+    (夫婦=夫/妻)、年少を子。年齢差は「年長=親・年少=子」で必ず現れる(束ねは年齢昇順)。"""
+    n = len(members_by_age)
+    if n == 2:
+        return [_ROLE_SPOUSE.get(getattr(m, "gender", ""), "同居人")
+                for m in members_by_age]
+    # 3-4人: 年長2人(末尾2)=親(夫婦の続柄)、残り(年少)=子
+    roles = ["子"] * n
+    for j in range(n - 2, n):                       # 末尾2 = 年長 = 親
+        roles[j] = _ROLE_SPOUSE.get(getattr(members_by_age[j], "gender", ""), "親")
+    return roles
+
+
+def _geo_key(a) -> str:
+    """束ねの地理キー(同じ住居建物→近接)。建物 id が無ければ home ノードで後退。"""
+    return getattr(a, "home_building", "") or getattr(a, "home_node", "") or ""
+
+
 def build_households(sim) -> None:
     """起動時1回: 居住者を決定論で世帯にまとめ、同一世帯で住居(home)を共有する。
 
-    決定論: 居住者を id 昇順に並べ、新 stream "household" からサイズを引いて先頭から詰める
-    (既存 draw 順に一切影響しない=OFF は完全 no-op)。2人以上の世帯にだけ household_id・
-    同居者 id を付し、home_building/home_node/home_floor を代表(最小 id)へ寄せる(夜間の家庭内
+    既定(realistic=false): 居住者を id 昇順に並べ、新 stream "household" からサイズを引いて
+    先頭から詰める(既存 draw 順に一切影響しない=OFF は完全 no-op)。realistic=true: 居住者を
+    (地理キー, 年齢) でソートしてから束ね(size_weights_realistic=渋谷実数)、2人=年齢近接の夫婦・
+    3-4人=年長の親+年少の子を決定論で割り当て household_role を付す。乱数は "household" のみ。
+    2人以上の世帯にだけ household_id・同居者 id を付し、home を代表(最小 id)へ寄せる(夜間の家庭内
     co-location)。simulation では本呼び出しの後に「顔なじみ」ブロックが home_building 共有から
-    初期関係を張る=housemate が自然に顔なじみになる。来街者(街の外に家)は世帯を組まない。"""
+    初期関係を張る。来街者(街の外に家)は世帯を組まない。"""
     cfg = sim.householdcfg
     if not cfg["enabled"]:
         return
-    residents = sorted((a for a in sim.agents if not a.visitor), key=lambda a: a.id)
     rng = sim.hub.stream("household")
+    realistic = bool(cfg.get("realistic"))
+    if realistic:                                  # 人口統計整合の束ね(地理×年齢)
+        residents = sorted(
+            (a for a in sim.agents if not a.visitor),
+            key=lambda a: (_geo_key(a), int(getattr(a, "age", 0)), a.id))
+        weights = cfg.get("size_weights_realistic") or cfg["size_weights"]
+    else:                                          # 現行=id 昇順の機械束ね(バイト一致)
+        residents = sorted((a for a in sim.agents if not a.visitor),
+                           key=lambda a: a.id)
+        weights = cfg["size_weights"]
+    scfg = dict(cfg)
+    scfg["size_weights"] = weights
     i = 0
     idx = 0
     while i < len(residents):
-        size = _pick_size(cfg, rng)
+        size = _pick_size(scfg, rng)
         members = residents[i:i + size]
         i += len(members)
         if len(members) < 2:                       # 単身世帯は個人のまま(何も付けない)
             continue
         is_family = bool(rng.random() < float(cfg["family_ratio"]))
-        rep = members[0]                           # 代表(最小 id)の住居を世帯で共有
         hh_id = f"hh{idx}"
         idx += 1
-        for m in members:
-            m.household_id = hh_id
-            m.household_kind = "family" if is_family else "roommate"
-            m.housemates = [o.id for o in members if o.id != m.id]
-            m.home_building = rep.home_building
-            m.home_node = rep.home_node
-            m.home_floor = rep.home_floor
+        roles = None
+        if realistic and is_family:                # 続柄割り当て(年齢昇順で親子/夫婦)
+            by_age = sorted(members, key=lambda m: (int(getattr(m, "age", 0)), m.id))
+            role_of = dict(zip((m.id for m in by_age), _family_roles(by_age)))
+            roles = [role_of[m.id] for m in members]
+        elif realistic:                            # ルームシェア=同居人
+            roles = ["同居人"] * len(members)
+        _assign_household(members, is_family, hh_id, roles)
 
 
 # ---------------------------------------------------------------- 家族/同居/恋人の文脈
@@ -143,7 +220,9 @@ def context_line(actor, nearby_ids, agent_by_id) -> str | None:
         if pid is not None and oid == pid:
             parts.append(f"恋人の{meta.name}")
         elif oid in housemates:
-            parts.append(f"{label}の{meta.name}")
+            # 現実化 S-R1: 続柄(夫/妻/親/子)があれば具体的な間柄に(無ければ現行文言)。
+            role = getattr(meta, "household_role", "")
+            parts.append(f"{role}の{meta.name}" if role else f"{label}の{meta.name}")
     return "、".join(parts[:3]) if parts else None
 
 
@@ -174,6 +253,69 @@ def date_dest(agent, sim, step: int, sim_min: int) -> str | None:
     lo, hi = (agent.id, pid) if agent.id < pid else (pid, agent.id)
     node = dests[(lo * 1000003 + hi * 97 + day) % len(dests)]
     return node if node != agent.node else None
+
+
+# ---------------------------------------------------------------- 夕食の共食(S-R1)
+def _at_home(agent) -> bool:
+    """在宅(自宅の建物の中、または自宅前の路上に静止)か(routine._at_home と同定義)。"""
+    if getattr(agent, "building", None) is not None:
+        return agent.building == agent.home_building
+    return not agent.route and agent.node == agent.home_node
+
+
+def dinner_dest(agent, sim, step: int, sim_min: int) -> str | None:
+    """夕食帯に世帯メンバの自由時間行き先を home へ寄せる(共食。date_dest と同型)。決定論・非LLM。
+
+    household OFF / family_dinner OFF / 同居者なし / 帯外 / 抽選外 なら乱数を一切引かず None
+    (既定不変)。専用 stream "dinner"(既存 draw 順を汚さない)で prob 抽選。行き先は自宅ノード=
+    同一世帯が home へ収束(夜間の家庭内 co-location)。現在地と同じなら None(=到着済み)。"""
+    cfg = sim.householdcfg
+    fd = cfg["family_dinner"]
+    if not cfg["enabled"] or not fd["enabled"]:
+        return None
+    if not (getattr(agent, "housemates", None) or []):
+        return None
+    m = sim_min % 1440
+    if not (int(fd["band_start_min"]) <= m < int(fd["band_end_min"])):
+        return None
+    rng = sim.hub.stream("dinner", agent.id, step)
+    if rng.random() >= float(fd["prob"]):
+        return None
+    home = getattr(agent, "home_node", "")
+    return home if home and home != agent.node else None
+
+
+def observe_dinner(sim, step: int, sim_min: int) -> None:
+    """毎 step: 夕食帯に同一世帯の2人以上が home で同席した最初の step で joint_activity
+    (type="family_dinner")を1件記録(1世帯1日1回)。OFF/帯外/非該当は即 return(=バイト一致)。"""
+    cfg = sim.householdcfg
+    fd = cfg["family_dinner"]
+    if not cfg["enabled"] or not fd["enabled"]:
+        return
+    m = sim_min % 1440
+    if not (int(fd["band_start_min"]) <= m < int(fd["band_end_min"])):
+        return
+    day = sim_min // 1440
+    logged = sim._dinner_logged
+    by_hh: dict = {}
+    for a in sim.agents:
+        hid = getattr(a, "household_id", None)
+        if hid is None or a.visitor:
+            continue
+        by_hh.setdefault(hid, []).append(a)
+    for hid, members in by_hh.items():
+        if (hid, day) in logged:
+            continue
+        present = [x for x in members if _at_home(x)]
+        if len(present) >= 2:
+            logged.add((hid, day))
+            leader = min(present, key=lambda x: x.id)
+            sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=leader.id,
+                                 kind="joint_activity", x=leader.x, y=leader.y,
+                                 payload={"type": "family_dinner",
+                                          "with": sorted(int(x.id) for x in present),
+                                          "place": leader.home_node, "tier": 0}))
+            sim._joint_total = getattr(sim, "_joint_total", 0) + 1
 
 
 # ---------------------------------------------------------------- 恋愛・パートナー形成(日次)

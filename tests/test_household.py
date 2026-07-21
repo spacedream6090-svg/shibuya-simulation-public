@@ -96,6 +96,82 @@ def test_family_context_line(tmp_path):
     assert household.context_line(a, [mate_id], sim.agent_by_id) == f"恋人の{mate_name}"
 
 
+# --------------------------------------------------------------------- 世帯の現実化(S-R1)
+_PARENTS = {"夫", "妻", "親"}
+
+
+def test_realistic_households(tmp_path):
+    """現実化 ON: 居住者が (地理×年齢) 整合で束ねられ、2人=夫婦(子なし)・3-4人=親子(親が年長)。
+
+    2人世帯: 続柄は夫/妻/同居人 で「子」を含まない(=年齢近接ペア=夫婦)。3-4人家族: 「子」を含み、
+    親(夫/妻/親)の年齢が子の年齢以上(年齢差=親子)。household_role が全員に付く。"""
+    sim = _sim(tmp_path, "real", n=40, **{"household.enabled": "true",
+                                          "household.realistic": "true"})
+    by_hh: dict = {}
+    for a in sim.agents:
+        if a.household_id is not None:
+            by_hh.setdefault(a.household_id, []).append(a)
+    assert by_hh, "現実化 ON なのに誰も世帯に属していない"
+    saw_couple = saw_parent_child = False
+    for _hh, members in by_hh.items():
+        roles = [m.household_role for m in members]
+        assert all(r for r in roles), "続柄(household_role)が未割当のメンバがいる"
+        assert all((m.home_building, m.home_node) ==
+                   (members[0].home_building, members[0].home_node)
+                   for m in members), "同一世帯で home が共有されていない"
+        if len(members) == 2 and members[0].household_kind == "family":
+            assert "子" not in roles, "2人家族に『子』が付いている(夫婦のはず)"
+            saw_couple = True
+        if len(members) >= 3 and members[0].household_kind == "family":
+            assert "子" in roles, "3-4人家族に『子』がいない"
+            kids = [m for m in members if m.household_role == "子"]
+            parents = [m for m in members if m.household_role in _PARENTS]
+            assert parents and kids, "親子の続柄が揃っていない"
+            assert min(p.age for p in parents) >= max(k.age for k in kids), \
+                "親の年齢が子より若い(親子の年齢差が逆転)"
+            saw_parent_child = True
+    assert saw_couple, "2人=夫婦の世帯が観測できない(n を増やすか較正を見直す)"
+    assert saw_parent_child, "3-4人=親子の世帯が観測できない(n を増やすか較正を見直す)"
+
+
+def test_realistic_off_matches_default_bundling(tmp_path):
+    """realistic=false(既定)は現行の id 順機械束ねと完全同一(household_role は付かない)。"""
+    sim = _sim(tmp_path, "nonreal", n=30, **_HH)
+    grouped = [a for a in sim.agents if a.household_id is not None]
+    assert grouped, "世帯 ON なのに誰も世帯に属していない"
+    assert all(a.household_role == "" for a in sim.agents), \
+        "非現実化なのに household_role が付いている"
+
+
+# --------------------------------------------------------------------- 夕食の共食(S-R1)
+def test_family_dinner_converges_and_logs(tmp_path):
+    """family_dinner ON: 夕食帯に世帯 home へ収束し2人以上同席で joint_activity(family_dinner)が
+    出る。1世帯1日1回(同一参加者集合の重複記録なし)。"""
+    sim = _sim(tmp_path, "fd", n=30, steps=100,
+               **{"household.enabled": "true",
+                  "household.family_dinner.enabled": "true",
+                  "household.family_dinner.prob": "1.0"})
+    sim.run()
+    fd = [e for e in _kind(sim, "joint_activity")
+          if e.payload.get("type") == "family_dinner"]
+    assert fd, "family_dinner ON なのに夕食共食イベントが1件も出ていない"
+    for e in fd:
+        assert len(e.payload["with"]) >= 2, "夕食共食の同席者が2人未満"
+        assert e.payload["place"], "夕食共食に place(home)が無い"
+    # 1世帯1日1回: day0(step<102)のみ=同一参加者集合の重複記録は無い
+    keys = [tuple(e.payload["with"]) for e in fd]
+    assert len(keys) == len(set(keys)), "同一世帯の夕食共食が1日に複数回記録されている"
+
+
+def test_family_dinner_off_no_events(tmp_path):
+    """household ON でも family_dinner OFF なら夕食共食イベントは 0 件(サブ機構の独立 OFF)。"""
+    sim = _sim(tmp_path, "fd_off", n=30, steps=100, **_HH)
+    sim.run()
+    fd = [e for e in _kind(sim, "joint_activity")
+          if e.payload.get("type") == "family_dinner"]
+    assert not fd, "family_dinner OFF なのに夕食共食イベントが出ている"
+
+
 # --------------------------------------------------------------------- パートナー形成
 def test_partner_forms_from_mutual_closeness(tmp_path):
     """恋愛 ON: 相互 closeness が閾値超の2者を決定論でパートナーにし partner_formed/life_event を出す。"""
