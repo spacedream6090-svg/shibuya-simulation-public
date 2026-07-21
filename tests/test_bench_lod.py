@@ -164,3 +164,100 @@ def test_scaling_markdown_backcompat():
     rows = [{"agents": 10, "steps": 60, "wall_s": 1.2}]
     txt = bench._markdown_table(rows)
     assert "agents" in txt and "ms/step" in txt
+
+
+# =============================================================================
+# scripts/bench_lod.py(思考リソースLOD 比較ハーネス)= 別ツール。上の bench.py の
+# 既存カバレッジを残したまま、同じ「LOD ベンチ」テーマの下に追記する(名前衝突の回避)。
+# 純関数(Gini/ヒスト/分布要約)+ 小規模 2 構成の in-process 実走(json 骨格)を検証。
+# =============================================================================
+def _load_bench_lod():
+    spec = importlib.util.spec_from_file_location(
+        "bench_lod_mod", REPO_ROOT / "scripts" / "bench_lod.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+bench_lod = _load_bench_lod()
+
+
+# ---- 純関数: Gini(在場全個体・0 を含む分布のまんべんなさ)----
+def test_gini_all_equal_is_zero():
+    assert bench_lod._gini([3, 3, 3, 3]) == 0.0
+    assert bench_lod._gini([0, 0, 0]) == 0.0      # 全 0 も 0(誰も思考せず=不均等ではない)
+    assert bench_lod._gini([]) == 0.0
+
+
+def test_gini_single_spike_approaches_one():
+    # 1 個体が全部を独占 → (n-1)/n。n=10 なら 0.9
+    g = bench_lod._gini([0] * 9 + [10])
+    assert abs(g - 0.9) < 1e-9
+    # より不均等(n 大)なほど 1 に近づく
+    assert bench_lod._gini([0] * 99 + [50]) > g
+
+
+def test_gini_monotone_with_inequality():
+    even = bench_lod._gini([5, 5, 5, 5, 5])
+    skew = bench_lod._gini([1, 1, 1, 1, 21])
+    assert even == 0.0 and skew > even
+
+
+# ---- 純関数: ヒストのバケット割当 ----
+def test_histogram_buckets():
+    counts = [0, 0, 1, 2, 2, 4, 7, 15, 25]
+    h = bench_lod._histogram(counts)
+    assert h["0"] == 2 and h["1"] == 1 and h["2"] == 2
+    assert h["3-5"] == 1 and h["6-10"] == 1 and h["11-20"] == 1 and h["21+"] == 1
+    assert sum(h.values()) == len(counts)
+
+
+# ---- 純関数: 分布要約(coverage/zeros/gini/median)----
+def test_summ_dist_shape():
+    counts = [0, 0, 1, 3, 3, 5]        # 6 個体・思考 0 が 2 人
+    s = bench_lod._summ_dist(counts)
+    assert s["n_agents"] == 6 and s["total_thinks"] == 12
+    assert s["zeros"] == 2 and s["coverage"] == round(4 / 6, 4)
+    assert s["max"] == 5 and s["median"] in (1, 3)
+    assert 0.0 <= s["gini"] <= 1.0
+    assert set(s["histogram"]) >= {"0", "1", "2", "3-5"}
+
+
+def test_summ_dist_empty():
+    s = bench_lod._summ_dist([])
+    assert s["n_agents"] == 0 and s["total_thinks"] == 0 and s["gini"] == 0.0
+
+
+# ---- markdown 表がキー欠損でも落ちない ----
+def test_comparison_markdown_renders():
+    rows = [{"label": "x", "wall_run_s": 1.0, "llm_calls": 10,
+             "think_dist": {"gini": 0.3, "mean": 2.0}}]
+    txt = bench_lod.comparison_markdown(rows)
+    assert "構成" in txt and "LLM呼" in txt and "peakRSS(MB)" in txt
+    dtxt = bench_lod.distribution_markdown(rows)
+    assert "Gini" in dtxt and "coverage" in dtxt
+
+
+# ---- 小規模 2 構成の in-process 実走: json 骨格 + 分布計算が通ること ----
+def test_run_matrix_inproc_skeleton(tmp_path):
+    payload = bench_lod.run_matrix_inproc(
+        ["cap300", "full"], agents=40, steps=24, seed=42, out_root=tmp_path)
+    meta = payload["meta"]
+    assert meta["backend"] == "mock" and meta["cache"] is False
+    assert meta["agents"] == 40 and meta["steps"] == 24 and meta["seed"] == 42
+    rows = payload["rows"]
+    assert [r["name"] for r in rows] == ["cap300", "full"]
+    for r in rows:
+        assert r["agents"] == 40 and r["steps"] == 24
+        assert r["wall_run_s"] >= 0.0 and r["llm_calls"] >= 0
+        assert isinstance(r["llm_by_purpose"], dict)
+        d = r["think_dist"]
+        # 分布は在場全個体(=40)で採る。思考0の個体も母数に含む。
+        assert d["n_agents"] == 40
+        # ヒストは人数のバケット分割 → 合計は在場全個体数に一致(思考0を含む)。
+        assert sum(d["histogram"].values()) == d["n_agents"]
+        assert 0 <= d["zeros"] <= d["n_agents"]
+        assert 0.0 <= d["gini"] <= 1.0
+    # N 比例(density0.15×40=6)は固定 cap300 より step 予算が小さい
+    assert rows[1]["budget_max_per_step"] == 6
+    assert rows[0]["budget_max_per_step"] == 300
