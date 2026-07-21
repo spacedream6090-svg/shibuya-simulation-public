@@ -26,6 +26,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 STEP_MINUTES = 10           # 1 step = 10 分(sim クロック Clock と同一)
 DEFAULT_START_MIN = 7 * 60  # 既定開始 07:00(sim_min 列が無いランのフォールバック=従来値)
 
+# 語彙の伝播(transmission)を1語あたりこの辺数で上限。超過は決定論規則で間引き、
+# out["caps"] に (kept/total) を記録=silent cap 禁止(画面にも「表示は上位N」と出す)。
+# 大ラン(daily300=130万伝播)でも dashboard が開けるサイズに抑えるための保険。
+TRANS_CAP_PER_WORD = 2000
+
 
 def _parse_start_tod(v) -> int:
     """"HH:MM"(または分 int)を分 of day(0..1439)へ。None/不正は既定 07:00。
@@ -385,6 +390,9 @@ def build_data(run_dir: Path, include_traffic: bool = True,
     net_posts, net_dms, net_news, searches = [], [], [], []
     state_series: dict[int, list] = defaultdict(list)
     vocab: dict[str, dict] = {}
+    # 語彙の来歴: transmission(聴取1辺=誰から誰へどのチャネルで)を item_id ごとに素で貯める。
+    # 後段で語ごとに上限(TRANS_CAP_PER_WORD)まで決定論間引き→ vocab[item]["trans"] へ。
+    trans_raw: dict[str, list] = defaultdict(list)
     for e in events:
         p = json.loads(e["payload"]) if e["payload"] else {}
         kind = e["kind"]
@@ -421,8 +429,21 @@ def build_data(run_dir: Path, include_traffic: bool = True,
                 pairs.append([e["step"], e["agent_id"], hearer])
         elif kind == "vocab_coin":
             feed.append({"s": e["step"], "a": e["agent_id"], "k": "coin", "t": p["text"]})
+            # 発生文脈(ctx): coin payload から item_id/text を除いた残り(fire_reason/place/
+            # drive/company_ids/saw_feed/adopted_n/media 等)=語の誕生のきっかけの観測。
+            # recent_mem は自由文で嵩むため落とす(観測に必須でなく上限対策)。
+            ctx = {k: v for k, v in p.items()
+                   if k not in ("item_id", "text", "recent_mem")}
+            media = bool(p.get("media")) or e["agent_id"] == -1   # メディア発(creator=-1)
             vocab[p["item_id"]] = {"w": p["text"], "born": e["step"],
-                                   "creator": e["agent_id"], "adopts": []}
+                                   "creator": e["agent_id"], "adopts": [],
+                                   "ctx": ctx, "media": media}
+        elif kind == "transmission":
+            # provenance.py: agent_id=聞き手(to)、payload={item_id, from, channel, (dist_m)}。
+            iid = p.get("item_id")
+            if iid is not None:
+                trans_raw[iid].append((e["step"], p.get("from"), e["agent_id"],
+                                       p.get("channel", "")))
         elif kind == "label_adopt":
             feed.append({"s": e["step"], "a": e["agent_id"], "k": "adopt", "t": p["text"]})
             if p.get("item_id") in vocab:
@@ -455,6 +476,36 @@ def build_data(run_dir: Path, include_traffic: bool = True,
         "names": [buildings[bi].get("name") or f"ビル#{bi}" for bi in top_blds],
         "series": [[occ.get(bi, 0) for occ in occ_per_step] for bi in top_blds]}
 
+    # ---- 語ごとの伝播辺(trans)を上限まで決定論間引き + caps に記録 ----
+    # trans: [[step, from, to, channel], ...](to=聞き手)。step 昇順(安定)で格納。
+    # 間引き規則(決定論・超過語のみ): ①各採用者の「当人宛の最初の聴取辺」を最優先で残す
+    #   (=採用に効いた辺。伝播ネットワーク図のエッジ規則と一致)→ ②残り枠を step の早い辺で充填。
+    #   最後に step 昇順へ整列。tn=間引き前の総辺数(常時)。caps=間引いた語の記録(silent 禁止)。
+    caps: list[dict] = []
+    for iid, v in vocab.items():
+        raw = trans_raw.get(iid, [])
+        total = len(raw)
+        v["tn"] = total
+        if total <= TRANS_CAP_PER_WORD:
+            kept = sorted(raw, key=lambda r: r[0])   # 安定ソート=同 step は記録順を保つ
+        else:
+            adopters = {a for _s, a in v["adopts"]}
+            first_to: dict[int, int] = {}            # 採用者 → 当人宛の最初の辺の index
+            for k, (s, fr, to, ch) in enumerate(raw):
+                if to in adopters and to not in first_to:
+                    first_to[to] = k
+            key_idx = set(first_to.values())         # 採用に効いた辺(最優先で残す)
+            chosen = set(key_idx)
+            for k in sorted(range(total), key=lambda k: (raw[k][0], k)):
+                if len(chosen) >= TRANS_CAP_PER_WORD:
+                    break
+                chosen.add(k)
+            picks = sorted(chosen, key=lambda k: (raw[k][0], k))[:TRANS_CAP_PER_WORD]
+            kept = [raw[k] for k in picks]
+            caps.append({"item_id": iid, "w": v["w"],
+                         "kept": len(kept), "total": total})
+        v["trans"] = [[s, fr, to, ch] for (s, fr, to, ch) in kept]
+
     rails = [{"k": r["kind"], "g": r["geometry"]} for r in city.get("railways", [])]
     rail_lines = build_rail_lines(city, transit_data)
 
@@ -474,6 +525,7 @@ def build_data(run_dir: Path, include_traffic: bool = True,
     out = {"agents": agents_meta, "ids": agent_ids, "positions": positions,
             "moves": moves, "traffic": traffic, "feed": feed, "pairs": pairs,
             "vocab": sorted(vocab.values(), key=lambda v: v["born"]),
+            "caps": caps,
             "labels": [{"x": n["x"], "y": n["y"], "n": n["name"]}
                        for n in city["nodes"] if n.get("name")],
             "edges": [{"k": e.get("klass", "footway"), "l": e.get("layer", 0),
@@ -945,7 +997,7 @@ __BASE_CSS__
     <select id="colorBy">
       <option value="id">個体色</option><option value="gender">性別</option>
       <option value="age">年齢</option><option value="occ">職業</option>
-      <option value="mode">移動</option><option value="vocab">語彙</option>__COMMUNITY_OPTION__
+      <option value="mode">移動</option><option value="vocab">語彙</option><option value="vocabword">語彙(語別)</option>__COMMUNITY_OPTION__
     </select>
     <select id="floorFilter">
       <option value="all">階:すべて</option>
@@ -1093,6 +1145,19 @@ const OCC_COLORS = {};__COMMUNITY_JS__
 function agentWords(id, s0){ const out=[];
   for(const v of D.vocab){ if(v.creator===id && v.born<=s0) out.push(v.w);
     else if(v.adopts.some(x=>x[0]<=s0 && x[1]===id)) out.push(v.w); } return out; }
+// ---- 語彙(語別)モード: 選択した1語の知識状態を s0 時点でキャッシュ(採用済/聴取済み未採用/未接触)。
+// D.vocab のインデックスで語を指す(selector option の value)。idx/s0 が変わった時だけ再構築。
+let _vwIdx=-1, _vwStep=-2, _vwAdopt=null, _vwHeard=null;
+function vwState(s0){
+  const sel=document.getElementById('vocabWordSel');
+  const idx=sel? Number(sel.value) : -1;
+  if(idx===_vwIdx && s0===_vwStep && _vwAdopt) return;
+  _vwIdx=idx; _vwStep=s0; _vwAdopt=new Set(); _vwHeard=new Set();
+  const v=D.vocab[idx]; if(!v) return;
+  if(v.creator>=0) _vwAdopt.add(v.creator);
+  for(const a of v.adopts){ if(a[0]<=s0) _vwAdopt.add(a[1]); }
+  for(const e of (v.trans||[])){ if(e[0]<=s0) _vwHeard.add(e[2]); }
+}
 function colorOf(i, s0){
   const mode = document.getElementById('colorBy').value;
   const a = D.agents[i]||{};__COMMUNITY_HOOK__
@@ -1101,6 +1166,10 @@ function colorOf(i, s0){
   if(mode==='occ'){ if(!(a.occupation in OCC_COLORS)){ let h=0; for(const c of a.occupation||'') h=(h*31+c.charCodeAt(0))%360; OCC_COLORS[a.occupation]=h; } return `hsl(${OCC_COLORS[a.occupation]} 65% 62%)`; }
   if(mode==='mode'){ const m=modeAt(s0,i); __MODE_TAXI__return m===2?'#f59e0b':m===1?'#6ee7b7':m===0?'#60a5fa':'#8a97a5'; }
   if(mode==='vocab'){ const n=agentWords(D.ids[i],s0).length; return n===0?'#5b6572':n<3?'#d9c26a':'#ffd166'; }
+  if(mode==='vocabword'){ vwState(s0); const id=D.ids[i];
+    if(_vwAdopt && _vwAdopt.has(id)) return '#ffd166';    // 採用済=濃
+    if(_vwHeard && _vwHeard.has(id)) return '#8a7a2a';    // 聴取済み未採用=中間
+    return '#3c4552'; }                                   // 未接触=灰
   return `hsl(${hue(i)} 70% 60%)`;
 }
 
@@ -1422,6 +1491,23 @@ function loop(ts){
 document.getElementById('play').onclick=()=>{ playing=!playing;
   document.getElementById('play').textContent=playing?'⏸':'▶'; };
 seek.oninput=()=>{ cur=Number(seek.value); };
+// ---- 語彙(語別)モードの語選択パネル(colorBy='vocabword' の時だけ表示)----
+// 上位語を採用者数順にセレクタへ。選ぶと「その語を知っている人だけ」が地図で濃/中間/灰に。
+// 時間スライダーで伝播が地図上に広がって見えるのが狙い(既存 mode の挙動は不変)。
+(function(){
+  if(!D.vocab || !D.vocab.length) return;
+  const el=document.createElement('div'); el.className='glass'; el.id='vocabWordPanel';
+  el.style.cssText='position:fixed;left:12px;bottom:70px;z-index:6;display:none;padding:6px 10px;font-size:11px;max-width:270px;';
+  const top=D.vocab.map((v,idx)=>({idx,v,n:v.adopts.length})).sort((a,b)=>b.n-a.n).slice(0,80);
+  const opts=top.map(o=>`<option value="${o.idx}">${o.v.w}(${o.n}人)</option>`).join('');
+  el.innerHTML='<b style="margin-right:5px">語彙(語別)</b><select id="vocabWordSel">'+opts+'</select>'
+    +'<div style="margin-top:4px;color:var(--dim)"><span style="color:#ffd166">●</span>採用 '
+    +'<span style="color:#8a7a2a">●</span>聴取のみ <span style="color:#3c4552">●</span>未接触</div>';
+  document.body.appendChild(el);
+  const cb=document.getElementById('colorBy');
+  const upd=()=>{ el.style.display=(cb&&cb.value==='vocabword')?'block':'none'; };
+  if(cb) cb.addEventListener('change', upd); upd();
+})();
 __MODE_LEGEND_JS__fit(); lastT=performance.now(); requestAnimationFrame(loop);
 </script></body></html>
 """
@@ -1483,8 +1569,19 @@ __BASE_CSS__
   .serp .res { padding:7px 2px; }
   .serp .res .tt { color:#1a73e8; font-size:14px; cursor:default; }
   .serp .res .sn { color:var(--dim); font-size:12px; }
-  .vocab { font-size:13px; padding:5px 8px; display:flex; justify-content:space-between; max-width:480px; }
+  .vocab { font-size:13px; padding:5px 8px; display:flex; justify-content:space-between; max-width:480px; border-radius:8px; }
+  .vocab.clk { cursor:pointer; }
+  .vocab.clk:hover { background:var(--surface2); }
   .vocab b { color:var(--accent); }
+  /* 語彙の詳細(採用曲線・伝播ネットワーク・伝播ログ) */
+  .vlegend { display:flex; gap:14px; font-size:11.5px; color:var(--dim); margin:2px 2px 8px; flex-wrap:wrap; }
+  .vlegend i { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:4px; vertical-align:middle; }
+  .vlog { max-height:320px; overflow-y:auto; font-size:12px; border:1px solid var(--line); border-radius:12px; }
+  .vlog .row { padding:5px 10px; border-bottom:1px solid var(--line); line-height:1.5; }
+  .vlog .row:last-child { border-bottom:0; }
+  .vlog .birth { background:var(--surface2); border-left:3px solid var(--accent); }
+  .vlog .ch { font-weight:600; }
+  .vcap { font-size:11px; color:#e8a33d; margin:2px 2px 6px; }
   .bld { font-size:12.5px; padding:7px 10px; margin:4px 0; background:var(--surface2); border-radius:8px; cursor:pointer; display:flex; justify-content:space-between; max-width:520px; }
   .bld:hover { background:var(--btnH); }
   .roster { font-size:12.5px; display:grid; grid-template-columns:repeat(auto-fill,minmax(190px,1fr)); gap:6px; }
@@ -1546,7 +1643,7 @@ __TIME_JS__
 __THEME_JS__
 __FLOOR_JS__
 const seek=document.getElementById('seek'); seek.max=D.nSteps-1;
-let cur=D.nSteps-1, playing=false, lastT=0, tab='feed', dmSel=null;
+let cur=D.nSteps-1, playing=false, lastT=0, tab='feed', dmSel=null, vocabSel=null;
 seek.value=cur;
 const body=document.getElementById('body');
 const S0=()=>Math.floor(cur);
@@ -1577,6 +1674,9 @@ function render(force){
   const s0=S0();
   if(tab==='scen'){ if(force && !document.querySelector('.scenForm')) renderScen(); return; }
   if(!force && (tab==='rel')) { drawRel(); return; }
+  // 語彙の詳細を開いている間は step 変化で DOM を作り直さず canvas/ログだけ更新
+  // (rel タブと同じ流儀。再生スクラブで曲線・ネットワークが「伸びる」)。
+  if(!force && tab==='vocab' && vocabSel!==null && document.getElementById('vcNet')){ drawVocabDetail(); return; }
   if(tab==='feed') renderFeed(s0);
   else if(tab==='sns') renderSns(s0);
   else if(tab==='dm') renderDm(s0, force);
@@ -1873,12 +1973,162 @@ function drawRel(noPhysics){
   g.setTransform(1,0,0,1,0,0);   // 変換を元に戻す(他描画・clearRect のため)
 }
 
+// ---- 語彙の広がりの可視化(第45バッチ)----
+// チャネル分類: 対面(face)/DM(dm)/SNS(sns)/メディア(search・event・news・その他)。
+const VCH_COLOR = {face:'#34d399', dm:'#f472b6', sns:'#60a5fa',
+                   search:'#fbbf24', event:'#fbbf24', news:'#fbbf24'};
+function vchCat(ch){ return ch==='face'?'対面':ch==='dm'?'DM':ch==='sns'?'SNS':'メディア'; }
+function vchColor(ch){ return VCH_COLOR[ch]||'#94a3b8'; }
+const VNET_CAP=250;   // ネットワーク図に描く採用者ノードの上限(超過は「表示は上位N」と明示)
+
 function renderVocab(s0){
-  const rows=D.vocab.filter(v=>v.born<=s0).map(v=>({w:v.w, born:v.born, by:nameOf(v.creator),
-    n:1+v.adopts.filter(x=>x[0]<=s0).length})).sort((a,b)=>b.n-a.n).slice(0,40);
-  body.innerHTML='<div style="font-size:12px;color:var(--dim);margin-bottom:8px">生まれた言葉と使用者数(詳しい推移は「分析」タブの①)</div>'
-    +(rows.map(r=>`<div class="vocab"><span>「<b>${r.w}</b>」 <span style="color:var(--dim);font-size:11px">${tstr(r.born)} ${r.by}発</span></span><span>${r.n}人</span></div>`).join('')
+  if(vocabSel!==null && D.vocab[vocabSel]) { renderVocabDetail(); return; }
+  // 一覧(クリックで詳細へ)。使用者数=創案者1 + s0 までの採用者。
+  const rows=D.vocab.map((v,idx)=>({v,idx})).filter(({v})=>v.born<=s0)
+    .map(({v,idx})=>({idx, w:v.w, born:v.born, by:nameOf(v.creator), media:v.media,
+      n:1+v.adopts.filter(x=>x[0]<=s0).length})).sort((a,b)=>b.n-a.n).slice(0,60);
+  body.innerHTML='<div style="font-size:12px;color:var(--dim);margin-bottom:8px">生まれた言葉をクリックすると、採用曲線・伝播ネットワーク・伝播ログで「どう広がったか」を追えます(再生時刻に連動)</div>'
+    +(rows.map(r=>`<div class="vocab clk" onclick="vocabSel=${r.idx};render(true)"><span>「<b>${r.w}</b>」 <span style="color:var(--dim);font-size:11px">${tstr(r.born)} ${r.media?'📢メディア発':r.by+'発'}</span></span><span>${r.n}人 ›</span></div>`).join('')
     ||'<div class="ev">まだ言葉が生まれていない</div>');
+}
+
+function renderVocabDetail(){
+  const v=D.vocab[vocabSel], s0=S0();
+  const cap=(D.caps||[]).find(c=>c.w===v.w && c.total>c.kept);
+  body.innerHTML=`
+    <button class="vback" onclick="vocabSel=null;render(true)">← 語彙一覧へ</button>
+    <h2 style="font-size:18px;margin:2px 0">「${v.w}」</h2>
+    <div style="font-size:12px;color:var(--dim);margin-bottom:10px">
+      誕生 ${tstr(v.born)} · ${v.media?'📢 メディア発(creator=-1)':'発案 '+nameOf(v.creator)}
+      · 累計採用 ${v.adopts.length}人 · 記録された聴取辺 ${v.tn||0}本</div>
+    ${cap?`<div class="vcap">⚠ 聴取辺が多いため上位 ${cap.kept} / 全 ${cap.total} 本のみ表示(誕生初期の採用に効いた辺を優先)</div>`:''}
+    <div class="chartBox"><h3>① 採用曲線(累積採用者数)</h3>
+      <div class="sub">現在時刻(点線)まで実線・以降は薄く。スクラバーを動かすと伸びます</div>
+      <canvas id="vcCurve"></canvas></div>
+    <div class="chartBox"><h3>② 伝播ネットワーク(誰から誰へ・チャネル色分け)</h3>
+      <div class="sub">中心=発案者。採用者を採用時刻順に外へ配置。エッジ=当人の採用に効いた最初の聴取辺</div>
+      <div class="vlegend">
+        <span><i style="background:${VCH_COLOR.face}"></i>対面</span>
+        <span><i style="background:${VCH_COLOR.dm}"></i>DM</span>
+        <span><i style="background:${VCH_COLOR.sns}"></i>SNS</span>
+        <span><i style="background:${VCH_COLOR.search}"></i>メディア/検索</span>
+        <span id="vnetNote" style="color:var(--dim)"></span></div>
+      <canvas id="vcNet" style="height:340px"></canvas></div>
+    <div class="chartBox"><h3>③ 伝播ログ(時刻順・新しい順)</h3>
+      <div class="sub">誰が誰からどのチャネルで聞いて採用したか。先頭は誕生と発生文脈(きっかけ)</div>
+      <div class="vlog" id="vcLog"></div></div>`;
+  drawVocabDetail();
+}
+
+// item の trans は step 昇順 → 各 to の最初の出現 = 「当人宛の最初の聴取辺」(採用に効いた辺)。
+function firstHear(v){ const m={};
+  for(const e of (v.trans||[])){ const to=e[2]; if(!(to in m)) m[to]=e; } return m; }
+
+function drawVocabDetail(){
+  const v=D.vocab[vocabSel]; if(!v) return; const s0=S0();
+  drawVCurve(document.getElementById('vcCurve'), v, s0);
+  drawVNet(document.getElementById('vcNet'), v, s0);
+  drawVLog(document.getElementById('vcLog'), v, s0);
+}
+
+// ① 採用曲線: 累積採用者数 vs 時刻。s0 まで実線・以降は薄い破線。
+function drawVCurve(c, v, s0){
+  if(!c) return; c.width=c.clientWidth*devicePixelRatio; c.height=c.clientHeight*devicePixelRatio;
+  const g=c.getContext('2d'), W=c.width, H=c.height;
+  const mL=42*devicePixelRatio, mB=26*devicePixelRatio, mT=10*devicePixelRatio, mR=12*devicePixelRatio;
+  const T=themeAt(cur), ink=_css(T.ink), dim=_css(T.dim);
+  const grid=T.k>.5?'rgba(255,255,255,.10)':'rgba(0,0,0,.10)';
+  g.clearRect(0,0,W,H);
+  const pts=[[v.born,1]]; let n=1;
+  for(const a of v.adopts.slice().sort((x,y)=>x[0]-y[0])){ n++; pts.push([a[0],n]); }
+  pts.push([D.nSteps-1,n]);
+  const x0=v.born, x1=D.nSteps-1, ymax=Math.max(1,n)*1.1;
+  const X=s=>mL+(W-mL-mR)*(x1>x0?(s-x0)/(x1-x0):0), Y=val=>H-mB-(H-mB-mT)*val/ymax;
+  g.strokeStyle=grid; g.fillStyle=dim; g.font=`${10*devicePixelRatio}px system-ui`; g.textAlign='right';
+  for(let k=0;k<=4;k++){ const val=ymax*k/4; g.beginPath(); g.moveTo(mL,Y(val)); g.lineTo(W-mR,Y(val)); g.stroke();
+    g.fillText(Math.round(val), mL-5*devicePixelRatio, Y(val)+3*devicePixelRatio); }
+  // 折れ線(step 関数): s0 で実線/破線を分ける
+  const drawSeg=(solid)=>{ g.beginPath(); let started=false, prev=null;
+    for(const p of pts){
+      if(solid && p[0]>s0){ if(prev){ const yv=prev[1]; g.lineTo(X(Math.min(s0,x1)),Y(yv)); } break; }
+      if(!started){ g.moveTo(X(p[0]),Y(p[1])); started=true; }
+      else { g.lineTo(X(p[0]),Y(prev[1])); g.lineTo(X(p[0]),Y(p[1])); }
+      prev=p; } g.stroke(); };
+  // 以降(薄い破線・全区間)
+  g.strokeStyle=T.k>.5?'rgba(255,209,102,.35)':'rgba(180,130,20,.35)'; g.lineWidth=1.6*devicePixelRatio; g.setLineDash([4,4]);
+  g.beginPath(); { let started=false, prev=null;
+    for(const p of pts){ if(!started){ g.moveTo(X(p[0]),Y(p[1])); started=true; }
+      else { g.lineTo(X(p[0]),Y(prev[1])); g.lineTo(X(p[0]),Y(p[1])); } prev=p; } } g.stroke();
+  g.setLineDash([]);
+  // s0 まで実線(上に重ねる)
+  g.strokeStyle='#ffd166'; g.lineWidth=2.2*devicePixelRatio; drawSeg(true);
+  // 現在時刻カーソル
+  g.strokeStyle='rgba(255,209,102,.7)'; g.setLineDash([4,4]); g.lineWidth=1*devicePixelRatio;
+  g.beginPath(); g.moveTo(X(Math.min(s0,x1)),mT); g.lineTo(X(Math.min(s0,x1)),H-mB); g.stroke(); g.setLineDash([]);
+  // x 軸時刻
+  g.fillStyle=dim; g.textAlign='center';
+  for(let s=x0; s<=x1; s+=Math.max(6,Math.round((x1-x0)/6/6)*6||6)){
+    const mm=D.startMin+s*10; g.fillText(`${Math.floor(mm/60)%24}時`, X(s), H-mB+15*devicePixelRatio); }
+}
+
+// ② 伝播ネットワーク: 発案者中心・採用者を採用時刻順に外へ・エッジ=最初の聴取辺(チャネル色)。
+function drawVNet(c, v, s0){
+  if(!c) return; c.width=c.clientWidth*devicePixelRatio; c.height=c.clientHeight*devicePixelRatio;
+  const g=c.getContext('2d'), W=c.width, H=c.height, cx=W/2, cy=H/2;
+  const T=themeAt(cur), dim=_css(T.dim);
+  g.clearRect(0,0,W,H);
+  const fh=firstHear(v);
+  // s0 までの採用者を採用時刻順に(上限 VNET_CAP=早い順)
+  let ad=v.adopts.filter(a=>a[0]<=s0).slice().sort((x,y)=>x[0]-y[0]);
+  const total=ad.length; if(ad.length>VNET_CAP) ad=ad.slice(0,VNET_CAP);
+  const note=document.getElementById('vnetNote');
+  if(note) note.textContent = total>VNET_CAP? `(採用者 ${total}人中 早い ${VNET_CAP}人を表示)` : (total?`(採用者 ${total}人)`:'');
+  const pos={}; pos[v.creator]=[cx,cy];
+  const R=Math.min(W,H)*0.44;
+  ad.forEach((a,i)=>{ const ang=i*2.399963;              // 黄金角スパイラル(重なりにくい)
+    const rr=R*Math.sqrt((i+1)/(ad.length+1));
+    pos[a[1]]=[cx+Math.cos(ang)*rr, cy+Math.sin(ang)*rr]; });
+  // エッジ(採用者ごとに「最初の聴取辺の from」→当人。from が図に無ければ発案者へ退避)
+  for(const a of ad){ const to=a[1], e=fh[to];
+    let from = (e && e[1]!==undefined && e[1] in pos)? e[1] : v.creator;
+    const ch = e? e[3] : 'face';
+    const P=pos[from], Q=pos[to]; if(!P||!Q) continue;
+    g.strokeStyle=vchColor(ch)+'aa'; g.lineWidth=1.3*devicePixelRatio;
+    g.beginPath(); g.moveTo(P[0],P[1]); g.lineTo(Q[0],Q[1]); g.stroke(); }
+  // ノード
+  g.font=`${10*devicePixelRatio}px system-ui`; g.textAlign='center';
+  for(const a of ad){ const P=pos[a[1]]; if(!P) continue;
+    g.fillStyle=colOf(a[1]); g.beginPath(); g.arc(P[0],P[1],4*devicePixelRatio,0,7); g.fill(); }
+  // 発案者(中心・強調)
+  const cP=pos[v.creator];
+  g.fillStyle=v.media?'#f43f5e':colOf(v.creator);
+  g.beginPath(); g.arc(cP[0],cP[1],8*devicePixelRatio,0,7); g.fill();
+  g.strokeStyle=T.k>.5?'#fff':'#111'; g.lineWidth=2*devicePixelRatio; g.stroke();
+  g.fillStyle=dim; g.fillText(v.media?'📢メディア':nameOf(v.creator), cP[0], cP[1]-12*devicePixelRatio);
+  if(!ad.length){ g.fillStyle=dim; g.textAlign='center'; g.font=`${12*devicePixelRatio}px system-ui`;
+    g.fillText('この時刻ではまだ採用者がいません', cx, cy+30*devicePixelRatio); }
+}
+
+// ③ 伝播ログ: s0 までの採用を新しい順に。先頭(最下)は誕生+発生文脈。
+function drawVLog(el, v, s0){
+  if(!el) return; const fh=firstHear(v);
+  const ad=v.adopts.filter(a=>a[0]<=s0).slice().sort((x,y)=>x[0]-y[0]);
+  const rows=ad.map(a=>{ const to=a[1], e=fh[to];
+    const from = e? nameOf(e[1]) : '(不明)';
+    const ch = e? e[3] : '';
+    const label = ch? `<span class="ch" style="color:${vchColor(ch)}">${vchCat(ch)}</span>で` : '';
+    return `<div class="row">${tstr(a[0])} <b style="color:${colOf(to)}">${nameOf(to)}</b> が ${from} から ${label}聞いて採用</div>`;
+  }).reverse().slice(0, 160);
+  // 誕生行(発生文脈=きっかけの観察)
+  const ctx=v.ctx||{}; const bits=[];
+  if(ctx.place) bits.push(`場所: ${ctx.place}`);
+  if(ctx.fire_reason) bits.push(`きっかけ: ${ctx.fire_reason}`);
+  if(ctx.drive!==undefined) bits.push(`drive: ${ctx.drive}`);
+  if(ctx.saw_feed) bits.push('直前にフィード視聴');
+  if(Array.isArray(ctx.company_ids)&&ctx.company_ids.length) bits.push(`同席 ${ctx.company_ids.length}人`);
+  const birth=`<div class="row birth">🌱 ${tstr(v.born)} <b style="color:${v.media?'#f43f5e':colOf(v.creator)}">${v.media?'📢メディア':nameOf(v.creator)}</b> が「${v.w}」を発案`
+    +(bits.length?` <span style="color:var(--dim)">— ${bits.join(' / ')}</span>`:'')+'</div>';
+  el.innerHTML = rows.join('') + birth;
 }
 let bldQuery='';
 function renderBld(s0){
