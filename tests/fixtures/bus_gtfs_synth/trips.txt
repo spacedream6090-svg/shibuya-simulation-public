@@ -1,0 +1,7 @@
+route_id,service_id,trip_id,direction_id,trip_headsign
+R1,WD,R1WD1,0,M1東
+R1,WD,R1WD2,0,M1東
+R1,WD,R1WD3,0,M1東
+R1,WE,R1WE1,0,M1東
+R2,WD,R2WD1,0,M2西
+R2,WD,R2WD2,0,M2西

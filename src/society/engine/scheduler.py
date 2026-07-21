@@ -31,6 +31,7 @@ from .. import delivery as delivery_mod
 from .. import services as services_mod
 from .. import status as status_mod
 from .. import street as street_mod
+from .. import transit_live as transit_live
 from .. import work as work_mod
 from .. import worldview as worldview_mod
 from ..net import infoenv as infoenv_mod
@@ -635,7 +636,9 @@ def _charge_ride(sim, agent, ride: dict, step: int, sim_min: int) -> None:
                "from": ride.get("from"), "to": ride.get("to")}
     # SUMO ライブ連成(v-Ride-1): 配車待ち/乗車時間/自由流超過を必ず記録(観測可能性=間接影響を
     # L2 で事後に測れる状態にする。traffic-indirect-effects.md §5 条件(5))。live OFF は付かない=バイト一致。
-    for _k in ("wait_s", "ride_s", "delay_s"):
+    # v-Ride-2 バス静的表: wait_s/ride_s/delay_s(実ダイヤ近似)。v-Ride-3 相乗り: shared(同乗者数)。
+    # いずれも OFF は ride に無い=payload に付かない=バイト一致。
+    for _k in ("wait_s", "ride_s", "delay_s", "shared"):
         if _k in ride:
             payload[_k] = ride[_k]
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
@@ -671,8 +674,33 @@ def _taxi_live_dispatch(sim, agent, dest, step: int, sim_min: int) -> None:
     ride["wait_s"] = res["wait_s"]                  # payload 観測(_charge_ride が記録)
     ride["ride_s"] = res["ride_s"]
     ride["delay_s"] = res["delay_s"]
+    if "shared" in res:                             # v-Ride-3 相乗り(同乗者数)。単発時は付かない=v-Ride-1 同一
+        ride["shared"] = res["shared"]
     hold = int(res["hold_steps"])
     if hold > 0:                                    # 配車待ち+超過を到着 step の追加待ちへ(車が来るまで動かない)
+        agent._taxi_hold_until = step + hold
+
+
+def _bus_ride_hold(sim, agent, dest, step: int) -> None:
+    """実バスダイヤ静的表 v-Ride-2 の到着 step 反映(_apply move_to から呼ぶ)。
+
+    既定 OFF(bus_table 無効=ride に wait_s が無い)は即 return=何も起きない=バイト一致。ON かつ
+    バスの実ダイヤ近似のときだけ:次便待ち wait_s + 自由流超過(区間所要 − 直線自由流)を到着 step の
+    追加待ち hold へ量子化し、観測用 delay_s を ride に足す(到着 step ≈ ceil((呼時刻+待ち+乗車)/step))。
+    乱数・k/belief を一切見ない純幾何+純ダイヤ計算(no-fingerprint)。taxi live と同じ hold 機構を共有。
+    ride["from"/"to"] は停留所 id(=地図ノードとは限らない)なので、自由流は agent.node→dest で測る。"""
+    ride = getattr(agent, "_ride_pending", None)
+    if not ride or ride.get("mode") != "bus" or "wait_s" not in ride:
+        return
+    speeds = sim.cfg.world.modes.speeds
+    car_m_per_s = float(speeds["car"]) / 600.0
+    fx, fy = sim.city.node_xy(agent.node)
+    tx, ty = sim.city.node_xy(dest)
+    free_s = math.hypot(fx - tx, fy - ty) / max(1e-6, car_m_per_s)
+    delay_s = max(0.0, float(ride["ride_s"]) - free_s)
+    ride["delay_s"] = round(delay_s, 1)
+    hold = transit_live.quantize_hold(float(ride["wait_s"]), delay_s)
+    if hold > 0:
         agent._taxi_hold_until = step + hold
 
 
@@ -2122,6 +2150,9 @@ def _apply(sim, agent, action: dict, step: int, sim_min: int) -> None:
         # SUMO ライブ連成タクシー配車 v-Ride-1(既定 OFF=None=no-op=used_mode 不変=バイト一致)。
         # ON 時のみ予約注入→配車待ち/超過を到着 step へ反映。未配車なら trip_mode を walk へ差し替える。
         _taxi_live_dispatch(sim, agent, action["dest"], step, sim_min)
+        # 実バスダイヤ静的表 v-Ride-2(既定 OFF=ride に wait_s 無し=no-op=バイト一致)。
+        # ON 時のみバスの次便待ち+区間所要を到着 step の追加待ちへ反映(taxi と同じ hold 機構)。
+        _bus_ride_hold(sim, agent, action["dest"], step)
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                              kind="route_start", x=agent.x, y=agent.y,
                              payload={"dest": action["dest"],

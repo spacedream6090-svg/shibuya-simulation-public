@@ -44,6 +44,13 @@ def live_cfg(cfg) -> dict | None:
     if not bool(live.get("enabled", False)):
         return None
     speeds = cfg.world.modes.speeds
+    # v-Ride-3 相乗り(既定 OFF=enabled false=v-Ride-1 と完全同一=単発配車のみ)。
+    shared_raw = live.get("shared", {}) or {}
+    shared = {
+        "enabled": bool(shared_raw.get("enabled", False)),
+        "capacity": max(1, int(shared_raw.get("capacity", 3))),
+        "max_detour_ratio": float(shared_raw.get("max_detour_ratio", 1.4)),
+    }
     return {
         "enabled": True,
         "backend": str(live.get("backend", "traci")),   # traci | mock
@@ -53,6 +60,7 @@ def live_cfg(cfg) -> dict | None:
         "net": (str(live["net"]) if live.get("net") else None),
         # 自由流の基準速度(m/s)= car の m/step ÷ 600s。delay_s(信号・渋滞超過)算出に使う。
         "car_m_per_s": float(speeds["car"]) / STEP_SECONDS,
+        "shared": shared,
     }
 
 
@@ -113,6 +121,11 @@ class TaxiLive:
         self.cfg = cfg
         self.bridge = bridge
         self.car_m_per_s = float(cfg["car_m_per_s"])
+        # v-Ride-3 相乗り(既定 OFF)。enabled=false は _resolve_single だけを通る=v-Ride-1 と同一。
+        self.shared = dict(cfg.get("shared") or {"enabled": False,
+                                                 "capacity": 3, "max_detour_ratio": 1.4})
+        self._pool: list[dict] = []      # 現 step の開いた相乗り束(id 昇順=挿入順で走査=決定論)
+        self._pool_step = -1
         self.n_requests = 0
         self.n_matched = 0
         self.n_unmatched = 0
@@ -121,9 +134,21 @@ class TaxiLive:
                 from_xy, to_xy, step: int, sim_min: int) -> dict:
         """1件の配車要求を解決する。返り値:
           matched=False → 捕まらない(呼び出し側は徒歩フォールバック + taxi_unmatched を記録)。
-          matched=True  → {wait_s, ride_s, delay_s, hold_steps}(payload 記録 + 到着 step の追加待ち)。
-        call_sim_sec は sim 内分 × 60(SUMO 秒時刻に同期)。"""
+          matched=True  → {wait_s, ride_s, delay_s, hold_steps [, shared]}(payload 記録 + 到着待ち)。
+        相乗り ON のときだけ shared(同乗者数=束の乗員数)を付ける。単発時は付けない=v-Ride-1 と同一。
+        並行配車: 呼び出し側(_apply)が agent id 昇順で反復するため、同 step の複数予約は id 昇順で
+        逐次処理される(dispatch 順=シミュ状態の純関数=research §4)。"""
         self.n_requests += 1
+        if self.shared.get("enabled"):
+            return self._request_shared(agent_id=agent_id, from_xy=from_xy, to_xy=to_xy,
+                                        from_node=from_node, to_node=to_node,
+                                        step=step, sim_min=sim_min)
+        return self._resolve_single(from_node=from_node, to_node=to_node,
+                                    from_xy=from_xy, to_xy=to_xy, sim_min=sim_min)
+
+    # -------------------------------------------------------------- 単発(v-Ride-1)
+    def _resolve_single(self, *, from_node, to_node, from_xy, to_xy, sim_min: int) -> dict:
+        """1台=1客の同期解決(ブリッジへ予約→wait_s/ride_s→delay_s/hold_steps)。純ロジック。"""
         call_sim_sec = float(sim_min) * 60.0
         res = self.bridge.reserve(from_node=from_node, to_node=to_node,
                                   from_xy=from_xy, to_xy=to_xy,
@@ -141,6 +166,62 @@ class TaxiLive:
         return {"matched": True,
                 "wait_s": round(wait_s, 1), "ride_s": round(ride_s, 1),
                 "delay_s": round(delay_s, 1), "hold_steps": hold_steps}
+
+    # -------------------------------------------------------------- 相乗り(v-Ride-3)
+    def _can_share(self, bundle: dict, from_xy, to_xy, ratio: float) -> bool:
+        """近接(乗車地の分離)+同方向(向きの内積≥0)+回り道上限(max_detour_ratio)で相乗り可否。
+        SUMO の greedyShared(absLossThreshold/relLossThreshold で許容回り道)相当を純幾何で決定論に判定。"""
+        ox, oy = bundle["origin"]
+        dx, dy = bundle["anchor_dest"]
+        base = max(1.0, bundle["base"])
+        # 同方向: 束のアンカー方向 (D-O) と新規客の方向 (T-F) の内積が非負(逆向きは相乗り不可)
+        v1x, v1y = dx - ox, dy - oy
+        v2x, v2y = to_xy[0] - from_xy[0], to_xy[1] - from_xy[1]
+        if (v1x * v2x + v1y * v2y) < 0.0:
+            return False
+        d_orig = math.hypot(from_xy[0] - ox, from_xy[1] - oy)   # 乗車地の分離
+        d_dest = math.hypot(to_xy[0] - dx, to_xy[1] - dy)       # 降車地の分離
+        return (d_orig + d_dest) <= (ratio - 1.0) * base        # 回り道が予算内
+
+    def _request_shared(self, *, agent_id: int, from_xy, to_xy,
+                        from_node, to_node, step: int, sim_min: int) -> dict:
+        """相乗り解決。開いている束に相乗り可なら合流(新規 dispatch を出さず束ねた結果を返す=
+        SUMO へは束ねた 1 台だけを渡す思想)。合流不可なら新規に 1 台 dispatch して束を開く。"""
+        if step != self._pool_step:      # step 境界で束をリセット(同 step 内だけで相乗り)
+            self._pool = []
+            self._pool_step = step
+        cap = int(self.shared.get("capacity", 3))
+        ratio = float(self.shared.get("max_detour_ratio", 1.4))
+        base_self = math.hypot(from_xy[0] - to_xy[0], from_xy[1] - to_xy[1])
+        free_self = base_self / max(1e-6, self.car_m_per_s)
+        for bundle in self._pool:        # 挿入順=id 昇順で最初に相乗り可な束へ(決定論)
+            if len(bundle["riders"]) >= cap:
+                continue
+            if not self._can_share(bundle, from_xy, to_xy, ratio):
+                continue
+            bundle["riders"].append(agent_id)
+            shared_n = len(bundle["riders"])
+            ox, oy = bundle["origin"]
+            dx, dy = bundle["anchor_dest"]
+            extra = (math.hypot(from_xy[0] - ox, from_xy[1] - oy)
+                     + math.hypot(to_xy[0] - dx, to_xy[1] - dy))
+            factor = min(ratio, 1.0 + extra / max(1.0, base_self))   # 回り道係数(上限=ratio)
+            ride_s = free_self * factor
+            delay_s = max(0.0, ride_s - free_self)
+            wait_s = float(bundle["wait_s"])                 # 既に配車済みの待ちを共有
+            self.n_matched += 1
+            return {"matched": True, "wait_s": round(wait_s, 1),
+                    "ride_s": round(ride_s, 1), "delay_s": round(delay_s, 1),
+                    "hold_steps": quantize_hold(wait_s, delay_s), "shared": shared_n}
+        res = self._resolve_single(from_node=from_node, to_node=to_node,
+                                   from_xy=from_xy, to_xy=to_xy, sim_min=sim_min)
+        if res.get("matched"):
+            self._pool.append({"riders": [agent_id], "origin": (from_xy[0], from_xy[1]),
+                               "anchor_dest": (to_xy[0], to_xy[1]),
+                               "wait_s": res["wait_s"], "base": base_self})
+            res = dict(res)
+            res["shared"] = 1
+        return res
 
     def stats(self) -> dict:
         return {"requests": self.n_requests, "matched": self.n_matched,

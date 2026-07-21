@@ -210,6 +210,21 @@ class Simulation:
                 getattr(self.transit, "bus_lines", []), self.city,
                 stop_radius_m=self.ridecfg["bus"]["stop_radius_m"],
                 headway_steps=self.ridecfg["bus"]["headway_steps"])
+        # 実バスダイヤの静的表 v-Ride-2(既定 OFF=None=従来の簡易バス近似のまま=バイト一致)。
+        # bus.enabled かつ bus_table.enabled かつ表が読めるときだけ BusTable を生成し、_ride_extra が
+        # 従来近似の代わりに実ダイヤ近似(次便待ち+区間所要)を使う。設計: src/society/bus_table.py。
+        self.bus_table = None
+        bt_raw = (rcfg.get("bus_table", {}) or {})
+        if self.ridecfg["bus"]["enabled"] and bool(bt_raw.get("enabled", False)):
+            from .. import bus_table as _bus_table_mod
+            bt_path = str(bt_raw.get("path", "data/odpt/bus_table_shibuya.json"))
+            if not Path(bt_path).is_absolute():
+                bt_path = str(REPO_ROOT / bt_path)
+            bt_origin = self.city.meta.get("origin_latlon")
+            self.bus_table = _bus_table_mod.load_bus_table(
+                bt_path, self.city,
+                origin=(tuple(bt_origin) if bt_origin else None),
+                access_radius_m=float(bt_raw.get("access_radius_m", 150.0)))
         # SUMO ライブ連成タクシー配車 v-Ride-1(既定 OFF=None=SUMO を一切起動しない=バイト一致)。
         # ON 時のみ TaxiLive を生成(backend=mock は SUMO 不要の純関数 / traci は実 SUMO を起動し、
         # 不在・失敗なら None へ後退=従来挙動)。設計: src/society/transit_live.py。

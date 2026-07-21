@@ -567,6 +567,15 @@ transit_ride:
     fare: 230                   # 運賃(円)
     stop_radius_m: 100          # 出発/目的ノードが停留所からこの距離内なら乗車可
     headway_steps: 1            # 便の間隔(step。1 step = 10分)
+  # ---- 実バスダイヤの静的表 v-Ride-2(既定 OFF=従来の簡易バス近似のまま=バイト一致)。
+  #      正典: docs/research/sumo-live-transit.md §3(静的表推奨=SUMO を回さない軽量版)。
+  #      ON 時(bus.enabled も要): scripts/build_bus_table.py が GTFS から吐いた実ダイヤ静的表を読み、
+  #      出発/目的が停留所 access 圏内なら「次便の待ち時間 + 区間所要」を実ダイヤ近似で乗車に反映する
+  #      (到着 step が実際に変わる=別ゴールデン)。ride payload に wait_s/ride_s を追記。運賃は既存のまま。----
+  bus_table:
+    enabled: false
+    path: data/odpt/bus_table_shibuya.json   # build_bus_table.py の出力(停留所・系統・発時刻・区間所要)
+    access_radius_m: 150        # 出発/目的が停留所からこの距離内なら乗車可(実ダイヤ近似の access 圏)
   # ---- SUMO ライブ連成タクシー配車 v-Ride-1(既定 OFF=SUMO プロセスを一切起動しない=完全従来挙動=
   #      ゴールデン L1 バイト一致)。正典: docs/research/sumo-live-transit.md / traffic-indirect-effects.md。
   #      ON 時: エージェントが taxi を選んだ瞬間だけ SUMO(taxi device・dispatch=traci)へ予約を注入し、
@@ -579,6 +588,13 @@ transit_ride:
     seed: 42                    # SUMO seed(固定・--random 禁止=決定論)
     max_wait_s: 900             # この秒内に配車できなければ未配車(捕まらない)=徒歩フォールバック
     net: null                   # 車道網 net.xml(null=runs 配下の *_car.net.xml を自動探索)
+    # ---- 相乗り・並行配車 v-Ride-3(既定 OFF=v-Ride-1 と完全同一=単発配車のみ・shared キー無し)。
+    #      ON 時: 同 step の複数予約を id 昇順で処理(並行配車)し、近接・同方向・回り道上限内の予約を
+    #      capacity まで 1 台に束ねる(我々の決定論 greedyShared)。ride payload に shared(同乗者数)を追記。----
+    shared:
+      enabled: false
+      capacity: 3               # 1 台に相乗りできる上限人数
+      max_detour_ratio: 1.4     # 相乗りで許容する回り道の上限比(SUMO relLossThreshold 相当)
 
 transit:
   file: data/transit_shibuya.json  # 定刻ダイヤ(乱れなし)。GTFS 実ダイヤに差し替え可

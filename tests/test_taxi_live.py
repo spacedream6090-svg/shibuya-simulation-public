@@ -210,6 +210,109 @@ def test_coupling_adds_zero_llm_calls(tmp_path):
     assert sim.taxi_live.stats()["requests"] == 1, "配車要求が記録されていない"
 
 
+# --------------------------------------------------------------------- v-Ride-3 相乗り/並行配車
+_SHARED = {**_MOCK, "transit_ride.live.shared.enabled": "true",
+           "transit_ride.live.shared.capacity": 3,
+           "transit_ride.live.shared.max_detour_ratio": 1.4}
+
+
+class _AlwaysBridge:
+    """常に配車成功する決定論ブリッジ(相乗り束ねロジックを mock ハッシュから隔離)。"""
+
+    def reserve(self, **_kw):
+        return {"matched": True, "wait_s": 120.0, "ride_s": 300.0}
+
+    def close(self):
+        return None
+
+
+def _shared_tl(**ov):
+    lc = transit_live.live_cfg(load_config(
+        ["transit_ride.live.enabled=true", "transit_ride.live.backend=mock",
+         "transit_ride.live.shared.enabled=true", "transit_ride.live.shared.capacity=3",
+         "transit_ride.live.shared.max_detour_ratio=1.4",
+         *[f"{k}={v}" for k, v in ov.items()]]))
+    return transit_live.TaxiLive(lc, _AlwaysBridge())
+
+
+def _feed(tl, trips, step=1, sim_min=600):
+    """(from_xy, to_xy) 列を id 昇順(agent_id=i)で同 step に投入=並行配車(id 昇順の逐次処理)。"""
+    out = []
+    for i, (fxy, txy) in enumerate(trips):
+        out.append(tl.request(agent_id=i, from_node=f"n{i}", to_node=f"m{i}",
+                              from_xy=fxy, to_xy=txy, step=step, sim_min=sim_min))
+    return out
+
+
+def test_shared_bundles_nearby_same_direction_up_to_capacity():
+    """近接・同方向の予約を capacity(=3)まで 1 台に束ね、shared(同乗者数)を増やす。満車で新規台。"""
+    tl = _shared_tl()
+    trips = [((0.0, 0.0), (1000.0, 0.0)),      # r0: 新規 dispatch → shared=1
+             ((50.0, 0.0), (1050.0, 0.0)),     # r1: 近接・同方向 → 束ね shared=2
+             ((30.0, 0.0), (1030.0, 0.0)),     # r2: 束ね shared=3
+             ((20.0, 0.0), (1020.0, 0.0)),     # r3: capacity 超過 → 新規台 shared=1
+             ((0.0, 0.0), (-1000.0, 0.0))]     # r4: 逆方向 → 相乗り不可 → 新規台 shared=1
+    res = _feed(tl, trips)
+    assert all(r["matched"] for r in res)
+    assert [r["shared"] for r in res] == [1, 2, 3, 1, 1]
+    # 束ねた同乗者は先頭の配車待ちを共有(新規 dispatch を出さない=SUMO へは束ねた1台)
+    assert res[1]["wait_s"] == res[0]["wait_s"] == 120.0
+    assert res[2]["wait_s"] == res[0]["wait_s"]
+    # 相乗りは回り道で ride_s が単発より伸びうる(delay_s>=0)
+    assert all(r["delay_s"] >= 0.0 for r in res)
+
+
+def test_shared_deterministic_same_sequence():
+    """同一予約列を 2 回投入 → 束ね結果(shared/wait/ride/hold)が完全一致=決定論。"""
+    trips = [((0.0, 0.0), (900.0, 0.0)), ((40.0, 0.0), (940.0, 0.0)),
+             ((10.0, 0.0), (910.0, 0.0)), ((0.0, 0.0), (0.0, 900.0))]
+    a = _feed(_shared_tl(), trips)
+    b = _feed(_shared_tl(), trips)
+    assert a == b, f"相乗り束ねが非決定論: {a} != {b}"
+
+
+def test_shared_resets_pool_across_steps():
+    """束は step 境界でリセット(同 step 内だけで相乗り)。別 step の同座標は新規台=shared=1。"""
+    tl = _shared_tl()
+    r0 = tl.request(agent_id=0, from_node="a", to_node="b",
+                    from_xy=(0.0, 0.0), to_xy=(1000.0, 0.0), step=1, sim_min=600)
+    r1 = tl.request(agent_id=0, from_node="a", to_node="b",
+                    from_xy=(0.0, 0.0), to_xy=(1000.0, 0.0), step=2, sim_min=610)
+    assert r0["shared"] == 1 and r1["shared"] == 1
+
+
+def test_shared_off_adds_no_shared_key():
+    """相乗り OFF(既定)は shared キーを一切付けない=v-Ride-1 と同一(単発配車)。"""
+    lc = transit_live.live_cfg(load_config(
+        ["transit_ride.live.enabled=true", "transit_ride.live.backend=mock"]))
+    assert lc["shared"]["enabled"] is False
+    tl = transit_live.TaxiLive(lc, _AlwaysBridge())
+    r = tl.request(agent_id=0, from_node="a", to_node="b",
+                   from_xy=(0.0, 0.0), to_xy=(1000.0, 0.0), step=1, sim_min=600)
+    assert r["matched"] and "shared" not in r
+
+
+def test_shared_off_matches_v_ride1_l1(tmp_path):
+    """相乗り明示 OFF と v-Ride-1(_MOCK)が L1 完全一致=相乗り seam が no-op(バイト一致)。"""
+    base = _sim(tmp_path, "vr1", **_MOCK)
+    base.run()
+    off = _sim(tmp_path, "vr3off", **{**_MOCK, "transit_ride.live.shared.enabled": "false"})
+    off.run()
+    assert _l1(base) == _l1(off), "相乗り OFF が v-Ride-1 と不一致"
+    for e in _kind(base, "ride"):
+        assert "shared" not in e.payload, "v-Ride-1 の ride に shared が漏れている"
+
+
+def test_shared_sim_deterministic(tmp_path):
+    """相乗り ON の sim 連成を 2 回 → L1 完全一致(乗車列・到着・shared の決定論)。"""
+    a = _sim(tmp_path, "shr_a", **_SHARED)
+    a.run()
+    b = _sim(tmp_path, "shr_b", **_SHARED)
+    b.run()
+    assert _l1(a) == _l1(b), "相乗り ON の決定論が崩れている(同 seed でバイト不一致)"
+    assert _kind(a, "ride"), "相乗り ON で乗車が 1 件も出ていない"
+
+
 # --------------------------------------------------------------------- SUMO 実走(環境ガード)
 @pytest.mark.skipif(not _sumo_available(),
                     reason="SUMO(sumo 実行ファイル+traci+car net)不在=実走テストは skip")

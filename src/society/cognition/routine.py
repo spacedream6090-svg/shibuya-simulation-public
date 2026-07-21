@@ -519,13 +519,27 @@ def _ride_extra(agent, sim, dest, step: int, sim_min: int):
     buses = getattr(sim, "buses", None)
     bus = ride["bus"]
     if bus["enabled"] and buses is not None and buses.serves(sim_min):
-        leg = buses.find_ride(agent.node, dest, sim.city)
+        # 実バスダイヤの静的表 v-Ride-2(既定 OFF=bus_table is None=従来近似のまま=バイト一致)。
+        # 表があれば実ダイヤ近似(次便待ち+区間所要)へ格上げし、ride に wait_s/ride_s を追記する。
+        bt = getattr(sim, "bus_table", None)
+        wait_s = ride_s = None
+        if bt is not None:
+            rt = bt.find_ride(agent.node, dest, sim.city, sim_min)
+            leg = None if rt is None else {"from": rt["from"], "to": rt["to"]}
+            if rt is not None:
+                wait_s, ride_s = rt["wait_s"], rt["ride_s"]
+        else:
+            leg = buses.find_ride(agent.node, dest, sim.city)
         if leg is not None:
             fare = float(bus["fare"])
             if rb is not None:
                 fare = rb.fee_price("bus", fare)
-            return ("car", {"mode": "bus", "fare": fare,
-                            "from": leg["from"], "to": leg["to"]})
+            ride_out = {"mode": "bus", "fare": fare,
+                        "from": leg["from"], "to": leg["to"]}
+            if wait_s is not None:                   # 実ダイヤ近似のときだけ観測を追記(OFF=不変)
+                ride_out["wait_s"] = round(float(wait_s), 1)
+                ride_out["ride_s"] = round(float(ride_s), 1)
+            return ("car", ride_out)
     taxi = ride["taxi"]
     if not taxi["enabled"] or agent.has_car:
         return None

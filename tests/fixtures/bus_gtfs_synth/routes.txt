@@ -1,0 +1,3 @@
+route_id,route_short_name,route_long_name
+R1,系統M1,環状線M1
+R2,系統M2,環状線M2
