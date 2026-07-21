@@ -1467,6 +1467,33 @@ services:
     laundry:  {cats: [service], hints: [クリーニング, ランドリー, 洗濯], price: 1200, stay: 1, band: mood, magnitude: 0.015, daily_rate: 0.14, age: [18, 90], remember: 衣類を整えてもらった}
     service:  {cats: [service], hints: [], price: 2000, stay: 2, band: mood, magnitude: 0.015, daily_rate: 0.03, age: [12, 100], remember: 用事を済ませてきた}
 
+# ---- 宅配・フードデリバリー スライス④(実装 src/society/delivery.py。設計 docs/research/economy-goods-services.md §7 ④)----
+# 買い手が来店せず注文→配達員が店で受取(① 在庫を1引く)→配送トリップ→到着で受給+課金 の4段(§3.3 ラストマイル ABM)。
+# 注文=在宅/職場滞在の agent が食事帯に外食の代替として選ぶ(専用 stream "delivery" の抽選=order_rate)。配達員=economy の
+# gig/自営「配達員」職の agent に業務実体を与える(最寄りの勤務可能な配達員を決定論選定=id 昇順。専任不在なら agent_id=-1 の
+# 抽象トリップへ graceful=注文は必ず配送される)。到着で注文者へ課金(食事+配達手数料 fee=定額+距離比例=Uber Eats 相当の
+# 簡略化)+ 配達員へ gig 収入(手数料×courier_share=金の保存)。R1: generate() を1本も足さない(注文は routine 食事分岐に
+# 相乗り)、乱数は "delivery" stream 1本のみ。判定は物理位置・時刻・所持金・config のみ=k 非依存(注文で在宅に留まる=
+# co-location 変化は services/goods と同型=compute_matched 下の k 不変性で担保)。① commerce.inventory と併用で実在庫を消費
+# (品切れ店は注文不可)。単独(inventory OFF)でも動く(在庫制約なし=どの食 POI も注文可)。
+# 較正(§10): order_rate は出前/宅配=月数回/世帯 の桁に合わせた初期値(1日1回上限=max_per_day)。B 段で調律。
+# 既定 OFF=注文せず・"delivery" stream も引かない・order/deliver 0 件=ゴールデン golden_baseline_l1.json をバイト一致で守る。
+delivery:
+  enabled: false                # ★ON 推奨(本番): true(宅配=来店なし注文・配達員の業務実体・ラストマイル配送を有効化)
+  order_rate: 0.02              # 食事帯の在宅/職場滞在 step あたりの注文確率(較正: 出前/宅配=月数回/世帯 の桁)
+  windows: [[690, 810], [1080, 1260]]   # 注文受付=食事帯(分 of day)。既定=昼11:30-13:30 / 夜18:00-21:00
+  cat: food                     # 宅配対象の POI カテゴリ(食=food)
+  radius_m: 1500                # 注文先(店)を探す近傍半径(m)。超過は近傍に店なし=注文不可
+  base_fee: 350                 # 定額配達手数料(円。Uber Eats 相当の簡略化=定額+距離比例まで)
+  per_km_fee: 100               # 距離比例の配達手数料(円/km)
+  courier_share: 0.7            # 配達手数料のうち配達員の取り分(残りはプラットフォーム手数料)
+  eta_m_per_step: 500           # 配送トリップの走行速度換算(m/step。1 step=10分)。eta=距離/これ(min/max で丸め)
+  min_eta_steps: 1
+  max_eta_steps: 6
+  courier_occupation: 配達員     # 配達員の職業(economy の gig/自営。この職の agent に配達業務が帰属)
+  max_per_day: 1                # 1日1個体あたりの宅配注文上限(現実頻度=月数回に桁を合わせる上限)
+  menu: [弁当, ラーメン, カレー, ピザ, 寿司]   # ① goods カタログが無い/OFF のときの注文品(日替わり巡回で決定論)
+
 # ---- 都市・環境インフラのショック(現実ギャップ 後続波 H4 2026-07-07。すべて既定 OFF=現行挙動と完全同一)----
 # 生活を麻痺させる外生ショック=集団的 grievance の源。既存の scenario/transit の最小拡張(独立 phase。
 # 都市再開発=地図が時間で変わる機構は本波では作らない=注記に留める)。実装 src/society/disaster.py。3機構:

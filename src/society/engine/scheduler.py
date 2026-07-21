@@ -27,6 +27,7 @@ from .. import party as party_mod
 from .. import relations as relations_mod
 from .. import pov as pov_mod
 from .. import b2b as b2b_mod
+from .. import delivery as delivery_mod
 from .. import services as services_mod
 from .. import status as status_mod
 from .. import street as street_mod
@@ -3471,6 +3472,16 @@ def _phase_goods(sim, step: int, sim_min: int) -> None:
     goods_mod.tick(sim, step, sim_min)
 
 
+def _phase_delivery(sim, step: int, sim_min: int) -> None:
+    """毎step: 宅配④の物理配車(dispatch)+ 到着処理(受給+課金+gig収入)(既定OFF=no-op。スライス④)。
+
+    注文生成は routine の食事分岐(delivery.maybe_order)に相乗り=ここでは配車と到着のみ。配車は _phase_move の
+    前に済ませ(配達員をその step のうちに動かす)、到着(eta)で注文者へ課金(_spend)+ 配達員へ gig 収入
+    (_pay_wage source="gig")=会計は既存経路に閉じる(engine 側で注入)。決定論・乱数ゼロ=新 stream を引かない。
+    delivery OFF なら完全 no-op(order/deliver 0 件・注文台帳も配達員フラグも生えない=ゴールデンを守る)。"""
+    delivery_mod.tick(sim, step, sim_min, _spend, _pay_wage)
+
+
 # ---------------------------------------------------------------- 都市・環境ショック(後続波 H4)
 def _phase_disaster(sim, step: int, sim_min: int) -> None:
     """日次境界: 災害(台風/地震/大雪)・交通の遅延/運休・インフラ障害(停電/通信断/断水)(既定 OFF=no-op。H4)。
@@ -3724,6 +3735,8 @@ def run_step(sim, step: int) -> None:
     _phase_disaster(sim, step, sim_min)            # 日次境界: 災害・交通遅延/運休・インフラ障害(既定OFF=no-op。H4)
     _phase_goods(sim, step, sim_min)               # 物流: 補充トリップ到着+日次(s,S)レビュー(既定OFF=no-op。①)。
                                                    # disaster/scenario 確定後=その日の封鎖(運休/shock_closure)を読む
+    _phase_delivery(sim, step, sim_min)            # 宅配④: 配達員の物理配車+到着で受給/課金/gig収入(既定OFF=no-op)。
+                                                   # _phase_move の前=配車した配達員をこの step のうちに動かす
     _phase_rules(sim, step, sim_min)               # 日次境界: 制度DSL(期限失効・定期イベント)
     _phase_recursion(sim, step, sim_min)           # 日次境界: 再帰性(昨日の街の動き。既定OFF=no-op)
     _phase_assembly(sim, step, sim_min)            # 日次境界: 代表制議会の改選(既定OFF=no-op。制度深化3)

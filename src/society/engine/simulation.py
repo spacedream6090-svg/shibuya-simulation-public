@@ -407,6 +407,19 @@ class Simulation:
                         if OmegaConf.is_config(raw_services) else raw_services)
         self.servicescfg = _services_mod.build_cfg(raw_services)
         self._service_total: int = 0               # service_use 件数(aggregator 用)
+        # 宅配・フードデリバリー スライス④(delivery。既定 OFF=注文せず・"delivery" stream も引かない=バイト一致)。
+        # 在宅/職場滞在の agent が食事帯に外食の代替として注文(① 実在庫を1引き店で受取)→ 配達員(gig/自営「配達員」)を
+        # 決定論選定して物理配車 or 抽象トリップ→ eta 到着で受給=注文者に課金(食事+配達手数料。_spend)+ 配達員に gig 収入
+        # (_pay_wage source="gig"=金の保存)。決定論・新 stream "delivery" のみ・LLM 呼ゼロ(R1)。判定は物理位置・時刻・
+        # 所持金・config・観測量のみ=k 非依存(注文で在宅に留まる=co-location 変化は services/goods と同型)。
+        # OFF=order/deliver 0 件・注文台帳も配達員フラグも生えない=ゴールデン golden_baseline_l1.json をバイト一致で守る。
+        from .. import delivery as _delivery_mod
+        raw_delivery = cfg.get("delivery", None)
+        raw_delivery = (OmegaConf.to_container(raw_delivery, resolve=True)
+                        if OmegaConf.is_config(raw_delivery) else raw_delivery)
+        self.deliverycfg = _delivery_mod.build_cfg(raw_delivery)
+        self._delivery_pending: list = []          # 宅配注文の到着待ち台帳(遅延構築でも可)
+        self._delivery_total: int = 0              # deliver(配送完了)件数(aggregator 用)
         # 都市・環境インフラのショック(現実ギャップ 後続波 H4 2026-07-07。既定 OFF=現行挙動と完全同一)。
         # 災害(台風/地震/大雪→交通麻痺=運休+外出抑制=在宅+強い grievance)+ 交通の遅延/運休(定刻ダイヤを
         # 新 stream "disaster" で乱す)+ インフラ障害(停電/通信断/断水→在宅娯楽・スマホ抑制+grievance)。

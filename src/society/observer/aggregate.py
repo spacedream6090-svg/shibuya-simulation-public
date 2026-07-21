@@ -396,6 +396,17 @@ def _n_b2b_trade(sim):
     return int(getattr(sim, "_b2b_total", 0))
 
 
+# ---- 宅配・フードデリバリー 第47バッチ ④(delivery)。OFF は None=列なし=L2 不変 ----
+@register_aggregator("n_delivery")
+def _n_delivery(sim):
+    """宅配の配送完了(deliver)の累積件数。delivery 無効なら None=列なし(L2 バイト不変)。
+    ON 時のみ deliver の累積を出す。"""
+    dc = getattr(sim, "deliverycfg", None)
+    if not (dc and dc.get("enabled")):
+        return None
+    return int(getattr(sim, "_delivery_total", 0))
+
+
 @register_aggregator("n_active_rules")
 def _n_active_rules(sim):
     """制度DSL: 現在アクティブな実効ルール数(rules 無効時は None=列なし=L2 不変)。"""

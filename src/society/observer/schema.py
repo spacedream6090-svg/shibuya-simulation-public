@@ -212,6 +212,10 @@ register_event_kind("service_use", "サービスの受給=滞在+課金+効果(�
 # ---- B2B 卸→小売の仕入れ スライス⑤(commerce.inventory.b2b ON のみ・既定 OFF=0件。決定論・乱数ゼロ。
 #      実装 src/society/b2b.py。設計: docs/research/economy-goods-services.md §7 ⑤)----
 register_event_kind("b2b_trade", "会社間取引=卸 org→小売 POI の仕入れ(org 間で金+物が移転。世界イベント agent_id=-1){from_org, to_poi, cat, qty, amount, from_node}")
+# ---- 宅配・フードデリバリー スライス④(delivery ON のみ・既定 OFF=0件。決定論・新 stream "delivery" のみ・
+#      LLM 呼ゼロ。実装 src/society/delivery.py。設計 docs/research/economy-goods-services.md §7 ④)----
+register_event_kind("order",   "宅配の注文(在宅/職場滞在で外食の代替。① 在庫を1引き店で受取){poi, item, fee, cat, to_node}")
+register_event_kind("deliver", "宅配の配送完了=到着で受給+課金(配達員に gig 収入。agent_id=配達員 or -1){courier, from_poi, to_node, item, fare, cat}")
 # ---- 関係性の再現 第44バッチ(共同行動エンジン S-R3 + 世帯の夕食共食 S-R1。既定 OFF=0件。
 #      決定論・LLM/generate ゼロ増。実装 src/society/joint.py + household.py。設計: docs/research/relationships-activities.md §4)----
 register_event_kind("joint_activity", "共同行動の成立=同伴グループ/世帯が同一POI・home で2人以上同席(1グループ1日1回){type, with, place, tier}")

@@ -16,6 +16,7 @@ import numpy as np
 
 from . import drive as _drive
 from .. import commerce as _commerce
+from .. import delivery as _delivery
 from .. import disaster as _disaster
 from .. import diversity as _diversity
 from .. import household as _household
@@ -705,6 +706,10 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
     """routine の行動決定。発話はしない(socialize で LLM へ委譲)。"""
     sim_min = sim.clock.sim_min(step)
     m = _minutes_of_day(sim_min)
+    # ---- 宅配④: 配達 gig 中の配達員は配送を最優先(通常 routine に割り込ませない。既定OFF=フラグ立たず不変)----
+    gig = _delivery.courier_action(agent, sim, step, sim_min)
+    if gig is not None:
+        return gig
     cal = _cal(sim)                         # 暦(weekday_work ゲート用。既定 OFF=不変)
     scfg = _stochastic_cfg(sim)             # 確率的実行 P2 S4(None=既定=新 stream を一切引かない)
     if scfg is not None:
@@ -826,6 +831,12 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
             agent.activity = ""
         else:
             return {"type": "stay"}
+
+    # ---- 宅配④: 食事帯の在宅/職場滞在は外食の代替として宅配を注文しうる(既定OFF=None=不変)。当たれば
+    #  stay を返して外食に出ない(二重課金しない)。乱数は専用 stream "delivery"(main routine draw 順に不干渉)----
+    order = _delivery.maybe_order(agent, sim, step, sim_min)
+    if order is not None:
+        return order
 
     # ---- 食事時間帯: 実在の飲食店へ(残高が価格に満たない店は避ける=経済 v0)----
     if in_meal_window(sim_min) \
