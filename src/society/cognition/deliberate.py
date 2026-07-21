@@ -157,6 +157,10 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
     onto = getattr(agent, "ontology_line", None)
     if onto:
         lines.append(onto)
+    # 直交する第2軸(情報行動など)+訓練経験行を、文化圏の経験行に続けて注入(軸ごとに1行)。
+    # OFF/軸未設定は属性なし=行なし=バイト一致。文言は config 由来=基盤に因子語なし。
+    for axl in (getattr(agent, "ontology_axis_lines", None) or []):
+        lines.append(axl)
     # 反射=自己モデル(第11バッチ 2026-07-08。深い内省の産物。OFF は None=行なし=バイト一致)。
     # persona(固定の自己紹介)の直後に「経験から更新される自己理解」を置く=自己認識の再帰。
     sm = getattr(agent, "self_model", None)

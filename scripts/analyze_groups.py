@@ -55,27 +55,38 @@ _EVAC_KINDS = frozenset({"exit_building", "exit_area"})
 # --------------------------------------------------------------------------- #
 # 群 id ↔ agent
 # --------------------------------------------------------------------------- #
-def load_group_map(run_dir: str) -> tuple[dict[int, str], dict[str, dict]]:
+# 文化圏軸(第1軸=従来)を指す --axis の別名。これ以外は axes.<name> の第2軸以降。
+_CULTURE_AXIS = frozenset({None, "", "culture", "default", "ontology_group"})
+
+
+def load_group_map(run_dir: str, axis: str | None = None
+                   ) -> tuple[dict[int, str], dict[str, dict]]:
     """agents.json から {agent_id: group} と {group: meta(label 等)} を返す。
 
-    ontology_group が1体も無い(OFF ラン)なら空を返す(呼び出し側で明示終了)。"""
+    axis=None/culture は従来どおり ontology_group(文化圏軸)。それ以外は ontology_axes[axis]
+    (直交する第2軸)で群別集計する。指定軸の群が1体も無い(OFF/未設定)なら空(呼び出し側で明示終了)。"""
     path = os.path.join(run_dir, "agents.json")
     if not os.path.exists(path):
         return {}, {}
     with open(path, encoding="utf-8") as fh:
         rows = json.load(fh)
     by_id: dict[int, str] = {}
+    is_culture = axis in _CULTURE_AXIS
     for r in rows:
-        g = r.get("ontology_group")
-        if g is not None and "id" in r:
+        if "id" not in r:
+            continue
+        g = (r.get("ontology_group") if is_culture
+             else (r.get("ontology_axes") or {}).get(axis))
+        if g is not None:
             by_id[int(r["id"])] = str(g)
     return by_id, {}
 
 
-def load_group_defs(run_dir: str) -> dict[str, dict]:
-    """conf の ontology.groups(あれば)からラベル等の定義を読む(無ければ空=id 表示)。
+def load_group_defs(run_dir: str, axis: str | None = None) -> dict[str, dict]:
+    """conf の ontology.groups(または axes.<axis>.groups)からラベル等の定義を読む(無ければ空=id 表示)。
 
     ラン再現の config.yaml は runs/<name>/config.yaml に落ちる(なければ conf/config.yaml)。"""
+    is_culture = axis in _CULTURE_AXIS
     for rel in ("config.yaml", os.path.join("..", "..", "conf", "config.yaml")):
         path = os.path.join(run_dir, rel)
         if os.path.exists(path):
@@ -83,7 +94,9 @@ def load_group_defs(run_dir: str) -> dict[str, dict]:
                 import yaml
                 with open(path, encoding="utf-8") as fh:
                     doc = yaml.safe_load(fh) or {}
-                groups = ((doc.get("ontology") or {}).get("groups") or {})
+                onto = (doc.get("ontology") or {})
+                groups = (onto.get("groups") if is_culture
+                          else ((onto.get("axes") or {}).get(axis) or {}).get("groups")) or {}
                 if groups:
                     return {str(k): dict(v or {}) for k, v in groups.items()}
             except Exception:
@@ -249,21 +262,23 @@ def _latencies(records: list[dict]) -> list[float]:
 
 
 # --------------------------------------------------------------------------- #
-def analyze(run_dir: str, pre: int, post: int) -> dict:
-    group_by_id, _ = load_group_map(run_dir)
+def analyze(run_dir: str, pre: int, post: int, axis: str | None = None) -> dict:
+    group_by_id, _ = load_group_map(run_dir, axis)
     if not group_by_id:
+        label = axis if axis not in _CULTURE_AXIS else "ontology_group"
         raise SystemExit(
-            "対象外: agents.json に ontology_group が無い(ontology OFF ランか未実装)。"
-            "ontology.enabled=true で走らせたランを渡すこと(捏造回避)。")
+            f"対象外: agents.json に {label} が無い(ontology OFF ランか、その軸が未設定)。"
+            "ontology.enabled=true(第2軸は axes に該当軸)で走らせたランを渡すこと(捏造回避)。")
     onsets = find_onsets(run_dir)
     agg = collect(run_dir, group_by_id, onsets, pre, post)
     # 潜時(相対)を各反応記録へ畳む: first_move(絶対step)− 直近 onset。
     for (aid, s), r in agg["react"].items():
         r["latency"] = (r["first_move"] - s) if r["first_move"] is not None else None
     summ = summarize(group_by_id, agg, post)
-    defs = load_group_defs(run_dir)
+    defs = load_group_defs(run_dir, axis)
     return {
         "run": os.path.basename(os.path.normpath(run_dir)),
+        "axis": (axis if axis not in _CULTURE_AXIS else "culture"),
         "shock_pre": pre, "shock_post": post,
         "n_onsets": len(onsets), "onsets": onsets[:50],
         "groups": summ,
@@ -277,6 +292,7 @@ def _fmt(v) -> str:
 
 def to_markdown(report: dict) -> str:
     lines = [f"# 群別行動統計: {report['run']}", ""]
+    lines.append(f"- 集計軸: {report.get('axis', 'culture')}")
     lines.append(f"- ショック窓: onset 前 {report['shock_pre']} / 後 {report['shock_post']} step")
     lines.append(f"- 検出 onset 数: {report['n_onsets']}"
                  + (f"(step {report['onsets']})" if report["onsets"] else ""))
@@ -310,10 +326,12 @@ def main(argv=None) -> int:
                     help="平常時から除外する onset 前の step 数(既定6=1時間)")
     ap.add_argument("--shock-post", type=int, default=6,
                     help="反応窓 [onset, onset+post] の後幅 step 数(既定6=1時間)")
+    ap.add_argument("--axis", default=None,
+                    help="群別集計の軸(既定=文化圏 ontology_group。第2軸は info_behavior 等)")
     ap.add_argument("--out", default=None, help="出力先(既定 <run_dir>/groups)")
     args = ap.parse_args(argv)
 
-    report = analyze(args.run_dir, args.shock_pre, args.shock_post)
+    report = analyze(args.run_dir, args.shock_pre, args.shock_post, args.axis)
     out_dir = args.out or os.path.join(args.run_dir, "groups")
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "group_summary.json"), "w", encoding="utf-8") as fh:

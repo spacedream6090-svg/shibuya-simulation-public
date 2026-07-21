@@ -645,7 +645,9 @@ class Simulation:
               **({"input_res": a.input_res["level"]}
                  if getattr(a, "input_res", None) else {}),
               **({"ontology_group": a.ontology_group}
-                 if getattr(a, "ontology_group", None) else {})}
+                 if getattr(a, "ontology_group", None) else {}),
+              **({"ontology_axes": a.ontology_axes}
+                 if getattr(a, "ontology_axes", None) else {})}
              for a in self.agents],
             ensure_ascii=False), encoding="utf-8")
 
@@ -824,6 +826,27 @@ class Simulation:
         c0 = _ontology_mod.initial_controllability(cfg, gid)
         if c0 is not None:                             # S-b: 可制御性の起点を群で1回だけずらす
             agent.controllability = c0
+        # ---- 直交する第2軸(方式B)+ 訓練経験行(方式A)。既定は axes 空・drill OFF=完全 no-op。
+        # 各軸は独立ハッシュ(seed+seed_offset)で文化圏軸と無相関=直交。age(人口統計 P0)がある時は
+        # 年代条件付き構成比を使う(traits/k は読まない=R1)。追加 LLM 呼・乱数はゼロ(hashlib 自前)。
+        age = getattr(agent, "age", None)
+        axis_groups: dict = {}
+        axis_lines: list = []
+        for axis_name in sorted(cfg.get("axes") or {}):
+            ag = _ontology_mod.assign_axis(cfg, axis_name, pid, tier, age)
+            if ag is None:
+                continue
+            axis_groups[axis_name] = ag
+            al = _ontology_mod.axis_line(cfg, axis_name, ag)
+            if al:
+                axis_lines.append(al)
+        dl = _ontology_mod.group_drill_line(cfg, gid)  # 方式A: 訓練経験を別行で付加
+        if dl:
+            axis_lines.append(dl)
+        if axis_groups:                                # 観測(agents.json)用の軸別群 id
+            agent.ontology_axes = axis_groups
+        if axis_lines:                                 # build_prompt が文化圏行に続けて注入
+            agent.ontology_axis_lines = axis_lines
 
     # ---- 日次ローテーション/presence(W2 P3)------------------------------------
     def _pool_weekday(self, day: int) -> int:

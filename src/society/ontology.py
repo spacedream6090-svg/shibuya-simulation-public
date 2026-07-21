@@ -65,6 +65,32 @@ def build_cfg(raw: dict | None) -> dict:
     for tier, mix in (raw.get("composition") or {}).items():
         cfg["composition"][str(tier)] = {
             str(k): float(v) for k, v in dict(mix or {}).items()}
+    # ---- 直交する第2軸(方式B。文化圏軸と真に独立)。軸ごとに seed_offset で独立ハッシュ ----
+    # 各軸: groups(label/line + 素通しメタ)/ composition.<tier>(age 不明時の全体分布)/
+    #        bands.<age_lo>(年代条件付き構成比。agent.age がある時に優先)/ seed_offset。
+    # 既定 OFF・軸未指定でも空 dict=現行と割当・注入とも完全同一(assign_group は axes を読まない)。
+    cfg["axes"] = {}
+    for name, ax in (raw.get("axes") or {}).items():
+        ax = dict(ax or {})
+        axc: dict = {"seed_offset": int(ax.get("seed_offset", 0)),
+                     "groups": {}, "composition": {}, "bands": {}}
+        for gid, g in (ax.get("groups") or {}).items():
+            g = dict(g or {})
+            e: dict = {"label": str(g.get("label", gid))}
+            e["line"] = str(g["line"]) if g.get("line") else ""
+            for k, v in g.items():                    # 観測・分析用メタを素通し
+                if k not in ("label", "line"):
+                    e[k] = v
+            axc["groups"][str(gid)] = e
+        for tier, mix in (ax.get("composition") or {}).items():
+            axc["composition"][str(tier)] = {
+                str(k): float(v) for k, v in dict(mix or {}).items()}
+        for lo, mix in (ax.get("bands") or {}).items():
+            axc["bands"][int(lo)] = {
+                str(k): float(v) for k, v in dict(mix or {}).items()}
+        cfg["axes"][str(name)] = axc
+    # ---- 訓練経験行(方式A)。文化圏群の drill_line を別行として付加(既定 line は不変)----
+    cfg["drill_enabled"] = bool((raw.get("drill") or {}).get("enabled", False))
     return cfg
 
 
@@ -76,6 +102,23 @@ def _stable_uniform(seed: int, pid: str) -> float:
     h = hashlib.blake2b(f"{int(seed)}\x1f{pid}".encode("utf-8"),
                         digest_size=8).digest()
     return int.from_bytes(h, "big") / float(1 << 64)
+
+
+def _choose(comp: dict, u: float) -> str | None:
+    """composition(group_id→比率)と一様値 u∈[0,1) から群 id を1つ選ぶ(group id 昇順で累積分割)。
+
+    dict 順に依らず同一 comp・同一 u で同一割当。総和 0 は None。数値誤差の保険で最後の群に落とす。"""
+    items = sorted((gid, max(0.0, float(w))) for gid, w in comp.items())
+    total = sum(w for _, w in items)
+    if total <= 0.0:
+        return None
+    r = u * total
+    cum = 0.0
+    for gid, w in items:
+        cum += w
+        if r < cum:
+            return gid
+    return items[-1][0]                               # 数値誤差の保険(必ず最後の群に落とす)
 
 
 def assign_group(cfg: dict, pid, tier: str) -> str | None:
@@ -92,17 +135,42 @@ def assign_group(cfg: dict, pid, tier: str) -> str | None:
         comp = cfg["composition"].get(_DEFAULT_TIER)
     if not comp:
         return None
-    items = sorted((gid, max(0.0, float(w))) for gid, w in comp.items())
-    total = sum(w for _, w in items)
-    if total <= 0.0:
+    return _choose(comp, _stable_uniform(int(cfg["seed"]), str(pid)))
+
+
+def _band_for_age(bands: dict, age) -> dict | None:
+    """年齢に対応する年代 band(下限キーが age 以下で最大のもの)の構成比を返す。該当なしは None。"""
+    chosen = None
+    for lo in sorted(bands):
+        if int(age) >= int(lo):
+            chosen = bands[lo]
+        else:
+            break
+    return chosen
+
+
+def assign_axis(cfg: dict, axis_name: str, pid, tier: str, age=None) -> str | None:
+    """第2軸以降(方式B)の群割当。文化圏軸と独立な一様値(seed + seed_offset)で決定論割当。
+
+    age がある(人口統計 P0 属性)なら bands で年代条件付き構成比を優先(SNS→公式の年代勾配)。
+    age 不明は composition[tier](未知 tier は default)= 全体分布。traits/k は一切読まない=R1 直交。
+    seed_offset により第1軸(文化圏)ハッシュと無相関=同一 pid でも軸間の割当は独立(直交)。"""
+    if not cfg.get("enabled"):
         return None
-    r = _stable_uniform(int(cfg["seed"]), str(pid)) * total
-    cum = 0.0
-    for gid, w in items:
-        cum += w
-        if r < cum:
-            return gid
-    return items[-1][0]                               # 数値誤差の保険(必ず最後の群に落とす)
+    axis = (cfg.get("axes") or {}).get(str(axis_name))
+    if not axis:
+        return None
+    comp = None
+    if age is not None and axis.get("bands"):
+        comp = _band_for_age(axis["bands"], age)
+    if comp is None:
+        comp = axis["composition"].get(str(tier))
+        if comp is None:
+            comp = axis["composition"].get(_DEFAULT_TIER)
+    if not comp:
+        return None
+    off = int(axis.get("seed_offset", 0))
+    return _choose(comp, _stable_uniform(int(cfg["seed"]) + off, str(pid)))
 
 
 def group_line(cfg: dict, gid: str | None) -> str | None:
@@ -114,6 +182,31 @@ def group_line(cfg: dict, gid: str | None) -> str | None:
         return None
     line = g.get("line")
     return str(line) if line else None
+
+
+def axis_line(cfg: dict, axis_name: str, gid: str | None) -> str | None:
+    """第2軸以降の群 id → プロンプトに注入する「一人称の行動の事実」1行(axes.*.groups.*.line)。"""
+    if not gid:
+        return None
+    axis = (cfg.get("axes") or {}).get(str(axis_name))
+    if not axis:
+        return None
+    g = axis["groups"].get(gid)
+    if not g:
+        return None
+    line = g.get("line")
+    return str(line) if line else None
+
+
+def group_drill_line(cfg: dict, gid: str | None) -> str | None:
+    """文化圏群の防災訓練経験1行(方式A・別キー drill_line)。drill.enabled=false/未設定なら None。
+
+    既定 line は変更せず、訓練経験を独立の1行として付加する(割当は文化圏群のまま=不変)。"""
+    if not gid or not cfg.get("drill_enabled"):
+        return None
+    g = cfg["groups"].get(gid) or {}
+    dl = g.get("drill_line")
+    return str(dl) if dl else None
 
 
 def initial_controllability(cfg: dict, gid: str | None) -> float | None:
