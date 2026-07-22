@@ -460,6 +460,12 @@ def _pay_wage(sim, agent, amount: float, step: int, sim_min: int,
       gross=net で追加キーも出さない=既存 wage payload とバイト一致。"""
     if amount <= 0:
         return
+    # T4 自助努力(第52バッチ): 自力累積(skill)の賃金乗数を1箇所だけ適用。全 wage 源(本業/バイト/
+    # 日銭 gig/月給/公務員)がこの唯一の支給点を通るので、乗数はここで一様にかかる=労働生産性の反映。
+    # 既定 OFF / wage_coef=0.0 は乗数 1.0 → amount を一切触らない(会計不変=ゴールデン L1 バイト一致)。
+    mult = services_mod.self_dev_wage_mult(sim, agent)
+    if mult != 1.0:
+        amount = float(amount) * mult
     gross = float(amount)
     tax_total = 0.0
     if _government_on(sim):
@@ -2549,6 +2555,7 @@ def _phase_daily(sim, step: int, sim_min: int) -> None:
     if day == getattr(sim, "_econ_day", -1):
         return
     sim._econ_day = day
+    services_mod.self_dev_daily(sim, step, sim_min)   # T4 自助努力: skill/fitness の日次自然減衰(既定 decay=0=no-op)
     thr = float(sim.economy["money_pressure_threshold"])
     fixed_cost = float(sim.economy.get("fixed_cost_daily", 0.0))     # 固定費(既定0=OFF)
     rd_coef = factor_update.relative_deprivation_coef(sim.mags)      # 相対的剥奪係数(既定0=OFF)

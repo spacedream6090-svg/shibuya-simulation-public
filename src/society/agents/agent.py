@@ -167,6 +167,12 @@ class Agent:
     implicit_self: str = ""           # 無意識層「最近の自分」1行(揮発的な作動自己。日次更新)
     behav_today: dict | None = None   # 当日の行動・経験カウント(reason→回数)。None=OFF
     behav_ema: dict | None = None     # 行動ベースライン EMA(+感情価 _neg/_pos)。None=OFF
+    # ---- 自助努力の累積(T4 自助努力 affordance、第52バッチ 2026-07-23。既定 空=OFF 不変)----
+    #  経験由来・traits 非依存の熟達ストック(例 {"skill": float, "fitness": float})。サービス
+    #  (塾=skill/ジム=fitness 等)の反復受給で逓減つき累積する(src/society/services.py が唯一の
+    #  書き手)。services.self_dev.enabled=false では誰も書かず {} のまま=挙動バイト一致。checkpoint は
+    #  Agent ごと pickle されるので resume で自動保存される。states 監査集合には入れない(k を汚さない)。
+    self_dev: dict = field(default_factory=dict)
 
     def remember(self, text: str, kind: str = "event",
                  importance_bonus: float = 0.0) -> None:

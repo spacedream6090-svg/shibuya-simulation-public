@@ -385,6 +385,34 @@ def _n_service_use(sim):
     return int(getattr(sim, "_service_total", 0))
 
 
+# ---- 自助努力 affordance 第52バッチ(services.self_dev)。OFF は None=列なし=L2 不変 ----
+def _self_dev_on(sim):
+    sc = getattr(sim, "servicescfg", None)
+    sd = sc.get("self_dev") if sc else None
+    return sd if (sd and sd.get("enabled")) else None
+
+
+@register_aggregator("n_self_dev_users")
+def _n_self_dev_users(sim):
+    """自助サービスの累積を1つでも持つ個体数(採用率の分子)。self_dev 無効なら None=列なし
+    (L2 バイト不変)。ON 時のみ「自力で伸ばすことを選んだ人」の広がりを出す。"""
+    if _self_dev_on(sim) is None:
+        return None
+    return sum(1 for a in sim.agents
+               if any(v > 0.0 for v in (getattr(a, "self_dev", None) or {}).values()))
+
+
+@register_aggregator("avg_self_dev")
+def _avg_self_dev(sim):
+    """累積を持つ個体の平均累積値(全軸プール。0=まだ誰も蓄積していない)。self_dev 無効なら
+    None=列なし(L2 バイト不変)。ON 時のみ蓄積の平均的な厚みを出す。"""
+    if _self_dev_on(sim) is None:
+        return None
+    vals = [v for a in sim.agents
+            for v in (getattr(a, "self_dev", None) or {}).values() if v > 0.0]
+    return round(sum(vals) / len(vals), 4) if vals else 0.0
+
+
 # ---- B2B 卸→小売 第46バッチ ⑤(commerce.inventory.b2b)。OFF は None=列なし=L2 不変 ----
 @register_aggregator("n_b2b_trade")
 def _n_b2b_trade(sim):

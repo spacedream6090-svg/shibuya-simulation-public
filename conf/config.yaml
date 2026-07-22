@@ -1510,14 +1510,24 @@ services:
   free_steps_ref: 48            # 日次利用率→per-step 化の基準自由 step 数(1日の自由行動 step の目安。桁較正の分母)
   # サービス定義テーブル(cats=ホスト POI カテゴリ / hints=POI 名の部分一致=空なら当該カテゴリの任意 POI /
   #   price=料金 / stay=滞在step / band=効果の帯(mood=気分/vitality=活力/learning=学習素地)/ magnitude=効果の
-  #   不透明量(0.0=観測のみ)/ daily_rate=日次利用率(較正)/ age=[min,max] 該当年齢帯 / remember=記憶1行)
+  #   不透明量(0.0=観測のみ)/ daily_rate=日次利用率(較正)/ age=[min,max] 該当年齢帯 / remember=記憶1行 /
+  #   dev_axis+dev_gain+dev_remember=T4 自助努力の累積軸(下の self_dev.enabled=true のときだけ効く。塾→skill=
+  #   賃金へ結ぶ唯一の経路 / ジム→fitness=観測のみ。gain/(1+現在値) の逓減で累積))
   services:
     grooming: {cats: [service], hints: [美容, 理容, 床屋, サロン, ヘア, ネイル], price: 4000, stay: 3, band: mood,     magnitude: 0.03,  daily_rate: 0.05,  age: [12, 90],  remember: 髪を整えて気分が上がった}
     clinic:   {cats: [service], hints: [クリニック, 医院, 診療, 歯科, 内科, 眼科], price: 3000, stay: 2, band: vitality, magnitude: 0.02,  daily_rate: 0.012, age: [0, 120],  remember: 健康のために受診してきた}
-    lesson:   {cats: [education, service], hints: [塾, スクール, 教室, 予備校, アカデミー], price: 5000, stay: 3, band: learning, magnitude: 0.02, daily_rate: 0.20, age: [8, 35], remember: 習い事で新しいことを学んだ}
-    gym:      {cats: [service, leisure], hints: [ジム, フィットネス, スポーツ, ヨガ, プール], price: 2000, stay: 4, band: vitality, magnitude: 0.025, daily_rate: 0.20, age: [15, 75], remember: ジムで汗を流してすっきりした}
+    lesson:   {cats: [education, service], hints: [塾, スクール, 教室, 予備校, アカデミー], price: 5000, stay: 3, band: learning, magnitude: 0.02, daily_rate: 0.20, age: [8, 35], remember: 習い事で新しいことを学んだ, dev_axis: skill, dev_gain: 0.08, dev_remember: 学びの積み重ねが力になってきた}
+    gym:      {cats: [service, leisure], hints: [ジム, フィットネス, スポーツ, ヨガ, プール], price: 2000, stay: 4, band: vitality, magnitude: 0.025, daily_rate: 0.20, age: [15, 75], remember: ジムで汗を流してすっきりした, dev_axis: fitness, dev_gain: 0.08, dev_remember: ジム通いの成果を感じる}
     laundry:  {cats: [service], hints: [クリーニング, ランドリー, 洗濯], price: 1200, stay: 1, band: mood, magnitude: 0.015, daily_rate: 0.14, age: [18, 90], remember: 衣類を整えてもらった}
     service:  {cats: [service], hints: [], price: 2000, stay: 2, band: mood, magnitude: 0.015, daily_rate: 0.03, age: [12, 100], remember: 用事を済ませてきた}
+  # 自助努力 affordance(T4 第52バッチ): 「自力で成長・改善できる」可能性を用意する(成長を強制せず選べる状態)。
+  #   反復受給の累積ストック agent.self_dev(skill/fitness)を作り、skill だけを賃金へ結ぶ(=経済成果への1本だけの
+  #   間接経路)。既定 すべて OFF/0=会計もイベントも不変(ゴールデン golden_baseline_l1.json をバイト一致で守る)。
+  self_dev:
+    enabled: false              # ★ON 推奨(本番): true(塾=技能/ジム=体力の反復累積と skill→賃金経路を有効化)
+    wage_coef: 0.0              # 賃金乗数 =1 + wage_coef × skill(★ON 較正例: 0.10=skill 1.0 で賃金+10%)。0.0=ON でも会計不変
+    decay: 0.0                 # skill/fitness の日次乗算減衰(★ON 較正例: 0.01=維持しないと薄れる→有界均衡)。0.0=減衰なし
+    remember_threshold: 0.5    # 累積軸がこの値を初めて越えた時だけ記憶を1行残す(反復の毎回は残さない=騒音回避)
 
 # ---- 宅配・フードデリバリー スライス④(実装 src/society/delivery.py。設計 docs/research/economy-goods-services.md §7 ④)----
 # 買い手が来店せず注文→配達員が店で受取(① 在庫を1引く)→配送トリップ→到着で受給+課金 の4段(§3.3 ラストマイル ABM)。

@@ -61,13 +61,17 @@ _DEFAULT_SERVICES: dict[str, dict] = {
                "price": 3000, "stay": 2, "band": "vitality", "magnitude": 0.02,
                "daily_rate": 0.012, "age": [0, 120], "remember": "健康のために受診してきた"},
     # 塾・習い事・スクール: 学習素地=効力感。該当層(若年)。週1-2回。
+    #   dev_axis/dev_gain(T4 自助努力): 反復通学で技能ストック skill が逓減つき累積する(唯一の経済経路)。
     "lesson": {"cats": ["education", "service"], "hints": ["塾", "スクール", "教室", "予備校", "アカデミー"],
                "price": 5000, "stay": 3, "band": "learning", "magnitude": 0.02,
-               "daily_rate": 0.20, "age": [8, 35], "remember": "習い事で新しいことを学んだ"},
+               "daily_rate": 0.20, "age": [8, 35], "remember": "習い事で新しいことを学んだ",
+               "dev_axis": "skill", "dev_gain": 0.08, "dev_remember": "学びの積み重ねが力になってきた"},
     # ジム・フィットネス: 疲労回復・活力。週1-2回。
+    #   dev_axis/dev_gain(T4 自助努力): 反復通いで体力ストック fitness が累積する(経済経路は持たない=観測のみ)。
     "gym": {"cats": ["service", "leisure"], "hints": ["ジム", "フィットネス", "スポーツ", "ヨガ", "プール"],
             "price": 2000, "stay": 4, "band": "vitality", "magnitude": 0.025,
-            "daily_rate": 0.20, "age": [15, 75], "remember": "ジムで汗を流してすっきりした"},
+            "daily_rate": 0.20, "age": [15, 75], "remember": "ジムで汗を流してすっきりした",
+            "dev_axis": "fitness", "dev_gain": 0.08, "dev_remember": "ジム通いの成果を感じる"},
     # クリーニング・ランドリー: 生活を整える=気分。週1回。
     "laundry": {"cats": ["service"], "hints": ["クリーニング", "ランドリー", "洗濯"],
                 "price": 1200, "stay": 1, "band": "mood", "magnitude": 0.015,
@@ -107,7 +111,13 @@ def build_cfg(raw) -> dict:
             "daily_rate": float(d.get("daily_rate", 0.0)),
             "age": [int(age[0]), int(age[1])],
             "remember": str(d.get("remember", "サービスを受けた")),
+            # T4 自助努力(第52バッチ): 反復利用の累積軸。dev_axis="" or dev_gain<=0 なら累積なし
+            #   (単発受給のみ=既存挙動)。self_dev.enabled=false ではそもそも読まれない。
+            "dev_axis": str(d.get("dev_axis", "") or ""),
+            "dev_gain": float(d.get("dev_gain", 0.0)),
+            "dev_remember": str(d.get("dev_remember", "") or ""),
         }
+    sd = dict(raw.get("self_dev", {}) or {})
     return {
         "enabled": bool(raw.get("enabled", False)),
         "services": services,
@@ -116,6 +126,17 @@ def build_cfg(raw) -> dict:
         "open_to": int(raw.get("open_to", 20)),
         "radius_m": float(raw.get("radius_m", 700.0)),       # 来店先を探す近傍半径(m)
         "free_steps_ref": max(1, int(raw.get("free_steps_ref", 48))),  # 日次利用率→per-step 化の基準自由 step 数
+        # ---- 自助努力 affordance(T4 第52バッチ)。すべて既定 OFF/中立=会計もイベントも不変(バイト一致)----
+        #  enabled: 累積(accrue)・賃金乗数・日次減衰を有効化する主スイッチ(false=誰も self_dev を書かない)。
+        #  wage_coef: 賃金乗数 =1 + wage_coef × skill の係数(既定 0.0=ON でも会計不変。較正は conf)。
+        #  decay: skill/fitness の日次乗算減衰(既定 0.0=減衰なし。>0 で「維持しないと薄れる」有界均衡)。
+        #  remember_threshold: 累積軸がこの値を初めて越えた時だけ記憶を1行残す(毎回は騒音)。
+        "self_dev": {
+            "enabled": bool(sd.get("enabled", False)),
+            "wage_coef": float(sd.get("wage_coef", 0.0)),
+            "decay": float(sd.get("decay", 0.0)),
+            "remember_threshold": float(sd.get("remember_threshold", 0.5)),
+        },
     }
 
 
@@ -123,6 +144,93 @@ def enabled(sim) -> bool:
     """サービスの実体(来店+効果)が有効か。既定 OFF=新経路を一切通さない(バイト一致)。"""
     cfg = getattr(sim, "servicescfg", None)
     return bool(cfg and cfg["enabled"])
+
+
+# ================================================================ 自助努力 affordance(T4 第52バッチ)
+# 「自力で成長・改善できる」可能性を用意する層。成長は強制せず選べる状態にする(affordance)。既存の
+# サービス受給(charge_service)に、反復利用の**累積効果**(agent.self_dev)と、経済成果への**1本だけの
+# 間接経路**(skill → 賃金乗数)を足す。既存の on_service 単発効果は不変(独立)。
+#
+# R1 の要点:
+#  - 発火判定に累積状態を読ませない。経路は経済成果(賃金)のみ。money_pressure 等の心理は money を見る
+#    ので self_dev→wage→money→(既存 economy↔psych seam) が唯一の間接経路=「1本だけ」。
+#  - 累積(accrue)・減衰(daily)は決定論=RNG を1つも引かない(新 stream も足さない)。
+#  - self_dev.enabled=false / wage_coef=0.0 / decay=0.0 は完全 no-op(state もイベントも会計も不変=バイト一致)。
+#  - 累積ロジックは本モジュール(src/society 直下=CHECKED_DIRS 外)に閉じる。engine/factors には既存の
+#    hook 流儀以外を足さない(no-fingerprint)。skill/fitness は経験由来のストックで k(構成概念)ではない。
+
+_WAGE_AXIS = "skill"   # 賃金へ結ぶ唯一の累積軸(fitness 等は累積・観測するが経済経路を持たない=「1本だけ」)
+
+
+def accrue_self_dev(sim, agent, key: str, step: int, sim_min: int):
+    """サービス反復受給の累積効果(T4)。サービス定義の dev_axis 軸へ逓減つきで加算する。
+
+    戻り値 = (axis, 累積後の値) or None(self_dev OFF / このサービスに dev_axis 無し / dev_gain<=0)。
+    累積式 = old + dev_gain/(1+old)。増分は現在値に反比例=単調増だが増分は 0 へ漸近する「飽和形」。
+    根拠: 練習の冪乗則/学習曲線(熟達が高いほど1回の伸びは小さい)。日次 decay(既定 0)と併せると
+    有界な均衡へ収束=無限成長を防ぐ。決定論(RNG ゼロ)・既存 on_service 単発効果からは独立。
+    remember は累積軸が remember_threshold を**初めて越えた時だけ**1行(毎回は騒音)。"""
+    cfg = getattr(sim, "servicescfg", None)
+    sd = cfg.get("self_dev") if cfg else None
+    if not (sd and sd["enabled"]):
+        return None
+    svc = cfg["services"].get(key)
+    if svc is None:
+        return None
+    axis = svc.get("dev_axis") or ""
+    gain = float(svc.get("dev_gain", 0.0))
+    if not axis or gain <= 0.0:
+        return None
+    store = getattr(agent, "self_dev", None)
+    if store is None:                                # 旧 checkpoint 等で欠落していても安全に起こす
+        store = {}
+        agent.self_dev = store
+    old = float(store.get(axis, 0.0))
+    new = old + gain / (1.0 + old)                   # 逓減(飽和形)。無限成長を防ぐ
+    store[axis] = new
+    thr = float(sd["remember_threshold"])
+    if thr > 0.0 and old < thr <= new:               # 閾値の初到達だけ記憶(反復の毎回は残さない)
+        agent.remember(str(svc.get("dev_remember", "") or "続けてきた努力が実を結びはじめた"))
+    return (axis, new)
+
+
+def self_dev_daily(sim, step: int, sim_min: int) -> None:
+    """自助努力ストックの日次自然減衰(T4)。維持しないと薄れる(技能の忘却・detraining)。
+
+    乗算減衰 x*=(1-decay): 蓄積 gain と釣り合う有界均衡へ収束し、負値化しない。既定 decay=0.0 /
+    self_dev.enabled=false は完全 no-op(state を触らず・イベントも出さない=バイト一致)。決定論(RNG ゼロ)。
+    減衰は静かに(イベント無し)—累積の観測は受給時の service_use payload と L2 集計が担う。"""
+    cfg = getattr(sim, "servicescfg", None)
+    sd = cfg.get("self_dev") if cfg else None
+    if not (sd and sd["enabled"]):
+        return
+    decay = float(sd["decay"])
+    if decay <= 0.0:
+        return
+    keep = 1.0 - decay
+    for agent in sim.agents:
+        store = getattr(agent, "self_dev", None)
+        if not store:
+            continue
+        for axis in list(store):
+            store[axis] = float(store[axis]) * keep
+
+
+def self_dev_wage_mult(sim, agent) -> float:
+    """自助努力(skill)による賃金乗数 = 1 + wage_coef × skill(T4 経済成果への1本だけの経路)。
+
+    scheduler の賃金支給点(_pay_wage)が1箇所だけ呼ぶ。self_dev OFF / wage_coef=0.0 は 1.0(会計不変=
+    バイト一致)。skill=累積した技能ストック(経験由来・traits 非依存)で、これは**経済成果**の乗数であり
+    発火判定には一切使われない(R1)。読むのは _WAGE_AXIS="skill" のみ(fitness 等は賃金へ結ばない)。"""
+    cfg = getattr(sim, "servicescfg", None)
+    sd = cfg.get("self_dev") if cfg else None
+    if not (sd and sd["enabled"]):
+        return 1.0
+    coef = float(sd["wage_coef"])
+    if coef == 0.0:
+        return 1.0
+    skill = float((getattr(agent, "self_dev", None) or {}).get(_WAGE_AXIS, 0.0))
+    return 1.0 + coef * skill
 
 
 # ---------------------------------------------------------------- POI 索引(遅延・軽量)
@@ -271,11 +379,16 @@ def charge_service(sim, agent, step: int, sim_min: int, spend) -> bool:
     spend(sim, agent, price, sim.servicescfg["spend_cat"], step, sim_min)   # 課金(会計不変)
     apply_effect(sim, agent, key, step, sim_min)     # 効果(不透明 magnitude・drive 非接続)
     agent.remember(str(svc["remember"]))
+    dev = accrue_self_dev(sim, agent, key, step, sim_min)   # T4 自助努力: 反復利用の累積(既定 OFF=None)
+    payload = {"node": node, "service": key,
+               "cost": round(price, 1),
+               "poi": _poi_name(sim, node, svc) or node}
+    if dev is not None:                              # 累積後の軸値を観測に追記(既存キー不変・追加のみ)
+        payload["dev_axis"] = dev[0]
+        payload["dev_value"] = round(dev[1], 4)
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                          kind="service_use", x=agent.x, y=agent.y,
-                         payload={"node": node, "service": key,
-                                  "cost": round(price, 1),
-                                  "poi": _poi_name(sim, node, svc) or node}))
+                         payload=payload))
     sim._service_total = int(getattr(sim, "_service_total", 0)) + 1
     return True
 
