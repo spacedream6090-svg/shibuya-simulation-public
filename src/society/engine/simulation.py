@@ -466,6 +466,17 @@ class Simulation:
         self._infra_until_day = -1                 # インフラ障害の解除日(day-index。exclusive)
         self._infra_kind = None                    # 発生中の障害種別(停電/通信断/断水)
         self.today_disaster_line = None            # 当日の災害1行(disaster 有効かつ発生中のみ非 None)
+        # 生活の偶発イベント層(第54バッチ 2026-07-23。純観察=不確実性許容モードの柱。既定 OFF=現行挙動と完全同一)。
+        # 臨時収入/財布紛失(money±)+ 偶然の出会い(closeness+)を単一 chance_event に束ね、日境界に専用 stream
+        # "chance"((agent, day) 個体別キー)で抽選する。効果は money/relations/記憶のみ=ドライブ/発火に流さない
+        # (k 非汚染)。R1: generate() を1本も足さない。OFF=抽選せず・chance_event 0 件・"chance" stream も引かない
+        # =乱数消費不変(ゴールデン golden_baseline_l1.json を守る)。実装 src/society/chance.py。
+        from .. import chance as _chance_mod
+        raw_chance = cfg.get("chance", None)
+        raw_chance = (OmegaConf.to_container(raw_chance, resolve=True)
+                      if OmegaConf.is_config(raw_chance) else raw_chance)
+        self.chancecfg = _chance_mod.build_cfg(raw_chance)
+        self._chance_day = -1                       # 日境界(偶発イベント抽選)の進行管理
         # 観光・多言語・犯罪・治安(現実ギャップ 後続波 H5 2026-07-07。既定 OFF=現行挙動と完全同一)。
         # 観光客(visitor の一部を回遊型に→ランドマーク回遊 tourist_visit)+ 多言語(非日本語話者=語の
         # 伝播障壁)+ 犯罪/迷惑(窃盗→被害者 money−+grievance / 迷惑→周囲 grievance、近傍警察官で抑止)+

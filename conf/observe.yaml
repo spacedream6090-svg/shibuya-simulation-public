@@ -1,0 +1,48 @@
+# 観察モード=再現性より生活の不確実性を優先。seed は auto を推奨(採取して記録される=事後に完全再現可)。
+# 実験(k 掃引・対照)にはこのプロファイルを使わない。
+#
+# 第54バッチ 2026-07-23。ユーザー要望(2026-07-23): 「対照実験ができないスケジュールなので不確実性の高い
+# シミュレーションにしてもいい。再現性を求めるシミュレーションと、純粋な観察なので不確実性を許容できる
+# シミュレーションの選択ができるようにしてほしい」。本ファイルは後者=**純観察ラン**向けの層。
+#
+# 設計の柱(Fable 確定): システムの決定論(同 seed 同結果)は絶対に壊さない。「不確実性」は
+#   (1) seed を実験者が選ばず OS エントロピーから自動採取+記録(run.seed_auto=true)
+#   (2) エージェントの人生に効く偶発イベント層(chance=臨時収入/財布紛失/偶然の出会い)
+#   (3) 既に実装済みの揺らぎ機能(行動の確率的実行・退屈/好奇心・天候・関係系)を束ねて ON
+#   の3点で「エージェント視点の不確実な世界」として与える。決定論エンジン自体は不変=この観察ランも
+#   採取された seed(config.yaml/summary.json に記録)で後から 1 バイト違わず再現できる。
+#
+# これは「基底 conf/config.yaml との差分だけ」を書いた重ね書き用ファイル。基底の上に OmegaConf.merge で
+# 重なる(未指定キーは基底のまま=既定 OFF の実験ノブは触らない・各値は既存の較正済み既定を尊重)。
+#   使い方: python scripts/run.py --profile conf/observe.yaml
+#           規模・期間を足すなら dotlist で(例: run.n_agents=100 run.n_steps=1440)。
+#           本番の厚い再現(組織・行政・現実ギャップ)と併せるなら production.yaml を土台に本ファイルの
+#           chance ブロックだけを足す運用でもよい(観察モードの本質は「不確実性を許容する」姿勢)。
+#
+# ★D14(docs/plans/finals-day1-decisions.md): 本番ランのモード選択(再現性実験 vs 純観察)。対照実験
+#   (k 掃引・spark ON/OFF)の予定があるなら再現性実験モード(数値 seed 固定)。純観察のみなら本プロファイル。
+
+# ---- (1) seed を選ばず採取+記録(実験者が seed を選ばない=不確実性の受容。但し失わない)----
+run:
+  seed_auto: true      # run.py が起動時に OS エントロピーから seed を採取し config.yaml/summary.json に記録
+                       # (run.seed=<数値> を明示併記すればそちらが優先=固定も可)
+
+# ---- (2) 偶発イベント層(人生に効く不確実性。臨時収入/財布紛失=money± / 偶然の出会い=closeness+)----
+chance:
+  enabled: true        # daily_rate/money 幅/weight は基底の較正済み既定(現実の桁)を使う=過剰にいじらない
+
+# ---- (3) 既存の揺らぎ機能を束ねる(各値は基底の較正済み既定を尊重・enabled だけ ON)----
+# 行動の確率的実行(L1 骨格 motif / L2 時刻ジッター / L3 寄り道 detour・中断 interrupt)。
+routine:
+  stochastic:
+    enabled: true      # novelty_prob 0.15 / jitter ±30分 / detour・interrupt は活動種別ごとの較正値(基底)
+# 退屈/好奇心の内発ドライブ(長居で退屈が溜まり閾値超えで近傍の未訪問 POI へ内発的探索)。
+drive:
+  boredom:
+    enabled: true      # accrual/threshold/fire_prob は基底の較正値
+# 天候(その日の天気=雨/晴れ等。全員共通・k 非依存の日次揺らぎ)。
+weather:
+  enabled: true
+# 関係系(社会関係の質=深化段階 tier / 断絶 decay / 評判 reputation)。chance の encounter と地続き。
+relations:
+  enabled: true

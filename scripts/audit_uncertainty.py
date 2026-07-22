@@ -92,9 +92,9 @@ LUCK_KINDS: dict[str, dict] = {
     "infra_outage":    _lk("shock",     scope="world", stream="disaster", valence="neg",
                            phase=("phase", "onset"),
                            note="インフラ障害=停電/通信断/断水(onset のみ計上)"),
-    # ---- 第54バッチ(不確実性モード)で 1 行足す予定の受け口(コメントのまま=現状 0 件)----
-    # "chance_event":  _lk("chance",    stream="chance", valence="mixed",
-    #                      note="宝くじ的当選/偶然の出会い/財布紛失/臨時収入 等の偶発事"),
+    # ---- 第54バッチ(不確実性モード)で接続(chance.enabled ON のみ・既定 OFF=0 件)。1 行で監査+ΔR² に反映 ----
+    "chance_event":    _lk("chance",    stream="chance", valence="mixed",
+                           note="臨時収入 windfall/財布紛失 loss/偶然の出会い encounter の偶発事(src/society/chance.py)"),
 }
 
 

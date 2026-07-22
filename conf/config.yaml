@@ -1628,6 +1628,35 @@ disaster:
   outage_duration_days: 1       # 障害の継続日数
   outage_grievance: 0.0         # ★ON 推奨: 例 0.03。障害中の不満増分(factors 経由・1日1回。0.0=観測のみ)
 
+# ---- 生活の偶発イベント層(第54バッチ 2026-07-23。純観察=不確実性許容モードの柱。既定 OFF=現行挙動と完全同一)----
+# ユーザー要望(2026-07-23): 「純粋な観察なので不確実性を許容できるシミュレーション」を選べるように。
+# システムの決定論(同 seed 同結果)は壊さず、「エージェント視点の不確実な世界」= 人生に効く偶発イベント層で与える。
+# 実装 src/society/chance.py + scheduler の _phase_chance。日境界に専用 stream "chance"((agent, day) 個体別キー=
+# 編成順非依存)で 1人1日 daily_rate の確率で偶発事に遭い、重み付きカタログから1件を適用する:
+#   windfall(臨時収入=拾得/還付/当選小口。money+)/ loss(財布紛失/急な出費。money−)/ encounter(偶然の再会・
+#   出会い。近傍 or 関係台帳の既知相手と closeness+ を双方に)。効果は money/relations/記憶のみ=ドライブ/発火に流さ
+#   ない(k の同定を汚さない)。運/実力分解(scripts/analyze_luck.py)では audit_uncertainty.LUCK_KINDS 経由で
+#   chance_event が運側説明変数になり、windfall/loss で「収入は運にほぼ無感応(第51実測 ΔR²≈0.001)」の穴に外生分散を
+#   狙って注入できる(=ダイナミズムを設計変数として制御。docs/research/uncertainty-audit.md §4)。
+# ---- 較正根拠(現実の桁) ----
+#   daily_rate 0.03 = 1人1日 3%(≈月1回、何か「想定外の偶発事」に遭う)。第51監査の平常日実測「住民の 96% が
+#     1日 平均5件超の想定外(寄り道/中断/退屈探索/被害/発症)を経験」の中で、金銭/出会いに効く節目イベントは
+#     もっと稀=月オーダー、という桁に合わせた保守既定。★ダイナミズムを厚くしたい観察ランは daily_rate や money 幅を
+#     上げる(income の運感度が直に上がる=audit_uncertainty で観測)。
+#   money 1,000〜20,000 円 = 経済スケール(会社員 日給 12,000・食事 900・買い物 2,500)に対し「小銭〜給料1日弱」。
+#     拾得/還付/小口当選・財布の現金相当。loss は手持ちの範囲(現金の外生流出。0 未満にはしない)。
+#   encounter weight 2.0(windfall/loss は各 1.0)= 偶然の再会は最も日常的(第51実測: 関係数は運が主経路 ΔR²≈0.19)
+#     ため他より厚く。closeness 1.5 = relations の tier 閾値(知人 2.0)に一歩近づく1回の再会。
+# R1: 新 stream "chance" 1本のみ・追加 LLM 呼ゼロ=呼数 k 非依存。enabled=false で chance_event 0 件・"chance"
+#   stream も引かない=ゴールデン L1 バイト一致。production/daily は触らない(純観察は conf/observe.yaml で束ねる)。
+chance:
+  enabled: false                # ★純観察ラン(不確実性許容)で ON。false=現行挙動と完全同一(バイト一致)
+  daily_rate: 0.03              # 1人1日あたり偶発事に遭う確率(≈月1回。上げると income の運感度が上がる)
+  events:                       # データ駆動カタログ(重み付き抽選)
+    windfall:  {weight: 1.0, money_lo: 1000, money_hi: 20000}   # 臨時収入(拾得/還付/当選小口)= money+
+    loss:      {weight: 1.0, money_lo: 1000, money_hi: 20000}   # 財布紛失/急な出費 = money−(手持ちの範囲)
+    encounter: {weight: 2.0, closeness: 1.5}                    # 偶然の再会/出会い = closeness+(双方)
+
 # ---- 宿泊・ホテル滞在(第9バッチ Wave L 2026-07-07。既定 OFF=現行挙動と完全同一)----
 # 来街者(visitor)が夜の帰宅退出の代わりにホテルへ宿泊する(実装 src/society/lodging.py +
 # scheduler の _maybe_lodge/_lodging_checkin/_phase_lodging)。夜の帰宅(homing)の退出時に

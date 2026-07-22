@@ -231,6 +231,10 @@ register_event_kind("friend_graph_built", "初期友人グラフの生成統計(
 #      決定論・LLM/generate ゼロ増・新 stream "spark" のみ。実装 src/society/spark.py。事後トレーサ
 #      scripts/trace_spark.py。設計: docs/plans/finals-day1-decisions.md D13)----
 register_event_kind("spark_roster", "火種介入の t=0 名簿(選抜 ids/pids・3メニュー ON/OFF・較正 params。起動時1回・世界イベント agent_id=-1){ids, pids, n, menus, params}")
+# ---- 生活の偶発イベント層(第54バッチ 2026-07-23。chance.enabled ON のみ・既定 OFF=0件。決定論・新 stream
+#      "chance" のみ・LLM/generate ゼロ増。実装 src/society/chance.py。運/実力分解 audit_uncertainty.LUCK_KINDS
+#      に 1 行接続=監査+ΔR² に自動反映。設計: docs/research/uncertainty-audit.md §4)----
+register_event_kind("chance_event", "生活の偶発事(臨時収入 windfall / 財布紛失 loss / 偶然の出会い encounter){type, amount?, balance?, other?}")
 
 
 @dataclass

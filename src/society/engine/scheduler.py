@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 
 from .. import annual as annual_mod
+from .. import chance as chance_mod
 from .. import commerce as commerce_mod
 from .. import conversation as conversation_mod
 from .. import disaster as disaster_mod
@@ -3539,6 +3540,21 @@ def _phase_disaster(sim, step: int, sim_min: int) -> None:
     disaster_mod.tick_day(sim, step, sim_min)
 
 
+# ---------------------------------------------------------------- 生活の偶発イベント層(第54バッチ)
+def _phase_chance(sim, step: int, sim_min: int) -> None:
+    """日次境界: 生活の偶発事(臨時収入/財布紛失=money± / 偶然の出会い=closeness+)。既定 OFF=no-op。
+
+    純観察=不確実性許容モードの柱。日境界に専用 stream "chance"((agent, day) 個体別キー=編成順非依存)で
+    1人1日 daily_rate の確率で偶発事に遭い、重み付きカタログから1件を適用する。効果は money/relations/記憶
+    のみ=ドライブ/発火に流さない(既存の間接経路で自然に波及)。R1: chance 機構は generate() を1本も足さず、
+    発火判断に k・内面状態(構成概念)を食わせず、物理量(現在地・所持金・関係台帳の既知相手)・config・新
+    stream のみ参照する。効果は物理位置・対面 co-location を変えうる(career G5 / 健康 H1 と同型)→ 呼数不変は
+    compute_matched 下の k 不変性で担保する。偶発ロジックは chance.py(CHECKED_DIRS 外)に閉じる(no-fingerprint)。
+
+    chance OFF なら完全 no-op(chance_event 0 件・"chance" stream も引かない=乱数消費不変=ゴールデンを守る)。"""
+    chance_mod.tick_day(sim, step, sim_min)
+
+
 # ---------------------------------------------------------------- 観光・多言語・犯罪・治安(後続波 H5)
 def _diversity_on(sim) -> bool:
     """観光・多言語・犯罪・治安(後続波 H5)が有効か。既定 OFF=新経路を一切通さない(バイト一致)。"""
@@ -3787,6 +3803,7 @@ def run_step(sim, step: int) -> None:
     _phase_career(sim, step, sim_min)              # 日次境界: 失業/求職/転職(既定OFF=no-op。Wave G5)
     _phase_health(sim, step, sim_min)              # 日次境界: 病気の発症/回復・受診・メンタル(既定OFF=no-op。H1)
     _phase_disaster(sim, step, sim_min)            # 日次境界: 災害・交通遅延/運休・インフラ障害(既定OFF=no-op。H4)
+    _phase_chance(sim, step, sim_min)              # 日次境界: 生活の偶発(臨時収入/財布紛失/偶然の出会い。既定OFF=no-op。第54バッチ)
     _phase_goods(sim, step, sim_min)               # 物流: 補充トリップ到着+日次(s,S)レビュー(既定OFF=no-op。①)。
                                                    # disaster/scenario 確定後=その日の封鎖(運休/shock_closure)を読む
     _phase_delivery(sim, step, sim_min)            # 宅配④: 配達員の物理配車+到着で受給/課金/gig収入(既定OFF=no-op)。
