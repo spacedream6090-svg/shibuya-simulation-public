@@ -25,6 +25,7 @@ from .. import joint as _joint
 from .. import media
 from .. import party as _party
 from .. import services as _services
+from .. import spark as _spark
 from ..factors import update as factor_update
 from ..observer.schema import Event
 from ..world import calendar as _calendar
@@ -925,6 +926,8 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
         joint_act = _joint.route_activity(agent)     # meal_cafe→eating(既存 _charge_meal で課金)/他→""
     elif (party := _party.party_dest(agent, sim, step, sim_min)) is not None:
         dest = party                                 # 来街者 party: 連れと共有の回遊 POI へ収束(第45バッチ S-R5)
+    elif (spk := _spark.spark_dest(agent, sim, step, sim_min)) is not None:
+        dest = spk                                   # 火種介入: sparked の集会アンカー POI へ収束(第53バッチ・bias 減衰)
     elif (svc := _services.service_dest(agent, sim, step, sim_min)) is not None:
         dest = svc                                   # サービス来店: 近傍の service/education POI へ寄せる(第46バッチ ③)
         service_act = "service"                      # 到着時 activity=="service" で受給(charge_service)

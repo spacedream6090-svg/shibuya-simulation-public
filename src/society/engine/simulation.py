@@ -344,6 +344,16 @@ class Simulation:
         raw_party = (OmegaConf.to_container(raw_party, resolve=True)
                      if OmegaConf.is_config(raw_party) else raw_party)
         self.partycfg = _party_mod.build_cfg(raw_party)
+        # 火種介入の実験条件化(spark treatment 第53バッチ 2026-07-23。既定 OFF=現行挙動と完全同一)。
+        # 「立ち上げには初期介入が不可欠」という助言と「介入ゼロで観測」という方針の対立を ON/OFF treatment で
+        # 決着させる。介入は hardcode せず初期条件(関係の束/資本・在庫/集会アンカー)の差としてのみ与える。
+        # trait-blind 選抜(pid, spark.seed の安定ハッシュ純関数)・decay は集会アンカーのみ・spark_roster 1件。
+        # OFF=何も適用せず・spark_roster も出さず・"spark" stream も引かない=バイト一致(ゴールデンを守る)。
+        from .. import spark as _spark_mod
+        raw_spark = cfg.get("spark", None)
+        raw_spark = (OmegaConf.to_container(raw_spark, resolve=True)
+                     if OmegaConf.is_config(raw_spark) else raw_spark)
+        self.sparkcfg = _spark_mod.build_cfg(raw_spark)
         # 閾値分布の seam(手続き生成経路のみ。名簿値優先=現状のまま)
         self.threshold_dist = str(cfg.get("factors", {}).get("threshold_dist",
                                                              "normal") or "normal")
@@ -759,6 +769,9 @@ class Simulation:
         _friends_mod.build_friend_graph(self)
         # 来街者 party の実体化(第45バッチ S-R5。起動時=day0 の present 来街者をグループ化)。既定 OFF=no-op。
         _party_mod.form_parties(self, 0, 0)
+        # 火種介入の適用(spark treatment 第53バッチ。party の後の中立な1呼び出し)。既定 OFF=no-op=バイト一致。
+        # ON=trait-blind 選抜→(a)関係の束/(b)資本・在庫/(c)集会アンカーを初期条件として据え・spark_roster を1件記録。
+        _spark_mod.apply(self)
         # 初期関係のアイスブレイク(実験前の初対面会話。build_icebreak.py 生成物)。
         # ★全 k 条件で同一ファイルを読む=初期関係が条件間で同一(交絡の排除)。
         self._load_icebreak(cfg)

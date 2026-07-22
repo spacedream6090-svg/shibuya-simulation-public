@@ -227,6 +227,10 @@ register_event_kind("joint_activity", "共同行動の成立=同伴グループ/
 register_event_kind("friend_graph_built", "初期友人グラフの生成統計(homophily+所属+Dunbar。起動時1回・世界イベント agent_id=-1){n_edges, mean_degree}")
 # ★ S-R4(職場の会食・飲み会)は joint_activity{type:colleague_lunch|colleague_dinner} を再利用(schema変更なし)。
 # ★ S-R5(来街者 party)は joint_activity{type:party} を再利用(schema変更なし)。
+# ---- 火種介入の実験条件化 spark treatment(第53バッチ 2026-07-23。spark.enabled ON のみ・既定 OFF=0件。
+#      決定論・LLM/generate ゼロ増・新 stream "spark" のみ。実装 src/society/spark.py。事後トレーサ
+#      scripts/trace_spark.py。設計: docs/plans/finals-day1-decisions.md D13)----
+register_event_kind("spark_roster", "火種介入の t=0 名簿(選抜 ids/pids・3メニュー ON/OFF・較正 params。起動時1回・世界イベント agent_id=-1){ids, pids, n, menus, params}")
 
 
 @dataclass

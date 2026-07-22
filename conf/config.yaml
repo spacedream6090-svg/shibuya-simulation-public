@@ -1417,6 +1417,38 @@ party:
   band_start_min: 600           # 回遊帯の開始(分 of day)= 10:00
   band_end_min: 1320            # 回遊帯の終了(分 of day)= 22:00
 
+# ---- 火種介入の実験条件化(spark treatment 第53バッチ 2026-07-23。ユーザー要望。既定 OFF=現行挙動と完全同一)----
+# 「立ち上げには初期介入が不可欠」という外部の助言と「介入ゼロで観測」という本プロジェクト方針の対立を、
+# ON/OFF 可能な treatment として実験で決着させるブロック。介入は hardcode せず、初期条件・環境の差
+# (初期関係の束/初期資本・在庫/定期集会アンカー)としてのみ与える。★プロンプトへの台本注入は一切しない。
+# 実装 src/society/spark.py(選抜・較正値はここと spark.py にのみ=no-fingerprint 契約)。事後トレーサ
+# scripts/trace_spark.py が spark_roster を起点に「sparked 発の現象か」を L1 から追跡(語彙可視化の資産を再利用)。
+# 設計絶対条件: (1)選抜は trait-blind 既定=(pid, spark.seed)の安定ハッシュ純関数=無作為(traits を読まない
+#   =生得/創発の交絡を排除。ids 明示指定は許可)。(2)decay が効くのは (c)集会アンカーのバイアス強度のみ
+#   (a 関係/b 資本・在庫は t=0 一発=減衰対象外)。(3)イベント毎の spark タグは付けず t=0 名簿1件のみ記録。
+# 決定論・run.seed 非依存: 選抜・(a)(b)(c)適用とも乱数ゼロ(spark.seed 固定なら run.seed 変更でも同一名簿)。
+# 既定 OFF=何も選抜/適用せず・spark_roster も出さず・"spark" stream も引かない=バイト一致(ゴールデンを守る)。
+spark:
+  enabled: false                # ★実験 treatment(ON/OFF 比較で回すかは D13=GPU 予算判断)
+  seed: 20260723                # 選抜の安定ハッシュ種(run.seed 非依存=別ランで同一名簿)
+  n: 5                          # 無作為選抜の人数(ids が空のとき)
+  ids: []                       # 名簿明示指定(pid か agent.id の文字列。空なら trait-blind 無作為選抜)
+  menus:                        # 3メニュー各個別 ON/OFF
+    relations:                  # (a) 初期関係の束: sparked 相互+近傍を友人 closeness へ注入(t=0 一発・減衰対象外)
+      enabled: true
+      closeness: 5.0            # 注入する closeness(relations の友人 tier2 相当=閾値 5.0)
+      mutual_k: 4               # 各 sparked に束ねる近傍人数(同 home_building 優先→id 近傍)
+    capital:                    # (b) 初期資本・在庫: money 上乗せ+(商業 POI 保持者なら)在庫上乗せ(t=0 一発・減衰対象外)
+      enabled: true
+      money: 50000             # 手持ちへの上乗せ(円。会社員初期レンジ相当の頭金)
+      stock: 20                # 商業 POI 在庫の上乗せ(単位。goods.inventory ON 時のみ実効)
+    anchor:                     # (c) 集会アンカー: 共通 POI へ band 内の自由時間を寄せる(bias は step で指数減衰)
+      enabled: true
+      poi_cat: leisure          # 集会 POI のカテゴリ((poi_cat, seed)純関数で全 sparked 共通の1 POI を決定)
+      band: [1020, 1320]        # 寄せる時間帯 [開始, 終了)(分 of day)= 17:00-22:00
+      bias: 0.5                 # 寄せる基礎確率/step(新 stream "spark")
+      decay: 0.02               # step 経過での指数減衰係数(bias × exp(-decay × step)=介入が初期だけ効く)
+
 # ---- 商業・店舗のダイナミクス(現実ギャップ 後続波 H3 2026-07-07。すべて既定 OFF=現行挙動と完全同一)----
 # 現状 POI(店・会社)は静的で常時営業・価格固定。商業の動きを最小・非LLM・決定論で載せる
 # (実装 src/society/commerce.py)。3機構(都市再開発=地図が変わる機構は本波では作らない=注記に留める):

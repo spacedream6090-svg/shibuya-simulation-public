@@ -374,6 +374,47 @@ def _n_joint_activity(sim):
     return int(getattr(sim, "_joint_total", 0))
 
 
+# ---- 火種介入 spark treatment(第53バッチ)。OFF/未選抜は None=列なし=L2 バイト不変 ----
+def _spark_groups(sim):
+    """(sparked 居住者, 非 sparked 居住者)を返す。spark OFF / 選抜 0 / 片群が空なら None。"""
+    ids = getattr(sim, "_spark_ids", None)
+    sc = getattr(sim, "sparkcfg", None)
+    if not (sc and sc.get("enabled")) or not ids:
+        return None
+    sp = [a for a in sim.agents if a.id in ids]
+    ot = [a for a in sim.agents if a.id not in ids and not a.visitor]
+    if not sp or not ot:
+        return None
+    return sp, ot
+
+
+@register_aggregator("spark_reach_ratio")
+def _spark_reach_ratio(sim):
+    """sparked 群 / 非 sparked 群の平均関係数(社会的リーチ=活動量の代理)の比。spark OFF は None=列なし。
+
+    t=0 の関係注入で高く始まり、非 sparked が追いつけば 1 へ寄る(火種の持続性の live 信号)。厳密な
+    活動量・波及分析は事後トレーサ scripts/trace_spark.py が L1 から行う。分母は 1.0 で床(0 除算回避)。"""
+    g = _spark_groups(sim)
+    if g is None:
+        return None
+    sp, ot = g
+    msp = sum(len(getattr(a.mem, "relations", {})) for a in sp) / len(sp)
+    mot = sum(len(getattr(a.mem, "relations", {})) for a in ot) / len(ot)
+    return round(msp / max(mot, 1.0), 4)
+
+
+@register_aggregator("spark_money_ratio")
+def _spark_money_ratio(sim):
+    """sparked 群 / 非 sparked 群の平均手持ち(資本の軌跡)の比。spark OFF は None=列なし=L2 不変。"""
+    g = _spark_groups(sim)
+    if g is None:
+        return None
+    sp, ot = g
+    msp = sum(float(getattr(a, "money", 0.0)) for a in sp) / len(sp)
+    mot = sum(float(getattr(a, "money", 0.0)) for a in ot) / len(ot)
+    return round(msp / max(mot, 1.0), 4)
+
+
 # ---- サービスの実体化 第46バッチ ③(services)。OFF は None=列なし=L2 不変 ----
 @register_aggregator("n_service_use")
 def _n_service_use(sim):
