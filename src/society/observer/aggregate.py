@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from .. import status as _status_mod
+from . import lens as _lens
 
 AGGREGATORS: dict[str, Callable[[Any], float | int | str]] = {}
 
@@ -466,6 +467,87 @@ def _belief_diversity(sim) -> float:
         return 0.0
     text = "".join(_last(getattr(a, "beliefs", None)) for a in sim.agents)
     return round(_type_token_ratio(text), 6)
+
+
+# ---- 観測レンズ 第50バッチ(既定 OFF)。lens.enabled=false は全て None=列なし=L2 バイト不変 ----
+# T1 価値4軸(value4): 当日のイベント数構成(utility/emotion/social/epistemic)。全体スカラーのみ。
+#   observe() は step 末に collect が 1 回呼ぶ経路で当日タリーを積む(idempotent・読むだけ・乱数ゼロ)。
+def _value_col(sim, axis):
+    if not (_lens.enabled(sim) and _lens.cfg_of(sim)["value4"]["enabled"]):
+        return None
+    st = _lens.observe(sim)
+    return int(st["value"].get(axis, 0)) if st else 0
+
+
+def _motive_col(sim, motive):
+    if not (_lens.enabled(sim) and _lens.cfg_of(sim)["motives"]["enabled"]):
+        return None
+    st = _lens.observe(sim)
+    return int(st["motive"].get(motive, 0)) if st else 0
+
+
+@register_aggregator("value4_utility")
+def _value4_utility(sim):
+    return _value_col(sim, "utility")
+
+
+@register_aggregator("value4_emotion")
+def _value4_emotion(sim):
+    return _value_col(sim, "emotion")
+
+
+@register_aggregator("value4_social")
+def _value4_social(sim):
+    return _value_col(sim, "social")
+
+
+@register_aggregator("value4_epistemic")
+def _value4_epistemic(sim):
+    return _value_col(sim, "epistemic")
+
+
+@register_aggregator("motive_earn")
+def _motive_earn(sim):
+    return _motive_col(sim, "earn")
+
+
+@register_aggregator("motive_love")
+def _motive_love(sim):
+    return _motive_col(sim, "love")
+
+
+@register_aggregator("motive_recognition")
+def _motive_recognition(sim):
+    return _motive_col(sim, "recognition")
+
+
+# T6 信用内訳(trust): 合成地位 status の分布 2 列(Gini・上位10%集中度)。lens+trust+status が全て ON の
+#   ときだけ出す。値は既存 status_gini/status_top10_share と同義(status を「信用」レンズとして束ねた列)。
+#   status 無効(=status 値が全て 0)や lens/trust 無効なら None=列なし=L2 不変。
+def _trust_on(sim) -> bool:
+    return bool(_lens.enabled(sim) and _lens.cfg_of(sim)["trust"]["enabled"]
+                and _status_mod.enabled(sim))
+
+
+@register_aggregator("trust_gini")
+def _trust_gini(sim):
+    if not _trust_on(sim):
+        return None
+    if not sim.agents:
+        return 0.0
+    return round(_gini(getattr(a, "status", 0.0) for a in sim.agents), 6)
+
+
+@register_aggregator("trust_top10")
+def _trust_top10(sim):
+    if not _trust_on(sim):
+        return None
+    vals = sorted((float(getattr(a, "status", 0.0)) for a in sim.agents), reverse=True)
+    total = sum(vals)
+    if not vals or total <= 0.0:
+        return 0.0
+    k = max(1, int(len(vals) * 0.1))
+    return round(sum(vals[:k]) / total, 6)
 
 
 def collect(sim) -> dict:

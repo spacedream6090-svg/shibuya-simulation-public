@@ -462,7 +462,11 @@ def build_data(run_dir: Path, include_traffic: bool = True,
         rows = sorted(pq.read_table(l2_path).to_pylist(), key=lambda r: r["step"])
         for key in ("mean_grievance", "n_sleeping", "n_working", "n_cars",
                     "n_inside_buildings", "n_outside", "n_moving",
-                    "distinct_vocab_in_use", "n_sns_posts", "total_adoptions"):
+                    "distinct_vocab_in_use", "n_sns_posts", "total_adoptions",
+                    # 第50バッチ 観測レンズの L2 全体スカラー(lens ON 時のみ列が在る)
+                    "value4_utility", "value4_emotion", "value4_social",
+                    "value4_epistemic", "motive_earn", "motive_love",
+                    "motive_recognition", "trust_gini", "trust_top10"):
             if rows and key in rows[0]:
                 metrics[key] = [r.get(key, 0) for r in rows]
 
@@ -552,6 +556,15 @@ def build_data(run_dir: Path, include_traffic: bool = True,
     # 無ければ out は不変=既存ラン(徒歩/自転車/車のみ)はビューワー再生成でバイト同一。
     if any(m is not None and m[0] == 3 for step in moves for m in step):
         out["mode_legend"] = {"0": "徒歩", "1": "自転車", "2": "車", "3": "タクシー"}
+    # 第50バッチ 観測レンズ: lens_map.json が「有る時だけ」価値/欲望を事後計算して埋め込む。
+    # 無ければ out は不変=既存ランのビューア再生成でバイト同一(communities/mode_legend と同型)。
+    lens_map = load_lens_map(run_dir)
+    if lens_map is not None:
+        out["lens"] = build_lens_data(events, agents_meta, lens_map, start_min)
+    # 信用内訳(T6): L3 に status がある(hierarchy ON)時だけ埋め込む。無ければ非表示=不変。
+    trust = build_trust_data(events, run_dir, agents_meta)
+    if trust is not None:
+        out["trust"] = trust
     return out
 
 
@@ -579,6 +592,229 @@ def load_communities(run_dir: Path) -> dict | None:
         wins.append({"start": w.get("step_start", 0), "end": w.get("step_end", 0),
                      "map": mp})
     return {"windows": wins}
+
+
+# ============================================================ 観測レンズ(第50バッチ)
+# 「lens_map.json が有る時だけ」build_data が価値4軸/3M欲望を事後計算する(sim⇄viz 疎結合)。
+# 無ければ out に一切足さない=既存ランのビューア再生成でバイト同一(後方互換。communities と同型)。
+
+def load_lens_map(run_dir: Path) -> dict | None:
+    """runs/<name>/lens_map.json(observer/lens.py が lens ON 時に書く写像)を読む。無ければ None。"""
+    p = run_dir / "lens_map.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _lens_axis(kind: str, payload: dict, kind_map: dict):
+    """observer/lens.resolve_axis の Python 鏡(sim なしで L1 を分類。2段マッチ対応)。"""
+    spec = kind_map.get(kind)
+    if spec is None:
+        return None
+    if isinstance(spec, str):
+        return spec or None
+    if isinstance(spec, dict):
+        if "__payload_argmax__" in spec:
+            key = spec["__payload_argmax__"]
+            w = payload.get(key) if isinstance(payload, dict) else None
+            if isinstance(w, dict) and w:
+                items = sorted(w.items(), key=lambda kv: str(kv[0]))
+                best = max(items, key=lambda kv: float(kv[1]))
+                return str(best[0]) or None
+            return spec.get("_else")
+        pkey = spec.get("__payload__")
+        val = payload.get(pkey) if (isinstance(payload, dict) and pkey) else None
+        if val is not None and str(val) in spec:
+            return spec[str(val)]
+        return spec.get("_else")
+    return None
+
+
+def build_lens_data(events: list, agents_meta: list, lens_map: dict,
+                    start_min: int) -> dict:
+    """L1 を価値4軸/3M欲望で事後分類する。全体日別構成 + 住民別プロファイル + 3M 軸間遷移。
+
+    L2 が持つのは全体スカラーのみ(人数>時間の方針)。住民別・遷移はここで L1 から算出=シム実行コスト0。"""
+    vaxes = lens_map.get("value_axes", [])
+    motives = lens_map.get("motives", [])
+    vmap = lens_map.get("value4", {}) if lens_map.get("value_enabled", True) else {}
+    mmap = lens_map.get("motive_map", {}) if lens_map.get("motive_enabled", True) else {}
+
+    name_of = {a["id"]: a.get("name", f"a{a['id']}") for a in agents_meta}
+    v_daily: dict[int, dict] = defaultdict(lambda: {t: 0 for t in vaxes})
+    m_daily: dict[int, dict] = defaultdict(lambda: {t: 0 for t in motives})
+    v_profile: dict[int, dict] = defaultdict(lambda: {t: 0 for t in vaxes})
+    # 3M 軸間遷移: 同一住民の「欲望を帯びた連続イベント」の (前→後) ペア集計
+    m_prev: dict[int, str] = {}
+    m_trans: dict[tuple, int] = defaultdict(int)
+
+    def _day(e):
+        sm = e.get("sim_min")
+        if sm is None:
+            sm = start_min + int(e["step"]) * STEP_MINUTES
+        return int(sm) // 1440
+
+    for e in events:
+        aid = e["agent_id"]
+        payload = json.loads(e["payload"]) if e["payload"] else {}
+        kind = e["kind"]
+        va = _lens_axis(kind, payload, vmap) if vmap else None
+        if va in v_daily[_day(e)]:
+            v_daily[_day(e)][va] += 1
+            if aid >= 0:
+                v_profile[aid][va] += 1
+        ma = _lens_axis(kind, payload, mmap) if mmap else None
+        if ma in m_daily[_day(e)]:
+            m_daily[_day(e)][ma] += 1
+            if aid >= 0:
+                if aid in m_prev:
+                    m_trans[(m_prev[aid], ma)] += 1
+                m_prev[aid] = ma
+
+    days = sorted(set(v_daily) | set(m_daily))
+    value = {
+        "axes": vaxes,
+        "days": days,
+        "series": {t: [v_daily[d][t] for d in days] for t in vaxes},
+    }
+    # 住民別プロファイル: 総数上位(価値の帯を持つ人)
+    prof = sorted(v_profile.items(), key=lambda kv: -sum(kv[1].values()))[:24]
+    value["profiles"] = [{"id": aid, "name": name_of.get(aid, f"a{aid}"),
+                          "counts": counts, "total": sum(counts.values())}
+                         for aid, counts in prof if sum(counts.values()) > 0]
+    motive = {
+        "motives": motives,
+        "days": days,
+        "series": {t: [m_daily[d][t] for d in days] for t in motives},
+        "transitions": [{"from": f, "to": t, "n": n}
+                        for (f, t), n in sorted(m_trans.items(),
+                                                key=lambda kv: -kv[1])],
+    }
+    return {"value": value, "motives": motive}
+
+
+# ============================================================ 信用内訳(第50バッチ T6)
+# status.py の合成地位スコアの材料別内訳・分布を L1+L3 から事後再構成する(status を可視化するだけ)。
+# hierarchy OFF(L3 に status 列なし)なら None=信用セクション非表示=後方互換。
+
+_TRUST_WEIGHTS = {"rep": 0.25, "followers": 0.25, "wealth": 0.20,
+                  "inst": 0.10, "biz": 0.10, "host": 0.10}
+# ビューアが L1/L3 から復元できる材料(followers は net の被フォロー数=L1 に残らないため事後再構成不可)。
+_TRUST_MATERIALS = ("rep", "wealth", "inst", "biz", "host")
+
+
+def _gini_py(values: list) -> float:
+    xs = sorted(float(v) for v in values)
+    n = len(xs)
+    if n == 0:
+        return 0.0
+    total = sum(xs)
+    if total <= 0.0:
+        return 0.0
+    cum = sum(i * x for i, x in enumerate(xs, start=1))
+    return round((2.0 * cum) / (n * total) - (n + 1.0) / n, 6)
+
+
+def build_trust_data(events: list, run_dir: Path, agents_meta: list) -> dict | None:
+    """信用(合成地位)の内訳・分布・org 相関を L1+L3 から再構成。hierarchy OFF なら None。"""
+    l3 = run_dir / "l3_snapshots.parquet"
+    if not l3.exists():
+        return None
+    status_by: dict[int, float] = {}
+    money_by: dict[int, float] = {}
+    try:
+        rows = pq.read_table(l3).to_pylist()
+    except Exception:
+        return None
+    if rows:
+        last = max(rows, key=lambda r: r["step"])
+        try:
+            state = json.loads(last["state"])
+        except Exception:
+            state = {}
+        for a in state.get("agents", []):
+            money_by[a["id"]] = float(a.get("money", 0.0)) + float(a.get("account", 0.0))
+            if "status" in a:
+                status_by[a["id"]] = float(a["status"])
+    if not status_by:                    # hierarchy OFF = status 列なし → 信用レンズは出さない
+        return None
+
+    prop_author: dict = {}
+    passed: set = set()
+    biz: dict = defaultdict(float)
+    host: dict = defaultdict(int)
+    rep: dict = {}
+    for e in events:
+        kind = e["kind"]
+        p = json.loads(e["payload"]) if e["payload"] else {}
+        if kind == "proposal":
+            prop_author[p.get("proposal_id")] = e["agent_id"]
+        elif kind == "proposal_passed":
+            passed.add(p.get("proposal_id"))
+        elif kind == "venture_sale":
+            biz[e["agent_id"]] += float(p.get("amount", 0.0))
+        elif kind == "event_host":
+            host[e["agent_id"]] += 1
+        elif kind == "reputation_update":
+            rep[e["agent_id"]] = float(p.get("new", 0.0))
+    inst: dict = defaultdict(int)
+    for pid in passed:
+        au = prop_author.get(pid)
+        if au is not None:
+            inst[au] += 1
+
+    ids = sorted(status_by)
+    raw = {
+        "rep": {i: rep.get(i, 0.0) for i in ids},
+        "wealth": {i: money_by.get(i, 0.0) for i in ids},
+        "inst": {i: float(inst.get(i, 0)) for i in ids},
+        "biz": {i: biz.get(i, 0.0) for i in ids},
+        "host": {i: float(host.get(i, 0)) for i in ids},
+    }
+
+    def _pct(valmap):
+        order = sorted(ids, key=lambda i: (valmap[i], i))
+        n = len(order) or 1
+        return {i: (pos + 1) / n for pos, i in enumerate(order)}
+
+    pct = {m: _pct(raw[m]) for m in _TRUST_MATERIALS}
+    # followers を欠く分、利用可能な 5 材料の重みを再正規化(近似=真の status とは一致しない旨を明記)
+    wsum = sum(_TRUST_WEIGHTS[m] for m in _TRUST_MATERIALS) or 1.0
+    wn = {m: _TRUST_WEIGHTS[m] / wsum for m in _TRUST_MATERIALS}
+    name_of = {a["id"]: a.get("name", f"a{a['id']}") for a in agents_meta}
+    role_of = {a["id"]: a.get("org_role", "") for a in agents_meta}
+
+    top = sorted(ids, key=lambda i: -status_by[i])[:15]
+    agents_out = [{
+        "id": i, "name": name_of.get(i, f"a{i}"), "status": round(status_by[i], 4),
+        "role": role_of.get(i, ""),
+        "contrib": {m: round(wn[m] * pct[m][i], 4) for m in _TRUST_MATERIALS},
+        "pct": {m: round(pct[m][i], 3) for m in _TRUST_MATERIALS},
+    } for i in top]
+
+    # org_role 相関: 役割ごとの平均 status(agents.json に org_role がある時のみ意味を持つ)
+    by_role: dict = defaultdict(list)
+    for i in ids:
+        r = role_of.get(i, "")
+        if r:
+            by_role[r].append(status_by[i])
+    org = sorted(({"role": r, "mean": round(sum(v) / len(v), 4), "n": len(v)}
+                  for r, v in by_role.items()), key=lambda x: -x["mean"])
+
+    svals = sorted(status_by.values(), reverse=True)
+    total = sum(svals)
+    k = max(1, int(len(svals) * 0.1))
+    top10 = round(sum(svals[:k]) / total, 6) if total > 0 else 0.0
+    return {
+        "materials": list(_TRUST_MATERIALS),
+        "weights": {m: round(wn[m], 4) for m in _TRUST_MATERIALS},
+        "agents": agents_out, "org": org,
+        "gini": _gini_py(list(status_by.values())), "top10": top10,
+        "note": "内訳は L1/L3 からの近似再構成(followers は事後復元不可のため除外・重み再正規化)。",
+    }
 
 
 # ============================================================ 共通 CSS/JS
@@ -1513,6 +1749,115 @@ __MODE_LEGEND_JS__fit(); lastT=performance.now(); requestAnimationFrame(loop);
 """
 
 
+# ============================================================ 観測レンズの描画(第50バッチ)
+# lens_map.json(価値/欲望)or L3 status(信用)が有る時だけ main() が dashboard に注入する追加 JS。
+# 無ければ空文字→ DASH_HTML はバイト同一(後方互換。communities/mode_legend と同型)。
+_LENS_JS = r"""
+// ---- T1 価値4軸(values.TAGS を正準軸に再利用)----
+const VAX_LABEL={utility:'実用',emotion:'感情',social:'社会',epistemic:'認識'};
+const VAX_COLOR={utility:'#60a5fa',emotion:'#f472b6',social:'#6ee7b7',epistemic:'#ffd166'};
+function renderValue(s0){
+  const L=D.lens.value, days=L.days;
+  const tot=days.map((d,i)=>L.axes.reduce((s,ax)=>s+L.series[ax][i],0));
+  body.innerHTML=`
+   <div class="chartBox"><h3>① 価値4軸の構成比(日別)</h3>
+     <div class="sub">当日のイベントを価値の4軸(実用/感情/社会/認識)へ振り分けた構成比。第17バッチ values.TAGS を正準軸に再利用</div><canvas id="lvc1"></canvas></div>
+   <div class="chartBox"><h3>② 実用充足 → 感情/社会シフト(近似指標)</h3>
+     <div class="sub">日別の「実用」比率と「感情+社会」比率の推移。実用が満たされるほど感情・社会へ重心が移る仮説の近似観測</div><canvas id="lvc2"></canvas></div>
+   <div class="chartBox"><h3>③ 住民別の価値プロファイル(上位)</h3>
+     <div class="sub">各住民のイベントを4軸で構成比表示(帯の長さ=総数)。誰がどの価値に厚いか</div>
+     <div id="lvProf"></div></div>`;
+  const X=d=>d*144;
+  lineChart(document.getElementById('lvc1'),
+    L.axes.map(ax=>({label:VAX_LABEL[ax]||ax,color:VAX_COLOR[ax]||'#999',
+      data:days.map((d,i)=>[X(d), tot[i]? L.series[ax][i]/tot[i]:0])})), {pct:true, ymax:1});
+  lineChart(document.getElementById('lvc2'), [
+    {label:'実用',color:VAX_COLOR.utility, data:days.map((d,i)=>[X(d), tot[i]? L.series.utility[i]/tot[i]:0])},
+    {label:'感情+社会',color:'#f472b6', data:days.map((d,i)=>[X(d), tot[i]? (L.series.emotion[i]+L.series.social[i])/tot[i]:0])},
+  ], {pct:true, ymax:1});
+  document.getElementById('lvProf').innerHTML = L.profiles.map(p=>{
+    const bars=L.axes.map(ax=>{ const w=p.total? p.counts[ax]/p.total*100:0;
+      return `<span style="display:inline-block;height:12px;width:${w.toFixed(2)}%;background:${VAX_COLOR[ax]||'#999'}" title="${VAX_LABEL[ax]||ax} ${p.counts[ax]}"></span>`;}).join('');
+    return `<div style="margin:4px 0;font-size:12px"><b>${p.name}</b> <span style="color:var(--dim)">${p.total}件</span><br>
+      <span style="display:inline-flex;width:100%;max-width:520px;border-radius:5px;overflow:hidden;background:var(--surface2)">${bars}</span></div>`;
+  }).join('') || '<div class="ev">価値を帯びたイベントがまだありません</div>';
+}
+
+// ---- T2 3M欲望 ----
+const MOT_LABEL={earn:'儲け(earn)',love:'モテ(love)',recognition:'承認(recognition)'};
+const MOT_COLOR={earn:'#4ade80',love:'#f472b6',recognition:'#a78bfa'};
+function renderMotive(s0){
+  const M=D.lens.motives, days=M.days;
+  body.innerHTML=`
+   <div class="chartBox"><h3>① 3M欲望の活性度(日別)</h3>
+     <div class="sub">儲けたい(earn)/モテたい(love)/認められたい(recognition)を帯びたイベント数の推移</div><canvas id="lmc1"></canvas></div>
+   <div class="chartBox"><h3>② 欲望の遷移(同一住民の連続イベントの軸ペア)</h3>
+     <div class="sub">ある欲望の直後に来る欲望。線の太さ=遷移回数(円弧=同じ欲望が続く自己ループ)。関係タブの canvas 流儀を再利用</div>
+     <canvas id="lmNet" style="height:300px"></canvas>
+     <div id="lmList" style="font-size:12px;color:var(--dim);margin-top:6px"></div></div>`;
+  const X=d=>d*144;
+  lineChart(document.getElementById('lmc1'),
+    M.motives.map(mt=>({label:MOT_LABEL[mt]||mt,color:MOT_COLOR[mt]||'#999',
+      data:days.map((d,i)=>[X(d), M.series[mt][i]])})), {});
+  drawMotiveNet(document.getElementById('lmNet'), M);
+  document.getElementById('lmList').innerHTML = M.transitions.slice(0,10)
+    .map(t=>`${MOT_LABEL[t.from]||t.from} → ${MOT_LABEL[t.to]||t.to}: <b>${t.n}</b>`).join(' ・ ') || '遷移データなし';
+}
+function drawMotiveNet(c, M){
+  if(!c) return; c.width=c.clientWidth*devicePixelRatio; c.height=c.clientHeight*devicePixelRatio;
+  const g=c.getContext('2d'), W=c.width, H=c.height, cx=W/2, cy=H/2, R=Math.min(W,H)*0.30;
+  g.clearRect(0,0,W,H);
+  const n=M.motives.length, pos={};
+  M.motives.forEach((mt,i)=>{ const ang=-Math.PI/2 + i*2*Math.PI/n;
+    pos[mt]=[cx+Math.cos(ang)*R, cy+Math.sin(ang)*R]; });
+  const maxN=Math.max(1, ...M.transitions.map(t=>t.n));
+  for(const t of M.transitions){ const P=pos[t.from], Q=pos[t.to]; if(!P||!Q) continue;
+    g.strokeStyle=(MOT_COLOR[t.from]||'#999')+'99'; g.lineWidth=(1+5*t.n/maxN)*devicePixelRatio;
+    if(t.from===t.to){ g.beginPath(); g.arc(P[0], P[1]-18*devicePixelRatio, 12*devicePixelRatio, 0, 7); g.stroke(); }
+    else { g.beginPath(); g.moveTo(P[0],P[1]); g.lineTo(Q[0],Q[1]); g.stroke(); } }
+  const T=themeAt(cur), ink=_css(T.ink);
+  g.font=`${12*devicePixelRatio}px system-ui`; g.textAlign='center';
+  for(const mt of M.motives){ const P=pos[mt];
+    g.fillStyle=MOT_COLOR[mt]||'#999'; g.beginPath(); g.arc(P[0],P[1],10*devicePixelRatio,0,7); g.fill();
+    g.fillStyle=ink; g.fillText(MOT_LABEL[mt]||mt, P[0], P[1]-16*devicePixelRatio); }
+}
+
+// ---- T6 信用内訳(status.py の合成地位スコアを可視化するだけ)----
+const MAT_LABEL={rep:'評判',wealth:'資産',inst:'制度実績',biz:'商い',host:'主催',followers:'フォロワー'};
+const MAT_COLOR={rep:'#60a5fa',wealth:'#ffd166',inst:'#a78bfa',biz:'#fb923c',host:'#6ee7b7',followers:'#38bdf8'};
+function renderTrust(s0){
+  const T=D.trust, mats=T.materials;
+  const rows=T.agents.map(a=>{
+    const bar=mats.map(m=>{ const w=a.contrib[m]*100;
+      return `<span style="display:inline-block;height:14px;width:${w.toFixed(2)}%;background:${MAT_COLOR[m]||'#999'}" title="${MAT_LABEL[m]||m} 寄与${a.contrib[m].toFixed(3)}(百分位${a.pct[m]})"></span>`;}).join('');
+    return `<div style="margin:5px 0;font-size:12px"><b>${a.name}</b> ${a.role?`<span style="color:var(--dim)">${a.role}</span>`:''} <span style="color:var(--dim)">status ${a.status}</span><br>
+      <span style="display:inline-flex;width:100%;max-width:520px;border-radius:5px;overflow:hidden;background:var(--surface2)">${bar}</span></div>`;
+  }).join('');
+  const legend=mats.map(m=>`<span style="font-size:11px;color:var(--dim);margin-right:10px"><i style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${MAT_COLOR[m]||'#999'};margin-right:3px;vertical-align:middle"></i>${MAT_LABEL[m]||m}(重み${T.weights[m]})</span>`).join('');
+  const org=(T.org||[]).length? `<div class="chartBox"><h3>③ 組織内地位(org_role)と信用の相関</h3>
+     <div class="sub">役割ごとの平均 status(agents.json に org_role がある時のみ)</div>${
+     T.org.map(o=>{ const w=(o.mean*100).toFixed(1);
+       return `<div style="font-size:12px;margin:3px 0">${o.role} <span style="color:var(--dim)">(${o.n}人)</span>
+         <span style="display:inline-block;height:12px;width:${w}%;max-width:380px;background:#60a5fa;vertical-align:middle;border-radius:3px"></span> ${o.mean}</div>`;}).join('')}</div>`:'';
+  body.innerHTML=`
+   <div class="chartBox"><h3>① 信用(合成地位)の分布</h3>
+     <div class="sub">Gini=集中度(0平等〜1独占)/ 上位10%集中度=winner-take-all。status.py 第11バッチの合成スコアの分布</div>
+     <div style="font-size:20px;font-weight:700">Gini ${T.gini}<span style="font-size:13px;color:var(--dim);margin-left:14px">上位10%が全体の ${(T.top10*100).toFixed(1)}% を占有</span></div></div>
+   <div class="chartBox"><h3>② 上位者の信用内訳(材料別の寄与)</h3>
+     <div class="sub">${legend}</div>
+     <div style="font-size:11px;color:#e8a33d;margin-bottom:6px">${T.note}</div>
+     ${rows||'<div class="ev">status データがありません</div>'}</div>
+   ${org}`;
+}
+
+function lensRender(tab, s0){
+  if(tab==='value' && D.lens){ renderValue(s0); }
+  else if(tab==='motive' && D.lens){ renderMotive(s0); }
+  else if(tab==='trust' && D.trust){ renderTrust(s0); }
+}
+"""
+
+
 # ============================================================ ダッシュボード
 DASH_HTML = r"""<!DOCTYPE html>
 <html lang="ja"><head><meta charset="utf-8">
@@ -1623,7 +1968,7 @@ __BASE_CSS__
     <button data-tab="rel">🕸 関係</button>
     <button data-tab="vocab">💬 語彙</button>
     <button data-tab="bld">🏢 施設</button>
-    <button data-tab="people">👥 住民</button>
+    <button data-tab="people">👥 住民</button>__LENS_TABS__
     <button data-tab="scen">🎬 シナリオ</button>
   </div>
   <div id="body"></div>
@@ -1695,6 +2040,7 @@ function render(force){
   else if(tab==='vocab') renderVocab(s0);
   else if(tab==='bld') renderBld(s0);
   else if(tab==='people') renderPeople(s0);
+  else if(typeof lensRender==='function') lensRender(tab, s0);   // 第50バッチ 観測レンズ(有る時だけ定義)
 }
 
 function renderFeed(s0){
@@ -2190,6 +2536,7 @@ function scenSave(){
   const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
   a.download='events_my.json'; a.click(); }
 
+__LENS_JS__
 render(true); requestAnimationFrame(loop);
 </script></body></html>
 """
@@ -2227,6 +2574,17 @@ def main() -> None:
     has_ml = "mode_legend" in data
     mode_taxi = "if(m===3) return '#a855f7'; " if has_ml else ""
     mode_legend_js = _MODE_LEGEND_JS if has_ml else ""
+    # 第50バッチ 観測レンズ: lens/trust データが有る時「だけ」タブと描画 JS を注入。無ければ
+    # 両トークンとも空文字→ DASH_HTML はバイト同一(後方互換の合格条件。viewer 側にトークンは無い)。
+    has_lens = "lens" in data
+    has_trust = "trust" in data
+    lens_tabs = ""
+    if has_lens:
+        lens_tabs += ('\n    <button data-tab="value">💠 価値</button>'
+                      '\n    <button data-tab="motive">🎯 欲望</button>')
+    if has_trust:
+        lens_tabs += '\n    <button data-tab="trust">🏅 信用</button>'
+    lens_js = _LENS_JS if (has_lens or has_trust) else ""
     for name, template in (("viewer.html", MAP_HTML), ("dashboard.html", DASH_HTML)):
         html = (template
                 .replace("__COMMUNITY_OPTION__", comm_option)
@@ -2234,6 +2592,8 @@ def main() -> None:
                 .replace("__COMMUNITY_JS__", comm_js)
                 .replace("__MODE_TAXI__", mode_taxi)
                 .replace("__MODE_LEGEND_JS__", mode_legend_js)
+                .replace("__LENS_TABS__", lens_tabs)
+                .replace("__LENS_JS__", lens_js)
                 .replace("__BASE_CSS__", _BASE_CSS)
                 .replace("__ERR_JS__", _ERR_JS)
                 .replace("__TIME_JS__", _TIME_JS)

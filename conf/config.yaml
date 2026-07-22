@@ -901,6 +901,27 @@ hierarchy:
   # weights(材料の混合重み)は build_status_cfg の既定に埋め込み済み(rep/followers/wealth/inst/biz/host)。
   # 上書きするなら hierarchy.weights.followers=0.4 のように指定(母集団内百分位への相対重み)。
 
+# ---- 観測レンズ 3本(第50バッチ 2026-07-23。外部アドバイスを observable へ翻訳。既定 OFF)----
+# 「読むだけ」= 行動・乱数・LLM 呼を一切増やさない(R1)。ロジックは observer 層(observer/lens.py +
+# aggregate.py)と本ブロックに閉じる(engine/cognition/world/factors/actions/labeling に軸語を書かない)。
+#   T1 value4:  イベント種 → 価値の4軸(utility/emotion/social/epistemic=第17バッチ values.TAGS を再利用)。
+#               当日のイベント数構成を L2 の全体スカラー4列(value4_*)で観測。
+#   T2 motives: イベント種 → 3M欲望(earn 儲けたい / love モテたい / recognition 認められたい)。L2 3列(motive_*)。
+#   T6 trust:   status.py の合成地位スコアの材料別内訳・分布(status.material_breakdown / L2 trust_gini・trust_top10)。
+# 正準の kind_map は observer/lens.py の DEFAULT_*(単一の源)。下の kind_map は「上書き」用の空マップ
+# (値を書けば既定へ重なる。値を空にすればそのキーを外す)。ビューアは runs/<name>/lens_map.json 経由で写像を読む。
+# enabled=false = L2 に列を足さず・サイドカーも書かず・ダッシュボードのレンズタブは非表示=ゴールデン L1/L2 バイト一致。
+lens:
+  enabled: false                # マスター。★ON はユーザー判断(production/daily は触らない)
+  value4:
+    enabled: true               # マスター ON 時に価値4軸の列・タブを出すか
+    kind_map: {}                # 例: {free_action: emotion}(既定 DEFAULT_VALUE4_MAP へ上書き)
+  motives:
+    enabled: true               # マスター ON 時に3M欲望の列・ビューを出すか
+    kind_map: {}                # 例: {venture_open: earn}(既定 DEFAULT_MOTIVE_MAP へ上書き)
+  trust:
+    enabled: true               # マスター ON 時に信用内訳(status 可視化)を出すか。要 hierarchy.enabled=true
+
 # ---- 行動心理プラグイン(config 着脱式・すべて既定 OFF。ユーザー方針 2026-07-06)----
 # 文献の数値を固定実装せず、回しながら柔軟に変える seam。OFF 時はイベント列がバイト一致で不変。
 # no-fingerprint: engine/cognition は因子名を見ず、factors から不透明な倍率・スコアだけ受け取る。

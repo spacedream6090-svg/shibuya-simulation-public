@@ -13,6 +13,7 @@ from ..config import REPO_ROOT, save_config
 from ..labeling.labels import LabelSystem
 from ..llm.cache import CachedLLM
 from ..llm.mock import MockBackend
+from ..observer import lens as lens_mod
 from ..observer.logger import ObserverLogger
 from ..observer.provenance import ItemStore
 from ..rng import RngHub
@@ -803,9 +804,15 @@ class Simulation:
               **({"ontology_group": a.ontology_group}
                  if getattr(a, "ontology_group", None) else {}),
               **({"ontology_axes": a.ontology_axes}
-                 if getattr(a, "ontology_axes", None) else {})}
+                 if getattr(a, "ontology_axes", None) else {}),
+              # 第50バッチ T6: 信用内訳レンズの org 相関用(org 配属時のみ=非配属ランはバイト同一)
+              **({"org_id": a.org_id, "org_role": getattr(a, "org_role", "")}
+                 if getattr(a, "org_id", None) else {})}
              for a in self.agents],
             ensure_ascii=False), encoding="utf-8")
+        # 第50バッチ: 観測レンズの kind_map サイドカー(lens ON 時のみ書く=OFF は後方互換でバイト同一)。
+        # ビューアが runs/<name>/lens_map.json 経由で写像を読む(sim⇄viz 疎結合。軸語は observer/lens.py に閉じる)。
+        lens_mod.write_sidecar(self, self.out_dir)
 
     def _build_router_child(self, spec: dict):
         """router の子バックエンドを1つ構築する(第23バッチ M2)。

@@ -183,6 +183,58 @@ def _recompute(sim, cfg: dict) -> None:
     sim._status_prev_rank = ranks
 
 
+def material_breakdown(sim, cfg: dict | None = None) -> dict:
+    """合成地位 status の材料別内訳(各材料の母集団内百分位 + weights 適用後の寄与)を返す純関数。
+
+    第50バッチ T6(信用内訳レンズ)の正準実装。_recompute と同じ客観カウント・同じ百分位規則で
+    決定論再現する(乱数なし・LLM なし・挙動不変=読むだけ)。status.enabled を問わない(呼び手が判断)。
+
+    返り値:
+      {"materials": (…6材料…),
+       "weights": {mat: 正規化後の重み},
+       "agents": [{"id", "status", "raw":{mat:実値}, "pct":{mat:0-1}, "contrib":{mat:0-1寄与}}…]}
+      contrib は sum が status に一致する(weights を正規化し百分位に掛けた分解)。"""
+    if cfg is None:
+        cfg = cfg_of(sim)
+    agents = sim.agents
+    materials = _WEIGHT_KEYS
+    w = cfg["weights"]
+    wsum = sum(w.values()) or 1.0
+    wn = {k: w[k] / wsum for k in materials}
+    if not agents:
+        return {"materials": materials, "weights": wn, "agents": []}
+    net = getattr(sim, "net", None)
+    passed_by, host_by, sales_by = _material_counts(sim)
+    ids = [a.id for a in agents]
+    raw = {
+        "rep": {a.id: float(getattr(a, "_reputation", 0.0)) for a in agents},
+        "followers": {a.id: (float(net.follower_count(a.id)) if net is not None else 0.0)
+                      for a in agents},
+        "wealth": {a.id: float(getattr(a, "money", 0.0)) + float(getattr(a, "account", 0.0))
+                   for a in agents},
+        "inst": {a.id: float(passed_by.get(a.id, 0)) for a in agents},
+        "biz": {a.id: float(sales_by.get(a.id, 0.0)) for a in agents},
+        "host": {a.id: float(host_by.get(a.id, 0)) for a in agents},
+    }
+    pct = {m: _percentiles(raw[m], ids) for m in materials}
+    out = []
+    for a in agents:
+        i = a.id
+        # status は未丸めの和を丸める(=_recompute の round(sum(wn*pct),6) と一字一致)。
+        # contrib は表示用に各項を丸める(和は status と丸め誤差内で一致=表示の分解)。
+        status_i = round(sum(wn[m] * pct[m][i] for m in materials), 6)
+        contrib = {m: round(wn[m] * pct[m][i], 6) for m in materials}
+        out.append({
+            "id": i,
+            "status": status_i,
+            "raw": {m: round(raw[m][i], 4) for m in materials},
+            "pct": {m: round(pct[m][i], 6) for m in materials},
+            "contrib": contrib,
+        })
+    return {"materials": materials, "weights": {k: round(v, 6) for k, v in wn.items()},
+            "agents": out}
+
+
 def phase_day(sim, step: int, sim_min: int) -> None:
     """日次(暦日1回)に全 agent の status を再計算する。OFF なら完全 no-op(バイト一致)。
 
