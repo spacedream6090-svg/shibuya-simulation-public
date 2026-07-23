@@ -1,0 +1,285 @@
+# 長期日常ラン(30日級)プロファイル(第57バッチ タスクC 2026-07-24)。
+# 方針正典: docs/closed-world-daily-observation.md §3 タスクC / devlog Entry 47(Fable 精査)。
+#
+# ── 二段構え(観察スケールと「人数>時間」の折衷)──────────────────────────────
+#   観察スケールの目安: 7日=日常の最小単位(平日/週末1周)、14〜30日=関係変化・語彙定着、
+#   60〜90日=組織形成・リーダー成立。方針「人数>時間」との折衷として:
+#     ・k* 測定       … 7〜14日・人数多め(production/daily を使う。本ファイルではない)
+#     ・構造創発の観察 … 1条件のみ 30日以上・人数は絞る(= 本プロファイル)
+#   本ファイルは後者=**構造の自然変化 / 固着を長期で観る 1 条件**。第56バッチ タスクB の構造指標
+#   (edge churn・順位 τ・中心性 turnover・コミュニティ変化・固着検知=scripts/analyze_structure.py)が
+#   30日ランの主要観測対象。危機トリガー(spark treatment=D13)は入れない(§2.1: 強制トリガーは
+#   指紋になり日常創発との区別を潰す)。ここで観るのは「強制トリガー無しで構造は変わるのか、固着するのか」。
+#
+# ── 土台と設計 ───────────────────────────────────────────────────────────
+#   observe.yaml(純観察=不確実性許容)の姿勢を土台に、daily.yaml の現実忠実な生活機構(組織/世帯/
+#   経済/関係/制度)を重ねた**自己完結の重ね書きファイル**。基底 conf/config.yaml の上に OmegaConf.merge で
+#   重なる(未指定キーは基底のまま=既定 OFF の実験ノブは触らない)。--profile は 1 本しか渡せないため、
+#   daily.yaml の較正値をここへ取り込んで整合させている(値の由来は各ブロックのコメント参照)。
+#
+#   使い方(一括・crash 耐性つき):
+#     python scripts/run.py --profile conf/longrun30.yaml run.name=longrun30
+#       → 4,320 step(30日)を回す。checkpoint_every=1440(10日ごと)で ckpt を残す。
+#         途中で落ちても以下で最新 ckpt から続行(単一 finalize=バイト一致):
+#     python scripts/run.py --resume runs/longrun30
+#
+#   使い方(意図的な 10日×3分割=夜間予算などで区切って回す):
+#     python scripts/run.py --profile conf/longrun30.yaml run.name=longrun30 run.n_steps=1440   # Day 0-10
+#     python scripts/run.py --resume runs/longrun30 run.n_steps=2880                            # Day 10-20
+#     python scripts/run.py --resume runs/longrun30 run.n_steps=4320                            # Day 20-30
+#       各チャンクは checkpoint_every=1440 の境界(1440/2880/4320)で ckpt を残しつつ finalize する。
+#       finalize は前チャンクの canonical parquet を先頭に含めて結合するため(第57バッチ補修=resume 時のみ・
+#       fresh ラン不変)、分割しても straight 4,320 と l1/l2/l3 がバイト一致する(tests/test_longrun.py で検証)。
+#
+#   resume=バイト一致の保証範囲(tests/test_resume.py + tests/test_longrun.py):
+#     ・checkpoint は master seed + 全 sim 状態(agents/labels/net/tools/rulebook/world_events/runtime/
+#       scenario/traffic)を保存し、RngHub はステートレス(stream=(用途,id,step) の純関数)=乱数状態を
+#       持たない。したがって「一気に回す」と「途中 ckpt→resume で続ける」は l1_events が全行全カラム一致。
+#     ・seed_auto は resume では無効(採取済みの数値 seed=config.yaml に記録=を使う)。分割の 2 本目以降は
+#       run_dir/config.yaml の数値 seed を読むので、全チャンクが同一 seed で決定論的に連続する。
+#     ・config_hash は n_steps/name/out_dir/checkpoint_every を除外して照合する(resume で正当に変わる)。
+#
+# ── 出力の軽量閲覧(30日×数百人)──────────────────────────────────────────
+#   長期ランの viewer.html は positions(n_steps×n_agents)が支配項で数百MBになりうる。閲覧は:
+#     python viz/make_viewer.py runs/longrun30 --no-traffic       # 背景交通の巨大軌跡を除外(既存)
+#     python viz/make_viewer.py runs/longrun30 --daily-rollup      # 日次ロールアップのみの軽量ダッシュボード(第57バッチ)
+#   --daily-rollup は rollup.html を追加生成する(既存 viewer.html/dashboard.html は不変=バイト一致)。
+#   構造タブを見るには先に事後分析を掛ける: python scripts/analyze_structure.py runs/longrun30
+#
+# ★D15(docs/plans/finals-day1-decisions.md): 長期日常ラン1条件(30日級)を本選で確保するか。
+
+# ============================================================================
+# (0) 純観察=不確実性許容の姿勢(observe.yaml と同一。seed は選ばないが失わない)
+# ============================================================================
+run:
+  seed_auto: true          # 起動時に OS エントロピーから seed を採取し config.yaml/summary.json に記録
+                           # (run.seed=<数値> を明示併記すれば固定も可=再現性実験モードへ切替)
+  n_agents: 100            # 構造創発の観察に足る最小規模へ「絞る」(数百規模の下限)。名簿は 100体 civic。
+                           # ★数百規模へ上げるなら daily.yaml の 300体 資産へ3行差し替え:
+                           #   agents.personas_file=data/personas_300_civic.json
+                           #   organizations.book=data/organizations_shibuya_wide300.json
+                           #   organizations.assignments=data/org_assignments_300_civic_wide.json
+  n_steps: 4320            # 30日(1日=144step)。分割時は dotlist で 1440/2880/4320 と刻む(上の手順例)。
+
+agents:
+  # 公務員(警察官/消防士/区職員)入り + 組織配属あり名簿=行政・警察執行・組織を同時に成立させる。
+  personas_file: data/personas_100_civic.json
+
+# ---- (0-b) 偶発イベント層(人生に効く不確実性。臨時収入/財布紛失=money± / 偶然の出会い=closeness+)----
+chance:
+  enabled: true            # daily_rate/money 幅/weight は基底の較正済み既定(現実の桁)を使う
+
+# ---- (0-c) 既存の揺らぎ機能(行動の確率的実行・退屈/好奇心)。天候/関係/drift は下の生活機構ブロックで ON ----
+routine:
+  stochastic:
+    enabled: true          # L1 骨格 motif / L2 時刻ジッター ±30分 / L3 寄り道・中断(活動種別ごとの較正)
+drive:
+  boredom:
+    enabled: true          # 長居で退屈が溜まり閾値超えで近傍の未訪問 POI へ内発的探索(accrual/threshold は基底)
+  drift:
+    enabled: true          # 内省しやすさの時間ドリフト(馴化/鋭敏化/自発回復)。誰が考え込みやすいかを固定しない
+
+# ============================================================================
+# (1) 地図・暦・電車・天候(daily.yaml 本番構成と整合)
+# ============================================================================
+world:
+  map: data/shibuya_osm_wide_v7.json
+  calendar:
+    enabled: true
+    start_date: "auto"     # 開始日=実行当日を初日にする(具体日付 "2026-10-31" 等を書けば固定も可)
+    weekday_work: true     # 平日のみ勤務・登校(土日祝は休み)=平日/週末の1周が7日で観測できる
+  scene_desc:
+    enabled: true          # エージェント視覚 v0(構造化シーン記述。追加 LLM 呼ゼロ・決定論)
+
+transit:
+  file: data/transit_odpt.json     # ODPT 実ダイヤ(平日)
+transit_ride:
+  taxi:
+    prob: 0.02             # 現実較正(徒歩圏2kmの街でタクシーは例外的)
+
+weather:
+  enabled: true            # その日の天気=全員共通・k 非依存の日次揺らぎ(observe 揺らぎ層の一部)
+  rain_grievance: 0.01
+
+# ---- LLM トークン較正(docs/research/token-budgets.md の推奨。think=false 前提)----
+model:
+  max_tokens: 320
+  reflect_max_tokens: 768  # think=false の実測 raw JSON max≈247tok に対し ~2.2倍余裕
+  plan_max_tokens: 448
+  reflect_think: false     # qwen3 系 think=true は夜間内省の最終 JSON が全滅する実測(第20バッチ修正)
+
+# ============================================================================
+# (2) 生活機構(現実ギャップ G1-G6 / 後続波 H1-H6 / 再帰性 / 制度)= daily.yaml の較正値を踏襲
+# ============================================================================
+organizations:
+  enabled: true
+  commute_to_poi: true
+  book: data/organizations_shibuya_wide.json
+  assignments: data/org_assignments_100_civic_wide.json
+government:
+  enabled: true
+media:
+  enabled: true
+needs:
+  enabled: true
+affect:
+  enabled: true
+  arousal_gain: 0.15
+  importance_arousal_w: 2.0
+  importance_novelty_w: 1.5
+  salience_k: 4
+  threshold_gain: 0.05
+schedule:
+  enabled: true
+tools:
+  equip_all: true
+  permit_steps: 6
+  permit_deny_prob: 0.15
+
+factors:
+  relative_deprivation_grievance: 0.012      # G1 相対的剥奪(飽和を破る)
+economy:
+  fixed_cost_daily: 300                       # G1 固定費(光熱費・サブスク)
+  visitor_refresh: true                       # 来街者の財布補充(恒久破綻の解消)
+  min_wage_hourly: 1226                       # 東京都最低賃金(2025-10-03 発効)
+  accounts:
+    enabled: true                             # 給料日25日に月給→翌日家賃引落し(月次の資金繰り)
+    # 30日ランでもほぼ起きない現実の稀さに合わせる(daily.yaml と同値=実法の3ヶ月滞納相当)。
+    eviction_days: 90
+    bankruptcy_days: 240
+  consumption:
+    enabled: true                             # 家計調査2024の費目配分(個体差つき予算制約)
+  payment:
+    enabled: true                             # 決済手段(キャッシュレス42.8%基準)
+  bank:
+    enabled: true                             # 預金利息・与信スコア・融資・返済→破産接続
+  vc:
+    enabled: true                             # venture 出資(トラクション/ネットワーク審査・持分・配当)
+rules:
+  allow_declare: true                         # 権利創設・宣言型 rule(パートナーシップ条例モデル)
+prompts:
+  variety_hint: true                          # 発話の定型化対策(決まり文句で始めない注意書き)
+  reflect_variety: false                      # 丸写し 33%=正味悪化のため当面 OFF(daily/production と同判断)
+  dialog_history: true                        # 相手との直近2往復をプロンプト注入
+  reply_partner: closeness                    # 返答宛先=closeness×距離
+relations:
+  enabled: true                               # G2 社会関係の質(深化段階 tier/断絶 decay/評判/派閥)
+                                              # = 構造タスクB の edge churn/固着の観測対象そのもの
+institution_routes:
+  labor:
+    enabled: true                             # 労働争議(職域)
+  vote:
+    enabled: true                             # 選挙/投票(民主)
+    deposit: 30000
+  enforcement:
+    enabled: true                             # 警察/条例執行(執行)
+    detention_steps: 3
+  deliberation:
+    enabled: true                             # 審議・パブコメ段階(否決されうる熟議)
+  assembly:
+    enabled: true                             # 代表制議会(採決は議会が行う)
+    size: 9
+    from_roster: true                         # 名簿制(persona=議員 の住民を据える。選挙はしない)
+    # 区議会は4年任期=30日ラン内で改選しない(初回選出のみ)。
+    term_days: 1460
+    realism:
+      enabled: false                          # 本番は名簿制=選挙をしない。realism は実験用に温存
+annual_events:
+  enabled: true                               # G4 文化カレンダー・ハロウィン型群集
+career:
+  enabled: true                               # G5 キャリア転換(転職/失業/起業転換)
+  severance_days: 5
+  unfair_ratio: 0.3
+  # 現実較正(雇用動向調査に合わせた圧縮)。30日ランでも数件級=固着観測の背景ノイズに埋もれない。
+  layoff_prob: 0.0002                         # 解雇 ≈ 7%/年
+  switch_prob: 0.0004                         # 転職 ≈ 15%/年
+  rehire_prob: 0.02                           # 再就職 → 平均失業期間 ~50日
+info_env:
+  enabled: true                               # G6 情報環境の非対称
+  recommendation:
+    enabled: true                             # 推薦/エコーチェンバー(関係の固着と相互作用しうる)
+  influence:
+    enabled: true                             # インフルエンサー非対称/バイラル(中心性 turnover の観測対象)
+  misinfo:
+    enabled: true                             # フェイク/炎上
+    flame_grievance: 0.02
+
+health:                                       # H1 健康・疲労・病気
+  enabled: true
+  fatigue_gain_work: 0.02
+  fatigue_gain_move: 0.015
+  fatigue_threshold_gain: 0.1
+  onset_prob: 0.02
+  medical_prob: 0.5
+household:                                    # H2 世帯・家族・恋愛(恋愛は relations.enabled 前提=上で ON)
+  enabled: true                               # = コミュニティ/世帯の自然形成を長期で観る土台
+commerce:                                     # H3 商業ダイナミクス(営業時間・動的価格・在庫)
+  enabled: true
+  stock_grievance: 0.02
+# H4 都市・環境ショック(災害・交通遅延・インフラ障害)。
+#   ★方針判断(第57バッチ): 本プロファイルは observe 姿勢=「日常はすでに揺らぎに満ちている(交通遅延・
+#     天候・欠品波及)」を土台にするため、**低頻度の現実較正値で ON**(closed-world §2.1 は既存ショック機構を
+#     「そのまま残す」=強度/頻度を上げなければ可。ここは production の較正値=増幅していない=spark treatment とは別物)。
+#     交通の日常遅延 delay_prob もこのモジュール内なので ON で日常遅延が生きる。
+#   ★「平凡な日常」の純度を最優先し全ショックを消すなら disaster.enabled=false(daily.yaml と同じ)に差し替え。
+disaster:
+  enabled: true
+  onset_prob: 0.01
+  grievance: 0.06
+  stay_home_bias: 0.7
+  delay_prob: 0.05
+  suspend_prob: 0.3
+  delay_grievance: 0.02
+  outage_prob: 0.02
+  outage_grievance: 0.03
+society_diversity:                            # H5 観光・多言語・犯罪・治安
+  enabled: true
+  tourist_ratio: 0.5
+  foreign_ratio: 0.2
+  crime_prob: 0.000002                        # 現実較正(渋谷区認知件数の ~5倍)
+  nuisance_prob: 0.005
+  crime_grievance: 0.08
+  nuisance_grievance: 0.03
+inner_life:                                   # H6 内面本格版(離散感情ラベル・長期目標・趣味サブカル)
+  enabled: true
+  hobbies:
+    leisure_bias: 0.3
+
+recursion:                                    # 規範・現状の監視→知覚→フィードバック→改変の閉ループ
+  enabled: true
+lodging:                                      # 来街者の夜間ホテル泊
+  enabled: true
+reflection:                                   # 反射=自己モデル(出来事誘発・夜に起こる深い内省)
+  self_model_days: 0
+  deep:
+    enabled: true
+  implicit_self:
+    enabled: true
+hierarchy:                                    # 社会的ヒエラルキー(マタイ効果)。
+  enabled: true                               # = 構造タスクB の順位 τ(status 系列)の観測対象。要 lens.trust
+
+# ============================================================================
+# (3) 観測レンズ(第50/55/56バッチ)= 長期観察の測る道具。読むだけ=行動・乱数・LLM 呼は増えない(R1)
+# ============================================================================
+lens:
+  enabled: true            # マスター ON(価値4軸/3M欲望/信用)。★本ファイルは観察プロファイル=ON してよい
+  value4:
+    enabled: true          # 価値4軸(utility/emotion/social/epistemic)の L2 全体スカラー4列
+  motives:
+    enabled: true          # 3M 欲望(earn/love/recognition)の L2 3列
+  trust:
+    enabled: true          # 信用内訳(status 可視化)。要 hierarchy.enabled=true(上で ON)= 順位固着の材料
+  deviation:
+    enabled: true          # ペルソナ逸脱率(注入ペルソナへの従順さ/逸脱=world-changer 検出の感度補助)
+  structure:
+    enabled: true          # 社会構造の内生変動(L2 の edge churn 系スカラー)。順位 τ・中心性 turnover・
+                           # コミュニティ変化・固着検知は事後 scripts/analyze_structure.py が L1(+L3)から算出
+
+# ============================================================================
+# (4) 長期ランの運用(checkpoint=分割/crash 耐性・L1 は全量保持)
+# ============================================================================
+observer:
+  checkpoint_every: 1440   # 10日ごとに完全状態を保存+L1 を part 化(分割/crash 耐性)。
+                           # ★crash 粒度を細かくするなら 288(2日)や 144(1日)へ。part 増=I/O 微増のみ。
+  # flush_every_steps: 288 # (任意)RAM が厳しければ 2日ごとに L1 を part flush して解放(OOM 回避)。
+                           #   checkpoint と独立・同一 step では二重 flush しない。既定 0=従来と完全同一。

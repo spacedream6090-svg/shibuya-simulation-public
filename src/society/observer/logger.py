@@ -35,6 +35,10 @@ class ObserverLogger:
         self._kinds_flushed: Counter = Counter()   # part へ出し済みイベント種別の累計
         self._n_flushed: int = 0                   # part へ出し済みイベント総数
         self._seg: int = self._next_seg()          # resume 時は既存 part の続きから採番
+        # 第57バッチ タスクC: 意図的な分割実行(10日×3等)で各チャンクが clean に finalize しても
+        # 前チャンクの canonical を失わないためのフラグ。resume 時のみ Simulation.run() が True にする。
+        # fresh ラン(resume でない)では常に False=finalize 挙動は従来と完全同一(byte 級不変)。
+        self._resumed: bool = False
 
     # ---- L1 ----
     def log(self, event: Event) -> None:
@@ -147,7 +151,13 @@ class ObserverLogger:
                 return None
             pq.write_table(table, canonical, compression="zstd")
             return canonical
-        tables = [pq.read_table(p) for p in parts]
+        tables = []
+        # 分割実行(resume で clean に finalize したチャンク)のときだけ、前チャンクが書いた
+        # canonical を先頭に含める。straight ラン / crash-recovery(前 finalize 無し=canonical 不在)
+        # では発火しないため従来と完全同一(_resumed=False の fresh ランはこの分岐に一切入らない)。
+        if self._resumed and canonical.exists():
+            tables.append(pq.read_table(canonical))
+        tables += [pq.read_table(p) for p in parts]
         if table is not None and table.num_rows > 0:
             tables.append(table)
         combined = pa.concat_tables(tables) if len(tables) > 1 else tables[0]

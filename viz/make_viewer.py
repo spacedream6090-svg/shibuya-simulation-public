@@ -741,6 +741,93 @@ def load_structure(run_dir: Path) -> dict | None:
         return None
 
 
+# ============================================================ 日次ロールアップ(第57バッチ タスクC)
+# 長期ラン(30日級)は viewer.html の positions(n_steps×n_agents)が支配項で数百MBになり得る。
+# --daily-rollup は positions を一切読まず、L2 metrics を日次集計 + structure.json(事後層)を束ねた
+# 軽量な rollup.html だけを追加生成する(既存 viewer/dashboard の生成経路には一切触れない=バイト一致)。
+# ROLLUP_STEPS_PER_DAY: 1日=144step(= STEP_MINUTES 10分 × 144 = 1440分)。analyze_structure と同一。
+ROLLUP_STEPS_PER_DAY = 1440 // STEP_MINUTES        # =144
+
+
+def _rollup_start_min(run_dir: Path) -> int:
+    """L1 の先頭 row group から sim_min 原点を安価に復元(全 L1 は読まない)。無ければ既定 07:00。"""
+    path = run_dir / "l1_events.parquet"
+    if not path.exists():
+        return DEFAULT_START_MIN
+    try:
+        pf = pq.ParquetFile(path)
+        t = pf.read_row_group(0, columns=["step", "sim_min"])
+        if t.num_rows == 0:
+            return DEFAULT_START_MIN
+        sm0 = t.column("sim_min")[0].as_py()
+        st0 = t.column("step")[0].as_py()
+        if sm0 is None:
+            return DEFAULT_START_MIN
+        return int(sm0) - int(st0) * STEP_MINUTES
+    except Exception:
+        return DEFAULT_START_MIN
+
+
+def build_rollup_data(run_dir: Path) -> dict:
+    """L2 metrics を日次平均へ集計 + structure.json を束ねた軽量ロールアップ dict を返す。
+
+    日境界は analyze_structure と同定義(sim_min//1440)。L2 は sim_min 列を持たないため、L1 先頭から
+    復元した start_min で day=(start_min+step*10)//1440 を算出して構造指標と日インデックスを揃える。
+    L2 が無いラン=metrics 空(structure だけ表示)。どちらも無ければ空の骨格(画面に案内を出す)。"""
+    start_min = _rollup_start_min(run_dir)
+
+    def _day(step: int) -> int:
+        return (start_min + int(step) * STEP_MINUTES) // 1440
+
+    # L2 を日次平均へ(全数値列を対象=lens ON の列も含め robust。step 列は集計対象外)
+    daily: dict[str, list] = {}
+    metric_keys: list[str] = []
+    days: list[int] = []
+    l2_path = run_dir / "l2_metrics.parquet"
+    if l2_path.exists():
+        rows = sorted(pq.read_table(l2_path).to_pylist(), key=lambda r: r["step"])
+        if rows:
+            metric_keys = [k for k in sorted(rows[0].keys())
+                           if k != "step" and isinstance(rows[0].get(k), (int, float))
+                           and not isinstance(rows[0].get(k), bool)]
+            sums: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+            cnts: dict[int, int] = defaultdict(int)
+            for r in rows:
+                d = _day(r["step"])
+                cnts[d] += 1
+                for k in metric_keys:
+                    v = r.get(k)
+                    if isinstance(v, (int, float)) and not isinstance(v, bool):
+                        sums[d][k] += float(v)
+            days = list(range(0, max(cnts) + 1)) if cnts else []
+            for k in metric_keys:
+                daily[k] = [round(sums[d][k] / cnts[d], 6) if cnts.get(d) else None
+                            for d in days]
+
+    structure = load_structure(run_dir)
+    # structure 側の日レンジも取り込んで days を広い方に合わせる(片方だけのランでも表を張れる)
+    if structure and structure.get("days"):
+        days = list(range(0, max(days[-1] if days else 0,
+                                 structure["days"][-1]) + 1))
+
+    n_agents = None
+    n_steps = None
+    sm = run_dir / "summary.json"
+    if sm.exists():
+        try:
+            s = json.loads(sm.read_text(encoding="utf-8"))
+            n_agents = s.get("n_agents")
+            n_steps = s.get("n_steps")
+        except Exception:
+            pass
+
+    return {"runName": run_dir.name, "startMin": start_min,
+            "stepsPerDay": ROLLUP_STEPS_PER_DAY, "days": days,
+            "metricKeys": metric_keys, "metrics": daily,
+            "structure": structure, "nAgents": n_agents, "nSteps": n_steps,
+            "hasL2": bool(metric_keys)}
+
+
 def build_deviation_data(events: list, agents_meta: list, dev_map: dict,
                          start_min: int) -> dict:
     """L1 を「ペルソナ期待 vs 実際の行動」で事後分類する。分布ヒスト + 日別推移 + 最逸脱者ドリルダウン。
@@ -2807,6 +2894,159 @@ render(true); requestAnimationFrame(loop);
 """
 
 
+# ============================================================ 日次ロールアップ HTML(第57バッチ タスクC)
+# --daily-rollup 専用の軽量ページ。positions を一切埋め込まない=30日×数百人でも数十KBで開ける。
+# 画面に「日次ロールアップ表示」を明示(silent cap 禁止)。既存 viewer/dashboard とは別ファイル(rollup.html)。
+ROLLUP_HTML = r"""<!doctype html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__RUN__ · 日次ロールアップ</title>
+<style>
+:root{--bg:#0f1216;--card:#171b21;--ink:#e8ecf1;--dim:#93a1b0;--line:#28303a;--accent:#ffd166;--warn:#f59e0b;}
+@media (prefers-color-scheme:light){:root{--bg:#f6f7f9;--card:#fff;--ink:#1c2430;--dim:#5b6774;--line:#e2e6ea;--accent:#b7791f;--warn:#b45309;}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,"Hiragino Sans","Noto Sans JP",sans-serif;padding:22px}
+h1{font-size:19px;margin:0 0 2px} h2{font-size:15px;margin:22px 0 8px;color:var(--ink)}
+.meta{color:var(--dim);font-size:12.5px;margin-bottom:14px}
+.banner{background:color-mix(in srgb,var(--warn) 16%,transparent);border:1px solid var(--warn);
+  border-radius:9px;padding:10px 14px;margin-bottom:16px;font-size:13px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:14px}
+.scroll{overflow-x:auto}
+table{border-collapse:collapse;font-size:12.5px;white-space:nowrap}
+th,td{padding:5px 9px;border-bottom:1px solid var(--line);text-align:right}
+th{position:sticky;top:0;background:var(--card);color:var(--dim);font-weight:600;text-align:right}
+th.d,td.d{text-align:left;position:sticky;left:0;background:var(--card);font-weight:600}
+tbody tr:hover td{background:color-mix(in srgb,var(--accent) 8%,transparent)}
+.stag{color:var(--warn);font-weight:600}
+.sub{color:var(--dim);font-size:12px;margin:2px 0 8px}
+code{background:color-mix(in srgb,var(--ink) 8%,transparent);padding:1px 5px;border-radius:4px;font-size:12px}
+.pill{display:inline-block;background:color-mix(in srgb,var(--accent) 16%,transparent);
+  border:1px solid var(--accent);border-radius:20px;padding:1px 10px;font-size:11.5px;margin-left:6px}
+</style></head><body>
+<h1>__RUN__ <span class="pill">日次ロールアップ</span></h1>
+<div class="meta" id="meta"></div>
+<div class="banner">📊 これは <b>日次ロールアップ表示</b>です。1日(144step=1,440分)ごとに L2 指標を平均集計し、
+社会構造の事後分析(structure.json)を束ねた軽量ページ。<b>地図・位置アニメ・個票は含みません</b>
+(長期ラン=30日級で viewer.html が数百MBになり開けない問題の回避用)。全量の閲覧は
+<code>python viz/make_viewer.py runs/__RUN__ --no-traffic</code> を使ってください。</div>
+<div id="body"></div>
+<script>
+const D=__DATA__;
+function tstr(v){ if(v===null||v===undefined) return '—';
+  if(typeof v!=='number') return String(v);
+  const a=Math.abs(v);
+  if(a!==0 && (a<0.001||a>=100000)) return v.toExponential(2);
+  return (Math.round(v*1000)/1000).toString(); }
+function pct(v){ return (v===null||v===undefined)?'—':(v*100).toFixed(1)+'%'; }
+
+// 主要指標の表示順とラベル(存在する列だけ描く=lens OFF のランでも壊れない)
+const CURATED=[
+  ['mean_grievance','平均不満'],
+  ['distinct_vocab_in_use','使用語彙'],
+  ['n_sns_posts','SNS投稿'],
+  ['total_adoptions','語彙採用'],
+  ['value4_social','価値:社会'],
+  ['value4_epistemic','価値:認識'],
+  ['motive_recognition','欲望:承認'],
+  ['trust_gini','信用Gini'],
+  ['trust_top10','信用上位10%'],
+  ['deviation_mean','逸脱(裁量)'],
+  ['deviation_top_share','上位逸脱者率'],
+  ['edge_churn_rate','edge組替率'],
+  ['edges_formed','紐帯形成'],
+  ['edges_broken','紐帯断絶'],
+];
+const meta=[];
+if(D.nAgents!=null) meta.push(`エージェント ${D.nAgents}体`);
+meta.push(`${D.days.length}日(${D.nSteps!=null?D.nSteps+'step':''})`);
+meta.push(`1日=${D.stepsPerDay}step`);
+document.getElementById('meta').textContent = meta.join(' · ');
+
+const B=document.getElementById('body');
+function h(html){ const d=document.createElement('div'); d.innerHTML=html; return d; }
+
+// ---- 主要指標テーブル(日 × 主要L2列 + 構造指標)----
+const struct=D.structure;
+function sArr(path){ // structure の日次配列を安全に取り出す
+  if(!struct) return null;
+  const parts=path.split('.'); let o=struct;
+  for(const p of parts){ if(o==null) return null; o=o[p]; }
+  return Array.isArray(o)?o:null; }
+const churn=sArr('churn.churn_rate'), tau=sArr('rank.tau_prev_day'),
+      cturn=sArr('centrality.turnover'), cchg=sArr('community.change_rate');
+const curCols=CURATED.filter(([k])=> D.metrics[k]!==undefined);
+let structCols=[];
+if(churn) structCols.push(['churn','churn率(構造)']);
+if(tau) structCols.push(['tau','前日τ(構造)']);
+if(cturn) structCols.push(['cturn','中心turnover(構造)']);
+if(cchg) structCols.push(['cchg','コミュ変化(構造)']);
+
+let html='<div class="card"><h2>日次サマリ</h2>'
+ +'<div class="sub">主要 L2 指標の日次平均(step毎の平均)＋ 社会構造の事後指標(structure.json が有る時)。'
+ +'空欄=その日にデータ無し / 列そのものが無い(lens OFF 等)。</div><div class="scroll"><table><thead><tr>'
+ +'<th class="d">日</th>';
+for(const [,lab] of curCols) html+=`<th>${lab}</th>`;
+for(const [,lab] of structCols) html+=`<th>${lab}</th>`;
+html+='</tr></thead><tbody>';
+for(const d of D.days){
+  html+=`<tr><td class="d">Day ${d}</td>`;
+  for(const [k] of curCols){ const v=(D.metrics[k]||[])[d];
+    const isPct=(k.indexOf('gini')>=0||k.indexOf('share')>=0||k.indexOf('top10')>=0||k.indexOf('churn_rate')>=0||k.indexOf('deviation')>=0);
+    html+=`<td>${isPct?pct(v):tstr(v)}</td>`; }
+  for(const [k] of structCols){
+    const arr=k==='churn'?churn:k==='tau'?tau:k==='cturn'?cturn:cchg;
+    const v=arr?arr[d]:null;
+    html+=`<td>${(k==='tau')?tstr(v):pct(v)}</td>`; }
+  html+='</tr>';
+}
+html+='</tbody></table></div></div>';
+B.appendChild(h(html));
+
+// ---- 構造固着の要約 ----
+if(struct && struct.stagnation){
+  const st=struct.stagnation; let s='<div class="card"><h2>構造固着の検知(観測記録・介入なし)</h2>';
+  if(st.longest){ const lg=st.longest;
+    s+=`<div>検出 <b>${st.combined.length}</b> 区間 / 固着延べ <b>${st.total_stagnant_days}</b> 日 / `
+      +`最長 <span class="stag">Day ${lg.start_day}–${lg.end_day}(${lg.len}日)</span></div>`;
+  } else {
+    s+='<div>中心性が N 日以上入れ替わらない固着区間は<b>検出されず</b>(構造は動いている)。</div>';
+  }
+  const labels={centrality_churn:'中心性 turnover 低(上位が入れ替わらない)',
+                edge_churn:'edge churn 低(紐帯が組み替わらない)',
+                rank_tau:'前日τ 高(順位が入れ替わらない)'};
+  s+='<div class="sub" style="margin-top:8px">信号別:</div><ul style="margin:0;padding-left:18px">';
+  for(const sig of ['centrality_churn','edge_churn','rank_tau']){
+    const segs=(st.by_signal&&st.by_signal[sig])||[];
+    const txt=segs.length? segs.map(x=>`Day ${x.start_day}–${x.end_day}(${x.len}日)`).join('、') : 'なし';
+    s+=`<li>${labels[sig]}: ${txt}</li>`;
+  }
+  s+='</ul></div>';
+  B.appendChild(h(s));
+} else {
+  B.appendChild(h('<div class="card"><div class="sub">構造の事後分析(structure.json)は未生成です。'
+    +'<code>python scripts/analyze_structure.py runs/'+D.runName+'</code> を掛けると固着検知・順位τ・'
+    +'中心性turnover・コミュニティ変化が本ページに表示されます。</div></div>'));
+}
+
+// ---- 全 L2 指標の日次平均(横スクロール)----
+if(D.hasL2){
+  let a='<div class="card"><h2>全 L2 指標(日次平均)</h2><div class="sub">'
+   +`${D.metricKeys.length} 列 × ${D.days.length} 日。lens ON の全体スカラーもここに出る。</div>`
+   +'<div class="scroll"><table><thead><tr><th class="d">日</th>';
+  for(const k of D.metricKeys) a+=`<th>${k}</th>`;
+  a+='</tr></thead><tbody>';
+  for(const d of D.days){ a+=`<tr><td class="d">Day ${d}</td>`;
+    for(const k of D.metricKeys){ a+=`<td>${tstr((D.metrics[k]||[])[d])}</td>`; }
+    a+='</tr>'; }
+  a+='</tbody></table></div></div>';
+  B.appendChild(h(a));
+} else {
+  B.appendChild(h('<div class="card"><div class="sub">L2 metrics(l2_metrics.parquet)が見つかりません。'
+    +'observer が有効なランで再生成してください。</div></div>'));
+}
+</script></body></html>
+"""
+
+
 def main() -> None:
     argv = sys.argv[1:]
     # --start-tod "HH:MM" を明示指定した時だけ壁時計原点を上書き(既定=run から復元)。
@@ -2822,6 +3062,20 @@ def main() -> None:
     run_dir = Path(args[0]) if args else REPO_ROOT / "runs" / "day80"
     if not run_dir.is_absolute():
         run_dir = REPO_ROOT / run_dir
+    # 第57バッチ タスクC: --daily-rollup は positions を読まない軽量ページ rollup.html「だけ」を
+    # 追加生成して早期 return する(既存 viewer.html/dashboard.html の生成経路には一切入らない=
+    # 既定=--daily-rollup 未指定時の出力は完全に従来どおり・バイト同一)。長期ラン(30日級)向け。
+    if "--daily-rollup" in flags:
+        rollup = build_rollup_data(run_dir)
+        html = (ROLLUP_HTML
+                .replace("__RUN__", rollup["runName"])
+                .replace("__DATA__", json.dumps(rollup, ensure_ascii=False)))
+        out = run_dir / "rollup.html"
+        out.write_text(html, encoding="utf-8")
+        print(f"written: {out}  ({out.stat().st_size / 1e6:.2f} MB) [日次ロールアップ]")
+        print(f"  days={len(rollup['days'])} metrics={len(rollup['metricKeys'])} "
+              f"structure={'yes' if rollup['structure'] else 'no'}")
+        return
     # 長期ラン(例: 100日=14400step)は背景交通の軌跡だけで数百MBになりブラウザで開けない。
     # --no-traffic で背景交通レイヤーを外す(エージェント・分析・ネットは全て従来どおり)。
     include_traffic = "--no-traffic" not in flags

@@ -1219,6 +1219,9 @@ class Simulation:
                     f"resume 元に checkpoint が無い: {Path(resume_from) / 'checkpoint'}")
             start = checkpoint.load(self, ckpt)
             self._restore_pool_resume(start)      # pool ON 時のみ: ドーマント/日境界の復元
+            # 第57バッチ タスクC: 分割実行で clean finalize しても前チャンクの canonical を失わない
+            # (logger._finalize_stream が resume 時のみ既存 canonical を先頭に結合する)。fresh ラン不変。
+            self.logger._resumed = True
         if every > 0:
             save_config(self.cfg, self.out_dir)   # 途中再開に備え config を先出しする
         for step in range(start, int(self.cfg.run.n_steps)):
