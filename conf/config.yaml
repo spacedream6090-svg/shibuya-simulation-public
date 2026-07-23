@@ -936,6 +936,18 @@ lens:
     occupation_map: {}          # 職業→期待勤務POIカテゴリ(ドリルダウンの注記のみ=勤務系イベントにPOIカテゴリが無く厳密判定不能。既定 DEFAULT_OCCUPATION_MAP へ上書き)
     hobby_map: {}               # 職業→期待余暇POIカテゴリ列(既定 DEFAULT_HOBBY_MAP へ上書き。例 {研究員: [leisure]})
     behavior_map: {}            # イベント種→行動カテゴリ(既定 DEFAULT_BEHAVIOR_MAP へ上書き)
+  # ---- 社会構造の内生変動レンズ(第56バッチ タスクB 2026-07-24。独立 observable。既定 OFF)----
+  # 「強制トリガーなしで社会構造は変化するのか、固着するのか」を正面から測る。関係性の固定化が実際に
+  # 起きるかを介入せず観測する(危機トリガー不採用の日常観察方針=Entry 47)。観測のみ。
+  # L2 全体スカラー(当日イベント+当日母数だけで計算する軽量スカラー。前日状態をシム側に持たない):
+  #   edges_formed(当日 relation_tier{tier==1}=新規紐帯)/ edges_broken(relation_break{cause=contact}=断絶)/
+  #   edges_decayed(relation_break{cause=absence}=長期不在の風化)/ edge_churn_rate(=組み替え率=churn/活性関係数)。
+  # 順位相関(Kendall τ)・中心性入れ替わり・コミュニティ変化・固着検知は事後層 scripts/analyze_structure.py が
+  # L1(+hierarchy ON なら L3 status)から計算(コミュニティ検出=既存の決定論 LPA observer/measure.communities を
+  # 再利用=新規依存なし)。ダッシュボードの「🏛 社会構造」タブは structure.json(事後層出力)が有る時だけ表示。
+  # enabled=false = L2 に列を足さない=ゴールデン L1/L2 バイト一致。
+  structure:
+    enabled: false              # ★ON はユーザー判断(production/daily は触らない)。lens.enabled とは独立
 
 # ---- 行動心理プラグイン(config 着脱式・すべて既定 OFF。ユーザー方針 2026-07-06)----
 # 文献の数値を固定実装せず、回しながら柔軟に変える seam。OFF 時はイベント列がバイト一致で不変。

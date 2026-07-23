@@ -573,6 +573,12 @@ def build_data(run_dir: Path, include_traffic: bool = True,
     dev_map = load_deviation_map(run_dir)
     if dev_map is not None:
         out["deviation"] = build_deviation_data(events, agents_meta, dev_map, start_min)
+    # 社会構造の内生変動(第56バッチ タスクB): structure.json(scripts/analyze_structure.py の事後出力)が
+    # 「有る時だけ」そのまま埋め込む。事後層が L1+L3 から計算済み(churn 時系列・順位 τ・中心性 turnover・
+    # コミュニティ変化・固着区間)を読むだけ=build_data は再計算しない。無ければ out 不変=後方互換。
+    struct = load_structure(run_dir)
+    if struct is not None:
+        out["structure"] = struct
     return out
 
 
@@ -713,6 +719,20 @@ def build_lens_data(events: list, agents_meta: list, lens_map: dict,
 def load_deviation_map(run_dir: Path) -> dict | None:
     """runs/<name>/deviation_map.json(observer/deviation.py が ON 時に書く map)を読む。無ければ None。"""
     p = run_dir / "deviation_map.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def load_structure(run_dir: Path) -> dict | None:
+    """runs/<name>/structure.json(scripts/analyze_structure.py の事後出力)を読む。無ければ None。
+
+    事後層が L1+L3 から計算済みの日次時系列(churn / 順位 τ / 中心性 turnover / コミュニティ変化 /
+    固着区間)をそのまま返す。ダッシュボードは読むだけ(sim⇄viz 疎結合。communities/deviation と同型)。"""
+    p = run_dir / "structure.json"
     if not p.exists():
         return None
     try:
@@ -2030,6 +2050,77 @@ function devRender(tab, s0){ if(tab==='deviation' && D.deviation){ renderDeviati
 """
 
 
+# 第56バッチ タスクB 社会構造タブ(structure.json が有る時だけ main() が dashboard に注入)。
+# 無ければ空文字→ DASH_HTML はバイト同一(lens/deviation と同型の後方互換)。structRender は tab で自己ガード。
+_STRUCT_JS = r"""
+function _stBands(container, intervals, nDays, color, label){
+  // 固着区間を日軸トラック上の帯として描く(観測記録=介入ではない旨は sub に明記)。
+  if(!intervals || !intervals.length){ container.innerHTML=
+    `<span style="color:var(--dim);font-size:11px">${label}: 検出なし</span>`; return; }
+  const denom=Math.max(1,nDays);
+  const bars=intervals.map(s=>{ const L=s.start_day/denom*100, W=Math.max(1.5,(s.len)/denom*100);
+    return `<div title="Day ${s.start_day}–${s.end_day}(${s.len}日)" style="position:absolute;left:${L.toFixed(2)}%;width:${W.toFixed(2)}%;top:0;bottom:0;background:${color};opacity:.55;border-radius:3px"></div>`;}).join('');
+  container.innerHTML=`<div style="font-size:11px;color:var(--dim);margin-bottom:2px">${label}</div>
+    <div style="position:relative;height:16px;background:var(--surface2);border-radius:3px">${bars}</div>`;
+}
+function renderStructure(s0){
+  const V=D.structure, days=V.days||[], nD=days.length;
+  const ch=V.churn||{}, rk=V.rank||{}, ce=V.centrality||{}, co=V.community||{}, st=V.stagnation||{};
+  const X=d=>d*144;
+  const pack=(arr)=> days.map((d,i)=>[X(d), arr&&arr[i]!=null?arr[i]:null]).filter(p=>p[1]!=null);
+  const lg = st.longest;
+  const hero = lg
+    ? `最長の構造固着: <b style="color:#f87171">Day ${lg.start_day}–${lg.end_day}(${lg.len}日)</b> ・ 固着延べ <b>${st.total_stagnant_days||0}</b> 日`
+    : `<b style="color:#6ee7b7">構造固着区間なし</b>(上位中心性が ${st.min_days||3} 日以上入れ替わらない期間は検出されず=構造は動いている)`;
+  const srcJP = {status:'合成地位(L3)', reputation:'評判(L1)', none:'なし'}[rk.source]||rk.source;
+  body.innerHTML=`
+   <div class="chartBox"><h3>■ 構造固着の検知(観測記録・介入しない)</h3>
+     <div class="sub">「強制トリガーなしで社会構造は変化するのか、固着するのか」を介入せず観測。固着=上位中心性が入れ替わらない/紐帯が組み替わらない/順位が入れ替わらない期間(閾値以下で連続 ${st.min_days||3} 日)。アラートではなく観測記録</div>
+     <div style="font-size:13px;margin:6px 0">${hero}</div>
+     <div id="stBand1" style="margin:6px 0"></div>
+     <div id="stBand2" style="margin:6px 0"></div>
+     <div id="stBand3" style="margin:6px 0"></div></div>
+   <div class="chartBox"><h3>① edge 組み替え(日次の件数)</h3>
+     <div class="sub">形成=新規に紐帯 tier≥1 到達 / 断絶=能動的な負交流 / 風化=長期不在の decay。日常の小さな積み重ねで関係が組み替わるか</div>
+     <canvas id="stc1"></canvas></div>
+   <div class="chartBox"><h3>② 変化率(組み替え率・中心性入れ替わり・コミュニティ変化)</h3>
+     <div class="sub">組み替え率=churn/活性関係数。中心性turnover=会話グラフ上位${ce.top_k||10}の入れ替わり率。コミュ変化率=所属クラスタの Jaccard 変化。いずれも低いまま推移=固着</div>
+     <canvas id="stc2"></canvas></div>
+   <div class="chartBox"><h3>③ 順位固着(ランキングの前日比・前週比 Kendall τ)</h3>
+     <div class="sub">順位ソース: <b>${srcJP}</b>。τ が高い(1 に近い)=順位が入れ替わらない=ヒエラルキー固着。低下・負=順位の流動</div>
+     <canvas id="stc3"></canvas></div>
+   <div class="chartBox"><h3>④ 上位者の順位推移(レースチャート)</h3>
+     <div class="sub">いずれかの日に上位${rk.top_k||10}入りした住民の日次順位(上=上位)。線が水平=順位固着 / 交差=入れ替わり</div>
+     <canvas id="strace"></canvas></div>`;
+  _stBands(document.getElementById('stBand1'), (st.by_signal||{}).centrality_churn, nD, '#f87171', '中心性 turnover 低(上位が入れ替わらない)');
+  _stBands(document.getElementById('stBand2'), (st.by_signal||{}).edge_churn, nD, '#fbbf24', 'edge churn 低(紐帯が組み替わらない)');
+  _stBands(document.getElementById('stBand3'), (st.by_signal||{}).rank_tau, nD, '#a78bfa', '前日比τ 高(順位が入れ替わらない)');
+  lineChart(document.getElementById('stc1'), [
+    {label:'形成',color:'#6ee7b7', data:pack(ch.edges_formed)},
+    {label:'断絶',color:'#f87171', data:pack(ch.edges_broken)},
+    {label:'風化',color:'#fbbf24', data:pack(ch.edges_decayed)},
+  ], {});
+  lineChart(document.getElementById('stc2'), [
+    {label:'組み替え率',color:'#60a5fa', data:pack(ch.churn_rate)},
+    {label:'中心性turnover',color:'#f472b6', data:pack(ce.turnover)},
+    {label:'コミュ変化率',color:'#34d399', data:pack(co.change_rate)},
+  ], {pct:true});
+  lineChart(document.getElementById('stc3'), [
+    {label:'前日比τ',color:'#a78bfa', data:pack(rk.tau_prev_day)},
+    {label:'前週比τ',color:'#fb923c', data:pack(rk.tau_prev_week)},
+  ], {ymax:1});
+  // レースチャート: 順位は反転(上=上位)。ymax=K+1 で 1 位が上端付近。
+  const K=rk.top_k||10;
+  const race=(rk.race||[]).slice(0,K).map((r,ix)=>({
+    label:r.name, color:PAL[ix%PAL.length],
+    data: days.map((d,i)=>[X(d), r.ranks[i]!=null?(K+1-r.ranks[i]):null]).filter(p=>p[1]!=null),
+  }));
+  lineChart(document.getElementById('strace'), race, {ymax:K+1});
+}
+function structRender(tab, s0){ if(tab==='structure' && D.structure){ renderStructure(s0); } }
+"""
+
+
 # ============================================================ ダッシュボード
 DASH_HTML = r"""<!DOCTYPE html>
 <html lang="ja"><head><meta charset="utf-8">
@@ -2213,7 +2304,8 @@ function render(force){
   else if(tab==='bld') renderBld(s0);
   else if(tab==='people') renderPeople(s0);
   else { if(typeof lensRender==='function') lensRender(tab, s0);   // 第50バッチ 観測レンズ(有る時だけ定義)
-         if(typeof devRender==='function') devRender(tab, s0); }   // 第55バッチ ペルソナ逸脱率(有る時だけ定義)
+         if(typeof devRender==='function') devRender(tab, s0);     // 第55バッチ ペルソナ逸脱率(有る時だけ定義)
+         if(typeof structRender==='function') structRender(tab, s0); }  // 第56バッチ 社会構造(有る時だけ定義)
 }
 
 function renderFeed(s0){
@@ -2752,6 +2844,7 @@ def main() -> None:
     has_lens = "lens" in data
     has_trust = "trust" in data
     has_deviation = "deviation" in data
+    has_structure = "structure" in data
     lens_tabs = ""
     if has_lens:
         lens_tabs += ('\n    <button data-tab="value">💠 価値</button>'
@@ -2760,9 +2853,13 @@ def main() -> None:
         lens_tabs += '\n    <button data-tab="trust">🏅 信用</button>'
     if has_deviation:
         lens_tabs += '\n    <button data-tab="deviation">🎭 逸脱</button>'
+    if has_structure:
+        lens_tabs += '\n    <button data-tab="structure">🏛 社会構造</button>'
     lens_js = _LENS_JS if (has_lens or has_trust) else ""
     if has_deviation:                      # 逸脱タブ JS は lens/trust と独立に注入(devRender を定義)
         lens_js += _DEV_JS
+    if has_structure:                      # 社会構造タブ JS も独立に注入(structRender を定義)
+        lens_js += _STRUCT_JS
     for name, template in (("viewer.html", MAP_HTML), ("dashboard.html", DASH_HTML)):
         html = (template
                 .replace("__COMMUNITY_OPTION__", comm_option)

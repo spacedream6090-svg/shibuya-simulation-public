@@ -6,6 +6,7 @@ from typing import Any, Callable
 from .. import status as _status_mod
 from . import deviation as _dev
 from . import lens as _lens
+from . import structure as _struct
 
 AGGREGATORS: dict[str, Callable[[Any], float | int | str]] = {}
 
@@ -648,6 +649,37 @@ def _deviation_top_share(sim):
 @register_aggregator("deviation_fulltime_mean")
 def _deviation_fulltime_mean(sim):
     return _dev_col(sim, "deviation_fulltime_mean")
+
+
+# ---- 社会構造の内生変動 第56バッチ タスクB(既定 OFF)。lens.structure.enabled=false は全て None=列なし ----
+#   edge 組み替え率(当日の新規形成/断絶/風化の件数・率)。前日状態を持たない軽量スカラー(条件2)。
+#   順位相関(Kendall τ)・中心性入れ替わり・コミュニティ変化・固着検知は事後層 scripts/analyze_structure.py。
+#   scalars() は step 末に collect が 1 回呼ぶ経路で当日タリー+当日母数から全体スカラーを作る(読むだけ・乱数ゼロ)。
+def _struct_col(sim, key):
+    if not _struct.enabled(sim):
+        return None
+    s = _struct.scalars(sim)
+    return s.get(key) if s else 0
+
+
+@register_aggregator("edges_formed")
+def _edges_formed(sim):
+    return _struct_col(sim, "edges_formed")
+
+
+@register_aggregator("edges_broken")
+def _edges_broken(sim):
+    return _struct_col(sim, "edges_broken")
+
+
+@register_aggregator("edges_decayed")
+def _edges_decayed(sim):
+    return _struct_col(sim, "edges_decayed")
+
+
+@register_aggregator("edge_churn_rate")
+def _edge_churn_rate(sim):
+    return _struct_col(sim, "edge_churn_rate")
 
 
 def collect(sim) -> dict:
