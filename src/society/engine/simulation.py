@@ -13,6 +13,7 @@ from ..config import REPO_ROOT, save_config
 from ..labeling.labels import LabelSystem
 from ..llm.cache import CachedLLM
 from ..llm.mock import MockBackend
+from ..observer import deviation as deviation_mod
 from ..observer import lens as lens_mod
 from ..observer.logger import ObserverLogger
 from ..observer.provenance import ItemStore
@@ -837,6 +838,9 @@ class Simulation:
         # 第50バッチ: 観測レンズの kind_map サイドカー(lens ON 時のみ書く=OFF は後方互換でバイト同一)。
         # ビューアが runs/<name>/lens_map.json 経由で写像を読む(sim⇄viz 疎結合。軸語は observer/lens.py に閉じる)。
         lens_mod.write_sidecar(self, self.out_dir)
+        # 第55バッチ タスクA: ペルソナ逸脱率レンズの map サイドカー(deviation ON 時のみ書く=OFF は
+        # 後方互換でバイト同一)。ビューアが deviation_map.json 経由で読む(ペルソナ語は observer/deviation.py に閉じる)。
+        deviation_mod.write_sidecar(self, self.out_dir)
 
     def _build_router_child(self, spec: dict):
         """router の子バックエンドを1つ構築する(第23バッチ M2)。

@@ -921,6 +921,21 @@ lens:
     kind_map: {}                # 例: {venture_open: earn}(既定 DEFAULT_MOTIVE_MAP へ上書き)
   trust:
     enabled: true               # マスター ON 時に信用内訳(status 可視化)を出すか。要 hierarchy.enabled=true
+  # ---- ペルソナ逸脱率レンズ(第55バッチ タスクA 2026-07-23。独立 observable。既定 OFF)----
+  # エージェントが注入されたペルソナ(職業・趣味)にどれだけ従順か/逸脱するかを測る。逸脱がゼロに近いなら
+  # それ自体が本シミュレーションの限界を語るデータ(world-changer 検出=k* 測定の感度の補助指標)。観測のみ。
+  # 主指標=**裁量時間限定**の逸脱(義務ルーチン=勤務行動を母数から除外=水増しを避ける)。全時間版は参考。
+  # 逸脱判定=行動種別(behavior_map で "@work" に落ちる kind=勤務=裁量から除外)による近似。
+  # L2 全体スカラー: deviation_mean(裁量・主)/ deviation_var / deviation_top_share / deviation_fulltime_mean(参考)。
+  # 住民別スコア・ドリルダウンはビューア事後計算(deviation_map.json サイドカー経由)。正準 map は
+  # observer/deviation.py の DEFAULT_*(単一の源)。下の map は「上書き」用の空マップ(値を書けば既定へ重なる)。
+  # enabled=false = L2 に列を足さず・サイドカーも書かず・ダッシュボードの逸脱タブは非表示=ゴールデン L1/L2 バイト一致。
+  deviation:
+    enabled: false              # ★ON はユーザー判断(production/daily は触らない)。lens.enabled とは独立
+    top_threshold: 0.5          # 「上位逸脱者」= 裁量逸脱率がこの値以上の測定対象住民の割合(deviation_top_share)
+    occupation_map: {}          # 職業→期待勤務POIカテゴリ(ドリルダウンの注記のみ=勤務系イベントにPOIカテゴリが無く厳密判定不能。既定 DEFAULT_OCCUPATION_MAP へ上書き)
+    hobby_map: {}               # 職業→期待余暇POIカテゴリ列(既定 DEFAULT_HOBBY_MAP へ上書き。例 {研究員: [leisure]})
+    behavior_map: {}            # イベント種→行動カテゴリ(既定 DEFAULT_BEHAVIOR_MAP へ上書き)
 
 # ---- 行動心理プラグイン(config 着脱式・すべて既定 OFF。ユーザー方針 2026-07-06)----
 # 文献の数値を固定実装せず、回しながら柔軟に変える seam。OFF 時はイベント列がバイト一致で不変。

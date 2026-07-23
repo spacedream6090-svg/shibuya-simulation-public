@@ -466,7 +466,10 @@ def build_data(run_dir: Path, include_traffic: bool = True,
                     # 第50バッチ 観測レンズの L2 全体スカラー(lens ON 時のみ列が在る)
                     "value4_utility", "value4_emotion", "value4_social",
                     "value4_epistemic", "motive_earn", "motive_love",
-                    "motive_recognition", "trust_gini", "trust_top10"):
+                    "motive_recognition", "trust_gini", "trust_top10",
+                    # 第55バッチ ペルソナ逸脱率の L2 全体スカラー(deviation ON 時のみ列が在る)
+                    "deviation_mean", "deviation_var", "deviation_top_share",
+                    "deviation_fulltime_mean"):
             if rows and key in rows[0]:
                 metrics[key] = [r.get(key, 0) for r in rows]
 
@@ -565,6 +568,11 @@ def build_data(run_dir: Path, include_traffic: bool = True,
     trust = build_trust_data(events, run_dir, agents_meta)
     if trust is not None:
         out["trust"] = trust
+    # ペルソナ逸脱率(第55バッチ タスクA): deviation_map.json が「有る時だけ」住民別逸脱を事後計算。
+    # 無ければ out は不変=既存ランのビューア再生成でバイト同一(lens/trust と同型の後方互換)。
+    dev_map = load_deviation_map(run_dir)
+    if dev_map is not None:
+        out["deviation"] = build_deviation_data(events, agents_meta, dev_map, start_min)
     return out
 
 
@@ -694,6 +702,117 @@ def build_lens_data(events: list, agents_meta: list, lens_map: dict,
                                                 key=lambda kv: -kv[1])],
     }
     return {"value": value, "motives": motive}
+
+
+# ============================================================ ペルソナ逸脱率(第55バッチ タスクA)
+# 「deviation_map.json が有る時だけ」build_data が住民別逸脱を L1 から事後計算する(sim⇄viz 疎結合)。
+# L2 が持つのは全体スカラーのみ(条件2)。住民別スコア・ドリルダウン・分布はここで L1 から算出。
+# in-sim(observer/deviation.classify)の鏡: occupation は agents.json の最終スナップ(非 pool ラン=厳密・
+# pool ラン=近似。lens/trust の name_of と同じ既知の割り切り)。無ければ out に一切足さない=後方互換。
+
+def load_deviation_map(run_dir: Path) -> dict | None:
+    """runs/<name>/deviation_map.json(observer/deviation.py が ON 時に書く map)を読む。無ければ None。"""
+    p = run_dir / "deviation_map.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def build_deviation_data(events: list, agents_meta: list, dev_map: dict,
+                         start_min: int) -> dict:
+    """L1 を「ペルソナ期待 vs 実際の行動」で事後分類する。分布ヒスト + 日別推移 + 最逸脱者ドリルダウン。
+
+    observer/deviation.classify と同一規則を _lens_axis(=resolve_axis の鏡)で再現。裁量(義務除外)を主・
+    全時間を参考に。カテゴリ非対応/測定対象外職業/世界イベントは母数に数えない。"""
+    occ_of = {a["id"]: a.get("occupation", "") for a in agents_meta}
+    name_of = {a["id"]: a.get("name", f"a{a['id']}") for a in agents_meta}
+    occ_map = dev_map.get("occupation_map", {})
+    hobby_map = dev_map.get("hobby_map", {})
+    beh_map = dev_map.get("behavior_map", {})
+    work_cat = dev_map.get("work_category", "@work")
+    threshold = float(dev_map.get("top_threshold", 0.5))
+
+    def _mk():
+        return {"disc_dev": 0, "disc_total": 0, "full_dev": 0, "full_total": 0}
+
+    per: dict[int, dict] = defaultdict(_mk)                      # 住民ごとのラン累計
+    actual: dict[int, dict] = defaultdict(lambda: defaultdict(int))  # 住民ごとの裁量カテゴリ構成
+    daily: dict[int, dict] = defaultdict(lambda: defaultdict(_mk))   # 日→住民→累計(時系列用)
+
+    def _day(e):
+        sm = e.get("sim_min")
+        if sm is None:
+            sm = start_min + int(e["step"]) * STEP_MINUTES
+        return int(sm) // 1440
+
+    for e in events:
+        aid = e["agent_id"]
+        if aid < 0:
+            continue
+        occ = occ_of.get(aid)
+        if occ is None or occ not in hobby_map:                 # 測定対象外の職業/未知個体
+            continue
+        payload = json.loads(e["payload"]) if e["payload"] else {}
+        cat = _lens_axis(e["kind"], payload, beh_map)
+        if cat is None:
+            continue
+        is_work = (cat == work_cat)
+        # 義務(勤務)行動は常に従順(条件1=機械導出=定義上ペルソナに従順。observer/deviation.classify の鏡)。
+        conforming = True if is_work else (cat in hobby_map.get(occ, []))
+        miss = 0 if conforming else 1
+        d = _day(e)
+        pa, da = per[aid], daily[d][aid]
+        pa["full_total"] += 1
+        pa["full_dev"] += miss
+        da["full_total"] += 1
+        da["full_dev"] += miss
+        if not is_work:
+            pa["disc_total"] += 1
+            pa["disc_dev"] += miss
+            actual[aid][cat] += 1
+            da["disc_total"] += 1
+            da["disc_dev"] += miss
+
+    days = sorted(daily)
+
+    def _mean(recs, kd, kt):
+        rs = [r[kd] / r[kt] for r in recs if r[kt] > 0]
+        return round(sum(rs) / len(rs), 6) if rs else 0.0
+
+    disc_series = [_mean(daily[d].values(), "disc_dev", "disc_total") for d in days]
+    full_series = [_mean(daily[d].values(), "full_dev", "full_total") for d in days]
+
+    # 住民別ラン累計の裁量逸脱率(分布ヒスト + ドリルダウン)
+    measured = [(aid, r) for aid, r in per.items() if r["disc_total"] > 0]
+    ratios = [r["disc_dev"] / r["disc_total"] for _aid, r in measured]
+    bins = [0] * 10                                             # [0,.1)..[.9,1.0] の 10 ビン
+    for x in ratios:
+        bins[min(9, int(x * 10))] += 1
+
+    top = sorted(measured, key=lambda kv: (-(kv[1]["disc_dev"] / kv[1]["disc_total"]),
+                                           kv[0]))[:15]
+    top_out = []
+    for aid, r in top:
+        dr = r["disc_dev"] / r["disc_total"]
+        fr = (r["full_dev"] / r["full_total"]) if r["full_total"] > 0 else 0.0
+        occ = occ_of.get(aid, "")
+        top_out.append({
+            "id": aid, "name": name_of.get(aid, f"a{aid}"), "occupation": occ,
+            "expect_hobby": list(hobby_map.get(occ, [])),
+            "expect_work": occ_map.get(occ),
+            "disc_ratio": round(dr, 4), "full_ratio": round(fr, 4),
+            "disc_dev": r["disc_dev"], "disc_total": r["disc_total"],
+            "actual": dict(sorted(actual[aid].items(), key=lambda kv: (-kv[1], kv[0]))),
+        })
+    return {
+        "days": days,
+        "disc_series": disc_series, "full_series": full_series,
+        "hist": bins, "n_measured": len(measured),
+        "top_threshold": threshold, "top": top_out,
+    }
 
 
 # ============================================================ 信用内訳(第50バッチ T6)
@@ -1858,6 +1977,59 @@ function lensRender(tab, s0){
 """
 
 
+# 第55バッチ ペルソナ逸脱率タブ(deviation_map.json が有る時だけ main() が dashboard に注入)。
+# 無ければ空文字→ DASH_HTML はバイト同一(lens/trust と同型の後方互換)。devRender は tab で自己ガード。
+_DEV_JS = r"""
+const DEV_CAT_LABEL={food:'飲食',nightlife:'ナイトライフ',shop:'買い物',leisure:'レジャー',education:'学び'};
+const DEV_CAT_COLOR={food:'#f59e0b',nightlife:'#a78bfa',shop:'#f472b6',leisure:'#34d399',education:'#60a5fa'};
+function renderDeviation(s0){
+  const V=D.deviation, days=V.days;
+  const lastDisc = V.disc_series.length? V.disc_series[V.disc_series.length-1]:0;
+  const lastFull = V.full_series.length? V.full_series[V.full_series.length-1]:0;
+  // ① 分布ヒスト(住民別ラン累計の裁量逸脱率を 10 ビン)
+  const hmax=Math.max(1,...V.hist);
+  const hbars=V.hist.map((c,i)=>{ const h=c/hmax*100;
+    return `<div style="display:flex;flex-direction:column;align-items:center;flex:1">
+      <div style="font-size:10px;color:var(--dim)">${c||''}</div>
+      <div style="width:70%;height:${h.toFixed(1)}px;min-height:1px;background:#e8a33d;border-radius:2px 2px 0 0"></div>
+      <div style="font-size:9px;color:var(--dim);margin-top:2px">${i*10}</div></div>`;}).join('');
+  // ② 最逸脱者ドリルダウン(ペルソナ属性 vs 実際の行動構成)
+  const rows=V.top.map(a=>{
+    const tot=Object.values(a.actual).reduce((s,x)=>s+x,0)||1;
+    const bar=Object.entries(a.actual).map(([c,n])=>{ const w=n/tot*100;
+      const ok=a.expect_hobby.includes(c);
+      return `<span style="display:inline-block;height:14px;width:${w.toFixed(2)}%;background:${DEV_CAT_COLOR[c]||'#999'};${ok?'':'outline:2px solid #ef4444;outline-offset:-2px'}" title="${DEV_CAT_LABEL[c]||c} ${n}件${ok?'(期待どおり)':'(逸脱)'}"></span>`;}).join('');
+    const chips=a.expect_hobby.map(c=>`<span style="font-size:10px;padding:1px 6px;border-radius:8px;background:${(DEV_CAT_COLOR[c]||'#999')}33;color:${DEV_CAT_COLOR[c]||'#999'};margin-right:3px">${DEV_CAT_LABEL[c]||c}</span>`).join('');
+    return `<div style="margin:7px 0;font-size:12px">
+      <b>${a.name}</b> <span style="color:var(--dim)">${a.occupation}</span>
+      <span style="color:#e8a33d;font-weight:700;margin-left:6px">裁量逸脱 ${(a.disc_ratio*100).toFixed(0)}%</span>
+      <span style="color:var(--dim);margin-left:6px">(全時間 ${(a.full_ratio*100).toFixed(0)}% ・ ${a.disc_dev}/${a.disc_total}件)</span><br>
+      <span style="color:var(--dim);font-size:11px">期待の行き先: </span>${chips||'<span style="color:var(--dim);font-size:11px">なし</span>'}
+      <span style="color:var(--dim);font-size:11px;margin-left:6px">${a.expect_work?('職場カテゴリ '+a.expect_work):''}</span><br>
+      <span style="color:var(--dim);font-size:11px">実際の裁量行動: </span>
+      <span style="display:inline-flex;width:100%;max-width:520px;border-radius:5px;overflow:hidden;background:var(--surface2);vertical-align:middle">${bar}</span></div>`;
+  }).join('') || '<div class="ev">裁量行動の記録がまだありません</div>';
+  body.innerHTML=`
+   <div class="chartBox"><h3>① 裁量逸脱率の分布(住民別・ラン累計)</h3>
+     <div class="sub">各住民の「裁量時間の行動のうちペルソナ期待(構造化趣味)と不一致の割合」の分布(横軸=逸脱率%・縦軸=人数)。測定対象 ${V.n_measured} 人。逸脱がゼロ寄りなら従順=シミュレーションの限界を語るデータ</div>
+     <div style="display:flex;align-items:flex-end;gap:2px;height:130px;max-width:560px;margin-top:8px">${hbars}</div></div>
+   <div class="chartBox"><h3>② 逸脱率の日別推移(裁量 vs 全時間)</h3>
+     <div class="sub">裁量限定(主指標)と全時間(参考)の日別平均逸脱率。全時間は義務ルーチン=勤務行動を含むため構造的に低く出る(従順度の水増し)。両者の差が「義務による水増し」の大きさ</div>
+     <div style="font-size:13px">直近: 裁量 <b style="color:#e8a33d">${(lastDisc*100).toFixed(1)}%</b> ・ 全時間 <b style="color:#60a5fa">${(lastFull*100).toFixed(1)}%</b></div>
+     <canvas id="dvc1"></canvas></div>
+   <div class="chartBox"><h3>③ 最も逸脱した住民(ペルソナ属性 vs 実際の行動構成)</h3>
+     <div class="sub">裁量逸脱率の高い順。帯=実際の裁量行動のカテゴリ構成(赤枠=期待外=逸脱)。閾値 ${(V.top_threshold*100).toFixed(0)}% 以上が「上位逸脱者」</div>
+     ${rows}</div>`;
+  const X=d=>d*144;
+  lineChart(document.getElementById('dvc1'), [
+    {label:'裁量逸脱率',color:'#e8a33d', data:days.map((d,i)=>[X(d), V.disc_series[i]])},
+    {label:'全時間逸脱率',color:'#60a5fa', data:days.map((d,i)=>[X(d), V.full_series[i]])},
+  ], {pct:true, ymax:1});
+}
+function devRender(tab, s0){ if(tab==='deviation' && D.deviation){ renderDeviation(s0); } }
+"""
+
+
 # ============================================================ ダッシュボード
 DASH_HTML = r"""<!DOCTYPE html>
 <html lang="ja"><head><meta charset="utf-8">
@@ -2040,7 +2212,8 @@ function render(force){
   else if(tab==='vocab') renderVocab(s0);
   else if(tab==='bld') renderBld(s0);
   else if(tab==='people') renderPeople(s0);
-  else if(typeof lensRender==='function') lensRender(tab, s0);   // 第50バッチ 観測レンズ(有る時だけ定義)
+  else { if(typeof lensRender==='function') lensRender(tab, s0);   // 第50バッチ 観測レンズ(有る時だけ定義)
+         if(typeof devRender==='function') devRender(tab, s0); }   // 第55バッチ ペルソナ逸脱率(有る時だけ定義)
 }
 
 function renderFeed(s0){
@@ -2578,13 +2751,18 @@ def main() -> None:
     # 両トークンとも空文字→ DASH_HTML はバイト同一(後方互換の合格条件。viewer 側にトークンは無い)。
     has_lens = "lens" in data
     has_trust = "trust" in data
+    has_deviation = "deviation" in data
     lens_tabs = ""
     if has_lens:
         lens_tabs += ('\n    <button data-tab="value">💠 価値</button>'
                       '\n    <button data-tab="motive">🎯 欲望</button>')
     if has_trust:
         lens_tabs += '\n    <button data-tab="trust">🏅 信用</button>'
+    if has_deviation:
+        lens_tabs += '\n    <button data-tab="deviation">🎭 逸脱</button>'
     lens_js = _LENS_JS if (has_lens or has_trust) else ""
+    if has_deviation:                      # 逸脱タブ JS は lens/trust と独立に注入(devRender を定義)
+        lens_js += _DEV_JS
     for name, template in (("viewer.html", MAP_HTML), ("dashboard.html", DASH_HTML)):
         html = (template
                 .replace("__COMMUNITY_OPTION__", comm_option)

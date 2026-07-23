@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from .. import status as _status_mod
+from . import deviation as _dev
 from . import lens as _lens
 
 AGGREGATORS: dict[str, Callable[[Any], float | int | str]] = {}
@@ -617,6 +618,36 @@ def _trust_top10(sim):
         return 0.0
     k = max(1, int(len(vals) * 0.1))
     return round(sum(vals[:k]) / total, 6)
+
+
+# ---- ペルソナ逸脱率 第55バッチ タスクA(既定 OFF)。lens.deviation.enabled=false は全て None=列なし ----
+#   裁量逸脱率(disc)を主・全時間版(fulltime)を参考に。住民別は L2 に出さず(条件2)ビューア事後計算へ。
+#   scalars() は step 末に collect が 1 回呼ぶ経路で当日タリーから全体スカラーを作る(読むだけ・乱数ゼロ)。
+def _dev_col(sim, key):
+    if not _dev.enabled(sim):
+        return None
+    s = _dev.scalars(sim)
+    return s.get(key) if s else 0.0
+
+
+@register_aggregator("deviation_mean")
+def _deviation_mean(sim):
+    return _dev_col(sim, "deviation_mean")
+
+
+@register_aggregator("deviation_var")
+def _deviation_var(sim):
+    return _dev_col(sim, "deviation_var")
+
+
+@register_aggregator("deviation_top_share")
+def _deviation_top_share(sim):
+    return _dev_col(sim, "deviation_top_share")
+
+
+@register_aggregator("deviation_fulltime_mean")
+def _deviation_fulltime_mean(sim):
+    return _dev_col(sim, "deviation_fulltime_mean")
 
 
 def collect(sim) -> dict:

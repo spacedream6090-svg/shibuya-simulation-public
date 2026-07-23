@@ -46,7 +46,9 @@ from society.observer import measure as m  # noqa: E402
 PALETTE = ["#0072B2", "#E69F00", "#009E73", "#D55E00", "#CC79A7",
            "#56B4E9", "#F0E442", "#000000"]
 # 別バッチが L2 に足しうる派生系列(存在すれば EWS を追加観測。無くても動く)
-_EXTRA_L2_SERIES = ("speech_diversity",)
+#   deviation_mean(第55バッチ タスクA): 裁量ペルソナ逸脱率の日別平均。k を上げると逸脱が増えるか=
+#   R²(k) の解釈材料(measure.collective_series が L2 全数値列を素通しするので per-run 系列として自然に載る)。
+_EXTRA_L2_SERIES = ("speech_diversity", "deviation_mean")
 
 plt.rcParams.update({
     "figure.facecolor": "white", "axes.facecolor": "white",
