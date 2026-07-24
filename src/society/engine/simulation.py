@@ -533,6 +533,14 @@ class Simulation:
                     if OmegaConf.is_config(raw_work) else raw_work)
         self.workcfg = _work_mod.build_cfg(raw_work)
         self._work_day = -1                        # 日次境界(オフィス産出集計)の進行管理
+        # 会社観測データ層 B4(work.service.ledger / office.by_org。既定 OFF=バイト一致・サイドカー不在)。
+        # 動力学(scheduler)が per-day アキュムレータへ積み、observer(OrgLedger)が日次境界で読むだけ。
+        self._org_day = {}                         # per-day アキュムレータ(org_id → 集計)
+        self._org_ledger_day = -1                  # 日次境界の進行管理(org_output by_org / ledger 締め)
+        self.org_ledger_sc = None                  # 日次系列サイドカー(ledger.enabled ON 時のみ生成)
+        if self.workcfg["enabled"] and self.workcfg["ledger"]["enabled"]:
+            from ..observer.org_ledger import OrgLedger
+            self.org_ledger_sc = OrgLedger(self.out_dir)
         # 職場束ね直し(work.bind_workplace。既定 OFF=現行の work_node 付与と完全同一=バイト一致)。
         # ON 時: pool 経路の L2/L3(occupation が persona._WORK_CAT に載らず work_node を持たない個体)を
         # 台帳 workplace_poi.node へ org_id で束ね直し、接客(serve)/産出(org_output)の網羅率を上げる。
@@ -833,31 +841,9 @@ class Simulation:
             ensure_ascii=False), encoding="utf-8")
         # ビューア用の名簿(L1 には出ない静的情報)
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        (self.out_dir / "agents.json").write_text(json.dumps(
-            [{"id": a.id, "name": a.name, "age": a.age, "gender": a.gender,
-              "occupation": a.occupation, "visitor": a.visitor,
-              "commute": a.commute, "arrival_min": a.arrival_min,
-              "residence_line": a.residence_line,
-              "has_bicycle": a.has_bicycle,
-              "has_car": a.has_car, "home": a.home_node,
-              "home_building": a.home_building, "home_floor": a.home_floor,
-              "work_name": a.work_name, "work_building": a.work_building,
-              "bedtime_min": a.bedtime_min,
-              "money": round(a.money, 1), "wage": round(a.wage, 1),
-              "part_time": bool(a.part_time),
-              "part_time_name": (a.part_time["name"] if a.part_time else None),
-              **({"sdt": a.drive_mods} if a.drive_mods else {}),
-              **({"input_res": a.input_res["level"]}
-                 if getattr(a, "input_res", None) else {}),
-              **({"ontology_group": a.ontology_group}
-                 if getattr(a, "ontology_group", None) else {}),
-              **({"ontology_axes": a.ontology_axes}
-                 if getattr(a, "ontology_axes", None) else {}),
-              # 第50バッチ T6: 信用内訳レンズの org 相関用(org 配属時のみ=非配属ランはバイト同一)
-              **({"org_id": a.org_id, "org_role": getattr(a, "org_role", "")}
-                 if getattr(a, "org_id", None) else {})}
-             for a in self.agents],
-            ensure_ascii=False), encoding="utf-8")
+        (self.out_dir / "agents.json").write_text(
+            json.dumps(self._agents_json_records(), ensure_ascii=False),
+            encoding="utf-8")
         # 第50バッチ: 観測レンズの kind_map サイドカー(lens ON 時のみ書く=OFF は後方互換でバイト同一)。
         # ビューアが runs/<name>/lens_map.json 経由で写像を読む(sim⇄viz 疎結合。軸語は observer/lens.py に閉じる)。
         lens_mod.write_sidecar(self, self.out_dir)
@@ -1247,6 +1233,8 @@ class Simulation:
             self.logger._resumed = True
             if self.indoor_tracks is not None:    # B3: tracks サイドカーも分割実行の canonical を保つ
                 self.indoor_tracks._resumed = True
+            if self.org_ledger_sc is not None:    # B4: org_ledger サイドカーも分割実行の canonical を保つ
+                self.org_ledger_sc._resumed = True
         if every > 0:
             save_config(self.cfg, self.out_dir)   # 途中再開に備え config を先出しする
         for step in range(start, int(self.cfg.run.n_steps)):
@@ -1260,18 +1248,65 @@ class Simulation:
                 self.logger.flush_segment()
                 if self.indoor_tracks is not None:  # B3: tracks サイドカーも対でセグメント化
                     self.indoor_tracks.flush_segment()
+                if self.org_ledger_sc is not None:  # B4: org_ledger サイドカーも対でセグメント化
+                    self.org_ledger_sc.flush_segment()
                 did_flush = True
             if flush_every > 0 and not did_flush \
                     and (step + 1) % flush_every == 0:
                 self.logger.flush_segment()        # checkpoint と独立の定期 flush
                 if self.indoor_tracks is not None:
                     self.indoor_tracks.flush_segment()
+                if self.org_ledger_sc is not None:
+                    self.org_ledger_sc.flush_segment()
         return self.finalize()
 
+    def _agents_json_records(self) -> list:
+        """ビューア用名簿(agents.json)のレコード列。org_id/org_role は配属時のみ(非配属ランはバイト同一)。
+
+        __init__ の初期出力と finalize の再出力で共有(重複回避)。org 配属は run 中の遅延初期化
+        (_ensure_orgs)で付くため、__init__ 時点では org_id が未付与=キー不在。会社観測データ層 B4
+        (indoor_fields/ledger)ON のランのみ finalize が本レコードで agents.json を再出力し org_id/
+        org_role を載せる(B7 会社 UI の org 相関材料)。OFF は再出力しない=既存 agents.json とバイト一致。"""
+        return [{"id": a.id, "name": a.name, "age": a.age, "gender": a.gender,
+                 "occupation": a.occupation, "visitor": a.visitor,
+                 "commute": a.commute, "arrival_min": a.arrival_min,
+                 "residence_line": a.residence_line,
+                 "has_bicycle": a.has_bicycle,
+                 "has_car": a.has_car, "home": a.home_node,
+                 "home_building": a.home_building, "home_floor": a.home_floor,
+                 "work_name": a.work_name, "work_building": a.work_building,
+                 "bedtime_min": a.bedtime_min,
+                 "money": round(a.money, 1), "wage": round(a.wage, 1),
+                 "part_time": bool(a.part_time),
+                 "part_time_name": (a.part_time["name"] if a.part_time else None),
+                 **({"sdt": a.drive_mods} if a.drive_mods else {}),
+                 **({"input_res": a.input_res["level"]}
+                    if getattr(a, "input_res", None) else {}),
+                 **({"ontology_group": a.ontology_group}
+                    if getattr(a, "ontology_group", None) else {}),
+                 **({"ontology_axes": a.ontology_axes}
+                    if getattr(a, "ontology_axes", None) else {}),
+                 # 第50バッチ T6: 信用内訳レンズの org 相関用(org 配属時のみ=非配属ランはバイト同一)
+                 **({"org_id": a.org_id, "org_role": getattr(a, "org_role", "")}
+                    if getattr(a, "org_id", None) else {})}
+                for a in self.agents]
+
     def finalize(self) -> dict:
-        paths = self.logger.flush()
+        scheduler.finalize_org_day(self)          # B4: 最終日の org_output(by_org)/ledger 行を締める
+        paths = self.logger.flush()               # ↑ logger.flush の前=最終日 org_output も L1 に載る
         if self.indoor_tracks is not None:        # B3: 屋内軌跡サイドカーを結合(part→canonical)
             self.indoor_tracks.finalize()
+        if self.org_ledger_sc is not None:        # B4: 組織日次系列サイドカーを結合(part→canonical)
+            self.org_ledger_sc.finalize()
+        # B4 item#4: 会社観測(indoor_fields/ledger)ON かつ org 配属があるランは agents.json を再出力し
+        # org_id/org_role を載せる(org 配属は run 中の遅延初期化=__init__ 時点では未付与のため)。
+        # OFF は再出力しない=既存 agents.json とバイト一致(ゴールデン非該当)。
+        wc = self.workcfg
+        if (wc["enabled"] and (wc["indoor_fields"] or wc["ledger"]["enabled"])
+                and any(getattr(a, "org_id", None) for a in self.agents)):
+            (self.out_dir / "agents.json").write_text(
+                json.dumps(self._agents_json_records(), ensure_ascii=False),
+                encoding="utf-8")
         save_config(self.cfg, self.out_dir)
         kinds = self.logger.total_event_kinds()
         summary = {

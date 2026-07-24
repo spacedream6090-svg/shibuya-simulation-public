@@ -402,10 +402,18 @@ def _log_org_output(sim, agent, step: int, sim_min: int) -> None:
                                                      "revenue_est": 0.0,
                                                      "wage_paid": 0.0})
     led["production_count"] += 1
+    d_rev = d_wage = 0.0
     if _economy_on(sim):
         wage = float(sim.economy["wages"].get(str(org.get("wage_tier", "")), 0.0))
-        led["revenue_est"] += wage * float(sim.orgscfg["revenue_margin"])
-        led["wage_paid"] += wage
+        d_rev = wage * float(sim.orgscfg["revenue_margin"])
+        d_wage = wage
+        led["revenue_est"] += d_rev
+        led["wage_paid"] += d_wage
+    if _org_ledger_on(sim):    # 会社観測データ層 B4: 日次アキュムレータへ同じ会計を積む(サイドカー用)
+        ent = _org_day_entry(sim, org["id"])
+        ent["production"] += 1
+        ent["revenue_est"] += d_rev
+        ent["wage_paid"] += d_wage
     b2b_mod.on_production(sim, org, step, sim_min)    # B2B ⑤: 卸/製造 org は生産で在庫が増える(既定OFF=no-op)
 
 
@@ -1462,6 +1470,165 @@ def _work_service_on(sim) -> bool:
     return bool(cfg and cfg["enabled"])
 
 
+# ---------------------------------------------------------------- 会社観測データ層 B4(既定 OFF)
+# work.service 傘下の会社ごと観測。すべて work.service.enabled が前提(データ源の統合スイッチ)。
+#  - indoor_fields: serve に org_id/floor を付ける(スタッフ経由が主・unstaffed は node→org 一意時のみ)。
+#  - office.by_org: org_output を org_id 単位に分解(同居複数社)+ indoor ON でミクロ在席分へ。
+#  - ledger.enabled: runs/<run>/org_ledger.parquet(日次1行/社)を書く。動力学は per-day アキュムレータ
+#    (sim._org_day)へ積み、observer(OrgLedger)が日次境界で読むだけ=記録と動力学の分離を維持。
+def _org_ledger_on(sim) -> bool:
+    cfg = getattr(sim, "workcfg", None)
+    return bool(cfg and cfg["enabled"] and cfg["ledger"]["enabled"])
+
+
+def _org_byorg_on(sim) -> bool:
+    cfg = getattr(sim, "workcfg", None)
+    return bool(cfg and cfg["enabled"] and cfg["office"]["by_org"])
+
+
+def _org_daily_on(sim) -> bool:
+    """日次アキュムレータ/締めが要るか(org_output by_org か ledger のいずれか)。"""
+    return _org_ledger_on(sim) or _org_byorg_on(sim)
+
+
+def _org_indoor_fields_on(sim) -> bool:
+    cfg = getattr(sim, "workcfg", None)
+    return bool(cfg and cfg["enabled"] and cfg["indoor_fields"])
+
+
+def _org_day_entry(sim, org_id) -> dict:
+    """per-day アキュムレータの 1 社エントリ(無ければ 0 初期化)。workers は在席頭数(headcount 用)の集合。"""
+    acc = getattr(sim, "_org_day", None)
+    if acc is None:
+        acc = {}
+        sim._org_day = acc
+    return acc.setdefault(str(org_id), {
+        "production": 0, "revenue_est": 0.0, "wage_paid": 0.0,
+        "serve_count": 0, "attendance_min": 0, "workers": set()})
+
+
+def _org_node_org_ids(sim) -> dict:
+    """work_node → その node を勤務地とする org_id の集合(present 個体由来・決定論)。
+
+    unstaffed serve の node→org 解決に使う(集合が一意=1社のときだけ org_id を付与し、多義ノードは
+    null=unknown を正直開示=推測しない)。pool ローテーションで在場が変わっても毎回再構成で整合。"""
+    m: dict[str, set] = {}
+    for a in sim.agents:
+        oid = getattr(a, "org_id", None)
+        wn = getattr(a, "work_node", "")
+        if oid and wn:
+            m.setdefault(wn, set()).add(str(oid))
+    return m
+
+
+def _org_worker_present_office(sim, a, sim_min: int, cal, ocfg) -> bool:
+    """agent a がこの step、自社(office 系)work_node に出勤中か(在席頭数/ミクロ在席分の母集団)。"""
+    oid = getattr(a, "org_id", None)
+    wn = getattr(a, "work_node", "")
+    if not oid or not wn or a.node != wn:
+        return False
+    if getattr(a, "work_start_min", -1) < 0:
+        return False
+    if not routine.in_work_window(a, sim_min, cal):
+        return False
+    return work_mod.is_office_node(sim.city, wn, ocfg)
+
+
+def _phase_org_accumulate(sim, step: int, sim_min: int) -> None:
+    """この step の office 系出勤者を per-day アキュムレータへ積む(在席頭数 workers・ミクロ在席分
+    attendance_min)。attendance は indoor.enabled かつ ind_space_type が職務区画(attendance_zones)の
+    step だけ +STEP_MINUTES 分。_phase_indoor(区画確定)の後に呼ぶ。既定 OFF=即 return=バイト一致。"""
+    if not _org_daily_on(sim):
+        return
+    ocfg = sim.workcfg["office"]
+    cal = getattr(sim, "calendarcfg", None)
+    ind_on = _indoor_on(sim)
+    zones = set(ocfg["attendance_zones"])
+    for a in sim.agents:
+        if not _org_worker_present_office(sim, a, sim_min, cal, ocfg):
+            continue
+        ent = _org_day_entry(sim, a.org_id)
+        ent["workers"].add(int(a.id))
+        if ind_on and str(getattr(a, "ind_space_type", "")) in zones:
+            ent["attendance_min"] += STEP_MINUTES
+
+
+def _emit_org_day(sim, step: int, sim_min: int, day: int) -> list:
+    """per-day アキュムレータ(sim._org_day)を締める。(a) by_org ON なら org_output を org_id 単位で
+    L1 へ 1 社 1 件(indoor ON はミクロ在席分 attendance_min・OFF は在席頭数×role重み。basis で自己記述)。
+    (b) ledger ON なら 1 社 1 行のサイドカー行(全列 0 の社は書かない)を返す。org_id 昇順=決定論。"""
+    acc = getattr(sim, "_org_day", None) or {}
+    rows: list = []
+    byorg = _org_byorg_on(sim)
+    ledger = _org_ledger_on(sim)
+    ind_on = _indoor_on(sim)
+    cfg = sim.workcfg
+    base_w = float(cfg["office"]["base_weight"])
+    for oid in sorted(acc):
+        ent = acc[oid]
+        workers = ent["workers"]
+        att = int(ent["attendance_min"])
+        if byorg and workers:                      # (a) org_output(在席のあった office 社のみ)
+            if ind_on:
+                out, basis = float(att), "attendance_min"
+            else:
+                out = round(sum(
+                    (work_mod.role_weight(sim.agent_by_id.get(w), cfg)
+                     if sim.agent_by_id.get(w) is not None else base_w)
+                    for w in sorted(workers)), 3)
+                basis = "headcount"
+            sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
+                                 kind="org_output", x=0.0, y=0.0,
+                                 payload={"org": str(oid), "output": out,
+                                          "n": len(workers), "kind": "office",
+                                          "basis": basis, "day": int(day)}))
+        if ledger:                                 # (b) ledger 行(いずれかの列が非0の社のみ)
+            prod = int(ent["production"])
+            rev = float(ent["revenue_est"])
+            wage = float(ent["wage_paid"])
+            serve = int(ent["serve_count"])
+            if prod or rev or wage or serve or att:
+                rows.append((int(day), str(oid), prod, round(rev, 6),
+                             round(wage, 6), serve, att))
+    return rows
+
+
+def _phase_org_ledger_roll(sim, step: int, sim_min: int) -> None:
+    """日次境界: 前日の per-day アキュムレータを締めて org_output(by_org)/ledger 行を出し、リセットする。
+
+    早期(当日の出勤・産出・接客の集計より前)に置く=当日分は新しい日へ正しく積まれる(オフバイワン回避)。
+    最終日は finalize_org_day が締める。既定 OFF=即 return=バイト一致。"""
+    if not _org_daily_on(sim):
+        return
+    day = sim_min // 1440
+    prev = getattr(sim, "_org_ledger_day", -1)
+    if prev >= 0 and day != prev:
+        rows = _emit_org_day(sim, step, sim_min, prev)
+        sc = getattr(sim, "org_ledger_sc", None)
+        if sc is not None and rows:
+            sc.add_rows(rows)
+        sim._org_day = {}
+    sim._org_ledger_day = day
+
+
+def finalize_org_day(sim) -> None:
+    """run 終了時: 最終日の per-day アキュムレータを締める(simulation.finalize が logger.flush の前に呼ぶ)。
+
+    最終日の org_output(by_org)は末 step の (step, sim_min) で記録=straight/split で同一。既定 OFF=no-op。"""
+    if not _org_daily_on(sim):
+        return
+    day = getattr(sim, "_org_ledger_day", -1)
+    if day < 0:
+        return
+    step = max(0, int(sim.cfg.run.n_steps) - 1)
+    sim_min = sim.clock.sim_min(step)
+    rows = _emit_org_day(sim, step, sim_min, day)
+    sc = getattr(sim, "org_ledger_sc", None)
+    if sc is not None and rows:
+        sc.add_rows(rows)
+    sim._org_day = {}
+
+
 def _work_office_output(sim, step: int, sim_min: int, cfg: dict) -> None:
     """日次境界: オフィス系職場に在場・在職の出勤者を職場単位で束ね、出勤者数×role重みを
     org_output として1件記録(会社が『何かを作っている』の最小観測形)。決定論・乱数なし・非LLM。
@@ -1502,7 +1669,8 @@ def _phase_work_service(sim, step: int, sim_min: int, since_idx: int) -> None:
     cfg = getattr(sim, "workcfg", None)
     if not (cfg and cfg["enabled"]):
         return
-    _work_office_output(sim, step, sim_min, cfg)   # 日次境界: オフィス系の産出
+    if not _org_byorg_on(sim):                     # by_org ON 時は org_id 分解を日次境界(_phase_org_ledger_roll)へ委譲
+        _work_office_output(sim, step, sim_min, cfg)   # 日次境界: オフィス系の産出(node/building キー)
     if since_idx < 0:                              # この step の増分イベントが無ければ接客帰属なし
         return
     # 勤務中スタッフを work_node で索引(在場=node==work_node かつ 勤務時間帯)。id 昇順で決定論。
@@ -1520,6 +1688,11 @@ def _phase_work_service(sim, step: int, sim_min: int, since_idx: int) -> None:
     max_serve = cfg["max_serve_per_event"]
     # ダイジェスト供給は interstitial の消費者があるときだけ(OFF なら業務アキュムレータを作らない)
     to_digest = cfg["digest"] and _interstitial_on(sim)
+    # 会社観測データ層 B4(既定 OFF=以下の org_id/floor/serve_count は付かない=serve payload バイト不変)。
+    fields_on = _org_indoor_fields_on(sim)         # serve に org_id/floor を付けるか
+    ledger_on = _org_ledger_on(sim)                # serve_count を per-day アキュムレータへ積むか
+    floor_gate = fields_on and _indoor_on(sim)     # (建物,階)絞り込み(客とスタッフの floor 一致要求)
+    node_orgs = _org_node_org_ids(sim) if (fields_on or ledger_on) else {}
     for e in sim.logger.events[since_idx:]:         # スライスはコピー=帰属 serve の追記中も安全
         if e.kind != "spend":
             continue
@@ -1532,20 +1705,39 @@ def _phase_work_service(sim, step: int, sim_min: int, since_idx: int) -> None:
             continue
         node = customer.node
         staff = [s for s in staff_by_node.get(node, []) if s.id != e.agent_id]
+        if floor_gate:                             # indoor ON+本トグル ON: 同一(建物,階)のスタッフだけ応対
+            cb, cf = getattr(customer, "building", ""), int(getattr(customer, "floor", 0) or 0)
+            staff = [s for s in staff
+                     if getattr(s, "building", "") == cb
+                     and int(getattr(s, "floor", 0) or 0) == cf]
         if staff:
             for s in staff[:max_serve]:
+                payload = {"cat": str(cat), "label": label,
+                           "customer": int(e.agent_id), "node": node}
+                s_oid = getattr(s, "org_id", None) or None
+                if fields_on:                      # スタッフ経由=帰属スタッフの org_id が主経路
+                    payload["org_id"] = s_oid
+                    payload["floor"] = int(getattr(s, "floor", 0) or 0)
                 sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=s.id,
-                                     kind="serve", x=s.x, y=s.y,
-                                     payload={"cat": str(cat), "label": label,
-                                              "customer": int(e.agent_id),
-                                              "node": node}))
+                                     kind="serve", x=s.x, y=s.y, payload=payload))
                 if to_digest:
                     work_mod.note_serve(s, label)
+                if ledger_on and s_oid:            # serve_count は付与した org_id に一致(検算整合)
+                    _org_day_entry(sim, s_oid)["serve_count"] += 1
         elif cfg["record_unstaffed"]:              # 不在=記録のみ(挙動変更なし)
+            payload = {"cat": str(cat), "node": node, "unstaffed": True}
+            u_oid = None
+            if fields_on or ledger_on:             # unstaffed は node→org が一意のときだけ解決(多義=null)
+                ids = sorted(node_orgs.get(node, ()))
+                u_oid = ids[0] if len(ids) == 1 else None
+            if fields_on:
+                payload["org_id"] = u_oid          # 一意なら org_id・多義/不在は null=unknown を正直開示
+                payload["floor"] = int(getattr(customer, "floor", 0) or 0)
             sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
                                  kind="serve", x=customer.x, y=customer.y,
-                                 payload={"cat": str(cat), "node": node,
-                                          "unstaffed": True}))
+                                 payload=payload))
+            if ledger_on and u_oid:
+                _org_day_entry(sim, u_oid)["serve_count"] += 1
 
 
 # ---------------------------------------------------------------- LLM 発話
@@ -4131,6 +4323,8 @@ def run_step(sim, step: int) -> None:
     # L2 業務の実体(work.service。既定OFF=-1でこの step の接客帰属を完全スキップ=バイト一致)。
     _work_idx = len(sim.logger.events) if _work_service_on(sim) else -1
     _ensure_orgs(sim)                              # 組織台帳の遅延初期化(既定OFF=no-op)
+    _phase_org_ledger_roll(sim, step, sim_min)     # 会社観測データ層 B4: 日次境界に前日の org_output/ledger を締める(既定OFF=no-op)。
+                                                   # 当日の産出/接客/在席より前に置く=当日分は新しい日へ積む(オフバイワン回避)
     for agent in sim.agents:
         agent.now_step = step                      # remember() の時刻付け
     _phase_inner_life(sim, step, sim_min)          # 起動後1回: 長期目標・趣味の付与(既定OFF=no-op。H6)
@@ -4199,6 +4393,7 @@ def run_step(sim, step: int) -> None:
     _phase_crowd(sim, step, sim_min)               # 群集(大規模行事型)の集中を観測(既定OFF=no-op)
     infoenv_mod.phase(sim, step, sim_min)          # 情報環境: バイラル加重・誤情報/炎上(既定OFF=no-op。Wave G6)
     _phase_work_service(sim, step, sim_min, _work_idx)  # L2業務: 接客serve/オフィスorg_output(既定OFF=no-op)
+    _phase_org_accumulate(sim, step, sim_min)      # 会社観測データ層 B4: 当日の office 在席頭数/ミクロ在席分を積む(既定OFF=no-op)
 
     _bl = (sim.cfg.get("engine", {}) or {}).get("batch_llm", {}) or {}
     if bool(_bl.get("enabled", False)):

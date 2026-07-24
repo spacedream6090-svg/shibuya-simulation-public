@@ -174,15 +174,23 @@ def test_old_run_html_byte_identical_end_to_end(tmp_path):
 
 
 def test_templates_indoor_tokens_are_empty_safe():
-    """__INDOOR_* を空へ潰すと HEAD テンプレートに一致(注入点が empty-safe)+ _FLOOR_JS 無改変。"""
-    if HEAD is None:
-        pytest.skip("git 不在(HEAD 版を取れない)")
-    for cur, head in ((mv.MAP_HTML, HEAD.MAP_HTML), (mv.DASH_HTML, HEAD.DASH_HTML)):
-        stripped = (cur.replace("__INDOOR_JS__", "")
-                       .replace("__INDOOR_HOOK__", "")
-                       .replace("__INDOOR_CLICK__", ""))
-        assert stripped == head
-    assert mv._FLOOR_JS == HEAD._FLOOR_JS, "_FLOOR_JS を改変している(バイト同一が崩れる)"
+    """屋内トークンが既知3種のみ+注入点が現存=空文字置換で旧ラン出力が退行しない。
+
+    初版は「トークンを空へ潰すと HEAD テンプレートに一致」だったが、トークン自体が
+    コミット(32971a0)で HEAD 側にも入り自己参照化(以後恒久的に不一致)したため、
+    git 非依存の自己完結不変量へ補修: ①テンプレート中の __INDOOR_* トークンは既知
+    3種以外に存在しない(main() の空置換の網羅性)②既知トークンの注入点が失われて
+    いない。旧ランのバイト同一そのものは end-to-end テストが直接担保する。"""
+    import re as _re
+    known = ("__INDOOR_JS__", "__INDOOR_HOOK__", "__INDOOR_CLICK__")
+    found = set()
+    for tpl in (mv.MAP_HTML, mv.DASH_HTML):
+        for tok in _re.findall(r"__INDOOR_[A-Z_]+__", tpl):
+            assert tok in known, f"未知の屋内トークン {tok}(空置換から漏れる)"
+            found.add(tok)
+    assert found == set(known), f"注入点の喪失: {set(known) - found}"
+    if HEAD is not None:
+        assert mv._FLOOR_JS == HEAD._FLOOR_JS, "_FLOOR_JS を改変している(バイト同一が崩れる)"
 
 
 def test_old_run_build_data_no_indoor_keys(tmp_path):

@@ -198,8 +198,8 @@ register_event_kind("presence_change", "日次ローテーションの在場入�
 register_event_kind("pov_image", "顕著時のPOV画像を撮影・保存(サイドカー画像への参照キー){ref, w, h, trigger, vlm?}")
 # ---- L2 業務の実体(work.service ON のみ・既定 OFF=0件。決定論・LLM/乱数ゼロ。
 #      設計: docs/research/l2-work-reality.md)----
-register_event_kind("serve",      "接客業務の帰属(客の消費と同一 work_node の勤務中スタッフに応対を帰属。不在時は agent_id=-1 の記録){cat, label, customer, node, unstaffed?}")
-register_event_kind("org_output", "オフィス系職場の日次産出集計(出勤者数×role重み。会社が『何かを作っている』の最小観測形){org, output, n, kind}")
+register_event_kind("serve",      "接客業務の帰属(客の消費と同一 work_node の勤務中スタッフに応対を帰属。不在時は agent_id=-1 の記録){cat, label, customer, node, unstaffed?, org_id?, floor?}")
+register_event_kind("org_output", "オフィス系職場の日次産出集計(頭数×role重み or ミクロ在席分。会社が『何かを作っている』の最小観測形){org, output, n, kind, basis?, day?}")
 # ---- 職場束ね直し(work.bind_workplace ON のみ・既定 OFF=0件。起動時1回・世界イベント agent_id=-1。
 #      pool 経路の L2/L3 を台帳 workplace_poi へ org_id 束ね=serve/org_output の網羅率を上げる)----
 register_event_kind("workplace_bound", "起動時の職場束ね直しの coverage 統計(day0 present の pool 個体){n_total, n_unbound_before, n_bound, n_unbound_after}")

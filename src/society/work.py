@@ -54,6 +54,7 @@ def build_cfg(raw: dict | None) -> dict:
     serve = dict(serve) if serve else dict(DEFAULT_SERVE_BY_CAT)
     off = dict(svc.get("office", {}) or {})
     bind = dict(raw.get("bind_workplace", {}) or {})
+    ledger = dict(svc.get("ledger", {}) or {})
     return {
         "enabled": bool(svc.get("enabled", False)),
         # 客の消費カテゴリ → 接客ラベル(業務名テキストは config 由来)。
@@ -64,6 +65,10 @@ def build_cfg(raw: dict | None) -> dict:
         "record_unstaffed": bool(svc.get("record_unstaffed", True)),
         # interstitial(S2)ダイジェストへ業務要約を1行供給するか(ON 時のみ効く)。
         "digest": bool(svc.get("digest", True)),
+        # 会社観測データ層 B4(既定 OFF=バイト一致)。ON 時のみ serve に org_id/floor を付ける。
+        # 解決順: スタッフ経由(帰属スタッフの org_id)→ unstaffed は node→org が一意のときのみ →
+        # 多義ノード null(推測せず unknown を正直開示)。(建物,階)絞り込みは indoor.enabled かつ本 ON 時のみ。
+        "indoor_fields": bool(svc.get("indoor_fields", False)),
         "office": {
             "enabled": bool(off.get("enabled", True)),
             # オフィス系職場と見なす職場 POI カテゴリ(既定 office)。
@@ -72,6 +77,18 @@ def build_cfg(raw: dict | None) -> dict:
             # occupation/role → 産出重み(空=全員 base_weight=出勤者数に比例)。
             "role_weights": {str(k): float(v)
                              for k, v in (off.get("role_weights") or {}).items()},
+            # 会社観測データ層 B4(既定 OFF=バイト一致)。ON 時: org_output を org_id 単位で記録
+            # (同居複数社の分解)。indoor.enabled のとき値は「頭数×重み」でなくミクロ在席分
+            # (attendance_zones の職務区画に居た step 数×10分)。basis フィールドで式を自己記述。
+            "by_org": bool(off.get("by_org", False)),
+            # ミクロ在席分の対象区画型(desk 等の職務区画。break/rest は在席に数えない)。
+            "attendance_zones": [str(z) for z in
+                                 (off.get("attendance_zones") or ["desk", "meeting"])],
+        },
+        # 会社観測データ層 B4: org_ledger サイドカー(runs/<run>/org_ledger.parquet)を書くか
+        # (既定 OFF=バイト一致・ファイル不在)。日次1行/社(活動があった社のみ)。
+        "ledger": {
+            "enabled": bool(ledger.get("enabled", False)),
         },
         # 職場束ね直し(bind_workplace。既定 OFF=現行の work_node 付与と完全同一=バイト一致)。
         "bind_workplace": {

@@ -397,6 +397,235 @@ def build_indoor_data(events: list, idx: dict, bld_idx: dict, run_dir: Path,
     return data
 
 
+# ============================================================ 会社(組織)エンティティ B7
+# org 系データ(agents.json の org_id / serve.org_id / org_ledger.parquet)がある時「だけ」会社の
+# 名簿・日次系列を埋め込む。無い旧ランは None=out 不変=ビューア再生成でバイト同一(indoor/lens と同型)。
+# 名称・業種・職場は「架空の合成台帳」(organizations.book, R17: 実在企業名を出さない)から引く。
+ORG_LIST_CAP = 300          # D.orgs.list に載せる会社の上限(従業員数の多い順・HTML 肥大ガード)
+ORG_EMP_CAP = 200           # 1社の従業員名簿の上限(超過は n_emp に真値・名簿は先頭 cap)
+
+
+def _ev_day(e: dict) -> int:
+    """イベントの day(org_ledger の day=sim_min//1440 と同義。sim_min 無い旧ランは step//144)。"""
+    sm = e.get("sim_min")
+    if sm is not None and sm >= 0:
+        return int(sm) // 1440
+    return int(e["step"]) // (1440 // STEP_MINUTES)
+
+
+def _load_org_book(cfg: dict) -> dict:
+    """config.organizations.book(架空の合成台帳)を id→org で読む。無ければ {}(名称は org_id 代替)。"""
+    try:
+        book_path = (cfg.get("organizations", {}) or {}).get("book")
+    except Exception:
+        book_path = None
+    p = Path(book_path or "data/organizations_shibuya.json")
+    if not p.is_absolute():
+        p = REPO_ROOT / p
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    book: dict = {}
+    for org in list(data.get("companies", [])) + list(data.get("schools", [])):
+        book[str(org["id"])] = org
+    return book
+
+
+def build_org_data(events: list, agents_meta: list, cfg: dict,
+                   run_dir: Path) -> dict | None:
+    """会社エンティティの埋め込み(org 系データがある時だけ非 None)。
+
+    トリガ(いずれか): ①agents.json に org_id ②serve イベントに org_id ③org_ledger.parquet。
+    従業員は agents.json の org_id で束ねる。日次系列は org_ledger.parquet があればそれ(production/
+    revenue_est/wage_paid/serve_count/attendance_min)、無ければ L1(production/serve を org_id で
+    groupby)から再構成できる範囲。B4(org データ層)未完でも agents.json+L1 経路で動く。"""
+    agent_org: dict = {}                       # global agent id → org_id(agents.json 由来)
+    for a in agents_meta:
+        oid = a.get("org_id")
+        if oid:
+            agent_org[a["id"]] = str(oid)
+    ledger_path = run_dir / "org_ledger.parquet"
+    has_ledger = ledger_path.exists()
+
+    # --- L1 再構成: production(payload.org=台帳 id)/ serve(payload.org_id or staff→org 束ね)---
+    serve_has_org = False
+    prod_by: dict = defaultdict(int)           # (org_id, day) → production 件数
+    serve_by: dict = defaultdict(int)          # (org_id, day) → serve 件数
+    org_ids: set = set(agent_org.values())
+    for e in events:
+        kind = e["kind"]
+        if kind not in ("production", "serve"):
+            continue
+        p = json.loads(e["payload"]) if e["payload"] else {}
+        day = _ev_day(e)
+        if kind == "production":
+            oid = p.get("org")
+            if oid is not None:
+                oid = str(oid)
+                org_ids.add(oid)
+                prod_by[(oid, day)] += 1
+        else:                                  # serve
+            oid = p.get("org_id")
+            if oid is not None:
+                serve_has_org = True
+                oid = str(oid)
+            else:
+                oid = agent_org.get(e["agent_id"])   # B4 の serve.org_id 未実装時の束ね
+            if oid is not None:
+                oid = str(oid)
+                org_ids.add(oid)
+                serve_by[(oid, day)] += 1
+
+    if not (agent_org or serve_has_org or has_ledger):
+        return None                            # org 系データ皆無=旧ラン=埋め込みなし(バイト同一)
+
+    # --- org_ledger.parquet(あれば最優先。B4 サイドカー契約の列)---
+    led_series: dict = {}                      # org_id → {metric: {day: val}}
+    days_set: set = set()
+    if has_ledger:
+        try:
+            lrows = pq.read_table(ledger_path).to_pylist()
+        except Exception:
+            lrows = []
+        for r in lrows:
+            oid = str(r.get("org_id"))
+            if oid in ("", "None"):
+                continue
+            day = int(r.get("day", 0))
+            org_ids.add(oid)
+            days_set.add(day)
+            d = led_series.setdefault(oid, {})
+            for m in ("production", "revenue_est", "wage_paid",
+                      "serve_count", "attendance_min"):
+                if m in r and r[m] is not None:
+                    d.setdefault(m, {})[day] = r[m]
+    else:
+        for (_oid, day) in list(prod_by) + list(serve_by):
+            days_set.add(day)
+
+    days = sorted(days_set)
+    book = _load_org_book(cfg)
+
+    # 従業員名簿と役職集計(agents.json org_id / org_role 由来)
+    emp_by_org: dict = defaultdict(list)
+    roles_by_org: dict = defaultdict(lambda: defaultdict(int))
+    for a in agents_meta:
+        oid = a.get("org_id")
+        if not oid:
+            continue
+        oid = str(oid)
+        emp_by_org[oid].append(a["id"])
+        role = a.get("org_role") or ""
+        if role:
+            roles_by_org[oid][role] += 1
+
+    def _series_for(oid: str) -> dict:
+        s: dict = {}
+        if has_ledger and oid in led_series:
+            lv = led_series[oid]
+            s["production"] = [float(lv.get("production", {}).get(d, 0)) for d in days]
+            s["serve"] = [float(lv.get("serve_count", {}).get(d, 0)) for d in days]
+            for m in ("revenue_est", "wage_paid", "attendance_min"):
+                if m in lv:
+                    s[m] = [float(lv[m].get(d, 0)) for d in days]
+        else:
+            s["production"] = [prod_by.get((oid, d), 0) for d in days]
+            s["serve"] = [serve_by.get((oid, d), 0) for d in days]
+        return s
+
+    # 会社リスト(従業員数の多い順・上限 ORG_LIST_CAP)
+    ranked = sorted(org_ids, key=lambda o: (-len(emp_by_org.get(o, [])), o))
+    listed = ranked[:ORG_LIST_CAP]
+    lst, series = [], {}
+    for oid in listed:
+        org = book.get(oid, {})
+        wp = org.get("workplace_poi", {}) or {}
+        emps = emp_by_org.get(oid, [])
+        ser = _series_for(oid)
+        rec = {
+            "id": oid,
+            "name": str(org.get("name") or oid),
+            "cat": str(org.get("industry") or org.get("school_type") or ""),
+            "ikey": str(org.get("industry_key") or ""),
+            "building": wp.get("building"), "node": wp.get("node"),
+            "floor": wp.get("floor"),
+            "x": wp.get("x"), "y": wp.get("y"),
+            "n_emp": len(emps),
+            "employees": emps[:ORG_EMP_CAP],
+            "roles": dict(roles_by_org.get(oid, {})),
+            "prod": int(round(sum(ser["production"]))),
+            "serve": int(round(sum(ser["serve"]))),
+        }
+        lst.append(rec)
+        series[oid] = ser
+    return {"source": "ledger" if has_ledger else "l1",
+            "days": days, "list": lst, "series": series,
+            "n_orgs": len(org_ids), "capped": len(org_ids) > len(listed)}
+
+
+# ============================================================ 在館観測列 B8
+# scripts/build_occupancy.py が書く occupancy.parquet(建物,階,step,n)が「有る時だけ」埋め込む。
+# 無いランは None=out 不変=バイト同一。屋内(space_move)トラッキングの有無は occupancy_meta.json。
+OCC_BLD_CAP = 16            # 在館タブに載せる建物の上限(ピーク在館数の多い順・HTML 肥大ガード)
+
+
+def load_occupancy(run_dir: Path, buildings: list, n_steps: int,
+                   has_indoor_floor: bool) -> dict | None:
+    """occupancy.parquet(scripts/build_occupancy.py の事後出力)を在館タブ用に読む。無ければ None。"""
+    occ_path = run_dir / "occupancy.parquet"
+    if not occ_path.exists():
+        return None
+    try:
+        rows = pq.read_table(occ_path).to_pylist()
+    except Exception:
+        return None
+    meta_path = run_dir / "occupancy_meta.json"
+    indoor = has_indoor_floor
+    if meta_path.exists():
+        try:
+            indoor = bool(json.loads(meta_path.read_text(encoding="utf-8")).get("indoor", indoor))
+        except Exception:
+            pass
+    name_of = {b["id"]: (b.get("name") or "") for b in buildings}
+    # 建物別: step→総在館数(全階合算) と 階別 step→在館数
+    bld_tot: dict = defaultdict(lambda: defaultdict(int))     # bld → {step: n}
+    bld_flr: dict = defaultdict(lambda: defaultdict(dict))    # bld → {floor: {step: n}}
+    peak: dict = defaultdict(lambda: (0, 0))                  # bld → (n, step)
+    for r in rows:
+        b = r["building"]
+        st = int(r["step"])
+        n = int(r["n"])
+        fl = int(r.get("floor", 0))
+        bld_tot[b][st] += n
+        bld_flr[b][fl][st] = bld_flr[b][fl].get(st, 0) + n
+    for b, byst in bld_tot.items():
+        for st, n in byst.items():
+            if n > peak[b][0]:
+                peak[b] = (n, st)
+    # ピーク在館数の多い順に上限 OCC_BLD_CAP 棟
+    order = sorted(bld_tot, key=lambda b: (-peak[b][0], str(b)))
+    top = order[:OCC_BLD_CAP]
+    out_blds = []
+    for b in top:
+        ser = [bld_tot[b].get(s, 0) for s in range(n_steps)]
+        floors = {}
+        if indoor:
+            for fl, byst in sorted(bld_flr[b].items()):
+                floors[str(fl)] = [byst.get(s, 0) for s in range(n_steps)]
+        out_blds.append({"id": b, "name": name_of.get(b, "") or str(b),
+                         "series": ser, "floors": floors,
+                         "peak": peak[b][0], "peakStep": peak[b][1]})
+    peak_tbl = [{"id": b, "name": name_of.get(b, "") or str(b),
+                 "n": peak[b][0], "step": peak[b][1]}
+                for b in order[:OCC_BLD_CAP]]
+    return {"indoor": indoor, "nSteps": n_steps, "buildings": out_blds,
+            "peak": peak_tbl, "nBld": len(bld_tot),
+            "capped": len(bld_tot) > len(top)}
+
+
 def build_data(run_dir: Path, include_traffic: bool = True,
                start_min: int | None = None,
                include_moves: bool = False) -> dict:
@@ -710,6 +939,16 @@ def build_data(run_dir: Path, include_traffic: bool = True,
     ind = build_indoor_data(events, idx, bld_idx, run_dir, n_steps, cfg, include_moves)
     if ind is not None:
         out.update(ind)
+    # 会社エンティティ(B7): org 系データ(agents.json org_id / serve.org_id / org_ledger.parquet)が
+    # 有る時「だけ」会社の名簿・日次系列を埋め込む。無ければ out 不変=バイト同一(indoor/lens と同型)。
+    orgs = build_org_data(events, agents_meta, cfg, run_dir)
+    if orgs is not None:
+        out["orgs"] = orgs
+    # 在館観測列(B8): occupancy.parquet(scripts/build_occupancy.py の事後出力)が有る時「だけ」
+    # 建物別/階別の在館系列を埋め込む。無ければ out 不変=バイト同一。
+    occ = load_occupancy(run_dir, buildings, n_steps, has_indoor_floor=(ind is not None))
+    if occ is not None:
+        out["occupancy"] = occ
     return out
 
 
@@ -2592,6 +2831,168 @@ function structRender(tab, s0){ if(tab==='structure' && D.structure){ renderStru
 """
 
 
+# 第58バッチ B7 会社タブ(orgs データが有る時だけ main() が dashboard に __LENS_JS__ 経由で注入)。
+# 無ければ空文字→ DASH_HTML はバイト同一。orgRender は tab==='org' で自己ガード。名称・業種・職場は
+# 架空の合成台帳(organizations.book, R17)由来=実在企業名は出さない。従業員クリックで個人情報へ。
+_ORG_JS = r"""
+const ORG_PAL=['#60a5fa','#f472b6','#6ee7b7','#ffd166','#a78bfa','#fb923c','#4ade80','#38bdf8','#fb7185','#34d399'];
+let orgSel=null, orgQuery='', orgSort='emp', orgPersonSel=null;
+function _orgUpto(arr, day){ if(!arr) return 0; let t=0;
+  for(let i=0;i<D.orgs.days.length;i++){ if(D.orgs.days[i]<=day) t+=arr[i]||0; } return t; }
+function _orgRows(s0){
+  const O=D.orgs, day=Math.floor((D.startMin+s0*10)/1440);
+  let rows=O.list.map(o=>{ const ser=O.series[o.id]||{};
+    return {o, prod:_orgUpto(ser.production, day), serve:_orgUpto(ser.serve, day)}; });
+  const q=orgQuery.trim();
+  if(q) rows=rows.filter(r=> (r.o.name&&r.o.name.includes(q)) || (r.o.cat&&r.o.cat.includes(q)) || (r.o.ikey&&r.o.ikey.toLowerCase().includes(q.toLowerCase())));
+  rows.sort((a,b)=> orgSort==='prod'? (b.prod-a.prod) : orgSort==='serve'? (b.serve-a.serve) : (b.o.n_emp-a.o.n_emp));
+  return {rows, day};
+}
+function renderOrg(s0){
+  const O=D.orgs; if(!O) return;
+  if(orgSel!==null){ renderOrgCard(s0); return; }
+  const {rows}=_orgRows(s0);
+  const sortBtn=(k,l)=>`<button onclick="orgSort='${k}';render(true)" class="${orgSort===k?'on':''}" style="padding:4px 9px;font-size:11px">${l}</button>`;
+  body.innerHTML=`<div style="max-width:720px">
+    <div style="font-size:12px;color:var(--dim);margin-bottom:8px">架空の合成台帳(R17: 実在企業名は使用しません)の会社。名称・業種で検索。行をクリックで日次産出・接客・従業員名簿へ。${O.capped?`<span style="color:#e8a33d">(会社数 ${O.n_orgs} のうち従業員数上位 ${O.list.length} 社を表示)</span>`:''}</div>
+    <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+      <input type="text" id="orgQ" placeholder="🔍 会社名・業種で検索" value="${orgQuery.replace(/"/g,'&quot;')}" style="width:260px">
+      <span style="font-size:11px;color:var(--dim)">並べ替え:</span>
+      ${sortBtn('emp','従業員数')}${sortBtn('prod','産出(当日まで)')}${sortBtn('serve','接客(当日まで)')}
+      <span style="font-size:11px;color:var(--dim);margin-left:6px">系列: ${O.source==='ledger'?'org_ledger':'L1再構成'}</span></div>`
+    + rows.map(r=>`<div class="bld" onclick="orgSel='${r.o.id}';orgPersonSel=null;render(true)">
+        <span><b>${r.o.name}</b> <span style="color:var(--dim);font-size:11px">${r.o.cat||r.o.ikey||''}</span></span>
+        <span style="color:var(--dim);font-size:12px">👥${r.o.n_emp} ・ 産出${r.prod} ・ 接客${r.serve} ›</span></div>`).join('')
+    + (rows.length?'':'<div class="ev">該当する会社がありません</div>') + '</div>';
+  const inp=document.getElementById('orgQ');
+  if(inp) inp.oninput=()=>{ orgQuery=inp.value; renderOrg(S0());
+    setTimeout(()=>{const i2=document.getElementById('orgQ'); if(i2){i2.focus(); i2.setSelectionRange(i2.value.length,i2.value.length);}},0); };
+}
+function renderOrgCard(s0){
+  const O=D.orgs, o=O.list.find(x=>x.id===orgSel); if(!o){ orgSel=null; renderOrg(s0); return; }
+  const ser=O.series[o.id]||{};
+  const wp = o.building? `職場: ${o.building}${o.floor?(' '+o.floor+'F'):''}` : (o.node? ('職場ノード: '+o.node):'職場情報なし');
+  const roles=Object.entries(o.roles||{}).map(([r,n])=>`<span style="font-size:10px;padding:1px 7px;border-radius:8px;background:var(--surface2);margin-right:3px">${r} ${n}</span>`).join('');
+  const hasLedger=(ser.revenue_est||ser.wage_paid||ser.attendance_min);
+  let personBlk='';
+  if(orgPersonSel!==null){ const a=D.agents.find(x=>x.id===orgPersonSel);
+    if(a){ const words=D.vocab.filter(v=>(v.creator===a.id&&v.born<=s0)||v.adopts.some(x=>x[0]<=s0&&x[1]===a.id)).length;
+      const speaks=D.feed.filter(e=>e.a===a.id&&e.k==='speak'&&e.s<=s0).slice(-3).reverse();
+      personBlk=`<div class="chartBox" style="border-left:3px solid ${colOf(a.id)}">
+        <button onclick="orgPersonSel=null;render(true)" style="float:right">✕</button>
+        <h3><span style="color:${colOf(a.id)}">●</span> ${a.name}</h3>
+        <div style="font-size:12px">${a.gender||''} ${a.age}歳・${a.occupation} ${a.has_car?'🚗':''}${a.has_bicycle?'🚲':''}
+          <span style="color:var(--dim)">${a.org_role?('・'+a.org_role):''}${a.work_name?(' @'+a.work_name):''}</span></div>
+        <div style="font-size:12px;color:var(--dim);margin-top:3px">語彙 ${words}語 ${speaks.length?('・ 最近: '+speaks.map(s=>'「'+s.t+'」').join(' ')):''}</div></div>`; }
+  }
+  const roster=o.employees.map(id=>{ const a=D.agents.find(x=>x.id===id)||{};
+    return `<div onclick="orgPersonSel=${id};render(true)"><span style="color:${colOf(id)}">●</span> ${a.name||('a'+id)} <span style="color:var(--dim)">${a.org_role||a.occupation||''}</span></div>`;}).join('');
+  body.innerHTML=`<button class="vback" onclick="orgSel=null;orgPersonSel=null;render(true)">← 会社一覧へ</button>
+    <h2 style="font-size:18px;margin:4px 0">${o.name}</h2>
+    <div style="font-size:12px;color:var(--dim);margin-bottom:8px">${o.cat||o.ikey||''} ・ ${wp} ・ 従業員 ${o.n_emp}人 ${o.n_emp>o.employees.length?`(名簿は先頭 ${o.employees.length}人)`:''}<br>${roles}</div>
+    ${personBlk}
+    <div class="chartBox"><h3>① 日次の産出・接客</h3>
+      <div class="sub">産出=勤務完遂/オフィス産出の件数(production)・接客=serve 帰属件数。系列ソース: ${O.source==='ledger'?'org_ledger.parquet':'L1 イベント再構成'}</div>
+      <canvas id="orgc1"></canvas></div>
+    ${hasLedger?`<div class="chartBox"><h3>② 会計(org_ledger)</h3>
+      <div class="sub">推定売上(revenue_est)・支払賃金(wage_paid)・在館分(attendance_min)。組織会計の代理指標</div>
+      <canvas id="orgc2"></canvas></div>`:''}
+    <div class="chartBox"><h3>${hasLedger?'③':'②'} 従業員名簿(クリックで個人情報)</h3>
+      <div class="sub">agents.json の org_id で束ねた従業員。クリックすると氏名・職種・語彙・直近発話を表示</div>
+      <div class="roster">${roster||'<div class="ev">従業員データがありません</div>'}</div></div>`;
+  const pts=arr=>O.days.map((d,i)=>[d*144, arr?arr[i]||0:0]);
+  lineChart(document.getElementById('orgc1'), [
+    {label:'産出',color:'#60a5fa', data:pts(ser.production)},
+    {label:'接客',color:'#f472b6', data:pts(ser.serve)}], {});
+  if(hasLedger){ const c2=document.getElementById('orgc2'); if(c2){
+    const s2=[]; if(ser.revenue_est) s2.push({label:'売上est',color:'#ffd166',data:pts(ser.revenue_est)});
+    if(ser.wage_paid) s2.push({label:'賃金',color:'#4ade80',data:pts(ser.wage_paid)});
+    if(ser.attendance_min) s2.push({label:'在館分',color:'#a78bfa',data:pts(ser.attendance_min)});
+    lineChart(c2, s2, {}); } }
+}
+function orgRender(tab, s0){ if(tab==='org' && D.orgs){ renderOrg(s0); } }
+"""
+
+
+# 第58バッチ B8 在館観測列タブ(occupancy データが有る時だけ __LENS_JS__ 経由で注入)。無ければ空文字。
+_OCC_JS = r"""
+let occBldSel=null;
+function _occDrawHeat(cv, bld){
+  if(!cv) return; cv.width=cv.clientWidth*devicePixelRatio; cv.height=cv.clientHeight*devicePixelRatio;
+  const g=cv.getContext('2d'), W=cv.width, H=cv.height;
+  const T=themeAt(cur), dim=_css(T.dim), ink=_css(T.ink);
+  g.clearRect(0,0,W,H);
+  const floors=Object.keys(bld.floors||{}).map(Number).sort((a,b)=>a-b);
+  if(!floors.length){ g.fillStyle=dim; g.font=`${12*devicePixelRatio}px system-ui`; g.textAlign='center';
+    g.fillText('階別データなし(屋内トラッキング無し=建物粒度のみ)', W/2, H/2); return; }
+  const mL=46*devicePixelRatio, mB=22*devicePixelRatio, mT=6*devicePixelRatio;
+  const N=D.occupancy.nSteps, rowH=(H-mB-mT)/floors.length, colW=(W-mL)/N;
+  let vmax=1; for(const f of floors){ const ar=bld.floors[String(f)]; for(const v of ar) if(v>vmax) vmax=v; }
+  floors.forEach((f,ri)=>{ const ar=bld.floors[String(f)];
+    for(let s=0;s<N;s++){ const v=ar[s]||0; if(!v) continue;
+      const a=Math.min(1,0.15+0.85*v/vmax);
+      g.fillStyle=`rgba(96,165,250,${a.toFixed(3)})`;
+      g.fillRect(mL+s*colW, mT+ri*rowH, Math.max(1,colW), Math.max(1,rowH-1*devicePixelRatio)); }
+    g.fillStyle=ink; g.font=`${10*devicePixelRatio}px system-ui`; g.textAlign='right';
+    g.fillText(f+'F', mL-4*devicePixelRatio, mT+ri*rowH+rowH*0.6); });
+  g.fillStyle=dim; g.textAlign='center';
+  for(let s=0;s<N;s+=Math.max(18,Math.round(N/8/18)*18)){ const mm=D.startMin+s*10;
+    g.fillText(`${Math.floor(mm/60)%24}時`, mL+s*colW, H-mB+15*devicePixelRatio); }
+  // 現在時刻カーソル
+  g.strokeStyle='rgba(255,209,102,.8)'; g.setLineDash([4,4]);
+  g.beginPath(); g.moveTo(mL+S0()*colW, mT); g.lineTo(mL+S0()*colW, H-mB); g.stroke(); g.setLineDash([]);
+}
+function renderOcc(s0){
+  const Oc=D.occupancy; if(!Oc) return;
+  const opts=Oc.buildings.map(b=>`<option value="${b.id}" ${b.id===occBldSel?'selected':''}>${b.name||b.id}</option>`).join('');
+  const peakRows=Oc.peak.map(p=>`<tr><td>${p.name||p.id}</td><td style="text-align:right">${p.n}</td><td style="color:var(--dim)">${tstr(p.step)}</td></tr>`).join('');
+  const sel=occBldSel? Oc.buildings.find(b=>b.id===occBldSel):null;
+  body.innerHTML=`<div style="max-width:860px">
+    <div style="font-size:12px;color:var(--dim);margin-bottom:8px">建物別の在館人数の時系列(ピーク在館数の多い上位 ${Oc.buildings.length} 棟)。${Oc.indoor?'階別ヒートマップは屋内トラッキング由来':'屋内トラッキング無し=建物粒度のみ(階は enter_building の階のみ・正直に縮退)'}。${Oc.capped?`<span style="color:#e8a33d">(全 ${Oc.nBld} 棟のうち上位表示)</span>`:''}</div>
+    <div class="chartBox"><h3>① 建物別 在館人数の推移</h3>
+      <div class="sub">どの建物に人が滞在しているか。点線=現在時刻</div><canvas id="occc1"></canvas></div>
+    <div class="chartBox"><h3>② 階別ヒートマップ${Oc.indoor?'':'(屋内トラッキング無し)'}</h3>
+      <div class="sub">建物を選ぶと階×時刻の在館密度(濃いほど多い)。<select id="occSel">${opts}</select></div>
+      <canvas id="occHeat" style="height:200px"></canvas></div>
+    <div class="chartBox"><h3>③ ピーク在館(建物別の最大在館数と時刻)</h3>
+      <table style="font-size:12px;border-collapse:collapse;width:100%;max-width:520px">
+        <tr style="color:var(--dim)"><td>建物</td><td style="text-align:right">ピーク在館</td><td>時刻</td></tr>
+        ${peakRows}</table></div></div>`;
+  lineChart(document.getElementById('occc1'), Oc.buildings.slice(0,8).map((b,i)=>({
+    label:(b.name||b.id).slice(0,10), color:PAL[i%8], data:b.series.map((v,s)=>[s,v])})), {});
+  const heat=document.getElementById('occHeat');
+  _occDrawHeat(heat, sel||Oc.buildings[0]||{floors:{}});
+  const os=document.getElementById('occSel');
+  if(os) os.onchange=()=>{ occBldSel=os.value; render(true); };
+}
+function occRender(tab, s0){ if(tab==='occ' && D.occupancy){ renderOcc(s0); } }
+"""
+
+
+# 会社タブ/在館タブの render 差し込み(テンプレート render() を書き換えず、__LENS_JS__ 内で1回だけ
+# ラップして org/occ の描画を追加)。has_orgs / has_occ のいずれかで main() が注入。二重ラップ防止付き。
+_DASH_TAB_WRAP = r"""
+(function(){ if(window.__orgOccWrapped) return; window.__orgOccWrapped=true;
+  const _origRender=render;
+  render=function(force){ _origRender(force);
+    if(typeof orgRender==='function') orgRender(tab, S0());
+    if(typeof occRender==='function') occRender(tab, S0()); };
+})();
+"""
+
+
+# 会社の地図側 colorBy='org'(MAP_HTML の __COMMUNITY_JS__ 経由で注入)。上位N社に色・他はグレー。
+# orgMapColor は colorOf の __COMMUNITY_HOOK__ から呼ばれる(関数宣言=巻き上げで参照可)。
+_ORG_MAP_JS = r"""
+const _ORG_TOPN=8;
+const _orgColorById=(function(){ const m={}; if(!D.orgs) return m;
+  const pal=['#60a5fa','#f472b6','#6ee7b7','#ffd166','#a78bfa','#fb923c','#4ade80','#38bdf8'];
+  const ranked=D.orgs.list.slice().sort((a,b)=>b.n_emp-a.n_emp).slice(0,_ORG_TOPN);
+  ranked.forEach((o,k)=>{ for(const aid of (o.employees||[])) m[aid]=pal[k%pal.length]; }); return m; })();
+function orgMapColor(i, s0){ return _orgColorById[D.ids[i]]||'#8a97a5'; }
+"""
+
+
 # ============================================================ ダッシュボード
 DASH_HTML = r"""<!DOCTYPE html>
 <html lang="ja"><head><meta charset="utf-8">
@@ -3501,6 +3902,26 @@ def main() -> None:
         lens_js += _DEV_JS
     if has_structure:                      # 社会構造タブ JS も独立に注入(structRender を定義)
         lens_js += _STRUCT_JS
+    # 第58バッチ B7/B8: 会社(orgs)・在館(occupancy)データが「有る時だけ」タブ/JS を注入。無ければ
+    # 全トークン空文字→ DASH_HTML/MAP_HTML はバイト同一(既存の lens/indoor と同型の後方互換)。
+    # DASH_HTML/MAP_HTML の文字列そのものは一切改変せず、既存の __LENS_TABS__/__LENS_JS__/
+    # __COMMUNITY_* トークンへ追記合成する(テンプレートを触らない=既存 viewer 系テストが無修正緑)。
+    has_orgs = "orgs" in data
+    has_occ = "occupancy" in data
+    if has_orgs:
+        lens_tabs += '\n    <button data-tab="org">🏢 会社</button>'
+    if has_occ:
+        lens_tabs += '\n    <button data-tab="occ">🏙 在館</button>'
+    if has_orgs:                            # 会社タブ JS(orgRender を定義)
+        lens_js += _ORG_JS
+    if has_occ:                            # 在館タブ JS(occRender を定義)
+        lens_js += _OCC_JS
+    if has_orgs or has_occ:                # render() を1回だけラップして org/occ 描画を差し込む
+        lens_js += _DASH_TAB_WRAP
+    if has_orgs:                           # 地図側 colorBy='org'(上位N社に色・他はグレー)
+        comm_option += '<option value="org">🏢会社</option>'
+        comm_hook += "\n  if(mode==='org') return orgMapColor(i, s0);"
+        comm_js += _ORG_MAP_JS
     # 屋内セマンティックズーム(B5): floorSpecs(=indoor ラン)が有る時「だけ」JS/フック/クリックを注入。
     # 無ければ3トークンとも空文字→ MAP_HTML/DASH_HTML は従来とバイト同一(後方互換の合格条件)。
     has_indoor = "floorSpecs" in data
@@ -3532,6 +3953,17 @@ def main() -> None:
     print(f"  steps={data['nSteps']} agents={len(data['ids'])} "
           f"posts={len(data['net']['posts'])} dms={len(data['net']['dms'])} "
           f"searches={len(data['net']['searches'])} vocab={len(data['vocab'])}")
+    if has_orgs:
+        print(f"  会社(B7): {data['orgs']['n_orgs']}社 系列={data['orgs']['source']}")
+    # 在館タブは occupancy.parquet が有る時だけ出る。屋内/建物の在館データが在るのに未生成なら案内
+    # (HTML には出さず=バイト同一を守る。stdout 案内=既存旧ランの出力は不変)。
+    if not has_occ and ("floorSpecs" in data
+                        or (run_dir / "indoor_tracks_samples.parquet").exists()):
+        print("  ヒント: 在館(🏙)タブは未生成です。先に "
+              f"`python scripts/build_occupancy.py {run_dir}` を実行してください")
+    elif has_occ:
+        oc = data["occupancy"]
+        print(f"  在館(B8): {oc['nBld']}棟 屋内階={'yes' if oc['indoor'] else 'no(建物粒度)'}")
 
 
 if __name__ == "__main__":

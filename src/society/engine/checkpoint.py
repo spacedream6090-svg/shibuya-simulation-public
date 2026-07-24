@@ -69,6 +69,11 @@ def save(sim, step: int, path: str | Path) -> Path:
             "drive_stats": sim.drive_stats,
             "econ_day": sim._econ_day,
             "acct_day": sim._acct_day,          # 口座 E5: 暦日境界の進行(給料日/家賃)
+            # 会社観測データ層 B4: per-day アキュムレータ(mid-day checkpoint でも resume==straight を保つ)。
+            # OFF ランでは空 dict / -1=挙動不変(load は .get で旧 checkpoint 互換)。workers 集合は
+            # emit 時に必ず sorted 反復=pickle の集合反復順非保存の影響を受けない(determinism 監査済み)。
+            "org_day": getattr(sim, "_org_day", {}),
+            "org_ledger_day": getattr(sim, "_org_ledger_day", -1),
         },
         # --- scenario は config から再構築される。封鎖の進行だけを直列化(順序安定) ---
         "scenario": {
@@ -117,6 +122,8 @@ def load(sim, path: str | Path) -> int:
     sim.drive_stats = rt["drive_stats"]
     sim._econ_day = rt["econ_day"]
     sim._acct_day = rt.get("acct_day", -1)      # 旧 checkpoint 互換(無ければ -1)
+    sim._org_day = rt.get("org_day", {})        # B4: 会社観測 per-day アキュムレータ(旧 checkpoint 互換)
+    sim._org_ledger_day = rt.get("org_ledger_day", -1)
 
     # scenario: __init__ で config から再構築済み。封鎖の進行を復元し city へ再適用。
     sc = blob["scenario"]

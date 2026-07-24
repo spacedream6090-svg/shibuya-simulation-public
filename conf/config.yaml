@@ -1172,11 +1172,22 @@ work:
     max_serve_per_event: 1      # 1消費あたり帰属するスタッフ数の上限(id 昇順で先頭から)
     record_unstaffed: true      # スタッフ不在の消費を agent_id=-1 の記録として残す(挙動変更なし・観測のみ)
     digest: true                # interstitial ON 時、スタッフの S2 ダイジェストに業務要約を1行供給
+    # ---- 会社観測データ層 B4(既定 OFF=serve payload バイト不変・org_ledger 不在)----
+    indoor_fields: false        # ★ serve に org_id/floor を付ける。解決順=スタッフ経由(主)→ unstaffed は
+                                #   node→org が一意のときのみ → 多義ノードは org_id=null(unknown を正直開示)。
+                                #   (建物,階)絞り込み(客とスタッフの floor 一致)は indoor.enabled かつ本 ON 時のみ。
     office:
       enabled: true             # オフィス系の日次 org_output を出すか
       poi_cats: [office]        # オフィス系職場と見なす職場 POI カテゴリ
       base_weight: 1.0          # role 重みの既定(1人=1.0 → 産出は出勤者数に比例)
       role_weights: {}          # occupation/role → 産出重み(空=全員 base_weight)
+      by_org: false             # ★ org_output を org_id 単位に分解(同居複数社)。indoor.enabled のとき値を
+                                #   「頭数×重み」でなくミクロ在席分へ。basis フィールドで式を自己記述。
+                                #   ON 時 org_output は日次境界(翌日先頭 step)に完了日分を記録(payload に day)。
+      attendance_zones: [desk, meeting]  # ミクロ在席分に数える職務区画型(break/rest は在席に数えない)
+    ledger:                     # 組織日次系列サイドカー(runs/<run>/org_ledger.parquet)
+      enabled: false            # ★ true で 1 日 1 行/社を書く(会社 UI=B7 が読む契約)。列: day, org_id,
+                                #   production, revenue_est, wage_paid, serve_count, attendance_min。値無し列=0。
   # ---- 職場束ね直し(第49バッチ。既定 OFF=現行の work_node 付与と完全同一=バイト一致)----
   # pool 経路の L2/L3 は occupation(role)が persona._pick_workplace の _WORK_CAT に載らないと
   # work_node を持たない=接客(serve)/産出(org_output)の帰属から漏れる(coverage の穴)。ON 時:
