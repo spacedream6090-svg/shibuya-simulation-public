@@ -275,6 +275,28 @@ lens:
     enabled: true          # 社会構造の内生変動(L2 の edge churn 系スカラー)。順位 τ・中心性 turnover・
                            # コミュニティ変化・固着検知は事後 scripts/analyze_structure.py が L1(+L3)から算出
 
+# ---- (3-b・任意) 屋内ミクロ観察(第58バッチ B0-B8 / B9 で性能較正・30日コスト実測)----------------
+# 建物の中(区画・階・秒スケール軌跡・遭遇ネットワーク・会社在席/在館)を観る観測レイヤ。既定は
+# base config で indoor.enabled=false=完全 no-op(バイト一致)。**観測のみ**=spark treatment とは別物
+# (介入でなく観察・LLM 呼数不変・k 非依存=tests/test_indoor_invariance.py で固定)。判断は D16 参照。
+#   30日コスト実測(B9・mock・40体7日→100体30日 外挿。docs/research/longrun-estimate.md §8):
+#     推奨 param(下記 max_substeps=300/sample_interval=10)で per-step +≈0.9s(mock。実 LLM では
+#     LLM レイテンシに隠れる)・indoor_tracks_samples ≈ +5MB/30日100体・org_ledger は数十KB=無視可。
+#     RAM は checkpoint_every(下の 1440)で有界(実測 40体7日=339MB)。
+# 足すなら以下を外す(値は B9 推奨=時間/ストレージ削減しつつ遭遇/壁非貫通を保つ):
+#
+# indoor:
+#   enabled: true
+#   markov: { enabled: true }
+#   sfm: { enabled: true, max_substeps: 300, sample_interval: 10 }   # ★B9 推奨(dt は 0.2 のまま)
+#   meeting: { enabled: true }
+#   tracks: { enabled: true }        # 秒スケール軌跡+遭遇サイドカー。OFF でも space_move(L1)不変。
+# work:                              # 会社在席/在館の日次台帳(🏢会社/🏙在館タブ)。organizations は上で ON。
+#   service: { enabled: true, indoor_fields: true, office: { by_org: true }, ledger: { enabled: true } }
+# # 30日ランの軌跡サイドカーは大きいので閲覧は日次ロールアップ推奨:
+# #   python viz/make_viewer.py runs/longrun30 --daily-rollup
+# #   python scripts/build_occupancy.py runs/longrun30      # 🏙在館タブ用サイドカー(L1 不変)
+
 # ============================================================================
 # (4) 長期ランの運用(checkpoint=分割/crash 耐性・L1 は全量保持)
 # ============================================================================

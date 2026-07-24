@@ -46,3 +46,25 @@ weather:
 # 関係系(社会関係の質=深化段階 tier / 断絶 decay / 評判 reputation)。chance の encounter と地続き。
 relations:
   enabled: true
+
+# ---- (任意) 屋内ミクロ観察(第58バッチ B0-B8 / 第58バッチ B9 で性能較正)----------------------
+# 建物の中(区画・階・秒スケール軌跡・遭遇ネットワーク・会社在席/在館)を観る観測レイヤ。
+# 既定は base config で indoor.enabled=false=完全 no-op(バイト一致)。**観測のみ**(spark とは別物=
+# 介入でなく観察・LLM 呼数不変・k 非依存=B9 の invariance テストで固定)。足すなら以下を外す:
+#
+# indoor:
+#   enabled: true
+#   markov: { enabled: true }       # フロア内の区画滞在→遷移(在室行動 ABM 流の幾何 dwell)
+#   sfm:                            # 遷移駆動 Social Force Model(区画内の微視軌跡・遭遇)
+#     enabled: true
+#     max_substeps: 300             # ★B9 推奨: 既定 900→300。実行時間 −24%・軌跡サンプル −56%・
+#                                   #   遭遇検出数/壁非貫通は不変(60s=直交フロア横断に十分)。
+#     sample_interval: 10           # ★B9 推奨: 既定 5→10。軌跡サイドカーを更に半減(時間/品質コストゼロ)。
+#     # dt は 0.2 のまま(0.3+ は waypoint 超過で遭遇が偽増=品質劣化・時間短縮は僅少=B9 実測)。
+#   meeting: { enabled: true }      # 同一職場グループを同時刻に会合区画へ集める(遭遇の会議成分)
+#   tracks: { enabled: true }       # 秒スケール軌跡+遭遇の Parquet サイドカー(indoor_tracks_*)。
+#                                   #   OFF でも space_move(L1)は不変=記録と動力学の分離(B9 で固定)。
+# # 会社在席/在館の観測(会社ごとの日次台帳=🏢会社/🏙在館タブ)を足すなら:
+# work:
+#   service: { enabled: true, indoor_fields: true, office: { by_org: true }, ledger: { enabled: true } }
+# # → 事後: python scripts/build_occupancy.py runs/<run>  で 🏙在館タブ用サイドカーを生成(L1 不変)。
