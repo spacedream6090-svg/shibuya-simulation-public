@@ -50,6 +50,7 @@ from ..world import presence as presence_mod
 from ..world import pool as pool_mod
 from ..world.clock import STEP_MINUTES
 from ..world import scene_desc as scene_desc_mod
+from ..world import vision as vision_mod
 from ..lang.sentiment import valence
 from ..factors import affect
 from ..factors import update as factor_update
@@ -1272,6 +1273,16 @@ def _select_partner(sim, agent, hearers):
     "closeness": score = closeness(話者→候補)·10.0 − dist_m·0.1 の argmax(同点は id 昇順)。"""
     if not hearers:
         return None
+    # B3b 遭遇→ペアリング(indoor.encounter.pairing): 直近(前 step)の屋内遭遇相手が同席者に
+    # 居れば、そこから (遭遇 duration 降順, id 昇順) の決定論で1人を優先返答相手にする(乱数なし・R1)。
+    # 該当者ゼロなら下の nearest/closeness へ後退。hearer 集合・会話発生・LLM 呼数は不変(相手だけ変わる)。
+    # _indoor_recent は _phase_indoor 末で焼き込まれる per-agent マップ(相手id→遭遇 duration_s)。
+    if _pairing_on(sim):
+        recent = getattr(agent, "_indoor_recent", None)
+        if recent:
+            cands = [h for h in hearers if h.id in recent]
+            if cands:
+                return max(cands, key=lambda h: (recent[h.id], -h.id))
     if _reply_partner_mode(sim) == "closeness":
         rels = agent.mem.relations
 
@@ -1546,7 +1557,10 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
     """LLM に発話/行動を生成させる。解釈不能なら None(沈黙)。
     予算は欲求フェーズ(_phase_drive)で消費済み(発火権を得た者だけが来る)。"""
     radius = float(sim.cfg.world.perception_radius_m)
-    company = hearers_of(agent, _percept(sim), radius)
+    # B3b 屋内 LOS ゲート(indoor.los): 同席文脈(発火プロンプトの近傍リスト)を壁 LOS+距離で絞る。
+    # occluder=None(既定/los OFF)は従来と完全にバイト一致。ここは「プロンプトに載る同席者」だけを
+    # ゲートし、発火判断(_phase_drive の face)・返答権(speak ハンドラの hearers)は素通し=LLM 呼数不変。
+    company = hearers_of(agent, _percept(sim), radius, occluder=_los_occluder(sim))
     if agent.building:
         pois = sim.city.pois_in_building(agent.building, agent.floor)
     else:
@@ -3788,6 +3802,43 @@ def _indoor_on(sim) -> bool:
     return getattr(sim, "indoor", None) is not None
 
 
+# ---------------------------------------------------------------- B3b 動力学接続(既定 OFF)
+def _pairing_on(sim) -> bool:
+    """遭遇→対面会話ペアリングが有効か(indoor.encounter.pairing)。indoor OFF なら常に False。
+
+    ON でも変えるのは「誰を返答相手に選ぶか」だけ(hearer 集合・会話発生・LLM 呼数は不変)。物理の
+    遭遇(duration/ids)しか読まない=k・内面構成概念を読まない=compute_matched 下の k 不変性で担保。"""
+    if getattr(sim, "indoor", None) is None:
+        return False
+    return bool(sim.indoorcfg.get("encounter", {}).get("pairing", False))
+
+
+def _los_on(sim) -> bool:
+    """屋内知覚の壁 LOS ゲートが有効か(indoor.los.enabled)。indoor OFF なら常に False。
+
+    ON でも変えるのは発火プロンプトの同席リスト(近傍リスト)の中身だけ(発火判断・返答権・hearer 集合は
+    ゲートしない=会話発生/LLM 呼数は不変)。座標・幾何しか読まない=no-fingerprint。"""
+    if getattr(sim, "indoor", None) is None:
+        return False
+    return bool(sim.indoorcfg.get("los", {}).get("enabled", False))
+
+
+def _los_occluder(sim):
+    """indoor.los ON のとき屋内 LOS 遮蔽器を返す(遅延構築・sim にキャッシュ)。既定 None=遮蔽なし。
+
+    None のとき hearers_of は従来と完全にバイト一致(occluder=None=既定)。occluder 実体は sim.indoor
+    (壁供給)を参照する=checkpoint 非対象(resume で再構築=状態を持たない読取専用ゲート)。"""
+    if not _los_on(sim):
+        return None
+    occ = getattr(sim, "_los_occluder_obj", None)
+    if occ is None:
+        los = sim.indoorcfg.get("los", {})
+        occ = vision_mod.IndoorLOSOccluder(
+            sim.indoor, max_dist_m=float(los.get("max_dist_m", 0.0)))
+        sim._los_occluder_obj = occ
+    return occ
+
+
 def _indoor_pref(cfg_map: dict, activity: str) -> list:
     """活動 → 優先型リスト(conf 由来。型語はコードに書かない=no-fingerprint)。無指定は []。"""
     v = (cfg_map or {}).get(str(activity or ""))
@@ -4050,6 +4101,22 @@ def _phase_indoor(sim, step: int, sim_min: int) -> None:
     if tracks is not None:
         tracks.add_samples(sim._indoor_samples_step)
         tracks.add_contacts(sim._indoor_encounters_step)
+
+    # ── B3b 遭遇→ペアリング動力学(indoor.encounter.pairing ON のみ)──────────────────
+    # この step の遭遇を各個体の直近遭遇マップ _indoor_recent(相手id→duration_s)へ焼き込む。
+    # 次 step の _apply(会話ペアリング)がこれを読む=phase 順(_phase_indoor は _apply の後)ゆえ
+    # 「前 step の遭遇」を使う 1-step ラグ(正直な近似)。毎 step 全個体を上書き=持ち越しは 1 step 限定。
+    # per-agent 属性ゆえ checkpoint(agents を pickle)へ自然に含まれ resume==straight がバイト一致
+    # (checkpoint.py は不変更)。OFF は一切書かない=属性を生やさない=バイト一致。
+    if _pairing_on(sim):
+        recent: dict = {}
+        for (_t_s, ia, ib, _knd, dur, _b, _f) in sim._indoor_encounters_step:
+            ma = recent.setdefault(ia, {})
+            ma[ib] = max(ma.get(ib, 0.0), float(dur))
+            mb = recent.setdefault(ib, {})
+            mb[ia] = max(mb.get(ia, 0.0), float(dur))
+        for agent in sim.agents:
+            agent._indoor_recent = recent.get(agent.id) or {}
 
 
 def run_step(sim, step: int) -> None:

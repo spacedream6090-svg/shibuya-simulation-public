@@ -119,7 +119,8 @@ def build_html(run_name: str, scene_json: str, tracks_json: str,
                terrain_json: str | None = None,
                has_extras: bool = False,
                mode_legend: dict | None = None,
-               notable_json: str | None = None) -> str:
+               notable_json: str | None = None,
+               indoor_json: str | None = None) -> str:
     three_js, orbit_js, lic = _read_vendor()
     html = _TEMPLATE
     html = html.replace("__RUN_NAME__", run_name)
@@ -139,6 +140,8 @@ def build_html(run_name: str, scene_json: str, tracks_json: str,
         html = _inject_modes(html)
     if notable_json is not None:        # notable_events.json(顕著イベントパネル)
         html = _inject_notable(html, notable_json)
+    if indoor_json is not None:         # indoor overlay(フロア板+接近フェード+実座標エージェント)
+        html = _inject_indoor(html, indoor_json)
     return html
 
 
@@ -494,6 +497,369 @@ _NOTABLE_BUILD = r"""// ========== 顕著イベント(notable-data 注入時の�
 """
 
 
+# ============================================================ 屋内オーバレイ(B6)
+def _has_space_move(ev_p: Path) -> bool:
+    """l1_events.parquet に space_move が 1 件でもあるか(kind 列だけ読む)。"""
+    if not ev_p.exists():
+        return False
+    try:
+        import pyarrow.parquet as pq
+        tbl = pq.read_table(ev_p, columns=["kind"])
+        return "space_move" in set(tbl.column("kind").to_pylist())
+    except Exception:
+        return False
+
+
+def _indoor_positions_from_samples(samples_p: Path, tracks_json: str):
+    """indoor_tracks_samples.parquet の実座標(x,y)を viewer フレーム別に畳む。
+
+    t_s → step = floor(t_s / (step_minutes*60))、step → frame は export の
+    emitted=range(0,n,stride) と同型(stride=1 は恒等)。(frame, agentIdx) ごとに
+    最大 t_s(その step 終端に最も近い)サンプルを採る。ids に無い agent は捨てる
+    (--sample-agents 間引き整合)。返り: {"frames": {"<frame>": [[idx,x,y]...]}} or None。"""
+    try:
+        import pyarrow.parquet as pq
+        tbl = pq.read_table(samples_p, columns=["agent_id", "t_s", "x", "y"])
+    except Exception:
+        return None
+    try:
+        tj = json.loads(tracks_json)
+    except Exception:
+        return None
+    ids = tj.get("ids") or []
+    id_to_idx = {int(a): i for i, a in enumerate(ids)}
+    meta = tj.get("meta", {})
+    n_frames = int(meta.get("nSteps", 0) or 0)
+    stride = max(1, int(meta.get("step_stride", 1) or 1))
+    step_secs = max(1, int(meta.get("step_minutes", 10) or 10)) * 60
+    aid = tbl.column("agent_id").to_pylist()
+    ts = tbl.column("t_s").to_pylist()
+    xs = tbl.column("x").to_pylist()
+    ys = tbl.column("y").to_pylist()
+    best: dict = {}                                  # (frame, idx) -> (t_s, x, y)
+    for a, t, x, y in zip(aid, ts, xs, ys):
+        idx = id_to_idx.get(int(a))
+        if idx is None:
+            continue
+        step = int(float(t) // step_secs)
+        frame = step // stride if stride > 1 else step
+        if n_frames and frame > n_frames - 1:
+            frame = n_frames - 1
+        if frame < 0:
+            frame = 0
+        k = (frame, idx)
+        prev = best.get(k)
+        if prev is None or float(t) > prev[0]:
+            best[k] = (float(t), round(float(x), 1), round(float(y), 1))
+    if not best:
+        return None
+    frames: dict = {}
+    for (frame, idx), (_t, x, y) in best.items():
+        frames.setdefault(frame, []).append([idx, x, y])
+    out = {str(f): sorted(frames[f]) for f in sorted(frames)}
+    return {"frames": out}
+
+
+def _ensure_indoor(run_dir: Path, tracks_json: str) -> str | None:
+    """屋内オーバレイの埋め込みデータを組み立てる(注入ゲート)。
+
+    ゲート = 新ラン信号(space_move が L1 にある OR indoor_tracks_samples.parquet がある)。
+    無ければ None = 一切注入しない = 旧ランは生成 HTML がバイト同一。有れば
+    data/floor_layouts.json(フロア板用の間取り正典 spec)と、samples があれば実座標
+    (フレーム別)を 1 つの JSON にまとめて返す。透明性のため scene3d へ書き出す。"""
+    samples_p = run_dir / "indoor_tracks_samples.parquet"
+    has_samples = samples_p.exists()
+    if not (has_samples or _has_space_move(run_dir / "l1_events.parquet")):
+        return None
+    payload: dict = {}
+    fl_p = REPO_ROOT / "data" / "floor_layouts.json"
+    if fl_p.exists():
+        try:
+            blds = json.loads(fl_p.read_text(encoding="utf-8")).get("buildings")
+            if isinstance(blds, list):
+                payload["floor_layouts"] = {"buildings": blds}   # meta は viewer 不要=同梱しない
+        except Exception:
+            pass
+    if has_samples:
+        pos = _indoor_positions_from_samples(samples_p, tracks_json)
+        if pos is not None:
+            payload["positions"] = pos
+    if not payload:
+        return None
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    try:
+        out_p = run_dir / "scene3d" / "indoor_overlay.json"
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        out_p.write_text(text, encoding="utf-8")
+    except Exception:
+        pass
+    n_bld = len(payload.get("floor_layouts", {}).get("buildings", []))
+    n_fr = len(payload.get("positions", {}).get("frames", {})) if "positions" in payload else 0
+    print(f"  [indoor] フロア板 spec {n_bld}棟"
+          f"{' + 実座標フレーム ' + str(n_fr) if 'positions' in payload else ''} を注入")
+    return text
+
+
+def _inject_indoor(html: str, indoor_json: str) -> str:
+    """屋内オーバレイを後付け注入(データ無し時は呼ばれない=既定出力はバイト同一)。
+    ①indoor-data ②レイヤートグル ③名寄せ+skip宣言 ④merged-mesh の skip 一行
+    ⑤本体JS(floorLayout3d/フロア板/接近フェード/実座標) ⑥placeAgents の屋内分岐。"""
+    data_tag = ('<script type="application/json" id="indoor-data">'
+                + _json_for_script(indoor_json) + "</script>")
+    anchor_data = '<script type="application/json" id="scene-data">'
+    html = _replace_once(html, anchor_data, data_tag + "\n" + anchor_data, "indoor-data")
+    # レイヤーパネルにトグル(昼夜の直後)
+    anchor_toggle = ('      <label class="chk"><input type="checkbox" id="lyDayNight" checked>'
+                     ' 昼夜ライティング</label>')
+    html = _replace_once(html, anchor_toggle,
+                         anchor_toggle + "\n" + _INDOOR_TOGGLE, "indoor-toggle")
+    # 名寄せ+INDOOR_SKIP 宣言(buildBuildings の直前・PLATEAU_DECL と同じアンカー=共存)
+    anchor_decl = "(function buildBuildings(){"
+    html = _replace_once(html, anchor_decl, _INDOOR_DECL + anchor_decl, "indoor-decl")
+    # merged-mesh から屋内建物を外す(PLATEAU skip の有無に依らず const fp 行の直前へ)
+    anchor_skip = "    const fp = b.footprint;"
+    html = _replace_once(
+        html, anchor_skip,
+        "    if(typeof INDOOR_SKIP!=='undefined' && INDOOR_SKIP.has(b.id)) continue;\n"
+        + anchor_skip, "indoor-skip")
+    # 本体(ループ直前=extras/modes/notable と同じアンカー)
+    anchor_build = "// ---------- ループ"
+    html = _replace_once(html, anchor_build, _INDOOR_MAIN + anchor_build, "indoor-main")
+    # placeAgents: 屋内エージェントは実座標/推定区画へ
+    anchor_place = ("    _p.set(x, groundAt(x, y) + upOf(w), -y);"
+                    "   // 地形があれば地表高に接地")
+    html = _replace_once(html, anchor_place, _INDOOR_PLACE, "indoor-place")
+    return html
+
+
+_INDOOR_TOGGLE = ('      <label class="chk"><input type="checkbox" id="lyIndoor" checked>'
+                  ' 屋内(フロア板・接近フェード)</label>')
+
+_INDOOR_PLACE = r"""    let _ax=x, _ay=y;                       // 屋内=実座標(samples)or 推定区画(floorLayout3d)
+    if(w>=1000 && typeof window.__indoorXY==='function'){ const _r=window.__indoorXY(i, w, t);
+      if(_r){ _ax=_r[0]; _ay=_r[1]; } }
+    _p.set(_ax, groundAt(_ax, _ay) + upOf(w), -_ay);   // 地形があれば地表高に接地"""
+
+# ---- ③ 名寄せ + skip(トップレベル・buildBuildings より前に実行)----
+_INDOOR_DECL = r"""// ========== 屋内オーバレイ: floor_layouts の名寄せ(部分一致・双方向=sim indoor._match と同一)
+const INDOOR = (()=>{ try { const el = document.getElementById('indoor-data');
+  if(el) return JSON.parse(el.textContent); } catch(e){ console.warn('indoor parse failed', e); } return null; })();
+const INDOOR_SPECS = (INDOOR && INDOOR.floor_layouts && INDOOR.floor_layouts.buildings) || [];
+function _indoorSpecFor(b){
+  const name = (b && (b.name || b.id)) || ''; if(!name) return null;
+  for(const rec of INDOOR_SPECS){ for(const m of (rec.match || [])){
+    if(m && (name.indexOf(m) >= 0 || m.indexOf(name) >= 0)) return rec; } }
+  return null;
+}
+const INDOOR_BLD = [];                 // [{bi, b, spec}] 名寄せ済み屋内建物
+const INDOOR_SKIP = new Set();         // merged-mesh から外す建物 id
+if(INDOOR){ SCENE.buildings.forEach((b, bi)=>{ const rec = _indoorSpecFor(b);
+  if(rec){ INDOOR_BLD.push({ bi, b, spec:rec }); INDOOR_SKIP.add(b.id); } }); }
+"""
+
+# ---- ⑤ 本体(IIFE。indoorXY は window へ公開=placeAgents から参照)----
+_INDOOR_MAIN = r"""// ========== 屋内オーバレイ本体: floorLayout3d(n_override) / フロア板(LRU8) / 接近フェード / 実座標
+(function setupIndoor(){
+  if(!INDOOR) return;
+  // ---- 決定論間取り(sim world.vision.building_layout と同一系列: FNV+mulberry32+重み列分割)----
+  function _fnv(s){ let h=2166136261>>>0; s=''+s;
+    for(let i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=Math.imul(h,16777619); } return h>>>0; }
+  function _mul32(seed){ let a=seed>>>0; return ()=>{ a=(a+0x6D2B79F5)>>>0;
+    let t=Math.imul(a^(a>>>15),1|a); t=((t+Math.imul(t^(t>>>7),61|t))>>>0)^t;
+    return ((t^(t>>>14))>>>0)/4294967296; }; }
+  function _cols(a0,a1,n,rng){ if(n<=0) return []; const w=[]; let s=0;
+    for(let i=0;i<n;i++){ const v=0.7+rng()*0.7; w.push(v); s+=v; }
+    const out=[]; let p=a0; for(const v of w){ const seg=(a1-a0)*v/s; out.push([p,p+seg]); p+=seg; } return out; }
+  // vision._POOL_LEN(区画候補プールの長さ)/ _kind_use。override/POI 無しのフォールバック経路のみ使う。
+  const _POOL_LEN = { fashion:6, beauty:5, food:6, restaurant:6, lifestyle:6, office:5, shop:4,
+    hall:3, theatre:3, hotel:3, station:4, park:3, nightlife:3, service:3, attraction:3, education:3, generic:3 };
+  function _kindUse(kind){ return kind==='office'?'office':kind==='station'?'station':kind==='retail'?'shop':'generic'; }
+  const _ZONE_HUE = { food:35, shop:210, nightlife:295, service:160, office:220, education:265,
+    attraction:48, hotel:330, lifestyle:180, restaurant:20, fashion:200, beauty:320, hall:255,
+    theatre:280, station:0, park:130, generic:210 };
+  // spec(floor_layouts)由来の n_override(sim indoor._build と同一規則: shops > Σzone_mix > null)
+  function _specFloor(b, f){ const rec=_indoorSpecFor(b); if(!rec) return null;
+    for(const fl of (rec.floors||[])){ if((fl.f|0)===(f|0)) return fl; } return null; }
+  function _nOverride(b, f){ const sp=_specFloor(b,f); if(!sp) return null;
+    if(sp.shops) return sp.shops|0;
+    if(sp.zone_mix){ let s=0; for(const k in sp.zone_mix) s+=(sp.zone_mix[k]|0); return s; }
+    return null; }
+  // building_layout(building, floor, n_override) の JS 移植(乱数消費順まで一致)
+  function floorLayout3d(b, f){
+    const fp=b.footprint; if(!fp || fp.length<3) return null;
+    const xs=fp.map(p=>p[0]), ys=fp.map(p=>p[1]);
+    const x0=Math.min.apply(null,xs), x1=Math.max.apply(null,xs);
+    const y0=Math.min.apply(null,ys), y1=Math.max.apply(null,ys);
+    const w=x1-x0, h=y1-y0; if(w<=0 || h<=0) return null;
+    const cx=(x0+x1)/2, cy=(y0+y1)/2;
+    const rng=_mul32((_fnv(b.id||b.name||'b')+(f+50)*2654435761)>>>0);
+    const nov=_nOverride(b,f); let n;
+    if(nov!=null){ n=Math.min(12, nov|0); }              // override 経路: cols 前に乱数を消費しない
+    else {                                               // pool 経路(POI 無しの決定論生成)
+      const use=_kindUse(b.kind); const poolN=_POOL_LEN[use]||_POOL_LEN.generic;
+      n=2+Math.floor(rng()*Math.min(4, poolN-1));
+      const used=new Set();
+      for(let k=0;k<n;k++){ let g=0, idx;
+        while(true){ idx=Math.floor(rng()*poolN); const cont=used.has(idx)&&(g<8); g++; if(!cont) break; }
+        used.add(idx); } }
+    if(n<=0) n=1;
+    const horiz=w>=h, band=(horiz?h:w)*0.09, nA=Math.ceil(n/2), nB=n-nA;
+    const zones=[]; let corridor;
+    if(horiz){ const yc0=cy-band, yc1=cy+band;
+      _cols(x0,x1,nA,rng).forEach(c=>zones.push([c[0],yc1,c[1],y1]));
+      _cols(x0,x1,nB,rng).forEach(c=>zones.push([c[0],y0,c[1],yc0]));
+      corridor=[x0,yc0,x1,yc1];
+    } else { const xc0=cx-band, xc1=cx+band;
+      _cols(y0,y1,nA,rng).forEach(c=>zones.push([xc1,c[0],x1,c[1]]));
+      _cols(y0,y1,nB,rng).forEach(c=>zones.push([x0,c[0],xc0,c[1]]));
+      corridor=[xc0,y0,xc1,y1]; }
+    const cs=Math.min(w,h)*0.13;
+    const core=[cx-cs/2, cy-cs/2, cx+cs/2, cy+cs/2];
+    return { bbox:[x0,y0,x1,y1], corridor, core, zones, horiz, nA, nB };
+  }
+  const _layCache = new Map();
+  function _layoutFor(bi, f){ const key=bi+':'+f; if(_layCache.has(key)) return _layCache.get(key);
+    const b=SCENE.buildings[bi]; const lay=b? floorLayout3d(b, f) : null; _layCache.set(key, lay); return lay; }
+  // ---- SpaceType 反映(zone_mix があれば面積降順+キー昇順で敷く=sim _types_from_mix と同型)----
+  function _area(z){ return Math.abs((z[2]-z[0])*(z[3]-z[1])); }
+  function _zoneCats(lay, b, f){
+    const sp=_specFloor(b,f), zones=lay.zones, n=zones.length;
+    if(sp && sp.zone_mix){
+      const order=zones.map((z,i)=>i).sort((a,c)=> (_area(zones[c])-_area(zones[a])) || (a-c));
+      const keys=Object.keys(sp.zone_mix).sort(); const seq=[];
+      for(const k of keys){ const cnt=sp.zone_mix[k]|0; for(let j=0;j<Math.max(0,cnt);j++) seq.push(k); }
+      const out=new Array(n); const fill=seq.length? seq[seq.length-1] : (sp.use||'generic');
+      for(let pos=0;pos<order.length;pos++){ const zi=order[pos]; out[zi]= pos<seq.length? seq[pos] : fill; }
+      return out;
+    }
+    const use=(sp&&sp.use) || _kindUse(b.kind);
+    return new Array(n).fill(use);
+  }
+  // ---- 実座標(samples): frame -> (agentIdx -> [x,y]) ----
+  const INDOOR_POS = new Map();
+  if(INDOOR.positions && INDOOR.positions.frames){ const F=INDOOR.positions.frames;
+    for(const k in F){ const m=new Map(); for(const e of F[k]) m.set(e[0], [e[1], e[2]]); INDOOR_POS.set(parseInt(k,10), m); } }
+  // 屋内エージェント位置: 実座標優先→無ければ推定区画(2D _agentSpot と同じ hash 選択・微動なし)
+  window.__indoorXY = function(i, w, tt){
+    const s0=Math.floor(tt); const fm=INDOOR_POS.get(s0);
+    if(fm){ const r=fm.get(i); if(r) return r; }
+    const bi=Math.floor((w-1000)/100), f=((w-1000)%100);
+    const b=SCENE.buildings[bi]; if(!b) return null;
+    const lay=_layoutFor(bi, f); if(!lay || !lay.zones.length) return null;
+    const id=TRACKS.ids[i];
+    const z=lay.zones[_fnv('a'+id)%lay.zones.length];
+    const rng=_mul32(_fnv('p'+id+':'+(b.id||b.name)+':'+f));
+    const u=0.2+rng()*0.6, v=0.2+rng()*0.6;
+    return [z[0]+(z[2]-z[0])*u, z[1]+(z[3]-z[1])*v];
+  };
+  // ---- 外殻シェル(屋内建物ごと・独自マテリアル=個別フェード可。PLATEAU 照合建物は作らない)----
+  const indoorShells = [];               // {bi, b, mesh, mat}
+  (function buildShells(){
+    const rot=new THREE.Matrix4().makeRotationX(-Math.PI/2);
+    for(const rec of INDOOR_BLD){ const b=rec.b;
+      if(typeof PLATEAU_SKIP!=='undefined' && PLATEAU_SKIP.has(b.id)) continue;  // PLATEAU 実形状側で描画
+      const sfp=b.footprint; if(!sfp || sfp.length<3) continue;
+      const shape=new THREE.Shape(); shape.moveTo(sfp[0][0], sfp[0][1]);
+      for(let i=1;i<sfp.length;i++) shape.lineTo(sfp[i][0], sfp[i][1]);
+      const hh=Math.max(b.height||FH, 1.0); let geo;
+      try { geo=new THREE.ExtrudeGeometry(shape,{ depth:hh, bevelEnabled:false, steps:1 }); } catch(e){ continue; }
+      geo.translate(0,0,(b.base||0)+(b.gz||0)); geo.applyMatrix4(rot);
+      const kind=(KIND_COLOR[b.kind]!==undefined)? b.kind : 'generic';
+      const mat=new THREE.MeshLambertMaterial({ color:NEUTRAL_BLD, transparent:true, opacity:1.0 });
+      mat.userData.kindColor=KIND_COLOR[kind]; mat.userData.indoorShell=true;
+      const mesh=new THREE.Mesh(geo, mat);
+      buildingMats.push(mat); buildingMeshes.push(mesh);   // X線/分類色/lyBld に自動追従
+      indoorShells.push({ bi:rec.bi, b, mesh, mat }); scene.add(mesh);
+    }
+  })();
+  // ---- フロア板(canvas→texture)。遅延生成 + LRU8 ----
+  const PLATE_CAP=8, PLATE_MAXPX=256, PLATE_FLOOR_CAP=24;
+  const _plate=new Map(), _plateLRU=[];
+  function _floorsToShow(b, bi){ const set=new Set();
+    const rec=_indoorSpecFor(b); if(rec) for(const fl of (rec.floors||[])) set.add(fl.f|0);
+    const s0=Math.floor(t), P=TRACKS.positions[s0]||[];   // 在館中の階も足す
+    for(let i=0;i<P.length;i++){ const w=P[i][2];
+      if(w>=1000 && Math.floor((w-1000)/100)===bi) set.add((w-1000)%100); }
+    let arr=[...set].filter(f=> f!==0).sort((a,c)=>a-c);
+    if(arr.length>PLATE_FLOOR_CAP) arr=arr.slice(0, PLATE_FLOOR_CAP); return arr; }
+  function _makePlate(b, f, lay){
+    const bb=lay.bbox, W=bb[2]-bb[0], H=bb[3]-bb[1]; if(W<=0||H<=0) return null;
+    const asp=W/H; let cw, ch;
+    if(asp>=1){ cw=PLATE_MAXPX; ch=Math.max(16, Math.round(PLATE_MAXPX/asp)); }
+    else { ch=PLATE_MAXPX; cw=Math.max(16, Math.round(PLATE_MAXPX*asp)); }
+    const cv=document.createElement('canvas'); cv.width=cw; cv.height=ch; const g=cv.getContext('2d');
+    const tfx=(x,y)=>[ (x-bb[0])/W*cw, ch-(y-bb[1])/H*ch ];
+    g.clearRect(0,0,cw,ch); g.fillStyle='rgba(20,26,34,0.72)'; g.fillRect(0,0,cw,ch);
+    const cats=_zoneCats(lay, b, f);
+    for(let zi=0; zi<lay.zones.length; zi++){ const z=lay.zones[zi];
+      const hue=(_ZONE_HUE[cats[zi]]!==undefined)? _ZONE_HUE[cats[zi]] : 210;
+      const a=tfx(z[0],z[1]), c=tfx(z[2],z[3]);
+      const rx=Math.min(a[0],c[0]), ry=Math.min(a[1],c[1]), rw=Math.abs(c[0]-a[0]), rh=Math.abs(c[1]-a[1]);
+      g.fillStyle='hsla('+hue+',48%,56%,0.86)'; g.fillRect(rx,ry,rw,rh);
+      g.strokeStyle='rgba(12,16,22,0.55)'; g.lineWidth=1; g.strokeRect(rx,ry,rw,rh); }
+    const co=lay.corridor, ca=tfx(co[0],co[1]), cc=tfx(co[2],co[3]);
+    g.fillStyle='rgba(200,210,225,0.14)';
+    g.fillRect(Math.min(ca[0],cc[0]),Math.min(ca[1],cc[1]),Math.abs(cc[0]-ca[0]),Math.abs(cc[1]-ca[1]));
+    const cr=lay.core, ka=tfx(cr[0],cr[1]), kc=tfx(cr[2],cr[3]);
+    g.fillStyle='rgba(40,52,68,0.95)';
+    g.fillRect(Math.min(ka[0],kc[0]),Math.min(ka[1],kc[1]),Math.abs(kc[0]-ka[0]),Math.abs(kc[1]-ka[1]));
+    const tex=new THREE.CanvasTexture(cv); tex.minFilter=THREE.LinearFilter; tex.magFilter=THREE.LinearFilter;
+    tex.generateMipmaps=false;
+    const pgeo=new THREE.PlaneGeometry(W, H); pgeo.rotateX(-Math.PI/2);
+    const pmat=new THREE.MeshBasicMaterial({ map:tex, transparent:true, opacity:0.9,
+      depthWrite:false, side:THREE.DoubleSide });
+    const mesh=new THREE.Mesh(pgeo, pmat);
+    const gz=groundAt(b.cx, b.cy), yy=gz + Math.max((f-1),0)*FH + 0.15;
+    mesh.position.set((bb[0]+bb[2])/2, yy, -(bb[1]+bb[3])/2); mesh.renderOrder=2;
+    return mesh;
+  }
+  function _disposeGroup(grp){ scene.remove(grp); grp.traverse(o=>{
+    if(o.material){ if(o.material.map) o.material.map.dispose(); o.material.dispose(); }
+    if(o.geometry) o.geometry.dispose(); }); }
+  function ensurePlates(bi){
+    if(_plate.has(bi)){ const k=_plateLRU.indexOf(bi); if(k>=0){ _plateLRU.splice(k,1); _plateLRU.push(bi); } return _plate.get(bi); }
+    const b=SCENE.buildings[bi]; if(!b) return null;
+    const grp=new THREE.Group();
+    for(const f of _floorsToShow(b, bi)){ const lay=_layoutFor(bi, f); if(!lay) continue;
+      const m=_makePlate(b, f, lay); if(m) grp.add(m); }
+    scene.add(grp); const cell={ group:grp }; _plate.set(bi, cell); _plateLRU.push(bi);
+    while(_plateLRU.length>PLATE_CAP){ const ev=_plateLRU.shift(); const c=_plate.get(ev);
+      if(c) _disposeGroup(c.group); _plate.delete(ev); }
+    return cell;
+  }
+  function hideAllPlates(){ for(const c of _plate.values()) c.group.visible=false; }
+  // ---- 接近フェード(外殻の不透明度=距離連動・X線と min 合成)+ フロア板の遅延表示 ----
+  const FADE_NEAR=60, FADE_FAR=220, PLATE_DIST=260;
+  function _bldDist(b){ const dx=camera.position.x - b.cx, dz=camera.position.z - (-b.cy); return Math.hypot(dx, dz); }
+  function updateProximity(){
+    if(!INDOOR) return;
+    const onEl=document.getElementById('lyIndoor'); const active=onEl? onEl.checked : true;
+    const xrayOn=document.getElementById('xray').checked; const base=xrayOn? 0.28 : 1.0;
+    for(const sh of indoorShells){ let op=base;
+      if(active){ const d=_bldDist(sh.b);
+        const fr=Math.max(0, Math.min(1, (d-FADE_NEAR)/(FADE_FAR-FADE_NEAR)));
+        op=Math.min(base, fr); }                         // どちらか透明なら透明(min 合成)
+      sh.mat.opacity=op; sh.mat.needsUpdate=true; }
+    // PLATEAU 実形状(1メッシュ=個別分離不可)は照合屋内建物への最短距離で一括フェード(妥協・報告済)
+    if(typeof PLATEAU_DATA!=='undefined' && PLATEAU_DATA){ let dmin=Infinity;
+      for(const rec of INDOOR_BLD){ if(PLATEAU_SKIP.has(rec.b.id)) dmin=Math.min(dmin, _bldDist(rec.b)); }
+      if(dmin<Infinity){ const fr=Math.max(0, Math.min(1, (dmin-FADE_NEAR)/(FADE_FAR-FADE_NEAR)));
+        const op=active? Math.min(base, fr) : base;
+        for(const m of buildingMats){ if(m.userData.plateau){ m.opacity=op; m.needsUpdate=true; } } } }
+    if(!active){ hideAllPlates(); return; }
+    for(const rec of INDOOR_BLD){ if(_bldDist(rec.b)<PLATE_DIST){ const c=ensurePlates(rec.bi); if(c) c.group.visible=true; } }
+    for(const bi of _plateLRU){ const b=SCENE.buildings[bi];
+      if(b && _bldDist(b)>=PLATE_DIST){ const c=_plate.get(bi); if(c) c.group.visible=false; } }
+  }
+  controls.addEventListener('change', updateProximity);
+  const _xr=document.getElementById('xray'); if(_xr) _xr.addEventListener('change', updateProximity);
+  const _li=document.getElementById('lyIndoor'); if(_li) _li.addEventListener('change', updateProximity);
+  updateProximity();                     // 初期化(遠景=不透明・板は未生成)
+})();
+
+"""
+
+
 def _strip_traffic(tracks_json: str) -> str:
     # 長期ラン(例 100日=14400step)は背景交通の軌跡だけで数百MBになりブラウザで開けない。
     # --no-traffic で traffic を空にする(人物・建物は従来どおり)。JS は traffic[s] 不在で車0台。
@@ -526,10 +892,12 @@ def main(argv: list) -> int:
         mode_legend = None
     # 顕著イベント(scene/tracks と同一入力=l1_events.parquet から抽出。無ければ None=バイト同一)
     notable_json = _ensure_notable(run_dir, tracks_json)
+    # 屋内オーバレイ(space_move / indoor_tracks サイドカー有=新ランのみ。無ければ None=バイト同一)
+    indoor_json = _ensure_indoor(run_dir, tracks_json)
     html = build_html(run_dir.name, scene_json, tracks_json,
                       plateau_json=plateau_json, terrain_json=terrain_json,
                       has_extras=has_extras, mode_legend=mode_legend,
-                      notable_json=notable_json)
+                      notable_json=notable_json, indoor_json=indoor_json)
     out = run_dir / "viewer3d.html"
     out.write_text(html, encoding="utf-8")
     mb = out.stat().st_size / 1024 / 1024
@@ -545,7 +913,7 @@ def main(argv: list) -> int:
         lite = build_html(run_dir.name, scene_json, tracks_json,
                           plateau_src="plateau_mesh.js", terrain_json=terrain_json,
                           has_extras=has_extras, mode_legend=mode_legend,
-                          notable_json=notable_json)
+                          notable_json=notable_json, indoor_json=indoor_json)
         lite_p = run_dir / "viewer3d_lite.html"
         lite_p.write_text(lite, encoding="utf-8")
         print(f"  {lite_p}  ({lite_p.stat().st_size/1024/1024:.2f} MB)"

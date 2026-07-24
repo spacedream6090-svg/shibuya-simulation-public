@@ -383,6 +383,41 @@ class VisionOccluder:
         return False
 
 
+class IndoorLOSOccluder:
+    """屋内知覚の区画粒度ゲート(B3b・indoor.los)。同一(建物,階)の同席ペアに対し、屋内実座標
+    ind_x/ind_y の距離上限 + 間仕切り壁 LOS(segment_blocked)で「同席文脈から外す」判定を返す。
+
+    休眠していた vision の LOS 資産(segment_blocked / 壁セグメント)の初配線。VisionOccluder と
+    違い、壁は IndoorSpace(get の walls=キャッシュ済み)から取り、座標はマクロ x/y ではなく屋内
+    ミクロ座標 ind_x/ind_y を使う(壁と ind 座標は同じフットプリント座標系)。街路/屋外ペア・ミクロ
+    状態未割当(ind_zone is None=到着直後など)のペアは対象外(遮らない=従来同一)。座標・幾何しか
+    見ない=no-fingerprint。前段(perception)が同一(建物,階)・距離を通したペアにだけ問われる。"""
+
+    def __init__(self, indoor, max_dist_m: float = 0.0):
+        self.indoor = indoor              # IndoorSpace(get(bid,floor)["walls"] を供給)
+        self.max_dist_m = float(max_dist_m)   # 0=距離ゲート無効(壁 LOS のみ)
+
+    def blocks(self, a, b) -> bool:
+        """a-b が壁で遮られる/距離上限を超える(=同席文脈から外す)なら True。"""
+        bid = getattr(a, "building", None)
+        # 屋内どうし・同一(建物,階)のみ対象。街路/屋外は遮らない(前段フィルタの自衛確認)。
+        if not bid or getattr(b, "building", None) != bid:
+            return False
+        if int(getattr(a, "floor", 0)) != int(getattr(b, "floor", 0)):
+            return False
+        # ミクロ状態未割当(_phase_indoor 前=到着直後)は判定材料が無い=遮らない(安全側)。
+        if getattr(a, "ind_zone", None) is None or getattr(b, "ind_zone", None) is None:
+            return False
+        ax, ay = float(a.ind_x), float(a.ind_y)
+        bx, by = float(b.ind_x), float(b.ind_y)
+        if self.max_dist_m > 0.0 and math.hypot(ax - bx, ay - by) > self.max_dist_m:
+            return True                   # 屋内で遠すぎる=区画粒度で不可視
+        walls = self.indoor.get(bid, int(a.floor))["walls"]
+        if not walls:
+            return False
+        return segment_blocked((ax, ay), (bx, by), walls)
+
+
 def _cfg_get(cfg, dotted: str, default=None):
     """OmegaConf / dict どちらでも dotted パスで安全に読む。"""
     cur = cfg

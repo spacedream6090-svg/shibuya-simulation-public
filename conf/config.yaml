@@ -334,8 +334,22 @@ indoor:
     meeting_types: [meeting, break]   # 会合を開く区画の型(その階にあれば・無ければ不開催)
   encounter:                          # 遭遇(接触ペア)観測のコスト制御
     bystander_cap: 24                 # 1セルの静止在館者を接触計算に含める上限(id 昇順=決定論)
+    # ★B3b 動力学接続: 直近(前 step)の屋内遭遇ペアを対面会話の「返答相手」選択で優先する
+    #   (遭遇 duration 降順・id 昇順の決定論・乱数なし。_phase_indoor は _apply の後に走るので
+    #    使うのは前 step の遭遇=1-step ラグ)。変えるのは相手選択のみ=hearer 集合・会話発生・
+    #    LLM 呼数は不変(co-location 変化系の正契約。呼数の k 不変性は compute_matched で担保)。
+    #    OFF=返答相手は従来(nearest/closeness)=ゴールデン L1 バイト一致。
+    pairing: false
   tracks:                             # 記録サイドカー(indoor.enabled とは独立のサブトグル)
     enabled: false                    # true で indoor_tracks_*.parquet(秒スケール軌跡+遭遇)を書く
+  los:                                # ★B3b 屋内知覚の壁 LOS ゲート(擬似視覚=区画粒度の同席文脈)
+    # ON 時: 発火プロンプトの同席リスト(近傍リスト)を屋内実座標 ind_x/ind_y の距離上限+間仕切り壁
+    #   LOS(vision.IndoorLOSOccluder=segment_blocked)で絞る(同一(建物,階)スコープのまま=構造不変)。
+    #   壁で遮られた/遠すぎる相手を「同席文脈」から外す=区画粒度の知覚。プロンプト文言テンプレは不変・
+    #   同席リストの中身だけが変わる(co-location 契約)。発火判断・返答権・hearer 集合はゲートしない
+    #   =LLM 呼数不変。壁は IndoorSpace のキャッシュ壁を使う。OFF=同席リスト従来=バイト一致。
+    enabled: false
+    max_dist_m: 15.0                  # 同席文脈に残す屋内での上限距離 [m](0=距離ゲート無効=壁 LOS のみ)
 
 # ---- 経済 v0(賃金+消費+バイト+心理接続。ユーザー決定 2026-07-05)----
 # 職業→賃金カテゴリ・持ち金・バイトの写像は src/society/economy.py(persona/sim 側)。

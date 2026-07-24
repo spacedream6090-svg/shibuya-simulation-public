@@ -271,8 +271,135 @@ def build_rail_lines(city: dict, transit: dict) -> list:
     return out
 
 
+# ============================================================ 屋内ミクロ(B5 セマンティックズーム)
+# 「space_move(L1)/ indoor_tracks サイドカーが有るラン=indoor ON」の時だけ、ビューアへ屋内ミクロ
+# データを埋め込む(セマンティックズームで建物内フロア平面+実座標エージェントを描く材料)。無い
+# 旧ランには一切足さない=out 不変=ビューア再生成でバイト同一(communities/lens と同型の後方互換)。
+# 埋め込む3点: (1) floorSpecs=data/floor_layouts.json の match/shops/zone_mix(JS が n_override を
+# シムと同一規則で再現=間取りパリティ)。(2) spaceMoves=区画遷移 [step, agent_idx, w, to_zone](JS が
+# carry-forward で現在区画を復元→実座標配置)。(3) contacts=遭遇の短命ハイライト。--indoor-moves の
+# 時だけ (4) tracks=秒スケール歩行軌跡ポリライン(サイズガード付き)。
+_INDOOR_MOVES_MAX_DAYS = 7          # 屋内軌跡ポリラインを埋め込むランの上限日数(それ超は note のみ)
+_INDOOR_MOVES_MAX_PTS = 50000       # 埋め込む軌跡点の総上限(超過は決定論間引き=silent cap 禁止)
+
+
+def _load_floor_specs_for_viewer(cfg) -> list:
+    """data/floor_layouts.json を JS 用に最小化(match + floors[f, use, shops, zone_mix])。
+
+    Python indoor.spec_floor / vision.building_layout の n_override 規則(shops>0 → shops、無ければ
+    zone_mix 合計、無ければ None=間取り正典)を JS が同一に再現するための素材。幾何に不要な anchors 等は
+    落とす。ファイル不在なら []=JS 側は n_override なし(=従来 floorLayout と同一)。"""
+    path = None
+    try:
+        path = (cfg.get("indoor", {}) or {}).get("floor_layouts_path")
+    except Exception:
+        path = None
+    p = Path(path or "data/floor_layouts.json")
+    if not p.is_absolute():
+        p = REPO_ROOT / p
+    if not p.exists():
+        return []
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    out = []
+    for rec in raw.get("buildings", []):
+        floors = []
+        for fl in rec.get("floors", []):
+            e = {"f": fl.get("f"), "use": fl.get("use")}
+            if fl.get("shops"):
+                e["shops"] = int(fl["shops"])
+            if fl.get("zone_mix"):
+                e["zone_mix"] = {k: int(v) for k, v in fl["zone_mix"].items()}
+            floors.append(e)
+        out.append({"match": list(rec.get("match", [])), "floors": floors})
+    return out
+
+
+def _build_indoor_tracks(samples_path: Path, idx: dict, bld_idx: dict,
+                         n_steps: int) -> tuple[str, list | None]:
+    """indoor_tracks_samples.parquet → (agent, building, floor) 別の歩行軌跡ポリライン。
+
+    7日超のランは埋め込まず note だけ返す(HTML 肥大ガード)。総点数が上限超なら決定論間引き
+    (stride 抽出)して note に明記(silent cap 禁止)。t_s=サブステップ秒(step0 起点の秒)。"""
+    if n_steps > _INDOOR_MOVES_MAX_DAYS * 144:
+        return (f"屋内軌跡ポリラインは7日以下のランのみ埋込(このランは {n_steps} step="
+                f"約{n_steps // 144}日)=非表示", None)
+    rows = pq.read_table(samples_path).to_pylist()
+    groups: dict[tuple, list] = {}
+    for r in rows:
+        aid = r["agent_id"]
+        bi = bld_idx.get(r["building"])
+        if aid not in idx or bi is None:
+            continue
+        groups.setdefault((idx[aid], bi, int(r["floor"])), []).append(
+            (round(float(r["t_s"]), 1), round(float(r["x"]), 1),
+             round(float(r["y"]), 1)))
+    total = sum(len(v) for v in groups.values())
+    stride, note = 1, ""
+    if total > _INDOOR_MOVES_MAX_PTS:
+        stride = -(-total // _INDOOR_MOVES_MAX_PTS)      # ceil
+        note = f"屋内軌跡 {total} 点が上限 {_INDOOR_MOVES_MAX_PTS} 超 → 1/{stride} に間引き表示"
+    tracks = []
+    for (ai, bi, fl), pts in groups.items():
+        pts.sort()
+        if stride > 1:
+            pts = pts[::stride]
+        if len(pts) < 2:
+            continue
+        tracks.append({"a": ai, "w": 1000 + bi * 100 + fl, "pts": pts})
+    return (note, tracks)
+
+
+def build_indoor_data(events: list, idx: dict, bld_idx: dict, run_dir: Path,
+                      n_steps: int, cfg: dict, include_moves: bool) -> dict | None:
+    """屋内ミクロ埋め込み(indoor ON のランのみ非 None)。無い旧ランは None=out 不変=バイト同一。"""
+    space_moves: list = []
+    has_sm = False
+    for e in events:
+        if e["kind"] != "space_move":
+            continue
+        has_sm = True
+        aid = e["agent_id"]
+        if aid not in idx:
+            continue
+        p = json.loads(e["payload"]) if e["payload"] else {}
+        bi = bld_idx.get(p.get("building"))
+        if bi is None:
+            continue
+        space_moves.append([int(e["step"]), idx[aid],
+                            1000 + bi * 100 + int(p.get("floor", 1)),
+                            int(p.get("to_zone", -1))])
+    samples_path = run_dir / "indoor_tracks_samples.parquet"
+    contacts_path = run_dir / "indoor_tracks_contacts.parquet"
+    if not (has_sm or samples_path.exists()):
+        return None                                       # indoor OFF の旧ラン=埋め込みなし
+    data: dict = {"floorSpecs": _load_floor_specs_for_viewer(cfg),
+                  "spaceMoves": space_moves}
+    if contacts_path.exists():
+        contacts = []
+        for r in pq.read_table(contacts_path).to_pylist():
+            bi = bld_idx.get(r["building"])
+            ia, ib = idx.get(r["id_a"]), idx.get(r["id_b"])
+            if bi is None or ia is None or ib is None:
+                continue
+            contacts.append([int(r["t_s"] // (STEP_MINUTES * 60)),
+                            1000 + bi * 100 + int(r["floor"]), ia, ib])
+        if contacts:
+            data["contacts"] = contacts
+    if include_moves and samples_path.exists():
+        note, tracks = _build_indoor_tracks(samples_path, idx, bld_idx, n_steps)
+        if tracks:
+            data["tracks"] = tracks
+        if note:
+            data["tracksNote"] = note
+    return data
+
+
 def build_data(run_dir: Path, include_traffic: bool = True,
-               start_min: int | None = None) -> dict:
+               start_min: int | None = None,
+               include_moves: bool = False) -> dict:
     events = pq.read_table(run_dir / "l1_events.parquet").to_pylist()
     n_steps = max(e["step"] for e in events) + 1
 
@@ -579,6 +706,10 @@ def build_data(run_dir: Path, include_traffic: bool = True,
     struct = load_structure(run_dir)
     if struct is not None:
         out["structure"] = struct
+    # 屋内ミクロ(B5): space_move / indoor_tracks が有るランだけ埋め込む。無ければ out 不変=バイト同一。
+    ind = build_indoor_data(events, idx, bld_idx, run_dir, n_steps, cfg, include_moves)
+    if ind is not None:
+        out.update(ind)
     return out
 
 
@@ -1319,6 +1450,259 @@ function drawFloor(){
 """
 
 
+# ============================================================ 屋内セマンティックズーム(B5)
+# space_move / indoor_tracks が有るラン「だけ」main() が __INDOOR_JS__ に注入する追加 JS。
+#  - floorLayout を n_override 対応版へ差し替え(D.floorSpecs=floor_layouts の match/shops/zone_mix を
+#    Python indoor.spec_floor / vision.building_layout と同一規則で読み、cols 前に乱数を消費しない
+#    POI 経路と同型で n=min(12,shops|Σzone_mix) 分割=シム⇄ビューアの間取りパリティ)。
+#  - cam.s≥2.6 で地図上に建物フロア平面(floorLayout)を直接描画+実座標エージェント(space_move の
+#    carry-forward 区画)。±15% クロスフェード・建物ごとの表示階チップ(canvas 上の小 UI・クリックで切替)。
+#  - --indoor-moves の時は歩行軌跡ポリライン(D.tracks)を再生、遭遇(D.contacts)は短命ハイライト。
+# 旧ラン(space_move 無し)では main() が __INDOOR_JS__/__INDOOR_HOOK__/__INDOOR_CLICK__ を空文字へ
+# 置換するため、生成 HTML は従来とバイト同一(communities/lens と同型の後方互換)。
+_INDOOR_JS = r"""
+// ---- floor_layouts spec 引き(Python indoor._match と同一規約: 部分一致・双方向)----
+function izSpecFloor(b, f){
+  const specs=D.floorSpecs; if(!specs) return null;
+  const name=(b.name||b.id||''); if(!name) return null;           // 空名は override 対象外(Python spec_floor と同)
+  for(const rec of specs){
+    if((rec.match||[]).some(m=> m && (name.indexOf(m)>=0 || m.indexOf(name)>=0))){
+      for(const fl of (rec.floors||[])) if((fl.f|0)===(f|0)) return fl;
+      return null;                                                // 建物一致・その階の spec 無し
+    }
+  }
+  return null;
+}
+// 区画数 override: shops(明示区画数)> zone_mix 合計 > null(=間取り正典の既定)。Python indoor._build と同順。
+function izNOverride(b, f){
+  const sp=izSpecFloor(b, f); if(!sp) return null;
+  if(sp.shops) return sp.shops|0;
+  if(sp.zone_mix){ let s=0; for(const k in sp.zone_mix) s+=(sp.zone_mix[k]|0); return s; }
+  return null;
+}
+// floorLayout を n_override 対応へ差し替え(旧 floorLayout と幾何完全一致 + override 分岐を追加)。
+// override 経路は POI 経路と同型に cols 前で乱数を1つも消費しない=vision.building_layout(n_override)と
+// ビット一致(seed/_rng/_cols は既に vision と回帰済み)。ラベルは spec.use のプールを cols 前の乱数
+// 非消費で敷く(幾何に無影響=表示専用)。
+floorLayout = function(b, f){
+  const fp=b.fp, xs=fp.map(p=>p[0]), ys=fp.map(p=>p[1]);
+  const bbox={x0:Math.min(...xs), x1:Math.max(...xs), y0:Math.min(...ys), y1:Math.max(...ys)};
+  const w=bbox.x1-bbox.x0, h=bbox.y1-bbox.y0, cx=(bbox.x0+bbox.x1)/2, cy=(bbox.y0+bbox.y1)/2;
+  const rng=_rng(_hash(b.id||b.name||'b')+(f+50)*2654435761>>>0);
+  const guide=b.guide? b.guide.find(x=>x.f===f):null;
+  const fPois=(b.pois||[]).filter(p=>p.f===f);
+  let items=[];
+  const nOv=izNOverride(b, f);
+  if(nOv!==null){                             // ① override(floor_layouts の shops/zone_mix)=最優先
+    let n=Math.min(12, nOv); if(n<=0) n=1;
+    const sp=izSpecFloor(b, f);
+    const use=_CATMAP[sp&&sp.use]||'generic', pool=_POOL[use]||_POOL.generic;
+    for(let i=0;i<n;i++) items.push({label: pool[i%pool.length], cat: use});   // ラベル=cols 前に乱数非消費
+  } else if(fPois.length){                     // ② POI 経路(従来どおり・乱数非消費)
+    items=fPois.slice(0,10).map(p=>({label:p.n, cat:_CATMAP[p.c]||'shop'}));
+  }
+  if(!items.length){                           // ③ 用途プール(従来どおり・乱数消費)
+    const use=guide? (_CATMAP[guide.use]||'generic')
+      : (b.kind==='office'?'office':b.kind==='station'?'station':b.kind==='retail'?'shop':'generic');
+    const pool=_POOL[use]||_POOL.generic;
+    const n=2+Math.floor(rng()*Math.min(4, pool.length-1));
+    const used=new Set();
+    for(let i=0;i<n;i++){ let nm; let g=0; do{ nm=pool[Math.floor(rng()*pool.length)]; }while(used.has(nm)&&g++<8);
+      used.add(nm); items.push({label:nm, cat:use}); } }
+  const n=items.length;
+  const horiz = w>=h;
+  const band = horiz? h*0.09 : w*0.09;
+  const zones=[]; const nA=Math.ceil(n/2), nB=n-nA;
+  if(horiz){
+    const yC0=cy-band, yC1=cy+band;
+    _cols(bbox.x0,bbox.x1,nA,rng).forEach((c,i)=>zones.push({r:[c[0],yC1,c[1],bbox.y1], ...items[i]}));
+    _cols(bbox.x0,bbox.x1,nB,rng).forEach((c,i)=>zones.push({r:[c[0],bbox.y0,c[1],yC0], ...items[nA+i]}));
+    var corridor=[bbox.x0,yC0,bbox.x1,yC1];
+  } else {
+    const xC0=cx-band, xC1=cx+band;
+    _cols(bbox.y0,bbox.y1,nA,rng).forEach((c,i)=>zones.push({r:[xC1,c[0],bbox.x1,c[1]], ...items[i]}));
+    _cols(bbox.y0,bbox.y1,nB,rng).forEach((c,i)=>zones.push({r:[bbox.x0,c[0],xC0,c[1]], ...items[nA+i]}));
+    var corridor=[xC0,bbox.y0,xC1,bbox.y1];
+  }
+  const cs=Math.min(w,h)*0.13;
+  const core=[cx-cs/2, cy-cs/2, cx+cs/2, cy+cs/2];
+  return {bbox, corridor, core, zones, horiz};
+};
+
+// ---- space_move の carry-forward で現在区画を復元(実データからの実座標配置)----
+let _izMoves=null;                                // agent_idx -> [[step,w,zone]...](step 昇順)
+function izMovesFor(i){
+  if(_izMoves===null){ _izMoves={};
+    for(const m of (D.spaceMoves||[])){ (_izMoves[m[1]]||(_izMoves[m[1]]=[])).push([m[0],m[2],m[3]]); }
+  }
+  return _izMoves[i]||[];
+}
+// agent i の s0 時点の区画(現在位置 w に一致する直近の space_move の to_zone)。無ければ -1(=未確定)。
+function izZoneOf(i, s0, w){
+  const mv=izMovesFor(i); let z=-1;
+  for(let k=0;k<mv.length;k++){ if(mv[k][0]>s0) break; if(mv[k][1]===w) z=mv[k][2]; }
+  return z;
+}
+// 区画内の決定論点(内側20%余白・hash ジッタ)。sim の _indoor_zone_point は blake2b で JS 再現不可の
+// ため mulberry32 で近似(実区画=実データ、区画内の正確な点だけは再現しない=正直な妥協)。
+function izZonePoint(r, id){
+  const rr=_rng(_hash('iz'+id)); const mx=(r[2]-r[0])*0.2, my=(r[3]-r[1])*0.2;
+  const u=rr(), v=rr();
+  return [r[0]+mx+u*Math.max(0,(r[2]-r[0]-2*mx)), r[1]+my+v*Math.max(0,(r[3]-r[1]-2*my))];
+}
+
+const IZ_FULL=2.6;                                // フロア平面が完全に立つ cam.s(±15% でクロスフェード)
+let izFloorSel={};                                // bi -> ユーザ選択階(未選択は自動=最多在館階)
+let izChips=[];                                   // 表示階チップの当たり矩形(screen px・毎フレーム再構築)
+let _izCurF={};                                   // bi -> 現在表示中の階(▲▼ ナビの起点)
+let _izScreen={};                                 // i -> [sx,sy] この階に描いたエージェントの画面位置(遭遇線用)
+function izAlpha(){ return Math.max(0, Math.min(1, (cam.s - IZ_FULL*0.85)/(IZ_FULL*0.30))); }
+
+// (bi,floor) 別の在館人数(この step)。selF 自動選択とチップの人数表示に使う。
+function izOccByFloor(pos){
+  const occ={};
+  for(let i=0;i<pos.length;i++){ const w=pos[i][2]; if(w<1000) continue;
+    const bi=Math.floor((w-1000)/100), fl=w%100;
+    (occ[bi]||(occ[bi]={}))[fl]=(occ[bi][fl]||0)+1; }
+  return occ;
+}
+// 建物 b の全階に在館人数を重ねた {floor: 人数}(未在館階は 0)。表示階チップ用。
+function izFloorsFor(b, occ){
+  const out={}; for(const f of floorList(b)) out[f]=0;
+  if(occ) for(const fl in occ) out[+fl]=occ[fl];
+  return out;
+}
+// 表示階の決定: ユーザ選択 > 最多在館階(同数は小階)> 1F(無ければ最小階)。
+function izAutoFloor(floors, occ){
+  if(occ){ let selF=null, best=-1;
+    for(const fl in occ){ const c=occ[fl], fn=+fl;
+      if(c>best || (c===best && (selF===null || fn<selF))){ best=c; selF=fn; } }
+    if(selF!==null) return selF; }
+  const fs=Object.keys(floors).map(Number).sort((a,c)=>a-c);
+  return fs.indexOf(1)>=0? 1 : (fs.length? fs[0] : 1);
+}
+// draw() 末尾フック: cam.s≥閾値で「ビューポート内の建物」にフロア平面(floorLayout)+実座標
+// エージェントを重ねる=マクロを注視するとミクロ(間取り)が現れる。小さすぎる建物は詳細を出さない
+// (画面上のフットプリントが小さい=details-on-demand の粒度制御)。±15% クロスフェード。
+function indoorOverlay(t, s0, pos){
+  izChips=[];
+  const a=izAlpha(); if(a<=0) return;
+  const T=themeAt(t), dark=T.k>0.5;
+  const occBF=izOccByFloor(pos);
+  ctx.save(); ctx.globalAlpha=a;
+  D.buildings.forEach((b,bi)=>{
+    const [sx,sy]=tf(b.cx,b.cy);
+    if(sx<-160||sy<-160||sx>cv.width+160||sy>cv.height+160) return;
+    // 画面上フットプリントの対角がこの閾値未満の建物は詳細を描かない(ノイズ抑制)。
+    const dpx=Math.hypot(b.fp.reduce((m,p)=>Math.max(m,p[0]),-1e9)-b.fp.reduce((m,p)=>Math.min(m,p[0]),1e9),
+                         b.fp.reduce((m,p)=>Math.max(m,p[1]),-1e9)-b.fp.reduce((m,p)=>Math.min(m,p[1]),1e9))*cam.s;
+    if(dpx<70*devicePixelRatio && !occBF[bi]) return;
+    const floors=izFloorsFor(b, occBF[bi]);
+    let selF=izFloorSel[bi];
+    if(selF===undefined || !(selF in floors)) selF=izAutoFloor(floors, occBF[bi]);
+    _izCurF[bi]=selF;
+    izDrawFloorPlan(b, bi, selF, s0, t, pos, dark);
+    izDrawChips(bi, floors, selF, sx, sy, dark);
+  });
+  ctx.restore();
+}
+
+function izDrawFloorPlan(b, bi, fl, s0, t, pos, dark){
+  const lay=floorLayout(b, fl);
+  const rp=(r)=>{ const [ax,ay]=tf(r[0],r[1]), [bx,by]=tf(r[2],r[3]);
+    return [Math.min(ax,bx),Math.min(ay,by),Math.abs(bx-ax),Math.abs(by-ay)]; };
+  // 外壁 footprint で clip
+  ctx.save();
+  ctx.beginPath(); b.fp.forEach((p,j)=>{ const [x,y]=tf(p[0],p[1]); j?ctx.lineTo(x,y):ctx.moveTo(x,y); }); ctx.closePath();
+  ctx.fillStyle=dark?'rgba(19,26,35,.96)':'rgba(245,247,249,.96)'; ctx.fill(); ctx.clip();
+  ctx.font=`${9.5*devicePixelRatio}px system-ui,sans-serif`; ctx.textAlign='center';
+  for(const z of lay.zones){ const hueV=_ZONE_HUE[z.cat]??210; const [x,y,w,h]=rp(z.r);
+    ctx.fillStyle=`hsla(${hueV} ${dark?42:56}% ${dark?28:80}% / ${dark?.62:.85})`; ctx.fillRect(x,y,w,h);
+    ctx.strokeStyle=dark?'rgba(255,255,255,.1)':'rgba(60,72,90,.28)'; ctx.lineWidth=1; ctx.strokeRect(x,y,w,h);
+    if(w>34*devicePixelRatio && h>13*devicePixelRatio){
+      ctx.fillStyle=dark?'rgba(232,234,237,.85)':'rgba(40,48,60,.85)';
+      const lb=z.label && z.label.length>8? z.label.slice(0,7)+'…':(z.label||'');
+      ctx.fillText(lb, x+w/2, y+h/2+3*devicePixelRatio); } }
+  { const [x,y,w,h]=rp(lay.corridor); ctx.fillStyle=dark?'rgba(200,210,225,.09)':'rgba(120,135,155,.15)'; ctx.fillRect(x,y,w,h); }
+  { const [x,y,w,h]=rp(lay.core); ctx.fillStyle=dark?'#26313f':'#d7dee6'; ctx.fillRect(x,y,w,h);
+    ctx.strokeStyle=dark?'rgba(255,255,255,.18)':'rgba(60,72,90,.4)'; ctx.strokeRect(x,y,w,h); }
+  ctx.restore();
+  // 外壁ライン
+  ctx.beginPath(); b.fp.forEach((p,j)=>{ const [x,y]=tf(p[0],p[1]); j?ctx.lineTo(x,y):ctx.moveTo(x,y); }); ctx.closePath();
+  ctx.strokeStyle=dark?'rgba(150,161,178,.65)':'rgba(60,72,90,.55)'; ctx.lineWidth=1.6*devicePixelRatio; ctx.stroke();
+  // 歩行軌跡ポリライン(--indoor-moves)+ 遭遇の短命ハイライトはエージェント描画の下地に敷く
+  const w=1000+bi*100+fl;
+  izDrawTracks(w, t);
+  // 実座標エージェント(現在区画の centroid 付近・未確定は従来 _agentSpot へフォールバック)
+  _izScreen={};
+  for(let i=0;i<D.ids.length;i++){ if(pos[i][2]!==w) continue;
+    const zi=izZoneOf(i, s0, w); let wx, wy;
+    if(zi>=0 && zi<lay.zones.length){ const sp=izZonePoint(lay.zones[zi].r, D.ids[i]); wx=sp[0]; wy=sp[1]; }
+    else { const sp=_agentSpot(b, fl, D.ids[i], lay, t); wx=sp[0]; wy=sp[1]; }
+    const [x,y]=tf(wx,wy); _izScreen[i]=[x,y];
+    ctx.beginPath(); ctx.arc(x,y,4.5*devicePixelRatio,0,7); ctx.fillStyle=colorOf(i,s0); ctx.fill();
+    ctx.strokeStyle='#ffd166'; ctx.lineWidth=1.3*devicePixelRatio; ctx.stroke(); }
+  izDrawContacts(w, s0, t);
+}
+
+// 表示階チップ(建物中心の右に ▲ / 現在階+人数 / ▼ の3セル縦帯。高層でも一定サイズ)。
+// クリックで表示階を切替(高さに依らず使える=up/down で floorList を辿る)。α はクロスフェード追従。
+function izDrawChips(bi, floors, selF, sx, sy, dark){
+  const cw=30*devicePixelRatio, ch=15*devicePixelRatio, gap=2*devicePixelRatio;
+  const x0=sx+10*devicePixelRatio, y0=sy-(3*(ch+gap))/2;
+  const occN=floors[selF]||0;
+  const lbl=(selF<0?'B'+(-selF):selF+'F')+(occN?(' ·'+occN):'');
+  const cells=[['▲','up',false],[lbl,'lbl',true],['▼','down',false]];
+  ctx.font=`${8.5*devicePixelRatio}px system-ui,sans-serif`; ctx.textAlign='center';
+  cells.forEach((cell,k)=>{ const y=y0+k*(ch+gap), isLbl=cell[2];
+    ctx.fillStyle= isLbl? (dark?'#ffd166':'#1a73e8') : (dark?'rgba(20,26,35,.85)':'rgba(255,255,255,.9)');
+    ctx.beginPath(); ctx.roundRect(x0,y,cw,ch,3*devicePixelRatio); ctx.fill();
+    ctx.strokeStyle=dark?'rgba(255,255,255,.2)':'rgba(60,72,90,.35)'; ctx.lineWidth=1; ctx.stroke();
+    ctx.fillStyle= isLbl? (dark?'#101418':'#fff') : (dark?'#c8ccd2':'#3a424e');
+    ctx.fillText(cell[0], x0+cw/2, y+ch/2+3*devicePixelRatio);
+    izChips.push({x:x0,y:y,w:cw,h:ch,bi:bi,act:cell[1]}); });
+}
+
+// 歩行軌跡: 表示階のポリラインを淡く敷き、現在 sim 秒(t*600)がその時間帯なら明点を進める。
+function izDrawTracks(w, t){
+  if(!D.tracks) return; const nowS=t*600;
+  for(const tk of D.tracks){ if(tk.w!==w) continue; const pts=tk.pts; if(pts.length<2) continue;
+    ctx.beginPath(); pts.forEach((p,j)=>{ const [x,y]=tf(p[1],p[2]); j?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+    ctx.strokeStyle='rgba(120,180,250,.35)'; ctx.lineWidth=1.4*devicePixelRatio; ctx.stroke();
+    if(nowS>=pts[0][0] && nowS<=pts[pts.length-1][0]){
+      let px=pts[0][1], py=pts[0][2];
+      for(let j=1;j<pts.length;j++){ if(pts[j][0]>=nowS){ const t0=pts[j-1][0], t1=pts[j][0];
+        const g=t1>t0? (nowS-t0)/(t1-t0):0;
+        px=pts[j-1][1]+(pts[j][1]-pts[j-1][1])*g; py=pts[j-1][2]+(pts[j][2]-pts[j-1][2])*g; break; } }
+      const [x,y]=tf(px,py); ctx.beginPath(); ctx.arc(x,y,3*devicePixelRatio,0,7);
+      ctx.fillStyle='#60a5fa'; ctx.fill(); } }
+}
+// 遭遇(coplace/meeting): この step・この階の接触ペアを短命ハイライト(2エージェント間の脈打つ線)。
+function izDrawContacts(w, s0, t){
+  if(!D.contacts) return; const pulse=0.4+0.6*Math.abs(Math.sin(t*3.0));
+  for(const c of D.contacts){ if(c[0]!==s0 || c[1]!==w) continue;
+    const pa=_izScreen[c[2]], pb=_izScreen[c[3]]; if(!pa||!pb) continue;
+    ctx.strokeStyle=`rgba(255,140,90,${(0.35+0.4*pulse).toFixed(3)})`; ctx.lineWidth=2*devicePixelRatio;
+    ctx.beginPath(); ctx.moveTo(pa[0],pa[1]); ctx.lineTo(pb[0],pb[1]); ctx.stroke();
+    const mx=(pa[0]+pb[0])/2, my=(pa[1]+pb[1])/2;
+    ctx.beginPath(); ctx.arc(mx,my,(3+3*pulse)*devicePixelRatio,0,7);
+    ctx.fillStyle=`rgba(255,160,100,${(0.5*pulse).toFixed(3)})`; ctx.fill(); }
+}
+// clickAt フック: フロア平面モードで表示階チップを最優先ヒットテスト(建物/エージェント選択より先)。
+// ▲/▼ は floorList を1つ辿る(現在表示階 _izCurF から相対移動)。ラベルはヒット吸収のみ。
+function izClickChips(px, py){
+  for(const c of izChips){ if(!(px>=c.x&&px<=c.x+c.w&&py>=c.y&&py<=c.y+c.h)) continue;
+    if(c.act==='lbl') return true;
+    const b=D.buildings[c.bi]; if(!b) return true;
+    const fs=floorList(b); const cur=(c.bi in _izCurF)? _izCurF[c.bi] : (fs[0]||1);
+    let k=fs.indexOf(cur); if(k<0) k=0;
+    k=Math.max(0, Math.min(fs.length-1, k+(c.act==='up'?1:-1)));
+    izFloorSel[c.bi]=fs[k]; return true; }
+  return false;
+}
+"""
+
+
 # ============================================================ コミュニティ色分け
 # 第18バッチ①: runs/<name>/communities.json が「有る時だけ」注入する追加 JS。
 # communityColor(i, s0) は再生中の step s0 が属する窓の agent→community 対応を引き、
@@ -1879,7 +2263,7 @@ function draw(){
       ctx.strokeStyle='rgba(0,0,0,.18)';
       ctx.beginPath(); ctx.roundRect(x-tw/2,y-34*devicePixelRatio,tw,bh,7*devicePixelRatio); ctx.fill(); ctx.stroke();
       ctx.fillStyle= b.k==='coin'? '#101418':TH.bubbleInkC; ctx.textAlign='center'; ctx.fillText(text,x,y-20*devicePixelRatio); } }
-  if(focusId!==null){ const i=iOf[focusId]; const p=pos[i];
+__INDOOR_HOOK__  if(focusId!==null){ const i=iOf[focusId]; const p=pos[i];
     if(p[2]!==-1){ cam.cx+=(p[0]-cam.cx)*.08; cam.cy+=(p[1]-cam.cy)*.08; } }
   let nSt=0,nIn=0,nOut=0,nSl=0;
   pos.forEach(p=>{ const w=p[2]; w===0?nSt++:w===-1?nOut++:w===-2?nSl++:nIn++; });
@@ -1901,7 +2285,7 @@ function clickAt(e){
   if (e.target !== cv) return;
   const rect=cv.getBoundingClientRect();
   const px=(e.clientX-rect.left)*devicePixelRatio, py=(e.clientY-rect.top)*devicePixelRatio;
-  const pos=posAt(cur); let best=null, bd=18*devicePixelRatio;
+__INDOOR_CLICK__  const pos=posAt(cur); let best=null, bd=18*devicePixelRatio;
   for(let i=0;i<pos.length;i++){ if(pos[i][2]!==0&&pos[i][2]!==-2) continue;
     const [sx,sy]=tf(pos[i][0],pos[i][1]); const d=Math.hypot(sx-px,sy-py);
     if(d<bd){ bd=d; best=D.ids[i]; } }
@@ -1938,7 +2322,7 @@ function renderFocus(){ const el=document.getElementById('focusCard');
 }
 
 // ---- フロアビュー(間取り生成+屋内エージェント)は共用モジュールを注入 ----
-__FLOOR_JS__
+__FLOOR_JS____INDOOR_JS__
 
 // 連続時刻 t を rAF で進める(既定=再生・終端で先頭へループ=街が生き続ける)
 function loop(ts){
@@ -2336,7 +2720,7 @@ __ERR_JS__
 const D = __DATA__;
 __TIME_JS__
 __THEME_JS__
-__FLOOR_JS__
+__FLOOR_JS____INDOOR_JS__
 const seek=document.getElementById('seek'); seek.max=D.nSteps-1;
 let cur=D.nSteps-1, playing=false, lastT=0, tab='feed', dmSel=null, vocabSel=null;
 seek.value=cur;
@@ -3079,7 +3463,10 @@ def main() -> None:
     # 長期ラン(例: 100日=14400step)は背景交通の軌跡だけで数百MBになりブラウザで開けない。
     # --no-traffic で背景交通レイヤーを外す(エージェント・分析・ネットは全て従来どおり)。
     include_traffic = "--no-traffic" not in flags
-    data = build_data(run_dir, include_traffic=include_traffic, start_min=start_min)
+    # 屋内セマンティックズーム(B5): --indoor-moves で歩行軌跡ポリラインも埋め込む(7日以下・サイズガード)。
+    include_moves = "--indoor-moves" in flags
+    data = build_data(run_dir, include_traffic=include_traffic, start_min=start_min,
+                      include_moves=include_moves)
     payload = json.dumps(data, ensure_ascii=False)
     # 第18バッチ①: communities.json が有る時だけ色分け「コミュニティ」を追加。
     # 無ければ3トークンとも空文字へ→ MAP_HTML はバイト同一(後方互換の合格条件)。
@@ -3114,6 +3501,12 @@ def main() -> None:
         lens_js += _DEV_JS
     if has_structure:                      # 社会構造タブ JS も独立に注入(structRender を定義)
         lens_js += _STRUCT_JS
+    # 屋内セマンティックズーム(B5): floorSpecs(=indoor ラン)が有る時「だけ」JS/フック/クリックを注入。
+    # 無ければ3トークンとも空文字→ MAP_HTML/DASH_HTML は従来とバイト同一(後方互換の合格条件)。
+    has_indoor = "floorSpecs" in data
+    indoor_js = _INDOOR_JS if has_indoor else ""
+    indoor_hook = "  indoorOverlay(t, s0, pos);\n" if has_indoor else ""
+    indoor_click = "  if(izClickChips(px,py)) return;\n" if has_indoor else ""
     for name, template in (("viewer.html", MAP_HTML), ("dashboard.html", DASH_HTML)):
         html = (template
                 .replace("__COMMUNITY_OPTION__", comm_option)
@@ -3128,6 +3521,9 @@ def main() -> None:
                 .replace("__TIME_JS__", _TIME_JS)
                 .replace("__THEME_JS__", _THEME_JS)
                 .replace("__FLOOR_JS__", _FLOOR_JS)
+                .replace("__INDOOR_JS__", indoor_js)
+                .replace("__INDOOR_HOOK__", indoor_hook)
+                .replace("__INDOOR_CLICK__", indoor_click)
                 .replace("__RUN__", data["runName"])
                 .replace("__DATA__", payload))
         out = run_dir / name

@@ -362,6 +362,7 @@ def build_engine_cfg(raw) -> dict:
     meeting = _as_map(r.get("meeting"))
     enc = _as_map(r.get("encounter"))
     tracks = _as_map(r.get("tracks"))
+    los = _as_map(r.get("los"))
 
     def _amap(m) -> dict:
         return {str(k): [str(x) for x in _as_list(v)] for k, v in _as_map(m).items()}
@@ -387,6 +388,15 @@ def build_engine_cfg(raw) -> dict:
             "window_min": [win[0], win[1]],
             "meeting_types": mtypes,
         },
-        "encounter": {"bystander_cap": max(0, int(enc.get("bystander_cap", 24) or 0))},
+        "encounter": {
+            "bystander_cap": max(0, int(enc.get("bystander_cap", 24) or 0)),
+            # B3b: 直近(前 step)の屋内遭遇ペアを対面会話の返答相手選択で優先する動力学接続。
+            "pairing": bool(enc.get("pairing", False)),
+        },
         "tracks": {"enabled": bool(tracks.get("enabled", False))},
+        # B3b: 屋内知覚の壁 LOS ゲート(擬似視覚=同席文脈=発火プロンプトの近傍リストを区画粒度に絞る)。
+        "los": {
+            "enabled": bool(los.get("enabled", False)),
+            "max_dist_m": max(0.0, float(los.get("max_dist_m", 0.0) or 0.0)),
+        },
     }
