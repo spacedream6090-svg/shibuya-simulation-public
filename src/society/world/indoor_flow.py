@@ -42,6 +42,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from society.world import vision
 from society.world.sfm_core import Crowd, CUTOFF_M, _EXP_ARG_MAX
 
 # ── 屋内拡張の確定パラメータ ──
@@ -119,28 +120,27 @@ def _point_seg(px, py, ax, ay, bx, by):
 # ドア開口の導出(vision._walls_from_layout が開ける開口を独立再現する自己完結ヘルパ)
 # ─────────────────────────────────────────────────────────────────────────────
 def doors_from_layout(layout: dict) -> list:
-    """間取り → 各 zone の廊下側の辺の中央にあるドア開口の中心点 [(x,y), …]。
+    """間取り → 各 zone の廊下側ドア開口の中心点 [(x,y), …]。
 
-    vision._walls_from_layout の開口位置(zone の廊下側辺の中央・半幅 min(0.8,幅*0.25))と
-    同じ x/y に開口中心を置く=このドア点を経由すれば開口(壁の隙間)を通る。zone index の順は
-    layout["zones"] と同順(側A[0..nA-1] → 側B[nA..])。B3 で B1 の doors_from_layout に差し替える。
-    """
-    zones = layout["zones"]
-    n_a = layout["nA"]
-    doors = []
-    if layout["horiz"]:
-        _, yc0, _, yc1 = layout["corridor"]
-        for idx, (zx0, _zy0, zx1, _zy1) in enumerate(zones):
-            xm = (zx0 + zx1) / 2.0
-            y = yc1 if idx < n_a else yc0        # 側A=上(通路の上辺 yc1)・側B=下(yc0)
-            doors.append((xm, y))
-    else:
-        xc0, _yc0, xc1, _yc1 = layout["corridor"]
-        for idx, (_zx0, zy0, _zx1, zy1) in enumerate(zones):
-            ym = (zy0 + zy1) / 2.0
-            x = xc1 if idx < n_a else xc0        # 側A=右(通路の右辺 xc1)・側B=左(xc0)
-            doors.append((x, ym))
-    return doors
+    B3 統一: 二重実装を解消し B1 正典(vision.doors_from_layout)へ委譲する。vision 版は
+    [{"zone","x","y","half","axis"}, …] を zone index 昇順(側A[0..nA-1]→側B[nA..])で返す。本層の
+    route_waypoints / integrate_transition は zone index で引ける (x,y) 列を要るので座標だけを射影する
+    (zone 順・x/y は旧自己完結実装と同値=幾何整合・test_indoor_flow はバイト不変)。lay 不正なら []。"""
+    return [(d["x"], d["y"]) for d in vision.doors_from_layout(layout)]
+
+
+def _door_xy(d) -> tuple:
+    """ドア点を (x,y) タプルへ正規化。タプル/リスト(本層)と vision の {"x","y",…} dict の両対応
+    (エンジンは IndoorSpace.doors=vision dict 版をそのまま渡せる=B3 の二重実装統一の受け口)。"""
+    if isinstance(d, dict):
+        return (d["x"], d["y"])
+    return (d[0], d[1])
+
+
+def _core_center(layout: dict) -> tuple:
+    """コア(階段/EV)矩形の中心 (x,y)。階間移動の到着基点(コア手前へ寄せる前段)。"""
+    cx0, cy0, cx1, cy1 = layout["core"]
+    return ((cx0 + cx1) / 2.0, (cy0 + cy1) / 2.0)
 
 
 def _zone_center(layout: dict, idx: int):
@@ -173,28 +173,44 @@ def route_waypoints(layout: dict, doors: list, src_zone, dst_zone,
 
     通常経路(3〜5 点): [src ドア, src 廊下接近点, dst 廊下接近点, dst ドア, dst 内目標]。
     dst_zone が "core"(階段/EV コア)なら [src ドア, src 廊下接近点, コア接近点] の 3 点。
-    重複する連続点は畳む。start(遷移の出発点)は goal 列に含めない(積分の初期位置)。
+    src_zone が "core"(階間移動の到着=別階から目的区画へ)なら [dst 廊下接近点, dst ドア, dst 内目標]
+      =B3 の階間ワープ差替の到着レッグ(新階の廊下に現れて目的区画へ歩く微視軌跡)。
+      【正直な近似(コード註)】簡略間取りではコア(階段/EV)が無開口矩形で廊下芯を塞ぐため、コア中心
+      からの出発は壁に閉じ込められる。ここでは到着レッグを「目的区画の廊下接近点→区画」に限定する
+      (階段/EV の実アクセス点=コア→廊下の脱出経路の厳密化は B3b 送り)。重複連続点は畳む。
 
     walls を渡した場合のみ、連続 waypoint の直線が壁と交差する区間を 0.5m グリッド BFS 距離場
     フォールバックで迂回に差し替える(非凸レイアウト・開口位置ずれ対策)。walls=None なら
     直線 waypoint のまま(直交間取りの正常経路は開口を通るので通常は交差しない)。
     """
-    src_door = tuple(doors[src_zone])
-    src_appr = _corridor_approach(layout, src_door)
-
-    if dst_zone == "core":
-        core_goal = _core_approach(layout, src_door)
-        wps = [src_door, src_appr, core_goal]
-    else:
-        dst_door = tuple(doors[dst_zone])
+    if src_zone == "core":                       # 階間移動の到着レッグ(新階の廊下→目的区画)
+        dst_door = _door_xy(doors[dst_zone])
         dst_appr = _corridor_approach(layout, dst_door)
         dst_target = _zone_center(layout, dst_zone)
-        wps = [src_door, src_appr, dst_appr, dst_door, dst_target]
+        wps = [dst_appr, dst_door, dst_target]
+        anchor_zone = None
+    else:
+        src_door = _door_xy(doors[src_zone])
+        src_appr = _corridor_approach(layout, src_door)
+        if dst_zone == "core":
+            core_goal = _core_approach(layout, src_door)
+            wps = [src_door, src_appr, core_goal]
+        else:
+            dst_door = _door_xy(doors[dst_zone])
+            dst_appr = _corridor_approach(layout, dst_door)
+            dst_target = _zone_center(layout, dst_zone)
+            wps = [src_door, src_appr, dst_appr, dst_door, dst_target]
+        anchor_zone = src_zone
 
     wps = _dedupe(wps)
 
-    if walls:
-        anchor = tuple(start) if start is not None else _zone_center(layout, src_zone)
+    if walls and wps:
+        if start is not None:
+            anchor = tuple(start)
+        elif anchor_zone is not None:
+            anchor = _zone_center(layout, anchor_zone)
+        else:
+            anchor = tuple(wps[0])       # core-src: 先頭 waypoint を anchor(コア中心の閉じ込めを回避)
         wps = _repair_with_bfs(layout, walls, anchor, wps, cell)
     return wps
 
@@ -486,6 +502,32 @@ class IndoorParams:
     arrive_radius: float = 0.5      # waypoint 到達判定半径 [m]
     bfs_cell: float = 0.5           # BFS フォールバック格子 [m]
 
+    @classmethod
+    def from_cfg(cls, sfm) -> "IndoorParams":
+        """conf indoor.sfm(dict/OmegaConf/None)から IndoorParams を組む(既定=現行値=不変)。
+
+        欠けたキーは dataclass 既定へ落ちる(=B2 の確定値)。エンジン配線(B3)がこの1点で接続する
+        =conf を触らないランは現行の積分パラメータと完全同一。"""
+        s = dict(sfm) if sfm else {}
+
+        def _f(key, default):
+            v = s.get(key)
+            return default if v is None else float(v)
+
+        def _i(key, default):
+            v = s.get(key)
+            return default if v is None else int(v)
+
+        d = cls()
+        return cls(dt=_f("dt", d.dt), max_substeps=_i("max_substeps", d.max_substeps),
+                   sample_interval=_i("sample_interval", d.sample_interval),
+                   r_contact=_f("r_contact", d.r_contact),
+                   t_sub_contact=_i("t_sub_contact", d.t_sub_contact),
+                   neighbor_cap=_i("neighbor_cap", d.neighbor_cap),
+                   wall_a=_f("wall_a", d.wall_a), wall_b=_f("wall_b", d.wall_b),
+                   arrive_radius=_f("arrive_radius", d.arrive_radius),
+                   bfs_cell=_f("bfs_cell", d.bfs_cell))
+
 
 # 遷移積分の結果(repr 比較で決定論検証できるよう平明な tuple/list 構造で返す)。
 TransitionResult = namedtuple("TransitionResult", ["samples", "contacts", "n_substeps"])
@@ -516,9 +558,14 @@ def integrate_transition(layout, walls, doors, movers, bystanders, params=None):
             route = [tuple(w) for w in explicit]
             start = tuple(m["start"]) if m.get("start") is not None else (
                 route[0] if route else (0.0, 0.0))
+        elif m["src_zone"] == "core":             # 階間到着: コア接近点(廊下側)から出発
+            # コアは無開口の壁矩形=中心から出発すると閉じ込められる。route[0]=廊下側のコア接近点を
+            # 実際の出発位置にする(BFS anchor はコア中心=route_waypoints 内で最近傍の自由ノードへ寄る)。
+            route = route_waypoints(layout, doors, "core", m["dst_zone"],
+                                    start=None, walls=walls, cell=p.bfs_cell)
+            start = tuple(route[0]) if route else _core_center(layout)
         else:
-            start = (tuple(m["start"]) if m.get("start") is not None
-                     else _zone_center(layout, m["src_zone"]))
+            start = _zone_center(layout, m["src_zone"])
             route = route_waypoints(layout, doors, m["src_zone"], m["dst_zone"],
                                     start=start, walls=walls, cell=p.bfs_cell)
         recs.append({"id": aid, "pos": start, "mover": True, "route": route, "wp": 0,

@@ -235,6 +235,9 @@ register_event_kind("spark_roster", "火種介入の t=0 名簿(選抜 ids/pids�
 #      "chance" のみ・LLM/generate ゼロ増。実装 src/society/chance.py。運/実力分解 audit_uncertainty.LUCK_KINDS
 #      に 1 行接続=監査+ΔR² に自動反映。設計: docs/research/uncertainty-audit.md §4)----
 register_event_kind("chance_event", "生活の偶発事(臨時収入 windfall / 財布紛失 loss / 偶然の出会い encounter){type, amount?, balance?, other?}")
+# ---- 屋内エンジン配線 B3(indoor.enabled ON のみ・既定 OFF=0件。決定論・新 stream "indoor"/"indoor_meet" のみ。
+#      フロア内の区画遷移=step 粒度の屋内ミクロ移動。秒スケール軌跡は L1 に入れず tracks サイドカーへ)----
+register_event_kind("space_move", "屋内フロア内の区画遷移(markov 回遊/会議/階間到着){building, floor, from_zone, to_zone, from_type, to_type, offset_s, kind}")
 
 
 @dataclass

@@ -44,8 +44,11 @@ from .. import economy as economy_mod
 from ..government import Government, build_government_cfg
 from .. import organizations, schedule, weather
 from ..world import calendar
+from ..world import indoor as indoor_mod
+from ..world import indoor_flow as indoor_flow_mod
 from ..world import presence as presence_mod
 from ..world import pool as pool_mod
+from ..world.clock import STEP_MINUTES
 from ..world import scene_desc as scene_desc_mod
 from ..lang.sentiment import valence
 from ..factors import affect
@@ -3773,6 +3776,282 @@ def _phase_workplace_bound_report(sim, step: int, sim_min: int) -> None:
                          kind="workplace_bound", x=0.0, y=0.0, payload=dict(stat)))
 
 
+# ---------------------------------------------------------------- 屋内エンジン配線(B3)
+# 屋内ミクロ状態=単一の真実。マクロ(建物内在館数)はこの集約。設計原則: ①認知/LLM step=10分は不変
+# (LLM 呼数・会話ペアリングに一切影響させない=それは次バッチ B3b)②物理は遷移駆動(空間遷移が起きた
+# step だけ SFM 積分)③観測(記録)と動力学を構造分離(動力学は observer バッファを読まない=下の向きは
+# 動力学→ sim._indoor_*_step 一時状態→観測)。既定 OFF(sim.indoor is None)は _phase_indoor が即 return
+# =新経路を一切通らず・新 stream も引かず=ゴールデン L1 バイト一致。乱数は新 named stream
+# "indoor"((agent,step)キー)/"indoor_meet"((group,day)キー)のみ=既存 stream を消費しない(R1)。
+def _indoor_on(sim) -> bool:
+    """屋内エンジンが有効か(sim.indoor= IndoorSpace が据わっているか)。既定 OFF=None=完全 no-op。"""
+    return getattr(sim, "indoor", None) is not None
+
+
+def _indoor_pref(cfg_map: dict, activity: str) -> list:
+    """活動 → 優先型リスト(conf 由来。型語はコードに書かない=no-fingerprint)。無指定は []。"""
+    v = (cfg_map or {}).get(str(activity or ""))
+    return list(v) if v else []
+
+
+def _meeting_zone(zone_types: list, meeting_types: list, exclude=None):
+    """会合を開く区画 index(meeting_types の先頭一致・exclude を除く)。無ければ None(=不開催)。
+
+    pick_zone と違い bulk へフォールバックしない=会合区画(型)が実在する階でのみ会議が成立する。"""
+    for t in (meeting_types or []):
+        for i, zt in enumerate(zone_types):
+            if str(zt) == str(t) and i != exclude:
+                return i
+    return None
+
+
+def _indoor_cell_offset(building: str, floor: int, step: int) -> float:
+    """遷移の step 内オフセット秒 [0,600)(2層タイムライン: t = step*600 + offset + サブ時刻)。
+
+    セル(建物,階)+step の安定ハッシュ=決定論・run.seed 非依存・resume 不変。1セル1積分に共通の
+    オフセットを与え(遭遇の相対時刻整合を保つ)、正直な近似: 個別遷移ごとではなくセル単位の offset。"""
+    return indoor_flow_mod._stable_uniform(f"{building}:{int(floor)}:{int(step)}",
+                                           "indoor_offset") * float(STEP_MINUTES * 60)
+
+
+def _indoor_zone_point(layout: dict, zi: int, agent_id, building: str, floor: int):
+    """区画矩形内の決定論点(安定ハッシュで内側 20% を余白にジッタ)。resume 不変・run.seed 非依存。"""
+    zx0, zy0, zx1, zy1 = layout["zones"][zi]
+    key = f"{building}:{int(floor)}:{int(zi)}"
+    u = indoor_flow_mod._stable_uniform(key, f"px:{agent_id}")
+    v = indoor_flow_mod._stable_uniform(key, f"py:{agent_id}")
+    mx, my = (zx1 - zx0) * 0.2, (zy1 - zy0) * 0.2
+    return (zx0 + mx + u * max(0.0, zx1 - zx0 - 2 * mx),
+            zy0 + my + v * max(0.0, zy1 - zy0 - 2 * my))
+
+
+def _work_group_key(agent):
+    """職場グループのキー(org_id 優先→職場建物→職場ノード)。無所属は None(会議対象外)。
+
+    グループ概念は汎用に扱う(業種名・組織名の中身はキーに使うだけでコードに書かない=no-fingerprint)。"""
+    org = getattr(agent, "org_id", None)
+    if org:
+        return f"org:{org}"
+    wb = getattr(agent, "work_building", "") or ""
+    if wb:
+        return f"wb:{wb}"
+    wn = getattr(agent, "work_node", "") or ""
+    if wn:
+        return f"wn:{wn}"
+    return None
+
+
+def _indoor_meeting_plan(sim, gk: str, day: int, prob: float, w0: int, w1: int):
+    """(group, day) の会議計画 (occurs, meet_min) を決定論導出(stream "indoor_meet"・memoize)。
+
+    キャッシュは pickle しない=resume でも同一 (gk,day) が同一 stream から同値を再導出する(独立キー
+    =描画順非依存)。draw は occurs/meet_min の2本を常に引く(条件分岐で消費数を変えない=決定論)。"""
+    cache = sim._indoor_meet_plan
+    key = (gk, int(day))
+    if key in cache:
+        return cache[key]
+    rng = sim.hub.stream("indoor_meet", str(gk), int(day))
+    occurs = bool(float(rng.random()) < float(prob))
+    span = max(1, int(w1) - int(w0))
+    meet_min = int(w0) + int(float(rng.random()) * span)
+    cache[key] = (occurs, meet_min)
+    return cache[key]
+
+
+def _indoor_meetings(sim, step: int, sim_min: int, cells: dict, icfg: dict) -> set:
+    """本 step に会議へ集まるべき agent.id 集合を返す(決定論)。会議成立ごとに meeting カウンタ +1。
+
+    同一 (building,floor) セル内で職場グループ別に min_party 人以上の勤務者が居り、(group,day) の会議
+    計画が本 step の分バケットに該当し、そのセルに会合区画(型)が実在するグループを集める。"""
+    mcfg = icfg["meeting"]
+    min_party = int(mcfg["min_party"])
+    prob = float(mcfg["prob"])
+    w0, w1 = int(mcfg["window_min"][0]), int(mcfg["window_min"][1])
+    mtypes = mcfg["meeting_types"]
+    day = sim_min // 1440
+    tod = sim_min % 1440
+    targets: set = set()
+    for cell_key in sorted(cells.keys()):
+        building, floor = cell_key
+        workers = [a for a in cells[cell_key] if a.activity == "working"]
+        if len(workers) < min_party:
+            continue
+        groups: dict = {}
+        for a in workers:
+            gk = _work_group_key(a)
+            if gk is not None:
+                groups.setdefault(gk, []).append(a)
+        for gk in sorted(groups.keys()):
+            members = groups[gk]
+            if len(members) < min_party:
+                continue
+            occurs, meet_min = _indoor_meeting_plan(sim, gk, day, prob, w0, w1)
+            if not (occurs and meet_min <= tod < meet_min + STEP_MINUTES):
+                continue
+            cell = sim.indoor.get(building, int(floor))
+            if _meeting_zone(cell["zone_types"], mtypes) is None:
+                continue                              # 会合区画の無い階では不開催
+            for a in members:
+                targets.add(a.id)
+            sim._indoor_n_meeting += 1                # 1職場・1日1回の開催(per-step カウンタ)
+    return targets
+
+
+def _phase_indoor(sim, step: int, sim_min: int) -> None:
+    """屋内フェーズ: 在館者の区画割当・フロア内 markov 遷移・階間到着の実軌跡差替・会議・遭遇。
+
+    位置(building/floor)が確定した後(_apply 後)に呼ぶ。動力学は sim._indoor_encounters_step /
+    _indoor_samples_step の step 内一時状態へ積み、観測(indoor_tracks サイドカー)はそれを読むだけ。
+    L1 space_move はここ(動力学)で記録(logger への書き込みは全層共通=観測バッファの読み取りではない)。"""
+    if not _indoor_on(sim):
+        return
+    space = sim.indoor
+    icfg = sim.indoorcfg
+    params = sim.indoorparams
+    markov_on = bool(icfg["markov"]["enabled"])
+    sfm_on = bool(icfg["sfm"]["enabled"])
+    meeting_on = bool(icfg["meeting"]["enabled"])
+    dwell_steps = max(1, int(icfg["markov"]["dwell_steps"]))
+    assign_map = icfg["markov"]["assign_types"]
+    roam_map = icfg["markov"]["roam_types"]
+    mtypes = icfg["meeting"]["meeting_types"]
+    byst_cap = int(icfg["encounter"]["bystander_cap"])
+    tracks = getattr(sim, "indoor_tracks", None)
+
+    # step 内一時状態(動力学→ここ→観測)。毎 step リセット。カウンタも per-step(resume 安全=
+    # 累積しない=分割再開でも各 step の値が state のみから再現される)。
+    sim._indoor_encounters_step = []
+    sim._indoor_samples_step = []
+    sim._indoor_n_space_move = 0
+    sim._indoor_n_encounter = 0
+    sim._indoor_n_meeting = 0
+
+    # ── 在館者を (building, floor) セルへ。屋外/睡眠/建物外はミクロ状態をクリア ──
+    cells: dict = {}
+    for agent in sim.agents:
+        if agent.loc == "outside" or agent.sleeping or not agent.building:
+            if agent.ind_zone is not None:
+                agent.ind_zone = None
+                agent.ind_space_type = ""
+                agent.ind_x = 0.0
+                agent.ind_y = 0.0
+            agent._ind_ctx = None
+            continue
+        cells.setdefault((agent.building, int(agent.floor)), []).append(agent)
+
+    meet_targets = _indoor_meetings(sim, step, sim_min, cells, icfg) if meeting_on else set()
+
+    for cell_key in sorted(cells.keys()):
+        building, floor = cell_key
+        members = sorted(cells[cell_key], key=lambda a: a.id)
+        cell = space.get(building, floor)
+        layout, zone_types = cell["layout"], cell["zone_types"]
+        if not layout or not zone_types:             # レイアウト無し=ミクロ状態を持てない
+            for agent in members:
+                agent.ind_zone = None
+                agent.ind_space_type = ""
+                agent._ind_ctx = cell_key
+            continue
+        doors = cell["doors"]
+        walls = cell["walls"] if sfm_on else []
+        n_zones = len(zone_types)
+
+        movers: list = []           # SFM 積分対象
+        bystanders: list = []       # 静止在館者(斥力源+接触対象)
+        for agent in members:
+            prev_ctx = getattr(agent, "_ind_ctx", None)
+            same_cell = (prev_ctx == cell_key)
+            cur_zone = (agent.ind_zone if (same_cell and agent.ind_zone is not None
+                                           and 0 <= agent.ind_zone < n_zones) else None)
+            old_zone = agent.ind_zone if agent.ind_zone is not None else None
+            floor_move = (prev_ctx is not None and prev_ctx[0] == building
+                          and prev_ctx[1] != floor and old_zone is not None)
+            act = agent.activity or ""
+
+            src = None
+            dst = None
+            kind = ""
+            from_zone = None
+            if agent.id in meet_targets:             # 会議: 会合区画へ集める(markov より優先・逃がさない)
+                if cur_zone is None:
+                    dst = _meeting_zone(zone_types, mtypes)        # 到着直後=会合区画へ配置(軌跡なし)
+                else:
+                    mz = _meeting_zone(zone_types, mtypes, exclude=cur_zone)
+                    if mz is not None:
+                        dst, src, from_zone, kind = mz, cur_zone, cur_zone, "meeting"
+                    # else: 既に会合区画に居る → 滞在
+            elif cur_zone is None:                   # 初期割当 / 階到着
+                rng = sim.hub.stream("indoor", agent.id, step)
+                dst = indoor_mod.pick_zone(zone_types, _indoor_pref(assign_map, act), rng)
+                if floor_move and dst is not None:   # 階到着=コア→目的区画の実軌跡へ差替
+                    src, kind, from_zone = "core", "floor", old_zone
+            elif markov_on:                          # フロア内 markov(幾何 dwell)
+                rng = sim.hub.stream("indoor", agent.id, step)
+                if float(rng.random()) < 1.0 / dwell_steps:
+                    roam = _indoor_pref(roam_map, act) or _indoor_pref(assign_map, act)
+                    d2 = indoor_mod.pick_zone(zone_types, roam, rng, exclude=cur_zone)
+                    if d2 is not None and d2 != cur_zone:
+                        dst, src, from_zone, kind = d2, cur_zone, cur_zone, "roam"
+
+            if dst is None:                          # 滞在(初回未割当も含む=位置は据え置き)
+                agent._ind_ctx = cell_key
+                bystanders.append(agent)
+                continue
+
+            old_x, old_y = agent.ind_x, agent.ind_y
+            nx, ny = _indoor_zone_point(layout, dst, agent.id, building, floor)
+            to_type = str(zone_types[dst])
+            integrate = bool(from_zone is not None and sfm_on and src is not None)
+            if from_zone is not None:                # 実遷移=space_move(L1)。placement は記録しない
+                offset_s = _indoor_cell_offset(building, floor, step)
+                from_type = str(zone_types[from_zone]) if 0 <= from_zone < n_zones else ""
+                sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                                     kind="space_move", x=agent.x, y=agent.y,
+                                     payload={"building": building, "floor": int(floor),
+                                              "from_zone": int(from_zone), "to_zone": int(dst),
+                                              "from_type": from_type, "to_type": to_type,
+                                              "offset_s": round(offset_s, 1), "kind": kind}))
+                sim._indoor_n_space_move += 1
+                if integrate:
+                    mv = {"agent_id": agent.id, "src_zone": src, "dst_zone": dst}
+                    if src != "core":
+                        mv["start"] = (old_x, old_y)
+                    movers.append(mv)
+            # 正典ミクロ状態を目的区画へ更新(位置=区画内決定論点。軌跡は tracks 専用)
+            agent.ind_zone = int(dst)
+            agent.ind_space_type = to_type
+            agent.ind_x, agent.ind_y = float(nx), float(ny)
+            agent._ind_ctx = cell_key
+            if not integrate:
+                bystanders.append(agent)
+
+        # ── 遷移が起きたときだけ SFM 積分(1セル1回・movers 同士 + 静止者 frozen) ──
+        if sfm_on and movers:
+            byst = sorted(bystanders, key=lambda a: a.id)
+            byst = byst[:byst_cap] if byst_cap > 0 else []
+            by_recs = [{"agent_id": a.id, "pos": (a.ind_x, a.ind_y)} for a in byst]
+            res = indoor_flow_mod.integrate_transition(layout, walls, doors, movers,
+                                                       by_recs, params)
+            offset_s = _indoor_cell_offset(building, floor, step)
+            base_t = step * (STEP_MINUTES * 60) + offset_s
+            dstmap = {m["agent_id"]: m["dst_zone"] for m in movers}
+            if tracks is not None:
+                for (aid, t_sub, x, y) in res.samples:
+                    sim._indoor_samples_step.append(
+                        (int(aid), float(base_t + t_sub), building, int(floor),
+                         float(x), float(y), int(dstmap.get(aid, -1))))
+            for (a, b, knd, dur) in res.contacts:
+                sim._indoor_encounters_step.append(
+                    (float(base_t), int(a), int(b), str(knd), float(dur),
+                     building, int(floor)))
+            sim._indoor_n_encounter += len(res.contacts)
+
+    # ── 観測(記録)= 一時状態を読むだけ(動力学は本ブロックを読まない=方向厳守) ──
+    if tracks is not None:
+        tracks.add_samples(sim._indoor_samples_step)
+        tracks.add_contacts(sim._indoor_encounters_step)
+
+
 def run_step(sim, step: int) -> None:
     sim.budget.reset()
     sim.freedom_stats = {"choice_points": 0, "exercised": 0}  # 自由度観測(P2)の step 境界。OFF は L2 で列不在
@@ -3846,6 +4125,9 @@ def run_step(sim, step: int) -> None:
     actions = [(agent, _decide(sim, agent, step, sim_min)) for agent in active]
     for agent, action in actions:
         _apply(sim, agent, action, step, sim_min)
+    # 屋内エンジン配線(B3): building/floor が確定した _apply 後に、在館者の区画割当・フロア内
+    # markov 遷移・階間到着の実軌跡差替・会議・遭遇を回す(既定 OFF=sim.indoor None=即 return=バイト一致)。
+    _phase_indoor(sim, step, sim_min)
     _phase_jitter(sim, step, sim_min)              # 路上滞在の完全静止を解消(微移動)
     _phase_crowd(sim, step, sim_min)               # 群集(大規模行事型)の集中を観測(既定OFF=no-op)
     infoenv_mod.phase(sim, step, sim_min)          # 情報環境: バイラル加重・誤情報/炎上(既定OFF=no-op。Wave G6)

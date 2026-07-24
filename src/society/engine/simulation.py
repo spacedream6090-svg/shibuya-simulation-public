@@ -120,6 +120,29 @@ class Simulation:
         self.budget = LodBudget(cap)
         self.pois = self.city.pois()
         self.dests = self.city.destinations()
+        # ---- 屋内エンジン配線(B3。既定 OFF=完全 no-op=バイト一致)----
+        # 屋内ミクロ状態(全建物・全階の区画=IndoorSpace)を単一の真実として据え、遷移駆動 SFM で
+        # フロア内移動・遭遇を回す(scheduler._phase_indoor)。indoor.enabled=false なら self.indoor=None=
+        # _phase_indoor が即 return=新 stream("indoor"/"indoor_meet")も引かない=ゴールデン L1 バイト一致。
+        from ..world import indoor as _indoor_mod
+        from ..world import indoor_flow as _indoor_flow_mod
+        raw_indoor = cfg.get("indoor", None)
+        raw_indoor = (OmegaConf.to_container(raw_indoor, resolve=True)
+                      if OmegaConf.is_config(raw_indoor) else raw_indoor)
+        self.indoorcfg = _indoor_mod.build_engine_cfg(raw_indoor)
+        self.indoor = _indoor_mod.indoor_from_cfg(self.city, cfg)   # None=既定 OFF
+        self.indoorparams = _indoor_flow_mod.IndoorParams.from_cfg(self.indoorcfg["sfm"])
+        self._indoor_meet_plan = {}                # (group,day)->(occurs,meet_min) 決定論キャッシュ(非pickle)
+        self._indoor_encounters_step = []          # step 内一時状態(動力学→観測)。B3b が動力学として読む
+        self._indoor_samples_step = []             # step 内一時状態(tracks 観測用)
+        self._indoor_n_space_move = 0              # per-step カウンタ(L2・resume 安全=累積しない)
+        self._indoor_n_encounter = 0
+        self._indoor_n_meeting = 0
+        # 記録サイドカー(indoor.enabled かつ tracks.enabled のみ。tracks は indoor.enabled と独立サブトグル)
+        self.indoor_tracks = None
+        if self.indoor is not None and self.indoorcfg["tracks"]["enabled"]:
+            from ..observer.indoor_tracks import IndoorTracks
+            self.indoor_tracks = IndoorTracks(self.out_dir)
         transit_path = Path(str(cfg.transit.file))
         if not transit_path.is_absolute():
             transit_path = REPO_ROOT / transit_path
@@ -1222,6 +1245,8 @@ class Simulation:
             # 第57バッチ タスクC: 分割実行で clean finalize しても前チャンクの canonical を失わない
             # (logger._finalize_stream が resume 時のみ既存 canonical を先頭に結合する)。fresh ラン不変。
             self.logger._resumed = True
+            if self.indoor_tracks is not None:    # B3: tracks サイドカーも分割実行の canonical を保つ
+                self.indoor_tracks._resumed = True
         if every > 0:
             save_config(self.cfg, self.out_dir)   # 途中再開に備え config を先出しする
         for step in range(start, int(self.cfg.run.n_steps)):
@@ -1233,14 +1258,20 @@ class Simulation:
                                 / f"ckpt-{step + 1:06d}.pkl.gz")
                 self._save_pool_sidecar(step + 1)  # pool ON 時のみ: ドーマント退避の対保存
                 self.logger.flush_segment()
+                if self.indoor_tracks is not None:  # B3: tracks サイドカーも対でセグメント化
+                    self.indoor_tracks.flush_segment()
                 did_flush = True
             if flush_every > 0 and not did_flush \
                     and (step + 1) % flush_every == 0:
                 self.logger.flush_segment()        # checkpoint と独立の定期 flush
+                if self.indoor_tracks is not None:
+                    self.indoor_tracks.flush_segment()
         return self.finalize()
 
     def finalize(self) -> dict:
         paths = self.logger.flush()
+        if self.indoor_tracks is not None:        # B3: 屋内軌跡サイドカーを結合(part→canonical)
+            self.indoor_tracks.finalize()
         save_config(self.cfg, self.out_dir)
         kinds = self.logger.total_event_kinds()
         summary = {

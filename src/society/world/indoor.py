@@ -284,6 +284,43 @@ class IndoorSpace:
         return best[0][0]
 
 
+def bulk_index(zone_types: list):
+    """最頻型(=bulk)の zone index(同数は型名昇順=決定論)。空なら None。"""
+    if not zone_types:
+        return None
+    counts = Counter(str(t) for t in zone_types)
+    best_type = min(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+    for i, t in enumerate(zone_types):
+        if str(t) == best_type:
+            return i
+    return 0
+
+
+def pick_zone(zone_types: list, preferred, rng=None, exclude=None):
+    """活動の優先型 preferred に一致する zone index を決定論選択する(B3 の区画割当・回遊の共通核)。
+
+    規則: preferred(型名の優先リスト)を先頭から見て、その型を持つ zone が在れば、それらから rng で
+    1つ選ぶ(rng=None なら最小 index=決定論)。どの優先型も無ければ bulk(最頻型)の zone へ落とす。
+    exclude(=現 zone)を渡すと候補から外す(markov 回遊=同/別型の別区画へ動く用途)。exclude を除く
+    候補が皆無なら None(=この step は滞在=移動しない)。zone_types が空なら None。型名は conf/data 由来
+    (このコードは型語を1つも埋め込まない=no-fingerprint)。"""
+    n = len(zone_types or [])
+    if n == 0:
+        return None
+    pref = [str(t) for t in (preferred or [])]
+    for t in pref:
+        cands = [i for i in range(n) if str(zone_types[i]) == t and i != exclude]
+        if cands:
+            return cands[0] if rng is None else int(cands[int(rng.integers(0, len(cands)))])
+    bi = bulk_index(zone_types)
+    if bi is not None and bi != exclude:
+        return bi
+    if exclude is None:
+        return bi                                    # n>=1 は必ず bulk を持つ
+    others = [i for i in range(n) if i != exclude]   # exclude==bulk: 別区画へ・無ければ滞在
+    return others[0] if others else None
+
+
 def _cfg_get(cfg, dotted: str, default=None):
     """OmegaConf / dict どちらでも dotted パスで安全に読む(vision._cfg_get と同流儀)。"""
     cur = cfg
@@ -311,3 +348,45 @@ def indoor_from_cfg(city, cfg) -> IndoorSpace | None:
     specs = load_floor_specs(path) if path else []
     space_types = _cfg_get(cfg, "indoor.space_types", None)
     return IndoorSpace(city, floor_specs=specs, space_types=space_types)
+
+
+def build_engine_cfg(raw) -> dict:
+    """conf.indoor を B3 エンジン配線用の素の dict へ正準化(既定 OFF=現行挙動と完全同一)。
+
+    markov(区画割当/回遊)・sfm(積分パラメータ)・meeting(会議)・encounter(コスト制御)・tracks
+    (記録サイドカー)を既定つきで平坦化する。型語(desk 等)・活動語(working 等)はここでは一切
+    埋め込まず conf から読むだけ=no-fingerprint。sfm は IndoorParams.from_cfg がそのまま読む生 dict。"""
+    r = _as_map(raw)
+    markov = _as_map(r.get("markov"))
+    sfm = _as_map(r.get("sfm"))
+    meeting = _as_map(r.get("meeting"))
+    enc = _as_map(r.get("encounter"))
+    tracks = _as_map(r.get("tracks"))
+
+    def _amap(m) -> dict:
+        return {str(k): [str(x) for x in _as_list(v)] for k, v in _as_map(m).items()}
+
+    win = [int(x) for x in _as_list(meeting.get("window_min"))]
+    if len(win) < 2:
+        win = [600, 900]
+    mtypes = [str(x) for x in _as_list(meeting.get("meeting_types"))] or ["meeting"]
+    return {
+        "enabled": bool(r.get("enabled", False)),
+        "markov": {
+            "enabled": bool(markov.get("enabled", False)),
+            "dwell_steps": max(1, int(markov.get("dwell_steps", 3) or 3)),
+            "assign_types": _amap(markov.get("assign_types")),
+            "roam_types": _amap(markov.get("roam_types")),
+        },
+        "sfm": {**{str(k): sfm[k] for k in sfm},
+                "enabled": bool(sfm.get("enabled", False))},
+        "meeting": {
+            "enabled": bool(meeting.get("enabled", False)),
+            "min_party": max(2, int(meeting.get("min_party", 2) or 2)),
+            "prob": float(meeting.get("prob", 0.5) or 0.0),
+            "window_min": [win[0], win[1]],
+            "meeting_types": mtypes,
+        },
+        "encounter": {"bystander_cap": max(0, int(enc.get("bystander_cap", 24) or 0))},
+        "tracks": {"enabled": bool(tracks.get("enabled", False))},
+    }

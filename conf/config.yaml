@@ -298,16 +298,44 @@ indoor:
     gym:         [service, seating]
     service:     [service]
     generic:     [sales, service]
-  # ---- 次バッチ(エンジン配線)が使うパラメータの置き場。enabled=false では未読=完全に不活性 ----
-  markov:                             # 区画間の滞在・遷移(屋内移動モデル)の置き場
+  # ---- エンジン配線(B3)が読む実パラメータ。indoor.enabled=false では未読=完全に不活性 ----
+  markov:                             # フロア内の区画滞在→遷移(LBNL 在室行動 ABM 流の幾何 dwell)
     enabled: false
-    dwell_steps: 3                    # 1区画の既定滞在 step(次バッチが較正)
-  sfm:                                # Social Force Model(区画内の微視的移動)の置き場
+    dwell_steps: 3                    # 平均滞在 step(遷移確率=1/dwell_steps の幾何 dwell=LBNL 流)
+    # 活動 → 初期区画割当の優先型(型語は conf 側=コードは業種名を書かない no-fingerprint)。
+    # 先頭から順に、その階の zone_types に在る最初の型を選ぶ。無ければ bulk(最頻型)。
+    assign_types:
+      working:  [desk, sales, service, concourse, classroom, register, seating]
+      eating:   [seating, register, sales]
+      shopping: [sales, register, seating]
+    # markov 遷移先の候補型(勤務者 desk⇄meeting⇄break・客 sales⇄seating 回遊)。活動別。無指定活動は
+    # assign_types にフォールバック。候補型がその階に無ければ遷移しない(=その step は滞在)。
+    roam_types:
+      working:  [desk, meeting, break]
+      eating:   [seating, register]
+      shopping: [sales, seating, register]
+  sfm:                                # 遷移駆動 Social Force Model(区画内の微視軌跡・Helbing2000)
     enabled: false
-    step_m: 1.2                       # 1 tick の歩幅 m(次バッチが較正)
-  meeting:                            # 会議・同席(desk⇄meeting 等の会合)ロジックの置き場
+    dt: 0.2                           # サブステップ [s]
+    max_substeps: 900                 # 1遷移の上限サブステップ(=180s)
+    sample_interval: 5                # 軌跡サブサンプル間隔(5×0.2=1s ごと)
+    r_contact: 1.2                    # 接触判定の中心間距離 [m](proxemics personal distance 上端)
+    t_sub_contact: 3                  # 接触成立の連続サブステップ(=0.6s・瞬間ブラシ除外)
+    neighbor_cap: 12                  # 対人斥力の近傍上限(Helbing 近傍・id 昇順で決定論選択)
+    wall_a: 2000.0                    # 壁斥力の強さ [N](Helbing2000 壁項)
+    wall_b: 0.08                      # 壁斥力の特性距離 [m](Helbing2000)
+    arrive_radius: 0.5                # waypoint 到達判定半径 [m]
+    bfs_cell: 0.5                     # BFS フォールバック格子 [m]
+  meeting:                            # 会議・同席(同一職場グループを同時刻に meeting 区画へ集める)
     enabled: false
-    min_party: 2                      # 会合成立の最小人数(次バッチが較正)
+    min_party: 2                      # 会合成立の最小人数(同一 (建物,階) の同一職場勤務者)
+    prob: 0.5                         # 1職場・1日あたりの開催確率(stream "indoor_meet" (group,day))
+    window_min: [600, 900]            # 開催時刻の分 of day 域(10:00-15:00)。この中の1 step で開催
+    meeting_types: [meeting, break]   # 会合を開く区画の型(その階にあれば・無ければ不開催)
+  encounter:                          # 遭遇(接触ペア)観測のコスト制御
+    bystander_cap: 24                 # 1セルの静止在館者を接触計算に含める上限(id 昇順=決定論)
+  tracks:                             # 記録サイドカー(indoor.enabled とは独立のサブトグル)
+    enabled: false                    # true で indoor_tracks_*.parquet(秒スケール軌跡+遭遇)を書く
 
 # ---- 経済 v0(賃金+消費+バイト+心理接続。ユーザー決定 2026-07-05)----
 # 職業→賃金カテゴリ・持ち金・バイトの写像は src/society/economy.py(persona/sim 側)。

@@ -682,6 +682,30 @@ def _edge_churn_rate(sim):
     return _struct_col(sim, "edge_churn_rate")
 
 
+# ---- 屋内エンジン配線 B3(indoor.enabled ON のみ・既定 OFF=None=列なし=L2 バイト不変)----
+#   この step のフロア内区画遷移(space_move)/遭遇(encounter)/会議開催の件数。per-step カウンタ
+#   (累積でない=resume 安全=分割再開でも各 step の値が state だけから再現される)。
+def _indoor_col(sim, attr):
+    if getattr(sim, "indoor", None) is None:
+        return None
+    return int(getattr(sim, attr, 0))
+
+
+@register_aggregator("n_space_move")
+def _n_space_move(sim):
+    return _indoor_col(sim, "_indoor_n_space_move")
+
+
+@register_aggregator("n_indoor_encounter")
+def _n_indoor_encounter(sim):
+    return _indoor_col(sim, "_indoor_n_encounter")
+
+
+@register_aggregator("n_indoor_meeting")
+def _n_indoor_meeting(sim):
+    return _indoor_col(sim, "_indoor_n_meeting")
+
+
 def collect(sim) -> dict:
     """全 aggregator を回して L2 の1行を作る。**None を返した列は出さない**(既定 OFF の
     プラグイン列を OFF 時に完全に不在化=L2 不変)。既存 aggregator は None を返さないので
