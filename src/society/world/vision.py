@@ -89,11 +89,16 @@ def _kind_use(kind: str) -> str:
     return "generic"
 
 
-def building_layout(building: dict, floor: int, city=None) -> dict | None:
+def building_layout(building: dict, floor: int, city=None,
+                    n_override: int | None = None) -> dict | None:
     """建物 building・階 floor の推定間取り(決定論)。
 
     返り値: {bbox:(x0,y0,x1,y1), corridor, core:(X0,Y0,X1,Y1), zones:[(x0,y0,x1,y1)...],
              horiz, nA, nB}。footprint が不正なら None。
+
+    n_override: 区画数の外部指定(既定 None=完全従来動作=乱数消費順不変)。指定時は POI 経路
+      (n_poi>0 分岐)と同型に、cols 前に乱数を1つも消費せず n=min(12, n_override) で分割する
+      (呼び出し側が floor_layouts の shops/zone_mix 等で区画数を持つときの決定論 seam)。
     """
     fp = building.get("footprint") or []
     if len(fp) < 3:
@@ -110,29 +115,33 @@ def building_layout(building: dict, floor: int, city=None) -> dict | None:
     seed = (_hash(bid) + (int(floor) + 50) * 2654435761) & _U32
     rng = _rng(seed)
 
-    # 区画数 n の決定(POI があればその数、無ければ用途プールから決定論生成)。
-    n_poi = 0
-    if city is not None and building.get("id"):
-        try:
-            n_poi = len(city.pois_in_building(building["id"], floor))
-        except Exception:
-            n_poi = 0
-    if n_poi > 0:
-        n = min(10, n_poi)                       # POI 経路: cols 前に乱数を消費しない
+    # 区画数 n の決定(override > POI > 用途プールから決定論生成)。override/POI 経路は
+    # どちらも cols 前に乱数を消費しない(=消費順を分岐間で一致させる)。
+    if n_override is not None:
+        n = min(12, int(n_override))             # 外部指定経路: cols 前に乱数を消費しない
     else:
-        use = _kind_use(building.get("kind", "generic"))
-        pool_n = _POOL_LEN.get(use, _POOL_LEN["generic"])
-        n = 2 + int(rng() * min(4, pool_n - 1))
-        used: set[int] = set()                   # 重複回避ループ(乱数消費数を JS と一致させる)
-        for _ in range(n):
-            g = 0
-            while True:
-                idx = int(rng() * pool_n)
-                cont = (idx in used) and (g < 8)
-                g += 1
-                if not cont:
-                    break
-            used.add(idx)
+        n_poi = 0
+        if city is not None and building.get("id"):
+            try:
+                n_poi = len(city.pois_in_building(building["id"], floor))
+            except Exception:
+                n_poi = 0
+        if n_poi > 0:
+            n = min(10, n_poi)                   # POI 経路: cols 前に乱数を消費しない
+        else:
+            use = _kind_use(building.get("kind", "generic"))
+            pool_n = _POOL_LEN.get(use, _POOL_LEN["generic"])
+            n = 2 + int(rng() * min(4, pool_n - 1))
+            used: set[int] = set()               # 重複回避ループ(乱数消費数を JS と一致させる)
+            for _ in range(n):
+                g = 0
+                while True:
+                    idx = int(rng() * pool_n)
+                    cont = (idx in used) and (g < 8)
+                    g += 1
+                    if not cont:
+                        break
+                used.add(idx)
     if n <= 0:
         n = 1
 
@@ -236,6 +245,52 @@ def building_walls(building: dict, floor: int, city=None) -> list:
     if lay is None:
         return []
     return _walls_from_layout(lay)
+
+
+def _door_span(a: float, b: float) -> tuple[float, float]:
+    """区画の通路側辺 [a,b] に開ける開口部の (中心, 半幅)。
+
+    壁生成 _wall_with_door_h/_v の中央開口と同一式(中心=(a+b)/2、半幅=min(_DOOR_HALF,
+    幅*0.25))。この関数は doors_from_layout 専用の新規補助で、既存の壁生成関数の出力・
+    乱数消費は一切変えない(vision.py の既存挙動バイト不変を保つための非破壊追加)。"""
+    return (a + b) / 2.0, min(_DOOR_HALF, (b - a) * 0.25)
+
+
+def doors_from_layout(lay: dict) -> list[dict]:
+    """間取り → 各区画(zones と同順)の通路側ドア開口を決定論導出する。
+
+    返り: [{"zone": i, "x": cx, "y": cy, "half": hd, "axis": "h"|"v"}...]。(cx,cy)=開口部の
+    中心で、区画と通路を隔てる corridor 側の間仕切り線上に乗る。axis="h"=水平壁上(開口は
+    x 方向に広がる)、"v"=垂直壁上(y 方向)。位置・半幅は _walls_from_layout が開ける開口と
+    一致する(=壁の穴とドアが幾何整合)。lay が None/空・zones なしなら []。"""
+    if not lay:
+        return []
+    zones = lay.get("zones") or []
+    if not zones:
+        return []
+    n_a, n_b = lay["nA"], lay["nB"]
+    doors: list[dict] = []
+    if lay["horiz"]:
+        _, yc0, _, yc1 = lay["corridor"]         # (x0, yc0, x1, yc1)
+        top = zones[:n_a]                        # 通路の上=下辺(y=yc1)が通路側
+        bot = zones[n_a:n_a + n_b]               # 通路の下=上辺(y=yc0)が通路側
+        for i, (zx0, _zy0, zx1, _zy1) in enumerate(top):
+            xm, hd = _door_span(zx0, zx1)
+            doors.append({"zone": i, "x": xm, "y": yc1, "half": hd, "axis": "h"})
+        for j, (zx0, _zy0, zx1, _zy1) in enumerate(bot):
+            xm, hd = _door_span(zx0, zx1)
+            doors.append({"zone": n_a + j, "x": xm, "y": yc0, "half": hd, "axis": "h"})
+    else:
+        xc0, _yc0, xc1, _yc1 = lay["corridor"]   # (xc0, y0, xc1, y1)
+        right = zones[:n_a]                      # 通路の右=左辺(x=xc1)が通路側
+        left = zones[n_a:n_a + n_b]              # 通路の左=右辺(x=xc0)が通路側
+        for i, (_zx0, zy0, _zx1, zy1) in enumerate(right):
+            ym, hd = _door_span(zy0, zy1)
+            doors.append({"zone": i, "x": xc1, "y": ym, "half": hd, "axis": "v"})
+        for j, (_zx0, zy0, _zx1, zy1) in enumerate(left):
+            ym, hd = _door_span(zy0, zy1)
+            doors.append({"zone": n_a + j, "x": xc0, "y": ym, "half": hd, "axis": "v"})
+    return doors
 
 
 # ---- 線分交差(LOS)----

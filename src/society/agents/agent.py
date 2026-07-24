@@ -173,6 +173,16 @@ class Agent:
     #  書き手)。services.self_dev.enabled=false では誰も書かず {} のまま=挙動バイト一致。checkpoint は
     #  Agent ごと pickle されるので resume で自動保存される。states 監査集合には入れない(k を汚さない)。
     self_dev: dict = field(default_factory=dict)
+    # ---- 屋内ミクロ正典(空間レイヤ核 B1、既定 OFF=すべて中立値。src/society/world/indoor.py)----
+    #  シームレスズーム観察の土台: 屋内に居るとき建物内のどの区画(zone)に居るかを常時保持する
+    #  「単一の真実」。マクロ(建物内在館数)はこの集約とする構想。エンジン配線(scheduler)は次バッチ
+    #  担当=本バッチではフィールドの置き場のみ用意し、serialize(schema/observer への書き出し)は次バッチ送り。
+    #  indoor.enabled=false では誰も書かない=すべて中立値のまま=L1 イベント列に一切現れない(バイト一致)。
+    #  ind_x/ind_y は建物ローカル m の屋内座標(x/y は既存のマクロ座標のまま=別軸)。監査集合には入れない。
+    ind_zone: int | None = None       # 現在いる区画 index(IndoorSpace.zone_types の添字)。None=未割当/屋外
+    ind_x: float = 0.0                # 屋内ミクロ x(建物内座標 m)。OFF/屋外時は 0.0
+    ind_y: float = 0.0                # 屋内ミクロ y(建物内座標 m)。OFF/屋外時は 0.0
+    ind_space_type: str = ""          # 現在区画の用途型(desk/seating/... = IndoorSpace 由来)。""=未割当
 
     def remember(self, text: str, kind: str = "event",
                  importance_bonus: float = 0.0) -> None:

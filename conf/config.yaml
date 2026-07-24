@@ -260,6 +260,55 @@ world:
     weekday_work: false         # ★ON 推奨: true(平日のみ勤務・登校。土日祝は休み)
     holidays: []                # 追加の休日(例: ["2026-04-29", "2026-05-05"])。土日は自動で休日
 
+# ---- 空間レイヤ核(屋内ミクロ状態=シームレスズーム観察の土台。既定 OFF=現行挙動と完全同一)----
+# 全建物・全階の屋内間取り(vision.building_layout=決定論・ビューア floorLayout と同一系列)を
+# 「単一の真実」として保持し、区画(zone)に用途型(SpaceType)を決定論割当する層。実装
+# src/society/world/indoor.py(IndoorSpace)。エンジン配線(scheduler)は次バッチ担当=本セクションは
+# スキーマの骨組みで、enabled=false では誰も読まない=イベント/L1/checkpoint のバイトに一切現れない。
+# no-fingerprint: use カテゴリ→型の写像はここ(conf)に置き、コードは地名・業種名を書かず汎用に読む。
+indoor:
+  enabled: false                      # ★空間レイヤ核を使う実験で ON。false=完全 no-op(バイト一致)
+  floor_layouts_path: data/floor_layouts.json   # 実フロア構成の補助データ(不在でも間取り正典で動く)
+  # use カテゴリ → 型優先順位表 [bulk, accent1, accent2...]。bulk を全区画へ敷き、accent を
+  # 「最小側」区画へ1つずつ(小さいほど後方の accent)割り当てる(面積降順+index 順=決定論)。
+  # 例) office の [desk, meeting, break] = 最大群 desk・二番目に小 meeting・最小 break。
+  # キー = floorguide/floor_layouts の use・POI cat・建物 kind(vision._kind_use=office/station/shop/generic)を網羅。
+  space_types:
+    office:      [desk, meeting, break]
+    station:     [concourse, service]
+    bus:         [concourse, service]
+    shop:        [sales, register]
+    food:        [sales, register]
+    fashion:     [sales, register]
+    beauty:      [sales, register]
+    lifestyle:   [sales, register]
+    restaurant:  [seating, kitchen, register]
+    hall:        [seating, service]
+    theatre:     [seating, service]
+    observation: [seating, service]
+    attraction:  [seating, service]
+    nightlife:   [seating, service]
+    leisure:     [seating, service]
+    hotel:       [seating, service]
+    park:        [seating]
+    education:   [classroom, service]
+    school:      [classroom, service]
+    amusement:   [seating, service]
+    clinic:      [service, seating]
+    gym:         [service, seating]
+    service:     [service]
+    generic:     [sales, service]
+  # ---- 次バッチ(エンジン配線)が使うパラメータの置き場。enabled=false では未読=完全に不活性 ----
+  markov:                             # 区画間の滞在・遷移(屋内移動モデル)の置き場
+    enabled: false
+    dwell_steps: 3                    # 1区画の既定滞在 step(次バッチが較正)
+  sfm:                                # Social Force Model(区画内の微視的移動)の置き場
+    enabled: false
+    step_m: 1.2                       # 1 tick の歩幅 m(次バッチが較正)
+  meeting:                            # 会議・同席(desk⇄meeting 等の会合)ロジックの置き場
+    enabled: false
+    min_party: 2                      # 会合成立の最小人数(次バッチが較正)
+
 # ---- 経済 v0(賃金+消費+バイト+心理接続。ユーザー決定 2026-07-05)----
 # 職業→賃金カテゴリ・持ち金・バイトの写像は src/society/economy.py(persona/sim 側)。
 # engine は precompute 済みの金額しか見ない(no-fingerprint 契約に触れない)。
