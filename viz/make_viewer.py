@@ -825,7 +825,10 @@ def build_data(run_dir: Path, include_traffic: bool = True,
                     "motive_recognition", "trust_gini", "trust_top10",
                     # 第55バッチ ペルソナ逸脱率の L2 全体スカラー(deviation ON 時のみ列が在る)
                     "deviation_mean", "deviation_var", "deviation_top_share",
-                    "deviation_fulltime_mean"):
+                    "deviation_fulltime_mean",
+                    # 第59バッチ 資産分布の L2 全体スカラー(assets ON 時のみ列が在る)
+                    "asset_gini", "asset_top10_share", "asset_median",
+                    "asset_mean", "asset_rank_tau"):
             if rows and key in rows[0]:
                 metrics[key] = [r.get(key, 0) for r in rows]
 
@@ -935,6 +938,13 @@ def build_data(run_dir: Path, include_traffic: bool = True,
     struct = load_structure(run_dir)
     if struct is not None:
         out["structure"] = struct
+    # 資産分布(第59バッチ スライスa): assets_map.json が「有る時だけ」L3 スナップの wealth から住民別分布・
+    # 日次系列・順位 τ・上位/下位ドリルダウンを事後計算。L3 が無ければ None=足さない=後方互換(lens/trust と同型)。
+    assets_map = load_assets_map(run_dir)
+    if assets_map is not None:
+        adata = build_assets_data(run_dir, agents_meta, start_min, assets_map)
+        if adata is not None:
+            out["assets"] = adata
     # 屋内ミクロ(B5): space_move / indoor_tracks が有るランだけ埋め込む。無ければ out 不変=バイト同一。
     ind = build_indoor_data(events, idx, bld_idx, run_dir, n_steps, cfg, include_moves)
     if ind is not None:
@@ -1109,6 +1119,182 @@ def load_structure(run_dir: Path) -> dict | None:
         return json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+# 「assets_map.json が有る時だけ」build_data が資産分布を事後計算する(sim⇄viz 疎結合。第59バッチ スライスa)。
+# L2 が持つのは全体スカラーのみ(条件2)。住民別 wealth(money[+account])は L3 スナップ(l3_snapshots.parquet)
+# から日次で復元する(analyze_structure._status_by_day / build_trust_data と同型)。無ければ out に一切足さ
+# ない=後方互換(旧ラン=タブ非表示=バイト同一)。事後 τ は初日=null=ギャップ(in-sim L2 の初期値 1.0 と別物=
+# in-sim は live wealth の初期値近似・ここは L3 の日末スナップ。注記でダッシュボードに明示)。
+
+def load_assets_map(run_dir: Path) -> dict | None:
+    """runs/<name>/assets_map.json(observer/assets.py が ON 時に書く map)を読む。無ければ None。"""
+    p = run_dir / "assets_map.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _wealth_by_day(run_dir: Path, start_min: int) -> tuple[list[int], dict[int, dict]]:
+    """L3 スナップから各暦日の末尾スナップの wealth=money+account を復元。(days, {day:{id:wealth}})。
+
+    day = (start_min + step*STEP_MINUTES)//1440(L2/deviation の暦日定義と同一)。L3 が無ければ ([], {})。"""
+    l3 = run_dir / "l3_snapshots.parquet"
+    if not l3.exists():
+        return [], {}
+    try:
+        rows = pq.read_table(l3).to_pylist()
+    except Exception:
+        return [], {}
+    last_by_day: dict[int, tuple[int, dict]] = {}     # day -> (step, row)
+    for r in rows:
+        d = (start_min + int(r["step"]) * STEP_MINUTES) // 1440
+        prev = last_by_day.get(d)
+        if prev is None or int(r["step"]) >= prev[0]:
+            last_by_day[d] = (int(r["step"]), r)
+    wealth_by_day: dict[int, dict] = {}
+    for d, (_step, r) in last_by_day.items():
+        try:
+            state = json.loads(r["state"])
+        except Exception:
+            continue
+        w: dict[int, dict] = {}
+        for a in state.get("agents", []):
+            if "id" not in a:
+                continue
+            w[int(a["id"])] = {
+                "wealth": float(a.get("money", 0.0)) + float(a.get("account", 0.0)),
+                "money": float(a.get("money", 0.0)),
+                "account": float(a.get("account", 0.0)),
+            }
+        if w:
+            wealth_by_day[d] = w
+    if not wealth_by_day:
+        return [], {}
+    days = list(range(0, max(wealth_by_day) + 1))
+    return days, wealth_by_day
+
+
+def _assets_gini(vals: list[float]) -> float:
+    xs = sorted(vals)
+    n = len(xs)
+    if n == 0:
+        return 0.0
+    total = sum(xs)
+    if total <= 0.0:
+        return 0.0
+    cum = sum(i * x for i, x in enumerate(xs, start=1))
+    return round((2.0 * cum) / (n * total) - (n + 1.0) / n, 6)
+
+
+def _assets_top_share(vals: list[float], pct: float) -> float:
+    v = sorted(vals, reverse=True)
+    total = sum(v)
+    if not v or total <= 0.0:
+        return 0.0
+    k = max(1, int(len(v) * pct))
+    return round(sum(v[:k]) / total, 6)
+
+
+def _assets_tau(cur: dict, prev: dict | None):
+    """現/前日 wealth の共通 id 上の前日比 Kendall τ-b(measure._kendall_tau と同式)。未定義は None。"""
+    if not prev:
+        return None
+    common = sorted(set(cur) & set(prev))
+    if len(common) < 2:
+        return None
+    a = [cur[i] for i in common]
+    b = [prev[i] for i in common]
+    concord = discord = tie_a = tie_b = 0
+    for i in range(len(a)):
+        for j in range(i + 1, len(a)):
+            s = (a[i] - a[j]) * (b[i] - b[j])
+            if s > 0:
+                concord += 1
+            elif s < 0:
+                discord += 1
+            else:
+                if a[i] == a[j]:
+                    tie_a += 1
+                if b[i] == b[j]:
+                    tie_b += 1
+    n0 = len(a) * (len(a) - 1) / 2.0
+    denom = ((n0 - tie_a) * (n0 - tie_b)) ** 0.5
+    if denom == 0:
+        return 0.0
+    return round((concord - discord) / denom, 6)
+
+
+def build_assets_data(run_dir: Path, agents_meta: list, start_min: int,
+                      assets_map: dict) -> dict | None:
+    """L3 スナップの wealth=money+account から資産分布を事後計算(assets_map が有る時のみ呼ぶ)。
+
+    日次の Gini/上位集中/中央値/平均/前日比 τ 系列 + 最終日の分布ヒスト + 上位/下位ドリルダウン。
+    L3 が無い(スナップ無効)ランでは None=タブ非表示(全体スカラーは 📈 分析タブに残る)。"""
+    top_pct = float(assets_map.get("top_pct", 0.1))
+    days, wbd = _wealth_by_day(run_dir, start_min)
+    if not days or not wbd:
+        return None
+    name_of = {a["id"]: a.get("name", f"a{a['id']}") for a in agents_meta}
+    occ_of = {a["id"]: a.get("occupation", "") for a in agents_meta}
+
+    gini_s: list = []
+    top_s: list = []
+    med_s: list = []
+    mean_s: list = []
+    tau_s: list = []
+    prev: dict | None = None
+    for d in days:
+        wd = wbd.get(d)
+        if not wd:                       # 空日(スナップ欠落)は系列も null(前日 prev は保持)
+            gini_s.append(None); top_s.append(None); med_s.append(None)
+            mean_s.append(None); tau_s.append(None)
+            continue
+        cur = {i: v["wealth"] for i, v in wd.items()}
+        vals = sorted(cur.values())
+        n = len(vals)
+        gini_s.append(_assets_gini(vals))
+        top_s.append(_assets_top_share(vals, top_pct))
+        med_s.append(round(vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2.0, 2))
+        mean_s.append(round(sum(vals) / n, 2))
+        tau_s.append(_assets_tau(cur, prev))
+        prev = cur
+
+    # 最終日(データのある最後の日)の分布と個人ドリルダウン
+    last_day = max(d for d in days if wbd.get(d))
+    lw = wbd[last_day]
+    ranked = sorted(lw.items(), key=lambda kv: (-kv[1]["wealth"], kv[0]))
+    rank_of = {aid: r for r, (aid, _v) in enumerate(ranked, start=1)}
+    vals = [v["wealth"] for _aid, v in ranked]
+    lo, hi = min(vals), max(vals)
+    NB = 12
+    bins = [0] * NB
+    span = (hi - lo) or 1.0
+    for x in vals:
+        b = int((x - lo) / span * NB)
+        bins[min(NB - 1, max(0, b))] += 1
+    edges = [round(lo + span * i / NB, 1) for i in range(NB + 1)]
+
+    def _person(aid, v):
+        return {"id": aid, "name": name_of.get(aid, f"a{aid}"),
+                "occupation": occ_of.get(aid, ""), "rank": rank_of.get(aid),
+                "wealth": round(v["wealth"], 1), "money": round(v["money"], 1),
+                "account": round(v["account"], 1)}
+
+    top_out = [_person(aid, v) for aid, v in ranked[:15]]
+    bottom_out = [_person(aid, v) for aid, v in ranked[-15:][::-1]]
+    return {
+        "days": days, "gini": gini_s, "top10": top_s, "median": med_s,
+        "mean": mean_s, "tau": tau_s, "top_pct": top_pct,
+        "hist": bins, "hist_edges": edges, "last_day": last_day,
+        "n_agents": len(lw), "top": top_out, "bottom": bottom_out,
+        "note": ("分布・順位は L3 スナップ(money+account)の日末値からの事後再構成。"
+                 "τ は前日比の順位相関(高い=順位不変=格差固定)で初日は前日なし=ギャップ。"
+                 "因果ではなく残高の構造の観測記録(介入しない=日常観察方針)。"),
+    }
 
 
 # ============================================================ 日次ロールアップ(第57バッチ タスクC)
@@ -2831,6 +3017,71 @@ function structRender(tab, s0){ if(tab==='structure' && D.structure){ renderStru
 """
 
 
+# 第59バッチ スライスa 資産タブ(assets_map.json が有る時だけ main() が dashboard に注入)。
+# 無ければ空文字→ DASH_HTML はバイト同一(lens/deviation/structure と同型の後方互換)。assetRender は tab で自己ガード。
+_ASSETS_JS = r"""
+function _yen(v){ if(v==null) return '—'; const a=Math.abs(v);
+  if(a>=1e8) return (v/1e8).toFixed(2)+'億'; if(a>=1e4) return (v/1e4).toFixed(1)+'万'; return Math.round(v).toLocaleString(); }
+function renderAssets(s0){
+  const V=D.assets, days=V.days||[];
+  const X=d=>d*144;
+  const pack=(arr)=> days.map((d,i)=>[X(d), arr&&arr[i]!=null?arr[i]:null]).filter(p=>p[1]!=null);
+  const gLast=(()=>{ for(let i=V.gini.length-1;i>=0;i--) if(V.gini[i]!=null) return V.gini[i]; return 0; })();
+  const tLast=(()=>{ for(let i=V.top10.length-1;i>=0;i--) if(V.top10[i]!=null) return V.top10[i]; return 0; })();
+  // ① 分布ヒスト(最終日の wealth 分布)
+  const hmax=Math.max(1,...V.hist);
+  const hbars=V.hist.map((c,i)=>{ const h=c/hmax*100;
+    return `<div style="display:flex;flex-direction:column;align-items:center;flex:1">
+      <div style="font-size:10px;color:var(--dim)">${c||''}</div>
+      <div style="width:74%;height:${h.toFixed(1)}px;min-height:1px;background:#34d399;border-radius:2px 2px 0 0" title="${_yen(V.hist_edges[i])}〜${_yen(V.hist_edges[i+1])}: ${c}人"></div></div>`;}).join('');
+  // ③④ 上位/下位ドリルダウン
+  const personRow=(a)=>`<div style="display:flex;justify-content:space-between;gap:8px;font-size:12px;margin:3px 0;border-bottom:1px solid var(--line);padding-bottom:2px">
+      <span><b>#${a.rank}</b> ${a.name} <span style="color:var(--dim)">${a.occupation||''}</span></span>
+      <span style="color:#34d399;font-weight:700">${_yen(a.wealth)}<span style="color:var(--dim);font-weight:400;font-size:11px"> (現金${_yen(a.money)}${a.account?('+口座'+_yen(a.account)):''})</span></span></div>`;
+  const topRows=(V.top||[]).map(personRow).join('')||'<div class="ev">データなし</div>';
+  const botRows=(V.bottom||[]).map(personRow).join('')||'<div class="ev">データなし</div>';
+  body.innerHTML=`
+   <div class="chartBox"><h3>① 資産(残高=現金+口座)の分布(最終日 Day ${V.last_day})</h3>
+     <div class="sub">横軸=残高の帯(${_yen(V.hist_edges[0])}〜${_yen(V.hist_edges[V.hist_edges.length-1])})・縦軸=人数。測定 ${V.n_agents} 人。裾が右に伸びるほど格差が大きい</div>
+     <div style="display:flex;align-items:flex-end;gap:2px;height:130px;max-width:600px;margin-top:8px">${hbars}</div></div>
+   <div class="chartBox"><h3>② 格差の推移(Gini・上位${Math.round(V.top_pct*100)}%集中度)</h3>
+     <div class="sub">Gini=残高の集中度(0=平等..1=1人に集中)。上位集中度=上位${Math.round(V.top_pct*100)}%が総資産に占める割合。上昇=マタイ効果(格差拡大)</div>
+     <div style="font-size:13px">直近: Gini <b style="color:#60a5fa">${gLast.toFixed(3)}</b> ・ 上位${Math.round(V.top_pct*100)}%集中 <b style="color:#f472b6">${(tLast*100).toFixed(1)}%</b></div>
+     <canvas id="asc1"></canvas></div>
+   <div class="chartBox"><h3>③ 資産順位の固着(前日比 Kendall τ)</h3>
+     <div class="sub">τ が高い(1 に近い)=資産順位が入れ替わらない=格差の固定化。低下・負=順位の流動。初日は前日なし=ギャップ(in-sim L2 の初期値 1.0 とは別=ここは L3 日末スナップの前日比)</div>
+     <canvas id="asc2"></canvas></div>
+   <div class="chartBox"><h3>④ 中央値・平均の推移</h3>
+     <div class="sub">中央値と平均の乖離(平均≫中央値)は上位への偏り=分布の歪みを表す</div>
+     <canvas id="asc3"></canvas></div>
+   <div class="chartBox"><h3>⑤ 上位/下位の住民(最終日・ドリルダウン)</h3>
+     <div class="sub">残高の多い順/少ない順。${V.note}</div>
+     <div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:6px">
+       <div style="flex:1;min-width:260px"><div style="font-size:12px;color:var(--dim);margin-bottom:3px">▲ 上位(富裕)</div>${topRows}</div>
+       <div style="flex:1;min-width:260px"><div style="font-size:12px;color:var(--dim);margin-bottom:3px">▼ 下位(困窮)</div>${botRows}</div></div></div>`;
+  lineChart(document.getElementById('asc1'), [
+    {label:'Gini',color:'#60a5fa', data:pack(V.gini)},
+    {label:'上位'+Math.round(V.top_pct*100)+'%集中', color:'#f472b6', data:pack(V.top10)},
+  ], {pct:true, ymax:1});
+  lineChart(document.getElementById('asc2'), [
+    {label:'前日比τ',color:'#a78bfa', data:pack(V.tau)},
+  ], {ymax:1});
+  lineChart(document.getElementById('asc3'), [
+    {label:'中央値',color:'#34d399', data:pack(V.median)},
+    {label:'平均',color:'#fbbf24', data:pack(V.mean)},
+  ], {});
+}
+function assetRender(tab, s0){ if(tab==='assets' && D.assets){ renderAssets(s0); } }
+// テンプレート render() を書き換えず、注入時に1回だけラップして資産タブ描画を差し込む(org/occ と同型=
+// 旧ラン<未注入>はテンプレートがバイト同一)。二重ラップ防止付き。
+(function(){ if(window.__assetsWrapped) return; window.__assetsWrapped=true;
+  const _origRender=render;
+  render=function(force){ _origRender(force);
+    if(typeof assetRender==='function') assetRender(tab, S0()); };
+})();
+"""
+
+
 # 第58バッチ B7 会社タブ(orgs データが有る時だけ main() が dashboard に __LENS_JS__ 経由で注入)。
 # 無ければ空文字→ DASH_HTML はバイト同一。orgRender は tab==='org' で自己ガード。名称・業種・職場は
 # 架空の合成台帳(organizations.book, R17)由来=実在企業名は出さない。従業員クリックで個人情報へ。
@@ -3887,6 +4138,7 @@ def main() -> None:
     has_trust = "trust" in data
     has_deviation = "deviation" in data
     has_structure = "structure" in data
+    has_assets = "assets" in data
     lens_tabs = ""
     if has_lens:
         lens_tabs += ('\n    <button data-tab="value">💠 価値</button>'
@@ -3897,11 +4149,15 @@ def main() -> None:
         lens_tabs += '\n    <button data-tab="deviation">🎭 逸脱</button>'
     if has_structure:
         lens_tabs += '\n    <button data-tab="structure">🏛 社会構造</button>'
+    if has_assets:
+        lens_tabs += '\n    <button data-tab="assets">💰 資産</button>'
     lens_js = _LENS_JS if (has_lens or has_trust) else ""
     if has_deviation:                      # 逸脱タブ JS は lens/trust と独立に注入(devRender を定義)
         lens_js += _DEV_JS
     if has_structure:                      # 社会構造タブ JS も独立に注入(structRender を定義)
         lens_js += _STRUCT_JS
+    if has_assets:                         # 資産タブ JS も独立に注入(assetRender を定義)
+        lens_js += _ASSETS_JS
     # 第58バッチ B7/B8: 会社(orgs)・在館(occupancy)データが「有る時だけ」タブ/JS を注入。無ければ
     # 全トークン空文字→ DASH_HTML/MAP_HTML はバイト同一(既存の lens/indoor と同型の後方互換)。
     # DASH_HTML/MAP_HTML の文字列そのものは一切改変せず、既存の __LENS_TABS__/__LENS_JS__/

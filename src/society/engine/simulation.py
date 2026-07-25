@@ -13,6 +13,7 @@ from ..config import REPO_ROOT, save_config
 from ..labeling.labels import LabelSystem
 from ..llm.cache import CachedLLM
 from ..llm.mock import MockBackend
+from ..observer import assets as assets_mod
 from ..observer import deviation as deviation_mod
 from ..observer import lens as lens_mod
 from ..observer.logger import ObserverLogger
@@ -850,6 +851,9 @@ class Simulation:
         # 第55バッチ タスクA: ペルソナ逸脱率レンズの map サイドカー(deviation ON 時のみ書く=OFF は
         # 後方互換でバイト同一)。ビューアが deviation_map.json 経由で読む(ペルソナ語は observer/deviation.py に閉じる)。
         deviation_mod.write_sidecar(self, self.out_dir)
+        # 第59バッチ スライス(a): 資産分布レンズの map サイドカー(assets ON 時のみ書く=OFF は後方互換で
+        # バイト同一)。ビューアが assets_map.json の有無で 💰資産タブを出す(資産語は observer/assets.py に閉じる)。
+        assets_mod.write_sidecar(self, self.out_dir)
 
     def _build_router_child(self, spec: dict):
         """router の子バックエンドを1つ構築する(第23バッチ M2)。

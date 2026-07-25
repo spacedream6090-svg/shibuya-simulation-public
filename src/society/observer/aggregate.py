@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from .. import status as _status_mod
+from . import assets as _assets
 from . import deviation as _dev
 from . import lens as _lens
 from . import structure as _struct
@@ -680,6 +681,43 @@ def _edges_decayed(sim):
 @register_aggregator("edge_churn_rate")
 def _edge_churn_rate(sim):
     return _struct_col(sim, "edge_churn_rate")
+
+
+# ---- 資産分布 第59バッチ スライス(a)(既定 OFF)。lens.assets.enabled=false は全て None=列なし=L2 不変 ----
+#   wealth=money+account の分布(Gini/上位10%集中/中央値/平均)を毎 step 現状から出す(status_gini と同型)。
+#   格差の固定化=資産順位の前日比 Kendall τ(asset_rank_tau。前日 wealth を sim に 1 本だけ持つ=status の
+#   rank_mobility と同流儀。初日/共通id<2 は初期値 1.0=順位不変)。住民別分布・ドリルダウンはビューア事後計算。
+#   scalars() は step 末に collect が 1 回呼ぶ経路で現 wealth+当日境界 τ から全体スカラーを作る(読むだけ・乱数ゼロ)。
+def _assets_col(sim, key):
+    if not _assets.enabled(sim):
+        return None
+    s = _assets.scalars(sim)
+    return s.get(key) if s else 0.0
+
+
+@register_aggregator("asset_gini")
+def _asset_gini(sim):
+    return _assets_col(sim, "asset_gini")
+
+
+@register_aggregator("asset_top10_share")
+def _asset_top10_share(sim):
+    return _assets_col(sim, "asset_top10_share")
+
+
+@register_aggregator("asset_median")
+def _asset_median(sim):
+    return _assets_col(sim, "asset_median")
+
+
+@register_aggregator("asset_mean")
+def _asset_mean(sim):
+    return _assets_col(sim, "asset_mean")
+
+
+@register_aggregator("asset_rank_tau")
+def _asset_rank_tau(sim):
+    return _assets_col(sim, "asset_rank_tau")
 
 
 # ---- 屋内エンジン配線 B3(indoor.enabled ON のみ・既定 OFF=None=列なし=L2 バイト不変)----

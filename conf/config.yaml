@@ -1039,6 +1039,19 @@ lens:
   # enabled=false = L2 に列を足さない=ゴールデン L1/L2 バイト一致。
   structure:
     enabled: false              # ★ON はユーザー判断(production/daily は触らない)。lens.enabled とは独立
+  # ---- 資産分布レンズ(第59バッチ スライス(a) 2026-07-25。独立 observable。既定 OFF)----
+  # 口座 E5 で永続ストックになった wealth=money+account の「残高そのもの」の分布と、格差が固定化するか
+  # (資産順位の固着)を正面から測る。合成地位 status の Gini は合成スコアであって残高ではない=別軸。観測のみ。
+  # L2 全体スカラー(住民別は L2 に出さない=ビューア事後計算):
+  #   asset_gini(残高の集中度)/ asset_top10_share(上位割合の占有率)/ asset_median / asset_mean /
+  #   asset_rank_tau(前日比 順位 Kendall τ=高いほど順位不変=格差固定。前日 wealth を sim に1本だけ持つ=
+  #   status の rank_mobility と同流儀。初日/共通id<2 は初期値 1.0=順位不変。checkpoint 非搭載=resume 後の初日も初期値)。
+  # 住民別分布ヒスト・上位/下位ドリルダウンは L3 スナップ(money[+account])からビューアが事後計算(deviation/trust と同型)。
+  # ダッシュボードの「💰 資産」タブは assets_map.json(ON 時サイドカー)が有る時だけ表示。
+  # enabled=false = L2 に列を足さず・サイドカーも書かず=ゴールデン L1/L2 バイト一致。
+  assets:
+    enabled: false              # ★ON はユーザー判断(production/daily は触らない)。lens.enabled とは独立
+    top_pct: 0.1                # 上位集中度 asset_top10_share の分位(既定 0.1=上位10%)
 
 # ---- 行動心理プラグイン(config 着脱式・すべて既定 OFF。ユーザー方針 2026-07-06)----
 # 文献の数値を固定実装せず、回しながら柔軟に変える seam。OFF 時はイベント列がバイト一致で不変。

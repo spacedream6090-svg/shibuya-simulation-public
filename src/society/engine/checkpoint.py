@@ -74,6 +74,13 @@ def save(sim, step: int, path: str | Path) -> Path:
             # emit 時に必ず sorted 反復=pickle の集合反復順非保存の影響を受けない(determinism 監査済み)。
             "org_day": getattr(sim, "_org_day", {}),
             "org_ledger_day": getattr(sim, "_org_ledger_day", -1),
+            # 資産レンズ 第59(検収補修): 前日 wealth スナップ+τ(observer/assets の state)。
+            # processed はプロセス内 logger カウンタ由来なので保存しない(load 側で 0 に戻す)。
+            # OFF ランでは _assets_state 自体が無い → None=挙動不変(load は .get で旧 ckpt 互換)。
+            "assets_state": (
+                {"day": sim._assets_state["day"], "prev": sim._assets_state["prev"],
+                 "tau": sim._assets_state["tau"]}
+                if getattr(sim, "_assets_state", None) else None),
         },
         # --- scenario は config から再構築される。封鎖の進行だけを直列化(順序安定) ---
         "scenario": {
@@ -124,6 +131,10 @@ def load(sim, path: str | Path) -> int:
     sim._acct_day = rt.get("acct_day", -1)      # 旧 checkpoint 互換(無ければ -1)
     sim._org_day = rt.get("org_day", {})        # B4: 会社観測 per-day アキュムレータ(旧 checkpoint 互換)
     sim._org_ledger_day = rt.get("org_ledger_day", -1)
+    ast = rt.get("assets_state")                # 第59: 資産レンズ τ の前日状態(旧 checkpoint 互換=無ければ素通り)
+    if ast:
+        sim._assets_state = {"day": ast["day"], "prev": ast["prev"],
+                             "tau": ast["tau"], "processed": 0}
 
     # scenario: __init__ で config から再構築済み。封鎖の進行を復元し city へ再適用。
     sc = blob["scenario"]
