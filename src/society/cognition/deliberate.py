@@ -427,6 +427,10 @@ def parse_action(response: str) -> dict | None:
                 out["rule"] = rule
             return out
         return None
+    if kind == "job_search":
+        # career選択由来化(第60バッチ b): 求職の意思表明。追加フィールドは不要(裁定=tools が
+        # 台帳から決定論マッチ)。by_choice OFF では tools 側が no-op=メニューにも出ない。
+        return {"type": "job_search"}
     if kind == "open_venture":
         name = _text_of("name", "title")
         if name:

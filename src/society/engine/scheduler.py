@@ -23,6 +23,7 @@ from .. import household as household_mod
 from .. import inner_life as inner_life_mod
 from .. import joint as joint_mod
 from .. import lodging as lodging_mod
+from .. import mobility as mobility_mod
 from .. import opinion as opinion_mod
 from .. import party as party_mod
 from .. import relations as relations_mod
@@ -366,6 +367,11 @@ def _ensure_orgs(sim) -> None:
         return
     sim.orgs = organizations.load_book(sim.orgscfg)
     sim.org_ledger = {}
+    # resume 時は配属(org_id/work_node)を checkpoint(agents pickle)から復元済み=再 attach しない。
+    # 再 attach すると career/求職の転職(switch_org)を元配属へ潰し resume!=straight になる(第60バッチ b
+    # で顕在化。book だけ再構築すれば book[new_org] 参照・求職マッチは動く)。fresh ランは従来どおり attach。
+    if getattr(sim.logger, "_resumed", False):
+        return
     personas_file = sim.cfg.get("agents", {}).get("personas_file")
     organizations.attach(sim.agents, sim.orgs, personas_file, city=sim.city,
                          commute_to_poi=bool(sim.orgscfg.get("commute_to_poi", False)),
@@ -2301,7 +2307,7 @@ def _apply(sim, agent, action: dict, step: int, sim_min: int) -> None:
     kind = action["type"]
 
     if kind in ("host_event", "post_flyer", "found_group", "propose",
-                "open_venture"):
+                "open_venture", "job_search"):
         tools = getattr(sim, "tools", None)
         if tools is not None:
             tools.apply(sim, agent, action, step, sim_min)
@@ -3623,6 +3629,36 @@ def _phase_career(sim, step: int, sim_min: int) -> None:
                     agent.remember("新しい仕事が見つかった")
 
 
+# ---------------------------------------------------------------- 内部可動性(第60バッチ b。既定 OFF)
+def _housing_on(sim) -> bool:
+    """転居 or 同棲(内部可動性)が有効か。既定 OFF=新経路を一切通さない(バイト一致)。"""
+    hcfg = getattr(sim, "housingcfg", None)
+    reloc = bool(hcfg and hcfg["enabled"])
+    hh = getattr(sim, "householdcfg", None)
+    cohabit = bool(hh and hh.get("enabled") and (hh.get("cohabit") or {}).get("enabled"))
+    return reloc or cohabit
+
+
+def _phase_housing(sim, step: int, sim_min: int) -> None:
+    """日次境界: 同棲(bond→N日→move_in)→ 転居(職場/家賃逼迫→relocate)を内生的に処理する。
+
+    転居も同棲も「エージェント側の状態・選択に由来する内生変化」=火種介入とは別物(devlog Entry 50)。
+    決定論: 確率・行き先は新 stream "housing"(agent, step)から引く=既存 draw 順に挿入しない。
+    R1: mobility 機構は generate() を1回も足さず、k・内面状態(構成概念)を発火判断に食わせず、暦・
+    config・物理位置(home/work)・relations の closeness(k 非依存の観測量)・新 stream のみ参照する
+    (呼数は k 非依存)。同棲を先に処理して(その日の世帯併合を確定)から転居を評価する(id 昇順・決定論)。
+    既定 OFF は即 return(relocate/move_in を1件も出さず housing stream も引かない=乱数消費不変)。
+    _housing_day は checkpoint.py 中央管理(mid-day checkpoint でも resume==straight を保つ=B4 前例)。"""
+    if not _housing_on(sim):
+        return
+    day = sim_min // 1440
+    if day == getattr(sim, "_housing_day", -1):
+        return
+    sim._housing_day = day
+    mobility_mod.cohabit_day(sim, step, sim_min)       # ② bond→同棲(世帯併合。household.cohabit)
+    mobility_mod.relocate_day(sim, step, sim_min)      # ① 転居(職場/家賃逼迫。housing.relocation)
+
+
 # ---------------------------------------------------------------- 健康・疲労・病気(後続波 H1)
 def _health_on(sim) -> bool:
     """健康(疲労・病気・メンタル)が有効か。既定 OFF=新経路を一切通さない(バイト一致)。"""
@@ -4341,6 +4377,7 @@ def run_step(sim, step: int) -> None:
     _phase_daily(sim, step, sim_min)               # 日次境界: 経済的逼迫の心理圧
     _phase_bank_day(sim, step, sim_min)            # 日次境界: 融資の定期返済・延滞→破産接続(既定OFF=no-op。E-W1)
     _phase_career(sim, step, sim_min)              # 日次境界: 失業/求職/転職(既定OFF=no-op。Wave G5)
+    _phase_housing(sim, step, sim_min)             # 日次境界: 同棲(move_in)→転居(relocate)(既定OFF=no-op。第60バッチ b)
     _phase_health(sim, step, sim_min)              # 日次境界: 病気の発症/回復・受診・メンタル(既定OFF=no-op。H1)
     _phase_disaster(sim, step, sim_min)            # 日次境界: 災害・交通遅延/運休・インフラ障害(既定OFF=no-op。H4)
     _phase_chance(sim, step, sim_min)              # 日次境界: 生活の偶発(臨時収入/財布紛失/偶然の出会い。既定OFF=no-op。第54バッチ)

@@ -418,6 +418,16 @@ class Simulation:
                       if OmegaConf.is_config(raw_health) else raw_health)
         self.healthcfg = _health_mod.build_cfg(raw_health)
         self._health_day = -1                      # 日境界(病気の発症/回復・メンタル)の進行管理
+        # 内部可動性 第60バッチ b(転居。既定 OFF=現行挙動と完全同一)。職場変更後の通勤逼迫 or 家賃逼迫
+        # (E5 滞納)から世帯単位で内生的に転居する(新 stream "housing")。同棲(household.cohabit)・
+        # career選択由来化(career.by_choice)と合わせた3機構=火種介入とは別の内生変化。決定論・非LLM
+        # (R1: 呼数は compute_matched 下の k 不変性で担保)。OFF=relocate 0 件・stream も引かない=バイト一致。
+        from .. import mobility as _mobility_mod
+        raw_housing = cfg.get("housing", None)
+        raw_housing = (OmegaConf.to_container(raw_housing, resolve=True)
+                       if OmegaConf.is_config(raw_housing) else raw_housing)
+        self.housingcfg = _mobility_mod.build_relocation_cfg(raw_housing)
+        self._housing_day = -1                      # 日境界(転居・同棲)の進行管理
         # 商業・店舗のダイナミクス(現実ギャップ 後続波 H3 2026-07-07。既定 OFF=現行挙動と完全同一)。
         # 営業時間(時刻の純関数=閉店中は行き先から除外・shop_state)+ 動的価格(在館数=需要から係数を
         # 決定論で消費額に乗せる・price_change)+ 在庫/品切れ・行列(需要集中で購入抑制+不満・stock_out)。

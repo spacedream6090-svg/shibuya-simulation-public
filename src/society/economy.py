@@ -173,6 +173,12 @@ def build_career_cfg(raw) -> dict:
         "severance_days": float(raw.get("severance_days", 0.0)),
         "unfair_ratio": float(raw.get("unfair_ratio", 0.0)),
         "unfair_grievance_mult": float(raw.get("unfair_grievance_mult", 2.0)),
+        # career選択由来化(内部可動性 第60バッチ b。既定 OFF=求職 tool を出さない=バイト一致)。
+        # ON: LLM の行動空間に求職 tool(job_search)を1件足す(既存 tool 選択枠内=呼数不変)。
+        # 発火→ mobility.match_job(定員空きの org を決定論選択)→ 既存 switch_org/rehire を呼ぶ。
+        # 確率駆動 switch_prob とは独立(両立可=干渉しない)。
+        "by_choice": {"enabled": bool(dict(raw.get("by_choice", {}) or {})
+                                      .get("enabled", False))},
     }
 
 

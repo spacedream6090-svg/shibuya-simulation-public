@@ -74,6 +74,14 @@ def save(sim, step: int, path: str | Path) -> Path:
             # emit 時に必ず sorted 反復=pickle の集合反復順非保存の影響を受けない(determinism 監査済み)。
             "org_day": getattr(sim, "_org_day", {}),
             "org_ledger_day": getattr(sim, "_org_ledger_day", -1),
+            # 内部可動性 第60バッチ b: 転居/同棲の日境界進行(mid-day checkpoint でも resume==straight
+            # を保つ)。新規の per-agent 状態(通勤既知値/同棲経過日/同棲フラグ)は agents pickle に自然
+            # 同梱=ここは日カウンタのみ中央管理する。OFF ランでは -1=挙動不変(load は .get で旧 ckpt 互換)。
+            "housing_day": getattr(sim, "_housing_day", -1),
+            # キャリア転換(Wave G5)の日境界進行。第60バッチ b の career 由来転居が resume で転職を
+            # 二重発火しないよう中央管理する(従来は未保存=career ON の mid-day resume が未検証だった)。
+            # OFF ランでは -1=挙動不変(load は .get で旧 checkpoint 互換)。
+            "career_day": getattr(sim, "_career_day", -1),
             # 資産レンズ 第59(検収補修): 前日 wealth スナップ+τ(observer/assets の state)。
             # processed はプロセス内 logger カウンタ由来なので保存しない(load 側で 0 に戻す)。
             # OFF ランでは _assets_state 自体が無い → None=挙動不変(load は .get で旧 ckpt 互換)。
@@ -131,6 +139,8 @@ def load(sim, path: str | Path) -> int:
     sim._acct_day = rt.get("acct_day", -1)      # 旧 checkpoint 互換(無ければ -1)
     sim._org_day = rt.get("org_day", {})        # B4: 会社観測 per-day アキュムレータ(旧 checkpoint 互換)
     sim._org_ledger_day = rt.get("org_ledger_day", -1)
+    sim._housing_day = rt.get("housing_day", -1)  # 第60バッチ b: 転居/同棲の日境界進行(旧 checkpoint 互換)
+    sim._career_day = rt.get("career_day", -1)    # 第60バッチ b: career 日境界進行(旧 checkpoint 互換)
     ast = rt.get("assets_state")                # 第59: 資産レンズ τ の前日状態(旧 checkpoint 互換=無ければ素通り)
     if ast:
         sim._assets_state = {"day": ast["day"], "prev": ast["prev"],

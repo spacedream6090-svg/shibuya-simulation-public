@@ -1387,6 +1387,12 @@ career:
   severance_days: 0.0           # ★ON 推奨(本番): 例 5(解雇時の退職金=日給×日数。wage source="severance")
   unfair_ratio: 0.0             # ★ON 推奨(本番): 例 0.3(解雇のうち不当解雇の割合。>0 のときのみ追加 draw)
   unfair_grievance_mult: 2.0    # 不当解雇時の生活不安(unemployment_grievance)の倍率
+  # career選択由来化(内部可動性 第60バッチ b。既定 OFF=求職 tool を出さない=バイト一致)。ON:
+  # LLM の行動空間に求職 tool(job_search)を1件足し(既存 tool 選択枠内=呼数不変)、発火→台帳から
+  # 定員空きの org を決定論マッチ(wage_tier整合+職場近接)→ 既存 switch_org/rehire を呼ぶ。要
+  # organizations.enabled=true。確率駆動 switch_prob とは独立(両立可)。実装 src/society/mobility.py。
+  by_choice:
+    enabled: false              # ★ON 推奨(本番): true(転職を確率でなくエージェントの選択起点にする)
 
 annual_events:
   enabled: false                # ★ON 推奨(本番): true(要 world.calendar.enabled=true)
@@ -1493,6 +1499,31 @@ household:
     prob: 0.69                  # 夕食帯の home 収束バイアス/step(農水省 食育調査 令和5=家族と夕食「ほぼ毎日」68.7%)
     band_start_min: 1080        # 夕食帯の開始(分 of day)= 18:00
     band_end_min: 1260          # 夕食帯の終了(分 of day)= 21:00
+  # ---- bond→同棲/unbond→転出(内部可動性 第60バッチ b。既定 OFF=世帯の物理再編なし=バイト一致)----
+  # パートナー成立(bond)から days 日継続+相互 closeness 維持で同棲(後から来た側=id 大が相手宅へ転居し
+  # 世帯併合。move_in)。別離(unbond)時は後から来た側が新居へ転出(世帯分離。move_out)。新 stream "housing"。
+  cohabit:
+    enabled: false              # ★ON 推奨(本番): true(同棲=世帯の物理再編を有効化。要 household.enabled=true + 恋愛)
+    days: 14                    # 同棲判定の最短 bond 継続日数(初観測日から起算)
+    closeness: 0.0              # 維持すべき相互 closeness(0=household.partner_closeness を採用)
+
+# ---- 転居(内部可動性 第60バッチ b 2026-07-24。既定 OFF=現行挙動と完全同一)----
+# 閉じた世界の構造固着を「運営者の介入なし」に内生的に動かす転居機構(devlog Entry 50)。トリガーは
+# エージェント側の状態に由来する内生変化のみ(火種介入とは別物): (i)職場変更(switch_org/rehire/
+# venture本業化/求職)後、通勤距離が閾値超なら日次確率で職場近接へ転居 (ii)家賃逼迫(E5 滞納 rent_due>0)
+# なら日次確率で転居。外生イベントでの強制転居は作らない。行き先=persona が使う city.residential_buildings
+# を近接重み+ (agent,day) 乱数で決定論選択し、世帯全員が一緒に動く(_share_home 整合)。同棲転居は
+# household.cohabit が担う。新 stream "housing"。実装 src/society/mobility.py。
+# R1: generate() を1本も足さず、k・内面状態を発火判断に食わせず暦・config・物理位置(home/work)・
+#   新 stream のみ参照(呼数は compute_matched 下の k 不変性で担保。career G5 / household H2 と同型)。
+# 既定 OFF=relocate 0 件・"housing" stream も引かない=乱数消費不変(ゴールデン golden_baseline_l1.json を守る)。
+housing:
+  relocation:
+    enabled: false              # ★ON 推奨(本番): true(内生的な転居=構造固着を運営者介入なしに動かす)
+    job_prob: 0.5               # 職場変更後・通勤閾値超の日次転居確率(職場近接へ)
+    rent_prob: 0.3              # 家賃逼迫(E5 滞納)時の日次転居確率(要 economy.accounts.enabled=true)
+    commute_threshold_m: 1500.0 # この通勤距離(m)超で職場近接転居を検討
+    candidate_k: 5              # 近接上位 K 件から (agent,day) 乱数で1件(過度な遠距離を避ける)
 
 # ---- 共同行動エンジン(関係性の再現 第44バッチ S-R3。ユーザー要望 2026-07-21。既定 OFF=現行挙動と完全同一)----
 # 関係(友人 relations tier≥2 / 同居人 housemates)を起点に「N人が同一(POI,時刻)へ独立に収束+合流は

@@ -48,6 +48,10 @@ DEFAULTS = {
     #  prob=農水省 食育調査 令和5(§2.4: 家族と夕食「ほぼ毎日」68.7%)。band=18:00-21:00(分 int)。
     "family_dinner": {"enabled": False, "prob": 0.69,
                       "band_start_min": 1080, "band_end_min": 1260},
+    # ---- bond→同棲/unbond→転出(内部可動性 第60バッチ b。既定 OFF=世帯の物理再編なし=バイト一致)----
+    #  days=同棲判定の最短 bond 継続日数、closeness=維持すべき相互 closeness(0=partner_closeness)。
+    #  ロジックは mobility.py(cohabit_day / on_breakup)。ここは config のみ。
+    "cohabit": {"enabled": False, "days": 14, "closeness": 0.0},
 }
 
 _BOOL_KEYS = ("enabled", "realistic")
@@ -96,6 +100,9 @@ def build_cfg(raw) -> dict:
             cfg[k] = [float(x) for x in v]
         elif k == "family_dinner":
             cfg[k] = _fd_cfg(v)
+        elif k == "cohabit":
+            from . import mobility as _mobility
+            cfg[k] = _mobility.build_cohabit_cfg(v)
         else:
             cfg[k] = float(v)
     return cfg
@@ -364,6 +371,9 @@ def unbond(sim, a, step: int, sim_min: int) -> bool:
     a.remember(f"{other_name}と別れた" if other_name else "恋人と別れた")
     if b is not None:
         b.remember(f"{a.name}と別れた")
+    # 内部可動性 第60バッチ b: 同棲していたら後から来た側を転出させる(cohabit OFF/非同棲は no-op)。
+    from . import mobility as _mobility
+    _mobility.on_breakup(sim, a, b, step, sim_min)
     return True
 
 

@@ -524,6 +524,10 @@ class Tools:
         ]
         if agent.money >= self.cfg["venture_cost"] and agent.id not in self.ventures:
             offers.append('{"action":"open_venture","name":"…","offer":"…"}')
+        # career選択由来化(第60バッチ b): career.by_choice ON かつ求職資格者にだけ「求職」を1件足す
+        # (既定 OFF=一字も足さない=バイト一致)。誰が動くかは LLM 判断=内生的キャリア移動の観察。
+        if self._job_search_offer(sim, agent):
+            offers.append('{"action":"job_search"}')
         # 議会選挙の現実化(realism ON): 告示期間中の資格者にだけ「立候補」を1件追加(既定 OFF=一字も
         # 足さない=ゴールデン維持)。誰が立候補するかは LLM 判断=ファウンダー観察の一部(勧めない)。
         cand = self._candidacy_offer(sim, agent)
@@ -626,6 +630,8 @@ class Tools:
                 self._propose(sim, agent, action, step, sim_min)
         elif kind == "open_venture":
             self._open_venture(sim, agent, action, step, sim_min)
+        elif kind == "job_search":
+            self._job_search(sim, agent, action, step, sim_min)
 
     # -- 1. host_event -----------------------------------------------------
     def _host_event(self, sim, agent, action, step, sim_min) -> None:
@@ -846,6 +852,56 @@ class Tools:
                        "open_step": step + permit_steps})
         sim.net.post(agent.id, f"「{name}」始めました。{offer}", [], step)
         agent.remember(f"「{name}」を開店した")
+
+    # -- 6. job_search(career選択由来化 第60バッチ b) --------------------------
+    def _by_choice_on(self, sim) -> bool:
+        cfg = getattr(sim, "careercfg", None)
+        return bool(cfg and (cfg.get("by_choice") or {}).get("enabled"))
+
+    def _job_search_offer(self, sim, agent) -> bool:
+        """求職 tool を提示するか(by_choice ON・被雇用者 or 求職中・会社台帳あり)。それ以外は False
+        =メニュー文字列が完全不変(OFF/非該当はバイト一致)。"""
+        if not self._by_choice_on(sim):
+            return False
+        from . import organizations as _orgs
+        if not getattr(sim, "orgs", None):
+            return False
+        return bool(_orgs.is_employee(agent) or _orgs.is_laid_off(agent))
+
+    def _job_search(self, sim, agent, action, step, sim_min) -> None:
+        """求職の裁定: 台帳から決定論マッチ(定員空きの org)→ 既存 switch_org/rehire を呼ぶ。
+
+        LLM の求職意思(job_search)を起点に、mobility.match_job が wage_tier 整合+職場近接+安定
+        ハッシュで空き org を1つ選ぶ(乱数ゼロ)。マッチ失敗=job_search{outcome:"none"} のみ記録。
+        職場変更の実体は既存機構(switch_org=被雇用者の転職 / rehire=求職者の再就職)を再利用する。
+        確率駆動 career(switch_prob 等)とは独立=両立可。転職事実は既存イベント→記憶経路に任せる
+        (新規プロンプト注入は作らない=R1)。by_choice OFF は apply に来ないが二重防御で即 return。"""
+        if not self._by_choice_on(sim):
+            return
+        from . import mobility as _mobility, organizations as _orgs
+        laid_off = _orgs.is_laid_off(agent)
+        if not (_orgs.is_employee(agent) or laid_off):     # 学生・自営・未配属は求職資格なし
+            self._log(sim, step, sim_min, agent, "job_search", {"outcome": "ineligible"})
+            return
+        org = _mobility.match_job(sim, agent)
+        if org is None:                                    # 空き無し=マッチ失敗(記録のみ)
+            self._log(sim, step, sim_min, agent, "job_search", {"outcome": "none"})
+            agent.remember("仕事を探したが、空きが見つからなかった")
+            return
+        commute = bool(getattr(sim, "orgscfg", {}) and sim.orgscfg.get("commute_to_poi"))
+        to_org = str(org["id"])
+        if laid_off:                                       # 求職者=再就職(収入復帰)
+            _orgs.rehire(agent, org, city=sim.city, commute_to_poi=commute)
+            from_org, cause = None, "job_search_rehire"
+        else:                                              # 被雇用者=別 org へ転職
+            from_org = _orgs.switch_org(agent, org, city=sim.city, commute_to_poi=commute)
+            cause = "job_search"
+        self._log(sim, step, sim_min, agent, "job_search",
+                  {"outcome": "hired", "from_org": from_org, "to_org": to_org})
+        # 既存 career の分析・記憶経路に整合する job_change も併記(職場変更の一貫観測)。
+        self._log(sim, step, sim_min, agent, "job_change",
+                  {"from_org": from_org, "to_org": to_org, "cause": cause})
+        agent.remember("自分から動いて新しい仕事を見つけた")
 
     # ---------------------------------------------------------------- 毎 step
     def phase(self, sim, step: int, sim_min: int) -> None:

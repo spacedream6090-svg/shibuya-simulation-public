@@ -151,6 +151,11 @@ register_event_kind("health_update", "疲労・メンタルの状態更新(内�
 # ---- 現実ギャップ実装 後続波 H2(世帯・家族・恋愛。既定 OFF)----
 register_event_kind("partner_formed", "恋愛・パートナー関係の成立(相互の強い親密度から){other}")
 register_event_kind("life_event",     "ライフイベント(結婚・同居・別れなど){kind, other?}")
+# ---- 内部可動性 第60バッチ(b)(転居・同棲・求職の内生化。既定 OFF=0件。実装 src/society/mobility.py)----
+register_event_kind("relocate",  "内生的な世帯転居(職場変更後の通勤逼迫 or 家賃逼迫。世帯単位){from, to, reason, n}")
+register_event_kind("move_in",   "同棲開始=後から来た側が相手宅へ転居し世帯併合(bond→N日+closeness){pair, from, to, reason}")
+register_event_kind("move_out",  "別離に伴う転出=後から来た側が新居へ移り世帯分離(unbond 時){pair, from, to, reason}")
+register_event_kind("job_search","求職 tool の発火(career選択由来化。決定論マッチ→switch_org/rehire){outcome, from_org?, to_org?}")
 # ---- 現実ギャップ実装 後続波 H3(商業ダイナミクス。既定 OFF)----
 register_event_kind("shop_state",    "店舗の開店・閉店(営業時間){poi, state}")
 register_event_kind("price_change",  "動的価格の変動(需給・セール){poi?, cat, ratio}")
