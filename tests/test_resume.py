@@ -103,3 +103,29 @@ def test_resume_across_shock_closure(tmp_path):
     assert sim.scenario.active and sim.scenario.closed, "封鎖状態が復元されていない"
     n_flags = sum(1 for _u, _v, d in sim.city.graph.edges(data=True) if d.get("closed"))
     assert n_flags == len(sim.scenario.closed) > 0, "closed フラグが city へ再適用されていない"
+
+
+def test_resume_relations_day_no_double_decay(tmp_path):
+    """relations ON の resume==straight(第61検収補修=_rel_day の checkpoint 中央管理の固定)。
+
+    _rel_day が checkpoint に無いと、日境界(step102=start_tod 07:00)を過ぎた後の resume 初 step で
+    _phase_relations_day が同じ日を再処理(closeness 減衰/評判風化の二重発火)し straight と食い違う。
+    split=105(境界処理済み)→110 の全層一致に加え、round-trip で _rel_day 復元を直接固定して
+    (mock で関係イベントが偶然 0 件でも)検証が空回りしないことを保証する。"""
+    ov = {"relations.enabled": "true"}
+    straight = _run_straight(tmp_path, "rel_straight", 110, **ov)
+    resumed = _run_resume(tmp_path, "rel_resumed", 105, 110, **ov)
+    for stem in ("l1_events", "l2_metrics", "l3_snapshots"):
+        assert _rows(straight, stem) == _rows(resumed, stem), f"{stem} 不一致(relations resume)"
+    # 直接検証: 境界処理済みの _rel_day が checkpoint round-trip で復元される(空回り防止)
+    d = tmp_path / "rel_ck"
+    sim1 = Simulation(_cfg("rel_ck", 105, **{"observer.checkpoint_every": 105}, **ov), out_dir=d)
+    for step in range(105):
+        scheduler.run_step(sim1, step)
+    assert getattr(sim1, "_rel_day", -1) >= 1, "日境界が未処理(テスト前提が崩れた=要再調整)"
+    p = checkpoint.save(sim1, 105, d / "checkpoint" / "ckpt-000105.pkl.gz")
+    sim2 = Simulation(_cfg("rel_ck2", 105, **{"observer.checkpoint_every": 105}, **ov),
+                      out_dir=tmp_path / "rel_ck2")
+    checkpoint.load(sim2, p)
+    assert getattr(sim2, "_rel_day", None) == getattr(sim1, "_rel_day", None), \
+        "_rel_day が checkpoint で復元されていない"

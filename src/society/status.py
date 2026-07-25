@@ -170,6 +170,16 @@ def _recompute(sim, cfg: dict) -> None:
              + w["biz"] * pr_biz[i] + w["host"] * pr_host[i]) / wsum
         a.status = round(s, 6)
 
+    # 負の評判(第61バッチ c): 悪評の被知覚数(/N)を status の負項として小さく反映する(max_penalty で
+    # 上限=孤立への滑り台にしない)。gossip OFF は penalty=0=status 不変(gossip.py に閉じる=no-fingerprint)。
+    from . import gossip as _gossip
+    if _gossip.enabled(sim):
+        perceived = _gossip.perceived_counts(sim)
+        for a in agents:
+            pen = _gossip.status_penalty(sim, a.id, perceived)
+            if pen:
+                a.status = round(max(0.0, a.status - pen), 6)
+
     # 移動性(前日 rank との平均絶対差)を sim に保持(L2 aggregator が参照)。
     ranks = _ranks_by_status(agents)
     prev = getattr(sim, "_status_prev_rank", None)

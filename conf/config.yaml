@@ -1573,6 +1573,35 @@ joint:
     "35": {karaoke: 0.8, shopping: 0.9, cinema: 1.0, meal_cafe: 1.0}
     "55": {karaoke: 0.4, shopping: 0.7, cinema: 0.8, meal_cafe: 1.0}
 
+# ---- 負の評判(悪評)の内生伝播 第61バッチ スライス(c)(2026-07-25。既定 OFF=現行挙動と完全同一)----
+# 現状の評判(relations)は「正の地位が上がり日次風化する」のみ=対人レベルの負の評判(ゴシップ制裁)が
+# 無い=「いい人ばかりの世界」。語彙伝播で実証済みの complex contagion(閾値2)を負方向に再利用し、悪評の
+# 内生伝播を実装する(外部からの危機注入ではない=種は既存の負イベントのみ)。実装 src/society/gossip.py
+# (較正値・種イベント種の写像はここと gossip.py にのみ=no-fingerprint 契約)。設計正典 devlog Entry 50。
+# ON 時: ① 種=既存の負イベント(seed_events マップ)当事者が (agent,day) 確率で匿名の悪評タグ化し、対象の
+#   直近会話相手が初期の知る者になる。② 伝播=会話接触に乗り、相異なる知人が adopt_threshold 人に達すると採用
+#   ((listener,day) キー決定論)。③ 忘却=日次 decay_prob で忘れる(烙印にしない)。制裁は相手選択の後退・
+#   共同行動の誘い低下・status の負項(いずれも max_penalty で上限=孤立への滑り台にしない)。悪評文は LLM に
+#   生成させない(呼数不変・指紋回避)。★ 効くのは relations.enabled=true(種の relation_break・会話接触台帳)。
+# OFF 時: gossip_seed/spread/fade 0 件・stream "gossip" を引かず・L2 に gossip_* 列を足さず・status/相手選択/
+#   joint 誘いとも不変=乱数消費・イベント列がバイト一致(ゴールデン golden_baseline_l1.json を守る)。
+gossip:
+  enabled: false                # ★ON はユーザー判断(対人レベルの負の評判=ゴシップ制裁を有効化。要 relations.enabled=true で活きる)
+  seed_prob: 0.5                # 負イベント当事者が悪評タグ化する (agent,day) 確率(× 下の event weight)
+  # 種になる既存の負イベント種 → 重み(コードに固有名詞を書かない=データ駆動の写像。与えたキーだけ既定へ重なる)
+  seed_events:
+    bankruptcy: 1.0             # 自己破産(常に負)
+    eviction: 0.7              # 立退き(回復 phase=rehoused は下の除外で種にしない)
+    relation_break: 0.3        # 関係断絶(原因側が特定できない=台帳所有者=正直に低確率)
+    misinfo: 0.6               # 誤情報の発信者(author 一貫)
+  seed_exclude_payload: [rehoused]  # payload 値にこれを含むイベントは種にしない(eviction の回復等=データ駆動)
+  seed_contact_days: 1          # 種化時、対象の直近この日数内に会話した相手を初期の知る者にする
+  adopt_threshold: 2           # 相異なる知人が何人で悪評を採用するか(labels と同じ complex contagion 閾値)
+  decay_prob: 0.15             # 悪評を1日で忘れる確率(永続の烙印にしない=噂の風化)
+  max_penalty: 0.2             # 各制裁効果の上限(孤立への滑り台にしない安全弁)
+  joint_penalty: 0.15          # 悪評を知る相手を共同行動に誘う確率の低下幅
+  status_weight: 0.1           # 被知覚数(/N)を status の負項に反映する重み(既定=効果最小)
+
 # ---- 来街者 party の実体化(関係性パッケージ完結 第45バッチ S-R5。ユーザー要望 2026-07-21。既定 OFF=現行挙動と完全同一)----
 # プールの L4 来街者 record に party_size 1-5(build_persona_pool.py=同行人数)が実在するが sim 内で未使用
 # だった。本ブロックは present な来街者を party_size でグループ化=「同席の連れ」にする: 同一初期ノードへ寄せ・

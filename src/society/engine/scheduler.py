@@ -17,6 +17,7 @@ from .. import conversation as conversation_mod
 from .. import disaster as disaster_mod
 from .. import diversity as diversity_mod
 from .. import freedom_p2 as freedom_p2_mod
+from .. import gossip as gossip_mod
 from .. import goods as goods_mod
 from .. import health as health_mod
 from .. import household as household_mod
@@ -1287,6 +1288,10 @@ def _select_partner(sim, agent, hearers):
     "closeness": score = closeness(話者→候補)·10.0 − dist_m·0.1 の argmax(同点は id 昇順)。"""
     if not hearers:
         return None
+    # 負の評判(第61バッチ c): 悪評を知る相手を返答相手選択から後退させる(B3b の遭遇優先と同じ相手
+    # 選択層。全員が悪評対象なら素通り=会話は必ず起き相手だけ変わる)。OFF は分岐に入らない=ゴールデン維持。
+    if gossip_mod.enabled(sim):
+        hearers = gossip_mod.demote_partners(sim, agent, hearers)
     # B3b 遭遇→ペアリング(indoor.encounter.pairing): 直近(前 step)の屋内遭遇相手が同席者に
     # 居れば、そこから (遭遇 duration 降順, id 昇順) の決定論で1人を優先返答相手にする(乱数なし・R1)。
     # 該当者ゼロなら下の nearest/closeness へ後退。hearer 集合・会話発生・LLM 呼数は不変(相手だけ変わる)。
@@ -3489,6 +3494,20 @@ def _phase_relations_day(sim, step: int, sim_min: int) -> None:
     relations_mod.decay_day(sim, sim.relationscfg, step, sim_min)
 
 
+# ---------------------------------------------------------------- 負の評判の内生伝播(第61バッチ c)
+def _phase_gossip(sim, step: int, sim_min: int) -> None:
+    """毎 step: 悪評の種スキャン(毎 step)+ 種/伝播(complex contagion)/忘却(日境界)。
+
+    gossip 無効なら完全 no-op(gossip_seed/spread/fade 0 件・stream "gossip" も引かない=バイト一致)。
+    ロジックは gossip.py(src/society 直下=CHECKED_DIRS 外=no-fingerprint)に閉じる。infoenv(誤情報)
+    確定後・collect(L2)前に置く=当日の負イベントを同 step でスキャンし L2 スカラーへ即反映する。
+    R1: generate() を 1 本も足さず、k・内面状態(構成概念)を読まず、既存イベント列(負イベント種は conf
+    マップ)・会話接触の relations 台帳(k 非依存の観測量)・専用 stream "gossip"・config のみ参照する
+    (呼数は k 非依存)。制裁(相手選択後退/joint 誘い低下)は対面 co-location を変えうる(career/joint と
+    同型で許容)→ 呼数不変は compute_matched 下の k 不変性で担保する。既存 _phase_* の並びは壊さない。"""
+    gossip_mod.phase(sim, step, sim_min)
+
+
 # ---------------------------------------------------------------- 世帯・恋愛(後続波 H2)
 def _household_on(sim) -> bool:
     """世帯・家族・恋愛(後続波 H2)が有効か。既定 OFF=新経路を一切通さない(バイト一致)。"""
@@ -4431,6 +4450,8 @@ def run_step(sim, step: int) -> None:
     infoenv_mod.phase(sim, step, sim_min)          # 情報環境: バイラル加重・誤情報/炎上(既定OFF=no-op。Wave G6)
     _phase_work_service(sim, step, sim_min, _work_idx)  # L2業務: 接客serve/オフィスorg_output(既定OFF=no-op)
     _phase_org_accumulate(sim, step, sim_min)      # 会社観測データ層 B4: 当日の office 在席頭数/ミクロ在席分を積む(既定OFF=no-op)
+    _phase_gossip(sim, step, sim_min)              # 負の評判の内生伝播: 種スキャン+種/伝播/忘却(既定OFF=no-op。第61バッチ c)。
+                                                   # infoenv(誤情報)確定後・collect(L2)前=当日の負イベントを同 step でスキャン
 
     _bl = (sim.cfg.get("engine", {}) or {}).get("batch_llm", {}) or {}
     if bool(_bl.get("enabled", False)):

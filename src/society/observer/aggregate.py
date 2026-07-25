@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from .. import gossip as _gossip
 from .. import status as _status_mod
 from . import assets as _assets
 from . import deviation as _dev
@@ -718,6 +719,29 @@ def _asset_mean(sim):
 @register_aggregator("asset_rank_tau")
 def _asset_rank_tau(sim):
     return _assets_col(sim, "asset_rank_tau")
+
+
+# ---- 負の評判の内生伝播 第61バッチ スライス(c)(既定 OFF)。gossip.enabled=false は全て None=列なし=L2 不変 ----
+#   現在悪評を知られている人数・当日伝播採用数・悪評1件あたり平均到達数(住民別・伝播経路は L1 から事後再構成)。
+#   scalars() は step 末に collect が 1 回呼ぶ経路で現状の被知覚数+当日境界カウンタから全体スカラーを作る(読むだけ)。
+def _gossip_col(sim, key):
+    s = _gossip.scalars(sim)
+    return s.get(key) if s else None
+
+
+@register_aggregator("gossip_active_count")
+def _gossip_active_count(sim):
+    return _gossip_col(sim, "gossip_active_count")
+
+
+@register_aggregator("gossip_spread_total")
+def _gossip_spread_total(sim):
+    return _gossip_col(sim, "gossip_spread_total")
+
+
+@register_aggregator("gossip_reach_mean")
+def _gossip_reach_mean(sim):
+    return _gossip_col(sim, "gossip_reach_mean")
 
 
 # ---- 屋内エンジン配線 B3(indoor.enabled ON のみ・既定 OFF=None=列なし=L2 バイト不変)----

@@ -22,6 +22,7 @@ R1 呼数不変: generate() を1本も足さない。日次編成(_phase_joint=�
 """
 from __future__ import annotations
 
+from . import gossip as _gossip
 from . import relations as _relations
 from .observer.schema import Event
 
@@ -343,6 +344,7 @@ def plan_day(sim, step: int, sim_min: int) -> None:
             other = sim.agent_by_id.get(cid)
             age_gap = abs(a_age - int(getattr(other, "age", 0) or 0)) if other else 0
             p = accept_prob(cfg, _tier(sim, a, cid), hier, age_gap)  # S-R4: 階層依存
+            p -= _gossip.joint_penalty(sim, a, cid)   # 負の評判(第61 c): 悪評を知る相手は誘いにくい(既定 OFF=0)
             if float(rng.random()) < p:               # 誘い→承諾(決定論・新 stream)
                 group.append(cid)
         if len(group) < int(cfg["min_group"]):

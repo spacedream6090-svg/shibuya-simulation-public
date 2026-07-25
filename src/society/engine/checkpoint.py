@@ -82,6 +82,10 @@ def save(sim, step: int, path: str | Path) -> Path:
             # 二重発火しないよう中央管理する(従来は未保存=career ON の mid-day resume が未検証だった)。
             # OFF ランでは -1=挙動不変(load は .get で旧 checkpoint 互換)。
             "career_day": getattr(sim, "_career_day", -1),
+            # 社会関係(Wave G2)の日境界進行 第61検収補修: 未保存だと relations ON の mid-day resume で
+            # _phase_relations_day が同じ日を再処理(closeness減衰/評判風化の二重発火)し resume!=straight。
+            # 第61バッチの gossip resume テストが顕在化させた既存ギャップ。OFF ランでは -1=挙動不変。
+            "rel_day": getattr(sim, "_rel_day", -1),
             # 資産レンズ 第59(検収補修): 前日 wealth スナップ+τ(observer/assets の state)。
             # processed はプロセス内 logger カウンタ由来なので保存しない(load 側で 0 に戻す)。
             # OFF ランでは _assets_state 自体が無い → None=挙動不変(load は .get で旧 ckpt 互換)。
@@ -89,6 +93,13 @@ def save(sim, step: int, path: str | Path) -> Path:
                 {"day": sim._assets_state["day"], "prev": sim._assets_state["prev"],
                  "tau": sim._assets_state["tau"]}
                 if getattr(sim, "_assets_state", None) else None),
+            # 負の評判 第61バッチ c: 種/伝播/忘却の日境界進行(gossip_day)+ 当日カウンタ(gossip_state)+
+            # 未ロールの種候補(gossip_pending)。agent 側の _gossip_known/_gossip_heard は agents pickle に
+            # 自然同梱。watermark はプロセス内 logger カウンタ由来なので保存しない(load で 0 に戻す=assets
+            # と同流儀)。OFF ランでは -1/None=挙動不変(load は .get で旧 checkpoint 互換)。
+            "gossip_day": getattr(sim, "_gossip_day", -1),
+            "gossip_state": getattr(sim, "_gossip_state", None),
+            "gossip_pending": getattr(sim, "_gossip_pending", None),
         },
         # --- scenario は config から再構築される。封鎖の進行だけを直列化(順序安定) ---
         "scenario": {
@@ -141,10 +152,19 @@ def load(sim, path: str | Path) -> int:
     sim._org_ledger_day = rt.get("org_ledger_day", -1)
     sim._housing_day = rt.get("housing_day", -1)  # 第60バッチ b: 転居/同棲の日境界進行(旧 checkpoint 互換)
     sim._career_day = rt.get("career_day", -1)    # 第60バッチ b: career 日境界進行(旧 checkpoint 互換)
+    sim._rel_day = rt.get("rel_day", -1)          # 第61検収補修: 社会関係 日境界進行(旧 checkpoint 互換)
     ast = rt.get("assets_state")                # 第59: 資産レンズ τ の前日状態(旧 checkpoint 互換=無ければ素通り)
     if ast:
         sim._assets_state = {"day": ast["day"], "prev": ast["prev"],
                              "tau": ast["tau"], "processed": 0}
+    sim._gossip_day = rt.get("gossip_day", -1)  # 第61 c: 負の評判の日境界進行(旧 checkpoint 互換)
+    gst = rt.get("gossip_state")
+    if gst is not None:
+        sim._gossip_state = gst
+    gpd = rt.get("gossip_pending")
+    if gpd is not None:
+        sim._gossip_pending = gpd
+    sim._gossip_watermark = 0                   # watermark は load で 0(fresh logger=total 0 から再走査。assets と同流儀)
 
     # scenario: __init__ で config から再構築済み。封鎖の進行を復元し city へ再適用。
     sc = blob["scenario"]

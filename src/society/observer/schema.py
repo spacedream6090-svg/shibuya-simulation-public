@@ -243,6 +243,11 @@ register_event_kind("chance_event", "生活の偶発事(臨時収入 windfall / 
 # ---- 屋内エンジン配線 B3(indoor.enabled ON のみ・既定 OFF=0件。決定論・新 stream "indoor"/"indoor_meet" のみ。
 #      フロア内の区画遷移=step 粒度の屋内ミクロ移動。秒スケール軌跡は L1 に入れず tracks サイドカーへ)----
 register_event_kind("space_move", "屋内フロア内の区画遷移(markov 回遊/会議/階間到着){building, floor, from_zone, to_zone, from_type, to_type, offset_s, kind}")
+# ---- 負の評判(悪評)の内生伝播 第61バッチ スライス(c)(gossip.enabled ON のみ・既定 OFF=0件。決定論・
+#      新 stream "gossip" のみ・LLM/generate ゼロ増。実装 src/society/gossip.py。設計 devlog Entry 50)----
+register_event_kind("gossip_seed",   "悪評タグの発生=既存の負イベント当事者が悪評化(匿名タグ=何をしたかは L1 参照){n, cause}")
+register_event_kind("gossip_spread", "悪評タグの伝播採用=独立した複数の知人から聞いて採用(complex contagion){target, sources}")
+register_event_kind("gossip_fade",   "悪評タグの忘却=知る者が悪評を忘れる(烙印にしない=噂の風化){target}")
 
 
 @dataclass
