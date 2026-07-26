@@ -1,0 +1,38 @@
+# endogenous_accept 配線検証(第63バッチ 2026-07-27 実行済み)= タスク指定の予備12ラン。
+# pilot との差分: 60体・seed2(6セル×2=12ラン)。mock で run_experiment→analyze_endo_treatment→
+# make_endo_report の一気通貫を検証する最小構成(実測時間は D17 の判断材料に記録)。
+#
+#   python scripts/run_experiment.py conf/experiments/endogenous_accept_wiring.yaml
+#   python scripts/analyze_endo_treatment.py "runs/endo7_*" --out runs/_endo7
+#   python scripts/make_endo_report.py runs/_endo7
+name: endo7
+profile: conf/daily.yaml
+seeds: [11, 13]
+
+common:
+  run.n_agents: 60
+  run.n_steps: 1008                       # 7日(1日=144step)
+  model.backend: mock                     # 配線検証=mock(実 LLM 禁止)
+  joint.enabled: true
+  relations.enabled: true
+  schedule.enabled: true
+  friend_graph.enabled: true
+  planning.framework.enabled: true
+  prompts.dialog_history: true
+  lens.structure.enabled: true
+
+conditions:
+  - name: koff_eoff
+    overrides: { k.writeback: "off", relations.endogenous_accept.enabled: false }
+  - name: koff_eon
+    overrides: { k.writeback: "off", relations.endogenous_accept.enabled: true }
+  - name: kfree_eoff
+    overrides: { k.writeback: free, relations.endogenous_accept.enabled: false }
+  - name: kfree_eon
+    overrides: { k.writeback: free, relations.endogenous_accept.enabled: true }
+  - name: kdg_eoff
+    overrides: { k.writeback: degraded, k.degraded_alpha: 0.5,
+                 relations.endogenous_accept.enabled: false }
+  - name: kdg_eon
+    overrides: { k.writeback: degraded, k.degraded_alpha: 0.5,
+                 relations.endogenous_accept.enabled: true }

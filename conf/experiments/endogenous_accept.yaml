@@ -1,0 +1,54 @@
+# endogenous_accept treatment 比較 6セル(第63バッチ 2026-07-27)。本実験=本選 D17 用。
+# 設計正典: docs/plans/endogenous-relations-plan.md §3 / 判断台帳: finals-day1-decisions.md D17。
+#
+# セル = endogenous_accept {OFF, ON} × k {off, degraded(α=0.5), free} = 6。
+# - CRN(共通乱数): 全セル同一 seed 列 [11,13,17,19,23] → 同一 seed の OFF/ON ランがペア
+#   (ABM 標準の分散低減 arXiv:2409.02086)。フェーズ1の always-draw 設計により分岐前の RNG 消費が
+#   ON/OFF で同一=ペアの共分散が保たれる(これが成立するのは "joint" stream の draw 数不変のため)。
+# - 展開順は条件優先(run_experiment.py 仕様)。**ペア隣接 + 両端の k を先**に並べる:
+#   koff ペア → kfree ペア → kdg ペア。時間切れでも H3(交互作用=本命)に必要な両端ペアから確保される。
+# - 期間 14日(2016 step): フェーズ1の判定材料(前日 day_schedule・予定帳簿・前日発話)は day2 から
+#   効く+タスクB構造指標(固着検知=連続3日)に日数が要るため 7日では短い。100体=人数>時間の本番方針。
+# - 共通 ON 群 = フェーズ1の判定材料の前提(joint+relations+schedule+friend_graph+framework+
+#   dialog_history)+観測レンズ(lens.structure=タスクB系。読むだけ=R1)。
+# - モデル: ここでは指定しない(基底 mock のまま)。**mock は配線検証のみ**(fallback 率 ~97% で
+#   ON の効果はほぼゼロ=承諾材料が LLM 構造化出力から来るため)。**本実験は実 LLM=本選(D17)**で
+#   model.backend=vllm 等を common に足して実行する。
+# - 解析: scripts/analyze_endo_treatment.py "runs/endo14_*" → scripts/make_endo_report.py。
+#
+# 使い方:
+#   python scripts/run_experiment.py conf/experiments/endogenous_accept.yaml --dry-run
+#   python scripts/run_experiment.py conf/experiments/endogenous_accept.yaml
+name: endo14
+profile: conf/daily.yaml
+seeds: [11, 13, 17, 19, 23]
+
+common:
+  run.n_agents: 100
+  run.n_steps: 2016                       # 14日(1日=144step)
+  joint.enabled: true                     # 共同行動(承諾抽選=treatment の座)
+  relations.enabled: true                 # 関係台帳(daily で ON だが自己文書化のため明示)
+  schedule.enabled: true                  # 予定帳簿(判定材料①=当日衝突/誘い主との予定)
+  friend_graph.enabled: true              # 初期友人ネットワーク(joint の同伴候補の源)
+  planning.framework.enabled: true        # 構造化 day_schedule(判定材料②=with/単独志向)
+  prompts.dialog_history: true            # 前日発話の明示キュー(判定材料③)
+  lens.structure.enabled: true            # タスクB: edge churn 4列(読むだけ=R1)
+
+conditions:
+  # ---- k=off ペア(k 書き戻しなし)----
+  - name: koff_eoff
+    overrides: { k.writeback: "off", relations.endogenous_accept.enabled: false }
+  - name: koff_eon
+    overrides: { k.writeback: "off", relations.endogenous_accept.enabled: true }
+  # ---- k=free ペア(k 全開)— koff とあわせ H3(交互作用)の両端 ----
+  - name: kfree_eoff
+    overrides: { k.writeback: free, relations.endogenous_accept.enabled: false }
+  - name: kfree_eon
+    overrides: { k.writeback: free, relations.endogenous_accept.enabled: true }
+  # ---- k=degraded(α=0.5)ペア(中間水準=用量反応の1点)----
+  - name: kdg_eoff
+    overrides: { k.writeback: degraded, k.degraded_alpha: 0.5,
+                 relations.endogenous_accept.enabled: false }
+  - name: kdg_eon
+    overrides: { k.writeback: degraded, k.degraded_alpha: 0.5,
+                 relations.endogenous_accept.enabled: true }

@@ -1,0 +1,41 @@
+# endogenous_accept 予備プロファイル(第63バッチ 2026-07-27)= 計画書§3 の「予備」。
+# 本体 endogenous_accept.yaml との差分: 7日(1008step)・seed3・model.backend=mock 固定。
+# 目的: 配線・指標感度の検証のみ(**実 LLM 判断は本選=D17**)。mock では承諾材料の大半が
+# fallback(~97%)= ON の効果はほぼゼロが正しい期待値(「差なし」と出ることが配線検証)。
+#
+# 使い方:
+#   python scripts/run_experiment.py conf/experiments/endogenous_accept_pilot.yaml --dry-run
+#   python scripts/run_experiment.py conf/experiments/endogenous_accept_pilot.yaml
+#   python scripts/analyze_endo_treatment.py "runs/endo7p_*" --out runs/_endo7p
+#   python scripts/make_endo_report.py runs/_endo7p
+name: endo7p
+profile: conf/daily.yaml
+seeds: [11, 13, 17]
+
+common:
+  run.n_agents: 100
+  run.n_steps: 1008                       # 7日(1日=144step)
+  model.backend: mock                     # 予備=mock 固定(実 LLM 禁止の検証プロファイル)
+  joint.enabled: true
+  relations.enabled: true
+  schedule.enabled: true
+  friend_graph.enabled: true
+  planning.framework.enabled: true
+  prompts.dialog_history: true
+  lens.structure.enabled: true
+
+conditions:
+  - name: koff_eoff
+    overrides: { k.writeback: "off", relations.endogenous_accept.enabled: false }
+  - name: koff_eon
+    overrides: { k.writeback: "off", relations.endogenous_accept.enabled: true }
+  - name: kfree_eoff
+    overrides: { k.writeback: free, relations.endogenous_accept.enabled: false }
+  - name: kfree_eon
+    overrides: { k.writeback: free, relations.endogenous_accept.enabled: true }
+  - name: kdg_eoff
+    overrides: { k.writeback: degraded, k.degraded_alpha: 0.5,
+                 relations.endogenous_accept.enabled: false }
+  - name: kdg_eon
+    overrides: { k.writeback: degraded, k.degraded_alpha: 0.5,
+                 relations.endogenous_accept.enabled: true }
