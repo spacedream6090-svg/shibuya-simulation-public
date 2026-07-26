@@ -78,6 +78,74 @@ def build_weighted_graph(events: list[dict]) -> dict[tuple, int]:
 
 
 # --------------------------------------------------------------------------- #
+# 1b. クラスタ係数・直径(第64バッチ フェーズ3の観測指標=計画書§4「クラスタ係数/直径」。
+#     既存 analyze 系に事後算出が無かったため本スクリプトへ最小追加: 接触グラフは本スクリプトが
+#     既に組んでおり、コミュニティ/橋辺と同じグラフ上で読むのが解釈上も一貫するため)
+# --------------------------------------------------------------------------- #
+def clustering_and_diameter(graph: dict[tuple, int]) -> dict:
+    """無向・非重みの平均局所クラスタ係数(Watts-Strogatz 1998)と最大連結成分の直径。
+
+    - clustering_coeff: 次数≥2 のノードの局所係数(隣接間の実辺/可能辺)の平均。母数 0 なら 0.0。
+    - diameter_lcc: 最大連結成分(タイは最小ノード id)内の全点対 BFS 最遠距離。N≤数百で O(N·E)。
+    全て決定論(ノードは id 昇順・純 Python・乱数なし)。"""
+    adj: dict[int, set] = defaultdict(set)
+    for (u, v) in graph:
+        adj[u].add(v)
+        adj[v].add(u)
+    nodes = sorted(adj)
+    if not nodes:
+        return {"clustering_coeff": 0.0, "diameter_lcc": 0, "lcc_size": 0,
+                "clustering_n_nodes": 0}
+    # 平均局所クラスタ係数(次数 ≥2 のノードのみ=定義できるノードの平均。正直な母数も返す)
+    coeffs = []
+    for n in nodes:
+        nb = sorted(adj[n])
+        k = len(nb)
+        if k < 2:
+            continue
+        links = sum(1 for i in range(k) for j in range(i + 1, k)
+                    if nb[j] in adj[nb[i]])
+        coeffs.append(2.0 * links / (k * (k - 1)))
+    cc = round(sum(coeffs) / len(coeffs), 6) if coeffs else 0.0
+    # 連結成分(id 昇順の決定論走査)→ 最大成分(タイは最小 id)
+    seen: set = set()
+    best: list = []
+    for start in nodes:
+        if start in seen:
+            continue
+        comp = [start]
+        seen.add(start)
+        i = 0
+        while i < len(comp):
+            for m in sorted(adj[comp[i]]):
+                if m not in seen:
+                    seen.add(m)
+                    comp.append(m)
+            i += 1
+        if len(comp) > len(best) or (len(comp) == len(best)
+                                     and comp and best and min(comp) < min(best)):
+            best = comp
+    # 直径 = LCC 内の全ノードからの BFS 最遠距離の最大
+    lcc = set(best)
+    diam = 0
+    for src in sorted(lcc):
+        dist = {src: 0}
+        q = [src]
+        i = 0
+        while i < len(q):
+            u = q[i]
+            i += 1
+            for m in sorted(adj[u]):
+                if m in lcc and m not in dist:
+                    dist[m] = dist[u] + 1
+                    q.append(m)
+        if dist:
+            diam = max(diam, max(dist.values()))
+    return {"clustering_coeff": cc, "diameter_lcc": int(diam),
+            "lcc_size": len(best), "clustering_n_nodes": len(coeffs)}
+
+
+# --------------------------------------------------------------------------- #
 # 5. Granovetter: 語彙の新規採用の出所 A を last_from 規則で帰属(measure.agent_features の鏡)
 # --------------------------------------------------------------------------- #
 def attribute_adoptions(events: list[dict]) -> list[tuple]:
@@ -138,6 +206,7 @@ def analyze(run_dir: str, min_strength: int = MIN_STRENGTH, top_k: int = 15) -> 
 
     bridge_strength = _mean_strength(bridge_edges)
     internal_strength = _mean_strength(internal_edges)
+    topo = clustering_and_diameter(graph)      # 第64: クラスタ係数・直径(フェーズ3観測指標)
 
     # ---- per-agent brokerage(接する辺の bridge 率)----
     brokers = []
@@ -172,7 +241,13 @@ def analyze(run_dir: str, min_strength: int = MIN_STRENGTH, top_k: int = 15) -> 
                   "bridge_mean_strength": bridge_strength,
                   "internal_mean_strength": internal_strength,
                   "weak_tie_signal": bool(bridge_edges and internal_edges
-                                          and bridge_strength < internal_strength)},
+                                          and bridge_strength < internal_strength),
+                  # 第64バッチ フェーズ3: 計画書§4 の観測指標(クラスタ係数/直径)。
+                  # endogenous_invite の弱い紐帯枠が構造(局所閉鎖性・到達距離)を動かすかの事後窓。
+                  "clustering_coeff": topo["clustering_coeff"],
+                  "clustering_n_nodes": topo["clustering_n_nodes"],
+                  "diameter_lcc": topo["diameter_lcc"],
+                  "lcc_size": topo["lcc_size"]},
         "community": {"n_communities": len(real_comms),
                       "sizes": sorted((comm_sizes[c] for c in real_comms), reverse=True)},
         "brokerage": top_brokers,
@@ -216,6 +291,9 @@ def write_report(result: dict, path: str) -> None:
     L.append(f"- 総辺数 {g['n_edges']} / うち bridge(別コミュ)={g['n_bridge_edges']}"
              f"({_pct(g['bridge_edge_fraction'])})/ internal(同コミュ)={g['n_internal_edges']}")
     L.append(f"- 平均接触頻度: bridge={g['bridge_mean_strength']} / internal={g['internal_mean_strength']}")
+    L.append(f"- クラスタ係数(平均局所・次数≥2 の {g.get('clustering_n_nodes', 0)} ノード)= "
+             f"{g.get('clustering_coeff', 0.0)} / 直径(最大連結成分 {g.get('lcc_size', 0)} 人)= "
+             f"{g.get('diameter_lcc', 0)}(第64: フェーズ3観測指標=計画書§4)")
     if g["weak_tie_signal"]:
         L.append("  → bridge の方が接触頻度が低い = **弱い紐帯が橋になっている**"
                  "(Granovetter の構造的含意と整合)")

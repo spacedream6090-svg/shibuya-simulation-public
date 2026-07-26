@@ -90,8 +90,12 @@ MIN_AGREE = 3                    # 符号一致とみなす最少 seed 数(計�
 STRUCT_SERIES = ("edge_churn_rate", "community_change_rate",
                  "centrality_turnover", "rank_tau_prev_day")
 STRUCT_METRICS = STRUCT_SERIES + ("stagnant_days",)
+# フェーズ3(第64バッチ)の invite 2列は L2 由来なので KPI_COLS へ接続(第63の引き継ぎ事項=
+# 1定数追記で _l2_kpi_daily→kpi 集計→レポートへ載る)。endogenous_invite OFF のランには列自体が
+# 無く自動で欠測(None)扱い=既存 accept 実験の解析はバイト不変。
 KPI_COLS = ("joint_accept_rate", "joint_endo_share",
-            "joint_accept_calib_gap", "joint_fulfill_rate")
+            "joint_accept_calib_gap", "joint_fulfill_rate",
+            "invite_weak_tie_rate", "invite_endo_share")
 PRIMARY_METRIC = "edge_churn_rate"        # H1/H3 の主指標(計画書§3)
 
 
@@ -519,8 +523,11 @@ def write_report(path: str, result: dict) -> None:
     L.append("")
 
     L.append("## フェーズ1 KPI(ON セルのみ=OFF は joint_invite を記録しない)\n")
-    L.append("| k | accept_rate | endo_share | calib_gap(±0.15 ゲート) | fulfill_rate |")
-    L.append("|---|---|---|---|---|")
+    L.append("フェーズ3 invite 2列(第64バッチ)は endogenous_invite ON のランのみ値が入る"
+             "(OFF は列なし=—)。")
+    L.append("| k | accept_rate | endo_share | calib_gap(±0.15 ゲート) | fulfill_rate | "
+             "invite_weak_tie | invite_endo |")
+    L.append("|---|---|---|---|---|---|---|")
     for k in ks:
         kv = kpi.get(k, {})
         g = jd["accept_gap_gate"]["by_k"].get(k, {})
@@ -528,7 +535,9 @@ def write_report(path: str, result: dict) -> None:
         L.append(f"| {k} | {_f(kv.get('joint_accept_rate'))} | "
                  f"{_f(kv.get('joint_endo_share'))} | "
                  f"{_f(kv.get('joint_accept_calib_gap'))} {mark} | "
-                 f"{_f(kv.get('joint_fulfill_rate'))} |")
+                 f"{_f(kv.get('joint_fulfill_rate'))} | "
+                 f"{_f(kv.get('invite_weak_tie_rate'))} | "
+                 f"{_f(kv.get('invite_endo_share'))} |")
     L.append("")
 
     L.append("## 仮説の機械判定(計画書§3: 符号一致 ≥3seed + 乖離±15pp)\n")

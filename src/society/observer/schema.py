@@ -251,7 +251,10 @@ register_event_kind("gossip_fade",   "悪評タグの忘却=知る者が悪評�
 # ---- 承諾/拒否判断の内生化 第62バッチ フェーズ1(relations.endogenous_accept ON のみ・既定 OFF=0件。
 #      全決定論・LLM/generate ゼロ増・新 stream なし(既存 "joint" の draw を再利用=always-draw)。
 #      実装 src/society/relations_endo.py + joint.py。設計正典 docs/plans/endogenous-relations-plan.md §2)----
-register_event_kind("joint_invite",  "共同行動の誘い1件の承諾判定内訳(誘い手視点。1日1誘い1件){invitee, verdict, basis, p_calib, p_final, accepted}")
+# ★ 第64バッチ フェーズ3(relations.endogenous_invite ON 時のみ): payload に source
+#    (plan_with/dialog_cue/weak_tie/closeness/housemate/colleague=誘い先の選抜経路)が付く。
+#    accept 単独 ON の payload は従来とバイト一致のまま(source キー自体が無い)。
+register_event_kind("joint_invite",  "共同行動の誘い1件の承諾判定内訳(誘い手視点。1日1誘い1件){invitee, verdict, basis, p_calib, p_final, accepted, source?}")
 
 
 @dataclass

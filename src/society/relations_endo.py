@@ -1,4 +1,5 @@
-"""承諾/拒否判断の内生化 第62バッチ フェーズ1(2026-07-27。既定 OFF)。
+"""承諾/拒否判断の内生化 第62バッチ フェーズ1 + 誘う相手の内生選抜 第64バッチ フェーズ3
+(2026-07-27。どちらも既定 OFF)。
 
 正典: docs/plans/endogenous-relations-plan.md §1-2。共同行動(joint)の誘い→承諾は従来
 「較正確率の抽選」(joint.accept_prob=accept_base+tier_bonus−hierarchy_penalty)のみで、
@@ -41,11 +42,46 @@ R1(既定 OFF=バイト一致): enabled=false のとき joint.py は本 module �
   結果を破棄)= "joint" stream の decision 単位の消費数・順序が ON/OFF で不変(CRN ペア比較の
   共分散維持・監査容易・resume 無風)。resume==straight: 当日タリー(sim._endo_state)は
   checkpoint.py が中央管理(第59-61 前例)、判定材料は agent 属性=agents pickle に自然同梱。
+
+─────────────────────────────────────────────────────────────────────────────
+第64バッチ フェーズ3(誘う相手の選択の内生化。conf relations.endogenous_invite.*。既定 OFF)。
+正典: docs/plans/endogenous-relations-plan.md §4。**本バッチは実装まで**=実験条件として回すかは
+フェーズ2評価(本選実LLM・analyze_endo_treatment.py の phase3_go 機械判定)の合否ゲート
+(実装と実験実施の分離=計画書の原則)。
+
+対象は joint._companions の friend 経路の**候補集合の並べ替え・拡張のみ**(選抜の枠組み・
+min/max_group・発生判定 daily_rate は不変)。ON 時の候補順:
+  1. 前日 day_schedule の with 解決相手(_resolve_with=従来どおり最優先)… source=plan_with
+  2. 前日発話の明示キュー相手(誘い手**自身**の「(相手名)と…行きたい/行こう」。フェーズ1の
+     _has_positive_cue を役割交換で invite 方向に再利用=語彙・hedge 棄却も accept と同一の源)
+     … source=dialog_cue
+  3. 従来の closeness 降順(較正分布を事前分布として維持=二段構えの invite 版)… source=closeness
+  4. 弱い紐帯の探索枠(weak_tie_slots。tier=1 知人から (agent,day) 安定ハッシュの決定論選択=
+     乱数ゼロ・候補**末尾**)… source=weak_tie
+
+弱い紐帯枠の理論根拠: Granovetter 1973「The Strength of Weak Ties」(AJS 78(6):1360-1380=弱い
+紐帯は新規情報の橋)+ Onnela et al. 2007(PNAS 104(18):7332=交流量の大半は強い紐帯が担い、弱い
+紐帯との交流イベントは現実に少数)。**誘い先が知人である現実頻度の直接統計は文献に見つからず**、
+weak_tie_slots=1(候補末尾の1枠=強い紐帯候補が先に埋まらない時だけ試行される)は保守的既定。
+
+関係の総量上限は本フェーズで変更しない: 誘いは一時的接触であり、層編成(Dunbar 入れ子層=
+friend_graph の close 3-5 / friend 7-12 / acq +20)は relations の tier 遷移(closeness 蓄積)が
+担う。tier は closeness からの純関数(relations.tier_of)で、誘い・同席そのものは closeness を
+書き換えない(交流イベント→note_contact 経由でのみ蓄積)ため、誘い候補の拡張が層次数上限を
+新規超過させる経路は構造上ない。
+
+R1(既定 OFF=バイト一致): enabled=false のとき候補順・"joint" stream 消費・イベント・L2 とも
+従来と完全同一(sim._invite_state も生えない)。ON でも LLM 呼ゼロ・追加乱数ゼロ(弱い紐帯枠は
+安定ハッシュ=新 stream "invite" は不要)。ON では候補列が変わるため "joint" stream の承諾 draw
+数は OFF と差が出得るが、それは treatment そのもの(承諾側の always-draw とは役割が違う=計画書
+§4)。承諾抽選の draw 列に invite 由来の**別用途 draw を混ぜない**(joint stream は承諾抽選のみ)。
+resume==straight: 当日タリー(sim._invite_state)は checkpoint.py が中央管理(endo_state と同型)。
 """
 from __future__ import annotations
 
 import re
 
+from . import relations as _relations
 from . import schedule as _schedule
 
 DEFAULTS = {
@@ -358,3 +394,142 @@ def scalars(sim) -> dict | None:
             "joint_endo_share": round(st["endo"] / inv, 6),
             "joint_accept_calib_gap": round(gap, 6),
             "joint_fulfill_rate": round(fulfill, 6)}
+
+
+# =========================================================================== #
+# 第64バッチ フェーズ3: 誘う相手の内生選抜(relations.endogenous_invite。既定 OFF)
+#   実装のみ=実験投入は phase3_go ゲート(冒頭 docstring 参照)。全決定論・LLM/乱数ゼロ。
+# =========================================================================== #
+INVITE_DEFAULTS = {
+    "enabled": False,
+    # 弱い紐帯(tier=1 知人)の探索枠数(候補**末尾**に付す。0=無効)。既定 1 の根拠:
+    # Granovetter 1973(弱い紐帯=新規情報の橋)を観測するための最小の探索枠。現実の交流量は
+    # 強い紐帯が大半を占める(Onnela et al. 2007 PNAS 104(18):7332)ため末尾1枠=強い紐帯候補が
+    # 先に埋まらない時だけ試される控えめな形。誘い先が知人である現実頻度の**直接統計は文献に
+    # 見つからなかった**ので「探索枠1=保守的既定」(正直な注記。冒頭 docstring)。
+    "weak_tie_slots": 1,
+}
+
+
+def build_invite_cfg(raw) -> dict:
+    """conf の relations.endogenous_invite ブロックを正準化(既定 OFF=現行挙動と完全同一)。"""
+    raw = dict(_to_plain(raw) or {})
+    cfg = dict(INVITE_DEFAULTS)
+    for k, v in raw.items():
+        if k == "enabled":
+            cfg["enabled"] = bool(v)
+        elif k == "weak_tie_slots":
+            cfg["weak_tie_slots"] = int(v)
+    return cfg
+
+
+def invite_cfg_of(sim) -> dict:
+    """endogenous_invite 設定(初回のみ遅延構築してキャッシュ)。キャッシュ属性 sim.endoinvcfg は
+    L1/L2/L3/乱数に一切現れない=既定 OFF のバイト一致を壊さない(cfg_of と同型)。"""
+    c = getattr(sim, "endoinvcfg", None)
+    if c is None:
+        try:
+            raw = (sim.cfg.get("relations", None) or {}).get("endogenous_invite", None)
+        except Exception:
+            raw = None
+        c = build_invite_cfg(raw)
+        sim.endoinvcfg = c
+    return c
+
+
+def invite_enabled(sim) -> bool:
+    return bool(invite_cfg_of(sim)["enabled"])
+
+
+def invite_cue_partners(sim, inviter) -> list:
+    """前日発話の明示キュー相手(invite 方向): 誘い手**自身**の発話に「(相手名)と…行きたい/
+    行こう」型がある relations 既知相手 id を (-closeness, id) の決定論順で返す。
+
+    フェーズ1 _has_positive_cue の**役割交換**による再利用(invitee:=誘い手=発話を走査される側 /
+    inviter:=候補=名前照合される側)。語彙(positive_cues)・婉曲棄却(hedge_markers)も
+    relations.endogenous_accept ブロックと共用=単一の源。dialog_history OFF / 履歴なしは空。
+    正直な限界: tier 0(顔見知り未満)の相手も名指しの明示キューなら拾う(名指しの意向=内生選択
+    そのものなので tier で足切りしない)。"""
+    if not _dialog_history_on(sim):
+        return []
+    if not getattr(inviter, "_dialog_hist", None):
+        return []
+    cfg = cfg_of(sim)                   # 語彙は accept ブロックと共用(単一の源)
+    rows = []
+    for oid, rel in (getattr(inviter.mem, "relations", {}) or {}).items():
+        if oid == inviter.id:
+            continue
+        o = sim.agent_by_id.get(oid)
+        if o is None:
+            continue
+        if _has_positive_cue(sim, inviter, o, cfg):
+            rows.append((-float(rel.get("closeness", 0.0)), int(oid)))
+    return [oid for _c, oid in sorted(rows)]
+
+
+def weak_tie_candidates(sim, agent, day: int, slots: int, exclude) -> list:
+    """弱い紐帯の探索枠: tier=1(知人)の relations 相手から (agent,day) キーの安定ハッシュで
+    slots 体を決定論選択(乱数ゼロ=新 stream "invite" 不要。_rendezvous_poi と同じ純関数流儀)。
+
+    pool は id 昇順に固定し、開始位置が日替わりで回る=同じ知人ばかり誘わない探索
+    (Granovetter 弱い紐帯の観測目的=計画書§4)。exclude(自分/既割当/既候補)と来街者は除外。"""
+    if slots <= 0:
+        return []
+    rc = getattr(sim, "relationscfg", None) or _relations.DEFAULTS
+    pool = []
+    for oid in sorted((getattr(agent.mem, "relations", {}) or {})):
+        if oid == agent.id or oid in exclude:
+            continue
+        o = sim.agent_by_id.get(oid)
+        if o is None or o.visitor:
+            continue
+        rel = agent.mem.relations[oid]
+        if _relations.tier_of(float(rel.get("closeness", 0.0)), rc) == 1:
+            pool.append(oid)
+    if not pool:
+        return []
+    start = (agent.id * 1000003 + int(day) * 97) % len(pool)
+    return [pool[(start + i) % len(pool)] for i in range(min(int(slots), len(pool)))]
+
+
+# --------------------------------------------------------------------------- #
+# 誘い経路の当日タリー(L2 観測の材料。checkpoint.py が中央管理=resume==straight)
+# --------------------------------------------------------------------------- #
+_ENDO_INVITE_SOURCES = ("plan_with", "dialog_cue")   # 内生経路(計画 with+明示キュー)
+
+
+def invite_day_state(sim, day: int) -> dict:
+    """日境界で当日の誘い経路タリーを初期化して返す(joint.plan_day が invite ON 時のみ呼ぶ)。
+    int のみ(set なし)=pickle/決定論監査は自明。"""
+    st = {"day": int(day), "invites": 0, "weak_tie": 0, "endo": 0}
+    sim._invite_state = st
+    return st
+
+
+def tally_invite_source(st: dict, source: str) -> None:
+    """1 誘い分の選抜経路をタリーへ加算(決定論・読むだけ)。"""
+    st["invites"] += 1
+    if source == "weak_tie":
+        st["weak_tie"] += 1
+    elif source in _ENDO_INVITE_SOURCES:
+        st["endo"] += 1
+
+
+def invite_scalars(sim) -> dict | None:
+    """L2 全体スカラー 2 列(OFF は None=列なし=L2 不変。scalars と同型)。
+
+      invite_weak_tie_rate = 弱い紐帯経路(source=weak_tie)の誘い率(当日)
+      invite_endo_share    = 内生経路(plan_with+dialog_cue)の誘い率(当日)
+    誘い 0 件の日は両列 0.0(scalars の流儀と同じ正直な限界=L1 件数と併読)。"""
+    cfg = invite_cfg_of(sim)
+    if not cfg["enabled"]:
+        return None
+    jc = getattr(sim, "jointcfg", None)
+    if not (jc and jc.get("enabled")):
+        return None
+    st = getattr(sim, "_invite_state", None)
+    inv = int(st["invites"]) if st else 0
+    if inv <= 0:
+        return {"invite_weak_tie_rate": 0.0, "invite_endo_share": 0.0}
+    return {"invite_weak_tie_rate": round(st["weak_tie"] / inv, 6),
+            "invite_endo_share": round(st["endo"] / inv, 6)}

@@ -111,6 +111,9 @@ def save(sim, step: int, path: str | Path) -> Path:
             "joint_groups": getattr(sim, "_joint_groups", []),
             "joint_total": getattr(sim, "_joint_total", 0),
             "endo_state": getattr(sim, "_endo_state", None),
+            # 第64バッチ: 誘い経路の当日タリー(invite ON 時のみ存在。int のみ=set なし=
+            # 決定論監査は自明)。OFF ランでは None=挙動不変(load は .get で旧 checkpoint 互換)。
+            "invite_state": getattr(sim, "_invite_state", None),
         },
         # --- scenario は config から再構築される。封鎖の進行だけを直列化(順序安定) ---
         "scenario": {
@@ -186,6 +189,9 @@ def load(sim, path: str | Path) -> int:
     est = rt.get("endo_state")
     if est is not None:
         sim._endo_state = est
+    ivs = rt.get("invite_state")                # 第64: 誘い経路タリー(旧 checkpoint 互換=無ければ素通り)
+    if ivs is not None:
+        sim._invite_state = ivs
 
     # scenario: __init__ で config から再構築済み。封鎖の進行を復元し city へ再適用。
     sc = blob["scenario"]

@@ -971,6 +971,31 @@ relations:
     # 曖昧化マーカー: 同一文に共起した発話はキューに数えない=フォールバック(「行きたいのは山々ですが」=
     # 願望+言い訳の婉曲断りを受諾に誤検出しない。曖昧例は落とす=計画書§1)。
     hedge_markers: [山々, ですが, だけど, けれど, けど, のに, 無理, 難しい, また今度, 行けたら]
+  # ---- 誘う相手の選択の内生化 第64バッチ フェーズ3(2026-07-27。既定 OFF=現行挙動と完全同一)----
+  # ★位置づけ: 本バッチは「実装」まで。実験条件として回すかは**フェーズ2評価(本選実LLM=D17)の
+  #   phase3_go 機械判定(scripts/analyze_endo_treatment.py)の合否ゲート**=計画書の原則(実装と実験実施の
+  #   分離。docs/plans/endogenous-relations-plan.md §4)。
+  # 共同行動(joint)の誘い先選抜(_companions の friend 経路)の**候補集合の並べ替え・拡張のみ**
+  # (選抜の枠組み・min/max_group・発生判定 daily_rate は不変)。ON 時の候補順:
+  #   ①前日計画 with の解決相手(従来=最優先のまま)→ ②前日発話の明示キュー相手(「(相手名)と…
+  #   行きたい/行こう」=endogenous_accept.positive_cues/hedge_markers を invite 方向に共用=単一の源)
+  #   → ③従来の closeness 降順(較正分布を事前分布として維持=二段構えの invite 版)→ ④弱い紐帯の
+  #   探索枠(tier=1 知人から (agent,day) 安定ハッシュで決定論選択=乱数ゼロ・候補**末尾**)。
+  # 関係の総量上限は変更しない: 誘いは一時的接触であり、層編成(Dunbar 入れ子層=friend_graph の
+  # close 3-5/friend 7-12/acq +20)は relations の tier 遷移(closeness 蓄積)が担う=誘い候補の拡張が
+  # 層次数上限を新規超過させる経路は構造上ない(tier は closeness の純関数・誘い自体は closeness を
+  # 書き換えない)。max_group(2-4人)も従来のまま=Dunbar 上限維持。
+  # 弱い紐帯枠の根拠: Granovetter 1973(AJS 78(6)=弱い紐帯は新規情報の橋)+ Onnela et al. 2007
+  # (PNAS 104(18):7332=交流量の大半は強い紐帯)。誘い先が知人である現実頻度の直接統計は文献に
+  # 見つからず=**探索枠1は保守的既定**(正直な注記)。
+  # 全決定論・LLM 呼ゼロ・追加乱数ゼロ(新 stream "invite" は不要のまま。"joint" stream は承諾抽選
+  # 専用を維持=別用途 draw を混ぜない。ON では候補列が変わるため承諾 draw 数は OFF と差が出得る=
+  # treatment そのもの)。ON 時のみ joint_invite(endogenous_accept ON 時)に source
+  # (plan_with/dialog_cue/weak_tie/closeness/housemate/colleague)が付き、L2 に
+  # invite_weak_tie_rate / invite_endo_share の2列を出す。要 joint.enabled=true で活きる。
+  endogenous_invite:
+    enabled: false              # ★実験 treatment 候補(投入は phase3_go ゲート合格後=実装と実験の分離)
+    weak_tie_slots: 1           # 弱い紐帯(tier=1 知人)の探索枠数(候補末尾。0=無効。1=保守的既定=直接統計なし)
 
 # ---- 友人グラフ生成(関係性パッケージ完結 第45バッチ S-R2。ユーザー要望 2026-07-21。既定 OFF=現行挙動と完全同一)----
 # 現状の初期関係は「同建物の顔なじみ最大3人」のみ=地理的共在だけが源泉。本ブロックは起動時1回、居住者の

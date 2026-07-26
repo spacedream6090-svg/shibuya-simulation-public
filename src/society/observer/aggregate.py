@@ -775,6 +775,26 @@ def _joint_fulfill_rate(sim):
     return _endo_col(sim, "joint_fulfill_rate")
 
 
+# ---- 誘う相手の内生選抜 第64バッチ フェーズ3(既定 OFF)。relations.endogenous_invite.enabled=false
+#      (または joint OFF)は全て None=列なし=L2 不変(endo accept 4列と同型)。実装のみ=実験投入は
+#      phase3_go ゲート(docs/plans/endogenous-relations-plan.md §4)。
+#   当日の弱い紐帯経路(source=weak_tie)の誘い率・内生経路(plan_with+dialog_cue)の誘い率。
+#   タリーは joint.plan_day(誘い時)が積み、invite_scalars() は当日タリーから読むだけ(乱数ゼロ)。
+def _invite_col(sim, key):
+    s = _rendo.invite_scalars(sim)
+    return s.get(key) if s else None
+
+
+@register_aggregator("invite_weak_tie_rate")
+def _invite_weak_tie_rate(sim):
+    return _invite_col(sim, "invite_weak_tie_rate")
+
+
+@register_aggregator("invite_endo_share")
+def _invite_endo_share(sim):
+    return _invite_col(sim, "invite_endo_share")
+
+
 # ---- 屋内エンジン配線 B3(indoor.enabled ON のみ・既定 OFF=None=列なし=L2 バイト不変)----
 #   この step のフロア内区画遷移(space_move)/遭遇(encounter)/会議開催の件数。per-step カウンタ
 #   (累積でない=resume 安全=分割再開でも各 step の値が state だけから再現される)。

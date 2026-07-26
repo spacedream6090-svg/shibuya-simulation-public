@@ -24,6 +24,13 @@ R1 呼数不変: generate() を1本も足さない。日次編成(_phase_joint=�
   承諾抽選を「較正確率を事前分布に残した内生判定の合成」に置き換え(relations_endo.decide_accept
   =全決定論・LLM呼ゼロ)、joint_invite を記録する。抽選 draw は always-draw(veto 時も draw して
   結果を破棄)= "joint" stream の decision 単位の消費はON/OFF不変。OFF はこの経路に一切入らない。
+
+第64バッチ(2026-07-27): 誘う相手の内生選抜 フェーズ3(relations.endogenous_invite。既定 OFF。
+  **実装のみ=実験投入はフェーズ2 phase3_go ゲート**)。ON 時のみ _companions の friend 経路の
+  候補集合を並べ替え・拡張する(枠組み・min/max_group・daily_rate 不変): 前日計画 with(従来=
+  最優先)→前日発話の明示キュー→closeness 降順(較正事前分布の維持)→弱い紐帯探索枠(tier=1・
+  安定ハッシュ=乱数ゼロ・末尾)。joint_invite に source を付し L2 に invite_* 2列を出す。
+  OFF は候補順・"joint" stream 消費・イベント・L2 とも従来と完全同一(relations_endo 冒頭参照)。
 """
 from __future__ import annotations
 
@@ -236,17 +243,28 @@ def _colleagues(sim, agent, assigned: set) -> list:
 
 
 def _companions(sim, agent, cfg: dict, assigned: set,
-                companion_type: str = "friend") -> list:
+                companion_type: str = "friend",
+                icfg: dict | None = None, sources: dict | None = None) -> list:
     """同伴候補を決定論で順序付ける。関係タイプ(companion_type)で経路を分ける(S-R4):
       friend    = planning の `with` 解決を先頭 → 友人 tier≥friend_tier を closeness 降順→id 昇順
                   → 友人ゼロなら housemates(既存 S-R3 挙動。未指定の既定)。
       housemate = 同居人(housemates)のみ。
       colleague = 同 org_id の同僚のみ(会食・飲み会)。
-    来街者・既割当・自分は除外。"""
+    来街者・既割当・自分は除外。
+
+    第64バッチ フェーズ3(icfg=relations.endogenous_invite。既定 OFF=従来と候補順まで完全同一):
+    ON 時のみ friend 経路を並べ替え・拡張する(選抜の枠組みは不変): `with` 解決(従来=最優先)の
+    直後に前日発話の明示キュー相手を挿入し、末尾に弱い紐帯探索枠(tier=1・安定ハッシュ=乱数ゼロ)
+    を付す。残りは従来の closeness 降順=較正分布を事前分布として維持(二段構えの invite 版)。
+    sources(呼び手が渡す dict)に {id: 選抜経路} を書き戻す(plan_with/dialog_cue/closeness/
+    weak_tie/housemate/colleague)。候補の総数は従来どおり呼び手の max_group 制約下=Dunbar 上限は
+    不変。**関係の総量上限(friend_graph の層次数=close 3-5/friend 7-12/acq +20)も変更しない**:
+    誘いは一時的接触であり tier 遷移は relations の closeness 蓄積経由のみ=誘い候補の拡張が層上限を
+    新規超過させる経路は構造上ない(relations_endo 冒頭 docstring)。"""
     out: list = []
     seen: set = set()
 
-    def _add(oid):
+    def _add(oid, src: str = ""):
         if oid == agent.id or oid in assigned or oid in seen:
             return
         o = sim.agent_by_id.get(oid)
@@ -254,28 +272,44 @@ def _companions(sim, agent, cfg: dict, assigned: set,
             return
         out.append(oid)
         seen.add(oid)
+        if sources is not None:
+            sources[oid] = src
 
     if companion_type == "colleague":
         for oid in _colleagues(sim, agent, assigned):
-            _add(oid)
+            _add(oid, "colleague")
         return out
     if companion_type == "housemate":
         for oid in (getattr(agent, "housemates", None) or []):
-            _add(oid)
+            _add(oid, "housemate")
         return out
     # friend(既定)
+    inv_on = bool(icfg and icfg.get("enabled"))    # 第64: 誘い先の内生選抜(既定 OFF)
     for cid in _resolve_with(sim, agent):        # S-R3(7): `with` 名の解決相手を先頭に
-        _add(cid)
+        _add(cid, "plan_with")
+    if inv_on:
+        # 第64(2): 前日発話の明示キュー相手を次点へ挿入(語彙は accept ブロックと共用=単一の源)
+        for cid in _endo.invite_cue_partners(sim, agent):
+            _add(cid, "dialog_cue")
     ft = int(cfg["friend_tier"])
     friends: list = []
     for oid, rel in (getattr(agent.mem, "relations", {}) or {}).items():
         if _tier(sim, agent, oid) >= ft:
             friends.append((float(rel.get("closeness", 0.0)), oid))
     for _clo, oid in sorted(friends, key=lambda t: (-t[0], t[1])):
-        _add(oid)
+        _add(oid, "closeness")
     if not out:                                  # 友人がいなければ housemates(同居人)
         for oid in (getattr(agent, "housemates", None) or []):
-            _add(oid)
+            _add(oid, "housemate")
+    if inv_on:
+        # 第64(3): 弱い紐帯の探索枠(tier=1 知人・(agent,day) 安定ハッシュ=乱数ゼロ・候補末尾。
+        # 理論根拠: Granovetter 1973 弱い紐帯=新規情報の橋/現実の交流量は強い紐帯が大半
+        # (Onnela 2007 PNAS)=末尾枠は保守的既定。relations_endo.INVITE_DEFAULTS 参照)
+        day = int(getattr(sim, "_joint_day", 0))
+        for oid in _endo.weak_tie_candidates(
+                sim, agent, day, int(icfg.get("weak_tie_slots", 1)),
+                assigned | seen | {agent.id}):
+            _add(oid, "weak_tie")
     return out
 
 
@@ -327,6 +361,12 @@ def plan_day(sim, step: int, sim_min: int) -> None:
     ecfg = _endo.cfg_of(sim)
     endo_on = bool(ecfg["enabled"])
     est = _endo.day_state(sim, day) if endo_on else None
+    # 第64バッチ フェーズ3: 誘う相手の内生選抜(relations.endogenous_invite。既定 OFF=候補順・
+    # 記録経路とも従来と完全同一で sim._invite_state も生えない=バイト一致)。実装のみ=実験投入は
+    # phase3_go ゲート(計画書§4)。選抜は _companions 内(全決定論・乱数/LLM 呼ゼロ)。
+    icfg = _endo.invite_cfg_of(sim)
+    inv_on = bool(icfg["enabled"])
+    ist = _endo.invite_day_state(sim, day) if inv_on else None
     for a in sim.agents:                              # 前日分をクリア(日境界=当日で上書き)
         a.joint_today = None
     sim._joint_groups = []
@@ -344,7 +384,8 @@ def plan_day(sim, step: int, sim_min: int) -> None:
         spec = cfg["activities"][act]
         ctype = spec.get("companion_type", "friend")   # S-R4: 友人/同居人/同僚
         hier = bool(spec.get("hierarchical", False))   # S-R4: 上司同席で承諾↓(飲み会)
-        cands = _companions(sim, a, cfg, assigned, ctype)
+        srcs: dict | None = {} if inv_on else None     # 第64: {id: 選抜経路}(OFF は None=素通り)
+        cands = _companions(sim, a, cfg, assigned, ctype, icfg, srcs)
         if not cands:
             continue
         group = [a.id]
@@ -359,6 +400,8 @@ def plan_day(sim, step: int, sim_min: int) -> None:
             p_calib = accept_prob(cfg, _tier(sim, a, cid), hier, age_gap)  # S-R4: 階層依存
             gp = _gossip.joint_penalty(sim, a, cid)   # 負の評判(第61 c): 悪評を知る相手は誘いにくい(既定 OFF=0)
             r = float(rng.random())                   # 誘い→承諾の抽選(always-draw: ON/OFF で消費数・順序不変)
+            if inv_on:                                # 第64: 誘い経路の当日タリー(L2 invite_* 2列の材料)
+                _endo.tally_invite_source(ist, srcs.get(cid, "closeness"))
             if endo_on and other is not None:
                 # 第62: 内生判定(構造化・決定論)→ 合成 p=clamp(w·p_calib+(1−w)·p_endo)−gossip
                 # (gossip は常に最後の減算=第61 の不変則)。conflict_veto は確率でなく確定拒否
@@ -368,14 +411,19 @@ def plan_day(sim, step: int, sim_min: int) -> None:
                 p_final = 0.0 if forced else p_mix - gp
                 ok = (not forced) and (r < p_final)
                 _endo.tally_invite(est, cid, verdict, p_calib, ok)
+                payload = {"invitee": int(cid),
+                           "verdict": verdict or "none",
+                           "basis": basis,
+                           "p_calib": round(float(p_calib), 4),
+                           "p_final": round(float(p_final), 4),
+                           "accepted": bool(ok)}
+                if inv_on:
+                    # 第64: 誘い先の選抜経路(invite ON 時のみ=accept 単独 ON の payload は
+                    # 従来とバイト一致のまま)。
+                    payload["source"] = srcs.get(cid, "closeness")
                 sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=a.id,
                                      kind="joint_invite", x=a.x, y=a.y,
-                                     payload={"invitee": int(cid),
-                                              "verdict": verdict or "none",
-                                              "basis": basis,
-                                              "p_calib": round(float(p_calib), 4),
-                                              "p_final": round(float(p_final), 4),
-                                              "accepted": bool(ok)}))
+                                     payload=payload))
             else:
                 ok = r < (p_calib - gp)               # 従来の較正抽選(既定=バイト一致)
             if ok:
