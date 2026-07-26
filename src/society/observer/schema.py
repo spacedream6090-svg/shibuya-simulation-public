@@ -248,6 +248,10 @@ register_event_kind("space_move", "屋内フロア内の区画遷移(markov 回�
 register_event_kind("gossip_seed",   "悪評タグの発生=既存の負イベント当事者が悪評化(匿名タグ=何をしたかは L1 参照){n, cause}")
 register_event_kind("gossip_spread", "悪評タグの伝播採用=独立した複数の知人から聞いて採用(complex contagion){target, sources}")
 register_event_kind("gossip_fade",   "悪評タグの忘却=知る者が悪評を忘れる(烙印にしない=噂の風化){target}")
+# ---- 承諾/拒否判断の内生化 第62バッチ フェーズ1(relations.endogenous_accept ON のみ・既定 OFF=0件。
+#      全決定論・LLM/generate ゼロ増・新 stream なし(既存 "joint" の draw を再利用=always-draw)。
+#      実装 src/society/relations_endo.py + joint.py。設計正典 docs/plans/endogenous-relations-plan.md §2)----
+register_event_kind("joint_invite",  "共同行動の誘い1件の承諾判定内訳(誘い手視点。1日1誘い1件){invitee, verdict, basis, p_calib, p_final, accepted}")
 
 
 @dataclass

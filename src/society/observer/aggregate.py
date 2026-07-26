@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from .. import gossip as _gossip
+from .. import relations_endo as _rendo
 from .. import status as _status_mod
 from . import assets as _assets
 from . import deviation as _dev
@@ -742,6 +743,36 @@ def _gossip_spread_total(sim):
 @register_aggregator("gossip_reach_mean")
 def _gossip_reach_mean(sim):
     return _gossip_col(sim, "gossip_reach_mean")
+
+
+# ---- 承諾/拒否判断の内生化 第62バッチ フェーズ1(既定 OFF)。relations.endogenous_accept.enabled=false
+#      (または joint OFF)は全て None=列なし=L2 不変(gossip/deviation と同型)。
+#   当日の承諾率・内生判定率(=1−fallback率)・較正期待との乖離(承諾率−p_calib平均=決定論算出)・
+#   履行率(承諾者が実際に同席したか)。タリーは joint.plan_day(誘い時)+ joint.observe(同席時)が積み、
+#   scalars() は step 末に collect が 1 回呼ぶ経路で当日タリーから全体スカラーを作る(読むだけ・乱数ゼロ)。
+def _endo_col(sim, key):
+    s = _rendo.scalars(sim)
+    return s.get(key) if s else None
+
+
+@register_aggregator("joint_accept_rate")
+def _joint_accept_rate(sim):
+    return _endo_col(sim, "joint_accept_rate")
+
+
+@register_aggregator("joint_endo_share")
+def _joint_endo_share(sim):
+    return _endo_col(sim, "joint_endo_share")
+
+
+@register_aggregator("joint_accept_calib_gap")
+def _joint_accept_calib_gap(sim):
+    return _endo_col(sim, "joint_accept_calib_gap")
+
+
+@register_aggregator("joint_fulfill_rate")
+def _joint_fulfill_rate(sim):
+    return _endo_col(sim, "joint_fulfill_rate")
 
 
 # ---- 屋内エンジン配線 B3(indoor.enabled ON のみ・既定 OFF=None=列なし=L2 バイト不変)----

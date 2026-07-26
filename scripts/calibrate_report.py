@@ -86,6 +86,14 @@ REALITY = [
      "設計ガード: 慢性飽和(≈1.0張り付き)は非現実"),
     ("status_gini",   "地位のジニ係数(ラン末)",   0.25,  0.70, "",
      "所得ジニ0.38(再分配後)〜金融資産ジニ0.6台の間"),
+    # ---- 共同行動・承諾(第62バッチ。joint / endogenous_accept ON のランのみ値が出る。0件は ―)----
+    ("joint_pp",      "共同外出への参加(住民)",    0.03,  0.45, "回/人日",
+     "直接統計なし: レジャー白書2024 外食39.2%/映画33.7%/カラオケ20.2%(年間参加率)+友人と会うのは"
+     "月1最頻(§2.3)→月1〜週3相当のプロキシ帯(daily_rate=0.15≈週1の設計較正を挟む)"),
+    ("joint_accept",  "誘いの承諾率 [直接統計なし]", 0.30,  0.75, "",
+     "承諾率の公的統計は不在(捏造しない)。プロキシ: 職場飲み会は誘われても「断る」が過半"
+     "(ツナグ働き方研究所2020・日経報道=受諾<5割)/同世代の任意の集まりは「好き」50.8%"
+     "(SHIBUYA109 lab.=受諾>5割)→ accept_base=0.5 を中心に ±0.2〜0.25 の帯"),
     # ---- 以下は LLM 依存(mock ランでは参考値。実LLMランで再判定する)----
     ("sns_post_pp",   "SNS投稿 [LLM依存]",        0.05,  1.5,  "件/人日",
      "X利用率~46%×投稿者は少数(1:9論)"),
@@ -270,6 +278,9 @@ def analyze(run_dir: str) -> dict:
     reflect_n = 0
     reflect_deep = 0
     crime_thefts = 0
+    joint_participants = 0
+    joint_invites = 0
+    joint_accepts = 0
 
     for e in stream_events(run_dir):
         k = e["kind"]
@@ -323,6 +334,12 @@ def analyze(run_dir: str) -> dict:
         elif k == "crime":
             if p.get("kind") == "theft":
                 crime_thefts += 1
+        elif k == "joint_activity":
+            joint_participants += len(p.get("with") or [])
+        elif k == "joint_invite":
+            joint_invites += 1
+            if p.get("accepted"):
+                joint_accepts += 1
 
     # ---- L2 曲線 ----
     l2 = read_l2(run_dir)
@@ -426,6 +443,12 @@ def analyze(run_dir: str) -> dict:
     m["reflect_pp"] = reflect_n / (n_all * n_days)
     m["reflect_deep_share"] = reflect_deep / reflect_n if reflect_n else None
     m["relation_break_pp"] = kinds.get("relation_break", 0) / (n_all * n_days)
+
+    # ---- 共同行動・承諾(第62バッチ)。0件は None=「―」(joint/endo OFF と発生ゼロを混同しない)----
+    m["joint_pp"] = (joint_participants / (n_res * n_days)
+                     if joint_participants and n_res else None)
+    m["joint_accept"] = (joint_accepts / joint_invites) if joint_invites else None
+    m["joint_invites"] = joint_invites or None
 
     # ---- ④生活時間配分(第31バッチ W3): build_panel の活動復元を再利用 ----
     try:

@@ -48,7 +48,11 @@ PALETTE = ["#0072B2", "#E69F00", "#009E73", "#D55E00", "#CC79A7",
 # 別バッチが L2 に足しうる派生系列(存在すれば EWS を追加観測。無くても動く)
 #   deviation_mean(第55バッチ タスクA): 裁量ペルソナ逸脱率の日別平均。k を上げると逸脱が増えるか=
 #   R²(k) の解釈材料(measure.collective_series が L2 全数値列を素通しするので per-run 系列として自然に載る)。
-_EXTRA_L2_SERIES = ("speech_diversity", "deviation_mean")
+#   joint_*(第62バッチ 承諾内生化): 承諾率・較正乖離(フェーズ2合否KPI=計画書§3)・内生判定率・履行率。
+#   endogenous_accept×k の交互作用(H3)の per-run 系列材料(列が無いラン=OFF では素通り)。
+_EXTRA_L2_SERIES = ("speech_diversity", "deviation_mean",
+                    "joint_accept_rate", "joint_accept_calib_gap",
+                    "joint_endo_share", "joint_fulfill_rate")
 
 plt.rcParams.update({
     "figure.facecolor": "white", "axes.facecolor": "white",

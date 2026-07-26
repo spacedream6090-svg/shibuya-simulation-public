@@ -100,6 +100,17 @@ def save(sim, step: int, path: str | Path) -> Path:
             "gossip_day": getattr(sim, "_gossip_day", -1),
             "gossip_state": getattr(sim, "_gossip_state", None),
             "gossip_pending": getattr(sim, "_gossip_pending", None),
+            # 共同行動 第62バッチ: 日境界進行(joint_day)+当日の成立グループ(logged フラグ込み)+
+            # 累積件数(joint_total=L2 n_joint_activity)。従来未保存で mid-day resume が同じ日を
+            # 再編成し joint_activity を二重記録し得た(既存ギャップ)。承諾内生化(joint_invite が
+            # 日境界で出る)で resume==straight を成立させるため中央管理へ。agent 側 joint_today は
+            # agents pickle に自然同梱。endo_state は当日の誘いタリー(承諾/内生判定/履行の set は
+            # membership/len のみ使用=集合反復順非保存の影響なし)。OFF ランでは -1/[]/0/None=挙動不変
+            # (load は .get で旧 checkpoint 互換)。
+            "joint_day": getattr(sim, "_joint_day", -1),
+            "joint_groups": getattr(sim, "_joint_groups", []),
+            "joint_total": getattr(sim, "_joint_total", 0),
+            "endo_state": getattr(sim, "_endo_state", None),
         },
         # --- scenario は config から再構築される。封鎖の進行だけを直列化(順序安定) ---
         "scenario": {
@@ -165,6 +176,16 @@ def load(sim, path: str | Path) -> int:
     if gpd is not None:
         sim._gossip_pending = gpd
     sim._gossip_watermark = 0                   # watermark は load で 0(fresh logger=total 0 から再走査。assets と同流儀)
+    # 共同行動 第62バッチ: 日境界進行+当日グループ+累積件数+承諾内生化タリー(旧 checkpoint 互換=
+    # 無ければ従来どおり -1/[]/0 で再編成へ後退)。
+    sim._joint_day = rt.get("joint_day", -1)
+    jg = rt.get("joint_groups")
+    if jg is not None:
+        sim._joint_groups = jg
+    sim._joint_total = rt.get("joint_total", 0)
+    est = rt.get("endo_state")
+    if est is not None:
+        sim._endo_state = est
 
     # scenario: __init__ で config から再構築済み。封鎖の進行を復元し city へ再適用。
     sc = blob["scenario"]

@@ -19,11 +19,17 @@ R1 呼数不変: generate() を1本も足さない。日次編成(_phase_joint=�
 
 既定 OFF(enabled=false)= 何も編成せず(joint_today も付かず)・"joint" stream を引かず・
   joint_activity 0 件=イベント/乱数消費とも不変(ゴールデン golden_baseline_l1.json を守る)。
+
+第62バッチ(2026-07-27): 承諾判断の内生化(relations.endogenous_accept。既定 OFF)。ON 時のみ
+  承諾抽選を「較正確率を事前分布に残した内生判定の合成」に置き換え(relations_endo.decide_accept
+  =全決定論・LLM呼ゼロ)、joint_invite を記録する。抽選 draw は always-draw(veto 時も draw して
+  結果を破棄)= "joint" stream の decision 単位の消費はON/OFF不変。OFF はこの経路に一切入らない。
 """
 from __future__ import annotations
 
 from . import gossip as _gossip
 from . import relations as _relations
+from . import relations_endo as _endo
 from .observer.schema import Event
 
 # ---- 活動カタログ(渋谷較正=§3.3 参加率。友人系4種)。POI カテゴリは routine._PLAN_CAT の語彙
@@ -315,6 +321,12 @@ def plan_day(sim, step: int, sim_min: int) -> None:
     if day == getattr(sim, "_joint_day", -1):
         return
     sim._joint_day = day
+    # 第62バッチ: 承諾判断の内生化(relations.endogenous_accept。既定 OFF=判定・記録経路に
+    # 一切入らず sim._endo_state も生えない=バイト一致)。設計正典: docs/plans/
+    # endogenous-relations-plan.md §2。判定は relations_endo.decide_accept(全決定論・LLM呼ゼロ)。
+    ecfg = _endo.cfg_of(sim)
+    endo_on = bool(ecfg["enabled"])
+    est = _endo.day_state(sim, day) if endo_on else None
     for a in sim.agents:                              # 前日分をクリア(日境界=当日で上書き)
         a.joint_today = None
     sim._joint_groups = []
@@ -338,21 +350,42 @@ def plan_day(sim, step: int, sim_min: int) -> None:
         group = [a.id]
         max_g = int(cfg["max_group"])
         a_age = int(getattr(a, "age", 0) or 0)
+        act_band = _band_minutes(cfg, spec["band"])    # 活動の時間帯(第62: 衝突判定にも使う)
         for cid in cands:
             if len(group) >= max_g:
                 break
             other = sim.agent_by_id.get(cid)
             age_gap = abs(a_age - int(getattr(other, "age", 0) or 0)) if other else 0
-            p = accept_prob(cfg, _tier(sim, a, cid), hier, age_gap)  # S-R4: 階層依存
-            p -= _gossip.joint_penalty(sim, a, cid)   # 負の評判(第61 c): 悪評を知る相手は誘いにくい(既定 OFF=0)
-            if float(rng.random()) < p:               # 誘い→承諾(決定論・新 stream)
+            p_calib = accept_prob(cfg, _tier(sim, a, cid), hier, age_gap)  # S-R4: 階層依存
+            gp = _gossip.joint_penalty(sim, a, cid)   # 負の評判(第61 c): 悪評を知る相手は誘いにくい(既定 OFF=0)
+            r = float(rng.random())                   # 誘い→承諾の抽選(always-draw: ON/OFF で消費数・順序不変)
+            if endo_on and other is not None:
+                # 第62: 内生判定(構造化・決定論)→ 合成 p=clamp(w·p_calib+(1−w)·p_endo)−gossip
+                # (gossip は常に最後の減算=第61 の不変則)。conflict_veto は確率でなく確定拒否
+                # = 直前の draw r を破棄(conditionally-use。draw 列はズレない)。
+                verdict, basis = _endo.decide_accept(sim, a, other, act, act_band, ecfg)
+                p_mix, forced = _endo.compose(p_calib, verdict, basis, ecfg)
+                p_final = 0.0 if forced else p_mix - gp
+                ok = (not forced) and (r < p_final)
+                _endo.tally_invite(est, cid, verdict, p_calib, ok)
+                sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=a.id,
+                                     kind="joint_invite", x=a.x, y=a.y,
+                                     payload={"invitee": int(cid),
+                                              "verdict": verdict or "none",
+                                              "basis": basis,
+                                              "p_calib": round(float(p_calib), 4),
+                                              "p_final": round(float(p_final), 4),
+                                              "accepted": bool(ok)}))
+            else:
+                ok = r < (p_calib - gp)               # 従来の較正抽選(既定=バイト一致)
+            if ok:
                 group.append(cid)
         if len(group) < int(cfg["min_group"]):
             continue
         poi = _rendezvous_poi(sim, group, day, act, cfg)
         if poi is None:
             continue
-        band = _band_minutes(cfg, cfg["activities"][act]["band"])
+        band = act_band
         tag = cfg["activities"][act]["activity_tag"]
         grp_tier = max((_tier(sim, a, gid) for gid in group[1:]), default=0)
         for gid in group:
@@ -405,11 +438,14 @@ def observe(sim, step: int, sim_min: int) -> None:
     if not groups:
         return
     m = sim_min % 1440
+    est = _endo.active_state(sim)   # 第62: 履行観測(ON かつ当日タリーがある時のみ。OFF=None=素通り)
     for grp in groups:
-        if grp["logged"]:
-            continue
         lo, hi = grp["band"]
         if not (lo <= m < hi):
+            continue
+        if est is not None:
+            _endo.mark_fulfilled(sim, grp, est)      # 承諾者の実同席を記録(読むだけ・乱数ゼロ)
+        if grp["logged"]:
             continue
         poi = grp["poi"]
         present = [gid for gid in grp["members"]

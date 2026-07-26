@@ -745,6 +745,9 @@ def build_data(run_dir: Path, include_traffic: bool = True,
     feed, pairs = [], []
     net_posts, net_dms, net_news, searches = [], [], [], []
     state_series: dict[int, list] = defaultdict(list)
+    # 第62バッチ: joint_invite(承諾内生化 ON のランのみ存在)の日次集計(🤝承諾タブの素材)。
+    # 無いラン=空のまま → out["endo"] を足さない=既存ランのビューア再生成でバイト同一(後方互換)。
+    endo_days: dict[int, dict] = {}
     vocab: dict[str, dict] = {}
     # 語彙の来歴: transmission(聴取1辺=誰から誰へどのチャネルで)を item_id ごとに素で貯める。
     # 後段で語ごとに上限(TRANS_CAP_PER_WORD)まで決定論間引き→ vocab[item]["trans"] へ。
@@ -810,6 +813,14 @@ def build_data(run_dir: Path, include_traffic: bool = True,
         elif kind == "enter_area":
             feed.append({"s": e["step"], "a": e["agent_id"], "k": "enter",
                          "t": "電車で帰ってきた" if p.get("via") == "train" else "戻ってきた"})
+        elif kind == "joint_invite":
+            d = (start_min + int(e["step"]) * STEP_MINUTES) // 1440
+            rec = endo_days.setdefault(d, {"inv": 0, "acc": 0, "basis": {}})
+            rec["inv"] += 1
+            if p.get("accepted"):
+                rec["acc"] += 1
+            b = str(p.get("basis", "fallback"))
+            rec["basis"][b] = rec["basis"].get(b, 0) + 1
 
     # ---- L2 集計(論文風グラフの素材)----
     metrics: dict[str, list] = {}
@@ -828,7 +839,10 @@ def build_data(run_dir: Path, include_traffic: bool = True,
                     "deviation_fulltime_mean",
                     # 第59バッチ 資産分布の L2 全体スカラー(assets ON 時のみ列が在る)
                     "asset_gini", "asset_top10_share", "asset_median",
-                    "asset_mean", "asset_rank_tau"):
+                    "asset_mean", "asset_rank_tau",
+                    # 第62バッチ 承諾内生化の L2 全体スカラー(endogenous_accept ON 時のみ列が在る)
+                    "joint_accept_rate", "joint_endo_share",
+                    "joint_accept_calib_gap", "joint_fulfill_rate"):
             if rows and key in rows[0]:
                 metrics[key] = [r.get(key, 0) for r in rows]
 
@@ -945,6 +959,30 @@ def build_data(run_dir: Path, include_traffic: bool = True,
         adata = build_assets_data(run_dir, agents_meta, start_min, assets_map)
         if adata is not None:
             out["assets"] = adata
+    # 承諾内生化(第62バッチ): joint_invite イベント(endogenous_accept ON のランのみ)が「有る時
+    # だけ」🤝承諾タブの素材を埋め込む。日次系列は L2 列の各日末値(列は当日タリー=日内ほぼ一定・
+    # 履行率のみ band 中に増える→日末値が最終値)。無ければ out 不変=既存ランはバイト同一(後方互換)。
+    if endo_days:
+        nd = max(endo_days) + 1
+        def _day_last(key):
+            vals = metrics.get(key) or []
+            picks = []
+            for d in range(nd):
+                j = min((d + 1) * (1440 // STEP_MINUTES) - 1, len(vals) - 1)
+                picks.append(round(float(vals[j]), 6) if 0 <= j < len(vals) else None)
+            return picks
+        bases = sorted({b for rec in endo_days.values() for b in rec["basis"]})
+        out["endo"] = {
+            "days": list(range(nd)),
+            "invites": [endo_days.get(d, {}).get("inv", 0) for d in range(nd)],
+            "accepts": [endo_days.get(d, {}).get("acc", 0) for d in range(nd)],
+            "basis": {b: [endo_days.get(d, {}).get("basis", {}).get(b, 0)
+                          for d in range(nd)] for b in bases},
+            "accept": _day_last("joint_accept_rate"),
+            "endo_share": _day_last("joint_endo_share"),
+            "gap": _day_last("joint_accept_calib_gap"),
+            "fulfill": _day_last("joint_fulfill_rate"),
+        }
     # 屋内ミクロ(B5): space_move / indoor_tracks が有るランだけ埋め込む。無ければ out 不変=バイト同一。
     ind = build_indoor_data(events, idx, bld_idx, run_dir, n_steps, cfg, include_moves)
     if ind is not None:
@@ -3082,6 +3120,71 @@ function assetRender(tab, s0){ if(tab==='assets' && D.assets){ renderAssets(s0);
 """
 
 
+# 第62バッチ 承諾タブ(endo データ=joint_invite が有る時だけ main() が dashboard に注入)。
+# 無ければ空文字→ DASH_HTML はバイト同一(assets と同型の後方互換)。endoRender は tab で自己ガード。
+_ENDO_JS = r"""
+const ENDO_BAS_LABEL={conflict:'予定衝突(拒否)', appointment:'誘い主と約束(受諾)',
+  plan_with:'計画のwithに誘い主(受諾)', solo_plan:'単独志向の計画(拒否)',
+  dialog_cue:'発話の明示キュー(受諾)', fallback:'フォールバック(較正確率)'};
+const ENDO_BAS_COLOR={conflict:'#f87171', appointment:'#6ee7b7', plan_with:'#34d399',
+  solo_plan:'#fbbf24', dialog_cue:'#60a5fa', fallback:'#94a3b8'};
+function renderEndo(s0){
+  const V=D.endo, days=V.days||[];
+  const X=d=>d*144;
+  const pack=(arr)=> days.map((d,i)=>[X(d), arr&&arr[i]!=null?arr[i]:null]).filter(p=>p[1]!=null);
+  const totInv=(V.invites||[]).reduce((s,x)=>s+(x||0),0);
+  const totAcc=(V.accepts||[]).reduce((s,x)=>s+(x||0),0);
+  const basTot={}; for(const b in (V.basis||{})) basTot[b]=(V.basis[b]||[]).reduce((s,x)=>s+(x||0),0);
+  const basSum=Object.values(basTot).reduce((s,x)=>s+x,0)||1;
+  const bbar=Object.entries(basTot).filter(([,n])=>n>0).map(([b,n])=>{
+    const w=n/basSum*100;
+    return '<span style="display:inline-block;height:16px;width:'+w.toFixed(2)+'%;background:'
+      +(ENDO_BAS_COLOR[b]||'#999')+'" title="'+(ENDO_BAS_LABEL[b]||b)+': '+n+'件('+w.toFixed(1)+'%)"></span>';}).join('');
+  const chips=Object.entries(basTot).filter(([,n])=>n>0).map(([b,n])=>
+    '<span style="font-size:11px;margin-right:10px"><span style="display:inline-block;width:9px;height:9px;background:'
+    +(ENDO_BAS_COLOR[b]||'#999')+';border-radius:2px;margin-right:3px"></span>'+(ENDO_BAS_LABEL[b]||b)+' '+n+'</span>').join('');
+  const fb=basTot.fallback||0;
+  body.innerHTML=`
+   <div class="chartBox"><h3>① 誘いの承諾率と較正乖離(日次)</h3>
+     <div class="sub">承諾率=当日の承諾/誘い。乖離=承諾率−p_calib平均(較正確率だけなら0付近に留まる。
+     ±15pp 超はフェーズ2合否のKPI=prior_weight で調整)。誘い ${totInv} 件・承諾 ${totAcc} 件</div>
+     <canvas id="edc1"></canvas></div>
+   <div class="chartBox"><h3>② 内生判定率(=1−フォールバック率)と履行率(日次)</h3>
+     <div class="sub">内生判定率=構造化材料(予定帳簿・前日計画・明示キュー)で判定できた誘いの割合。低い=
+     ほぼ較正確率のまま=それ自体が正直な観測。履行率=承諾者が当日実際に同席した割合(「関心はあるが不履行」の弁別)</div>
+     <canvas id="edc2"></canvas></div>
+   <div class="chartBox"><h3>③ 判定根拠(basis)の内訳(ラン累計)</h3>
+     <div class="sub">フォールバック ${fb} 件 / ${totInv} 件。婉曲拒否の自由文抽出は意図的に非対応
+     (誤検出回避=明示キューのみ)</div>
+     <div style="display:flex;width:100%;max-width:560px;border-radius:5px;overflow:hidden;background:var(--surface2);margin:8px 0">${bbar}</div>
+     <div>${chips}</div></div>
+   <div class="chartBox"><h3>④ 誘い・承諾の件数(日次)</h3>
+     <div class="sub">誘いは日境界(真夜中)の編成時に判定される(1誘い=joint_invite 1件)</div>
+     <canvas id="edc3"></canvas></div>`;
+  lineChart(document.getElementById('edc1'), [
+    {label:'承諾率',color:'#6ee7b7', data:pack(V.accept)},
+    {label:'較正乖離',color:'#f472b6', data:pack(V.gap)},
+  ], {});
+  lineChart(document.getElementById('edc2'), [
+    {label:'内生判定率',color:'#60a5fa', data:pack(V.endo_share)},
+    {label:'履行率',color:'#fbbf24', data:pack(V.fulfill)},
+  ], {pct:true, ymax:1});
+  lineChart(document.getElementById('edc3'), [
+    {label:'誘い',color:'#94a3b8', data:pack(V.invites)},
+    {label:'承諾',color:'#6ee7b7', data:pack(V.accepts)},
+  ], {});
+}
+function endoRender(tab, s0){ if(tab==='endo' && D.endo){ renderEndo(s0); } }
+// テンプレート render() を書き換えず、注入時に1回だけラップして承諾タブ描画を差し込む(assets と同型=
+// 旧ラン<未注入>はテンプレートがバイト同一)。二重ラップ防止付き。
+(function(){ if(window.__endoWrapped) return; window.__endoWrapped=true;
+  const _origRender=render;
+  render=function(force){ _origRender(force);
+    if(typeof endoRender==='function') endoRender(tab, S0()); };
+})();
+"""
+
+
 # 第58バッチ B7 会社タブ(orgs データが有る時だけ main() が dashboard に __LENS_JS__ 経由で注入)。
 # 無ければ空文字→ DASH_HTML はバイト同一。orgRender は tab==='org' で自己ガード。名称・業種・職場は
 # 架空の合成台帳(organizations.book, R17)由来=実在企業名は出さない。従業員クリックで個人情報へ。
@@ -3990,6 +4093,9 @@ const CURATED=[
   ['edge_churn_rate','edge組替率'],
   ['edges_formed','紐帯形成'],
   ['edges_broken','紐帯断絶'],
+  ['joint_accept_rate','共同承諾率'],
+  ['joint_accept_calib_gap','承諾較正乖離'],
+  ['joint_endo_share','内生判定率'],
 ];
 const meta=[];
 if(D.nAgents!=null) meta.push(`エージェント ${D.nAgents}体`);
@@ -4139,6 +4245,7 @@ def main() -> None:
     has_deviation = "deviation" in data
     has_structure = "structure" in data
     has_assets = "assets" in data
+    has_endo = "endo" in data
     lens_tabs = ""
     if has_lens:
         lens_tabs += ('\n    <button data-tab="value">💠 価値</button>'
@@ -4151,6 +4258,8 @@ def main() -> None:
         lens_tabs += '\n    <button data-tab="structure">🏛 社会構造</button>'
     if has_assets:
         lens_tabs += '\n    <button data-tab="assets">💰 資産</button>'
+    if has_endo:
+        lens_tabs += '\n    <button data-tab="endo">🤝 承諾</button>'
     lens_js = _LENS_JS if (has_lens or has_trust) else ""
     if has_deviation:                      # 逸脱タブ JS は lens/trust と独立に注入(devRender を定義)
         lens_js += _DEV_JS
@@ -4158,6 +4267,8 @@ def main() -> None:
         lens_js += _STRUCT_JS
     if has_assets:                         # 資産タブ JS も独立に注入(assetRender を定義)
         lens_js += _ASSETS_JS
+    if has_endo:                           # 承諾タブ JS も独立に注入(endoRender を定義・自己ラップ)
+        lens_js += _ENDO_JS
     # 第58バッチ B7/B8: 会社(orgs)・在館(occupancy)データが「有る時だけ」タブ/JS を注入。無ければ
     # 全トークン空文字→ DASH_HTML/MAP_HTML はバイト同一(既存の lens/indoor と同型の後方互換)。
     # DASH_HTML/MAP_HTML の文字列そのものは一切改変せず、既存の __LENS_TABS__/__LENS_JS__/

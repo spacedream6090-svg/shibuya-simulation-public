@@ -946,6 +946,31 @@ relations:
   rep_decay_per_day: 0.5        # 評判の日次風化
   rep_known_threshold: 3.0      # 評判がこれ以上で「街で名が知られている」文脈をプロンプトに
   faction: true                 # 同じグループ所属を「同じ仲間」1行に(軽量。重い分極は後続波)
+  # ---- 承諾/拒否判断の内生化 第62バッチ フェーズ1(2026-07-27。既定 OFF=現行挙動と完全同一)----
+  # 共同行動(joint)の誘い→承諾を「較正確率のみの抽選」から「較正値を事前分布に残した内生判定の合成」へ。
+  # 合成 p = clamp(prior_weight·p_calib + (1−prior_weight)·p_endo) − gossip_penalty(gossip は常に最後の減算)。
+  # 判定材料は被誘者の**前日までの構造化出力のみ**(①予定帳簿の当日予定=schedule ON時 ②前日 day_schedule の
+  # 志向 ③前日発話の明示キュー=prompts.dialog_history ON時 ④判定不能→較正フォールバック)。全決定論・
+  # LLM 呼ゼロ・"joint" stream の draw は always-draw で ON/OFF 不変。実装 src/society/relations_endo.py +
+  # joint.py(語彙・較正はここと relations_endo.py にのみ)。設計正典 docs/plans/endogenous-relations-plan.md §2。
+  # ON 時のみ joint_invite(判定内訳)を記録し L2 に joint_accept_rate / joint_endo_share /
+  # joint_accept_calib_gap / joint_fulfill_rate の4列を出す。要 joint.enabled=true で活きる。
+  endogenous_accept:
+    enabled: false              # ★実験 treatment(フェーズ2で OFF/ON × k の6セル比較=D17)
+    prior_weight: 0.5           # 較正確率の事前分布重み(1.0=完全較正/0.0=完全内生。乖離±15pp超はここで調整)
+    conflict_veto: true         # 当日予定と時間帯衝突なら確率でなく確定拒否(draw は破棄=消費数不変)
+    positive_boost: 0.35        # 受諾材料(誘い主との予定/計画 with/明示キュー)の p_endo 加算
+    negative_cut: 0.35          # 拒否材料(単独志向の計画が過半)の p_endo 減算
+    fallback: calibrated        # 判定不能時の後退先(現在唯一のモード=較正確率をそのまま使う)
+    # 前日計画の「単独志向」what 語彙(with 空×これに該当が過半=拒否材料)。walk=ウォーキングは典型同伴
+    # 「一人」(レジャー白書2024 §2.6)、home/personal/study は計画スキーマの定義上単独行動。
+    solo_whats: [walk, home, personal, study]
+    # 前日発話の明示キュー動詞(受諾方向のみ。「(誘い主名)と…<cue>」)。拒否方向のキューは置かない=
+    # 日本語の断りは間接的意味公式が支配的(Beebe et al. 1990)で辞書法は誤検出が多い(relations_endo.py 冒頭)。
+    positive_cues: [行きたい, 行こう, したい, しよう, 遊びたい, 遊ぼう, 会いたい, 楽しみ]
+    # 曖昧化マーカー: 同一文に共起した発話はキューに数えない=フォールバック(「行きたいのは山々ですが」=
+    # 願望+言い訳の婉曲断りを受諾に誤検出しない。曖昧例は落とす=計画書§1)。
+    hedge_markers: [山々, ですが, だけど, けれど, けど, のに, 無理, 難しい, また今度, 行けたら]
 
 # ---- 友人グラフ生成(関係性パッケージ完結 第45バッチ S-R2。ユーザー要望 2026-07-21。既定 OFF=現行挙動と完全同一)----
 # 現状の初期関係は「同建物の顔なじみ最大3人」のみ=地理的共在だけが源泉。本ブロックは起動時1回、居住者の
