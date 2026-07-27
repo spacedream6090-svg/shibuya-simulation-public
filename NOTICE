@@ -1,0 +1,13 @@
+shibuya-simulation
+Copyright 2026 syota tsukamoto
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+This product bundles third-party components and data. Code and data are
+licensed separately — see the "ライセンス" section of README.md for the
+per-source data licenses (OpenStreetMap/ODbL, 全国の人流オープンデータ/
+政府標準利用規約2.0, 公共交通オープンデータセンター(ODPT), three.js/MIT).

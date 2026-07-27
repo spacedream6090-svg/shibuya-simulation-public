@@ -93,3 +93,18 @@ scripts/  tests/  viz/  conf/config.yaml  data/  docs/
 
 実在の場所・施設名は使うが**実在の個人・団体は登場させず**、シミュ内の全出来事・人物は**架空**である。
 ペルソナは公表統計からの手続き生成、データは合成データのみ。詳細は [`ETHICS.md`](ETHICS.md) を参照。
+
+## ライセンス
+
+- **コード**: [Apache License 2.0](LICENSE)([NOTICE](NOTICE) 併置)
+- **データ**: コードとは**別ライセンス**。同梱データは出典別に以下に従う。
+  - OpenStreetMap 由来(`data/shibuya_osm*.json` / `env/shimokita/*`):
+    © OpenStreetMap contributors・[ODbL 1.0](https://opendatacommons.org/licenses/odbl/)(派生データベースは ODbL を継承)
+  - 全国の人流オープンデータ(`data/jinryu/`): 国土交通省(株式会社 Agoop 提供データより作成)・
+    政府標準利用規約 2.0(CC BY 4.0 互換)。出典・定義・DL 元は [`data/jinryu/SOURCE.md`](data/jinryu/SOURCE.md)
+  - 公共交通オープンデータセンター(`data/odpt/`): [ODPT の利用規約](https://developer.odpt.org/)に従う。
+    出典表示は各ファイルの `_meta` に付与済み。データの権利は各公共交通事業者等に帰属
+  - フロアガイド事実データ(`data/floorguide_shibuya.json` / `data/floor_layouts.json`):
+    公開フロアガイド等からの**カテゴリ事実のみ**(店名・ブランド名不記載。出典は各ファイル `meta.sources`)
+  - 組織台帳(`data/organizations_shibuya_wide11k.json`): 手続き生成の**合成データ**(実在企業・学校名なし)
+  - three.js(`viz/vendor/`): MIT([`viz/vendor/LICENSE`](viz/vendor/LICENSE) 同梱)
