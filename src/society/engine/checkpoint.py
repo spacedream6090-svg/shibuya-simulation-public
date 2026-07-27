@@ -114,6 +114,10 @@ def save(sim, step: int, path: str | Path) -> Path:
             # 第64バッチ: 誘い経路の当日タリー(invite ON 時のみ存在。int のみ=set なし=
             # 決定論監査は自明)。OFF ランでは None=挙動不変(load は .get で旧 checkpoint 互換)。
             "invite_state": getattr(sim, "_invite_state", None),
+            # 第65バッチ: 会話由来 magnitude の当日タリー(quality ON 時のみ存在。int/float のみ)。
+            # mid-day checkpoint でも当日平均(L2 quality_magnitude_mean)が resume==straight に
+            # なるよう中央管理する。OFF ランでは None=挙動不変(load は .get で旧 ckpt 互換)。
+            "quality_state": getattr(sim, "_quality_state", None),
         },
         # --- scenario は config から再構築される。封鎖の進行だけを直列化(順序安定) ---
         "scenario": {
@@ -192,6 +196,9 @@ def load(sim, path: str | Path) -> int:
     ivs = rt.get("invite_state")                # 第64: 誘い経路タリー(旧 checkpoint 互換=無ければ素通り)
     if ivs is not None:
         sim._invite_state = ivs
+    qst = rt.get("quality_state")               # 第65: 会話の質タリー(旧 checkpoint 互換=無ければ素通り)
+    if qst is not None:
+        sim._quality_state = qst
 
     # scenario: __init__ で config から再構築済み。封鎖の進行を復元し city へ再適用。
     sc = blob["scenario"]

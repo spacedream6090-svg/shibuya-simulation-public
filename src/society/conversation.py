@@ -178,7 +178,13 @@ def plan_conversation(a, b, opinioncfg, c2cfg) -> dict:
 def _contact(sim, actor, other, valence: float, step: int, sim_min: int) -> None:
     """交流 1 件を actor→other の関係台帳へ反映(scheduler._contact と同型)。
 
-    relations ON なら符号つき closeness 更新+tier 変化ログ、OFF なら従来の record_contact のみ。"""
+    relations ON なら符号つき closeness 更新+tier 変化ログ、OFF なら従来の record_contact のみ。
+
+    第65バッチ フェーズ4(関係の質)の magnitude は**この経路には載せない**(既定 1.0=従来と同値)。
+    正直な限界: C2 は「実文テキストを作らない」軽量会話(dialogue act の数だけを記録)なので、
+    発話長・明示キューという抽出材料が構造的に存在しない。往復数だけで係数を作ると C1(実文)と
+    尺度が揃わないため、材料が揃う C1(scheduler の speak/dm)経路に限定した(quality ON でも
+    C2 由来の交流は magnitude 1.0=従来どおり)。"""
     if sim.relationscfg["enabled"]:
         relations_mod.note_contact(actor, other.id, other.name, "", valence,
                                    sim.relationscfg, step, sim_min, sim.logger)

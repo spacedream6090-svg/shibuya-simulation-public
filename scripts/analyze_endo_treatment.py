@@ -93,9 +93,11 @@ STRUCT_METRICS = STRUCT_SERIES + ("stagnant_days",)
 # フェーズ3(第64バッチ)の invite 2列は L2 由来なので KPI_COLS へ接続(第63の引き継ぎ事項=
 # 1定数追記で _l2_kpi_daily→kpi 集計→レポートへ載る)。endogenous_invite OFF のランには列自体が
 # 無く自動で欠測(None)扱い=既存 accept 実験の解析はバイト不変。
+# フェーズ4(第65バッチ)の quality 1列も同じ理由で接続(列が無いラン=OFF は自動で欠測扱い)。
 KPI_COLS = ("joint_accept_rate", "joint_endo_share",
             "joint_accept_calib_gap", "joint_fulfill_rate",
-            "invite_weak_tie_rate", "invite_endo_share")
+            "invite_weak_tie_rate", "invite_endo_share",
+            "quality_magnitude_mean")
 PRIMARY_METRIC = "edge_churn_rate"        # H1/H3 の主指標(計画書§3)
 
 

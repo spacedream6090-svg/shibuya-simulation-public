@@ -28,6 +28,7 @@ from .. import mobility as mobility_mod
 from .. import opinion as opinion_mod
 from .. import party as party_mod
 from .. import relations as relations_mod
+from .. import relations_endo as relations_endo_mod
 from .. import pov as pov_mod
 from .. import b2b as b2b_mod
 from .. import delivery as delivery_mod
@@ -100,14 +101,31 @@ def _relations_on(sim) -> bool:
 
 
 def _contact(sim, actor, other_id: int, other_name: str, text: str,
-             valence: float, step: int, sim_min: int) -> None:
+             valence: float, step: int, sim_min: int,
+             magnitude: float = 1.0) -> None:
     """交流1件を actor→other の関係台帳へ記録する。relations OFF なら従来の record_contact
-    のみ(closeness を付けない=バイト一致)。ON なら符号つき closeness 更新 + tier 変化ログ。"""
+    のみ(closeness を付けない=バイト一致)。ON なら符号つき closeness 更新 + tier 変化ログ。
+
+    magnitude(第65バッチ)は _quality_mag が返す不透明係数(既定 1.0=従来と同値)。増減の
+    **量**にのみ載る=engine はここ以外の判定(発火・相手選択・段階)へ一切流さない。"""
     if _relations_on(sim):
         relations_mod.note_contact(actor, other_id, other_name, text, valence,
-                                   sim.relationscfg, step, sim_min, sim.logger)
+                                   sim.relationscfg, step, sim_min, sim.logger,
+                                   magnitude)
     else:
         actor.mem.record_contact(other_id, other_name, step, text)
+
+
+def _quality_mag(sim, speaker, other_id: int, text: str, sim_min: int) -> float:
+    """交流1件に載せる不透明係数を society 層から受け取る(既定 OFF/relations OFF は 1.0
+    =従来と同値=バイト一致)。既生成テキストからの決定論抽出のみ=LLM 呼・乱数ともゼロ。
+
+    engine は数値を運ぶだけで中身(何を材料にどう測るか)を知らない。片方向 hook:
+    戻り値は _contact 以外へ渡さない=発話の発生・相手選択・イベント列は ON/OFF で不変。"""
+    if not _relations_on(sim):
+        return 1.0
+    return relations_endo_mod.contact_magnitude(sim, speaker, other_id, text,
+                                                sim_min)
 
 
 def _steps_until_tod(cur_sim_min: int, target_min: int) -> int:
@@ -2486,10 +2504,12 @@ def _apply(sim, agent, action: dict, step: int, sim_min: int) -> None:
             recipient._last_dm_from = agent.id
             v_dm = valence(action["text"])
             # 関係台帳(Wave G2 の交流符号=DM の感情価)。OFF は従来の record_contact と完全同一。
+            # 第65バッチ: DM も文面から同じ係数を1回算出して両方向へ(既定 OFF=1.0)。
+            mag_dm = _quality_mag(sim, agent, recipient.id, action["text"], sim_min)
             _contact(sim, recipient, agent.id, agent.name, action["text"],
-                     v_dm, step, sim_min)
+                     v_dm, step, sim_min, mag_dm)
             _contact(sim, agent, recipient.id, recipient.name, "",
-                     v_dm, step, sim_min)
+                     v_dm, step, sim_min, mag_dm)
             drive.add(recipient, "dm_received", sim.drivecfg)
             _arouse(sim, recipient, "dm", step, sim_min,
                     valence_abs=abs(v_dm), addressed=1.0)   # DM=被話しかけ→覚醒↑(OFF=no-op)
@@ -2589,10 +2609,13 @@ def _apply(sim, agent, action: dict, step: int, sim_min: int) -> None:
                                                         novelty=(1.0 if words else 0.0)))
             sim.net.add_contact(agent.id, hearer.id)   # 対面で知り合い→DM可・フォロー
             # 関係台帳(Wave G2 の交流符号=発話の感情価)。OFF は従来の record_contact と完全同一。
+            # 第65バッチ: 交流の**量**に載る係数を(話者,聞き手)1組につき1回だけ算出し両方向へ
+            # 同じ値で渡す(既定 OFF=1.0=従来と同値)。算出は society 層=engine は運ぶだけ。
+            mag = _quality_mag(sim, agent, hearer.id, action["text"], sim_min)
             _contact(sim, hearer, agent.id, agent.name, action["text"],
-                     v_text, step, sim_min)
+                     v_text, step, sim_min, mag)
             _contact(sim, agent, hearer.id, hearer.name, "",
-                     v_text, step, sim_min)
+                     v_text, step, sim_min, mag)
             _hear_words(sim, hearer, words, agent.id, "face", step, sim_min)
             # 聞いた言葉の感情価(SIMCA: affective)+ 語の使用の目撃(代理経験)。
             # in-group 判定=グループ所属の照合だけ engine が行い、倍率(不透明 float)を渡す。
@@ -3492,6 +3515,9 @@ def _phase_relations_day(sim, step: int, sim_min: int) -> None:
         return
     sim._rel_day = day
     relations_mod.decay_day(sim, sim.relationscfg, step, sim_min)
+    # 第65バッチ: 会話由来 magnitude の当日タリーを日境界で初期化(OFF は None=状態も作らない
+    # =バイト一致)。観測専用=closeness/イベント/乱数には触れない。
+    relations_endo_mod.quality_day_state(sim, day)
 
 
 # ---------------------------------------------------------------- 負の評判の内生伝播(第61バッチ c)

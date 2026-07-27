@@ -76,6 +76,42 @@ R1(既定 OFF=バイト一致): enabled=false のとき候補順・"joint" strea
 数は OFF と差が出得るが、それは treatment そのもの(承諾側の always-draw とは役割が違う=計画書
 §4)。承諾抽選の draw 列に invite 由来の**別用途 draw を混ぜない**(joint stream は承諾抽選のみ)。
 resume==straight: 当日タリー(sim._invite_state)は checkpoint.py が中央管理(endo_state と同型)。
+
+─────────────────────────────────────────────────────────────────────────────
+第65バッチ フェーズ4(関係の質の内生化。conf relations.endogenous_quality.*。既定 OFF)。
+正典: docs/plans/endogenous-relations-plan.md §4(最終段)。従来 relations.note_contact は交流の
+**符号**(valence>=0=+pos_weight / <0=−neg_weight)だけを見て、どんな会話でも増減量は一定だった。
+本ブロックは既生成の会話テキストから決定論抽出した不透明係数 magnitude を増減**量**に載せる
+片方向 hook(値の生成のみ。掛け算は relations.note_contact、引き渡しは engine の1関数)。
+
+抽出材料(全て既生成テキスト・LLM 呼ゼロ・乱数ゼロ):
+  1. 発話長(自己開示の**量**の粗い代理)… len_chars で正規化し len_gain まで加算
+  2. 往復数(相手別リングバッファ _dialog_hist の蓄積=応答のやり取りの厚み)… turn_gain/回・turn_max 上限
+  3. 明示キューの共起(フェーズ1 positive_cues を**そのまま再利用**=語彙は単一の源)… cue_gain 加算
+  4. hedge_markers の共起 → **中立 1.0 に倒す**(婉曲・逆接の混じる曖昧文は関係の質に効かせない=
+     フェーズ1「曖昧例はフォールバックへ」と同じ保守側の設計)
+最後に [mag_min, mag_max] へ clamp。
+
+文献根拠(選択の理由。深追いはしない=優先度低の最終段):
+  - Altman & Taylor 1973 の社会的浸透理論=自己開示の breadth/depth の累積が関係を深化させる。
+    Laurenceau, Barrett & Pietromonaco 1998(JPSP 74(5):1238-1251)は日誌法で「知覚された開示の
+    **深さ**が当日の親密さの最強の予測子」「事実より**感情**の開示が効く」を実証。
+    → 材料3(明示キュー=感情/意向の表出)を長さと別枠で加点する根拠。
+  - Reis & Shaver 1988 の対人過程モデル=親密さは「自己開示 + 相手の応答性」の相互作用で生じる
+    (Laurenceau et al. 1998 が partner responsiveness の媒介を実証)。
+    → 材料2(往復数=応答のやり取りが実際に成立した回数)を加点する根拠。
+  **正直な限界**: 文字数は開示の「深さ」の代理にならない(文献が効くと言っているのは depth と
+  responsiveness であって長さではない)。長さは「厚みの下限を粗く測る」以上の主張をしない=
+  len_gain を最大の加点にしない既定値(0.5 で cue 0.4 / turn 0.45 と同程度)にとどめる。
+
+片方向 hook(計画書§4「発火判定には流さない」の厳守): magnitude は closeness の増減量にのみ入る。
+  発火判定(drive/申請/抽選)・会話ペアリング(_select_partner)・tier 閾値の式(tier_of)・誘い/承諾の
+  判定には**一切**渡さない=会話数・LLM 呼数・イベント数・乱数消費は ON/OFF で不変。magnitude が
+  closeness の蓄積速度を変えることで tier 遷移の**時期**が動くのは treatment そのもの(意図)。
+
+R1(既定 OFF=バイト一致): enabled=false のとき contact_magnitude は 1.0 を返すだけ(タリーも作らず
+  sim._quality_state が生えない)=L1/L2/乱数消費とも従来と完全同一。ON でも LLM 呼ゼロ・乱数ゼロ。
+  resume==straight: 当日タリー(sim._quality_state)は checkpoint.py が中央管理(endo/invite と同型)。
 """
 from __future__ import annotations
 
@@ -533,3 +569,151 @@ def invite_scalars(sim) -> dict | None:
         return {"invite_weak_tie_rate": 0.0, "invite_endo_share": 0.0}
     return {"invite_weak_tie_rate": round(st["weak_tie"] / inv, 6),
             "invite_endo_share": round(st["endo"] / inv, 6)}
+
+
+# =========================================================================== #
+# 第65バッチ フェーズ4: 関係の質の内生化(relations.endogenous_quality。既定 OFF)
+#   会話由来の不透明 magnitude を closeness の増減**量**にのみ載せる片方向 hook。
+#   全決定論・LLM/乱数ゼロ(冒頭 docstring のフェーズ4節が設計の正典)。
+# =========================================================================== #
+QUALITY_DEFAULTS = {
+    "enabled": False,
+    # clamp 範囲(この外へは出さない=暴走防止。既定 [0.5, 2.0]=最大でも従来の2倍・半分)。
+    "mag_min": 0.5,
+    "mag_max": 2.0,
+    # 発話長: min(1, len(text)/len_chars) × len_gain を加算。len_chars=60 は本シムの発話
+    # (max_tokens 制約下の1〜2文)の実測レンジから採った「厚い発話」の目安で、文献値ではない
+    # (正直な注記: 開示の深さの直接指標は自由文からは取れない=長さは粗い代理)。
+    "len_chars": 60.0,
+    "len_gain": 0.5,
+    # 往復: (バッファ内発話数−1) × turn_gain を turn_max まで加算(応答性 = Reis & Shaver 1988)。
+    # リングバッファは相手あたり最大4発話なので既定では 3×0.15=0.45=turn_max に届く。
+    "turn_gain": 0.15,
+    "turn_max": 0.45,
+    # 明示キュー(positive_cues の共起)の加算。感情/意向の表出=Laurenceau et al. 1998。
+    "cue_gain": 0.4,
+}
+
+_QUAL_FLOAT_KEYS = ("mag_min", "mag_max", "len_chars", "len_gain",
+                    "turn_gain", "turn_max", "cue_gain")
+
+
+def build_quality_cfg(raw) -> dict:
+    """conf の relations.endogenous_quality ブロックを正準化(既定 OFF=現行挙動と完全同一)。"""
+    raw = dict(_to_plain(raw) or {})
+    cfg = dict(QUALITY_DEFAULTS)
+    for k, v in raw.items():
+        if k == "enabled":
+            cfg["enabled"] = bool(v)
+        elif k in _QUAL_FLOAT_KEYS:
+            cfg[k] = float(v)
+    return cfg
+
+
+def quality_cfg_of(sim) -> dict:
+    """endogenous_quality 設定(初回のみ遅延構築してキャッシュ)。キャッシュ属性 sim.endoqualcfg は
+    L1/L2/L3/乱数に一切現れない=既定 OFF のバイト一致を壊さない(cfg_of と同型)。"""
+    c = getattr(sim, "endoqualcfg", None)
+    if c is None:
+        try:
+            raw = (sim.cfg.get("relations", None) or {}).get("endogenous_quality", None)
+        except Exception:
+            raw = None
+        c = build_quality_cfg(raw)
+        sim.endoqualcfg = c
+    return c
+
+
+def quality_enabled(sim) -> bool:
+    return bool(quality_cfg_of(sim)["enabled"])
+
+
+def magnitude_of(text: str, turns: int, cfg: dict, qcfg: dict) -> float:
+    """会話1件の magnitude を決定論算出する純関数(乱数・LLM・sim 状態に依存しない)。
+
+    cfg=endogenous_accept ブロック(語彙 positive_cues/hedge_markers の**単一の源**)、
+    qcfg=endogenous_quality ブロック(係数)。turns=その相手との直近バッファの発話数。
+
+    hedge_markers が本文に共起したら他の材料を見ずに 1.0(中立=従来と同値)を返す。
+    保守側に倒す選択の理由: 日本語の逆接・困難表現は婉曲の断り/留保の意味公式に頻出し
+    (Beebe et al. 1990。冒頭 docstring)、その文を「厚い交流」と読むと関係の質を上振れさせる。
+    **正直な限界**: 語彙は accept ブロック共用で「けど/のに」等の高頻度語を含むため、
+    中立へ落ちる会話の割合は実測で高くなり得る(中立比率自体を観測して報告する)。"""
+    for h in cfg["hedge_markers"]:
+        if h in text:
+            return 1.0
+    mag = 1.0
+    n = len(text)
+    if n > 0 and qcfg["len_chars"] > 0:
+        mag += min(1.0, n / float(qcfg["len_chars"])) * float(qcfg["len_gain"])
+    if turns > 1:
+        mag += min(float(qcfg["turn_max"]),
+                   (int(turns) - 1) * float(qcfg["turn_gain"]))
+    if any(c in text for c in cfg["positive_cues"]):
+        mag += float(qcfg["cue_gain"])
+    return min(float(qcfg["mag_max"]), max(float(qcfg["mag_min"]), mag))
+
+
+def contact_magnitude(sim, speaker, other_id: int, text: str,
+                      sim_min: int) -> float:
+    """交流1件の magnitude を返し、当日タリーへ加算する(OFF は常に 1.0・タリーも作らない)。
+
+    材料は speaker 側の既生成テキスト(text)と、その相手との直近バッファ(_dialog_hist=
+    prompts.dialog_history ON 時のみ存在。OFF は turns=0=長さとキューだけで判定)。
+    呼び手(engine)は「不透明な float を1つ受け取って note_contact に渡す」だけ=関係語彙・
+    判定ロジックは本 module 側に閉じる(no-fingerprint の作法)。"""
+    if not quality_enabled(sim):
+        return 1.0
+    qcfg = quality_cfg_of(sim)
+    hist = getattr(speaker, "_dialog_hist", None) or {}
+    turns = len(hist.get(other_id) or ())
+    mag = magnitude_of(str(text or ""), turns, cfg_of(sim), qcfg)
+    _quality_tally(sim, int(sim_min) // 1440, mag)
+    return mag
+
+
+# --------------------------------------------------------------------------- #
+# 会話の質の当日タリー(L2 観測の材料。checkpoint.py が中央管理=resume==straight)
+# --------------------------------------------------------------------------- #
+def quality_day_state(sim, day: int) -> dict | None:
+    """日境界で当日タリーを初期化して返す(scheduler の関係日次フェーズが ON 時のみ呼ぶ)。
+    OFF なら None=状態を一切生やさない(バイト一致)。int/float のみ=決定論監査は自明。"""
+    if not quality_enabled(sim):
+        return None
+    st = {"day": int(day), "n": 0, "sum": 0.0, "neutral": 0}
+    sim._quality_state = st
+    return st
+
+
+def _quality_tally(sim, day: int, mag: float) -> None:
+    """1交流分をタリーへ加算(決定論)。日が変わっていれば作り直す(日境界フェーズが先に
+    走るのが通常経路。ここでの再作成は phase 順に依存しないための防御=同じ結果になる)。
+    neutral は magnitude が厳密に 1.0(hedge 中立・材料ゼロ)だった件数=品質の正直な指標。"""
+    st = getattr(sim, "_quality_state", None)
+    if st is None or int(st.get("day", -1)) != int(day):
+        st = {"day": int(day), "n": 0, "sum": 0.0, "neutral": 0}
+        sim._quality_state = st
+    st["n"] += 1
+    st["sum"] += float(mag)
+    if mag == 1.0:
+        st["neutral"] += 1
+
+
+def quality_scalars(sim) -> dict | None:
+    """L2 全体スカラー 1 列(OFF は None=列なし=L2 不変。scalars と同型)。
+
+      quality_magnitude_mean = 当日の会話由来 magnitude の平均(交流1件=(話者,聞き手)1組
+        あたり1件。両方向の note_contact には同じ値が載るので二重計上しない)。
+    会話 0 件の日は 0.0(magnitude は mag_min>0 の範囲なので「会話が無い」と区別可能=
+    invite/accept scalars と同じ正直な限界)。relations 本体 OFF では closeness 自体が
+    動かない=列も出さない。"""
+    if not quality_cfg_of(sim)["enabled"]:
+        return None
+    rc = getattr(sim, "relationscfg", None)
+    if not (rc and rc.get("enabled")):
+        return None
+    st = getattr(sim, "_quality_state", None)
+    n = int(st["n"]) if st else 0
+    if n <= 0:
+        return {"quality_magnitude_mean": 0.0}
+    return {"quality_magnitude_mean": round(float(st["sum"]) / n, 6)}

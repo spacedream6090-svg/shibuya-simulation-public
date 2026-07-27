@@ -795,6 +795,16 @@ def _invite_endo_share(sim):
     return _invite_col(sim, "invite_endo_share")
 
 
+# ---- 関係の質の内生化 第65バッチ フェーズ4(既定 OFF)。relations.endogenous_quality.enabled=false
+#      (または relations OFF)は None=列なし=L2 不変(accept/invite 列と同型)。
+#   当日の会話由来 magnitude の平均(closeness の増減量に載った不透明係数=会話の厚みの観測)。
+#   タリーは engine の交流記録が積み、日境界で初期化される(読むだけ・乱数ゼロ)。
+@register_aggregator("quality_magnitude_mean")
+def _quality_magnitude_mean(sim):
+    s = _rendo.quality_scalars(sim)
+    return s.get("quality_magnitude_mean") if s else None
+
+
 # ---- 屋内エンジン配線 B3(indoor.enabled ON のみ・既定 OFF=None=列なし=L2 バイト不変)----
 #   この step のフロア内区画遷移(space_move)/遭遇(encounter)/会議開催の件数。per-step カウンタ
 #   (累積でない=resume 安全=分割再開でも各 step の値が state だけから再現される)。

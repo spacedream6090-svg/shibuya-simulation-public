@@ -104,14 +104,21 @@ def _log_tier(actor, other_id: int, old_tier: int, new_tier: int, count: int,
 # ---------------------------------------------------------------- 交流(1件)の反映
 def note_contact(actor, other_id: int, other_name: str, text: str,
                  valence: float, cfg: dict, step: int, sim_min: int,
-                 logger) -> None:
+                 logger, magnitude: float = 1.0) -> None:
     """1件の交流を actor→other の関係台帳へ反映する(closeness 更新 + tier 変化ログ)。
 
     record_contact を closeness_delta 付きで呼び(count/last_step/last も従来通り更新)、
     交流の符号で closeness を動かす。valence>=0=ポジ交流(+pos_weight)、<0=ネガ交流
     (−neg_weight)。closeness から tier を導出し、変化していれば relation_tier/relation_break
-    を記録する。乱数・LLM を一切使わない。"""
-    delta = cfg["pos_weight"] if valence >= 0.0 else -cfg["neg_weight"]
+    を記録する。乱数・LLM を一切使わない。
+
+    magnitude(第65バッチ フェーズ4=関係の質の内生化): 増減**量**に載る不透明係数。既定 1.0=
+    従来と同値(IEEE754 の ×1.0 は厳密=既定 OFF のバイト一致)。呼び手(engine)が会話の厚みから
+    決定論抽出して渡す片方向 hook で、本 module は「数値を受け取って掛ける」以上のことをしない
+    (符号=valence の解釈・tier 閾値の式・発火判定には一切流さない)。設計正典:
+    docs/plans/endogenous-relations-plan.md §4 / 抽出は relations_endo.contact_magnitude。"""
+    delta = (cfg["pos_weight"] if valence >= 0.0
+             else -cfg["neg_weight"]) * float(magnitude)
     rel = actor.mem.record_contact(other_id, other_name, step, text,
                                    closeness_delta=delta)
     old_tier = int(rel.get("tier", 0))

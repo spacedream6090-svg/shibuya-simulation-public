@@ -996,6 +996,31 @@ relations:
   endogenous_invite:
     enabled: false              # ★実験 treatment 候補(投入は phase3_go ゲート合格後=実装と実験の分離)
     weak_tie_slots: 1           # 弱い紐帯(tier=1 知人)の探索枠数(候補末尾。0=無効。1=保守的既定=直接統計なし)
+  # ---- 関係の質の内生化 第65バッチ フェーズ4(2026-07-27。既定 OFF=現行挙動と完全同一)----
+  # 従来 note_contact は交流の**符号**だけを見て増減量が一定(+pos_weight/−neg_weight)だった。
+  # ON 時は既生成の会話テキストから決定論抽出した不透明係数 magnitude を増減**量**にのみ載せる:
+  #   ①発話長(len_chars で正規化・len_gain まで)②往復数(_dialog_hist の蓄積・turn_gain/回・turn_max まで)
+  #   ③明示キューの共起(endogenous_accept.positive_cues を**そのまま再利用**=語彙は単一の源・cue_gain)
+  #   ④hedge_markers の共起 → 中立 1.0 へ(婉曲/逆接の曖昧文は関係の質に効かせない=保守側)
+  #   最後に [mag_min, mag_max] へ clamp。
+  # 文献: Altman & Taylor 1973(社会的浸透)/ Reis & Shaver 1988(親密さ=自己開示+応答性)/
+  #   Laurenceau, Barrett & Pietromonaco 1998 JPSP 74(5):1238-1251(開示の**深さ**と応答性が当日の
+  #   親密さを予測・事実より感情の開示が効く)。**正直な限界**: 文字数は「深さ」の代理にならない=
+  #   len_gain を最大加点にしない既定にとどめる。
+  # ★片方向 hook: magnitude は closeness の増減量にのみ入り、発火判定・会話ペアリング・tier 閾値の式・
+  #   誘い/承諾判定には一切流さない=会話数・LLM 呼数・イベント数・乱数消費は ON/OFF で不変
+  #   (magnitude が closeness の蓄積速度を変えて tier 遷移の**時期**を動かすのは treatment そのもの)。
+  # ON 時のみ L2 に quality_magnitude_mean(当日の会話由来 magnitude 平均)1列を出す。
+  # 要 relations.enabled=true(closeness が動く経路が前提)。実装 src/society/relations_endo.py。
+  endogenous_quality:
+    enabled: false              # ★実験 treatment 候補(フェーズ4=最終段。実装と実験実施は分離)
+    mag_min: 0.5                # clamp 下限(従来の半分より下げない)
+    mag_max: 2.0                # clamp 上限(従来の2倍より上げない)
+    len_chars: 60.0             # 発話長の正規化基準(この文字数で長さ由来の加点が満点)
+    len_gain: 0.5               # 発話長由来の最大加点(長さは開示の深さの代理にならない=控えめ)
+    turn_gain: 0.15             # 往復1回ごとの加点(応答性=Reis & Shaver 1988)
+    turn_max: 0.45              # 往復由来の加点上限(相手別バッファは最大4発話=3往復で到達)
+    cue_gain: 0.4               # 明示キュー(positive_cues)共起の加点(感情/意向の表出)
 
 # ---- 友人グラフ生成(関係性パッケージ完結 第45バッチ S-R2。ユーザー要望 2026-07-21。既定 OFF=現行挙動と完全同一)----
 # 現状の初期関係は「同建物の顔なじみ最大3人」のみ=地理的共在だけが源泉。本ブロックは起動時1回、居住者の
