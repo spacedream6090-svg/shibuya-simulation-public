@@ -1,7 +1,8 @@
 # publish_public_mirror.ps1 — 公開ミラー同期スクリプト
 #
 # 役割: ローカルの private リポジトリから「フィルタ済み公開ミラー」を再生成して公開リポへ push する。
-#   - 全履歴から公開不可 2 パスを除去(GPL 参照コード reference/2d-fire-sim/・主催メモ docs/AUTOMATA*)
+#   - 全履歴から公開不可パスを除去(GPL 参照コード reference/2d-fire-sim/・主催メモ docs/AUTOMATA*・
+#     他チーム分析 docs/research/hackathon1-analysis/)
 #   - コミット作者/コミッタのメールアドレスを GitHub noreply へ書換(公開側のみ。ローカルは不変)
 #   - ローカルの作業フォルダー・private リポは一切変更しない(一時 clone 上でのみ書換)
 #
@@ -37,16 +38,18 @@ Set-Content -Path $mailmap -Value "$oldName <$noreply> <$oldEmail>" -Encoding UT
 
 Push-Location $work
 try {
-    # 除去 2 パス: GPL-3.0 参照コード(本体未使用)と主催の非公開メモ。
+    # 除去パス: GPL-3.0 参照コード(本体未使用)・主催の非公開メモ・第1回ハッカソン他チーム分析
+    # (他チームの弱み分析を含むため非公開。ユーザー指示 2026-07-29)。
     # 日本語ファイル名をこのスクリプトに埋め込まないため docs/AUTOMATA* は glob で指定する。
     python -m git_filter_repo --invert-paths `
         --path reference/2d-fire-sim `
         --path-glob "docs/AUTOMATA*" `
+        --path docs/research/hackathon1-analysis `
         --mailmap $mailmap
     if ($LASTEXITCODE -ne 0) { throw "git filter-repo failed" }
 
     # 検証(push 前の機械チェック): 除去パスの残存ゼロ・旧メールの残存ゼロ
-    $leftPaths = (git log --all --name-only --format= ) -match '^(reference/|docs/AUTOMATA)'
+    $leftPaths = (git log --all --name-only --format= ) -match '^(reference/|docs/AUTOMATA|docs/research/hackathon1-analysis)'
     if ($leftPaths) { throw "excluded paths still present in mirror history: $($leftPaths -join ', ')" }
     $emails = (git log --all --format='%ae%n%ce' | Sort-Object -Unique)
     if ($emails -contains $oldEmail) { throw "old author email still present in mirror history" }
