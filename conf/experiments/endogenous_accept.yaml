@@ -19,6 +19,14 @@
 # 使い方:
 #   python scripts/run_experiment.py conf/experiments/endogenous_accept.yaml --dry-run
 #   python scripts/run_experiment.py conf/experiments/endogenous_accept.yaml
+#
+# ★P0バッチ 2026-07-29 の発見(未対応・実行前にユーザー判断が要る):
+#   profile の conf/daily.yaml は `world.calendar.start_date: "auto"`(= **実行当日**を初日にする)。
+#   そのため **別の日に走らせると曜日列が変わり、同じ seed でも結果が変わる**。実測: 第63バッチの
+#   endo7_kfree_eoff_s11(月曜開始)=6,507 呼 に対し、同一設定を 2026-07-29(水曜)に再走すると
+#   6,635 呼。スイープ**内**の全セルは同じ日に走るので条件間比較は成立するが、**スイープを跨ぐ比較
+#   (再走・追加 seed の後追い)は成立しない**。D17 本実験の前に
+#   `world.calendar.start_date: "2026-08-16"` のように**固定日を common に明示**することを推奨。
 name: endo14
 profile: conf/daily.yaml
 seeds: [11, 13, 17, 19, 23]
@@ -26,6 +34,17 @@ seeds: [11, 13, 17, 19, 23]
 common:
   run.n_agents: 100
   run.n_steps: 2016                       # 14日(1日=144step)
+  world.calendar.start_date: "2026-08-17" # ★検収補修 2026-07-29: daily.yaml の "auto"(実行当日開始)は
+                                          # 実行日で曜日列が変わり再走・後追い seed の比較を壊すため固定。
+                                          # 月曜開始=第63バッチ endo7 の実測(月曜)と曜日整合・本選週。
+  controls.mode: compute_matched          # ★P0バッチ 2026-07-29 追加(計算量交絡の是正)。
+                                          # k=off でも内省 LLM を実行して結果を捨てる
+                                          # (cognition/reflection.py の discard 経路)ため、
+                                          # k=off/degraded/free の **LLM 呼数が完全一致**する。
+                                          # 未指定(=基盤既定 none)で回した第63バッチ endo7 は
+                                          # k=off 5944 vs k=free 6507 = **9.5% 乖離**しており、
+                                          # 「k と計算量が交絡してはならない」不変条件を破っていた。
+                                          # 是正の実測は runs/endo8w_*(P0バッチ)を参照。
   joint.enabled: true                     # 共同行動(承諾抽選=treatment の座)
   relations.enabled: true                 # 関係台帳(daily で ON だが自己文書化のため明示)
   schedule.enabled: true                  # 予定帳簿(判定材料①=当日衝突/誘い主との予定)

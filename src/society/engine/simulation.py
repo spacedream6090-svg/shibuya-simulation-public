@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from pathlib import Path
 
 from omegaconf import DictConfig, OmegaConf
@@ -26,6 +27,61 @@ from ..world.transit import Transit
 from ..world import presence as presence_mod
 from ..world import pool as pool_mod
 from . import checkpoint, scheduler
+
+
+def _peak_rss_mb() -> float | None:
+    """このプロセスのピーク常駐メモリ [MB]。取得できない環境では None(= summary に出さない)。
+
+    P0バッチ 2026-07-29。**観測のみ・挙動に一切影響しない**。**真のピーク**を優先する取得順:
+      1) Windows 素の stdlib: psapi.GetProcessMemoryInfo の PeakWorkingSetSize(真のピーク)
+      2) POSIX 素の stdlib: resource.getrusage(RUSAGE_SELF).ru_maxrss(真のピーク。
+         Linux は KB / macOS は byte)— **本選機が Linux ならここが効く**
+      3) psutil(あれば)の rss = **現在値**であってピークではない(最後の手段・近似)
+    tracemalloc(scripts/bench.py が使う Python ヒープ峰値)とは別物で、
+    こちらは pyarrow 等の C++ バッファを含む **プロセス実メモリ**。
+    """
+    try:                                          # 1) Windows: psapi(stdlib ctypes のみ)
+        import ctypes
+        from ctypes import wintypes
+
+        class _PMC(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                        ("PeakWorkingSetSize", ctypes.c_size_t),
+                        ("WorkingSetSize", ctypes.c_size_t),
+                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                        ("PagefileUsage", ctypes.c_size_t),
+                        ("PeakPagefileUsage", ctypes.c_size_t)]
+        k32 = ctypes.WinDLL("kernel32")
+        psapi = ctypes.WinDLL("psapi")
+        # ★argtypes/restype を明示しないと 64bit で HANDLE が切り詰められ常に失敗する
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE,
+                                               ctypes.POINTER(_PMC), wintypes.DWORD]
+        psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+        counters = _PMC()
+        counters.cb = ctypes.sizeof(_PMC)
+        if psapi.GetProcessMemoryInfo(k32.GetCurrentProcess(),
+                                      ctypes.byref(counters), counters.cb):
+            return round(float(counters.PeakWorkingSetSize) / (1024 * 1024), 1)
+    except Exception:
+        pass
+    try:                                          # 2) POSIX(真のピーク)
+        import resource
+        import sys as _sys
+        ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        unit = 1024 * 1024 if _sys.platform == "darwin" else 1024    # macOS=byte / Linux=KB
+        return round(float(ru) / unit, 1)
+    except Exception:
+        pass
+    try:                                          # 3) psutil(現在値=近似。最後の手段)
+        import psutil                             # type: ignore
+        rss = getattr(psutil.Process().memory_info(), "rss", None)
+        return round(float(rss) / (1024 * 1024), 1) if rss else None
+    except Exception:
+        return None
 
 
 def _parse_start_tod(v) -> int:
@@ -63,6 +119,9 @@ def _natural_wake_step(start_tod: int, bedtime_min: int, sleep_steps: int) -> in
 
 class Simulation:
     def __init__(self, cfg: DictConfig, out_dir: Path | None = None):
+        # P0バッチ 2026-07-29: summary.json の elapsed_sec 用の起点(構築込み)。run() が
+        # ループ開始時に打ち直す。観測専用で挙動・乱数・出力イベントには一切影響しない。
+        self._t_start = time.perf_counter()
         self.cfg = cfg
         name = cfg.run.name or f"seed{cfg.run.seed}"
         self.out_dir = Path(out_dir) if out_dir else REPO_ROOT / str(cfg.run.out_dir) / str(name)
@@ -1227,6 +1286,9 @@ class Simulation:
         self._pool_update_budget()
 
     def run(self, resume_from: Path | str | None = None) -> dict:
+        # P0バッチ: elapsed_sec の起点を「run 開始」に打ち直す(構築時間を除く)。
+        # resume 時はこのチャンクの経過だけを測る(通算ではない)。
+        self._t_start = time.perf_counter()
         # D16: checkpoint_every>0 で該当 step ごとに完全状態を保存 + ログを part 化。
         # 既定 0 = 無効(part を作らず出力・挙動は従来と完全同一)。
         every = int(self.cfg.observer.get("checkpoint_every", 0) or 0)
@@ -1336,6 +1398,16 @@ class Simulation:
             "out_dir": str(self.out_dir),
             "files": {k: str(v) for k, v in paths.items()},
         }
+        # ---- P0バッチ 2026-07-29: 性能実測の追加キー(既存キーは一切不変)----
+        # elapsed_sec: run() 開始から finalize 直前までの wall time [s]。run() を経ずに
+        #   finalize() を直接呼ぶテスト経路では __init__ からの経過になる(その旨を承知で使う)。
+        #   resume したランでは「そのチャンクの経過」であって通算ではない。
+        # peak_rss_mb: プロセスのピーク常駐メモリ [MB]。取得できない環境ではキー自体を出さない
+        #   (欠測を 0 と偽らない)。tracemalloc の Python ヒープ峰値とは別物(C++ バッファ込み)。
+        summary["elapsed_sec"] = round(time.perf_counter() - self._t_start, 3)
+        peak_rss = _peak_rss_mb()
+        if peak_rss is not None:
+            summary["peak_rss_mb"] = peak_rss
         (self.out_dir / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         return summary

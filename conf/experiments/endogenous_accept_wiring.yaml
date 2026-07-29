@@ -1,18 +1,41 @@
-# endogenous_accept 配線検証(第63バッチ 2026-07-27 実行済み)= タスク指定の予備12ラン。
-# pilot との差分: 60体・seed2(6セル×2=12ラン)。mock で run_experiment→analyze_endo_treatment→
-# make_endo_report の一気通貫を検証する最小構成(実測時間は D17 の判断材料に記録)。
+# endogenous_accept 配線検証 = タスク指定の予備12ラン(6セル × seed2)。
+# pilot との差分: 60体・seed2。mock で run_experiment→analyze_endo_treatment→make_endo_report の
+# 一気通貫を検証する最小構成(実測時間は D17 の判断材料に記録)。
+#
+# 履歴:
+#   第63バッチ 2026-07-27  name: endo7 で実行(runs/endo7_*・約22分)。
+#     ★このときは controls.mode を指定しておらず基盤既定の `none` で回っていたため、
+#       k=off 5944 呼 vs k=free 6507 呼 = **9.5% 乖離**(= 自由度 k と計算量の交絡)。
+#       実査レポート §2.5 / §10.1(1)。runs/endo7_* は履歴として残す(消さない)。
+#   P0バッチ 2026-07-29  `controls.mode: compute_matched` を追加し name を endo8w にして再走。
+#     結果(runs/endo8w_index.json):
+#       - **構造的な偏りは消えた**。endo7(none)は 4 条件すべてで koff < kfree(平均 −5.50%・最大
+#         −8.65%)= 一方向の系統誤差だったが、endo8w では符号が混在(平均 −1.23%・最大 4.14%・
+#         seed13 eoff では koff > kfree)。残差は「内省の内容が違う→プロンプトが違う→mock の応答が
+#         違う→同席が違う→対面発火数が違う」という **treatment 由来の内生的な差**であって、
+#         装置由来の交絡ではない。
+#       - **装置由来の差はゼロになる**ことを別途 probe で確認済み: プロンプト非依存の固定応答 LLM
+#         (tests/test_career.py の _FixedLLM と同流儀)で回すと、compute_matched では
+#         koff == kfree == 1,199 呼で**完全一致**。none では 1,117 vs 1,199(差=内省の呼数そのもの)。
+#         → `controls.mode=compute_matched` は目的どおり機能している。**mock/実 LLM で完全一致を
+#         期待してはいけない**(応答がプロンプト依存だから)。
+#     ★注意: profile の daily.yaml は `world.calendar.start_date: "auto"`(実行当日)なので、
+#       endo7(月曜開始)と endo8w(水曜開始)は暦が違う。両者の絶対値の比較は無意味で、
+#       比較してよいのは**同一スイープ内の条件間差**だけ。
 #
 #   python scripts/run_experiment.py conf/experiments/endogenous_accept_wiring.yaml
-#   python scripts/analyze_endo_treatment.py "runs/endo7_*" --out runs/_endo7
-#   python scripts/make_endo_report.py runs/_endo7
-name: endo7
+#   python scripts/analyze_endo_treatment.py "runs/endo8w_*" --out runs/_endo8w
+#   python scripts/make_endo_report.py runs/_endo8w
+name: endo8w
 profile: conf/daily.yaml
 seeds: [11, 13]
 
 common:
   run.n_agents: 60
   run.n_steps: 1008                       # 7日(1日=144step)
+  world.calendar.start_date: "2026-08-17" # ★検収補修 2026-07-29: 実行日依存の排除(以後の再走は同暦で比較可)
   model.backend: mock                     # 配線検証=mock(実 LLM 禁止)
+  controls.mode: compute_matched          # ★計算量交絡の是正(k=off でも内省呼びを実行して捨てる)
   joint.enabled: true
   relations.enabled: true
   schedule.enabled: true

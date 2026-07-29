@@ -15,6 +15,9 @@ seeds: [11, 13, 17]
 common:
   run.n_agents: 100
   run.n_steps: 1008                       # 7日(1日=144step)
+  world.calendar.start_date: "2026-08-17" # ★検収補修 2026-07-29: 実行日依存の排除(本体 yaml と同じ理由)
+  controls.mode: compute_matched          # ★P0バッチ 2026-07-29 追加。本体 yaml と同じ理由
+                                          # (k=off/degraded/free の LLM 呼数を一致させる)。
   model.backend: mock                     # 予備=mock 固定(実 LLM 禁止の検証プロファイル)
   joint.enabled: true
   relations.enabled: true

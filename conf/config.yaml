@@ -693,7 +693,12 @@ transit:
 
 lod:
   max_llm_per_step: 300         # LLM 発火の step 上限(実機実測で更新)
-  congestion_surprise: 0.5      # 混雑係数がこれ未満なら「驚き」
+                                # ★注意: この上限がかかるのは _phase_drive の発火 2 箇所と返答保証の
+                                # 計 3 箇所(scheduler.py の budget.take())のみ。**朝の計画と夜の内省は
+                                # 予算外の無条件呼び出し**=日次総呼数はこの値では拘束しきれない
+                                # (実測 14〜25 呼/agent/日。docs/research/finals-llm-budget.md)。
+  # (削除) congestion_surprise: 驚きゲートは 2026-07-04 に欲求駆動発火へ移行して消滅し、
+  #         このキーを読むコードは存在しなかった(死んだキー。第P0バッチ 2026-07-29 に削除)。
   # ---- 予算のN比例化(P2-S6a・既定OFF=バイト一致)。docs/plans/million-scale.md §2.3 ----
   # 全員思考の「200体相当の思考密度をNに比例して維持」: ON で step 上限を
   # ceil(density × run.n_agents) に置換(固定 max_llm_per_step は使わない)。
@@ -1168,6 +1173,18 @@ observer:
   y_weights: null               # Y外部(世界改変量)の4層合成重み。既定 null=合成せず列を出すのみ。
                                 # ★合成式は B段でユーザーと決定(analyze 側で使用)。例:
                                 # y_weights: { spatial: 1.0, resource: 1.0, symbolic: 1.0, network: 1.0 }
+  # ---- LLM 健全性 KPI(P0バッチ 2026-07-29・既定 OFF=L2 列なし=既存ランとバイト一致)----
+  # ON で L2 に 3 列(llm_calls_total / llm_fallback_rate / llm_cache_hit_rate)を毎 step 追加する。
+  # 読むだけ・乱数ゼロ・LLM 呼ゼロ・イベント追加ゼロ(R1: 機構は k を読まない)。
+  # 値はランのプロセス開始からの**累積**(CachedLLM.calls/hits と ObserverLogger のカウンタ)なので
+  # **resume すると 0 から数え直す**(= resume 前後で L2 バイト一致にならない)。既定 OFF はこの
+  # 性質が既存の resume バイト一致テストと衝突しないための選択。本選 10 日ランでは ON にして
+  # scripts/watchdog.py --fallback-warn の監視対象にする。
+  # llm_fallback_rate の定義と正直な限界は observer/aggregate.py の該当ブロックを参照
+  # (分子 = L1 `fallback` イベント = 発話系のパース失敗のみ。plan の再試行・reflect の空応答は
+  #  別イベントを持たないので分子に入らない=真のパース失敗率の下限)。
+  llm_health:
+    enabled: false
 
 # ============================================================
 # 第6バッチ(ユーザー要望 2026-07-06)。すべて既定 OFF=現行挙動と完全同一。

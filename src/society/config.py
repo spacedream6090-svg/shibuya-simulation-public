@@ -28,7 +28,7 @@ _INT_KEYS = [
 ]
 _FLOAT_KEYS = [
     "world.walk_speed_m_per_step", "world.perception_radius_m",
-    "lod.congestion_surprise", "k.degraded_alpha", "model.temperature",
+    "k.degraded_alpha", "model.temperature",
     "rewards.amount_per_adoption",          # D9: 採用1件あたりの報酬額
     "drive.slope",                          # logistic 発火のシャープさ(B段 seam)
     "opinion.w_face", "opinion.w_dm", "opinion.w_sns",  # FJ 意見更新の説得重み(#16)

@@ -829,6 +829,80 @@ def _n_indoor_meeting(sim):
     return _indoor_col(sim, "_indoor_n_meeting")
 
 
+# ---- LLM 健全性 KPI(P0バッチ 2026-07-29・既定 OFF)。observer.llm_health.enabled=false は
+#      全て None=列なし=L2 不変(gossip/endo/indoor 列と同型)。読むだけ・乱数ゼロ・LLM 呼ゼロ。
+#
+# 3 列(すべて**ラン開始からの累積**。per-step 差分ではない):
+#   llm_calls_total    … CachedLLM/RouterLLM の calls(summary.json の llm_calls と同じ源)
+#   llm_cache_hit_rate … hits / calls(mock リプレイや同一プロンプト再発で上がる)
+#   llm_fallback_rate  … L1 `fallback` イベント数 / llm_calls_total
+#
+# ★llm_fallback_rate の正直な限界(実装可能な範囲の代理指標である旨):
+#   - 分子は L1 kind="fallback"(payload.reason="parse_error")で、これを出すのは
+#     scheduler の発話系 1 箇所だけ = **発話・熟考のパース失敗しか数えない**。
+#   - 朝の計画は「決定論修復 → 再試行(purpose="plan_retry")→ 前日流用 → 既定骨格」の
+#     失敗の階段を持ち、`fallback` イベントを出さない。夜の内省も空応答時に無言で退行する。
+#     したがって本列は**真のパース失敗率の下限**であり、上振れは検知できるが下振れは保証しない。
+#   - 分母は「発話系の呼数」ではなく総呼数(plan/reflect/recall/null を含む)なので、
+#     purpose 構成が変わると同じ失敗率でも値が動く。**条件間の絶対比較には使わず、
+#     同一構成のラン内の時系列監視(急増の検知)に使う**のが正しい用法。
+#   - 実 LLM 側の HTTP エラーは backend が "__*_error__" 文字列を返し、パースに失敗して
+#     `fallback` になるので分子に入る(mock では発生しない)。
+def _llm_health_on(sim) -> bool:
+    cfg = getattr(sim, "cfg", None)
+    if cfg is None:
+        return False
+    try:
+        obs = cfg.observer
+        block = obs.get("llm_health", None) if hasattr(obs, "get") else None
+    except Exception:
+        return False
+    if block is None:
+        return False
+    enabled = block.get("enabled", False) if hasattr(block, "get") else False
+    return bool(enabled)
+
+
+def _llm_totals(sim):
+    """(calls, hits, fallbacks) を返す。llm_health OFF / 取得不能なら None。"""
+    if not _llm_health_on(sim):
+        return None
+    llm = getattr(sim, "llm", None)
+    logger = getattr(sim, "logger", None)
+    if logger is None:
+        return None
+    calls = getattr(llm, "calls", None)
+    hits = getattr(llm, "hits", None)
+    if calls is None:                     # 呼数カウンタを持たない backend(素の LLMBackend)
+        calls = getattr(logger, "n_llm_rows", 0)
+        hits = getattr(logger, "n_llm_cached", 0)
+    return int(calls), int(hits or 0), int(getattr(logger, "n_fallback_events", 0))
+
+
+@register_aggregator("llm_calls_total")
+def _llm_calls_total(sim):
+    t = _llm_totals(sim)
+    return None if t is None else t[0]
+
+
+@register_aggregator("llm_cache_hit_rate")
+def _llm_cache_hit_rate(sim):
+    t = _llm_totals(sim)
+    if t is None:
+        return None
+    calls, hits, _ = t
+    return round(hits / calls, 6) if calls else 0.0
+
+
+@register_aggregator("llm_fallback_rate")
+def _llm_fallback_rate(sim):
+    t = _llm_totals(sim)
+    if t is None:
+        return None
+    calls, _, fb = t
+    return round(fb / calls, 6) if calls else 0.0
+
+
 def collect(sim) -> dict:
     """全 aggregator を回して L2 の1行を作る。**None を返した列は出さない**(既定 OFF の
     プラグイン列を OFF 時に完全に不在化=L2 不変)。既存 aggregator は None を返さないので

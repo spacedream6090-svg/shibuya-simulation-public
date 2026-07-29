@@ -27,13 +27,24 @@ checkpoint / resume(D16)はエンジン側に実装済み。本モジュール�
 - **バックアップ**: checkpoint が進むたび(または `--backup-every-min`)、checkpoint/ +
   config.yaml + l1 parts を `--backup-dir`(既定 `<run-dir>_backup`)へ世代コピー(直近3世代)。
 
+LLM 健全性の監視(P0バッチ 2026-07-29 追加)
+------------------------------------------
+- ラン中に `l2_metrics(.part-*).parquet` の最新行の **`llm_fallback_rate`** を定期的に読み、
+  `--fallback-warn`(既定 0.20)を超えたら watchdog.log と status.json に警告を出す。
+- **警告のみ。プロセスは絶対に止めない**(パース失敗が増えても観察ランは続ける方が損失が小さい)。
+- 列が無い(= `observer.llm_health.enabled=false` で回している)場合は起動後 1 回だけ
+  「監視不能」を記録する。pyarrow が無い環境でも 1 回記録して監視を諦める(watchdog 本体の
+  stdlib 限定方針を壊さないため import は関数内・失敗許容)。
+- 事後(ラン終了後)の点検は `python scripts/watchdog_llm.py <run-dir>` を使う。
+
 記録
 ----
 - `<run-dir>/watchdog.log`: タイムスタンプ付きの全アクション。
-- `<run-dir>/status.json`: {state, restarts, last_progress, ...}。
+- `<run-dir>/status.json`: {state, restarts, last_progress, llm_health, ...}。
 - `<run-dir>/run.out.log`: 子プロセスの stdout/stderr(障害解析用)。
 
-Windows 対応・標準ライブラリのみ(society を import しない)。
+Windows 対応・標準ライブラリのみ(society を import しない。pyarrow だけは
+LLM 健全性監視のために関数内で任意 import し、無ければ監視を諦める)。
 """
 from __future__ import annotations
 
@@ -88,6 +99,13 @@ class Watchdog:
         self.backup_every_sec = (float(args.backup_every_min) * 60.0
                                  if args.backup_every_min else 0.0)
         self.keep_gens = int(args.keep_backups)
+        # ---- LLM 健全性監視(P0バッチ)----
+        self.fallback_warn = float(getattr(args, "fallback_warn", 0.20) or 0.0)
+        self.health_check_sec = float(getattr(args, "health_check_min", 10.0)) * 60.0
+        self._health_next_t = 0.0
+        self._health_unavailable_logged = False
+        self._health_warned = False
+        self.last_health: dict | None = None
 
         # --- 監督状態 ---
         self.restarts = 0
@@ -124,6 +142,8 @@ class Watchdog:
             "pid": pid,
             "updated": _now_iso(),
         }
+        if self.last_health is not None:      # P0バッチ: 直近の LLM 健全性(監視できたときのみ)
+            data["llm_health"] = self.last_health
         tmp = self.status_path.with_name(self.status_path.name + ".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
                        encoding="utf-8")
@@ -181,6 +201,70 @@ class Watchdog:
         parts = sorted(self.run_dir.glob(PART_GLOB))
         pmtime = max((p.stat().st_mtime for p in parts), default=0.0)
         return (ck, len(parts), round(pmtime, 3))
+
+    # ------------------------------------------------------------------ #
+    # LLM 健全性の監視(P0バッチ 2026-07-29。警告のみ・プロセスは止めない)
+    # ------------------------------------------------------------------ #
+    def read_llm_health(self) -> dict | None:
+        """run-dir の L2 から最新の LLM 健全性 3 列を読む。読めなければ None。
+
+        探索順は「最も新しい part → canonical」。observer.llm_health.enabled=false の
+        ランには列が無いので None を返す(捏造しない)。pyarrow が無い環境でも None。
+        """
+        try:
+            import pyarrow.parquet as pq          # 任意 import(stdlib 限定方針の例外)
+        except Exception:
+            return None
+        cands = sorted(self.run_dir.glob("l2_metrics.part-*.parquet"))
+        canonical = self.run_dir / "l2_metrics.parquet"
+        if canonical.exists():
+            cands.append(canonical)
+        for path in reversed(cands):
+            try:
+                tbl = pq.read_table(path)
+            except Exception:
+                continue
+            cols = set(tbl.column_names)
+            if not {"llm_calls_total", "llm_fallback_rate"} <= cols:
+                continue
+            if tbl.num_rows == 0:
+                continue
+            last = tbl.slice(tbl.num_rows - 1, 1).to_pylist()[0]
+            return {
+                "step": last.get("step"),
+                "llm_calls_total": last.get("llm_calls_total"),
+                "llm_fallback_rate": last.get("llm_fallback_rate"),
+                "llm_cache_hit_rate": last.get("llm_cache_hit_rate"),
+                "source": path.name,
+            }
+        return None
+
+    def _maybe_check_llm_health(self, now: float) -> None:
+        if self.fallback_warn <= 0.0 or now < self._health_next_t:
+            return
+        self._health_next_t = now + max(self.health_check_sec, 30.0)
+        health = self.read_llm_health()
+        if health is None:
+            if not self._health_unavailable_logged:
+                self._health_unavailable_logged = True
+                self.log("LLM 健全性を監視できない(L2 に llm_fallback_rate 列が無い"
+                         " or pyarrow 不在)。observer.llm_health.enabled=true で回すと"
+                         "監視できる", echo=False)
+            return
+        self.last_health = health
+        rate = health.get("llm_fallback_rate")
+        if rate is None:
+            return
+        if float(rate) > self.fallback_warn:
+            self.log(f"WARN llm_fallback_rate={float(rate):.4f} > "
+                     f"{self.fallback_warn:.4f} (step={health.get('step')}, "
+                     f"calls={health.get('llm_calls_total')}) — "
+                     "モデル/プロンプト/バックエンドの点検を推奨(ランは継続する)")
+            self._health_warned = True
+        elif self._health_warned:                 # 復帰も記録する(閾値を跨ぎ直したとき)
+            self._health_warned = False
+            self.log(f"llm_fallback_rate が閾値以下へ復帰: {float(rate):.4f} "
+                     f"(step={health.get('step')})", echo=False)
 
     # ------------------------------------------------------------------ #
     # バックアップ(世代管理)
@@ -385,6 +469,7 @@ class Watchdog:
                       and (now - pending_since) >= self.poll_sec):
                     self._maybe_backup(pending_step)
                     pending_step = None
+                self._maybe_check_llm_health(now)   # P0バッチ: 警告のみ(kill しない)
 
             uptime = time.monotonic() - start
 
@@ -510,6 +595,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="時間ベースの追加バックアップ間隔・分(0=checkpoint 進捗ごとのみ)")
     p.add_argument("--keep-backups", type=int, default=3,
                    help="保持するバックアップ世代数(既定3)")
+    p.add_argument("--fallback-warn", type=float, default=0.20,
+                   help="L2 の llm_fallback_rate がこれを超えたら警告(既定0.20・0=監視しない)。"
+                        "警告のみでランは止めない。observer.llm_health.enabled=true が前提")
+    p.add_argument("--health-check-min", type=float, default=10.0,
+                   help="LLM 健全性の点検間隔・分(既定10。最小30秒)")
     p.add_argument("--cmd", default=None,
                    help="テスト用フック: 起動する基底コマンドを上書き"
                         "(既定は `python scripts/run.py`)")

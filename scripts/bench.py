@@ -7,6 +7,18 @@
   python scripts/bench.py                               # --agents 10 40 80 --steps 60 --seed 42
   python scripts/bench.py --agents 10 50 --steps 30
 
+  # 1') N 掃引 + 既存ランの再集計(P0バッチ 2026-07-29)
+  python scripts/bench.py --agents 10 40 80 100 300 1000 --steps 144 \
+      --out-name bench_scaling --run-out runs/_bench/p0 \
+      --include-runs "runs/_bench/n10" "runs/_bench/n40" runs/rehearsal_pool10k
+    * --out-name  出力 stem を引数化(既定 bench)。.json と .md を同時に出す。
+    * ★既存の <stem>.json は**上書きしない**(タイムスタンプ付きの別名に退避して警告)。
+      --overwrite で従来どおり上書き。2026-07-15 に 3体×3step のスモークが bench.json を潰して
+      N スケーリング実測を失った事故の再発防止。
+    * --run-out   ベンチランの出力先を --out と分ける(過去のベンチラン dir を守る)。
+    * --include-runs  既存 run dir の summary.json を再集計して表に混ぜる(読むだけ・新規ランなし)。
+      wall time を持たない世代のランは wall_s=null のまま残す(欠測を捏造しない)。
+
   # 2) LOD スループット計測(M4・新規): purpose(tier)別に実 LLM を数十呼して
   #    tok/s・呼数・fallback率・平均応答長を1表に。ollama は eval_count で真の tok/s を測る。
   python scripts/bench.py --lod --model qwen3:4b --calls 4
@@ -96,10 +108,81 @@ def bench_one(n_agents: int, steps: int, seed: int, out_root: Path,
                               if steps and n_agents else None),
         "llm_calls": llm_calls,
         "llm_per_step": round(llm_calls / steps, 2) if steps else None,
+        "llm_per_agent_day": _per_agent_day(llm_calls, n_agents, steps),
         "peak_mem_mb": round(peak / (1024 * 1024), 2),
+        # P0バッチ 2026-07-29: summary.json の新キー(プロセス実メモリ/シム側 wall)。
+        # peak_mem_mb(tracemalloc=Python ヒープ)と違い pyarrow の C++ バッファを含む。
+        "peak_rss_mb": summary.get("peak_rss_mb"),
+        "summary_elapsed_s": summary.get("elapsed_sec"),
         "n_events": n_events,
         "events_per_step": round(n_events / steps, 1) if steps else None,
+        "events_per_agent_day": _per_agent_day(n_events, n_agents, steps),
+        "source": "fresh",
     }
+
+
+def _per_agent_day(total: int, n_agents: int, steps: int, steps_per_day: int = 144):
+    """総数 → 1エージェント1シミュ日あたり(144 step=1日)。分母 0 なら None。"""
+    denom = n_agents * (steps / float(steps_per_day))
+    return round(total / denom, 2) if denom > 0 else None
+
+
+def rows_from_existing_runs(run_dirs: list[Path]) -> list[dict]:
+    """既存 run dir の summary.json を再集計して行にする(**新規ランを走らせない**)。
+
+    P0バッチ 2026-07-29。runs/_bench/n10 等の過去ランや runs/rehearsal_pool10k のような
+    大規模ランの実測点を、スケーリング表に**出典つきで**取り込むための読み取り専用モード。
+    古いランには wall time が無い(summary に elapsed_sec が入ったのは P0 バッチ以降)ので
+    wall_s=None のまま残し、**欠測を捏造しない**。
+    """
+    out: list[dict] = []
+    for d in run_dirs:
+        sp = d / "summary.json"
+        if not sp.exists():
+            print(f"[bench] summary.json が無いのでスキップ: {d}", file=sys.stderr)
+            continue
+        s = json.loads(sp.read_text(encoding="utf-8"))
+        n_agents = int(s.get("n_agents", 0))
+        steps = int(s.get("n_steps", 0))
+        llm_calls = int(s.get("llm_calls", 0))
+        n_events = int(s.get("n_events", 0))
+        wall = s.get("elapsed_sec")
+        out.append({
+            "agents": n_agents, "steps": steps, "seed": None,
+            "wall_s": wall,
+            "ms_per_step": (round(1000.0 * wall / steps, 3)
+                            if wall and steps else None),
+            "ms_per_agent_step": (round(1000.0 * wall / (steps * n_agents), 4)
+                                  if wall and steps and n_agents else None),
+            "llm_calls": llm_calls,
+            "llm_per_step": round(llm_calls / steps, 2) if steps else None,
+            "llm_per_agent_day": _per_agent_day(llm_calls, n_agents, steps),
+            "peak_mem_mb": None,
+            "peak_rss_mb": s.get("peak_rss_mb"),
+            "summary_elapsed_s": wall,
+            "n_events": n_events,
+            "events_per_step": round(n_events / steps, 1) if steps else None,
+            "events_per_agent_day": _per_agent_day(n_events, n_agents, steps),
+            "source": f"existing:{d.name}",
+        })
+    return out
+
+
+def resolve_out_paths(out_root: Path, stem: str, overwrite: bool) -> tuple[Path, Path]:
+    """(json, md) の出力先を決める。**既存ファイルは既定で上書きしない**。
+
+    P0バッチ 2026-07-29 の再発防止: 2026-07-15 に 3体×3step のスモークが
+    runs/_bench/bench.json を上書きし、N スケーリング曲線の実測が失われた
+    (実査レポート §2.6)。以後、同名が既に在るときは自動でタイムスタンプ付きの
+    別名に退避し、標準エラーに警告を出す(--overwrite で従来どおり上書き)。
+    """
+    js, md = out_root / f"{stem}.json", out_root / f"{stem}.md"
+    if js.exists() and not overwrite:
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        js, md = out_root / f"{stem}-{ts}.json", out_root / f"{stem}-{ts}.md"
+        print(f"[bench] {stem}.json は既存のため上書きせず {js.name} に書く"
+              f"(上書きしたいときは --overwrite)", file=sys.stderr)
+    return js, md
 
 
 def _markdown_table(rows: list[dict]) -> str:
@@ -107,8 +190,10 @@ def _markdown_table(rows: list[dict]) -> str:
         ("agents", "agents"), ("steps", "steps"), ("wall_s", "wall(s)"),
         ("ms_per_step", "ms/step"), ("ms_per_agent_step", "ms/agent-step"),
         ("llm_calls", "llm_calls"), ("llm_per_step", "llm/step"),
-        ("peak_mem_mb", "peak_mem(MB)"), ("n_events", "events"),
-        ("events_per_step", "events/step"),
+        ("llm_per_agent_day", "llm/agent-day"),
+        ("peak_mem_mb", "peak_heap(MB)"), ("peak_rss_mb", "peak_rss(MB)"),
+        ("n_events", "events"), ("events_per_step", "events/step"),
+        ("events_per_agent_day", "events/agent-day"), ("source", "source"),
     ]
     head = "| " + " | ".join(h for _, h in cols) + " |"
     sep = "|" + "|".join("---:" for _ in cols) + "|"
@@ -118,10 +203,26 @@ def _markdown_table(rows: list[dict]) -> str:
 
 def _run_scaling(args, out_root: Path) -> None:
     rows: list[dict] = []
+    # 既存ランの再集計(読み取り専用。--include-runs "runs/_bench/n10" 等)を先に置く
+    include: list[Path] = []
+    for pat in (args.include_runs or []):
+        for p in sorted(_glob.glob(pat)):
+            pp = Path(p)
+            if pp.is_dir():
+                include.append(pp)
+    if include:
+        rows += rows_from_existing_runs(include)
+
+    # ラン出力先は --run-out で分けられる(既定は --out と同じ=従来どおり)。
+    # 過去のベンチラン(runs/_bench/n10 等)を上書きせずに新しい掃引を回すための seam。
+    run_root = Path(args.run_out) if args.run_out else out_root
+    if not run_root.is_absolute():
+        run_root = REPO_ROOT / run_root
+    run_root.mkdir(parents=True, exist_ok=True)
     for n in args.agents:
         print(f"[bench] running n_agents={n}, steps={args.steps}, "
               f"backend={args.backend} ...", file=sys.stderr, flush=True)
-        rows.append(bench_one(n, args.steps, args.seed, out_root,
+        rows.append(bench_one(n, args.steps, args.seed, run_root,
                               backend=args.backend, servers=args.servers))
 
     table = _markdown_table(rows)
@@ -129,16 +230,23 @@ def _run_scaling(args, out_root: Path) -> None:
         "meta": {
             "backend": args.backend, "cache": False, "steps": args.steps,
             "seed": args.seed, "agents": args.agents,
-            "note": ("wall = time.perf_counter; peak_mem = tracemalloc Python heap "
-                     "peak (excl. pyarrow C++ buffers); Windows なので resource 不使用。"),
+            "included_runs": [str(p) for p in include],
+            "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "note": ("wall = time.perf_counter; peak_heap = tracemalloc の Python ヒープ峰値"
+                     "(pyarrow の C++ バッファを含まない); peak_rss = プロセスのピーク常駐"
+                     "メモリ(summary.json の peak_rss_mb・P0バッチで追加。取得不能なら null); "
+                     "source=existing:<dir> の行は既存ランの summary.json の再集計で、"
+                     "wall time が記録されていない世代のランは wall_s=null(欠測を捏造しない)。"),
         },
         "rows": rows,
     }
-    (out_root / "bench.json").write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    js, md = resolve_out_paths(out_root, args.out_name, args.overwrite)
+    js.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    md.write_text(f"# {args.out_name}\n\n生成: {payload['meta']['generated']}\n\n"
+                  f"{table}\n\n注記: {payload['meta']['note']}\n", encoding="utf-8")
 
     print("\n" + table + "\n")
-    print(f"[bench] wrote {out_root / 'bench.json'}")
+    print(f"[bench] wrote {js} / {md}")
 
 
 # =============================================================================
@@ -609,6 +717,18 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=60)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out", default="runs/_bench")
+    ap.add_argument("--out-name", default="bench",
+                    help="スケーリング出力の stem(既定 bench → bench.json/bench.md)。"
+                         "例: --out-name bench_scaling")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="既存の <out-name>.json を上書きする(既定は上書きせず "
+                         "タイムスタンプ付きの別名に退避=実測の喪失防止)")
+    ap.add_argument("--run-out", default=None,
+                    help="ベンチランの出力先(既定は --out と同じ)。過去のベンチラン"
+                         "(runs/_bench/n10 等)を上書きしたくないときに分ける")
+    ap.add_argument("--include-runs", nargs="*", default=None,
+                    help="既存 run dir の summary.json を再集計して表に含める"
+                         '(例: --include-runs "runs/_bench/n[0-9]*" runs/rehearsal_pool10k)')
     ap.add_argument("--backend", default="mock",
                     help="mock | ollama | vllm(本選)。vllm は --servers 必須。")
     ap.add_argument("--servers", nargs="*", default=None,

@@ -3,9 +3,15 @@
 使い方:  python scripts/export_3d.py runs/<name> [--map data/shibuya_osm.json]
                                   [--sample-agents N] [--step-stride K]
                                   [--plateau] [--plateau-dir data/plateau]
-                                  [--rich-tracks]
+                                  [--rich-tracks] [--low-mem]
   --sample-agents N : tracks の対象を先頭 N エージェントに間引く(大規模ランの LOD 出力)。
   --step-stride K   : K step ごとに1フレームだけ出力する(時間ダウンサンプル)。
+  --low-mem         : L1 を row group 単位でストリーム読みし、tracks 再構成が実際に使う
+                      7 列 × 13 kind だけを Python へ持ち上げる(既定は 9 列全行を
+                      to_pylist() で全展開)。**出力はバイト同一**(下記 load_track_events)。
+                      1万体×1日(16.2M イベント・L1 167MiB)の実測で
+                      プロセスピーク RSS 13.3GB → 2.0GB・所要 84.8s → 12.8s。
+                      10日ランのように L1 が GB 級のときに使う。既定 OFF=従来経路そのまま。
   --plateau         : PLATEAU 実形状(plateau_extract/match_plateau の成果物)で、照合済み建物を
                       実測メッシュに置換する(glb ハイブリッド+scene.json height 上書き+
                       viewer3d 用 plateau_web.json)。既定 OFF=従来出力とバイト同一。
@@ -569,10 +575,75 @@ def build_scene(city: dict, buildings: list) -> dict:
     }
 
 
+# ------------------------------------------------------------------ L1 の省メモリ読み
+# reconstruct_tracks が実際に「読む」列と kind。ここに無い列/kind は tracks.json に一切影響しない。
+#   列: e["step"] / e["agent_id"] / e["kind"] / e["x"] / e["y"] / e["payload"] / e.get("sim_min")
+#       (L1 の rng_stream・llm_call_id は本関数から参照されない)
+#   kind: 下の集合以外は for ループの全分岐から外れるので cur/mv/tr_step を変えない。
+#         "ride" は --rich-tracks のタクシー振替でのみ使うが、既定でも読み込みだけはしておく
+#         (ride は本ループのどの分岐にも当たらないので既定出力は不変)。
+TRACK_COLUMNS = ("step", "sim_min", "agent_id", "kind", "x", "y", "payload")
+TRACK_KINDS = ("arrive", "enter_area", "enter_building", "exit_area", "exit_building",
+               "floor_move", "move_segment", "reflect", "ride", "sleep_start",
+               "speak", "traffic_flow", "wake_up")
+
+
+def load_track_events(parquet_path: Path,
+                      columns: tuple = TRACK_COLUMNS,
+                      kinds: tuple = TRACK_KINDS) -> tuple[list, dict]:
+    """L1 を row group 単位でストリーム読みし、tracks 再構成に要る行だけ Python へ持ち上げる。
+
+    `pq.read_table(...).to_pylist()` は全行を dict 化するため L1 のサイズに比例して RAM を食う
+    (実測 790 B/row = 16.2M イベントで約 12GB)。本関数は
+      (a) 列を TRACK_COLUMNS に射影し、
+      (b) 行を TRACK_KINDS に絞り(1万体1日ランでは 3.40% しか残らない)、
+      (c) 落とした行にしか無い情報 —— n_steps・step ごとの sim_min・全 agent_id ——
+          を Arrow/numpy 側(Python オブジェクト化せず)で先に集計して override として返す。
+    (c) があるので **戻り値で reconstruct_tracks を呼ぶと全件 to_pylist() と tracks.json が
+    バイト同一**になる。順序も row group 順 = ファイル順で保存される。
+
+    戻り値: (events, overrides)。overrides は reconstruct_tracks の *_override 引数へそのまま渡す。
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    pf = pq.ParquetFile(parquet_path)
+    value_set = pa.array(sorted(set(kinds)), type=pa.string())
+    events: list = []
+    max_step = -1
+    step_min: dict[int, int] = {}
+    agent_ids: set = set()
+    for i in range(pf.metadata.num_row_groups):
+        tbl = pf.read_row_group(i, columns=list(columns))
+        if tbl.num_rows == 0:
+            continue
+        st = tbl.column("step").to_numpy(zero_copy_only=False)
+        max_step = max(max_step, int(st.max()))
+        # step ごとの「最初の非 null sim_min」= 全件版 step_min.setdefault(...) と同一
+        sm = tbl.column("sim_min").to_numpy(zero_copy_only=False)
+        ok = ~np.isnan(sm) if sm.dtype.kind == "f" else np.ones(len(sm), dtype=bool)
+        if ok.any():
+            st_ok, sm_ok = st[ok], sm[ok]
+            uniq, first = np.unique(st_ok, return_index=True)   # return_index は最初の出現
+            for s, j in zip(uniq.tolist(), first.tolist()):
+                step_min.setdefault(int(s), int(sm_ok[j]))
+        aid = np.unique(tbl.column("agent_id").to_numpy(zero_copy_only=False))
+        agent_ids.update(int(a) for a in aid.tolist() if a >= 0)
+        events.extend(tbl.filter(pc.is_in(tbl.column("kind"), value_set=value_set)).to_pylist())
+        del tbl
+    return events, {"n_steps_override": max_step + 1,
+                    "step_min_override": step_min,
+                    "agent_ids_override": sorted(agent_ids)}
+
+
 # ------------------------------------------------------------------ tracks.json
 def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
                        sample_agents: int | None = None,
-                       step_stride: int = 1, rich_tracks: bool = False) -> dict:
+                       step_stride: int = 1, rich_tracks: bool = False,
+                       n_steps_override: int | None = None,
+                       step_min_override: dict | None = None,
+                       agent_ids_override: list | None = None) -> dict:
     """viz/make_viewer.py build_data の位置再構成を移植・整理。
     positions[step][i] = [x, y, w]  (w: 0=路上 -1=範囲外 -2=睡眠 1000+bIdx*100+floor=屋内)
     moves[step][i] = [mode, pts] または None,  traffic[step] = {n, segs}
@@ -584,11 +655,17 @@ def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
     rich_tracks(--rich-tracks・既定 OFF=現行とバイト同一):
     - moves の mode に 3=タクシー を追加(ride イベントと同一 agent×step の car 区間を振替)。
     - positions の w に -3=電車で圏外 を追加(exit_area payload via=="train" のとき)。
-    - meta に mode_legend / away_train を追加。"""
-    n_steps = max((e["step"] for e in events), default=-1) + 1
+    - meta に mode_legend / away_train を追加。
+
+    *_override(--low-mem 経路・既定 None=従来どおり events から算出):
+    load_track_events が「間引きで落とした行にしか無い情報」を先に集計して渡すための口。
+    None のときは一切参照されないので、既定経路は従来とバイト同一。"""
+    n_steps = (max((e["step"] for e in events), default=-1) + 1
+               if n_steps_override is None else int(n_steps_override))
     bld_idx = {b["id"]: i for i, b in enumerate(buildings)}
 
-    agent_ids = sorted({e["agent_id"] for e in events if e["agent_id"] >= 0})
+    agent_ids = (sorted({e["agent_id"] for e in events if e["agent_id"] >= 0})
+                 if agent_ids_override is None else list(agent_ids_override))
     if agents_meta:
         idx = {a["id"]: i for i, a in enumerate(agents_meta)}
         agent_ids = [a["id"] for a in agents_meta]
@@ -604,9 +681,12 @@ def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
     stride = max(1, int(step_stride or 1))
 
     by_step: dict[int, list[dict]] = defaultdict(list)
-    step_min: dict[int, int] = {}
+    step_min: dict[int, int] = ({} if step_min_override is None
+                                else {int(k): int(v) for k, v in step_min_override.items()})
     for e in events:
         by_step[e["step"]].append(e)
+        if step_min_override is not None:
+            continue
         sm = e.get("sim_min")
         if sm is not None:
             step_min.setdefault(e["step"], int(sm))
@@ -709,10 +789,15 @@ def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
 # ------------------------------------------------------------------ top-level
 def export_run(run_dir: Path, map_path: Path | None = None,
                sample_agents: int | None = None, step_stride: int = 1,
-               plateau_dir: Path | None = None, rich_tracks: bool = False) -> dict:
+               plateau_dir: Path | None = None, rich_tracks: bool = False,
+               low_mem: bool = False) -> dict:
     run_dir = Path(run_dir)
-    import pyarrow.parquet as pq
-    events = pq.read_table(run_dir / "l1_events.parquet").to_pylist()
+    if low_mem:                       # 追加専用: 出力バイトは既定経路と同一(load_track_events)
+        events, track_ov = load_track_events(run_dir / "l1_events.parquet")
+    else:
+        import pyarrow.parquet as pq
+        events = pq.read_table(run_dir / "l1_events.parquet").to_pylist()
+        track_ov = {}
 
     mp = _resolve_map_path(run_dir, map_path)
     city = json.loads(mp.read_text(encoding="utf-8"))
@@ -735,7 +820,8 @@ def export_run(run_dir: Path, map_path: Path | None = None,
             b["gz"] = _sample_terrain_gz(terrain, b["cx"], b["cy"])  # 追加専用キー
     tracks = reconstruct_tracks(events, buildings, agents_meta,
                                 sample_agents=sample_agents,
-                                step_stride=step_stride, rich_tracks=rich_tracks)
+                                step_stride=step_stride, rich_tracks=rich_tracks,
+                                **track_ov)
     glb = build_glb(scene["buildings"], plateau)
 
     out_dir = run_dir / "scene3d"
@@ -791,9 +877,10 @@ def main(argv: list) -> int:
         if not plateau_dir.is_absolute():
             plateau_dir = REPO_ROOT / plateau_dir
     rich_tracks = "--rich-tracks" in argv
+    low_mem = "--low-mem" in argv
     res = export_run(run_dir, map_override, sample_agents=sample_agents,
                      step_stride=step_stride, plateau_dir=plateau_dir,
-                     rich_tracks=rich_tracks)
+                     rich_tracks=rich_tracks, low_mem=low_mem)
     keys = (("scene", "tracks", "glb")
             + (("plateau_web",) if "plateau_web" in res else ())
             + (("terrain_web",) if "terrain_web" in res else ()))

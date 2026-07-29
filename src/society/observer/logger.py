@@ -39,6 +39,13 @@ class ObserverLogger:
         # 前チャンクの canonical を失わないためのフラグ。resume 時のみ Simulation.run() が True にする。
         # fresh ラン(resume でない)では常に False=finalize 挙動は従来と完全同一(byte 級不変)。
         self._resumed: bool = False
+        # ---- LLM 健全性 KPI(P0バッチ 2026-07-29)の O(1) 累積カウンタ ----
+        # flush_segment がバッファを空にしても失われないよう、記録時点で加算する。
+        # **出力(L1/L1b/L2/L3 の中身)には一切現れない**内部カウンタ = 既存ランとバイト一致。
+        # observer.llm_health.enabled=false のときは誰も読まない(L2 列も出ない)。
+        self.n_fallback_events: int = 0     # L1 kind="fallback"(発話系のパース失敗)の累計
+        self.n_llm_rows: int = 0            # L1b 行(= LLM 呼び出し)の累計
+        self.n_llm_cached: int = 0          # うちキャッシュ命中の累計
 
     # ---- L1 ----
     def log(self, event: Event) -> None:
@@ -47,10 +54,15 @@ class ObserverLogger:
                 f"未登録のイベント種類 '{event.kind}'。"
                 f" observer/schema.py で register_event_kind() してから使うこと(D12 拡張契約)。"
             )
+        if event.kind == "fallback":       # LLM 健全性 KPI(文字列比較1回だけ=ホットパス影響最小)
+            self.n_fallback_events += 1
         self.events.append(event)
 
     # ---- L1b ----
     def log_llm_call(self, row: dict) -> None:
+        self.n_llm_rows += 1
+        if row.get("cached"):
+            self.n_llm_cached += 1
         self.llm_calls.append(row)
 
     # ---- L2 ----
