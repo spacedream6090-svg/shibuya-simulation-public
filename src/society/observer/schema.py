@@ -255,6 +255,11 @@ register_event_kind("gossip_fade",   "悪評タグの忘却=知る者が悪評�
 #    (plan_with/dialog_cue/weak_tie/closeness/housemate/colleague=誘い先の選抜経路)が付く。
 #    accept 単独 ON の payload は従来とバイト一致のまま(source キー自体が無い)。
 register_event_kind("joint_invite",  "共同行動の誘い1件の承諾判定内訳(誘い手視点。1日1誘い1件){invitee, verdict, basis, p_calib, p_final, accepted, source?}")
+# ---- 場所の意味づけ最小版 D1 第69バッチ(labeling.place_binding ON のみ・既定 OFF=0件。
+#      全決定論・乱数ゼロ・LLM/generate ゼロ増・新 stream なし。造語を発生ノードへ束縛した
+#      瞬間を 1 件だけ記録する(最初の coin のみ・上書きなし)。実装 src/society/labeling/labels.py。
+#      設計 docs/plans/twin-physics-vision-affordance-plan.md §2 レーン1 D1)----
+register_event_kind("place_label_bind", "造語がその発生ノードへ束縛された(語ごとに最初の1回のみ){word, node}")
 
 
 @dataclass

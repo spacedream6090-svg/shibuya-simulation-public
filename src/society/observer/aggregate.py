@@ -829,6 +829,17 @@ def _n_indoor_meeting(sim):
     return _indoor_col(sim, "_indoor_n_meeting")
 
 
+# ---- 場所の意味づけ最小版 D1 第69バッチ(既定 OFF)。labeling.place_binding.enabled=false は
+#      None=列なし=L2 不変(gossip/endo/indoor 列と同型)。読むだけ・乱数ゼロ・LLM 呼ゼロ。
+#   place_bound_labels … 発生ノードへ束縛された語の**累計数**(単調非減少。per-step 差分ではない)。
+#   累計なので resume 安全(state=束縛台帳だけから各 step の値が再現される)。
+@register_aggregator("place_bound_labels")
+def _place_bound_labels(sim):
+    labels = getattr(sim, "labels", None)
+    fn = getattr(labels, "place_bound_count", None) if labels is not None else None
+    return fn() if fn is not None else None
+
+
 # ---- LLM 健全性 KPI(P0バッチ 2026-07-29・既定 OFF)。observer.llm_health.enabled=false は
 #      全て None=列なし=L2 不変(gossip/endo/indoor 列と同型)。読むだけ・乱数ゼロ・LLM 呼ゼロ。
 #

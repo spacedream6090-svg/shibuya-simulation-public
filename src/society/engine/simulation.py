@@ -190,9 +190,20 @@ class Simulation:
         self.clock = Clock(start_min=_parse_start_tod(cfg.run.get("start_tod", "07:00")))
         self.logger = ObserverLogger(self.out_dir)
         self.items = ItemStore()
+        # ---- 場所の意味づけ最小版 D1(labeling.place_binding。既定 OFF=完全 no-op=バイト一致)----
+        # ON 時だけ LabelSystem が束縛台帳を持つ(状態は LabelSystem 内に閉じるので checkpoint の
+        # "labels" 同梱でそのまま resume される=checkpoint.py への追加配線は不要)。
+        # dotlist 上書きは文字列で入りうるのでここで型を確定させる(config.py の型強制表と同じ趣旨)。
+        _pb_raw = cfg.labeling.get("place_binding", None)
+        _place_binding = None
+        if _pb_raw is not None and bool(_pb_raw.get("enabled", False)):
+            _place_binding = {"enabled": True,
+                              "min_adopters": int(_pb_raw.get("min_adopters", 1)),
+                              "prompt_line": bool(_pb_raw.get("prompt_line", True))}
         self.labels = LabelSystem(self.items,
                                   adopt_threshold=cfg.labeling.adopt_threshold,
-                                  mode=str(cfg.labeling.get("mode", "constrained")))
+                                  mode=str(cfg.labeling.get("mode", "constrained")),
+                                  place_binding=_place_binding)
         npro = cfg.lod.get("n_proportional", None)
         if npro is not None and bool(npro.get("enabled", False)):
             dens = float(npro.get("density", 0.15))

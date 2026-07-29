@@ -954,6 +954,31 @@ labeling:
   mode: constrained             # constrained | open(D9)
   adopt_threshold: 2            # complex contagion: 2回聞いたら採用
 
+  # ---- 場所の意味づけ最小版 D1 第69バッチ(2026-07-29。既定 OFF=現行挙動と完全同一)----
+  # 実査で特定された唯一の構造的欠落(「造語をノードに束縛する機構が無い」= 意味が場所に戻らない)
+  # への最小の手当て。ON 時: 熟慮の coin_label が受理された瞬間、その造語を**発生ノード**へ束縛し
+  #   (語ごとに最初の 1 回だけ・上書きなし)、L1 に place_label_bind を 1 件記録する。
+  #   以後、そのノードに居る人の熟慮プロンプトへ中立 1 行
+  #   「この場所の呼ばれ方: 「〈語〉」と呼ばれることがある。」を注入する
+  #   = 命名 → 場所 → 他者の知覚 → 採用 という「痕跡の蓄積」経路が開く。
+  # 注入条件: その語の**採用者数 >= min_adopters**。1 ノードに複数語が束縛されている場合も
+  #   プロンプトに出るのは決定論で 1 語だけ(束縛 step 降順 → 語の辞書順)。
+  #   行は状態記述のみ(行動指示・評価語・推奨は一切書かない=no-fingerprint / 促進しない)。
+  # 束縛するのは熟慮 coin_label 経路のみ。グループ名・提案文の coin(tools)とメディア発の
+  #   coin_media(創作者 -1・場所を持たない)は束縛しない。
+  # 全決定論・乱数ゼロ(新 stream も既存 draw の追加消費も無し)・LLM 呼数不変(変わるのは
+  #   プロンプトの内容だけ)。R1: k.writeback / beliefs を読まない。
+  #   束縛台帳は LabelSystem 内に閉じるので checkpoint("labels")へ同梱=resume==straight。
+  # 実装 src/society/labeling/labels.py。設計 docs/plans/twin-physics-vision-affordance-plan.md
+  #   §2 レーン1 D1(ON にするかは D0 の事前登録閾値+実 LLM 診断ランで判定)。
+  # OFF が保つ不変条件: 束縛台帳を作らない(place_bind is None)=新イベント 0 件・新状態なし・
+  #   プロンプト 1 バイト不変・L1 バイト一致(tests/data/golden_baseline_l1.json)・draw 数同一・
+  #   L2 に place_bound_labels 列なし。
+  place_binding:
+    enabled: false              # ★D0 事前登録ゲート通過後に実験投入。false=完全 no-op(バイト一致)
+    min_adopters: 1             # 束縛語の採用者数がこれ以上のときだけ知覚に出す(1=造語者本人だけでも出る)
+    prompt_line: true           # 熟慮プロンプトへの1行注入(false=束縛と観測だけ行い知覚には出さない)
+
 rewards:
   enabled: false                # D9: 既定 off(過正当化の交絡を排除)
   amount_per_adoption: 300      # enabled 時、自分の造語が採用されるたび creator に与える報酬額(円)

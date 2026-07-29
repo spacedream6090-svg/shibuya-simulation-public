@@ -115,6 +115,7 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
                  event_line: str | None = None,
                  disaster_line: str | None = None,
                  ads_line: str | None = None,
+                 place_label_line: str | None = None,
                  crowd_line: str | None = None,
                  wv_expect_line: str | None = None,
                  wv_self_line: str | None = None,
@@ -188,6 +189,9 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
         lines.append(disaster_line)
     if ads_line:                         # 街頭広告の想起(ads 有効かつ想起窓内のみ。中立提示・第18バッチ)
         lines.append(ads_line)
+    if place_label_line:                 # 場所の呼ばれ方(labeling.place_binding 有効かつ現在ノードに
+        lines.append(place_label_line)   # 束縛語があるときのみ。中立提示=状態記述のみ・D1 第69バッチ。
+                                         # 既定 OFF は None=1行も足さない=バイト一致(ads_line と同型 seam)
     lines += [f"時刻: {_time_label(sim_min)}",
               f"場所: {place_name}"]
     if nearby_pois:

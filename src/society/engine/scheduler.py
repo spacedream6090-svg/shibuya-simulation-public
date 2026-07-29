@@ -1849,6 +1849,9 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
     # 直近接触1行(中立提示)、群衆視覚=同席者の決定論要約(記述的規範)。呼数不変=R1。
     ads_line = street_mod.ads_line(agent, getattr(sim, "adscfg", None), step)
     crowd_line = street_mod.crowd_line(company, getattr(sim, "crowdcfg", None))
+    # 場所の意味づけ D1(labeling.place_binding・既定 OFF は None=1行も足さない=バイト一致)。
+    # 現在ノードに束縛された語(採用者数が閾値以上)を中立 1 行に。決定論・乱数ゼロ・呼数不変=R1。
+    place_label_line = sim.labels.place_line(getattr(agent, "node", None))
     # 構造化シーン記述 v0(scene_desc 有効時のみ。方向つき視界/注視対象/垂直関係の 2〜4 行)。
     # 決定論・追加 LLM 呼ゼロ・乱数ゼロの純関数。company(同席者=LOS 済み)を注視の人ソースに
     # 使う。OFF は None=1行も足さない=バイト一致(crowd_line と同型 seam)。
@@ -1903,6 +1906,7 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
                                      event_line=getattr(sim, "today_event_line", None),
                                      disaster_line=getattr(sim, "today_disaster_line", None),
                                      ads_line=ads_line,
+                                     place_label_line=place_label_line,
                                      crowd_line=crowd_line,
                                      wv_expect_line=wv_expect_line,
                                      wv_self_line=wv_self_line,
@@ -2541,8 +2545,11 @@ def _apply(sim, agent, action: dict, step: int, sim_min: int) -> None:
             "place": _place_of(sim, agent),
             "adopted_n": len(agent.adopted),        # その時までに採用済みの語数
         }
+        # 場所の意味づけ D1: 発生ノードを渡す(束縛は labels 側・既定 OFF は無視されて no-op)。
+        # node を渡すのはこの熟慮 coin_label 経路だけ = tools の group 名/提案文は束縛しない。
         item = sim.labels.coin(agent, action["word"], step=step, sim_min=sim_min,
-                               logger=sim.logger, context=context)
+                               logger=sim.logger, context=context,
+                               node=getattr(agent, "node", None))
         if item is None:                           # constrained で棄却された = 沈黙
             return
         action = {"type": "speak", "text": action["text"], "use_items": [item.text]}
