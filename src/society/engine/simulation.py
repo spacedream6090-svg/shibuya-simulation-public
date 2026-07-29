@@ -151,6 +151,29 @@ class Simulation:
             map_path,
             underground_label=self.envpackcfg["lexicon"]["underground_name"])
         self.router = Router(self.city)
+        # 建物の実高さ(A1 第67バッチ。world.heights.enabled=false=既定なら**表を開きもしない**
+        # =建物 dict にキーが増えない=バイト一致)。ON でも属性を付けるだけで知覚・移動・
+        # プロンプト・LLM 呼数には一切影響しない(消費者は後続 C0/B-L1)。決定論・乱数ゼロ。
+        hcfg = cfg.world.get("heights", None)
+        self.heights_stat = None
+        if hcfg is not None and bool(hcfg.get("enabled", False)):
+            hpath = Path(str(hcfg.get("path", "data/building_heights_shibuya.json")))
+            if not hpath.is_absolute():
+                hpath = REPO_ROOT / hpath
+            self.heights_stat = self.city.attach_heights(
+                hpath, fallback_m_per_level=float(hcfg.get("fallback_m_per_level", 3.5)))
+            # summary にはローカル絶対パスではなく conf に書かれた相対指定を残す(ラン間比較可能)
+            self.heights_stat["path"] = str(hcfg.get("path",
+                                                     "data/building_heights_shibuya.json"))
+        # 環境改変条件(A1 第67バッチ world.mod)。現実幾何が原点、改変はその周りの反実仮想。
+        # 既定 OFF=プロファイルを開きもしない=地図・エッジ属性とも不変=バイト一致。
+        # 適用はここで一度だけ(決定論・乱数ゼロ)。適用後は経路キャッシュを捨てる
+        # (scenario.shock_closure と同じ規約)。commerce への適用は commercecfg 構築後(下方)。
+        from ..world import worldmod as _worldmod
+        self.worldmod = _worldmod.load(cfg, REPO_ROOT)
+        if self.worldmod is not None:
+            self.worldmod.apply_world(self.city)
+            self.router.invalidate()
         # 標高 z 列(3D Phase 0)。既定 OFF=イベント payload 不変=バイト一致。
         # ON でも読み出しは純関数(乱数なし)・記録専用=認知経路と LLM 呼数は不変(R1)。
         ecfg = cfg.world.get("elevation", None)
@@ -499,6 +522,10 @@ class Simulation:
                         if OmegaConf.is_config(raw_commerce) else raw_commerce)
         self.commercecfg = _commerce_mod.build_cfg(raw_commerce)
         self._commerce_open: dict = {}             # 営業時間の開閉遷移(shop_state)の進行管理
+        # 環境改変条件の営業時間オーバーライド(world.mod。OFF=self.worldmod is None=何もしない)。
+        # cat 単位の上書きのみ実効(POI 単位は worldmod の予約フィールド)。決定論・乱数ゼロ。
+        if self.worldmod is not None:
+            self.worldmod.apply_commerce(self.commercecfg)
         # 物流の実体化 スライス①+②(commerce.inventory。既定 OFF=現行挙動と完全同一)。店舗在庫((s,S) 方策)+
         # 日次補充トリップ(depot→店=delivery_trip→到着で restock)+ 商品実体(何を買ったか=spend.item)。
         # 決定論・非LLM・乱数ゼロ(R1: 品切れは spend 抑制のみ・補充は agent_id=-1 の世界イベント=個体位置を
@@ -1408,6 +1435,13 @@ class Simulation:
         peak_rss = _peak_rss_mb()
         if peak_rss is not None:
             summary["peak_rss_mb"] = peak_rss
+        # ---- A1 第67バッチ 2026-07-29: 環境条件の追加キー(既定 OFF ではキー自体を出さない)----
+        # world_mod: 適用したプロファイル名と適用実績(予約=未消費フィールドも正直に残す)。
+        # building_heights: 実高さの付与実測(plateau 実測 / levels 推定 / 不明 の内訳)。
+        if getattr(self, "worldmod", None) is not None:
+            summary["world_mod"] = self.worldmod.summary()
+        if getattr(self, "heights_stat", None) is not None:
+            summary["building_heights"] = dict(self.heights_stat)
         (self.out_dir / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         return summary

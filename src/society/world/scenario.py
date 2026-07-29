@@ -13,16 +13,18 @@ world.scenario / world.scenario_params で切替える(コードは書き換え�
 
 街の語彙として shock という英単語は用いるが、内部状態を表す語は一切参照しない
 (no-fingerprint 契約: このファイルは world/ 配下=静的検査の対象)。
+
+A1 第67バッチ: 「時間軸のない静的な環境改変条件」は `world/worldmod.py` へ一般化した
+(shock_closure = 半径セレクタ + 時限発動、worldmod = 明示/矩形セレクタ + 構築時 1 回)。
+エッジの同一性規則(正準キー)は 2 モジュールで食い違ってはならないので worldmod へ集約し、
+ここはそれを別名で使う(関数本体は移動前と同一=挙動・バイト完全不変)。
 """
 from __future__ import annotations
 
 import math
 
 from ..observer.schema import Event
-
-
-def _edge_key(u: str, v: str) -> tuple[str, str]:
-    return (u, v) if u <= v else (v, u)
+from .worldmod import edge_key as _edge_key
 
 
 class Scenario:

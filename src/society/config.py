@@ -42,6 +42,8 @@ _FLOAT_KEYS = [
     "transit_ride.bus.fare", "transit_ride.bus.stop_radius_m",
     # 制度DSL(ユーザー構想 2026-07-06)の小数パラメータ
     "rules.fee_max_ratio", "rules.bonus_max", "rules.boost_prob",
+    # 建物の実高さ(A1 第67バッチ)。未照合建物の推定高さ = levels x この値
+    "world.heights.fallback_m_per_level",
 ]
 
 

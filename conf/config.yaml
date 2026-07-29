@@ -199,6 +199,42 @@ world:
   elevation:                    # 3D Phase 0: 標高 z 列(3d-movement.md §7)。ON で move_segment/arrive payload に z[m](DEM 双一次・export_3d と同値)を追加
     enabled: false              # 既定 OFF=イベント不変(バイト一致)。表示・観測専用=移動判定・認知・LLM 呼数は不変
     dir: data/plateau           # terrain.npz + terrain.json のフォルダ(scripts/plateau_extract.py の出力)
+
+  # ---- 建物の実高さ A1 第67バッチ(2026-07-29。既定 OFF=現行挙動と完全同一)----
+  # ON 時: CityMap が高さ表(scripts/build_heights.py の生成物=PLATEAU 実測 3,531 棟)を読み、
+  #   各建物へ height_m [m] と height_src("plateau" | "levels")を付与する。表に無い建物は
+  #   levels x fallback_m_per_level の推定値を入れ、出自を height_src で必ず区別する
+  #   (階数が無い建物には属性を付けない=欠測を捏造しない)。
+  # ★本バッチでは**属性の付与のみ**。知覚・移動・プロンプト・LLM 呼数のいずれにも影響しない
+  #   (消費者は後続バッチ C0 の可視行列 / B-L1 の 2.5D 遮蔽)。全決定論・乱数ゼロ・LLM 呼ゼロ。
+  # OFF が保つ不変条件: 高さ表を一切読まない=建物 dict にキーが増えない=新イベント 0 件・
+  #   新状態なし・L1 バイト一致(tests/data/golden_baseline_l1.json)・draw 数同一。
+  heights:
+    enabled: false              # ★可視性/遮蔽の実験で ON。false=完全 no-op(バイト一致)
+    path: data/building_heights_shibuya.json   # OSM 建物 id → 実高さ [m](210KB・data/plateau は gitignore だがこの派生表は追跡する)
+    fallback_m_per_level: 3.5   # 未照合の建物の推定高さ = levels x この値(export_3d の FLOOR_HEIGHT と同値)
+
+  # ---- 環境改変条件 world.mod A1 第67バッチ(2026-07-29。既定 OFF=現行挙動と完全同一)----
+  # 「現実の渋谷幾何が原点、改変条件はその周りの反実仮想」を条件パラメータ化する層
+  # (実装 src/society/world/worldmod.py。scenario.shock_closure の一般化=時間軸を持たず
+  #  ワールド構築時に一度だけ・決定論・乱数ゼロで適用する)。
+  # profile = conf/worldmod/<name>.yaml の名前(裸の名前 or パス)。ラン config に条件名が残る。
+  # 改変4種: edges_closed(エッジ無効化)/ edge_speed_scale(速度係数=歩道幅の代理。走行コスト長
+  #   へ写して経路選択と移動所要 step の双方に効く)/ open_hours(営業時間の cat 単位上書き)/
+  #   gate_capacity(駅ゲート容量。★現行エンジンに容量概念が無いため**予約フィールド=未消費**)。
+  # ★未消費の予約フィールド: gate_capacity と open_hours.pois(POI 単位)。スキーマ受理・検証・
+  #   summary への記録(reserved_not_consumed)までを行い、世界には効かせない=実効は将来バッチ。
+  # ★scenario(shock_closure)との併用は非対応: 同じ edge["closed"] を使うため shock の解除が
+  #   静的封鎖まで開けてしまう。world.scenario は baseline のまま使うこと。
+  # エッジ集合の指定は「明示リスト edges」と「矩形 bbox(端点いずれかが内側)」の 2 通り。
+  #   地名・カテゴリ名のリテラルはプロファイル(conf 側)にのみ書く(src は no-fingerprint)。
+  # R1: k.writeback / beliefs を読まない。LLM 呼数への影響は co-location 変化の物理経由のみ。
+  # OFF が保つ不変条件: プロファイルを開きもしない=地図・エッジ属性・commerce 設定とも不変=
+  #   新イベント 0 件・新状態なし・L1 バイト一致・draw 数同一。
+  mod:
+    enabled: false              # ★反実仮想の条件ランで ON。false=完全 no-op(バイト一致)
+    profile: null               # 例) example_counterfactual(= conf/worldmod/example_counterfactual.yaml)
+
   modes:                        # 移動手段(1 step = 10分 で進める距離 m)
     speeds: { walk: 800.0, bicycle: 2000.0, car: 3500.0 }
   exit_prob: 0.02               # 暇なとき範囲外へ出かける確率/step

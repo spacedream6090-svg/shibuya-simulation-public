@@ -118,6 +118,11 @@ class CityMap:
         if data["u0"] != u:
             geometry = list(reversed(geometry))
         remaining = max(0.0, min(offset, data["length"]))
+        cs = data.get("cost_scale")
+        if cs is not None:
+            # 走行コスト長 → 幾何長への戻し(scale_edge_cost 参照)。world.mod OFF ではこのキー
+            # 自体が存在しない=この分岐に入らない=従来と完全同一の算術(バイト一致)。
+            remaining /= cs
         for a, b in zip(geometry, geometry[1:]):
             seg = math.hypot(b[0] - a[0], b[1] - a[1])
             if seg <= 0:
@@ -168,6 +173,80 @@ class CityMap:
         if lyr > 0:
             return "ペデストリアンデッキ"
         return "路上"
+
+    # ---- 建物の実高さ(A1 第67バッチ。world.heights.enabled=true のときだけ一度だけ呼ばれる)----
+    def attach_heights(self, path: str | Path, fallback_m_per_level: float = 3.5) -> dict:
+        """外部の実測高さ表を読み、各建物に height_m / height_src を付与する(決定論・乱数ゼロ)。
+
+        表(scripts/build_heights.py の生成物)は {"heights": {<建物id>: {"h": float, "src": str}}}。
+        表に載っている建物は実測値、載っていない建物は階数 levels x fallback_m_per_level を入れて
+        height_src="levels" と出自を明示する(推定値を実測と混同させない)。levels が無い/0 以下の
+        建物には**属性を付けない**(欠測を捏造しない。件数は戻り値の n_missing に残す)。
+
+        ★この関数は world.heights.enabled=false のとき一切呼ばれない=建物 dict にキーが増えない
+          =従来挙動と完全同一(L1 バイト一致)。付与された属性は本バッチでは誰も読まない
+          (知覚・移動・プロンプトへは影響させない。消費者は後続バッチ)。
+
+        戻り値: {"path", "n_buildings", "n_plateau", "n_levels", "n_missing",
+                 "fallback_m_per_level", "src_schema"}(summary.json 用の実測統計)。
+        """
+        p = Path(path)
+        doc = json.loads(p.read_text(encoding="utf-8"))
+        table = doc.get("heights", {}) or {}
+        fb = float(fallback_m_per_level)
+        n_plateau = n_levels = n_missing = 0
+        for b in self.buildings:                      # 地図の並び順どおり=決定論
+            rec = table.get(b["id"])
+            if rec is not None:
+                b["height_m"] = round(float(rec["h"]), 1)
+                b["height_src"] = str(rec.get("src", "plateau"))
+                n_plateau += 1
+                continue
+            lv = int(b.get("levels") or 0)
+            if lv > 0 and fb > 0.0:
+                b["height_m"] = round(lv * fb, 1)
+                b["height_src"] = "levels"
+                n_levels += 1
+            else:
+                n_missing += 1                        # 階数も無い=高さ不明。属性を付けない
+        return {"path": str(path), "n_buildings": len(self.buildings),
+                "n_plateau": n_plateau, "n_levels": n_levels, "n_missing": n_missing,
+                "fallback_m_per_level": fb,
+                "src_schema": (doc.get("meta", {}) or {}).get("schema")}
+
+    def building_height_m(self, bld_id: str) -> float | None:
+        """建物の高さ [m]。heights 未配線(既定 OFF)や高さ不明なら None(欠測を 0 と偽らない)。"""
+        b = self._bld_by_id.get(bld_id)
+        return None if b is None else b.get("height_m")
+
+    # ---- エッジ走行コストの係数(A1 第67バッチ。world.mod の edge_speed_scale が使う)----
+    def scale_edge_cost(self, u: str, v: str, speed_scale: float) -> bool:
+        """エッジ (u,v) の走行速度係数を設定する(決定論・乱数ゼロ。ワールド構築時に一度だけ)。
+
+        routing(A* の weight="length")も移動予算(scheduler の edge_length 消費)も **length 属性
+        しか見ない**ので、速度係数は「実効長 length = 実長 / speed_scale」として表現する
+        (speed_scale=0.5 なら走破に 2 倍の時間=2 倍の長さに見える)。幾何そのものは変えないため、
+        コスト長→幾何長の戻し比 cost_scale を同時に置き、xy_along がそれで位置を補正する。
+
+        speed_scale<=0 や実長 0 のエッジは何もせず False を返す(不正値で世界を壊さない)。
+        既定 OFF ではこの関数が呼ばれない=length も cost_scale も従来のまま=バイト一致。
+        """
+        s = float(speed_scale)
+        if s <= 0.0:
+            return False
+        d = self.graph.edges[u, v]
+        base = float(d.get("base_length", d["length"]))
+        if base <= 0.0:
+            return False
+        d["base_length"] = round(base, 1)
+        d["length"] = round(base / s, 1)
+        if d["length"] <= 0.0:                        # 極端な係数で 0 に潰れたら適用しない
+            d["length"] = round(base, 1)
+            d.pop("base_length", None)
+            d.pop("cost_scale", None)
+            return False
+        d["cost_scale"] = d["length"] / d["base_length"]
+        return True
 
     # ---- 入口(実データ由来。v6 地図のみ。旧地図は空を返す=後方互換)----
     def building_entrances(self, bld_id: str) -> list[dict]:
