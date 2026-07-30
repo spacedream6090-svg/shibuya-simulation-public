@@ -156,6 +156,28 @@ model:
   plan_max_tokens: 0    # 0=max_tokens と同じ(朝の計画のみ上限を分けたい時に設定)
   reflect_think: true   # 内省を qwen3 の思考モードで回す(thinking/response 分離)
   cache: true           # 応答キャッシュ(D13: 再現性の実体)
+  # ---- 第71バッチ 2026-07-31: 実行モードと入出力ジャーナル(dual-mode-observe-verify-plan.md 第71行)----
+  cache_mode: free      # free(既定=従来動作そのまま)| replay
+                        #   free   : キャッシュミス時は実推論して保存する(FREE ラン=本選の観察ラン)。
+                        #   replay : キャッシュミス時は**即例外**。新規推論へは絶対にフォールバックしない
+                        #            (silent fallback = 「再現したつもりで再現していない」最悪の失敗モード)。
+                        #            FREE ランの llm_cache.jsonl を同じ out_dir に置いて再走すると、
+                        #            全 LLM 応答が同一になり L1 がバイト一致する(受入基準 T2)。
+                        #            model.cache=false との併用は矛盾なので起動時にエラーにする。
+  journal: true         # LLM 入出力ジャーナル(プロンプト全文+応答+params+key を per-run に記録)。
+                        #   出力: runs/<name>/llm_journal.jsonl.gz(+ .index.json)。router では子ごとに1本。
+                        #   ★**新規別ファイル**なので L1/L2/L3・summary・キャッシュのバイト列には一切触れない
+                        #     (ゴールデン tests/data/golden_baseline_l1.json は不変)。書くだけ・シム本体は読まない。
+                        #   ★これが無いと「そのエージェントが何を見せられて何を返したか」がラン終了で永久に失われる
+                        #     (llm_cache は sha256 キーのみ・L1b は call_id 等のメタのみ=どちらも入力全文を持たない)。
+                        #   容量が逼迫しても削るのは snapshot 側であってここではない(dual-mode-requirements §2.3)。
+                        #   ★同じ out_dir を作り直したときは**追記**になる(llm_cache.jsonl と同じ
+                        #     ディレクトリ単位 append-only の意味論。resume で記録を消さないための必然)。
+                        #     「行数 == そのランの llm_calls」が成り立つのは fresh な out_dir のとき。
+  journal_flush_records: 128   # この件数ごとに「完結した gzip メンバ」を1個追記する(=常に有効な .gz)。
+                        #   大きいほど圧縮率が上がり(共通テンプレートが deflate 32KB 窓に入る)、
+                        #   クラッシュ時に失う末尾件数と RAM 使用が増える。checkpoint / flush_every_steps
+                        #   のたびに強制 flush されるので、実効の損失窓はそちらの間隔でも頭打ちになる。
   format: json          # 構造化出力の強制(第33バッチ 計画A。docs/research/constrained-decoding.md)
                         #   json(既定)=従来挙動そのまま(ollama format=json / vLLM response_format)。
                         #   none=送らない(プロンプト規約のみ)。schema は将来拡張(未対応)。
@@ -1244,6 +1266,13 @@ observer:
   flush_every_steps: 0          # B2(スケール): この step ごとに L1 ログを part 化して RAM を解放
                                 # (checkpoint とは独立。0=無効で従来と完全同一)。大規模ランの OOM 回避用。
                                 # checkpoint_every と同一 step では二重 flush しない。finalize で part を結合。
+  # ---- 第71バッチ 2026-07-31: ラン来歴 run_manifest.json(既定 ON=新規別ファイル)----
+  # ラン開始時に runs/<name>/run_manifest.json を書く: git SHA/branch/dirty・resolved config の
+  # 正準 JSON sha256・run_seed・モデル ID・cache_mode・**真偽値スイッチ全状態**(機械採取)・
+  # イベントスキーマ hash・開始時刻(壁時計=観測メタデータ)・開始日。
+  # **書くだけ・読む経路なし** = L1/L2/L3・summary・決定論・LLM 呼数のいずれにも影響しない。
+  # 同じ out_dir を再利用/resume したときは前回分の要点を history に畳んで残す(来歴を失わない)。
+  run_manifest: true
   y_weights: null               # Y外部(世界改変量)の4層合成重み。既定 null=合成せず列を出すのみ。
                                 # ★合成式は B段でユーザーと決定(analyze 側で使用)。例:
                                 # y_weights: { spatial: 1.0, resource: 1.0, symbolic: 1.0, network: 1.0 }

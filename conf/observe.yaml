@@ -27,6 +27,17 @@ run:
   seed_auto: true      # run.py が起動時に OS エントロピーから seed を採取し config.yaml/summary.json に記録
                        # (run.seed=<数値> を明示併記すればそちらが優先=固定も可)
 
+# ---- (1b) 観察ランの必須記録(第71バッチ 2026-07-31)----
+# 観察ラン=再現性より発見を優先する代わりに「起きたことは全部残す」ことで事後検証を成立させる層。
+# 基底 config.yaml でも既定 ON だが、観察ランでは**外してはならない**ので profile に明示しておく
+# (docs/plans/dual-mode-observe-verify-plan.md §1.3 訂正6:「observe/journal プロファイルで必須 ON」)。
+#   journal      = 全 LLM 呼び出しのプロンプト全文+応答を llm_journal.jsonl.gz に残す
+#                  (これが無いと「何を見せられて何を返したか」がラン終了で永久に失われる)
+#   cache_mode   = free(観察ランは新規推論を許す。事後の再生は llm_cache.jsonl から replay で行う)
+model:
+  journal: true
+  cache_mode: free
+
 # ---- (2) 偶発イベント層(人生に効く不確実性。臨時収入/財布紛失=money± / 偶然の出会い=closeness+)----
 chance:
   enabled: true        # daily_rate/money 幅/weight は基底の較正済み既定(現実の桁)を使う=過剰にいじらない

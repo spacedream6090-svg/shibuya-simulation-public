@@ -17,6 +17,7 @@ from ..llm.mock import MockBackend
 from ..observer import assets as assets_mod
 from ..observer import deviation as deviation_mod
 from ..observer import lens as lens_mod
+from ..observer import manifest as manifest_mod
 from ..observer.logger import ObserverLogger
 from ..observer.provenance import ItemStore
 from ..rng import RngHub
@@ -701,6 +702,32 @@ class Simulation:
         self.exit_points.sort()
 
         self.out_dir.mkdir(parents=True, exist_ok=True)
+        # ---- 第71バッチ: LLM 入出力ジャーナル / REPLAY モードの配線 ----
+        # journal: 全 LLM 呼び出しの**プロンプト全文**を per-run に残す観測 sink(書くだけ・
+        #   シム本体からは読まない=決定論にも k 呼数にも不参加)。router の子キャッシュにも
+        #   1本ずつ付けて漏らさない。既定 ON(新規別ファイルなので L1 バイトには触れない)。
+        # cache_mode: free(既定=従来動作)| replay(キャッシュミスで即例外・フォールバック禁止)。
+        #   矛盾する組(cache=false かつ replay)は CachedLLM の __init__ が起動時に落とす。
+        cache_mode = str(cfg.model.get("cache_mode", "free"))
+        journal_on = bool(cfg.model.get("journal", True))
+        journal_flush = int(cfg.model.get("journal_flush_records", 128) or 128)
+        self._journals: list = []
+        _journal_by_stem: dict = {}
+
+        def _new_journal(stem: str):
+            if not journal_on:
+                return None
+            # 同名ファイルには必ず同一オブジェクトを返す。router で別 spec の子が同じ
+            # backend.name(例: mock 2 個)になるとファイル名が衝突し、別オブジェクトだと
+            # seq が二系列になって重複する(キャッシュファイルが子の name 別=同名共有なのと同じ扱い)。
+            if stem in _journal_by_stem:
+                return _journal_by_stem[stem]
+            from ..llm.journal import LlmJournal
+            j = LlmJournal(self.out_dir / stem, flush_records=journal_flush)
+            _journal_by_stem[stem] = j
+            self._journals.append(j)
+            return j
+
         backend = str(cfg.model.backend)
         if backend == "mock":
             raw = MockBackend(self.hub)
@@ -750,7 +777,9 @@ class Simulation:
                                    for c in child.name)
                     built[skey] = CachedLLM(
                         child, enabled=bool(cfg.model.cache),
-                        path=self.out_dir / f"llm_cache.{safe}.jsonl")
+                        path=self.out_dir / f"llm_cache.{safe}.jsonl",
+                        mode=cache_mode,
+                        journal=_new_journal(f"llm_journal.{safe}.jsonl.gz"))
                 children[str(purpose)] = built[skey]
             self.llm = RouterLLM(children)
             raw = None
@@ -759,7 +788,9 @@ class Simulation:
                 f"backend '{backend}' は未実装(mock | ollama | vllm | router)。")
         if raw is not None:
             self.llm = CachedLLM(raw, enabled=bool(cfg.model.cache),
-                                 path=self.out_dir / "llm_cache.jsonl")
+                                 path=self.out_dir / "llm_cache.jsonl",
+                                 mode=cache_mode,
+                                 journal=_new_journal("llm_journal.jsonl.gz"))
 
         nodes = self.dests or sorted(self.city.graph.nodes)
         # ペルソナ名簿(scripts/build_personas.py 生成物。無ければ手続き生成)
@@ -961,6 +992,27 @@ class Simulation:
         # 第59バッチ スライス(a): 資産分布レンズの map サイドカー(assets ON 時のみ書く=OFF は後方互換で
         # バイト同一)。ビューアが assets_map.json の有無で 💰資産タブを出す(資産語は observer/assets.py に閉じる)。
         assets_mod.write_sidecar(self, self.out_dir)
+        # 第71バッチ: ラン来歴(git SHA・config hash・seed・モデル・cache_mode・全スイッチ・
+        # 開始時刻)を run_manifest.json に固定する。**書くだけ・読む経路なし**(R1)。
+        manifest_mod.write(self)
+
+    # ------------------------------------------------------ LLM ジャーナル(第71)
+    # ObserverLogger の flush_segment / checkpoint と同じ「checkpoint が真の境界」流儀で、
+    # 確定点(records/bytes)を checkpoint に載せ、resume 時にそこまで巻き戻す。
+    # これで「checkpoint 後に走ってクラッシュした分」が再走で二重記録にならない。
+    def _journal_marks(self) -> dict:
+        """checkpoint に載せる確定点(ジャーナルファイル名 → {records, bytes})。"""
+        return {j.path.name: j.mark() for j in getattr(self, "_journals", [])}
+
+    def _journal_rewind(self, marks: dict | None) -> None:
+        if not marks:
+            return
+        for j in getattr(self, "_journals", []):
+            j.rewind(marks.get(j.path.name))
+
+    def _journal_close(self) -> None:
+        for j in getattr(self, "_journals", []):
+            j.close()
 
     def _build_router_child(self, spec: dict):
         """router の子バックエンドを1つ構築する(第23バッチ M2)。
@@ -1368,6 +1420,8 @@ class Simulation:
             if flush_every > 0 and not did_flush \
                     and (step + 1) % flush_every == 0:
                 self.logger.flush_segment()        # checkpoint と独立の定期 flush
+                for _j in self._journals:          # 第71: LLM ジャーナルも同時に確定させる
+                    _j.flush()
                 if self.indoor_tracks is not None:
                     self.indoor_tracks.flush_segment()
                 if self.org_ledger_sc is not None:
@@ -1407,6 +1461,7 @@ class Simulation:
 
     def finalize(self) -> dict:
         scheduler.finalize_org_day(self)          # B4: 最終日の org_output(by_org)/ledger 行を締める
+        self._journal_close()                     # 第71: LLM ジャーナルの残バッファを確定させる
         paths = self.logger.flush()               # ↑ logger.flush の前=最終日 org_output も L1 に載る
         if self.indoor_tracks is not None:        # B3: 屋内軌跡サイドカーを結合(part→canonical)
             self.indoor_tracks.finalize()

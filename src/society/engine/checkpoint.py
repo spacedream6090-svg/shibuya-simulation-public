@@ -37,16 +37,24 @@ _VOLATILE_KEYS = [
 ]
 
 
-def config_hash(cfg) -> str:
-    """決定論に効く config の内容ハッシュ(resume 制御キーは除外)。"""
-    from omegaconf import OmegaConf
-    data = OmegaConf.to_container(cfg, resolve=True)
+def config_hash_from_container(data: dict) -> str:
+    """resolved config(OmegaConf.to_container 済み dict)の内容ハッシュ。
+
+    resolve 済みの dict を既に持っている呼び出し側(observer/manifest.py)が
+    to_container を二度走らせずに済むよう、定義をここ 1 箇所に保ったまま口を分けてある。
+    """
     data = copy.deepcopy(data)
     for sect, key in _VOLATILE_KEYS:
         if isinstance(data.get(sect), dict):
             data[sect].pop(key, None)
     blob = json.dumps(data, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def config_hash(cfg) -> str:
+    """決定論に効く config の内容ハッシュ(resume 制御キーは除外)。"""
+    from omegaconf import OmegaConf
+    return config_hash_from_container(OmegaConf.to_container(cfg, resolve=True))
 
 
 def save(sim, step: int, path: str | Path) -> Path:
@@ -125,6 +133,13 @@ def save(sim, step: int, path: str | Path) -> Path:
             # deque/dict/Counter のみ=pickle の集合反復順非保存の影響を受けない。
             # observer.echo.enabled=false のランでは state 自体が生えない → None=挙動不変。
             "echo_state": getattr(sim, "_echo_state", None),
+            # 第71バッチ: LLM 入出力ジャーナルの確定点(ファイル名 → {records, bytes})。
+            # mark() が flush してから採るので、この時点のファイル末尾は必ず gzip メンバ境界
+            # = 安全な切り詰め点。resume(load)がここまで巻き戻すことで、「checkpoint 後に
+            # 走ってクラッシュした分」を再走したときの二重記録と seq の巻き戻りを両方防ぐ。
+            # journal OFF のランでは {} = 挙動不変(load は .get で旧 checkpoint 互換)。
+            "llm_journal": (sim._journal_marks()
+                            if hasattr(sim, "_journal_marks") else {}),
         },
         # --- scenario は config から再構築される。封鎖の進行だけを直列化(順序安定) ---
         "scenario": {
@@ -211,6 +226,8 @@ def load(sim, path: str | Path) -> int:
         sim._echo_state = est_echo
     sim._echo_processed = 0                     # fresh logger=total 0 から再走査(assets と同流儀)
     sim._echo_cache = None
+    if hasattr(sim, "_journal_rewind"):         # 第71: LLM ジャーナルを確定点まで巻き戻す
+        sim._journal_rewind(rt.get("llm_journal"))
 
     # scenario: __init__ で config から再構築済み。封鎖の進行を復元し city へ再適用。
     sc = blob["scenario"]
