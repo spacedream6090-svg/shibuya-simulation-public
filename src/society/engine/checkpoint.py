@@ -133,6 +133,15 @@ def save(sim, step: int, path: str | Path) -> Path:
             # deque/dict/Counter のみ=pickle の集合反復順非保存の影響を受けない。
             # observer.echo.enabled=false のランでは state 自体が生えない → None=挙動不変。
             "echo_state": getattr(sim, "_echo_state", None),
+            # 第73バッチ(真偽台帳 Part B): sim 側の台帳=fact レコード(_tl_facts)・重複判定キー
+            # (_tl_keys)・累積カウンタ(_tl_stats)。**保存しないと resume 後に fact_id が振り直され、
+            # 信念(agents pickle に自然同梱される _fact_beliefs)の参照先が全部迷子になる**
+            # (第62 joint / 第70 echo と同型の「日次/累積状態の未保存」ギャップ)。watermark は
+            # プロセス内 logger カウンタ由来なので保存しない(load 側で 0 に戻す=assets/gossip 流儀)。
+            # beliefs OFF のランでは属性自体が生えない → None=挙動不変(load は .get で旧 ckpt 互換)。
+            "tl_facts": getattr(sim, "_tl_facts", None),
+            "tl_keys": getattr(sim, "_tl_keys", None),
+            "tl_stats": getattr(sim, "_tl_stats", None),
             # 第71バッチ: LLM 入出力ジャーナルの確定点(ファイル名 → {records, bytes})。
             # mark() が flush してから採るので、この時点のファイル末尾は必ず gzip メンバ境界
             # = 安全な切り詰め点。resume(load)がここまで巻き戻すことで、「checkpoint 後に
@@ -226,6 +235,21 @@ def load(sim, path: str | Path) -> int:
         sim._echo_state = est_echo
     sim._echo_processed = 0                     # fresh logger=total 0 から再走査(assets と同流儀)
     sim._echo_cache = None
+    # 第73 Part B: 真偽台帳(旧 checkpoint 互換=無ければ素通り=beliefs OFF の挙動不変)。
+    # canary は module 側のプロセス内レジストリなので、復元した fact 分を再登録して武装を保つ。
+    tlf = rt.get("tl_facts")
+    if tlf is not None:
+        from ..truth_ledger import register_canary as _tl_canary
+        sim._tl_facts = tlf
+        for _fid in sorted(tlf):
+            _tl_canary(_fid)
+    tlk = rt.get("tl_keys")
+    if tlk is not None:
+        sim._tl_keys = tlk
+    tls = rt.get("tl_stats")
+    if tls is not None:
+        sim._tl_stats = tls
+    sim._tl_watermark = 0                       # fresh logger=total 0 から再走査(gossip と同流儀)
     if hasattr(sim, "_journal_rewind"):         # 第71: LLM ジャーナルを確定点まで巻き戻す
         sim._journal_rewind(rt.get("llm_journal"))
 

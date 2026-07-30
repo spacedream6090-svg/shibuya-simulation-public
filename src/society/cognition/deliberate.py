@@ -42,15 +42,26 @@ _DO_LINE = (
 _NOTHING_LINE = (
     '  {"action": "nothing"}(何もしない・誰とも関わらない)\n'
 )
+# 検証行動(第73バッチ Part B・beliefs.verify_actions=true のときのみ足す1行。既定 OFF=
+# ヘッダ不変)。中立提示: 勧めない・「確かめるべき」等の推奨語を書かない・具体的な対象も
+# 例示しない(_DO_LINE / _NOTHING_LINE と同じ流儀)。括弧内は 3 手段の**記述**のみ。
+# ★ この行は fact にも belief にも依存しない**固定文字列**である(= 実験条件も台帳の中身も
+#   エージェント側から観測できない = no-fingerprint)。誰が確かめに行くかが観測対象そのもの。
+_VERIFY_LINE = (
+    '  {"action": "verify", "about": "確かめたいこと", '
+    '"how": "go(その場所へ行く) / ask(人に聞く) / net(ネットで調べる)"}\n'
+)
 
 
 def _header(labeling_mode: str, open_actions: bool = False,
-            city_name: str = "", explicit_nothing: bool = False) -> str:
+            city_name: str = "", explicit_nothing: bool = False,
+            verify_actions: bool = False) -> str:
     coin = _COIN_LINE.get(labeling_mode, _COIN_LINE["constrained"])
     do = _DO_LINE if open_actions else ""
     nothing = _NOTHING_LINE if explicit_nothing else ""
+    verify = _VERIFY_LINE if verify_actions else ""
     head = _HEADER_INTRO.format(city=city_name) + _HEADER_FORMS
-    return head + coin + _HEADER_TAIL + do + nothing
+    return head + coin + _HEADER_TAIL + do + nothing + verify
 
 
 # ヘッダの構造ベースライン(街名は呼び出し時に注入=ここでは空)。後方互換の基準。
@@ -143,6 +154,7 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
                  open_actions: bool = False,
                  city_name: str = "",
                  explicit_nothing: bool = False,
+                 verify_actions: bool = False,
                  p2_offers: str | None = None,
                  dialog_history: list | None = None) -> str:
     """個別文脈(時刻・場所・活動・気分・記憶・直近発話)を渡し、内容の固定化を防ぐ。
@@ -152,7 +164,10 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
     labeling_mode(constrained 既定 / open)はヘッダの coin_label 行のみを差し替える。
     open_actions(第17バッチ・既定 False)は開放行動 "do" の1行だけをヘッダ末尾に足す。
     explicit_nothing(第70バッチ・既定 False)は「何もしない」の1行だけをヘッダ末尾に足す
-    (open_actions と完全同型の seam。既定 OFF ではヘッダがバイト一致)。"""
+    (open_actions と完全同型の seam。既定 OFF ではヘッダがバイト一致)。
+    verify_actions(第73バッチ・既定 False)は「確かめる」の1行だけをヘッダ末尾に足す
+    (同型 seam)。**真偽台帳の中身はここへ一切渡らない**(bool 1 個だけ。台帳 module は
+    cognition から import されないことを tests/test_beliefs.py が静的に固定する)。"""
     # 入力解像度LOD(第30バッチ・lod.input_res)。OFF=属性なし → 既定値=現行定数で
     # バイト一致。ON でも変わるのは注入の「件数」だけ(呼数・乱数・発火は不変=R1)。
     # beliefs(k の行動流入路 D7)と全員共通行は解像度の対象外(docs/plans/input-resolution-lod.md §2)。
@@ -162,7 +177,8 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
     _recent_n = int(_ir.get("recent_n", 4))
     _retrieve_n = int(_ir.get("retrieve_n", 3))
     _feed_n = int(_ir.get("feed_n", 3))
-    lines = [_header(labeling_mode, open_actions, city_name, explicit_nothing),
+    lines = [_header(labeling_mode, open_actions, city_name, explicit_nothing,
+                     verify_actions),
              agent.persona]
     # 群のオントロジー(文化圏×経験の「経験の事実」1行。ontology 有効時のみ agent に設定される。
     # 文言は config 由来=基盤に文化名リテラルなし。OFF は属性なし=行なし=バイト一致)。
@@ -383,6 +399,7 @@ KNOWN_ACTIONS = frozenset({
     "open_venture",
     "move_home", "buy", "study", "propose_partnership", "break_up",
     "do", "free", "activity",
+    "verify", "check", "confirm",
     "plan", "wander", "recall", "reflect",
     *_NOTHING_ACTIONS,
 })
@@ -541,6 +558,13 @@ def parse_action(response: str) -> dict | None:
                     "minutes": max(10, min(240, minutes)),
                     "value_report": data.get("value")}
         return None
+    if kind in ("verify", "check", "confirm"):   # 検証行動(第73バッチ Part B)。OFF 時は提示
+        # されないだけで解釈は常に受ける=寛容(P2 の move_home / do と同じ流儀)。裁定
+        # (どの fact を指すか・確かめられるか)は engine 側 = ここは値を素通しするだけで、
+        # **真偽台帳の中身には一切触れない**(cognition は台帳を import しない)。
+        return {"type": "verify",
+                "about": _text_of("about", "what", "topic", "text", "content") or "",
+                "how": _text_of("how", "method", "way", "channel") or ""}
     if kind == "plan":                   # 朝の一日計画(cognition/planning.py が消費)
         items = [it for it in (data.get("items") or []) if isinstance(it, dict)]
         if items:

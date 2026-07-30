@@ -1483,6 +1483,11 @@ class Simulation:
                 json.dumps(self._agents_json_records(), ensure_ascii=False),
                 encoding="utf-8")
         save_config(self.cfg, self.out_dir)
+        # 第73バッチ Part B: 真偽台帳をサイドカー(beliefs_ledger.json)へ書き出す。
+        # **L1 には真値を出さない**(L1 の消費経路へ紛れ込む余地を構造的に断つ)。
+        # beliefs OFF のランでは 1 ファイルも作らない=既存ランの出力一式とバイト一致。
+        from .. import truth_ledger as _truth_ledger
+        _truth_ledger.dump(self)
         kinds = self.logger.total_event_kinds()
         summary = {
             "n_agents": len(self.agents),

@@ -36,6 +36,7 @@ from .. import services as services_mod
 from .. import status as status_mod
 from .. import street as street_mod
 from .. import transit_live as transit_live
+from .. import truth_ledger as truth_ledger_mod
 from .. import work as work_mod
 from .. import worldview as worldview_mod
 from ..net import infoenv as infoenv_mod
@@ -1929,6 +1930,9 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
                                      explicit_nothing=bool(
                                          getattr(sim, "freedomcfg", None)
                                          and sim.freedomcfg.get("explicit_nothing")),
+                                     # 検証行動(第73バッチ Part B)。渡すのは bool 1 個だけ
+                                     # =真偽台帳の値・ID・文字列は build_prompt へ到達しない。
+                                     verify_actions=truth_ledger_mod.verify_actions_on(sim),
                                      p2_offers=p2_offers,
                                      dialog_history=dialog_history)
     rng_key = f"deliberate/{agent.id}/{step}"
@@ -2377,6 +2381,13 @@ def _apply(sim, agent, action: dict, step: int, sim_min: int) -> None:
     if kind in ("move_home", "buy", "study", "propose_partnership", "break_up"):
         # 生活の自己決定 P2(D3)。該当項目が OFF や解釈不能では静かに無視(=wander 相当)。
         _apply_p2(sim, agent, action, step, sim_min)
+        return
+
+    if kind == "verify":
+        # 検証行動(第73バッチ Part B)。beliefs.verify_actions OFF では静かに無視
+        # (=wander 相当)= 既定 OFF のイベント 0 件・状態変化ゼロ。裁定は truth_ledger に
+        # 閉じる(engine は真偽台帳の中身を読まない=呼ぶだけ)。LLM 呼ゼロ・乱数ゼロ。
+        truth_ledger_mod.apply_verify(sim, agent, action, step, sim_min)
         return
 
     if kind == "stay":
@@ -3583,6 +3594,17 @@ def _phase_gossip(sim, step: int, sim_min: int) -> None:
 
 
 # ---------------------------------------------------------------- 世帯・恋愛(後続波 H2)
+def _phase_beliefs(sim, step: int, sim_min: int) -> None:
+    """真偽台帳ミニマル(第73バッチ Part B)。既定 OFF=完全 no-op。
+
+    beliefs 無効なら 1 バイトも変わらない(fact/belief/イベント 0 件・新フィールド無し・
+    乱数ゼロ)。ロジックは truth_ledger.py(src/society 直下=CHECKED_DIRS 外=no-fingerprint
+    契約に触れない層)に閉じる。engine は**台帳の中身を読まない**(呼ぶだけ)。
+    位置と発話が確定した _apply の後・collect(L2)の前に置く=当日の世界イベントと発話を
+    同 step のうちに取り込み、L2 スカラーへ即反映する(gossip と同じ配置の流儀)。"""
+    truth_ledger_mod.phase(sim, step, sim_min)
+
+
 def _household_on(sim) -> bool:
     """世帯・家族・恋愛(後続波 H2)が有効か。既定 OFF=新経路を一切通さない(バイト一致)。"""
     cfg = getattr(sim, "householdcfg", None)
@@ -4526,6 +4548,8 @@ def run_step(sim, step: int) -> None:
     _phase_org_accumulate(sim, step, sim_min)      # 会社観測データ層 B4: 当日の office 在席頭数/ミクロ在席分を積む(既定OFF=no-op)
     _phase_gossip(sim, step, sim_min)              # 負の評判の内生伝播: 種スキャン+種/伝播/忘却(既定OFF=no-op。第61バッチ c)。
                                                    # infoenv(誤情報)確定後・collect(L2)前=当日の負イベントを同 step でスキャン
+    _phase_beliefs(sim, step, sim_min)             # 真偽台帳: fact 抽出→直接目撃→伝聞→現場確認(既定OFF=no-op。第73バッチ B)。
+                                                   # _apply 後=この step の発話・世界イベントを同 step で取り込む / collect(L2)前
 
     _bl = (sim.cfg.get("engine", {}) or {}).get("batch_llm", {}) or {}
     if bool(_bl.get("enabled", False)):

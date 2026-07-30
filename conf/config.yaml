@@ -1823,6 +1823,51 @@ gossip:
   joint_penalty: 0.15          # 悪評を知る相手を共同行動に誘う確率の低下幅
   status_weight: 0.1           # 被知覚数(/N)を status の負項に反映する重み(既定=効果最小)
 
+# ---- 真偽台帳ミニマル(第73バッチ Part B。2026-07-31。既定 OFF=現行挙動と完全同一)----------
+# 正典 docs/plans/source/dual-mode-instruments.md Part B / dual-mode-observe-verify-plan.md §1.3 訂正3。
+# 狙い: このシミュレーションで最も強い人工オラクル=「実際に何が起きたか」を世界の内部が知っていること。
+#   ① 真偽台帳(ground truth)= 既存の L1 イベントから決定論で fact を抽出(fact_kinds マップ=データ駆動。
+#      コードに固有名詞を書かない)。ID・発生step・場所・真値・直接目撃可能条件(半径×時間窓)を持つ。
+#      ★台帳は**エージェント絶対不可視**: プロンプトには 1 バイトも入らない。実装 src/society/truth_ledger.py
+#      は src/society 直下 = cognition から import されない(tests が静的に固定)+ 全プロンプトに canary 検査。
+#   ② 信念状態 = agent×fact の 値/確信度/情報源/取得step/検証済み/親ノード(= 伝播木が事後に構成できる)。
+#      取得経路は 直接目撃(位置ログの決定論判定)と 伝聞(既存 speak/dm に乗る・話題の一致判定は部分文字列)。
+#      変形は**ホップ数による無情報 0.5 へのドリフト + 確信度減衰**だけ(凝った変形モデルは入れない)。
+#   ③ 検証行動 3 種(verify_actions=true のときだけ行動空間に中立 1 行)。誘導文言は書かない
+#      (誰が確かめに行くかが観測対象そのもの)。LLM 呼は 1 本も足さない(既存応答のパースで受理)。
+# OFF 時: fact/belief/belief_* イベント 0 件・L2 に belief_* 列を足さず・プロンプト不変・乱数消費ゼロ
+#   =イベント列がバイト一致(ゴールデン golden_baseline_l1.json を守る)。
+# 真値そのものは L1 に出さない(runs/<name>/beliefs_ledger.json のサイドカーに分離)。解析 scripts/analyze_beliefs.py。
+beliefs:
+  enabled: false                # ★ON はユーザー判断(観察ランでの信念計測。fact 種は下のマップ次第)
+  verify_actions: false         # 「確かめる」を行動空間に追加(要 enabled=true。全発火プロンプトへ中立1行)
+  # 台帳の供給源: L1 の event kind → fact 仕様(★ dotlist 上書きは OmegaConf の仕様でマップが
+  #   **merge** される=種を減らしたいときは profile YAML 側でブロックごと置き換えること)
+  #   topic_key … 話題トークンに使う payload キー(場所名に加えて1個)
+  #   value_key/value_scale … 真値に使う数値 payload キーと正規化除数(無ければ定数 value=1.0)
+  #   radius_m  … 目撃半径の上書き(<=0 は市域全体)/ window … 目撃可能な時間窓 [step, step+window)
+  fact_kinds:
+    event_host:   {topic_key: title}          # 組織/集合(payload に node=会場・start_step。場所と時刻が確定)
+    venture_open: {topic_key: name}           # 経済/出店(payload に node。「そこに店が出た」= 現場で確かめられる)
+    flyer_post:   {}                          # 情報物の掲示(payload に node)
+    group_found:  {topic_key: name}           # 組織の結成(座標が確定=結成者の位置)
+    crime:        {topic_key: kind}           # 治安(座標が確定=被害の現場)
+    stock_out:    {topic_key: poi}            # 経済/欠品(poi は POI 名。座標は客の位置)
+    price_change: {topic_key: cat, value_key: ratio, value_scale: 2.0}  # 経済/価格急変(真値が連続量)
+    disaster:     {topic_key: kind, radius_m: 0}  # 外生ショック(市域全体=その場に居る全員が目撃しうる)
+  witness_radius_m: 60.0        # 直接目撃の半径 [m](発生地点からこの距離以内)
+  witness_window: 6             # 直接目撃の時間窓 [step](6 step = 1 時間)
+  fact_ttl_steps: 288           # これより古い fact は伝聞に乗らない(鮮度 = 2 日)
+  max_facts_per_utterance: 2    # 1 発話で伝わる fact 数の上限(地名の過剰一致に対する安全弁)
+  max_beliefs_per_agent: 32     # 1 人が保持する信念数の上限(古い取得順に捨てる=有界)
+  min_topic_len: 2              # 話題トークンの最小長(1 文字は雑音)
+  hop_drift: 0.15               # 1 ホップごとに真値から無情報 0.5 へ寄る率(唯一の変形モデル)
+  conf_decay: 0.8               # 1 ホップごとの確信度の減衰係数
+  min_conf: 0.05                # これを下回る確信度は伝えない(噂が自然に消える)
+  verify_deadline_steps: 36     # 現場確認(go)の有効期限 [step](6 時間)
+  net_conf: 0.7                 # ネット裏取りで得る確信度(公開記録=真値だが直接目撃より弱い)
+  ask_conf: 0.9                 # 目撃者に聞いて得る確信度の上限
+
 # ---- 来街者 party の実体化(関係性パッケージ完結 第45バッチ S-R5。ユーザー要望 2026-07-21。既定 OFF=現行挙動と完全同一)----
 # プールの L4 来街者 record に party_size 1-5(build_persona_pool.py=同行人数)が実在するが sim 内で未使用
 # だった。本ブロックは present な来街者を party_size でグループ化=「同席の連れ」にする: 同一初期ノードへ寄せ・

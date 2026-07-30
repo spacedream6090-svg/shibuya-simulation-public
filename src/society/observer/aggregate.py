@@ -6,6 +6,7 @@ from typing import Any, Callable
 from .. import gossip as _gossip
 from .. import relations_endo as _rendo
 from .. import status as _status_mod
+from .. import truth_ledger as _truth
 from . import assets as _assets
 from . import deviation as _dev
 from . import echo as _echo
@@ -982,6 +983,40 @@ def _silent_agent_rate(sim):
 @register_aggregator("chosen_nothing_rate")
 def _chosen_nothing_rate(sim):
     return _silence_col(sim, "chosen_nothing_rate")
+
+
+# ---- 真偽台帳ミニマル 第73バッチ Part B(既定 OFF)。beliefs.enabled=false は全て None=
+#      列なし=L2 不変(gossip/echo/silence 列と同型)。読むだけ・乱数ゼロ・LLM 呼ゼロ。
+#      定義と正直な限界は truth_ledger.py の docstring を参照(真値は 1 次元スカラー・
+#      変形はホップ数のみ・話題一致は部分文字列)。
+def _belief_col(sim, key):
+    s = _truth.scalars(sim)
+    return s.get(key) if s else None
+
+
+@register_aggregator("belief_facts_total")
+def _belief_facts_total(sim):
+    return _belief_col(sim, "belief_facts_total")
+
+
+@register_aggregator("belief_distance_mean")
+def _belief_distance_mean(sim):
+    return _belief_col(sim, "belief_distance_mean")
+
+
+@register_aggregator("belief_verified_rate")
+def _belief_verified_rate(sim):
+    return _belief_col(sim, "belief_verified_rate")
+
+
+@register_aggregator("belief_hop_mean")
+def _belief_hop_mean(sim):
+    return _belief_col(sim, "belief_hop_mean")
+
+
+@register_aggregator("belief_holders_mean")
+def _belief_holders_mean(sim):
+    return _belief_col(sim, "belief_holders_mean")
 
 
 def collect(sim) -> dict:

@@ -262,6 +262,17 @@ FEATURES: tuple[Feature, ...] = (
     _f("freedom.p2.deviance", "journal", False, "possible",
        "生活の自己決定: 軽微な逸脱(無許可出店)"),
 
+    # ---- beliefs(真偽台帳 第73バッチ Part B)----
+    # journal 等級の根拠: 伝聞の発火判定が **LLM の自由文(発話テキスト)を消費する**
+    # (話題の一致判定の入力が speak/dm の本文)。判定規則そのものは決定論で、入力は
+    # L1 と llm_journal に残るので事後に再生できる = journal(none ではない)。
+    _f("beliefs.enabled", "journal", False, "none",
+       "真偽台帳(世界の事実を決定論で fact 化)+信念状態+伝播木。台帳はエージェント不可視"
+       "(プロンプトに 1 バイトも足さない=fingerprint_risk は none)"),
+    _f("beliefs.verify_actions", "journal", False, "possible",
+       "『確かめる』(現場go/人にask/ネットnet)を行動空間へ追加する。全発火プロンプトへ"
+       "中立な 1 行(fact に依存しない固定文字列)を足すので possible"),
+
     # ---- worldview / ontology ----
     _f("worldview.enabled", "strict", False, "possible",
        "主観的世界モデル(期待・可制御性・記述規範を状態から決定論導出)"),

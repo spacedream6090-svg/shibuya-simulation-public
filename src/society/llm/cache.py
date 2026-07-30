@@ -22,6 +22,7 @@ import json
 from pathlib import Path
 
 from .base import LLMBackend
+from ..truth_ledger import check_prompt as _check_ledger_leak
 
 CACHE_MODES = ("free", "replay")
 
@@ -90,6 +91,10 @@ class CachedLLM:
     def generate(self, prompt: str, *, rng_key: str, temperature: float,
                  max_tokens: int, think: bool = False) -> tuple[str, str, bool]:
         """(response, call_id, cached) を返す。"""
+        # 第73バッチ Part B: 真偽台帳の漏洩に対する**実行時アサーション**。全 LLM 呼び出しが
+        # 通る唯一の関門なので、ここに置けばプロンプト構築経路のどこで混入しても捕まる。
+        # 台帳が 1 件も無い(= beliefs OFF)間は 1 命令で return する = 既定ランのコストはゼロ。
+        _check_ledger_leak(prompt, where=f"generate rng_key={rng_key}")
         self.calls += 1
         key = self._key(prompt, temperature, max_tokens, think)
         if self.enabled and key in self._mem:
@@ -131,6 +136,8 @@ class CachedLLM:
         ジャーナルはフェーズ3の後に**要求順**で書く(逐次 generate と同じ並びになる)。
         """
         n = len(requests)
+        for r in requests:                  # 第73 Part B: 台帳漏洩の実行時アサーション(既定はゼロコスト)
+            _check_ledger_leak(r["prompt"], where=f"generate_many rng_key={r['rng_key']}")
         results: list[tuple[str, str, bool] | None] = [None] * n
         self.calls += n
         # --- フェーズ1(逐次): キャッシュ解決と未命中の列挙(初出順) ---

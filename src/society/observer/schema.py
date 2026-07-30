@@ -270,6 +270,17 @@ register_event_kind("place_label_bind", "造語がその発生ノードへ束縛
 register_event_kind("undefined_action", "enum 外だが構文としては行動を主張している LLM 出力(行動空間の拡張の痕跡){action, keys, text, trigger}")
 # ★ 沈黙の第一級化(freedom.explicit_nothing ON のみ)は既存 kind "stay" を再利用する
 #   (payload に reason:"chosen_nothing" が付く。既定 OFF では stay イベントは 1 件も出ない)。
+# ---- 真偽台帳ミニマル 第73バッチ Part B(beliefs.enabled ON のみ・既定 OFF=0件。全決定論・
+#      乱数ゼロ(新 stream なし)・LLM/generate ゼロ増・プロンプトは verify_actions の 1 行のみ。
+#      実装 src/society/truth_ledger.py。設計 docs/plans/source/dual-mode-instruments.md Part B)。
+#      ★ 真値(ground truth)そのものは L1 に出さない: 台帳は runs/<name>/beliefs_ledger.json
+#        (サイドカー)に分離してある。ここに出るのは**エージェントが持っている信念**だけ。
+register_event_kind("belief_update",   "信念の獲得・更新(親ノードつき=伝播木が事後に構成できる)"
+                                       "{fact, fact_kind, value, conf, src, from, hop, cause, verified}")
+register_event_kind("belief_transmit", "伝聞の送出(話題が一致した発話に乗って聞き手へ伝わった)"
+                                       "{fact, fact_kind, to, channel, hop, topic, conf}")
+register_event_kind("belief_verify",   "検証行動(現場go/当事者ask/ネットnet)の実行と根拠"
+                                       "{fact, fact_kind, how, about, match, outcome, evidence?}")
 
 
 @dataclass
