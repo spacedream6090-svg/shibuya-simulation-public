@@ -94,10 +94,14 @@ STRUCT_METRICS = STRUCT_SERIES + ("stagnant_days",)
 # 1定数追記で _l2_kpi_daily→kpi 集計→レポートへ載る)。endogenous_invite OFF のランには列自体が
 # 無く自動で欠測(None)扱い=既存 accept 実験の解析はバイト不変。
 # フェーズ4(第65バッチ)の quality 1列も同じ理由で接続(列が無いラン=OFF は自動で欠測扱い)。
+# 第70バッチ(IDEA①)のエコー 3 列も同じ配線で接続する。これらは **常設列** なので全ランに
+# 存在するが、observer.echo.enabled=false のランでは列が無く自動で欠測扱い(既存解析はバイト不変)。
+# 目的は「条件間で伝播 KPI が動いた」ときに、それが LLM の反復癖の差ではないことを同じ表で示すこと。
 KPI_COLS = ("joint_accept_rate", "joint_endo_share",
             "joint_accept_calib_gap", "joint_fulfill_rate",
             "invite_weak_tie_rate", "invite_endo_share",
-            "quality_magnitude_mean")
+            "quality_magnitude_mean",
+            "echo_max", "self_similarity_mean", "transmission_novel_rate")
 PRIMARY_METRIC = "edge_churn_rate"        # H1/H3 の主指標(計画書§3)
 
 

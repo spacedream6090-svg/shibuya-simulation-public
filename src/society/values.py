@@ -151,6 +151,13 @@ def build_cfg(raw: dict | None) -> dict:
         "max_minutes": int(raw.get("max_minutes", 240)),
         "mods_lo": float(raw.get("mods_lo", 0.7)),
         "mods_hi": float(raw.get("mods_hi", 1.5)),
+        # 第70バッチ IDEA②(既定 全 False=ヘッダ・イベント・L2 ともバイト一致)。
+        # undefined_register: enum 外の行動主張を `undefined_action` として記録する(パース後の
+        #   振り分けのみ=プロンプト不変・LLM 呼数不変・乱数ゼロ)。
+        # explicit_nothing: 「何もしない」をヘッダに 1 行だけ足す(open_actions の "do" と同型)+
+        #   `stay{reason:"chosen_nothing"}` の記録を開く。
+        "undefined_register": bool(raw.get("undefined_register", False)),
+        "explicit_nothing": bool(raw.get("explicit_nothing", False)),
         "p2": _build_p2(raw.get("p2")),
     }
 

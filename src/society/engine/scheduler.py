@@ -1926,6 +1926,9 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
                                      labeling_mode=sim.labels.mode,
                                      open_actions=bool(getattr(sim, "freedomcfg", None)
                                                        and sim.freedomcfg["open_actions"]),
+                                     explicit_nothing=bool(
+                                         getattr(sim, "freedomcfg", None)
+                                         and sim.freedomcfg.get("explicit_nothing")),
                                      p2_offers=p2_offers,
                                      dialog_history=dialog_history)
     rng_key = f"deliberate/{agent.id}/{step}"
@@ -1940,12 +1943,36 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
                          llm_call_id=call_id, payload={"trigger": trigger}))
     action = deliberate.parse_action(response)
     if action is None:                             # D16: 壊れたら沈黙して続行
-        sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
-                             kind="fallback", x=agent.x, y=agent.y,
-                             payload={"reason": "parse_error"}))
+        _log_reject(sim, agent, response, trigger, step, sim_min)
     else:
         deliberate.store_action(sim, agent, step, sim_min, trigger, action)
     return action
+
+
+def _log_reject(sim, agent, response: str, trigger: str,
+                step: int, sim_min: int) -> None:
+    """パース不成立の記録。既定は従来どおり `fallback{reason:"parse_error"}` 1 件。
+
+    未定義行動レジスタ(第70バッチ IDEA②・freedom.undefined_register=true)のときだけ、
+    「JSON は読めて "action" もあるが既知動詞のどれでもない」出力を `fallback` **ではなく**
+    `undefined_action` として記録する(= 行動空間の外へ出ようとした痕跡を捨てない)。
+    振り分けなので分子は排他 = `llm_fallback_rate + undefined_action_rate` が旧
+    `llm_fallback_rate` に一致する(保存則)。既定 OFF は 1 バイトも変わらない。
+    乱数ゼロ・LLM 呼ゼロ・プロンプト不変。
+    """
+    fcfg = getattr(sim, "freedomcfg", None)
+    if fcfg is not None and fcfg.get("undefined_register"):
+        reason, info = deliberate.classify_reject(response)
+        if reason == "unknown_action":
+            payload = dict(info)
+            payload["trigger"] = trigger
+            sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                                 kind="undefined_action", x=agent.x, y=agent.y,
+                                 payload=payload))
+            return
+    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                         kind="fallback", x=agent.x, y=agent.y,
+                         payload={"reason": "parse_error"}))
 
 
 # ---------------------------------------------------------------- 対照: null 系列
@@ -2350,6 +2377,20 @@ def _apply(sim, agent, action: dict, step: int, sim_min: int) -> None:
     if kind in ("move_home", "buy", "study", "propose_partnership", "break_up"):
         # 生活の自己決定 P2(D3)。該当項目が OFF や解釈不能では静かに無視(=wander 相当)。
         _apply_p2(sim, agent, action, step, sim_min)
+        return
+
+    if kind == "stay":
+        # 沈黙の第一級化(第70バッチ IDEA②)。stay は従来どおり何もしない(=この分岐が無くても
+        # 下の if 連鎖はすべて外れて no-op に落ちる)。「関わらないことを選んだ」という**意思表示**
+        # だけを、freedom.explicit_nothing=true のときに 1 件記録する。既定 OFF ではイベント 0 件
+        # =従来の stay と完全同一(ゴールデン L1 バイト一致)。乱数ゼロ・LLM 呼ゼロ。
+        fcfg = getattr(sim, "freedomcfg", None)
+        if (action.get("reason") == "chosen_nothing"
+                and fcfg is not None and fcfg.get("explicit_nothing")):
+            sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                                 kind="stay", x=agent.x, y=agent.y,
+                                 payload={"reason": "chosen_nothing",
+                                          "node": agent.node}))
         return
 
     if kind == "go_to_bed":

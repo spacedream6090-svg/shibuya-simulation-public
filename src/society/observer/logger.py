@@ -46,6 +46,10 @@ class ObserverLogger:
         self.n_fallback_events: int = 0     # L1 kind="fallback"(発話系のパース失敗)の累計
         self.n_llm_rows: int = 0            # L1b 行(= LLM 呼び出し)の累計
         self.n_llm_cached: int = 0          # うちキャッシュ命中の累計
+        # ---- 未定義行動レジスタ(第70バッチ IDEA②)の O(1) 累積カウンタ ----
+        # fallback と**排他**(scheduler._log_reject がどちらか片方だけを出す)。
+        # 出力には現れない内部カウンタ = 既定 OFF なら 0 のまま・L1/L2 ともバイト一致。
+        self.n_undefined_action_events: int = 0
 
     # ---- L1 ----
     def log(self, event: Event) -> None:
@@ -56,6 +60,8 @@ class ObserverLogger:
             )
         if event.kind == "fallback":       # LLM 健全性 KPI(文字列比較1回だけ=ホットパス影響最小)
             self.n_fallback_events += 1
+        elif event.kind == "undefined_action":     # 未定義行動レジスタ(既定 OFF では 0 件)
+            self.n_undefined_action_events += 1
         self.events.append(event)
 
     # ---- L1b ----

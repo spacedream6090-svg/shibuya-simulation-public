@@ -36,14 +36,21 @@ _DO_LINE = (
     '"where": "する場所の名前(任意)", "minutes": 30, '
     '"value": ["実用/感情/社会/認識 のうち自分が感じるもの(任意)"]}\n'
 )
+# 沈黙の第一級化(第70バッチ IDEA②・freedom.explicit_nothing=true のときのみ足す1行。
+# 既定 OFF=ヘッダ不変)。中立提示: 勧めない・理由も推奨も書かない(_DO_LINE と同じ流儀)。
+# 括弧内は wander(ぶらつく)との違いを示す**記述**のみ(評価語・推奨語を含めない)。
+_NOTHING_LINE = (
+    '  {"action": "nothing"}(何もしない・誰とも関わらない)\n'
+)
 
 
 def _header(labeling_mode: str, open_actions: bool = False,
-            city_name: str = "") -> str:
+            city_name: str = "", explicit_nothing: bool = False) -> str:
     coin = _COIN_LINE.get(labeling_mode, _COIN_LINE["constrained"])
     do = _DO_LINE if open_actions else ""
+    nothing = _NOTHING_LINE if explicit_nothing else ""
     head = _HEADER_INTRO.format(city=city_name) + _HEADER_FORMS
-    return head + coin + _HEADER_TAIL + do
+    return head + coin + _HEADER_TAIL + do + nothing
 
 
 # ヘッダの構造ベースライン(街名は呼び出し時に注入=ここでは空)。後方互換の基準。
@@ -135,6 +142,7 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
                  labeling_mode: str = "constrained",
                  open_actions: bool = False,
                  city_name: str = "",
+                 explicit_nothing: bool = False,
                  p2_offers: str | None = None,
                  dialog_history: list | None = None) -> str:
     """個別文脈(時刻・場所・活動・気分・記憶・直近発話)を渡し、内容の固定化を防ぐ。
@@ -142,7 +150,9 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
     pull_query が渡された時だけ(agentic_pull=true)、その文で決定論の記憶想起を
     1回行い1行注入する。LLM 呼び出しは増やさない(発火時の pull はここに集約)。
     labeling_mode(constrained 既定 / open)はヘッダの coin_label 行のみを差し替える。
-    open_actions(第17バッチ・既定 False)は開放行動 "do" の1行だけをヘッダ末尾に足す。"""
+    open_actions(第17バッチ・既定 False)は開放行動 "do" の1行だけをヘッダ末尾に足す。
+    explicit_nothing(第70バッチ・既定 False)は「何もしない」の1行だけをヘッダ末尾に足す
+    (open_actions と完全同型の seam。既定 OFF ではヘッダがバイト一致)。"""
     # 入力解像度LOD(第30バッチ・lod.input_res)。OFF=属性なし → 既定値=現行定数で
     # バイト一致。ON でも変わるのは注入の「件数」だけ(呼数・乱数・発火は不変=R1)。
     # beliefs(k の行動流入路 D7)と全員共通行は解像度の対象外(docs/plans/input-resolution-lod.md §2)。
@@ -152,7 +162,8 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
     _recent_n = int(_ir.get("recent_n", 4))
     _retrieve_n = int(_ir.get("retrieve_n", 3))
     _feed_n = int(_ir.get("feed_n", 3))
-    lines = [_header(labeling_mode, open_actions, city_name), agent.persona]
+    lines = [_header(labeling_mode, open_actions, city_name, explicit_nothing),
+             agent.persona]
     # 群のオントロジー(文化圏×経験の「経験の事実」1行。ontology 有効時のみ agent に設定される。
     # 文言は config 由来=基盤に文化名リテラルなし。OFF は属性なし=行なし=バイト一致)。
     onto = getattr(agent, "ontology_line", None)
@@ -360,6 +371,62 @@ def _loads_lenient(response: str) -> dict | None:
     return None
 
 
+# 沈黙の第一級化(第70バッチ IDEA②)。「関わらない/何もしない」の受理動詞(常に寛容受理)。
+_NOTHING_ACTIONS = ("nothing", "none", "do_nothing", "idle")
+
+# parse_action が解釈できる動詞の全集合(未定義行動レジスタの判定に使う単一の源)。
+# ★ parse_action に分岐を足したらここにも足すこと(tests/test_undefined_action.py が
+#   「既知動詞は unknown_action に落ちない」を機械的に固定して同期ズレを検知する)。
+KNOWN_ACTIONS = frozenset({
+    "speak", "coin_label", "post", "dm",
+    "host_event", "post_flyer", "found_group", "propose", "job_search",
+    "open_venture",
+    "move_home", "buy", "study", "propose_partnership", "break_up",
+    "do", "free", "activity",
+    "plan", "wander", "recall", "reflect",
+    *_NOTHING_ACTIONS,
+})
+
+
+def classify_reject(response: str) -> tuple[str, dict]:
+    """`parse_action` が None を返した理由を分類する(第70バッチ IDEA①=観測専用)。
+
+    既存の戻り値契約(parse_action)は**一切変えない**ので呼び出し側の分岐を壊さない。
+    副作用ゼロ・乱数ゼロ・LLM 呼ゼロ・完全決定論。
+
+    返り値 (reason, info):
+      "broken_json"    … JSON として読めない(トークン切れ・非 dict)。従来どおり fallback。
+      "missing_field"  … JSON は読めたが "action" が無い、または既知動詞なのに必須欄が空。
+                          従来どおり fallback。
+      "unknown_action" … **enum 外だが構文としては行動を主張している**(dict で "action" があり、
+                          その値が既知動詞のどれでもない)。= 行動空間の外へ出ようとした痕跡。
+    info は "unknown_action" のときだけ中身を持つ:
+      {"action": 動詞名(40字まで), "keys": トップレベルのキー名(12個・各24字まで),
+       "text": 最初の非空文字列値の要約(120字まで)}
+    発話本文は既存の speak/post/dm イベントに載る**別経路**があるが、未定義行動の内容は
+    どこにも残っていないため、ここでだけ要約を残す(二重化ではない)。
+    """
+    data = _loads_lenient(response)
+    if not isinstance(data, dict):
+        return "broken_json", {}
+    if "action" not in data:
+        return "missing_field", {}
+    kind = data["action"]
+    name = kind.strip() if isinstance(kind, str) else str(kind)
+    if name in KNOWN_ACTIONS:
+        return "missing_field", {}
+    keys = sorted(str(k) for k in data if k != "action")
+    text = ""
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            text = value.strip()
+            break
+    return "unknown_action", {"action": name[:40],
+                              "keys": [k[:24] for k in keys[:12]],
+                              "text": text[:120]}
+
+
 def parse_action(response: str) -> dict | None:
     """JSON を解釈。壊れていたら None(→呼び出し側が routine へフォールバック)。"""
     data = _loads_lenient(response)
@@ -481,6 +548,10 @@ def parse_action(response: str) -> dict | None:
         return None
     if kind == "wander":
         return {"type": "stay"}
+    if kind in _NOTHING_ACTIONS:         # 沈黙の第一級化(第70バッチ IDEA②)。OFF 時は提示
+        # されないだけで解釈は常に受ける=寛容(P2 の move_home 等と同じ流儀)。wander(ぶらつく)
+        # と区別できるよう reason を載せる(L1 へ出すか否かは scheduler が explicit_nothing で決める)。
+        return {"type": "stay", "reason": "chosen_nothing"}
     if kind == "recall":                 # 内省の agentic pull 第1段(何を思い出すか)
         return {"type": "recall",
                 "query": _text_of("query", "text", "content") or ""}

@@ -30,6 +30,14 @@ _KNOWN_TRAITS = (
 )
 # 個人間の「会話/伝播」とみなすチャネル
 _SOCIAL_CHANNELS = {"face", "sns", "dm"}
+# エコー/自己反復の既定パラメータ(第70バッチ IDEA①。conf の observer.echo と同値)。
+# ランタイム(observer/echo.py)と事後解析でパラメータの単一の源を分けないための定数。
+ECHO_WINDOW_STEPS = 144
+ECHO_NGRAM = 4
+ECHO_SIM_THRESHOLD = 0.6
+ECHO_MIN_UTTERANCES = 2
+# 発話とみなすイベント種(payload["text"] を持つ 3 種)
+_UTTERANCE_KINDS = ("speak", "sns_post", "dm")
 
 
 # --------------------------------------------------------------------------- #
@@ -483,38 +491,204 @@ def agent_features(events: list[dict], agents_meta: list[dict] | None = None,
 # --------------------------------------------------------------------------- #
 # item カスケード
 # --------------------------------------------------------------------------- #
-def item_cascades(events: list[dict]) -> list[dict]:
-    """item ごとに size / adopters / depth / channel_mix / t_half を返す。"""
+def item_cascades(events: list[dict],
+                  echo_window_steps: int = ECHO_WINDOW_STEPS) -> list[dict]:
+    """item ごとに size / adopters / depth / channel_mix / t_half を返す。
+
+    第70バッチ IDEA①: 既存キーは 1 バイトも変えずに `size_novel`(= size から
+    「同一話者による同一語の窓内再送出」を除いた件数)と `echo_share`
+    (= 1 − size_novel/size)を**並記**する(ID-U3: 既存列は不変・新列で並べる)。
+    """
     creator, media = _item_creators(events)
     trans: dict[str, list] = defaultdict(list)   # iid -> [(step, from, to, channel)]
     edges: dict[str, set] = defaultdict(set)     # iid -> {(from, to)}
+    novel: Counter = Counter()                   # iid -> エコー除外後の伝播件数
+    last_emit: dict[tuple, int] = {}             # (from, iid) -> 直近送出 step
     for e in _ordered(events):
         if e["kind"] == "transmission":
             p = e["payload"]
             iid = p.get("item_id")
             if iid is None:
                 continue
-            trans[iid].append((e["step"], p.get("from"), e["agent_id"],
-                               p.get("channel")))
-            edges[iid].add((p.get("from"), e["agent_id"]))
+            s, frm = int(e["step"]), p.get("from")
+            trans[iid].append((e["step"], frm, e["agent_id"], p.get("channel")))
+            edges[iid].add((frm, e["agent_id"]))
+            prev = last_emit.get((frm, iid))
+            # from < 0(メディア発)は「話者の自己反復」ではないので常に新規扱い。
+            if not (isinstance(frm, int) and frm >= 0 and prev is not None
+                    and s - prev < echo_window_steps):
+                novel[iid] += 1
+            last_emit[(frm, iid)] = s
 
     out: list[dict] = []
     for iid in sorted(set(creator) | set(trans)):
         tl = trans.get(iid, [])
         adopters = sorted({to for (_, _, to, _) in tl
                            if isinstance(to, int) and to >= 0})
+        size = len(tl)
+        n_novel = int(novel.get(iid, 0))
         out.append({
             "item_id": iid,
             "creator": creator.get(iid),
             "media": iid in media,
-            "size": len(tl),
+            "size": size,
             "n_adopters": len(adopters),
             "adopters": adopters,
             "depth": _tree_depth(edges.get(iid, set())),
             "channel_mix": dict(Counter(ch for (_, _, _, ch) in tl)),
             "t_half": _t_half(tl),
+            "size_novel": n_novel,
+            "echo_share": round(1.0 - n_novel / size, 6) if size else 0.0,
         })
     return out
+
+
+# --------------------------------------------------------------------------- #
+# エコー/自己反復(第70バッチ IDEA①)の事後算出。ランタイム L2(observer/echo.py)と
+# **同じ定義**を、保存済み L1 イベント列に対して再現する純関数。
+#
+#   エコー発話 … 窓内で完全同一文の再出 **または** 直前の自分の発話との文字 n-gram
+#                 Jaccard が閾値以上(= 微妙な言い換えでの同テーマ連投)
+#   新規伝播   … transmission のうち「同一話者による同一語の窓内再送出」を除いたもの
+#                 (他者からの再伝播は落とさない = 本来の伝播は保存される)
+#   新規採用   … label_adopt のうち、その語を**相異なる 2 人以上**から聞いていたもの
+#                 (現行の adopt_threshold は延べ聴取回数で数えるので、1 人が 2 回
+#                  繰り返しただけでも採用が成立しうる。その分を分子から外す)
+# 既存の列・関数の出力は 1 バイトも変えない(ID-U3: 新列として並記する方針)。
+# --------------------------------------------------------------------------- #
+def _echo_ngrams(text: str, n: int) -> set:
+    if not text:
+        return set()
+    if len(text) < n:
+        return {text}
+    return {text[i:i + n] for i in range(len(text) - n + 1)}
+
+
+def _echo_jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    union = a | b
+    return len(a & b) / len(union) if union else 0.0
+
+
+def echo_accumulator(window_steps: int = ECHO_WINDOW_STEPS,
+                     ngram: int = ECHO_NGRAM,
+                     sim_threshold: float = ECHO_SIM_THRESHOLD,
+                     min_utterances: int = ECHO_MIN_UTTERANCES) -> dict:
+    """echo_novelty の 1 パス集計状態(stream 版と実装を共有するための素材)。"""
+    return {
+        "cfg": {"window_steps": int(window_steps), "ngram": int(ngram),
+                "sim_threshold": float(sim_threshold),
+                "min_utterances": int(min_utterances)},
+        "utt_by_agent": defaultdict(Counter),   # agent -> Counter[text](ラン全体)
+        "last_text": {},                        # (agent, text) -> 直近 step(窓判定用)
+        "last_utt": {},                         # agent -> (step, text)
+        "last_emit": {},                        # (from, item) -> 直近 step
+        "senders": defaultdict(set),            # (listener, item) -> {送り手}
+        "n_utt": 0, "n_echo": 0, "sim_sum": 0.0, "sim_n": 0,
+        "n_trans": 0, "n_trans_novel": 0, "n_adopt": 0, "n_adopt_novel": 0,
+    }
+
+
+def echo_feed(acc: dict, kind: str, step, agent_id, payload: dict) -> None:
+    """1 イベントを echo 集計へ流し込む(step 昇順で呼ぶこと。決定論・副作用は acc のみ)。"""
+    cfg = acc["cfg"]
+    window, ngram = cfg["window_steps"], cfg["ngram"]
+    s = int(step)
+    if kind in _UTTERANCE_KINDS:
+        text = payload.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return
+        if not isinstance(agent_id, int) or agent_id < 0:
+            return
+        text = text.strip()
+        grams = _echo_ngrams(text, ngram)
+        prev = acc["last_utt"].get(agent_id)
+        sim_val = None
+        if prev is not None and prev[0] >= s - window + 1:
+            sim_val = _echo_jaccard(grams, _echo_ngrams(prev[1], ngram))
+            acc["sim_sum"] += sim_val
+            acc["sim_n"] += 1
+        seen = acc["last_text"].get((agent_id, text))
+        dup = seen is not None and s - seen < window     # 窓内での完全同一文の再出
+        if dup or (sim_val is not None and sim_val >= cfg["sim_threshold"]):
+            acc["n_echo"] += 1
+        acc["utt_by_agent"][agent_id][text] += 1
+        acc["last_text"][(agent_id, text)] = s
+        acc["n_utt"] += 1
+        acc["last_utt"][agent_id] = (s, text)
+    elif kind == "transmission":
+        iid, frm = payload.get("item_id"), payload.get("from")
+        if iid is None:
+            return
+        acc["n_trans"] += 1
+        prev_step = acc["last_emit"].get((frm, iid))
+        # from < 0(メディア発)は「話者の自己反復」ではないので常に新規扱い。
+        self_repeat = (isinstance(frm, int) and frm >= 0 and prev_step is not None
+                       and s - prev_step < window)
+        if not self_repeat:
+            acc["n_trans_novel"] += 1
+        acc["last_emit"][(frm, iid)] = s
+        if isinstance(agent_id, int) and agent_id >= 0:
+            acc["senders"][(agent_id, iid)].add(frm)
+    elif kind == "label_adopt":
+        acc["n_adopt"] += 1
+        if len(acc["senders"].get((agent_id, payload.get("item_id")), ())) >= 2:
+            acc["n_adopt_novel"] += 1
+
+
+def echo_finish(acc: dict) -> dict:
+    """echo 集計状態 → 指標 dict。"""
+    cfg = acc["cfg"]
+    echo_max = 0.0
+    for counter in acc["utt_by_agent"].values():
+        total = sum(counter.values())
+        if total < cfg["min_utterances"]:
+            continue
+        echo_max = max(echo_max, max(counter.values()) / total)
+    n_utt, n_trans, n_adopt = acc["n_utt"], acc["n_trans"], acc["n_adopt"]
+    return {
+        "window_steps": cfg["window_steps"],
+        "ngram": cfg["ngram"],
+        "sim_threshold": cfg["sim_threshold"],
+        "n_utterances": n_utt,
+        "n_echo_utterances": acc["n_echo"],
+        "echo_utterance_rate": round(acc["n_echo"] / n_utt, 6) if n_utt else 0.0,
+        "self_similarity_mean": (round(acc["sim_sum"] / acc["sim_n"], 6)
+                                 if acc["sim_n"] else 0.0),
+        "echo_max_run": round(echo_max, 6),
+        "n_transmission": n_trans,
+        "n_transmission_novel": acc["n_trans_novel"],
+        "transmission_novel_rate": (round(acc["n_trans_novel"] / n_trans, 6)
+                                    if n_trans else 0.0),
+        "n_label_adopt": n_adopt,
+        "n_label_adopt_novel": acc["n_adopt_novel"],
+        "adopt_novel_rate": (round(acc["n_adopt_novel"] / n_adopt, 6)
+                             if n_adopt else 0.0),
+    }
+
+
+def echo_novelty(events: list[dict], window_steps: int = ECHO_WINDOW_STEPS,
+                 ngram: int = ECHO_NGRAM,
+                 sim_threshold: float = ECHO_SIM_THRESHOLD,
+                 min_utterances: int = ECHO_MIN_UTTERANCES) -> dict:
+    """ラン全体のエコー指標と「エコー除外後」の伝播/採用カウントを返す(決定論・純関数)。
+
+    返り値(すべて**新規の観測**。既存 KPI の値は 1 バイトも変えない):
+      n_utterances / n_echo_utterances / echo_utterance_rate
+      self_similarity_mean … 同一話者の連続発話間 Jaccard の平均(窓内のペアのみ)
+      echo_max_run         … 個体ごと「同一文の最大反復率(**ラン全体**)」の最大値
+        ★L2 列 `echo_max` は同じ量を **直近 window_steps** で測ったもの。窓が違うので
+          値は一致しない(ラン全体版のほうが分母が大きく、通常は小さめに出る)。
+      n_transmission / n_transmission_novel / transmission_novel_rate
+      n_label_adopt  / n_label_adopt_novel  / adopt_novel_rate
+
+    メモリ: 個体ごとの発話テキストを保持するので、発話数に比例する(事後解析専用)。
+    """
+    acc = echo_accumulator(window_steps, ngram, sim_threshold, min_utterances)
+    for e in _ordered(events):
+        echo_feed(acc, e["kind"], e["step"], e["agent_id"], e["payload"])
+    return echo_finish(acc)
 
 
 def _tree_depth(edge_set: set) -> int:

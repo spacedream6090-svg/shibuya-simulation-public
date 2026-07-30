@@ -290,10 +290,11 @@ def _t_half_from_stepcum(stepcum: list) -> int | None:
     return stepcum[-1][0]
 
 
-def item_cascades(run_dir: str) -> list[dict]:
+def item_cascades(run_dir: str,
+                  echo_window_steps: int = m.ECHO_WINDOW_STEPS) -> list[dict]:
     """measure.item_cascades と同一出力(size/creator/media/adopters/depth/
-    channel_mix/t_half)を 1 パスの逐次読みで。伝播列を全保持せず、item ごとに
-    有界な集計(Counter/set/step 終端累積)だけを持つ。"""
+    channel_mix/t_half + 第70バッチの size_novel/echo_share)を 1 パスの逐次読みで。
+    伝播列を全保持せず、item ごとに有界な集計(Counter/set/step 終端累積)だけを持つ。"""
     cols = ["step", "agent_id", "kind", "payload"]
     creator: dict = {}
     media: set = set()
@@ -303,6 +304,8 @@ def item_cascades(run_dir: str) -> list[dict]:
     adopters: dict = defaultdict(set)
     stepcum: dict = defaultdict(list)     # iid -> [(step, cum_after_step)]
     cur_step: dict = {}                    # iid -> 集計中の step
+    novel: Counter = Counter()             # iid -> エコー除外後の伝播件数(第70 IDEA①)
+    last_emit: dict = {}                   # (from, iid) -> 直近送出 step
 
     for e in _events(run_dir, cols):
         k, aid, p = e["kind"], e["agent_id"], e["payload"]
@@ -320,6 +323,12 @@ def item_cascades(run_dir: str) -> list[dict]:
             size[iid] += 1
             chan[iid][p.get("channel")] += 1
             edges[iid].add((p.get("from"), aid))
+            frm = p.get("from")
+            prev = last_emit.get((frm, iid))
+            if not (isinstance(frm, int) and frm >= 0 and prev is not None
+                    and int(s) - prev < echo_window_steps):
+                novel[iid] += 1
+            last_emit[(frm, iid)] = int(s)
             # step 終端累積の記録(step が進んだら前 step 分を確定)
             prev = cur_step.get(iid)
             if prev is not None and s != prev:
@@ -335,16 +344,20 @@ def item_cascades(run_dir: str) -> list[dict]:
     out: list[dict] = []
     for iid in sorted(set(creator) | set(size)):
         ad = sorted(adopters.get(iid, ()))
+        n = size.get(iid, 0)
+        n_novel = int(novel.get(iid, 0))
         out.append({
             "item_id": iid,
             "creator": creator.get(iid),
             "media": iid in media,
-            "size": size.get(iid, 0),
+            "size": n,
             "n_adopters": len(ad),
             "adopters": ad,
             "depth": m._tree_depth(edges.get(iid, set())),
             "channel_mix": dict(chan.get(iid, {})),
             "t_half": _t_half_from_stepcum(stepcum.get(iid, [])),
+            "size_novel": n_novel,
+            "echo_share": round(1.0 - n_novel / n, 6) if n else 0.0,
         })
     return out
 
@@ -649,6 +662,24 @@ def drift_metrics(run_dir: str, n_agents: int) -> dict[str, dict]:
             "n_communities": len(comms),
         }
     return out
+
+
+# --------------------------------------------------------------------------- #
+# エコー/自己反復(measure.echo_novelty のストリーミング版。第70バッチ IDEA①)
+# --------------------------------------------------------------------------- #
+def echo_novelty(run_dir: str, window_steps: int = m.ECHO_WINDOW_STEPS,
+                 ngram: int = m.ECHO_NGRAM,
+                 sim_threshold: float = m.ECHO_SIM_THRESHOLD,
+                 min_utterances: int = m.ECHO_MIN_UTTERANCES) -> dict:
+    """measure.echo_novelty と同一出力を 1 パスの逐次読みで(集計器は measure と共有)。
+
+    注意: 個体ごとの発話テキストを保持するので、他のストリーミング関数と違い
+    **完全な有界メモリではない**(発話数に比例)。事後解析専用。
+    """
+    acc = m.echo_accumulator(window_steps, ngram, sim_threshold, min_utterances)
+    for e in _events(run_dir, ["step", "agent_id", "kind", "payload"]):
+        m.echo_feed(acc, e["kind"], e["step"], e["agent_id"], e["payload"])
+    return m.echo_finish(acc)
 
 
 # --------------------------------------------------------------------------- #

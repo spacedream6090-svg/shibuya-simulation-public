@@ -8,7 +8,9 @@ from .. import relations_endo as _rendo
 from .. import status as _status_mod
 from . import assets as _assets
 from . import deviation as _dev
+from . import echo as _echo
 from . import lens as _lens
+from . import silence as _silence
 from . import structure as _struct
 
 AGGREGATORS: dict[str, Callable[[Any], float | int | str]] = {}
@@ -912,6 +914,74 @@ def _llm_fallback_rate(sim):
         return None
     calls, _, fb = t
     return round(fb / calls, 6) if calls else 0.0
+
+
+# ---- エコー/自己反復の計測 第70バッチ IDEA①(**常設** 5 列)。observer/echo.py が単一の源。
+#      読むだけ・乱数ゼロ・LLM 呼ゼロ・L1 イベント追加ゼロ・プロンプト 1 バイト不変。
+#      `observer.echo.enabled: false` にした時だけ 5 列とも消える(過去ランとの L2 一致用の逃げ道)。
+#      定義と正直な限界は observer/echo.py の docstring を参照(完全一致反復 vs 言い換え反復の
+#      切り分け・閾値の恣意性・意味的言い換えは捉えられない旨)。
+def _echo_col(sim, key):
+    s = _echo.scalars(sim)
+    return s.get(key) if s else None
+
+
+@register_aggregator("echo_max")
+def _echo_max_col(sim):
+    return _echo_col(sim, "echo_max")
+
+
+@register_aggregator("self_similarity_mean")
+def _self_similarity_mean(sim):
+    return _echo_col(sim, "self_similarity_mean")
+
+
+@register_aggregator("echo_utterance_rate")
+def _echo_utterance_rate(sim):
+    return _echo_col(sim, "echo_utterance_rate")
+
+
+@register_aggregator("transmission_novel")
+def _transmission_novel(sim):
+    return _echo_col(sim, "transmission_novel")
+
+
+@register_aggregator("transmission_novel_rate")
+def _transmission_novel_rate(sim):
+    return _echo_col(sim, "transmission_novel_rate")
+
+
+# ---- 未定義行動レジスタ + 沈黙の第一級化 第70バッチ IDEA②(既定 OFF)。
+#      freedom.undefined_register=false / freedom.explicit_nothing=false は None=列なし=L2 不変。
+#      観測の源は observer/silence.py(累積カウンタ + 暦日タリー)。読むだけ・乱数ゼロ。
+def _undef_col(sim, key):
+    s = _silence.undefined_scalars(sim)
+    return s.get(key) if s else None
+
+
+@register_aggregator("undefined_action_total")
+def _undefined_action_total(sim):
+    return _undef_col(sim, "undefined_action_total")
+
+
+@register_aggregator("undefined_action_rate")
+def _undefined_action_rate(sim):
+    return _undef_col(sim, "undefined_action_rate")
+
+
+def _silence_col(sim, key):
+    s = _silence.silence_scalars(sim)
+    return s.get(key) if s else None
+
+
+@register_aggregator("silent_agent_rate")
+def _silent_agent_rate(sim):
+    return _silence_col(sim, "silent_agent_rate")
+
+
+@register_aggregator("chosen_nothing_rate")
+def _chosen_nothing_rate(sim):
+    return _silence_col(sim, "chosen_nothing_rate")
 
 
 def collect(sim) -> dict:

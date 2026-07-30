@@ -382,7 +382,8 @@ def _load_y_weights(run_dir, cli_json):
 
 def write_report(path, run_dir, feats, cascades, windows, collective,
                  r2, ews_adopt, ews_entropy, tsrc, tnames,
-                 coinages=None, trigger_dist=None, tools=None, drift=None):
+                 coinages=None, trigger_dist=None, tools=None, drift=None,
+                 echo=None):
     big = max(cascades, key=lambda c: c["size"], default=None)
     top_ext = max(feats, key=lambda f: f["Y_external"], default=None)
     top_int = max(feats, key=lambda f: f["Y_internal"], default=None)
@@ -412,6 +413,33 @@ def write_report(path, run_dir, feats, cascades, windows, collective,
                      f"adopters {big['n_adopters']}, depth {big['depth']}, "
                      f"t_half {big['t_half']}, media {big['media']}")
         lines.append(f"- channel mix: {big['channel_mix']}")
+        # 第70バッチ IDEA①: 同一話者の再送出を除いた「新規伝播」を並記(既存 size は不変)
+        lines.append(f"- size_novel (echo excluded): {big.get('size_novel')} "
+                     f"/ echo_share {big.get('echo_share')}")
+    lines.append("")
+    # ---- エコー/自己反復(第70バッチ IDEA①)。伝播数値が LLM の反復癖の関数でないかの検査 ----
+    lines.append("## Echo / self-repetition (IDEA-1; observation only, world unchanged)")
+    if echo:
+        lines.append(f"- utterances: {echo['n_utterances']} "
+                     f"(echo {echo['n_echo_utterances']} = "
+                     f"{echo['echo_utterance_rate']})")
+        lines.append(f"- self_similarity_mean: {echo['self_similarity_mean']} "
+                     f"(char {echo['ngram']}-gram Jaccard, "
+                     f"threshold {echo['sim_threshold']})")
+        lines.append(f"- echo_max_run: {echo['echo_max_run']} "
+                     f"(1.000 = one agent repeated a single sentence throughout; "
+                     f"such runs must be excluded or handled separately in k* estimation)")
+        lines.append(f"- transmission: {echo['n_transmission']} -> novel "
+                     f"{echo['n_transmission_novel']} "
+                     f"(rate {echo['transmission_novel_rate']}; "
+                     f"same speaker re-sending the same word within "
+                     f"{echo['window_steps']} steps is excluded)")
+        lines.append(f"- label_adopt: {echo['n_label_adopt']} -> novel "
+                     f"{echo['n_label_adopt_novel']} "
+                     f"(rate {echo['adopt_novel_rate']}; adoption backed by "
+                     f"2+ distinct senders)")
+    else:
+        lines.append("- (not computed)")
     lines.append("")
     lines.append("## Network")
     lines.append(f"- mean degree range: {min(md):.2f} .. {max(md):.2f}")
@@ -530,6 +558,9 @@ def analyze(run_dir, y_weights=None):
     trigger_dist = coinage_trigger_dist(coinages)
     tools = st.tool_usage(run_dir)
     drift = st.drift_metrics(run_dir, n_agents)
+    # エコー/自己反復(第70バッチ IDEA①)。既存の伝播/採用 KPI は 1 バイトも変えず、
+    # 「エコー除外後」の件数・率を **新しい成果物** として並記する(ID-U3)。
+    echo = st.echo_novelty(run_dir)
 
     _dump(os.path.join(outdir, "agent_features.json"), feats)
     _dump(os.path.join(outdir, "items.json"), cascades)
@@ -540,6 +571,7 @@ def analyze(run_dir, y_weights=None):
     _dump(os.path.join(outdir, "network_windows.json"), windows)
     _dump(os.path.join(outdir, "collective.json"), collective)
     _dump(os.path.join(outdir, "drift.json"), drift)
+    _dump(os.path.join(outdir, "echo.json"), echo)
     _dump(os.path.join(outdir, "ews.json"),
           {"adoption_frac": {k: ews_adopt[k] for k in ("var_tau", "ac1_tau")},
            "vocab_entropy": {k: ews_entropy[k] for k in ("var_tau", "ac1_tau")}})
@@ -557,7 +589,7 @@ def analyze(run_dir, y_weights=None):
 
     write_report(os.path.join(outdir, "report.md"), run_dir, feats, cascades,
                  windows, collective, r2, ews_adopt, ews_entropy, tsrc, tnames,
-                 coinages, trigger_dist, tools, drift)
+                 coinages, trigger_dist, tools, drift, echo)
     return outdir, m.count_events(run_dir), len(cascades)
 
 

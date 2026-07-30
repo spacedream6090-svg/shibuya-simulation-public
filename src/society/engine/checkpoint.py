@@ -118,6 +118,13 @@ def save(sim, step: int, path: str | Path) -> Path:
             # mid-day checkpoint でも当日平均(L2 quality_magnitude_mean)が resume==straight に
             # なるよう中央管理する。OFF ランでは None=挙動不変(load は .get で旧 ckpt 互換)。
             "quality_state": getattr(sim, "_quality_state", None),
+            # 第70バッチ IDEA①(エコー計測): rolling 窓のタリー(deque + カウンタ)。L2 の 5 列は
+            # **常設**なので、これを保存しないと mid-day resume の L2 が straight と食い違う
+            # (第62の joint 状態と同じ既存ギャップの型)。processed カウンタは**プロセス内 logger
+            # 由来**なので保存しない(load 側で 0 に戻す=assets/gossip と同流儀)。集合は使わず
+            # deque/dict/Counter のみ=pickle の集合反復順非保存の影響を受けない。
+            # observer.echo.enabled=false のランでは state 自体が生えない → None=挙動不変。
+            "echo_state": getattr(sim, "_echo_state", None),
         },
         # --- scenario は config から再構築される。封鎖の進行だけを直列化(順序安定) ---
         "scenario": {
@@ -199,6 +206,11 @@ def load(sim, path: str | Path) -> int:
     qst = rt.get("quality_state")               # 第65: 会話の質タリー(旧 checkpoint 互換=無ければ素通り)
     if qst is not None:
         sim._quality_state = qst
+    est_echo = rt.get("echo_state")             # 第70 IDEA①: エコー窓(旧 checkpoint 互換=無ければ素通り)
+    if est_echo is not None:
+        sim._echo_state = est_echo
+    sim._echo_processed = 0                     # fresh logger=total 0 から再走査(assets と同流儀)
+    sim._echo_cache = None
 
     # scenario: __init__ で config から再構築済み。封鎖の進行を復元し city へ再適用。
     sc = blob["scenario"]

@@ -260,6 +260,16 @@ register_event_kind("joint_invite",  "共同行動の誘い1件の承諾判定�
 #      瞬間を 1 件だけ記録する(最初の coin のみ・上書きなし)。実装 src/society/labeling/labels.py。
 #      設計 docs/plans/twin-physics-vision-affordance-plan.md §2 レーン1 D1)----
 register_event_kind("place_label_bind", "造語がその発生ノードへ束縛された(語ごとに最初の1回のみ){word, node}")
+# ---- 未定義行動レジスタ 第70バッチ IDEA②(freedom.undefined_register ON のみ・既定 OFF=0件。
+#      全決定論・乱数ゼロ・LLM/generate ゼロ増・プロンプト 1 バイト不変=パース後の振り分けのみ)。
+#      「JSON は読めて "action" もあるが、既知の動詞のどれでもない」出力 = 与えられた行動空間の
+#      外へ出ようとした痕跡。従来はこれが fallback{reason:"parse_error"} = JSON 崩れと同じ箱に
+#      入って内容ごと捨てられていた。ON のときは fallback **ではなく**こちらへ振り分ける(分子は排他)。
+#      実装 src/society/cognition/deliberate.classify_reject + engine/scheduler._log_reject。
+#      ★正直な限界: mock は enum 内しか返さないので実発火は実 LLM ランに限られる。
+register_event_kind("undefined_action", "enum 外だが構文としては行動を主張している LLM 出力(行動空間の拡張の痕跡){action, keys, text, trigger}")
+# ★ 沈黙の第一級化(freedom.explicit_nothing ON のみ)は既存 kind "stay" を再利用する
+#   (payload に reason:"chosen_nothing" が付く。既定 OFF では stay イベントは 1 件も出ない)。
 
 
 @dataclass

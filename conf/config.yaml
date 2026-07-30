@@ -792,6 +792,19 @@ freedom:
   sat_step: 0.15                # 自由行動1回の充足量(限界効用逓減つき)
   sat_decay: 0.15               # 日次の中立(0.5)への回帰率(需要の再蓄積)
   max_minutes: 240              # 1回の開放行動の上限時間(分)
+  # ---- 未定義行動レジスタ + 沈黙の第一級化(第70バッチ IDEA② 2026-07-31。既定 全 OFF=バイト一致)----
+  # undefined_register: enum 外だが構文としては行動を主張している出力(= JSON は読めて "action" は
+  #   あるが、既知の動詞に当てはまらない)を捨てずに L1 `undefined_action` として記録する。
+  #   現行はこれが `fallback{reason:"parse_error"}` = JSON 崩れと同じ箱に入って内容ごと消えている。
+  #   ON でも **プロンプトは 1 バイトも変わらない**(パース後の振り分けだけ)= LLM 呼数・乱数不変。
+  #   保存則: 振り分けなので `llm_fallback_rate + undefined_action_rate` が旧 `llm_fallback_rate` に一致。
+  #   ★正直な限界: mock は enum 内しか返さないので、実際の発火は実 LLM ランに限られる。
+  # explicit_nothing: 「関わらない/何もしない」をヘッダの選択肢に 1 行だけ足す(open_actions の "do"
+  #   1 行と完全同型)。parse は ON/OFF に関わらず常に寛容受理する(P2 の move_home 等と同じ流儀=
+  #   OFF は「提示されないだけ」)が、L1 `stay{reason:"chosen_nothing"}` を出すのは ON のときだけ
+  #   =既定 OFF はイベント 0 件・ヘッダ不変・ゴールデンとバイト一致。
+  undefined_register: false
+  explicit_nothing: false
   # ---- 生活の自己決定 P2(D3 棚卸し。docs/plans/agent-freedom-plan.md #6-#10。既定 全 OFF=バイト一致)----
   # 5項目を個別 bool で切る(中立メニュー提示+決定論裁定=R1 呼数不変)。ON 化はユーザー判断(daily/production は触らない)。
   p2:
@@ -1246,6 +1259,22 @@ observer:
   #  別イベントを持たないので分子に入らない=真のパース失敗率の下限)。
   llm_health:
     enabled: false
+  # ---- エコー/自己反復の計測(第70バッチ IDEA① 2026-07-31・**常設**)----
+  # L2 に 5 列(echo_max / self_similarity_mean / echo_utterance_rate /
+  # transmission_novel / transmission_novel_rate)を毎 step 追加する。
+  # 「同じ語が繰り返し出た」が伝播なのか LLM の反復癖なのかを切り分けるための観測で、
+  # **他の全ての伝播数値(造語 k*・誤情報・規範化)の信頼性の前提**になるため、
+  # speech_diversity(R12 崩壊検知)と同じ「常設の観測列」として既定 ON にしてある。
+  # 読むだけ・乱数ゼロ・LLM 呼ゼロ・L1 イベント追加ゼロ・プロンプト 1 バイト不変
+  # (=ゴールデン tests/data/golden_baseline_l1.json はバイト一致で不変)。
+  # enabled: false にすると 5 列とも消える(過去ランと L2 を完全一致させたい場合の逃げ道)。
+  # 定義・正直な限界は src/society/observer/echo.py の docstring を参照。
+  echo:
+    enabled: true
+    window_steps: 144           # rolling 窓(144 = 1 日)
+    ngram: 4                    # 自己類似度の文字 n-gram の n
+    sim_threshold: 0.6          # 直前の自分の発話との Jaccard がこれ以上ならエコー扱い
+    min_utterances: 2           # echo_max の対象にする最小発話数(1 件で 1.0 になる退化を防ぐ)
 
 # ============================================================
 # 第6バッチ(ユーザー要望 2026-07-06)。すべて既定 OFF=現行挙動と完全同一。
