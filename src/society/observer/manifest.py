@@ -90,19 +90,11 @@ def collect_toggles(cfg) -> dict:
     """resolved config の**真偽値リーフを全部**ドット記法で平坦化する。
 
     「全スイッチ状態」を人手の列挙ではなく機械的に採る(登録漏れが原理的に起きない)。
-    第72 の機能レジストリ(repro_tier 宣言)はこの一覧を突き合わせ相手にする。
+    第72 の機能レジストリ(repro_tier 宣言)はこの一覧を突き合わせ相手にする
+    (定義を二重に持たないよう registry.flatten_bools へ委譲した)。
     """
-    out: dict[str, bool] = {}
-
-    def walk(node, prefix: str) -> None:
-        if isinstance(node, dict):
-            for k in sorted(node.keys()):
-                walk(node[k], f"{prefix}.{k}" if prefix else str(k))
-        elif isinstance(node, bool):
-            out[prefix] = node
-
-    walk(cfg if isinstance(cfg, dict) else OmegaConf.to_container(cfg, resolve=True), "")
-    return out
+    from ..registry import flatten_bools
+    return flatten_bools(cfg)
 
 
 # --------------------------------------------------------------------- 構築
@@ -111,10 +103,15 @@ def build(sim) -> dict:
     from ..config import REPO_ROOT
     from ..engine import checkpoint
 
+    from ..registry import describe as _describe_features
+
     cfg = sim.cfg
     # resolve は 1 回だけ(config は 1,300 行超あり、to_container を 3 回回すと
     # Simulation 構築 1 回あたり 10ms 級の無駄になる)。以降は resolved dict を使い回す。
     resolved = OmegaConf.to_container(cfg, resolve=True)
+    # 第72バッチ: ランモードと機能レジストリの報告。Simulation が構築時に作った報告
+    # (自動 OFF の明細を含む)を使い、無い場合(素の sim スタブ等)は config から作り直す。
+    features = getattr(sim, "run_mode_report", None) or _describe_features(resolved)
     model = cfg.get("model", {}) or {}
     started = time.time()
     calendar = (cfg.get("world", {}) or {}).get("calendar", {}) or {}
@@ -130,7 +127,10 @@ def build(sim) -> dict:
         # resume 可否判定に使われる方(揮発キー除外)。checkpoint と同じ定義を再利用する。
         "config_determinism_sha256": checkpoint.config_hash_from_container(resolved),
         "event_schema_sha256": event_schema_sha256(),
+        # 第72バッチ: ランモード(none/observe/journal/verify)。比較ガードが最初に見る場所。
+        "run_mode": features["run_mode"],
         "run": {
+            "mode": features["run_mode"],
             "seed": int(cfg.run.seed),
             "seed_auto": bool(cfg.run.get("seed_auto", False)),
             "n_agents": int(cfg.run.n_agents),
@@ -171,6 +171,12 @@ def build(sim) -> dict:
         },
         # 「全スイッチ状態」= resolved config の真偽値リーフ全部(機械採取)。
         "toggles": collect_toggles(resolved),
+        # 第72バッチ 機能レジストリ: 有効な機能とその再現性等級 / モードで自動 OFF にした一覧 /
+        # まだ宣言されていない bool キー(通常は空。CI が空を固定する)。
+        #   enabled      … [{id, repro_tier, affects_k, fingerprint_risk}]
+        #   auto_disabled… [{id, repro_tier, was, now, explicit, reason}]
+        # これが「observe ランと verify ランを無自覚に並べる」事故を事後に検出する material。
+        "features": features,
     }
     return man
 

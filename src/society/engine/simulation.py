@@ -123,6 +123,12 @@ class Simulation:
         # P0バッチ 2026-07-29: summary.json の elapsed_sec 用の起点(構築込み)。run() が
         # ループ開始時に打ち直す。観測専用で挙動・乱数・出力イベントには一切影響しない。
         self._t_start = time.perf_counter()
+        # 第72バッチ: ランモード(run.mode)による機能の自動取捨。**シム構築の最初の1箇所**で
+        # resolved config のキーを off 値へ落とし切る(以降の全構築はゲート後の config だけを見る)。
+        # 既定 run.mode=none では apply_mode は cfg を触らず同一オブジェクトを返す=1バイトも変わらない。
+        # 落とした一覧は WARNING ログ + run_manifest.json(features.auto_disabled)に必ず残る。
+        from ..registry import apply_mode as _apply_run_mode
+        cfg, self.run_mode_report = _apply_run_mode(cfg)
         self.cfg = cfg
         name = cfg.run.name or f"seed{cfg.run.seed}"
         self.out_dir = Path(out_dir) if out_dir else REPO_ROOT / str(cfg.run.out_dir) / str(name)

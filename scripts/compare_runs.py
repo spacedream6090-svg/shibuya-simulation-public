@@ -495,7 +495,14 @@ def render_report(cond_a: str, cond_b: str, pairs: list[tuple],
 
 
 def run_compare(a_dirs: list[str], b_dirs: list[str], out_dir: str,
-                crn_max_steps: int = 288) -> dict:
+                crn_max_steps: int = 288,
+                allow_tier_mismatch: bool = False) -> dict:
+    # 第72バッチ: ラン間比較ガード。両群の run_manifest.json の run_mode と有効機能の
+    # 再現性等級集合を照合し、異なれば既定で拒否する(observe ランと verify ランを無自覚に
+    # 並べて論じるのが最も危険な誤読)。manifest が無い旧ランは「不明」として警告のみ。
+    from society.registry import guard_or_die
+    tier_guard = guard_or_die(list(a_dirs) + list(b_dirs),
+                              allow_mismatch=allow_tier_mismatch)
     os.makedirs(out_dir, exist_ok=True)
     pairs, pair_notes = pair_runs(a_dirs, b_dirs)
     cond_a = _cond_of(a_dirs[0]) if a_dirs else "A"
@@ -506,10 +513,14 @@ def run_compare(a_dirs: list[str], b_dirs: list[str], out_dir: str,
 
     _write_stats_parquet(os.path.join(out_dir, "compare_stats.parquet"), rows)
     md = render_report(cond_a, cond_b, pairs, pair_notes, rows, crn, did)
+    if tier_guard["messages"]:                   # 等級の注意書きはレポート冒頭に必ず残す
+        note = "\n".join(f"> {m}" for m in tier_guard["messages"])
+        md = f"{note}\n\n{md}"
     with open(os.path.join(out_dir, "compare_report.md"), "w", encoding="utf-8") as fh:
         fh.write(md + "\n")
     return {"out_dir": out_dir, "n_pairs": len(pairs), "cond_a": cond_a,
             "cond_b": cond_b, "rows": rows, "crn": crn, "did": did, "md": md,
+            "tier_guard": tier_guard,
             "n_have": sum(1 for r in rows if not r["data_short"])}
 
 
@@ -522,6 +533,9 @@ def main() -> None:
                     help="出力先(既定 runs/_compare/<A条件>_vs_<B条件>)")
     ap.add_argument("--crn-max-steps", type=int, default=288,
                     help="介入が無いとき CRN 突合する先頭 step 数(既定288=2日)")
+    ap.add_argument("--allow-tier-mismatch", action="store_true",
+                    help="run_mode / 再現性等級が異なるラン同士の比較を明示的に許可する"
+                         "(既定は拒否。許可しても警告はレポートに残る)")
     args = ap.parse_args()
     for d in list(args.a) + list(args.b):
         if not os.path.isdir(d):
@@ -532,7 +546,8 @@ def main() -> None:
         cb = _cond_of(args.b[0])
         name = f"{cb}_vs_{ca}" if cb != ca else f"{ca}_vs_self"
         out = os.path.join("runs", "_compare", name)
-    info = run_compare(args.a, args.b, out, crn_max_steps=args.crn_max_steps)
+    info = run_compare(args.a, args.b, out, crn_max_steps=args.crn_max_steps,
+                       allow_tier_mismatch=args.allow_tier_mismatch)
     print(info["md"])
     print(f"\n[compare_runs] pairs={info['n_pairs']}  "
           f"比較可能指標={info['n_have']}  -> {info['out_dir']}")

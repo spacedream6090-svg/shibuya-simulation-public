@@ -570,7 +570,8 @@ def write_report(path: str, result: dict) -> None:
 # 本体
 # --------------------------------------------------------------------------- #
 def analyze(pattern, out=None, skip_days: int = SKIP_DAYS, mc: int = MC_ITER,
-            block_len: int = 0, min_agree: int = MIN_AGREE) -> dict:
+            block_len: int = 0, min_agree: int = MIN_AGREE,
+            allow_tier_mismatch: bool = False) -> dict:
     """実験ラン群を横断解析し、結果 dict を返す(out 指定時はファイルも書く)。"""
     if isinstance(pattern, (list, tuple)):
         candidates = sorted(str(p) for p in pattern)
@@ -581,6 +582,10 @@ def analyze(pattern, out=None, skip_days: int = SKIP_DAYS, mc: int = MC_ITER,
             and os.path.isfile(os.path.join(d, "l1_events.parquet"))]
     if not dirs:
         raise SystemExit(f"no runs matched: {pattern}")
+    # 第72バッチ: ラン間比較ガード。CRN ペア差の前提は「同じ装置で回した2本」なので、
+    # run_mode / 再現性等級が混ざったセル群は既定で拒否する。
+    from society.registry import guard_or_die
+    guard_or_die(dirs, allow_mismatch=allow_tier_mismatch)
 
     runs: dict = {}
     n_days_max = 0
@@ -675,11 +680,15 @@ def main() -> None:
                     help="副検定のブロック長(0=auto max(2, round(T^(1/3))))")
     ap.add_argument("--min-agree", type=int, default=MIN_AGREE,
                     help="符号一致とみなす最少 seed 数(既定 3=計画書§3)")
+    ap.add_argument("--allow-tier-mismatch", action="store_true",
+                    help="run_mode / 再現性等級が異なるラン同士の比較を明示的に許可する"
+                         "(既定は拒否)")
     args = ap.parse_args()
     out = args.out or os.path.join("runs", "_endo_treatment")
     result = analyze(args.pattern, out=out, skip_days=args.skip_days,
                      mc=args.mc, block_len=args.block_len,
-                     min_agree=args.min_agree)
+                     min_agree=args.min_agree,
+                     allow_tier_mismatch=args.allow_tier_mismatch)
     jd = result["judgment"]
     print(f"[endo] {len(result['runs'])} runs / k={result['k_order']} -> {out}")
     print(f"  H1={'成立' if jd['H1']['pass'] else '不成立'} "

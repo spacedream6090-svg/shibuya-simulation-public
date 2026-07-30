@@ -470,7 +470,7 @@ def _write_report(path, N_levels, table, fss):
 # --------------------------------------------------------------------------- #
 # 本体
 # --------------------------------------------------------------------------- #
-def analyze_sweep(pattern, out=None):
+def analyze_sweep(pattern, out=None, allow_tier_mismatch: bool = False):
     """glob パターン(または dir リスト)を横断解析し、出力ディレクトリを返す。"""
     if isinstance(pattern, (list, tuple)):
         candidates = list(pattern)
@@ -481,6 +481,9 @@ def analyze_sweep(pattern, out=None):
             and os.path.isfile(os.path.join(d, "l1_events.parquet"))]
     if not dirs:
         raise SystemExit(f"no runs matched: {pattern}")
+    # 第72バッチ: ラン間比較ガード(run_mode / 再現性等級の混在は既定で拒否)。
+    from society.registry import guard_or_die
+    guard_or_die(dirs, allow_mismatch=allow_tier_mismatch)
 
     runs = []
     for d in dirs:
@@ -599,8 +602,12 @@ def main():
     ap = argparse.ArgumentParser(description="Phase E cross-condition k sweep")
     ap.add_argument("pattern", help='glob, e.g. "runs/pilot_*" or "runs/fss_*"')
     ap.add_argument("--out", default=None, help="output dir (default runs/_sweep)")
+    ap.add_argument("--allow-tier-mismatch", action="store_true",
+                    help="run_mode / 再現性等級が異なるラン同士の横断解析を明示的に許可する"
+                         "(既定は拒否)")
     args = ap.parse_args()
-    analyze_sweep(args.pattern, args.out)
+    analyze_sweep(args.pattern, args.out,
+                  allow_tier_mismatch=args.allow_tier_mismatch)
 
 
 if __name__ == "__main__":

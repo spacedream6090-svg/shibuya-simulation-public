@@ -25,6 +25,16 @@ run:
   # 対象外。本番 ON はユーザー判断(production/daily は触らない)。ON の効果はイベント時系列に現れるが
   # LLM 呼数は k 非依存のまま(発火ゲートに k/traits を入れない=既存機構に乗るだけ)。
   natural_start: false
+  # ---- ランモード(第72バッチ 2026-07-31。dual-mode-observe-verify-plan.md 第72行)----
+  # 機能レジストリ(src/society/registry.py)が全機能トグルに宣言している再現性等級
+  # repro_tier(strict / journal / none)を、ラン単位で機械的に取捨するスイッチ。
+  #   none    … 既定。**現行動作そのまま**(レジストリは何も落とさない=1バイトも変えない)。
+  #   observe … 全等級を許可(制限なし)。本選の観察ラン=面白いものを全部載せる用。
+  #   journal … repro_tier=none の機能を自動 OFF(事後再生できる範囲での観察)。
+  #   verify  … strict のみ許可(journal / none を自動 OFF)。対照実験・アブレーション用。
+  # 自動 OFF は黙って起きない: WARNING ログ(明示 ON を落としたときは★印)+ run_manifest.json の
+  # features.auto_disabled に必ず出る。落とした後の config が runs/<name>/config.yaml に保存される。
+  mode: none
 
 # ---- state 更新則の magnitude(OPEN#2: 因果構造は factors/update.py、量はここで調律)----
 factors:
