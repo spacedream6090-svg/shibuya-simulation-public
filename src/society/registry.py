@@ -254,6 +254,19 @@ FEATURES: tuple[Feature, ...] = (
        "決定論計算し、観測サイドカー channels.parquet へ書くだけ。**読み取り専用・乱数ゼロ・"
        "LLM ゼロ・プロンプト不変**なので ON でも L1/L2/L3 はバイト一致(サイドカーが 1 本増える)。"
        "σ_c は scripts/measure_sigma.py がこの parquet から実測し data/calib/sigma_c.json へ凍結する"),
+    _f("cognition.fire.enabled", "journal", True, "none",
+       "閾値発火+認知イベントキュー+同期バリア(第81バッチ)。『1 step=10分』が兼ねていた"
+       "世界の進行と思考の頻度を分離し、(発火時刻, agent_id) の全順序キューが『いつ考えるか』を"
+       "決める。発火源4種=periodic(文脈別の基本周期)/salience(S=Σg·|o−ô|/σ が θ 超え)/"
+       "internal(ニーズ閾値の上向き横断)/social(会話返答・夜内省・朝計画の第一級化)。"
+       "★affects_k=true を正直に宣言する: LLM 呼の**発生点そのもの**(_phase_drive の発火権配布)を"
+       "差し替えるため。旧 k 非依存則は OFF のときに従来どおり成立し、ON では新不変量"
+       "『認知イベントのスケジュール列が同一なら世界状態が同一』(P0-4)に置き換わる。"
+       "★journal 等級: 発火数が変わる=LLM の自由文出力の量そのものが変わるので、"
+       "事後再生には llm_cache/llm_journal が要る。"
+       "★fingerprint_risk=none: プロンプト文面・欄構成を 1 バイトも変えない(発火理由は L1 の"
+       "cog_fire にしか出ず、LLM へ渡す『きっかけ』は従来どおり drive.top_reason の既存語彙)。"
+       "既定 OFF では本機能のモジュールが 1 度も呼ばれない=L1/L2/L3・乱数・呼数バイト一致"),
 
     # ---- freedom(LLM の自由記述をそのまま行動にする層=全部 journal)----
     _f("freedom.open_actions", "journal", False, "possible",

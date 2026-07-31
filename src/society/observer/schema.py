@@ -293,6 +293,15 @@ register_event_kind("relation_dormant",  "関係の休眠=認知枠の上限超�
                                          "(退避であって削除ではない){other, closeness, from_tier, gap_days}")
 register_event_kind("relation_rekindle", "休眠関係の再会=再接触で割引つきに再活性化"
                                          "{other, before, closeness, tier, gap_days}")
+# ---- 認知イベントキュー(閾値発火)第81バッチ(cognition.fire ON のみ・既定 OFF=0件)。
+#      P0-4「認知イベントの発火時刻・理由・トリガー元をすべて記録し、事後にスケジュール列
+#      そのものを解析対象にできること(思考頻度の分布自体が観測量になります)」。
+#      実装 src/society/cognition/fire.py。**LLM へ渡す文面は 1 バイトも変わらない**
+#      (発火理由はここにしか出ない=エージェント側から機構の ON/OFF が読めない)。
+register_event_kind("cog_fire",  "認知イベントが期限を迎えた(スケジュール列そのもの)"
+                                 "{reason, due, ctx, s, theta, contrib, interrupt, active, granted}")
+register_event_kind("cog_event", "既存機構が担う第一級の認知イベント(会話返答/夜内省/朝計画)"
+                                 "{reason, via, ctx}")
 
 
 @dataclass

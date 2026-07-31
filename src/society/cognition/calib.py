@@ -48,6 +48,9 @@ import json
 from pathlib import Path
 
 SCHEMA = 1
+# 較正テーブルだけ別の schema 番号を持つ(σ_c 凍結ファイルとは独立に版が進むため)。
+# 2 = 第81バッチで驚き発火の閾値 θ(salience ブロック)を追加した版。
+CALIB_SCHEMA = 2
 
 # 既定パス(リポジトリルート相対)。conf 側で上書きできる。
 SIGMA_DEFAULT_REL = "data/calib/sigma_c.json"
@@ -134,9 +137,10 @@ def validate_calib(doc: dict, path: str = "") -> dict:
     where = f"({path})" if path else ""
     if not isinstance(doc, dict):
         raise ValueError(f"較正テーブルが mapping でない{where}")
-    if int(doc.get("schema", 0)) != SCHEMA:
+    if int(doc.get("schema", 0)) != CALIB_SCHEMA:
         raise ValueError(
-            f"較正テーブルの schema が非対応{where}: {doc.get('schema')!r} != {SCHEMA}")
+            f"較正テーブルの schema が非対応{where}: "
+            f"{doc.get('schema')!r} != {CALIB_SCHEMA}")
     contexts = tuple(doc.get("contexts") or ())
     stimuli = tuple(doc.get("stimuli") or ())
     if tuple(contexts) != CONTEXTS:
@@ -180,10 +184,22 @@ def validate_calib(doc: dict, path: str = "") -> dict:
                 "sigma": _positive(cell.get("sigma"),
                                    f"onset_delay.{ctx}.{sti}.sigma"),
             }
-    return {"schema": SCHEMA, "version": str(doc.get("version", "")),
+    # ---- 驚き発火の閾値 θ(第81バッチ)。文脈ごとに必須・正でなければならない ----
+    #  欠けを黙って既定値で埋めない: θ は発火率を直接決める量なので、欠測を 0 や適当な値で
+    #  補うと「較正していない閾値で走った」ことが事後に判らなくなる(本 module の既定方針)。
+    sal_raw = doc.get("salience") or {}
+    salience: dict[str, dict[str, float]] = {}
+    for ctx in CONTEXTS:
+        blk = sal_raw.get(ctx)
+        if not isinstance(blk, dict):
+            raise ValueError(f"較正テーブル salience.{ctx} が無い{where}")
+        salience[ctx] = {"theta": _positive(blk.get("theta"),
+                                            f"salience.{ctx}.theta")}
+
+    return {"schema": CALIB_SCHEMA, "version": str(doc.get("version", "")),
             "status": str((doc.get("provenance") or {}).get("status", "unknown")),
             "contexts": list(CONTEXTS), "stimuli": list(STIMULI),
-            "base_period": period, "onset_delay": delay}
+            "base_period": period, "onset_delay": delay, "salience": salience}
 
 
 def load_calib(path_str: str | None = None) -> dict:
@@ -257,17 +273,27 @@ def sigma_of(loaded: dict) -> dict[str, float]:
 # 来歴(run_manifest.json 用)
 # --------------------------------------------------------------------------- #
 def provenance(sim) -> dict | None:
-    """認知の凍結入力の来歴。チャンネル観測 OFF(既定)では **None**(=既存 manifest と同形)。"""
+    """認知の凍結入力の来歴。
+
+    チャンネル観測(第80)と閾値発火(第81)の**どちらかが ON のとき**だけ生える。
+    両方 OFF(既定)では None = 既存 manifest と同形。
+    """
     cfg = getattr(sim, "channelscfg", None) or {}
-    if not cfg.get("enabled"):
+    from . import fire as _fire
+    fire_on = _fire.enabled(sim)
+    if not cfg.get("enabled") and not fire_on:
         return None
     from . import channels as _channels
     out: dict = {
         "schema": SCHEMA,
         "channel_spec_sha256": _channels.spec_sha256(),
         "n_channels": len(_channels.CHANNELS),
-        "every_steps": int(cfg.get("every_steps", 1)),
     }
+    if cfg.get("enabled"):                       # 観測サイドカーの粒度(第80)
+        out["every_steps"] = int(cfg.get("every_steps", 1))
+    fire_prov = _fire.provenance(sim)
+    if fire_prov is not None:
+        out["fire"] = fire_prov
     calib = getattr(sim, "cognition_calib", None)
     if calib:
         out["calib"] = {"file": rel_path(calib["path"]), "sha256": calib["sha256"],

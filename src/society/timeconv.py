@@ -245,6 +245,21 @@ TABLE: tuple[tuple[str, str, str], ...] = (
      "σ_c を測る母集団の粒度は実験者が指定する量。state_hash.interval と同じ扱い"
      "(snapshot_every のように実時間粒度を保つ量ではない: Δt を変えたら『何 step ごとに"
      "採るか』も実験者が測りたい粒度に合わせて指定し直す)"),
+    # ---- 閾値発火(第81バッチ)。★周期系の扱いに注意: **単位が分であって step ではない** ----
+    #  P0 の要点は「認知イベントは世界 tick から独立」。基本周期は較正テーブル(分)から来て
+    #  実時間の分でスケジュールされるので、Δt を変えても**思考の間隔は実時間で不変**でなければ
+    #  ならない(そうでないと「Δt を細かくしても総発火数は変わらない」という驚き駆動の主利点=
+    #  設計 §5.1 が崩れる)。したがって周期系は STEPS ではなく INVARIANT。
+    ("cognition.fire.period_override_min", INVARIANT,
+     "基本周期の上書き値[分]。step ではなく実時間の分なので Δt に依らず同じ間隔になる"
+     "(=これが『認知時間を世界 tick から分離する』ことの実装上の意味)"),
+    ("cognition.fire.period_scale", INVARIANT, "基本周期[分]への無次元倍率"),
+    ("cognition.fire.period_cv_scale", INVARIANT, "変動係数への無次元倍率(0=ばらつきなし)"),
+    ("cognition.fire.sleep_period_mult", INVARIANT, "睡眠中の周期の無次元倍率"),
+    ("cognition.fire.theta_scale", INVARIANT,
+     "発火閾値 θ の無次元倍率。θ の単位は σ の本数(時間量ではない)"),
+    ("cognition.fire.max_contrib", INVARIANT,
+     "L1 に残す S 寄与内訳の件数。観測装置の設定で世界の因果に触れない"),
     ("beliefs.fact_kinds.event_host", INVARIANT, "fact 種の写像定義(数値ではない)"),
     ("drive.fail_decay", INVARIANT, "抽選落ち 1 回あたりの減衰(出来事単位)"),
     ("drive.fire_reset", INVARIANT, "発火 1 回あたりのリセット係数(出来事単位)"),

@@ -689,12 +689,25 @@ class Simulation:
         raw_ch = (OmegaConf.to_container(raw_ch, resolve=True)
                   if OmegaConf.is_config(raw_ch) else raw_ch)
         self.channelscfg = _channels_mod.build_cfg(raw_ch)
+        # ---- 閾値発火 + 認知イベントキュー(第81バッチ。既定 OFF=キュー不在=完全 no-op)----
+        # ON のときだけ _phase_drive の発火権配布がキュー駆動に差し替わる(単一作用点)。
+        from ..cognition import fire as _fire_mod
+        raw_fire = (cfg.get("cognition", {}) or {}).get("fire", None)
+        raw_fire = (OmegaConf.to_container(raw_fire, resolve=True)
+                    if OmegaConf.is_config(raw_fire) else raw_fire)
+        self.firecfg = _fire_mod.build_cfg(raw_fire)
+        self.cogq = _fire_mod.CogQueue() if self.firecfg["enabled"] else None
+        self._fire_plan_due = ()               # 朝計画の対象者(記録専用。OFF は常に空)
+        self._fire_usable = None               # usable チャンネル索引のメモ(初回に確定)
         self.channels_sc = None
         self.cognition_calib = None
         self.cognition_sigma = None
         if self.channelscfg["enabled"]:
             from ..observer.channels import ChannelsSidecar
             self.channels_sc = ChannelsSidecar(self.out_dir, _channels_mod.COLUMNS)
+        # 較正テーブル(壊れていたら即エラー)と σ_c 凍結の来歴は、観測チャンネルか発火の
+        # どちらかが ON なら 1 回だけ採る(発火は σ_c を S の分母として実際に消費する)。
+        if self.channelscfg["enabled"] or self.firecfg["enabled"]:
             self.cognition_calib = _calib_mod.load_calib(self.channelscfg["calib_file"])
             self.cognition_sigma = _calib_mod.load_sigma(self.channelscfg["sigma_file"])
         # 職場束ね直し(work.bind_workplace。既定 OFF=現行の work_node 付与と完全同一=バイト一致)。

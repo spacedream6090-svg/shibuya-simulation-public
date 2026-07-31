@@ -43,6 +43,7 @@ from .. import work as work_mod
 from .. import worldview as worldview_mod
 from ..net import infoenv as infoenv_mod
 from ..cognition import deliberate, drive, planning, routine
+from ..cognition import fire as fire_mod
 from ..cognition import reflection as reflection_mod
 from ..cognition.reflection import maybe_reflect
 from ..economy import CIVIL_SERVANTS, civil_servant_pay, gig_profile, price_of
@@ -2096,7 +2097,23 @@ def _phase_drive(sim, step: int, sim_min: int) -> None:
     # logistic=閾値を soft 化し p=σ(slope·(drive−threshold)) に一本化。
     logistic = (cfg.get("firing", "fixed") == "logistic")
     null_series = (getattr(sim, "controls_mode", "none") == "null_series")
-    if logistic:
+    # ---- 第81バッチ: 認知イベントキュー(既定 OFF)。**発火機構の唯一の置換点** ----
+    #  ON では「誰がこの tick に思考の申請をするか」をキューが決める(= 世界 tick と
+    #  思考の頻度の分離)。周期発火は従来どおり閾値+個人重み抽選+予算のゲートを通し、
+    #  驚き/内部の割込みだけが抽選を飛ばす(対面会話の確定発火と同格)。
+    #  「全員の基本周期 10 分・他の発火源なし」設定では due が毎 step 全員になるので
+    #  requesters は現行と厳密に同じ集合になる(P0(2) の後方互換の要)。
+    fire_on = fire_mod.enabled(sim)
+    due: dict = {}
+    forced: set = set()
+    granted_ids: set = set()
+    if fire_on:
+        due = fire_mod.due_events(sim, step, sim_min, active)
+        forced = {aid for aid, ev in due.items() if ev["interrupt"]}
+        requesters = [a for a in active
+                      if a.id in due and step >= a.refractory_until
+                      and (a.id in forced or logistic or a.drive >= _eff_thr(a))]
+    elif logistic:
         requesters = [a for a in active if step >= a.refractory_until]
     else:
         requesters = [a for a in active
@@ -2111,15 +2128,20 @@ def _phase_drive(sim, step: int, sim_min: int) -> None:
         # 対面会話: 同席者がいて会話クールダウン外なら抽選なしで確定発火(logistic でも不変)。
         face = bool(hearers_of(agent, _percept(sim), radius)) \
             and step >= agent.conv_cooldown_until
+        # 第81: 驚き/内部の割込みは抽選なしの確定発火(face と同格)。OFF は forced 空=不変。
+        interrupt = agent.id in forced
         granted = False
-        if face:
+        if face or interrupt:
             lottery = None
             if sim.budget.take():                  # 予算切れ=ゲージ維持で持ち越し
                 granted = True
-                agent._fire_reason = "social_face"
+                # 割込みでも LLM へ渡す「きっかけ」は既存語彙のまま(no-fingerprint:
+                # 発火機構の ON/OFF がプロンプトから読めない)。理由は L1 の cog_fire にだけ残る。
+                agent._fire_reason = "social_face" if face else reason
                 drive.on_fire(agent, step, cfg)
                 stats["fires"] += 1
-                stats["face_fires"] += 1
+                if face:
+                    stats["face_fires"] += 1
         else:                                      # 媒体/独り言: 抽選
             if logistic:
                 p = 1.0 / (1.0 + math.exp(
@@ -2141,8 +2163,12 @@ def _phase_drive(sim, step: int, sim_min: int) -> None:
                                       "mode": "face" if face else "media",
                                       "lottery": lottery, "granted": granted,
                                       "reason": reason}))
+        if granted:
+            granted_ids.add(agent.id)
         if granted and null_series:                # 対照: 発火に紐付けたダミー呼び出し
             _null_calls(sim, agent, step, sim_min)
+    if fire_on:                                    # スケジュール列そのものを L1 に残す(P0-4)
+        fire_mod.log_events(sim, step, sim_min, due, granted_ids)
     sim.drive_stats = stats
 
 
@@ -4582,6 +4608,9 @@ def run_step(sim, step: int) -> None:
     # 観測チャンネル(第80。既定 OFF=sim.channels_sc None=-1 で以降を完全スキップ)。
     # この step で新規に記録される L1(受信発話・掲示視認)の起点を控える(_isl と同じ流儀)。
     _ch_idx = len(sim.logger.events) if _channels_on(sim, step) else -1
+    # 閾値発火(第81。既定 OFF=-1 で以降を完全スキップ)。step 末に o_c(t) を採って各個体へ
+    # **凍結**し、次 tick の S 判定はその 1 枚のスナップショットだけを読む(ダブルバッファ)。
+    _fire_idx = len(sim.logger.events) if fire_mod.enabled(sim) else -1
     # L2 業務の実体(work.service。既定OFF=-1でこの step の接客帰属を完全スキップ=バイト一致)。
     _work_idx = len(sim.logger.events) if _work_service_on(sim) else -1
     _ensure_orgs(sim)                              # 組織台帳の遅延初期化(既定OFF=no-op)
@@ -4620,6 +4649,10 @@ def run_step(sim, step: int) -> None:
     _phase_world_events(sim, step, sim_min)
     _phase_lodging(sim, step, sim_min)             # 宿泊のチェックアウト(checkout_hour。既定OFF=no-op。Wave L)
     _phase_wake_and_returns(sim, step, sim_min)
+    # 第81(記録専用・OFF は no-op): 朝計画の対象者を _phase_planning が消費する前に控える。
+    # 「内省・会話も第一級の発火源」(計画書 §6-3)を認知イベント列に載せるためだけの1行で、
+    # 発火権の配布そのものは _phase_drive の単一作用点に閉じている。
+    fire_mod.note_plan_due(sim, step)
     _phase_planning(sim, step, sim_min)            # 起床/帰還の直後 step に朝の一日計画
     _phase_tools(sim, step, sim_min)               # イベント開始で会場へ発つ→次の移動で反映
     _phase_move(sim, step, sim_min)
@@ -4647,6 +4680,10 @@ def run_step(sim, step: int) -> None:
     active = [a for a in sim.agents
               if a.loc != "outside" and not a.sleeping]   # 外・睡眠中=計算しない
     actions = [(agent, _decide(sim, agent, step, sim_min)) for agent in active]
+    # 同期バリア + ダブルバッファ(第81・設計 §3.3)。既定 OFF は引数をそのまま返す恒等。
+    # ON では推論結果の **world への適用順を agent_id 昇順に正準化**する(到着順=推論の
+    # 完了順が世界に漏れない。T1 完了順序不変性テストがこれを固定する)。
+    actions = fire_mod.barrier(sim, actions)
     for agent, action in actions:
         _apply(sim, agent, action, step, sim_min)
     # 屋内エンジン配線(B3): building/floor が確定した _apply 後に、在館者の区画割当・フロア内
@@ -4702,6 +4739,10 @@ def run_step(sim, step: int) -> None:
     if _ch_idx >= 0:
         from ..cognition import channels as _channels_mod
         sim.channels_sc.add_rows(_channels_mod.observe(sim, step, sim_min, _ch_idx))
+
+    # 閾値発火(第81。既定 OFF は _fire_idx=-1 で完全 no-op)。この step 末の o_c(t) を
+    # 各個体へ凍結し、次 tick の S 判定の唯一の入力にする(全員が同じ state(t) を読む)。
+    fire_mod.observe_end(sim, step, sim_min, _fire_idx)
 
     sim.logger.log_metrics(step, collect(sim))
     if step % int(sim.cfg.observer.snapshot_every) == 0:

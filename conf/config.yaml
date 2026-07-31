@@ -843,6 +843,25 @@ cognition:
     every_steps: 1        # 観測の採取間隔(1=毎 step。位相は step=0 を含む=L3 と揃う)
     sigma_file: ""        # 空=data/calib/sigma_c.json(無くてもランは落とさない=来歴に absent と残す)
     calib_file: ""        # 空=conf/cognition/calib_default.yaml(壊れていたら即エラー)
+  # ---- 閾値発火 + 認知イベントキュー + 同期バリア(第81バッチ 2026-08-01・**既定 OFF**)----
+  # 「1 step = 10 分」が兼ねている『世界の進行』と『思考の頻度』を分離する層
+  # (physics-instructions.md Part P0 / cognition-design-record.md §2.3・§3.3)。
+  #   S_i(t) = Σ_c g_ic·|o_c(t) − ô_ic|/σ_c、  発火 ⟺ S > θ_i     … 毎 tick コード側のみ・LLM ゼロ
+  # 発火源は 4 種: periodic(文脈別の基本周期=較正テーブル)/ salience(驚き=上式)/
+  # internal(ニーズ閾値の上向き横断)/ social(会話返答・夜内省・朝計画の第一級化=§6-3)。
+  # ★ON は journal 等級・affects_k=true(LLM 呼の発生点そのものが変わる)。旧 k 非依存則は
+  #   OFF のときに従来どおり成立し、ON では「スケジュール列が同一なら世界が同一」に置き換わる。
+  # ★後方互換の要: sources=[periodic] / period_override_min=10 / period_cv_scale=0 /
+  #   sleep_period_mult=1.0 が「全員の基本周期 10 分・他の発火源なし」= 現行の特殊ケース。
+  fire:
+    enabled: false
+    sources: [periodic, salience, internal, social]
+    period_override_min: 0    # >0 = 全文脈の基本周期をこの分数で上書き(0=較正テーブルに従う)
+    period_scale: 1.0         # 較正テーブルの基本周期にかける全体倍率
+    period_cv_scale: 1.0      # 周期のばらつき(較正 cv への倍率)。0=乱数を1本も引かない
+    sleep_period_mult: 6.0    # 睡眠中の周期の伸び(P0(2)「睡眠中は伸びる」)
+    theta_scale: 1.0          # θ の全体スケール(較正は第83のパイロット。ここは実験レバー)
+    max_contrib: 3            # L1 に残す S 寄与内訳の件数(観測装置の設定)
 
 # ---- 開放行動+価値の4軸(第17バッチ 2026-07-10。既定 OFF=現行と完全同一)----
 # LLM 自身が自由記述で行動を決める "do" をメニューに追加し、価値(実用/感情/社会/認識)で

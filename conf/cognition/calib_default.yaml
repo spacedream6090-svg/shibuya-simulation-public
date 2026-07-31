@@ -22,8 +22,8 @@
 #       対数正規を既定にする(反応時間分布の標準的な当てはめ)。median_s は中央値、
 #       sigma は対数スケールの標準偏差(= 中央値の ×exp(±sigma) が ±1σ 帯)。
 # ============================================================================
-schema: 1
-version: "0.1-provisional"
+schema: 2
+version: "0.2-provisional"
 
 provenance:
   status: provisional
@@ -86,3 +86,25 @@ onset_delay:
     environmental: { dist: lognormal, median_s: 1.5, sigma: 0.65 }
     internal:      { dist: lognormal, median_s: 1.2, sigma: 0.70 }
     signage:       { dist: lognormal, median_s: 2.5, sigma: 0.80 }
+
+# ---- 驚き発火の閾値 θ(第81バッチ 2026-08-01・**仮置き**)----
+# 発火判定(cognition-design-record.md §2.3):
+#     S_i(t) = Σ_c g_ic·|o_c(t) − ô_ic|/σ_c + Σ_j w_ij·[trigger_j]、  発火 ⟺ S > θ_i
+# S は σ_c で正規化済み = 「usable なチャンネル全体で、期待から何σぶん外れたかの合計」。
+# したがって θ の単位は **σ の本数**であり、チャンネル本数に依存する量である
+# (data/calib/sigma_c.json の usable は現在 7 本)。
+#
+# ★★ 値は仮置き。実測にも較正パイロットにも合わせ込んでいない。★★
+#    設計 §2.6 の「1 日あたり平均発火数が目標値になるよう θ の全体スケールのみを合わせる」
+#    較正は**第83バッチ**の仕事で、そこまでは暫定値。個体差 θ_i の分散と恒常性項
+#    (θ_i ← θ_i + μ·(f̄_i − f*))も第82/83で入る。ここは文脈別の水準だけを持つ。
+#    全体スケールはランごとに conf の cognition.fire.theta_scale で振れる。
+#
+# 文脈間の大小関係の根拠(これも仮説であって実測ではない):
+#   talking / working = 目の前の相手・課題に注意が向いているぶん外界の偏差に鈍い → 高い
+#   resting          = 注意が空いていて偏差を拾いやすい → 低い
+salience:
+  walking: { theta: 3.0 }
+  talking: { theta: 4.0 }
+  working: { theta: 4.5 }
+  resting: { theta: 2.5 }

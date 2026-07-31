@@ -168,6 +168,16 @@ def save(sim, step: int, path: str | Path) -> Path:
             "today_date_line": getattr(sim, "today_date_line", None),
             "today_weather": getattr(sim, "today_weather", None),
             "today_weather_line": getattr(sim, "today_weather_line", None),
+            # 第81バッチ: 認知イベントキューの状態(pending = {agent_id: {at, reason, tok}})。
+            # ★これを保存しないと resume 直後に「全員が今すぐ期限」の初期化に戻り、発火の
+            # スケジュール列が straight と食い違う(= 新不変量「スケジュール列が同一なら
+            # 世界が同一」が resume で破れる)。第62 joint / 第70 echo / 第75 dunbar / 第80 W2 と
+            # 同じ型の中央管理。ヒープ本体は保存しない — 順序は pending の内容だけで決まるので
+            # load 側で決定論的に再構築できる。期待値 ô(_fire_pred)・凍結観測(_fire_obs)・
+            # 前 tick のゲージ(_fire_prev_drive)は agents pickle に自然同梱される。
+            # cognition.fire OFF のランでは None = 挙動不変(load は .get で旧 ckpt 互換)。
+            "cogq": (sim.cogq.state() if getattr(sim, "cogq", None) is not None
+                     else None),
             # 第71バッチ: LLM 入出力ジャーナルの確定点(ファイル名 → {records, bytes})。
             # mark() が flush してから採るので、この時点のファイル末尾は必ず gzip メンバ境界
             # = 安全な切り詰め点。resume(load)がここまで巻き戻すことで、「checkpoint 後に
@@ -292,6 +302,10 @@ def load(sim, path: str | Path) -> int:
         sim.today_date_line = rt.get("today_date_line")
         sim.today_weather = rt.get("today_weather")
         sim.today_weather_line = rt.get("today_weather_line")
+    # 第81: 認知イベントキュー(旧 checkpoint 互換=無ければ初期化のまま=OFF ランは無風)。
+    if getattr(sim, "cogq", None) is not None:
+        from ..cognition.fire import CogQueue as _CogQueue
+        sim.cogq = _CogQueue.restore(rt.get("cogq"))
     if hasattr(sim, "_journal_rewind"):         # 第71: LLM ジャーナルを確定点まで巻き戻す
         sim._journal_rewind(rt.get("llm_journal"))
 
