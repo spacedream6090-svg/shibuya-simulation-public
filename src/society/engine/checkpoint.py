@@ -133,6 +133,12 @@ def save(sim, step: int, path: str | Path) -> Path:
             # deque/dict/Counter のみ=pickle の集合反復順非保存の影響を受けない。
             # observer.echo.enabled=false のランでは state 自体が生えない → None=挙動不変。
             "echo_state": getattr(sim, "_echo_state", None),
+            # 第74バッチ IDEA③(規範化ステージ): 語ごとの 4 段階台帳(素の dict/list のみ)。
+            # 既定 OFF(labeling.norm_stage.enabled=false)では state 自体が生えない → None=
+            # 挙動不変。ON のときは L2 の 2 列が累積量なので、保存しないと mid-day resume の
+            # L2 が straight と食い違う(第62 joint / 第70 echo と同じ型のギャップ)。
+            # processed カウンタは**プロセス内 logger 由来**なので保存しない(load 側で 0)。
+            "norm_state": getattr(sim, "_norm_state", None),
             # 第73バッチ(真偽台帳 Part B): sim 側の台帳=fact レコード(_tl_facts)・重複判定キー
             # (_tl_keys)・累積カウンタ(_tl_stats)。**保存しないと resume 後に fact_id が振り直され、
             # 信念(agents pickle に自然同梱される _fact_beliefs)の参照先が全部迷子になる**
@@ -235,6 +241,11 @@ def load(sim, path: str | Path) -> int:
         sim._echo_state = est_echo
     sim._echo_processed = 0                     # fresh logger=total 0 から再走査(assets と同流儀)
     sim._echo_cache = None
+    nst = rt.get("norm_state")                  # 第74 IDEA③: 規範化ステージ台帳(旧 ckpt 互換=無ければ素通り)
+    if nst is not None:
+        sim._norm_state = nst
+    sim._norm_processed = 0                     # fresh logger=total 0 から再走査(echo と同流儀)
+    sim._norm_cache = None
     # 第73 Part B: 真偽台帳(旧 checkpoint 互換=無ければ素通り=beliefs OFF の挙動不変)。
     # canary は module 側のプロセス内レジストリなので、復元した fact 分を再登録して武装を保つ。
     tlf = rt.get("tl_facts")

@@ -683,6 +683,40 @@ def echo_novelty(run_dir: str, window_steps: int = m.ECHO_WINDOW_STEPS,
 
 
 # --------------------------------------------------------------------------- #
+# 規範化ステージ / コホートタグ(measure.norm_stages / first_presence の逐次版。第74)
+# --------------------------------------------------------------------------- #
+def norm_stages(run_dir: str, markers=None, min_word_len: int = 2,
+                max_gap: int = 2, usage: bool = False) -> dict:
+    """measure.norm_stages と同一出力を 1 パスの逐次読みで(判定器は norms と共有)。
+
+    メモリは語彙数で有界(発話テキストを保持しない)。usage=True のときだけ
+    語ごとの使用記録((step, agent) の列)を持つので使用件数に比例する。
+    """
+    from . import norms as _norms
+    acc = _norms.accumulator(markers, min_word_len, max_gap)
+    use: dict = {} if usage else None
+    for e in _events(run_dir, ["step", "agent_id", "kind", "payload"]):
+        kind, step, aid, p = e["kind"], e["step"], e["agent_id"], e["payload"]
+        _norms.feed(acc, kind, step, aid, p)
+        if use is not None:
+            m.norm_usage_feed(acc, use, kind, step, aid, p)
+    res = _norms.finish(acc)
+    if use is not None:
+        res["usage"] = {w: use[w] for w in sorted(use)}
+    return res
+
+
+def first_presence(run_dir: str) -> dict[int, int]:
+    """measure.first_presence の逐次版(エージェント → L1 初出 step)。"""
+    out: dict[int, int] = {}
+    for e in _events(run_dir, ["step", "agent_id"]):
+        aid = e["agent_id"]
+        if isinstance(aid, int) and aid >= 0 and aid not in out:
+            out[aid] = int(e["step"])
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # 造語文脈(scripts/analyze.coinage_contexts のストリーミング版)
 # --------------------------------------------------------------------------- #
 def coinage_contexts(run_dir: str) -> list[dict]:

@@ -691,6 +691,84 @@ def echo_novelty(events: list[dict], window_steps: int = ECHO_WINDOW_STEPS,
     return echo_finish(acc)
 
 
+# --------------------------------------------------------------------------- #
+# 規範化ステージ(第74バッチ IDEA③)+ コホートタグ(Part E1)の事後算出。
+# 判定規則の単一の源は observer/norms.py(ランタイム L2 と同じ関数を回す)。
+# --------------------------------------------------------------------------- #
+def norm_usage_feed(acc: dict, usage: dict, kind: str, step, agent_id,
+                    payload: dict) -> None:
+    """語の「使用(産出)」記録を集める(norms.feed の**後**に同じイベントで呼ぶこと)。
+
+    使用 = その語を **発した** こと。3 経路を数える(聴取 label_adopt は含めない):
+      (a) label_coin  … 造語した本人
+      (b) transmission… payload["from"](= その語を口にした話者)
+      (c) 発話テキスト… speak / sns_post / dm の本文に語が含まれる
+    `usage[word]` は (step, agent) の **step 昇順** リスト(重複含む)。
+    """
+    if kind == "label_coin":
+        word = payload.get("text")
+        if isinstance(word, str) and word.strip() in acc["words"] \
+                and isinstance(agent_id, int) and agent_id >= 0:
+            usage.setdefault(word.strip(), []).append((int(step), int(agent_id)))
+        return
+    if kind == "transmission":
+        word = acc["by_item"].get(payload.get("item_id"))
+        frm = payload.get("from")
+        if word is not None and isinstance(frm, int) and frm >= 0:
+            usage.setdefault(word, []).append((int(step), int(frm)))
+        return
+    if kind in _UTTERANCE_KINDS:
+        text = payload.get("text")
+        if not isinstance(text, str) or not text:
+            return
+        if not isinstance(agent_id, int) or agent_id < 0:
+            return
+        for word in acc["order"]:
+            if word in text:
+                usage.setdefault(word, []).append((int(step), int(agent_id)))
+
+
+def norm_stages(events: list[dict], markers=None, min_word_len: int = 2,
+                max_gap: int = 2, usage: bool = False) -> dict:
+    """語ごとの規範化 4 段階(S1 初出 / S2 他者引用 / S3 定冠詞化 / S4 制度化)。
+
+    markers = {"definite": [...], "agreement": [...]}(**conf から渡す**。
+    None または空リストなら S3/S4 は 1 件も立たない=コードに語彙を書かない設計)。
+    usage=True で `result["usage"]`(語 → [(step, agent), ...])も返す
+    (= Part E(2) の「相異なる利用者数」閾値判定の材料)。
+    """
+    from . import norms as _norms
+    acc = _norms.accumulator(markers, min_word_len, max_gap)
+    use: dict = {} if usage else None
+    for e in _ordered(events):
+        kind, step, aid, p = e["kind"], e["step"], e["agent_id"], e["payload"]
+        _norms.feed(acc, kind, step, aid, p)
+        if use is not None:
+            norm_usage_feed(acc, use, kind, step, aid, p)
+    res = _norms.finish(acc)
+    if use is not None:
+        res["usage"] = {w: use[w] for w in sorted(use)}
+    return res
+
+
+def first_presence(events: list[dict]) -> dict[int, int]:
+    """エージェント → **L1 に初めて現れた step**(= 初 presence の操作的定義)。
+
+    Part E1 のコホートタグ。**シム側に新しい記録を足さずに済む**ことを実査で確認した:
+    在場中のエージェントは毎 step 何らかのイベント(stay/move_segment/route_start 等)を
+    出すので、初出 step = その個体が世界に居た最初の step になる。
+
+    正直な限界: `pool.enabled=false`(既定)では全員が step 0 から在場するため、
+    **コホートは 1 群しかできない**(= 下方因果の群間比較は pool ON のランでのみ成立する)。
+    """
+    out: dict[int, int] = {}
+    for e in _ordered(events):
+        aid = e["agent_id"]
+        if isinstance(aid, int) and aid >= 0 and aid not in out:
+            out[aid] = int(e["step"])
+    return out
+
+
 def _tree_depth(edge_set: set) -> int:
     """from->to 有向辺の最長路(辺数)。media/search/news は from=-1 が自然な根。
 

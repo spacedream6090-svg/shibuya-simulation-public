@@ -482,6 +482,15 @@ class Simulation:
         # 閾値分布の seam(手続き生成経路のみ。名簿値優先=現状のまま)
         self.threshold_dist = str(cfg.get("factors", {}).get("threshold_dist",
                                                              "normal") or "normal")
+        # 初期個体差ゼロ対照(第74バッチ IDEA④。既定 OFF=build_agent 側で 1 行も通らない)。
+        # conf 非搭載の旧 config でも既定へ落ちる(実験マニフェストだけが ON にする)。
+        _flat = cfg.get("experiment", {}) or {}
+        _flat = (_flat.get("flat_traits", None) if hasattr(_flat, "get") else None) or {}
+        self.flatcfg = {
+            "enabled": bool(_flat.get("enabled", False)),
+            "value": float(_flat.get("value", 0.5)),
+            "include_derived": bool(_flat.get("include_derived", True)),
+        }
         # state 更新則の magnitude(OPEN#2、B段調律。Phase D)
         from ..factors import update as factor_update
         self.mags = factor_update.build_magnitudes(cfg.get("factors", {}))
@@ -850,7 +859,8 @@ class Simulation:
                                     threshold_dist=self.threshold_dist,
                                     drift=self.drivecfg["drift"],
                                     reflection=self.reflectcfg,
-                                    place_name=self.place_name)
+                                    place_name=self.place_name,
+                                    flat=self.flatcfg)
                 self._init_agent_runtime(agent)
                 # 群のオントロジー(既定 OFF=no-op)。直接ランは tier=default(プール非使用)。
                 self._apply_ontology(agent, "default")
@@ -1280,7 +1290,8 @@ class Simulation:
                             threshold_dist=self.threshold_dist,
                             drift=self.drivecfg["drift"],
                             reflection=self.reflectcfg,
-                            place_name=self.place_name)
+                            place_name=self.place_name,
+                            flat=self.flatcfg)
         agent.pool_pid = pid
         # party_size(L4 来街者 record に実在=同行人数)を保持(S-R5 party の実体化が読む。無ければ None)。
         agent.party_size = record.get("party_size")
@@ -1519,6 +1530,18 @@ class Simulation:
             summary["world_mod"] = self.worldmod.summary()
         if getattr(self, "heights_stat", None) is not None:
             summary["building_heights"] = dict(self.heights_stat)
+        # ---- 初期フレーム共変量 第74バッチ IDEA④(observer.initial_frame.days: 0 = 既定 OFF)----
+        # 確定済みの l1_events.parquet(直前の logger.flush)を読み直す **完全な事後処理**。
+        # OFF ではこのブロックが即 None を返し summary にキーを足さない=既存ランと同形。
+        from ..observer import initial_frame as _iframe
+        from ..observer import norms as _norms_mod
+        _ifcfg = _iframe.cfg_of_config(self.cfg)
+        if _ifcfg["days"] > 0:
+            _if = _iframe.summarize(self.out_dir, _ifcfg["days"],
+                                    _ifcfg["top_kinds"],
+                                    _norms_mod.cfg_of(self)["markers"])
+            if _if is not None:
+                summary["initial_frame"] = _if
         (self.out_dir / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         return summary

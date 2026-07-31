@@ -11,6 +11,7 @@ import numpy as np
 
 from ..economy import assign_part_time, initial_money, split_account, wage_amount
 from ..factors.registry import (STATE_INIT, drift_params, drive_params,
+                                flat_drive_params, flat_traits,
                                 reflect_trigger_params,
                                 opinion_params, sample_traits)
 from .agent import Agent
@@ -66,12 +67,24 @@ def build_agent(agent_id: int, rng: np.random.Generator, nodes: list[str],
                 threshold_dist: str = "normal",
                 drift: dict | None = None,
                 reflection: dict | None = None,
-                place_name: str = "この街") -> Agent:
+                place_name: str = "この街",
+                flat: dict | None = None) -> Agent:
     """entry(scripts/build_personas.py の名簿)があればそれを使い、
     無ければ手続き生成(v2 以前の互換動作: 全員居住者)。
 
     economy が渡されれば手持ち初期値・本業日給・バイトを職業別に決める(経済 v0)。
-    threshold_dist は手続き生成経路のみに作用(名簿 entry 使用時は名簿値優先=現状のまま)。"""
+    threshold_dist は手続き生成経路のみに作用(名簿 entry 使用時は名簿値優先=現状のまま)。
+
+    flat(第74バッチ IDEA④ 初期個体差ゼロ対照。既定 None=**現行挙動と完全同一**):
+      {"enabled": bool, "value": float, "include_derived": bool}。enabled で
+      traits を全個体同一の定数に潰す。**名簿経路と pool 経路の両方がこの関数を通る**ので、
+      ここが唯一の実装点になる(実査で確認: traits を読む下流 = drive/opinion/drift/
+      reflect/sdt/needs/collective は全て agent.traits か本関数内の traits を見る)。
+      乱数は 1 draw も増減しない(sample_traits / drive_params は従来どおり引いてから
+      値だけ捨てる)ので ON/OFF で draw 順が完全に一致する。"""
+    flat_on = bool(flat and flat.get("enabled"))
+    flat_value = float((flat or {}).get("value", 0.5))
+    flat_derived = bool((flat or {}).get("include_derived", True))
     if entry:
         gender = entry["gender"]
         name = entry["name"]
@@ -103,6 +116,14 @@ def build_agent(agent_id: int, rng: np.random.Generator, nodes: list[str],
         has_car = bool(rng.random() < 0.08)
         persona_txt = ""
         commute = False
+    # ---- 初期個体差ゼロ対照(第74バッチ IDEA④。既定 OFF = ここを 1 行も通らない)----
+    # traits を潰すのは **両経路の合流点**(名簿の値も手続き生成の値もここで上書きされる)。
+    # sample_traits / drive_params は上で既に呼ばれている = draw は消費済み → 差し替えても
+    # 乱数列は 1 本もずれない。include_derived で発火個体差(閾値・重み)も中心値へ潰す。
+    if flat_on:
+        traits = flat_traits(traits.keys(), flat_value)
+        if flat_derived:
+            drive_threshold, fire_weight = flat_drive_params(traits)
     start = nodes[int(rng.integers(len(nodes)))]
 
     # ---- 家: 居住者=実在の住宅建物 / 来街者=街の外(駅・縁が帰路の起点)----

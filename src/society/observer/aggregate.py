@@ -11,6 +11,7 @@ from . import assets as _assets
 from . import deviation as _dev
 from . import echo as _echo
 from . import lens as _lens
+from . import norms as _norms
 from . import silence as _silence
 from . import structure as _struct
 
@@ -950,6 +951,25 @@ def _transmission_novel(sim):
 @register_aggregator("transmission_novel_rate")
 def _transmission_novel_rate(sim):
     return _echo_col(sim, "transmission_novel_rate")
+
+
+# ---- 規範化ステージ 第74バッチ IDEA③(既定 OFF = 2 列とも消える = L2 バイト不変)。
+#      観測の源は observer/norms.py(語ごとの 4 段階台帳)。読むだけ・乱数ゼロ・LLM 呼ゼロ・
+#      L1 イベント追加ゼロ・プロンプト 1 バイト不変。詳細な語別の台帳と命名者/制度化者の
+#      突合は **解析側**(scripts/analyze_norms.py)が持ち、L2 は要約 2 列だけに絞る。
+def _norm_col(sim, key):
+    s = _norms.scalars(sim)
+    return s.get(key) if s else None
+
+
+@register_aggregator("norm_stage_max")
+def _norm_stage_max(sim):
+    return _norm_col(sim, "norm_stage_max")
+
+
+@register_aggregator("norm_steps_to_agreement")
+def _norm_steps_to_agreement(sim):
+    return _norm_col(sim, "norm_steps_to_agreement")
 
 
 # ---- 未定義行動レジスタ + 沈黙の第一級化 第70バッチ IDEA②(既定 OFF)。

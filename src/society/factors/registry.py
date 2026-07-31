@@ -55,6 +55,34 @@ def drive_params(traits: dict[str, float],
     return threshold, fire_weight
 
 
+def flat_traits(names=None, value: float = 0.5) -> dict[str, float]:
+    """全 trait を同一の定数にした traits(第74バッチ IDEA④ の初期個体差ゼロ対照)。
+
+    キー集合は `sample_traits` と同じ(sorted(TRAITS))ので、下流の写像関数は
+    ひとつも欠損キーを見ない。乱数を引かない = 呼び出し位置に関係なく draw 順不変。
+    """
+    keys = sorted(TRAITS) if names is None else sorted(names)
+    v = float(value)
+    return {k: v for k in keys}
+
+
+def flat_drive_params(traits: dict[str, float]) -> tuple[float, float]:
+    """`drive_params` の**乱数抜き中心値**(= 個体差ゼロ版の (threshold, fire_weight))。
+
+    drive_params は traits から分布の中心を決め、そこへ 2 draw のノイズを載せる。
+    初期個体差ゼロ対照ではノイズも「生まれつきのばらつき」なので中心値へ潰す。
+    threshold_dist は normal / lognormal ともモーメントマッチングで平均が一致する設計
+    (drive_params の docstring)なので、中心値はどちらでも同じ = 引数に取らない。
+    **乱数を 1 draw も引かない**ので、呼び出し側は従来どおり drive_params を呼んで
+    draw を消費したうえで値だけ差し替えれば、ON/OFF で draw 順が完全に一致する。
+    """
+    nfc = traits.get("nfc", 0.5)
+    locus = traits.get("internal_locus", 0.5)
+    threshold = float(np.clip(0.60 - 0.20 * (nfc - 0.5) * 2, 0.30, 0.85))
+    fire_weight = float(np.clip(0.50 + 0.30 * (locus - 0.5) * 2, 0.15, 0.90))
+    return threshold, fire_weight
+
+
 def drift_params(traits: dict[str, float], rng: np.random.Generator,
                  cfg: dict) -> dict[str, float]:
     """traits → 内省しやすさの時間ドリフト率(E2)。drive_params と同格(no-fingerprint)。

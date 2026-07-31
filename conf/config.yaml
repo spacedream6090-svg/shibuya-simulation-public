@@ -1024,6 +1024,34 @@ labeling:
     min_adopters: 1             # 束縛語の採用者数がこれ以上のときだけ知覚に出す(1=造語者本人だけでも出る)
     prompt_line: true           # 熟慮プロンプトへの1行注入(false=束縛と観測だけ行い知覚には出さない)
 
+  # ---- 規範化ステージ検出器 第74バッチ IDEA③(2026-07-31。**観測のみ**=世界に一切効かない)----
+  # 語ごとに 4 段階を **既存 L1 イベントと発話テキストだけ**から決定論検出する:
+  #   S1 初出(label_coin の step。主=coiner)
+  #   S2 他者引用(coiner 以外による最初の使用。transmission の from もしくは発話本文)
+  #   S3 定冠詞化(発話本文に「〈definite マーカー〉+ 語」が現れた初出。主=definitizer)
+  #   S4 制度化 (発話本文に〈agreement マーカー〉と語が共起した初出。主=institutionalizer)
+  # 段階 n は n-1 が既に成立しているときにしか記録しない(飛び段・逆順を作らない)。
+  # ★ここの markers が **検出語彙の単一の源**。コードには 1 語も書いていない(envpack 流儀)ので、
+  #   リストを空にすれば S3/S4 は永久に 0 件になる(= 語彙を差し替えて感度分析ができる)。
+  # enabled は **L2 の 2 列(norm_stage_max / norm_steps_to_agreement)を出すかどうかだけ** の
+  #   スイッチ。false(既定)= 列なし = L2 バイト不変。語別の台帳・命名者/制度化者の突合・
+  #   下方因果(Part E)の検定は **解析側** scripts/analyze_norms.py が保存済み L1 から
+  #   いつでも再現する(= enabled に依存しない)。
+  # プロンプト 1 バイト不変・LLM 呼数不変・乱数ゼロ・L1 イベント追加ゼロ(R1)。
+  # 実装と正直な限界(表層文字列一致しか見ない・mock では S3/S4 が 0 件)は
+  #   src/society/observer/norms.py の docstring を参照。
+  norm_stage:
+    enabled: false              # true で L2 に 2 列。false=列なし(既存ランと L2 バイト一致)
+    min_word_len: 2             # 検出対象にする語の最小文字数(1 文字語の部分一致誤爆よけ)
+    max_gap: 2                  # 定冠詞マーカーと語の間に許す文字数(「例の『語』」の括弧を吸収)
+    markers:
+      # 定冠詞相当(既知の共有物として指す形式)。日本語には冠詞が無いので指示詞・限定詞で代替する。
+      definite: ["例の", "れいの", "あの", "いつもの", "おなじみの", "先ほどの", "さっきの", "その"]
+      # 合意参照(既に決まった事として引く形式)= 規範化の言語的指標。
+      agreement: ["さっき決めた", "前に決めた", "決めたとおり", "決めた通り", "決まりだから",
+                  "決まりです", "ということになった", "ルール", "取り決め",
+                  "いつもどおり", "いつも通り", "そういうこと"]
+
 rewards:
   enabled: false                # D9: 既定 off(過正当化の交絡を排除)
   amount_per_adoption: 300      # enabled 時、自分の造語が採用されるたび creator に与える報酬額(円)
@@ -1314,6 +1342,45 @@ observer:
     ngram: 4                    # 自己類似度の文字 n-gram の n
     sim_threshold: 0.6          # 直前の自分の発話との Jaccard がこれ以上ならエコー扱い
     min_utterances: 2           # echo_max の対象にする最小発話数(1 件で 1.0 になる退化を防ぐ)
+  # ---- 初期フレーム共変量 第74バッチ IDEA④(2026-07-31。既定 OFF=summary にキーを足さない)----
+  # 「そのランが最初の N 日をどう解釈したか」を **ラン単位の共変量** として summary.json へ残す。
+  # workplace チームの実測(初期の解釈枠がその後の分化の形を決める)を層別の材料にするための
+  # 記録で、**L1/L2/プロンプト/乱数/LLM 呼数のいずれも変えない**(finalize で確定済みの
+  # l1_events.parquet を読み直して決定論集計するだけ = 完全な事後処理)。
+  # days: 0(既定)= 一切集計しない = summary.json に initial_frame キーが出ない(既存ランと同形)。
+  # >0 で最初の days 日(1 日 = 144 step)を窓に取り、行動(イベント種)構成比・造語数・
+  #   発話数・規範マーカー出現率・L2 平均(mean_grievance / mean_drive 等)を書く。
+  # 解析側は scripts/analyze_norms.py --cohort / analyze_sweep が層別軸として読む。
+  initial_frame:
+    days: 0                     # 0=OFF(summary にキーなし)。1 で初日、2 で 2 日分を窓にする
+    top_kinds: 20               # 記録するイベント種の上限(件数降順→種名昇順の決定論で切る)
+
+# ============================================================
+# 実験セル(第74バッチ IDEA④ 2026-07-31)。**対照条件の宣言だけ**を置く層で、
+# 世界の機構は 1 つも増えない。既定は全て OFF = 現行挙動と完全同一(バイト一致)。
+# ============================================================
+experiment:
+  # ---- 初期個体差ゼロ対照(flat_traits)----
+  # 研究課題「生まれつきか、環境から創発か」に対する最強の対照条件。ON にすると
+  # **全エージェントの traits を同一の定数**にし、traits から決まる発火個体差
+  # (drive_threshold / fire_weight)も同じ定数写像へ潰す = R²(k) の分母を実験的に消す。
+  # ペルソナ文(名前・年齢・職業・住所・職場・就寝時刻)は **一切変えない**
+  #   = 消すのは「生まれつきの傾性」だけで、履歴と環境は残す(ebiyama 講評と整合)。
+  # 実装点は src/society/agents/persona.py:build_agent の 1 箇所だけ(名簿経路・
+  #   pool 経路の両方がここを通る)。**乱数の消費本数は ON/OFF で完全に同一**
+  #   (sample_traits / drive_params は従来どおり引いてから値を捨てる)。
+  # 実査で確認した「traits の漏れ経路」= drive_params(発火閾値)・opinion_params・
+  #   drift_params・reflect_trigger_params・sdt_params・needs_profile・collective_init。
+  #   全て build_agent が据えた agent.traits を読むので、ここを定数化すれば全経路に効く。
+  #   presence の日次選抜は stream("presence", pid, day) の純関数 = **traits 非依存**
+  #   (engine/scheduler.py の _phase_pool_rotation)なので漏れない。
+  # ★LLM 呼数は ON/OFF で一致しない(閾値が変われば誰が発火するかが変わる=それが実験の目的)。
+  #   k との交絡は conf/experiments/zero_traits.yaml が controls.mode=compute_matched で潰す。
+  flat_traits:
+    enabled: false              # true で全個体の traits を定数化(既定 false=現行挙動)
+    value: 0.5                  # 定数化する値(全 trait 共通。0.5=分布の中心)
+    include_derived: true       # traits から決まる drive_threshold / fire_weight も定数写像へ潰す
+                                # (false にすると名簿の個体差が発火閾値経由で残る=不完全な対照)
 
 # ============================================================
 # 第6バッチ(ユーザー要望 2026-07-06)。すべて既定 OFF=現行挙動と完全同一。

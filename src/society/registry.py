@@ -315,6 +315,11 @@ FEATURES: tuple[Feature, ...] = (
        "熟慮の coin_label(LLM が作った語の文字列)を発生ノードへ束縛する"),
     _f("labeling.place_binding.prompt_line", "journal", False, "possible",
        "束縛された造語を『この場所の呼ばれ方』として熟慮プロンプトへ1行注入"),
+    # 第74バッチ IDEA③: 観測専用(L1 と発話テキストを読むだけ・世界へ戻さない)。
+    # LLM の自由文(発話本文)を**入力に使う**が、出力は L2 の 2 列と解析だけで
+    # 世界の因果に一切入らない。入力は L1 に残っており事後に同じ判定を再現できる=strict。
+    _f("labeling.norm_stage.enabled", "strict", False, "none",
+       "規範化ステージ検出器の L2 2列(観測専用。プロンプト・イベント・乱数は 1 バイトも動かない)"),
     _f("rewards.enabled", "strict", False, "possible",
        "造語が採用されるたび創作者に金銭報酬(D9。既定 off=過正当化の交絡排除)"),
     _f("memory.agentic_pull", "journal", True, "possible",
@@ -385,6 +390,14 @@ FEATURES: tuple[Feature, ...] = (
        "L2 に LLM 健全性 KPI 3列を足す(観測専用・累積カウンタ)"),
     _f("observer.echo.enabled", "strict", False, "none",
        "L2 にエコー/自己反復 5列を足す(観測専用・常設)"),
+
+    # ---- experiment(第74バッチ IDEA④: 対照セルの宣言。決定論=strict)----
+    _f("experiment.flat_traits.enabled", "strict", False, "none",
+       "初期個体差ゼロ対照。全個体の traits を定数化して R²(k) の分母を実験的に消す"
+       "(ペルソナ文は不変・乱数消費本数も不変。プロンプトに条件を示す語は 1 つも出ない)"),
+    _f("experiment.flat_traits.include_derived", "strict", False, "none",
+       "flat_traits ON のとき traits 由来の drive_threshold / fire_weight も定数写像へ潰す"
+       "(false は名簿の個体差が発火閾値経由で残る=不完全な対照)"),
 
     # ---- government / media / organizations / work ----
     _f("government.enabled", "strict", False, "none",

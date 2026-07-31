@@ -1,0 +1,59 @@
+# 初期個体差ゼロ対照(第74バッチ IDEA④ 2026-07-31)。
+# 設計正典: docs/research/hackathon1-analysis/ideas-shortlist.md §2 ⑤ /
+#           docs/plans/hackathon1-ideas-implementation-plan.md §2 投入順4。
+#
+# 問い: 「世界を変える個体」は **生まれつき**(traits)なのか、環境と履歴から**創発**するのか。
+# 対照: experiment.flat_traits.enabled=true で全個体の traits を同一の定数に潰す
+#       (= R²(k) の分母を実験的に消す)。ペルソナ文(職業・年齢・住所・職場・就寝時刻)は
+#       **一切変えない**ので、残るのは環境と履歴だけ。ここで分化が観測されたら、それは
+#       「生まれつき」では説明できない = 創発の直接証拠になる。
+#
+# セル = flat_traits {OFF, ON} × k.writeback {off, free} = 4。
+# - CRN(共通乱数): 全セル同一 seed 列 → 同一 seed の OFF/ON がペアになる
+#   (ABM 標準の分散低減。第63バッチ endogenous_accept.yaml と同じ作法)。
+#   ★flat_traits は **乱数の消費本数を 1 本も変えない**(sample_traits / drive_params は
+#     従来どおり引いてから値だけ捨てる= agents/persona.py の実装点)ので、
+#     分岐前の RNG 消費が ON/OFF で完全に一致し、ペアの共分散が保たれる。
+# - 展開順は条件優先(run_experiment.py 仕様)。**両端の k を先**に並べ、
+#   時間切れでも交互作用(flat × k)に必要なペアから確保されるようにする。
+# - controls.mode=compute_matched: k=off でも内省 LLM を実行して結果を捨てる
+#   (第63→P0バッチで是正済みの不変条件)。**flat_traits ON/OFF では LLM 呼数は一致しない**
+#   (発火閾値が変われば誰が発火するかが変わる= それが実験の目的)。この差は
+#   セル間比較の交絡ではなく **処置そのもの**なので、レポートに呼数を必ず併記すること。
+# - start_date 固定: conf/daily.yaml の "auto"(実行当日開始)は実行日で曜日列が変わり
+#   再走・後追い seed の比較を壊す(P0バッチの実測)。
+# - 初期フレーム共変量(observer.initial_frame.days=1)を ON にして、
+#   「そのランが初日をどう入ったか」を summary.json のラン単位ラベルとして残す
+#   (scripts/analyze_norms.py / analyze_sweep が層別に使う)。
+#
+# 使い方:
+#   python scripts/run_experiment.py conf/experiments/zero_traits.yaml --dry-run
+#   python scripts/run_experiment.py conf/experiments/zero_traits.yaml
+# 解析:
+#   python scripts/analyze_sweep.py "runs/zerotr_*"          # R²(k) の分母検証
+#   python scripts/analyze_norms.py "runs/zerotr_*" --norm-stage 3 --norm-threshold 5
+name: zerotr
+profile: conf/daily.yaml
+seeds: [11, 13, 17, 19, 23]
+
+common:
+  run.n_agents: 100
+  run.n_steps: 2016                       # 14日(1日=144step)
+  world.calendar.start_date: "2026-08-17" # 固定(実行日で曜日列が変わるのを防ぐ)
+  controls.mode: compute_matched          # k=off/free の計算量交絡を潰す
+  observer.initial_frame.days: 1          # 初期フレーム共変量(summary.json のラン単位ラベル)
+  labeling.norm_stage.enabled: true       # 規範化ステージの L2 2列(観測専用=世界に効かない)
+  relations.enabled: true                 # 関係台帳(分化の観測材料)
+  lens.structure.enabled: true            # 構造の内生変動 4列(読むだけ=R1)
+
+conditions:
+  # ---- k=off ペア(k 書き戻しなし)----
+  - name: koff_flatoff
+    overrides: { k.writeback: "off", experiment.flat_traits.enabled: false }
+  - name: koff_flaton
+    overrides: { k.writeback: "off", experiment.flat_traits.enabled: true }
+  # ---- k=free ペア(k 全開)— koff とあわせ交互作用(flat × k)の両端 ----
+  - name: kfree_flatoff
+    overrides: { k.writeback: free, experiment.flat_traits.enabled: false }
+  - name: kfree_flaton
+    overrides: { k.writeback: free, experiment.flat_traits.enabled: true }
