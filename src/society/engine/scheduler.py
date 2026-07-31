@@ -45,6 +45,7 @@ from .. import worldview as worldview_mod
 from ..net import infoenv as infoenv_mod
 from ..cognition import deliberate, drive, planning, routine
 from ..cognition import fire as fire_mod
+from ..cognition import perception_contract as contract_mod
 from ..cognition import plasticity as plasticity_mod
 from ..cognition import watch as watch_mod
 from ..cognition import reflection as reflection_mod
@@ -1833,21 +1834,23 @@ def _phase_work_service(sim, step: int, sim_min: int, since_idx: int) -> None:
 
 
 # ---------------------------------------------------------------- LLM 発話
-def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
-               dm_target: str | None = None,
-               feed_texts: list[str] | None = None,
-               reply_to: tuple[str, str] | None = None,
-               partner_id: int | None = None) -> dict | None:
-    """LLM に発話/行動を生成させる。解釈不能なら None(沈黙)。
-    予算は欲求フェーズ(_phase_drive)で消費済み(発火権を得た者だけが来る)。"""
-    # ---- ablate.llm_off(第78バッチ・既定 OFF=この 2 行は素通り)----
-    # LLM を 1 本も呼ばず即 None を返す。呼び出し元(_decide)は既存の「解釈不能=沈黙」経路と
-    # 同じく routine.decide(既存のニーズ充足ロジック + POI 選好)へ後退する。
-    # ★新しいヒューリスティックは 1 つも足していない(比較のベースラインなので素朴さに価値がある)。
-    # ★プロンプトを 1 つも組まないので、この分岐に入った時点で「実験条件がプロンプトに現れる」
-    #   経路は原理的に存在しない(fingerprint_risk=none の根拠)。
-    if ablate_mod.llm_off(sim):
-        return None
+def _gather_material(sim, agent, trigger: str, step: int, sim_min: int, *,
+                     dm_target: str | None = None,
+                     feed_texts: list[str] | None = None,
+                     reply_to: tuple[str, str] | None = None,
+                     partner_id: int | None = None) -> dict:
+    """1 回の思考へ渡す世界情報を集める(**世界側の唯一の収集点**・第85バッチ P1)。
+
+    元は `_llm_speak` の本体に直書きされていた材料収集をそのまま切り出したもので、
+    **順序も内容も 1 つも変えていない**(= 既定 OFF はゴールデンとバイト一致)。
+    切り出す理由は P1 の要求「Perception の生成は世界側の責務」を満たすため:
+    契約経路 ON ではこの dict を `Perception.from_material` が包み、OFF では従来どおり
+    そのまま `build_prompt` のキーワードになる。
+
+    ★行間ダイジェスト(`_isl_take`)と watch 節はここに**含めない**。前者はバッファを
+      空にする副作用を持ち、方針キャッシュ命中時には実行してはならないため
+      (呼び出し元が再利用判定の**後**に足す = 従来の評価順を厳密に保つ)。
+    """
     radius = float(sim.cfg.world.perception_radius_m)
     # B3b 屋内 LOS ゲート(indoor.los): 同席文脈(発火プロンプトの近傍リスト)を壁 LOS+距離で絞る。
     # occluder=None(既定/los OFF)は従来と完全にバイト一致。ここは「プロンプトに載る同席者」だけを
@@ -1948,6 +1951,132 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
             p = _select_partner(sim, agent, company)
             pid = p.id if p is not None else None
         dialog_history = _dialog_get(agent, pid)
+    return {"place_name": place,
+            "surprise": trigger,
+            "nearby_names": [a.name for a in company],
+            "nearby_ids": [a.id for a in company],
+            "sim_min": sim_min, "step": step,
+            "nearby_pois": [p["name"] for p in pois],
+            "dm_target": dm_target, "feed_texts": feed_texts,
+            "reply_to": reply_to, "tool_offers": tool_offers,
+            "memberships": memberships, "pull_query": pull_query,
+            "familiar_places": familiar_places,
+            "institutions": institutions,
+            "equip_all": equip_all,
+            "venture_cost": equip_venture_cost,
+            "city_name": getattr(sim, "place_name", ""),
+            "date_line": getattr(sim, "today_date_line", None),
+            "weather_line": getattr(sim, "today_weather_line", None),
+            "schedule_line": schedule_line,
+            "event_line": getattr(sim, "today_event_line", None),
+            "disaster_line": getattr(sim, "today_disaster_line", None),
+            "ads_line": ads_line,
+            "place_label_line": place_label_line,
+            "crowd_line": crowd_line,
+            "wv_expect_line": wv_expect_line,
+            "wv_self_line": wv_self_line,
+            "wv_norm_line": wv_norm_line,
+            "relation_line": relation_line,
+            "reputation_line": reputation_line,
+            "household_line": household_line,
+            "diversity_line": diversity_line,
+            "emotion_line": emotion_line,
+            "goal_line": goal_line,
+            "hobby_line": hobby_line,
+            "norm_line": norm_line,
+            "digest_line": digest_line,
+            "scene_lines": scene_lines,
+            "variety_hint": variety_hint,
+            "labeling_mode": sim.labels.mode,
+            "open_actions": bool(getattr(sim, "freedomcfg", None)
+                                 and sim.freedomcfg["open_actions"]),
+            "explicit_nothing": bool(getattr(sim, "freedomcfg", None)
+                                     and sim.freedomcfg.get("explicit_nothing")),
+            # 検証行動(第73バッチ Part B)。渡すのは bool 1 個だけ
+            # =真偽台帳の値・ID・文字列は build_prompt へ到達しない。
+            "verify_actions": truth_ledger_mod.verify_actions_on(sim),
+            "p2_offers": p2_offers,
+            "dialog_history": dialog_history}
+
+
+# --------------------------------------------------------------------------- #
+# Perception / Intent 契約(第85バッチ・physics-instructions.md Part P1)
+#
+# ★ Perception の**生成は世界側の責務**(P1(1))。生成関数は本 1 本だけで、
+#   cognition/perception_contract.py は型と純関数しか持たない(sim を 1 度も見ない)。
+# ★ 既定 `cognition.contract.enabled: false` では下の 2 関数は 1 度も呼ばれない。
+# --------------------------------------------------------------------------- #
+def _contract_on(sim) -> bool:
+    return bool((getattr(sim, "contractcfg", None) or {}).get("enabled"))
+
+
+def _percept_salience(sim, agent) -> dict:
+    """項目別の顕著性(**第80 channels の値を再利用**。二重計算しない)。
+
+    源は第81 fire が前 step 末に採った観測 `agent._fire_obs` と期待値 `agent._fire_pred`
+    で、σ 正規化誤差 |o−ô|/σ を `fire.terms_of`(S の材料の唯一の計算点)から得る。
+    観測が無いラン(channels/fire OFF、または初回発火前)は **空 dict = 欠測**にする
+    (0.0 で埋めない = 本リポジトリの既定則)。乱数ゼロ・LLM ゼロ・副作用なし。
+    """
+    obs = getattr(agent, "_fire_obs", None)
+    pred = getattr(agent, "_fire_pred", None)
+    if obs is None or pred is None:
+        return {}
+    usable = fire_mod.usable_channels(sim)
+    if not usable:
+        return {}
+    errs, _parts = fire_mod.terms_of(obs, pred, usable)
+    by_id = {i: cid for i, cid, _s in usable}
+    return contract_mod.salience_from_channels(
+        {by_id[i]: v for i, v in errs.items() if i in by_id})
+
+
+def build_perception(sim, agent, material: dict):
+    """世界情報 → `Perception`(P1(1) の唯一の生成関数)。
+
+    `material` は `_gather_material` が集めた既存のプロンプト材料そのもの。
+    ここで足すのは **プロンプトへ出ない 3 項目**だけ:
+      body     … 位置・同席・移動の成否(P3 の物理由来項目の着地点)
+      internal … ニーズ・時刻感覚(同上)
+      salience … 第80 channels 由来の顕著性(P0 の顕著性発火が参照する値と同一)
+    ★この 3 つは `prompt_kwargs()` に出ない = 物理由来の項目がプロンプトへ裏口から
+      入らないことが構造で保証される(P3 の no-fingerprint 受け入れ基準の前倒し)。
+    """
+    body = {"x": agent.x, "y": agent.y, "node": agent.node,
+            "building": agent.building, "floor": agent.floor,
+            "loc": agent.loc,
+            "companions": len(material["nearby_ids"]),
+            # 進行の阻害・接触・局所密度は物理領域を持たない現行のグラフ世界には
+            # **存在しない**。捏造せず None で欠測を明示する(P3 で埋まる枠)。
+            "blocked": None, "contact": None, "local_density": None}
+    internal = {"drive": float(getattr(agent, "drive", 0.0) or 0.0),
+                "fatigue": float(getattr(agent, "fatigue", 0.0) or 0.0),
+                "arousal": float(getattr(agent, "arousal", 0.0) or 0.0),
+                "sim_min": int(material["sim_min"]),
+                "minute_of_day": int(material["sim_min"]) % 1440}
+    return contract_mod.Perception.from_material(
+        material, body=body, internal=internal,
+        salience=_percept_salience(sim, agent))
+
+
+def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
+               dm_target: str | None = None,
+               feed_texts: list[str] | None = None,
+               reply_to: tuple[str, str] | None = None,
+               partner_id: int | None = None) -> dict | None:
+    """LLM に発話/行動を生成させる。解釈不能なら None(沈黙)。
+    予算は欲求フェーズ(_phase_drive)で消費済み(発火権を得た者だけが来る)。"""
+    # ---- ablate.llm_off(第78バッチ・既定 OFF=この 2 行は素通り)----
+    # LLM を 1 本も呼ばず即 None を返す。呼び出し元(_decide)は既存の「解釈不能=沈黙」経路と
+    # 同じく routine.decide(既存のニーズ充足ロジック + POI 選好)へ後退する。
+    # ★新しいヒューリスティックは 1 つも足していない(比較のベースラインなので素朴さに価値がある)。
+    # ★プロンプトを 1 つも組まないので、この分岐に入った時点で「実験条件がプロンプトに現れる」
+    #   経路は原理的に存在しない(fingerprint_risk=none の根拠)。
+    if ablate_mod.llm_off(sim):
+        return None
+    material = _gather_material(sim, agent, trigger, step, sim_min,
+                                dm_target=dm_target, feed_texts=feed_texts,
+                                reply_to=reply_to, partner_id=partner_id)
     # 方針キャッシュ(P2 S7): 類似状況の熟慮を再利用し LLM をスキップ(既定 OFF は即 None)。
     # ダイジェスト消費(_isl_take)より前に置く=再利用時は「実際の LLM 発火」ではないので
     # 行間バッファを仕切り直さない。
@@ -1956,61 +2085,23 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
         return reused
     # 行間補間(P2 S2): 前回発火以降の客観ダイジェスト。OFF は None=1行も足さない=バイト一致。
     # 発火のたびに1度だけ組み、バッファを仕切り直す(=次の「前回発火以降」の起点)。
-    interstitial_digest = _isl_take(sim, agent)
-    prompt = deliberate.build_prompt(agent, place_name=place,
-                                     surprise=trigger,
-                                     nearby_names=[a.name for a in company],
-                                     nearby_ids=[a.id for a in company],
-                                     sim_min=sim_min, step=step,
-                                     nearby_pois=[p["name"] for p in pois],
-                                     dm_target=dm_target, feed_texts=feed_texts,
-                                     reply_to=reply_to, tool_offers=tool_offers,
-                                     memberships=memberships, pull_query=pull_query,
-                                     familiar_places=familiar_places,
-                                     institutions=institutions,
-                                     equip_all=equip_all,
-                                     venture_cost=equip_venture_cost,
-                                     city_name=getattr(sim, "place_name", ""),
-                                     date_line=getattr(sim, "today_date_line", None),
-                                     weather_line=getattr(sim, "today_weather_line", None),
-                                     schedule_line=schedule_line,
-                                     event_line=getattr(sim, "today_event_line", None),
-                                     disaster_line=getattr(sim, "today_disaster_line", None),
-                                     ads_line=ads_line,
-                                     place_label_line=place_label_line,
-                                     crowd_line=crowd_line,
-                                     wv_expect_line=wv_expect_line,
-                                     wv_self_line=wv_self_line,
-                                     wv_norm_line=wv_norm_line,
-                                     relation_line=relation_line,
-                                     reputation_line=reputation_line,
-                                     household_line=household_line,
-                                     diversity_line=diversity_line,
-                                     emotion_line=emotion_line,
-                                     goal_line=goal_line,
-                                     hobby_line=hobby_line,
-                                     norm_line=norm_line,
-                                     digest_line=digest_line,
-                                     interstitial_digest=interstitial_digest,
-                                     scene_lines=scene_lines,
-                                     variety_hint=variety_hint,
-                                     labeling_mode=sim.labels.mode,
-                                     open_actions=bool(getattr(sim, "freedomcfg", None)
-                                                       and sim.freedomcfg["open_actions"]),
-                                     explicit_nothing=bool(
-                                         getattr(sim, "freedomcfg", None)
-                                         and sim.freedomcfg.get("explicit_nothing")),
-                                     # 検証行動(第73バッチ Part B)。渡すのは bool 1 個だけ
-                                     # =真偽台帳の値・ID・文字列は build_prompt へ到達しない。
-                                     verify_actions=truth_ledger_mod.verify_actions_on(sim),
-                                     p2_offers=p2_offers,
-                                     dialog_history=dialog_history,
-                                     # 第82: 監視仕様 watch(既定 OFF は None=1行も
-                                     # 足さない=バイト一致)。§6-3 の model-revision は
-                                     # 驚き発火のときだけ中立 1 行が増える。
-                                     watch_section=watch_mod.section(sim),
-                                     revision_line=watch_mod.revision_line(
-                                         sim, agent, step, trigger))
+    # 第82: 監視仕様 watch(既定 OFF は None=1行も足さない=バイト一致)。§6-3 の
+    # model-revision は驚き発火のときだけ中立 1 行が増える。
+    # ★ここまでの 3 行の評価順は build_prompt の引数評価順(従来)と厳密に同じ。
+    material["interstitial_digest"] = _isl_take(sim, agent)
+    material["watch_section"] = watch_mod.section(sim)
+    material["revision_line"] = watch_mod.revision_line(sim, agent, step, trigger)
+    # ---- 第85バッチ: 契約経路(既定 OFF)------------------------------------- #
+    #  ON では world → Perception → prompt に一本化する。**プロンプト文字列は 1 バイトも
+    #  変わらない**(prompt_kwargs() が material と完全に等しい dict を返す)= P1(3)
+    #  「この時点では挙動は変わらない」。Perception も既存の canary 関門へ通す(P1 受入 3)。
+    if _contract_on(sim):
+        percept = build_perception(sim, agent, material)
+        truth_ledger_mod.check_percept(percept)
+        kwargs = percept.prompt_kwargs()
+    else:
+        kwargs = material
+    prompt = deliberate.build_prompt(agent, **kwargs)
     rng_key = f"deliberate/{agent.id}/{step}"
     response, call_id, cached = sim.llm.generate(
         prompt, rng_key=rng_key,
@@ -2022,6 +2113,14 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
                          kind="llm_deliberate", x=agent.x, y=agent.y,
                          llm_call_id=call_id, payload={"trigger": trigger}))
     action = deliberate.parse_action(response)
+    # ---- 第85バッチ: Intent 契約(既定 OFF)--------------------------------- #
+    #  思考の出力を型化して世界へ返す唯一の経路。`Intent` は移動目標・急ぎ度・回避傾向・
+    #  対話意図・滞在意図までしか持たず、**経路の各点・速度の時系列は持たない**(P1(2))。
+    #  現行のグラフ世界では実行側が従来の行動 dict を消費するので、ここで**無損失に**
+    #  戻す(from_action → to_action が恒等 = 情報等価)。P3 で物理側が Intent を直接
+    #  受け取るようになったとき、この行が写像の分岐点になる。
+    if action is not None and _contract_on(sim):
+        action = contract_mod.Intent.from_action(action).to_action()
     # 第82: 監視仕様の受理(ホワイトリスト検証→数値クランプ→不正なら**前回仕様を維持**)。
     # 行動のパース成否とは独立(行動が壊れていても watch だけ読めることがある)。
     # 既定 OFF は即 return で 1 バイトも触らない。

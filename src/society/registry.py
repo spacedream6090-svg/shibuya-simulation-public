@@ -292,6 +292,20 @@ FEATURES: tuple[Feature, ...] = (
        "動かすのは fire.enabled の affects_k=true が既に宣言している間接経路)。"
        "★プロンプトを 1 バイトも変えない(g/θ は L1 と g/θ 軌跡サイドカーにしか出ない)。"
        "初期値条件は experiment.g_init(F/N/P)で切り替える"),
+    _f("cognition.contract.enabled", "strict", False, "none",
+       "Perception / Intent 契約(第85バッチ。physics-instructions.md Part P1)。"
+       "エージェントコアと世界の結合面を 2 つのデータ型に限定する層で、物理エンジン(P3)は"
+       "この契約の**裏側**に入る。Perception=1 回の思考が受け取る世界情報の唯一の型"
+       "(視覚/聴覚/身体/内部 + 第80 channels 由来の salience。**生成は世界側の責務**="
+       "engine/scheduler.py::build_perception 1 本)。Intent=思考の出力の唯一の型"
+       "(移動目標・急ぎ度・回避傾向・対話意図・滞在意図。**経路の各点・速度の時系列は"
+       "含めない**= 実行は世界側)。"
+       "★repro_tier=strict: 通り道を変えるだけで乱数も LLM 呼も 1 本も足さない。"
+       "★affects_k=False: 呼び出し点を 1 つも増減しない。"
+       "★fingerprint_risk=none: **プロンプト文字列が 1 バイトも変わらない**ことが契約の"
+       "定義そのもの(prompt_kwargs() が従来の材料 dict と完全に等しい dict を返す)。"
+       "したがって ON/OFF で L1/L2/L3・draw・呼数が一致する(P1(3)『この時点では挙動は"
+       "変わらない』)。既定 OFF は契約 module の関数が 1 度も呼ばれない従来経路"),
 
     # ---- freedom(LLM の自由記述をそのまま行動にする層=全部 journal)----
     _f("freedom.open_actions", "journal", False, "possible",

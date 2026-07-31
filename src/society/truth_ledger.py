@@ -124,6 +124,23 @@ def check_prompt(prompt: str, *, where: str = "prompt") -> None:
         "(docs/plans/source/dual-mode-instruments.md Part B)。")
 
 
+def check_percept(percept, *, where: str = "perception") -> None:
+    """`Perception`(第85バッチ P1)にも同じ canary 検査をかける。
+
+    P1 の受け入れ基準「Perception に真偽台帳由来の値が混入しないこと(既存の漏洩検査に
+    統合)」。Perception は **1 回の思考が受け取る世界情報の唯一の型**なので、ここが
+    塞がっていれば「台帳 → 世界情報 → プロンプト」の経路は構造的に存在しない。
+
+    ★呼び出しは engine 側から行う(cognition/ は台帳 module を import も参照もしない
+      = tests/test_beliefs.py の静的検査を維持するため)。Perception 側は
+      `text_blob()`(プロンプトに出うる文字列材料の連結)を返すだけ。
+    未武装(fact ゼロ・機能 OFF)は 1 命令で return = 既定ランのコストはゼロ。
+    """
+    if not _ARMED or percept is None:
+        return
+    check_prompt(percept.text_blob(), where=where)
+
+
 # --------------------------------------------------------------------------- #
 # 設定(gossip.build_cfg と同型: dict / OmegaConf 両対応・dotlist 文字列も型強制)
 # --------------------------------------------------------------------------- #

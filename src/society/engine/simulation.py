@@ -726,6 +726,14 @@ class Simulation:
         raw_g = (OmegaConf.to_container(raw_g, resolve=True)
                  if OmegaConf.is_config(raw_g) else raw_g)
         self.gcfg = _plasticity_mod.build_cfg(raw_g)
+        # ---- Perception / Intent 契約(第85バッチ P1。既定 OFF=従来経路)----
+        # ON では scheduler の材料収集 → build_prompt が world → Perception → prompt に
+        # 一本化される(プロンプト文字列は 1 バイトも変わらない = ON/OFF で世界一致)。
+        from ..cognition import perception_contract as _contract_mod
+        raw_contract = _raw_cog.get("contract", None)
+        raw_contract = (OmegaConf.to_container(raw_contract, resolve=True)
+                        if OmegaConf.is_config(raw_contract) else raw_contract)
+        self.contractcfg = _contract_mod.build_cfg(raw_contract)
         # 初期値条件 F/N/P(§2.7)。experiment ブロックの下= flat_traits と同じ置き場。
         _ginit = cfg.get("experiment", {}) or {}
         _ginit = (_ginit.get("g_init", None) if hasattr(_ginit, "get") else None)
