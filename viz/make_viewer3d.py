@@ -1,11 +1,20 @@
 """Web3D ビューア生成(バッチE / 3D 可視化)。
 
-使い方:  python viz/make_viewer3d.py runs/<name>
+使い方:  python viz/make_viewer3d.py runs/<name> [--no-traffic] [--tracks-binary]
 生成物:  runs/<name>/viewer3d.html
   自己完結の単一 HTML。three.js(r128, MIT)本体・OrbitControls・シーンデータを埋め込み。
   ブラウザで開けば即グリグリ(OrbitControls)+ 再生 + 昼夜 + クリックで人物情報。
 
+  --tracks-binary : 軌跡を JSON 埋め込みではなく量子化バイナリのチャンク遅延ロードにする
+    (P0 / docs/research/dt-integration-deep.md §2)。HTML には軽いヘッダ(meta/agents/ids/
+    sim_min + チャンク表)だけを埋め、位置・移動・交通は runs/<name>/tracks_bin/chunk_NNNN.js
+    を再生位置に応じて `<script src>` で動的に取り込む(既存 plateau_mesh.js と同じ file://
+    で動く方式)。**HTML サイズが軌跡の長さにほぼ依存しなくなる**のが本質で、
+    1万体×1日で 90.4MB(80MB ゲート超過)→ 約 26MB、10日でもほぼ同じに収まる。
+    既定 OFF=このフラグ無しでは生成 HTML は従来とバイト同一。
+
 データは runs/<name>/scene3d/{scene.json,tracks.json} を読む。無ければ export_3d を実行して生成。
+tracks.json が無く tracks.bin だけのラン(export_3d --no-tracks-json)も従来どおり開ける。
 移動補間は 2D ビューア(viz/make_viewer.py)の posAt/alongPath を移植し、同じ滑らかさを再現。
 座標系: scene/tracks は local-m Z-up。three.js では (east, up, -north) に写像(Y-up)。
 """
@@ -23,6 +32,15 @@ VENDOR = REPO_ROOT / "viz" / "vendor"
 def _load_export3d():
     spec = importlib.util.spec_from_file_location(
         "export_3d", REPO_ROOT / "scripts" / "export_3d.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _load_tracks_bin():
+    """scripts/tracks_bin.py を場所非依存で読み込む(_load_export3d と同じ流儀)。"""
+    spec = importlib.util.spec_from_file_location(
+        "tracks_bin", REPO_ROOT / "scripts" / "tracks_bin.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -78,20 +96,35 @@ def _ensure_notable(run_dir: Path, tracks_json: str) -> str | None:
     return text
 
 
-def _ensure_scene(run_dir: Path) -> tuple[str, str, str | None, str | None]:
+def _ensure_scene(run_dir: Path,
+                  tracks_binary: bool = False) -> tuple[str, str, str | None, str | None]:
+    """scene/tracks のテキストを返す。tracks_binary=True のときは tracks.json の代わりに
+    tracks_meta.json(= tracks.bin の JSON ヘッダと同一文字列)を返す。"""
     scene_dir = run_dir / "scene3d"
     scene_p = scene_dir / "scene.json"
     tracks_p = scene_dir / "tracks.json"
-    if not (scene_p.exists() and tracks_p.exists()):
-        _load_export3d().export_run(run_dir)
+    bin_p = scene_dir / "tracks.bin"
+    meta_p = scene_dir / "tracks_meta.json"
+    if tracks_binary:
+        if not (scene_p.exists() and bin_p.exists() and meta_p.exists()):
+            _load_export3d().export_run(run_dir, tracks_binary=True)
+        tracks_text = meta_p.read_text(encoding="utf-8")
+    else:
+        if not (scene_p.exists() and (tracks_p.exists() or bin_p.exists())):
+            _load_export3d().export_run(run_dir)
+        if tracks_p.exists():
+            tracks_text = tracks_p.read_text(encoding="utf-8")
+        else:                       # tracks.bin だけのラン: 復号して従来経路へ流す
+            tracks_text = json.dumps(
+                _load_tracks_bin().decode_tracks(bin_p.read_bytes()),
+                ensure_ascii=False, separators=(",", ":"))
     # PLATEAU 実形状(export_3d --plateau の成果物)。無ければ None=従来とバイト同一。
     pw_p = scene_dir / "plateau_web.json"
     plateau = pw_p.read_text(encoding="utf-8") if pw_p.exists() else None
     # 地形(並行生成の terrain_web.json)。無ければ None=地形なし=完全従来動作。
     tw_p = scene_dir / "terrain_web.json"
     terrain = tw_p.read_text(encoding="utf-8") if tw_p.exists() else None
-    return (scene_p.read_text(encoding="utf-8"),
-            tracks_p.read_text(encoding="utf-8"), plateau, terrain)
+    return (scene_p.read_text(encoding="utf-8"), tracks_text, plateau, terrain)
 
 
 def _read_vendor() -> tuple[str, str, str]:
@@ -120,7 +153,9 @@ def build_html(run_name: str, scene_json: str, tracks_json: str,
                has_extras: bool = False,
                mode_legend: dict | None = None,
                notable_json: str | None = None,
-               indoor_json: str | None = None) -> str:
+               indoor_json: str | None = None,
+               tracks_binary: bool = False,
+               chunk_dir: str = "tracks_bin") -> str:
     three_js, orbit_js, lic = _read_vendor()
     html = _TEMPLATE
     html = html.replace("__RUN_NAME__", run_name)
@@ -142,6 +177,8 @@ def build_html(run_name: str, scene_json: str, tracks_json: str,
         html = _inject_notable(html, notable_json)
     if indoor_json is not None:         # indoor overlay(フロア板+接近フェード+実座標エージェント)
         html = _inject_indoor(html, indoor_json)
+    if tracks_binary:                   # 軌跡バイナリ(P0): JSON 埋め込み → チャンク遅延ロード
+        html = _inject_tracks_binary(html, chunk_dir)
     return html
 
 
@@ -860,6 +897,174 @@ _INDOOR_MAIN = r"""// ========== 屋内オーバレイ本体: floorLayout3d(n_ov
 """
 
 
+# ============================================================ 軌跡バイナリ(P0)
+_TRACKS_BIN_LOADING = (
+    '<div id="binload" style="position:fixed;left:50%;top:50%;'
+    'transform:translate(-50%,-50%);z-index:60;padding:10px 16px;border-radius:8px;'
+    'background:rgba(12,16,22,.84);color:#dfe7f2;font:13px/1.6 system-ui,sans-serif;'
+    'display:none">軌跡データを読み込み中…</div>')
+
+_TRACKS_BIN_ANCHOR = ("const TRACKS = JSON.parse("
+                      "document.getElementById('tracks-data').textContent);")
+
+_TRACKS_BIN_JS = r"""// ---------- 軌跡バイナリ(P0): チャンク遅延ロード。TRACKS は従来と同じ形の façade。
+// tracks-data には tracks_meta.json(= tracks.bin の JSON ヘッダ)だけが入っている。
+// 位置/移動/交通は chunk_NNNN.js を script 要素の動的挿入で取り込んで型付き配列にする
+// (fetch は file:// で CORS に阻まれるため。既存 plateau_mesh.js と同じ src 参照方式)。
+const TB = JSON.parse(document.getElementById('tracks-data').textContent);
+const BIN = TB.binary;
+const _CHUNK_DIR = "__CHUNK_DIR__";
+const _NA = BIN.n_agents, _NSB = BIN.n_steps, _PC = BIN.pos_coords;
+const _QU = BIN.quant, _OX = BIN.origin[0], _OY = BIN.origin[1];
+const _PAL = BIN.state_palette;
+const _NOTR = !!BIN.no_traffic;
+const _CH = new Map(), _PEND = new Set(), _LRU = [];
+const _KEEP = 4;                  // 常駐チャンク数(再生に必要なのは高々 2 = 現在と次)
+const _PCACHE = new Map(), _MCACHE = new Map(), _TCACHE = new Map();
+const _HOLD = (function(){ const a = new Array(_NA);
+  for(let i=0;i<_NA;i++) a[i] = [0, 0, -1];      // 未ロード時は「範囲外」= 非表示
+  return a; })();
+const _MHOLD = new Array(_NA).fill(null);
+const _THOLD = { n:0, segs:[] };
+
+function _chunkOf(s){ const k = Math.floor(s / BIN.chunk_steps);
+  return Math.max(0, Math.min(BIN.n_chunks - 1, k)); }
+function _chunkFile(ci){ return _CHUNK_DIR + '/chunk_' + String(ci).padStart(4,'0') + '.js'; }
+function _need(ci){
+  if(ci < 0 || ci >= BIN.n_chunks || _CH.has(ci) || _PEND.has(ci)) return;
+  _PEND.add(ci);
+  const sc = document.createElement('script');
+  sc.src = _chunkFile(ci); sc.async = true;
+  sc.onerror = ()=>{ _PEND.delete(ci);
+    console.error('tracks.bin: チャンク読込に失敗', sc.src); };
+  document.head.appendChild(sc);
+}
+window.__TRACKS_CHUNK__ = function(ci, b64){
+  const c = BIN.chunks[ci]; if(!c) return;
+  if(_CH.has(ci)){ _PEND.delete(ci); return; }      // 二重取り込みで LRU が壊れないように
+  const s = atob(b64), u = new Uint8Array(s.length);
+  for(let i=0;i<s.length;i++) u[i] = s.charCodeAt(i);
+  const buf = u.buffer, S = c.sec, ns = c.s1 - c.s0;
+  const ST = (BIN.state_dtype === 'u2') ? Uint16Array : Uint32Array;
+  _CH.set(ci, { s0:c.s0, s1:c.s1,
+    pos:   new Int16Array(buf, S.pos, ns*_NA*_PC),
+    st:    new ST(buf, S.state, ns*_NA),
+    mvoff: new Uint32Array(buf, S.mvoff, ns+1),
+    mvag:  new Uint32Array(buf, S.mvag, c.n_moves),
+    mvmode:new Uint8Array(buf, S.mvmode, c.n_moves),
+    mvpo:  new Uint32Array(buf, S.mvpo, c.n_moves+1),
+    mvpts: new Int16Array(buf, S.mvpts, c.n_move_pts*2),
+    troff: new Uint32Array(buf, S.troff, ns+1),
+    trn:   new Int32Array(buf, S.trn, ns),
+    trpo:  new Uint32Array(buf, S.trpo, c.n_segs+1),
+    trpts: new Int16Array(buf, S.trpts, c.n_seg_pts*2) });
+  _PEND.delete(ci); _LRU.push(ci);
+  while(_LRU.length > _KEEP){ const old = _LRU.shift(); if(old !== ci) _CH.delete(old); }
+  _PCACHE.clear(); _MCACHE.clear(); _TCACHE.clear();
+};
+function _trim(m){ while(m.size > 6){ m.delete(m.keys().next().value); } }
+function _at(s){ const d = _CH.get(_chunkOf(s));
+  return (d && s >= d.s0 && s < d.s1) ? d : null; }
+function _posStep(s){
+  if(_PCACHE.has(s)) return _PCACHE.get(s);
+  const d = _at(s); if(!d) return _HOLD;
+  const li = s - d.s0, b = li*_NA*_PC, sb = li*_NA, out = new Array(_NA);
+  for(let i=0;i<_NA;i++){ const o = b + i*_PC;
+    out[i] = [ d.pos[o]*_QU + _OX, d.pos[o+1]*_QU + _OY, _PAL[d.st[sb+i]] ]; }
+  _PCACHE.set(s, out); _trim(_PCACHE); return out;
+}
+function _movesStep(s){
+  if(_MCACHE.has(s)) return _MCACHE.get(s);
+  const d = _at(s); if(!d) return _MHOLD;
+  const li = s - d.s0, out = new Array(_NA).fill(null);
+  for(let r = d.mvoff[li]; r < d.mvoff[li+1]; r++){
+    const p0 = d.mvpo[r], p1 = d.mvpo[r+1], pts = new Array(p1-p0);
+    for(let j=p0;j<p1;j++) pts[j-p0] = [ d.mvpts[j*2]*_QU + _OX, d.mvpts[j*2+1]*_QU + _OY ];
+    out[d.mvag[r]] = [ d.mvmode[r], pts ];
+  }
+  _MCACHE.set(s, out); _trim(_MCACHE); return out;
+}
+function _trafficStep(s){
+  if(_NOTR) return _THOLD;
+  if(_TCACHE.has(s)) return _TCACHE.get(s);
+  const d = _at(s); if(!d) return _THOLD;
+  const li = s - d.s0, segs = [];
+  for(let r = d.troff[li]; r < d.troff[li+1]; r++){
+    const p0 = d.trpo[r], p1 = d.trpo[r+1], pts = new Array(p1-p0);
+    for(let j=p0;j<p1;j++) pts[j-p0] = [ d.trpts[j*2]*_QU + _OX, d.trpts[j*2+1]*_QU + _OY ];
+    segs.push(pts);
+  }
+  const o = { n: d.trn[li], segs: segs };
+  _TCACHE.set(s, o); _trim(_TCACHE); return o;
+}
+function _series(fn){
+  return new Proxy({}, {
+    get(o, k){ if(k === 'length') return _NSB;
+      if(typeof k !== 'string') return undefined;
+      const s = +k; return Number.isInteger(s) ? fn(s) : undefined; },
+    has(o, k){ const s = +k; return Number.isInteger(s) && s >= 0 && s < _NSB; } });
+}
+const TRACKS = { meta: TB.meta, agents: TB.agents, ids: TB.ids, sim_min: TB.sim_min,
+  positions: _series(_posStep), moves: _series(_movesStep), traffic: _series(_trafficStep) };
+function _clampStep(tt){ return Math.max(0, Math.min(_NSB-1, Math.floor(tt) || 0)); }
+const TRACKS_LAZY = {
+  ready(tt){ if(BIN.n_chunks === 0) return true;    // 0 step のランで待ち続けない
+    const s = _clampStep(tt);
+    return _at(s) !== null && _at(Math.min(s+1, _NSB-1)) !== null; },
+  request(tt){ const s = _clampStep(tt);
+    _need(_chunkOf(s)); _need(_chunkOf(Math.min(s+1, _NSB-1))); },
+  prefetch(tt){ _need(_chunkOf(_clampStep(tt)) + 1); },
+  status(){ return _CH.size + '/' + BIN.n_chunks; } };
+function _showLoading(on){ const el = document.getElementById('binload');
+  if(el) el.style.display = on ? 'block' : 'none'; }
+_need(0); _need(1);
+"""
+
+_TRACKS_BIN_TICK_ANCHOR = "  if(playing){ t += dt * speed * 1.2;   // 1x で ≈1.2 step/秒"
+
+_TRACKS_BIN_TICK = r"""  if(!TRACKS_LAZY.ready(t)){ TRACKS_LAZY.request(t); _showLoading(true);
+    controls.update(); renderer.render(scene, camera); return; }
+  _showLoading(false); TRACKS_LAZY.prefetch(t);
+"""
+
+
+def _inject_tracks_binary(html: str, chunk_dir: str) -> str:
+    """TRACKS を「チャンク遅延ロードの façade」に差し替える(既定 OFF=呼ばれない)。
+    ①ローディング表示 ②TRACKS 定義の置換 ③未ロード時に再生を止める animate ゲート。"""
+    anchor_data = '<script type="application/json" id="scene-data">'
+    html = _replace_once(html, anchor_data,
+                         _TRACKS_BIN_LOADING + "\n" + anchor_data, "binload")
+    html = _replace_once(html, _TRACKS_BIN_ANCHOR,
+                         _TRACKS_BIN_JS.replace("__CHUNK_DIR__", chunk_dir), "tracks-bin")
+    html = _replace_once(html, _TRACKS_BIN_TICK_ANCHOR,
+                         _TRACKS_BIN_TICK + _TRACKS_BIN_TICK_ANCHOR, "tracks-bin-tick")
+    return html
+
+
+def _mark_no_traffic(tracks_meta_json: str) -> str:
+    """--no-traffic をバイナリ経路で表現する(交通セクションは読まずに空を返させる)。"""
+    meta = json.loads(tracks_meta_json)
+    meta.setdefault("binary", {})["no_traffic"] = True
+    return json.dumps(meta, ensure_ascii=False, separators=(",", ":"))
+
+
+def _write_tracks_chunks(run_dir: Path, chunk_dir: str = "tracks_bin") -> tuple[int, int]:
+    """scene3d/tracks.bin → runs/<name>/<chunk_dir>/chunk_NNNN.js(base64 の JSONP)。
+    以前の生成物が残ると古いチャンクを掴むので、書く前に chunk_*.js を掃除する。"""
+    blob = (run_dir / "scene3d" / "tracks.bin").read_bytes()
+    out_dir = run_dir / chunk_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for stale in sorted(out_dir.glob("chunk_*.js")):
+        stale.unlink()
+    total = 0
+    parts = _load_tracks_bin().chunk_sidecars(blob)
+    for name, text in parts:
+        p = out_dir / name
+        p.write_text(text, encoding="ascii")
+        total += p.stat().st_size
+    return len(parts), total
+
+
 def _strip_traffic(tracks_json: str) -> str:
     # 長期ラン(例 100日=14400step)は背景交通の軌跡だけで数百MBになりブラウザで開けない。
     # --no-traffic で traffic を空にする(人物・建物は従来どおり)。JS は traffic[s] 不在で車0台。
@@ -875,9 +1080,11 @@ def main(argv: list) -> int:
         print(__doc__)
         return 1
     run_dir = Path(args[0]).resolve()
-    scene_json, tracks_json, plateau_json, terrain_json = _ensure_scene(run_dir)
+    tracks_binary = "--tracks-binary" in flags
+    scene_json, tracks_json, plateau_json, terrain_json = _ensure_scene(run_dir, tracks_binary)
     if "--no-traffic" in flags:
-        tracks_json = _strip_traffic(tracks_json)
+        tracks_json = (_mark_no_traffic(tracks_json) if tracks_binary
+                       else _strip_traffic(tracks_json))
     # データ存在フラグ(注入するか=バイト同一を崩すか の判定)。パースは 1 回だけ。
     has_extras = False
     if plateau_json is not None:
@@ -897,15 +1104,23 @@ def main(argv: list) -> int:
     html = build_html(run_dir.name, scene_json, tracks_json,
                       plateau_json=plateau_json, terrain_json=terrain_json,
                       has_extras=has_extras, mode_legend=mode_legend,
-                      notable_json=notable_json, indoor_json=indoor_json)
+                      notable_json=notable_json, indoor_json=indoor_json,
+                      tracks_binary=tracks_binary)
     out = run_dir / "viewer3d.html"
     out.write_text(html, encoding="utf-8")
     mb = out.stat().st_size / 1024 / 1024
     print(f"  {out}  ({mb:.2f} MB)")
+    if tracks_binary:
+        n_chunks, chunk_bytes = _write_tracks_chunks(run_dir)
+        bin_mb = (run_dir / "scene3d" / "tracks.bin").stat().st_size / 1024 / 1024
+        print(f"  {run_dir / 'tracks_bin'}  ({n_chunks} チャンク・"
+              f"{chunk_bytes/1024/1024:.2f} MB / tracks.bin {bin_mb:.2f} MB)"
+              f"  ← 遅延ロード(HTML には常駐しない)")
     if plateau_json is not None:
         if mb > 80:
             print(f"  [warn] 埋め込み版が {mb:.1f} MB > 80MB ゲート。"
-                  " LOD 簡略化か分離版の利用を検討。")
+                  " --tracks-binary(軌跡のチャンク遅延ロード)"
+                  "・LOD 簡略化・分離版の利用を検討。")
         # 分離版: 軽量 HTML + サイドカー(同フォルダに置けば file:// で動く)
         side = run_dir / "plateau_mesh.js"
         side.write_text("PLATEAU_MESH = " + plateau_json + ";",
@@ -913,7 +1128,8 @@ def main(argv: list) -> int:
         lite = build_html(run_dir.name, scene_json, tracks_json,
                           plateau_src="plateau_mesh.js", terrain_json=terrain_json,
                           has_extras=has_extras, mode_legend=mode_legend,
-                          notable_json=notable_json, indoor_json=indoor_json)
+                          notable_json=notable_json, indoor_json=indoor_json,
+                          tracks_binary=tracks_binary)
         lite_p = run_dir / "viewer3d_lite.html"
         lite_p.write_text(lite, encoding="utf-8")
         print(f"  {lite_p}  ({lite_p.stat().st_size/1024/1024:.2f} MB)"

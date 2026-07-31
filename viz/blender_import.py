@@ -46,7 +46,18 @@ CAR_RGB = (0.95, 0.69, 0.20)
 # ------------------------------------------------------------------ データ読込
 def load_scene(scene_dir: Path):
     scene = json.loads((scene_dir / "scene.json").read_text(encoding="utf-8"))
-    tracks = json.loads((scene_dir / "tracks.json").read_text(encoding="utf-8"))
+    tracks_p = scene_dir / "tracks.json"
+    if tracks_p.exists():
+        return scene, json.loads(tracks_p.read_text(encoding="utf-8"))
+    # export_3d --no-tracks-json のラン: 量子化バイナリを復号して従来どおりの dict にする
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "tracks_bin", Path(__file__).resolve().parents[1] / "scripts" / "tracks_bin.py")
+    tb = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tb)
+    tracks = tb.load_tracks(scene_dir)
+    if tracks is None:
+        raise SystemExit(f"[blender_import] {scene_dir} に tracks.json / tracks.bin が無い")
     return scene, tracks
 
 

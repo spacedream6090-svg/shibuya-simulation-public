@@ -3,11 +3,19 @@
 使い方:
   python scripts/export_ue.py runs/<name> [--offset X Y Z] [--heading DEG]
                                           [--no-yflip] [--scale 100] [--csv]
+                                          [--binary [--no-json]]
 生成物:  runs/<name>/scene3d/
   sim_ue.json    — sim(local-m, ENU, Z-up 右手系, m)を Unreal(cm, Z-up, 左手系)へ
                    *一度だけ* 変換した再生用データ。位置・移動ポリライン・車トラフィックは
                    すべて UE のワールド座標(uu=cm)で格納済み。
   sim_ue.csv     — --csv 指定時。(step, agent_id, ux, uy, uz, state) のフラット表。
+  sim_ue.bin / sim_ue_meta.json — --binary 指定時。同じ内容の量子化型付きバイナリ
+                   (int16 × 5uu = 0.05m 相当)。実測 684B/agent-step の JSON に対して
+                   8B/agent-step = **1/85**。1万体×10日の JSON は ≈9.8GB で
+                   `FJsonSerializer` に載らない(docs/research/dt-integration-deep.md §3B.12)。
+                   UE 側は `FFileHelper::LoadFileToArray` → `TArray<int16>` で読む。
+                   既定 OFF=このフラグ無しでは sim_ue.json は従来とバイト同一。
+  --no-json      — --binary 併用時のみ。sim_ue.json を書かない(巨大ラン向け)。
 
 設計方針(なぜ別ファイルか):
   export_3d.py の scene.json/tracks.json 契約は *変更しない*(読み取り専用)。
@@ -50,22 +58,30 @@ ORIGIN_EPSG6677 = {"northing_m": -37768.576, "easting_m": -12015.952}
 
 
 # ------------------------------------------------------------------ 入出力
-def _load_export3d():
+def _load_mod(name: str):
     spec = importlib.util.spec_from_file_location(
-        "export_3d", REPO_ROOT / "scripts" / "export_3d.py")
+        name, REPO_ROOT / "scripts" / f"{name}.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def _load_export3d():
+    return _load_mod("export_3d")
 
 
 def _ensure_scene(run_dir: Path) -> tuple[dict, dict]:
     scene_dir = run_dir / "scene3d"
     scene_p = scene_dir / "scene.json"
     tracks_p = scene_dir / "tracks.json"
-    if not (scene_p.exists() and tracks_p.exists()):
+    bin_p = scene_dir / "tracks.bin"
+    if not (scene_p.exists() and (tracks_p.exists() or bin_p.exists())):
         _load_export3d().export_run(run_dir)
     scene = json.loads(scene_p.read_text(encoding="utf-8"))
-    tracks = json.loads(tracks_p.read_text(encoding="utf-8"))
+    # tracks.json が無いラン(export_3d --no-tracks-json)は tracks.bin を復号して読む
+    tracks = _load_mod("tracks_bin").load_tracks(scene_dir)
+    if tracks is None:
+        raise SystemExit(f"[export_ue] {scene_dir} に tracks.json / tracks.bin が無い")
     return scene, tracks
 
 
@@ -180,17 +196,31 @@ def write_csv(sim_ue: dict, path: Path) -> None:
                 wtr.writerow([s, ids[i], ux, uy, uz, st])
 
 
-def export_run(run_dir: Path, tf: Transform, want_csv: bool = False) -> dict:
+def export_run(run_dir: Path, tf: Transform, want_csv: bool = False,
+               binary: bool = False, write_json: bool = True) -> dict:
+    if not binary and not write_json:
+        raise SystemExit("[export_ue] --no-json は --binary と併用する")
     run_dir = Path(run_dir)
     scene, tracks = _ensure_scene(run_dir)
     sim_ue = build_sim_ue(scene, tracks, tf)
     out_dir = run_dir / "scene3d"
     out_dir.mkdir(parents=True, exist_ok=True)
-    jp = out_dir / "sim_ue.json"
-    jp.write_text(json.dumps(sim_ue, ensure_ascii=False, separators=(",", ":")),
-                  encoding="utf-8")
-    res = {"json": jp, "n_agents": len(sim_ue["ids"]),
-           "n_steps": sim_ue["meta"]["nSteps"]}
+    res = {"n_agents": len(sim_ue["ids"]), "n_steps": sim_ue["meta"]["nSteps"]}
+    if write_json:
+        jp = out_dir / "sim_ue.json"
+        jp.write_text(json.dumps(sim_ue, ensure_ascii=False, separators=(",", ":")),
+                      encoding="utf-8")
+        res["json"] = jp
+    if binary:                       # 追加専用: 既定 OFF=sim_ue.json は従来とバイト同一
+        tb = _load_mod("tracks_bin")
+        blob, header = tb.encode_sim_ue(sim_ue)
+        bp = out_dir / "sim_ue.bin"
+        mp = out_dir / "sim_ue_meta.json"
+        bp.write_bytes(blob)
+        mp.write_text(json.dumps(header, ensure_ascii=False, separators=(",", ":")),
+                      encoding="utf-8")
+        res["bin"] = bp
+        res["meta"] = mp
     if want_csv:
         cp = out_dir / "sim_ue.csv"
         write_csv(sim_ue, cp)
@@ -210,6 +240,10 @@ def parse_args(argv):
                     help="north 反転を無効化(鏡像になる場合の切替)")
     ap.add_argument("--scale", type=float, default=M_TO_UU, help="m→uu(既定100)")
     ap.add_argument("--csv", action="store_true", help="sim_ue.csv も出力")
+    ap.add_argument("--binary", action="store_true",
+                    help="sim_ue.bin + sim_ue_meta.json(量子化型付きバイナリ)も出力")
+    ap.add_argument("--no-json", action="store_true",
+                    help="--binary 併用時のみ: sim_ue.json を書かない")
     return ap.parse_args(argv)
 
 
@@ -220,8 +254,9 @@ def main(argv: list) -> int:
     args = parse_args(argv)
     tf = Transform(scale=args.scale, offset=tuple(args.offset),
                    heading_deg=args.heading, y_flip=not args.no_yflip)
-    res = export_run(Path(args.run_dir).resolve(), tf, want_csv=args.csv)
-    for k in ("json", "csv"):
+    res = export_run(Path(args.run_dir).resolve(), tf, want_csv=args.csv,
+                     binary=args.binary, write_json=not args.no_json)
+    for k in ("json", "bin", "meta", "csv"):
         if k in res:
             p = res[k]
             try:

@@ -4,6 +4,7 @@
                                   [--sample-agents N] [--step-stride K]
                                   [--plateau] [--plateau-dir data/plateau]
                                   [--rich-tracks] [--low-mem]
+                                  [--tracks-binary [--no-tracks-json] [--chunk-mb M]]
   --sample-agents N : tracks の対象を先頭 N エージェントに間引く(大規模ランの LOD 出力)。
   --step-stride K   : K step ごとに1フレームだけ出力する(時間ダウンサンプル)。
   --low-mem         : L1 を row group 単位でストリーム読みし、tracks 再構成が実際に使う
@@ -19,12 +20,22 @@
                       extras.npz があれば地下街/橋メッシュ(plateau_web.extras)も書き出す。
   --rich-tracks     : tracks.json の移動手段を細分化(タクシー=mode 3・電車で圏外=w -3)。
                       既定 OFF=tracks.json はバイト同一。--plateau と併用可。
+  --tracks-binary   : tracks を量子化型付きバイナリ(scene3d/tracks.bin + tracks_meta.json)でも
+                      書き出す(P0 / docs/research/dt-integration-deep.md §2)。既定 OFF=
+                      **既存出力とバイト同一**(このフラグ無しでは 1 バイトも変わらない)。
+                      量子化は int16 × 0.05 m/unit(PLATEAU メッシュ埋め込みと同一・D-3)。
+                      1万体×1日の実測で tracks.json 65.8MB → tracks.bin 19.1MB(1/3.4)。
+  --no-tracks-json  : --tracks-binary 併用時のみ有効。tracks.json を書かない(10日ランで
+                      数百 MB の JSON を作らずに済む)。読み手は tracks.bin を復号する。
+  --chunk-mb M      : tracks.bin の遅延ロード用チャンク目標サイズ[MB](既定 8)。
   既定はいずれも全量・OFF=現行と完全同一。
 生成物:  runs/<name>/scene3d/
   scene.json     — 静的シーン(建物押出し情報・道路・線路・POI)。座標系 local-m(X=east,Y=north,Z=up)。
   tracks.json    — 時系列(エージェント位置・移動ポリライン・車トラフィック・sim 時刻)。
   buildings.glb  — 建物押出しプリズムの glTF 2.0 バイナリ(numpy+stdlib 手書き生成、依存追加なし)。
   plateau_web.json — (--plateau 時のみ)照合建物の量子化メッシュ(int16×0.05m・base64)。
+  tracks.bin / tracks_meta.json — (--tracks-binary 時のみ)量子化軌跡バイナリと、その JSON
+                   ヘッダの同内容コピー(形式は scripts/tracks_bin.py の docstring)。
 
 設計方針: sim⇄viz 疎結合(docs/lit/viz__plateau-pipeline-overview.md)。
   本スクリプトは l1_events.parquet を読むだけ。sim 本体には非依存。
@@ -37,6 +48,7 @@ make_viewer.py 自体は変更しない。
 from __future__ import annotations
 
 import base64
+import importlib.util
 import json
 import struct
 import sys
@@ -46,6 +58,16 @@ from pathlib import Path
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_tracks_bin():
+    """scripts/tracks_bin.py を場所非依存で読み込む(本ファイル自体が importlib で
+    読まれる前例に合わせる。scripts/ を sys.path に載せない)。"""
+    spec = importlib.util.spec_from_file_location(
+        "tracks_bin", Path(__file__).resolve().parent / "tracks_bin.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 FLOOR_HEIGHT = 3.5
 STEP_MINUTES = 10
@@ -790,7 +812,11 @@ def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
 def export_run(run_dir: Path, map_path: Path | None = None,
                sample_agents: int | None = None, step_stride: int = 1,
                plateau_dir: Path | None = None, rich_tracks: bool = False,
-               low_mem: bool = False) -> dict:
+               low_mem: bool = False, tracks_binary: bool = False,
+               write_tracks_json: bool = True,
+               chunk_bytes: int | None = None) -> dict:
+    if not tracks_binary and not write_tracks_json:
+        raise SystemExit("[export_3d] --no-tracks-json は --tracks-binary と併用する")
     run_dir = Path(run_dir)
     if low_mem:                       # 追加専用: 出力バイトは既定経路と同一(load_track_events)
         events, track_ov = load_track_events(run_dir / "l1_events.parquet")
@@ -831,11 +857,26 @@ def export_run(run_dir: Path, map_path: Path | None = None,
     glb_p = out_dir / "buildings.glb"
     scene_p.write_text(json.dumps(scene, ensure_ascii=False, separators=(",", ":")),
                        encoding="utf-8")
-    tracks_p.write_text(json.dumps(tracks, ensure_ascii=False, separators=(",", ":")),
-                        encoding="utf-8")
+    if write_tracks_json:
+        tracks_p.write_text(json.dumps(tracks, ensure_ascii=False, separators=(",", ":")),
+                            encoding="utf-8")
     glb_p.write_bytes(glb)
-    res = {"scene": scene_p, "tracks": tracks_p, "glb": glb_p,
+    res = {"scene": scene_p, "glb": glb_p,
            "n_buildings": len(scene["buildings"]), "n_steps": tracks["meta"]["nSteps"]}
+    if write_tracks_json:
+        res["tracks"] = tracks_p
+    if tracks_binary:                                 # 追加専用: 既定 OFF=既存出力バイト同一
+        tb = _load_tracks_bin()
+        kw = {"chunk_bytes": chunk_bytes} if chunk_bytes else {}
+        blob, header = tb.encode_tracks(tracks, **kw)
+        bin_p = out_dir / "tracks.bin"
+        meta_p = out_dir / "tracks_meta.json"
+        bin_p.write_bytes(blob)
+        # tracks.bin 内の JSON ヘッダと**同一文字列**(ビューアはこちらを埋め込む)
+        meta_p.write_text(json.dumps(header, ensure_ascii=False, separators=(",", ":")),
+                          encoding="utf-8")
+        res["tracks_bin"] = bin_p
+        res["tracks_meta"] = meta_p
     if plateau:
         web = build_plateau_web(scene["buildings"], plateau)
         extras = _load_extras(plateau_dir)                # extras.npz があれば地下街/橋を同梱
@@ -878,10 +919,20 @@ def main(argv: list) -> int:
             plateau_dir = REPO_ROOT / plateau_dir
     rich_tracks = "--rich-tracks" in argv
     low_mem = "--low-mem" in argv
+    tracks_binary = "--tracks-binary" in argv
+    write_tracks_json = "--no-tracks-json" not in argv
+    chunk_bytes = None
+    if "--chunk-mb" in argv:
+        chunk_bytes = int(float(argv[argv.index("--chunk-mb") + 1]) * 1024 * 1024)
     res = export_run(run_dir, map_override, sample_agents=sample_agents,
                      step_stride=step_stride, plateau_dir=plateau_dir,
-                     rich_tracks=rich_tracks, low_mem=low_mem)
-    keys = (("scene", "tracks", "glb")
+                     rich_tracks=rich_tracks, low_mem=low_mem,
+                     tracks_binary=tracks_binary,
+                     write_tracks_json=write_tracks_json, chunk_bytes=chunk_bytes)
+    keys = (("scene",)
+            + (("tracks",) if "tracks" in res else ())
+            + ("glb",)
+            + (("tracks_bin", "tracks_meta") if "tracks_bin" in res else ())
             + (("plateau_web",) if "plateau_web" in res else ())
             + (("terrain_web",) if "terrain_web" in res else ()))
     for k in keys:
