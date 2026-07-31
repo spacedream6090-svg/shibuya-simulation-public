@@ -1,0 +1,754 @@
+{
+  "calibration_probe": {
+    "rho1.0": {
+      "orca.default_tau2": 1.1867817138984944,
+      "orca.tau4": 1.1932567302267254,
+      "orca.tau4_radius1.3": 1.1556108706091206,
+      "orca.tau8": 1.1839330445445055,
+      "sfm.A500_B0.6": -0.10563280675272296,
+      "sfm.B0.3_onlyrange": 0.49989809276261293,
+      "sfm.HelbingMolnar1995_A560_B0.3": 0.5842987413987905,
+      "sfm.default_A2000_B0.08": 1.0803893216321785,
+      "sfm.tau1.0": 1.0349161438658805,
+      "weidmann_vf1.34": 1.0580628560768004
+    },
+    "rho2.0": {
+      "orca.default_tau2": 1.1386597411351265,
+      "orca.tau4": 1.126699121094523,
+      "orca.tau4_radius1.3": -0.27440087126590984,
+      "orca.tau8": 1.0902499488116688,
+      "sfm.A500_B0.6": 0.7602944406019189,
+      "sfm.B0.3_onlyrange": 0.9174187738665746,
+      "sfm.HelbingMolnar1995_A560_B0.3": 0.410275899043024,
+      "sfm.default_A2000_B0.08": 0.745475274613723,
+      "sfm.tau1.0": 0.6883009807277171,
+      "weidmann_vf1.34": 0.6062384205544558
+    },
+    "rho3.0": {
+      "orca.default_tau2": 0.2894309972119147,
+      "orca.tau4": -0.01204187164244506,
+      "orca.tau4_radius1.3": -0.011166172850771103,
+      "orca.tau8": 0.6256620972459024,
+      "sfm.A500_B0.6": 0.7938875468571096,
+      "sfm.B0.3_onlyrange": 0.9249596205475085,
+      "sfm.HelbingMolnar1995_A560_B0.3": 0.7778743265011244,
+      "sfm.default_A2000_B0.08": 0.9714733568249493,
+      "sfm.tau1.0": 0.9224732258361049,
+      "weidmann_vf1.34": 0.330694766470473
+    }
+  },
+  "counterflow": {
+    "w3.orca": {
+      "band_count": 3.2903225806451615,
+      "continuity": {
+        "gate": {
+          "accel_max": 15.961489945610522,
+          "accel_p99": 5.1359833823135626,
+          "mean_speed": 0.9135472733461978,
+          "stall_rate": 0.010787839163125205
+        },
+        "gate_reversal_rate_per_agent_s": 0.11992005329780148,
+        "interior": {
+          "accel_max": 16.783595529960778,
+          "accel_p99": 1.6844208751311838,
+          "mean_speed": 0.32263113995648335,
+          "stall_rate": 0.21264126532605623
+        },
+        "jump_max_m": 0.17672659067637073,
+        "reversal_rate_per_agent_s": 0.12900864835868617
+      },
+      "density": 1.1111111111111112,
+      "efficiency": 0.07291894187595574,
+      "lane_order_null": 0.02952068961145815,
+      "lane_order_phi": 0.02585165664701295,
+      "length": 60.0,
+      "mean_forward_speed": 0.08643773919147092,
+      "mean_speed": 0.2276297415930553,
+      "mean_wait_s": 0.21400000000000002,
+      "min_gap_m": -0.0989700426342045,
+      "overlap_pair_rate": 0.006465443404122026,
+      "width": 3.0
+    },
+    "w3.sfm": {
+      "band_count": 3.806451612903226,
+      "continuity": {
+        "gate": {
+          "accel_max": 30.659037447377468,
+          "accel_p99": 9.173628608294635,
+          "mean_speed": 0.5177020035847134,
+          "stall_rate": 0.07552931596091206
+        },
+        "gate_reversal_rate_per_agent_s": 0.6906474820143885,
+        "interior": {
+          "accel_max": 32.38017985526398,
+          "accel_p99": 4.570301600003542,
+          "mean_speed": 0.15964873503521362,
+          "stall_rate": 0.6481811620039829
+        },
+        "jump_max_m": 0.18175490427230787,
+        "reversal_rate_per_agent_s": 0.4628537579554781
+      },
+      "density": 1.1111111111111112,
+      "efficiency": 0.020270530312099307,
+      "lane_order_null": 0.05164140148993416,
+      "lane_order_phi": 0.049380970694669735,
+      "length": 60.0,
+      "mean_forward_speed": 0.024028582523463564,
+      "mean_speed": 0.06712319877866839,
+      "mean_wait_s": 0.14850000000000002,
+      "min_gap_m": 0.05018096881474432,
+      "overlap_pair_rate": 0.0,
+      "width": 3.0
+    },
+    "w6.orca": {
+      "band_count": 6.32258064516129,
+      "continuity": {
+        "gate": {
+          "accel_max": 15.512686652917566,
+          "accel_p99": 3.7412637965401956,
+          "mean_speed": 0.7464356478731775,
+          "stall_rate": 0.07764642665233745
+        },
+        "gate_reversal_rate_per_agent_s": 0.11507271326960539,
+        "interior": {
+          "accel_max": 15.951671842533841,
+          "accel_p99": 2.587941023009377,
+          "mean_speed": 0.6895405156768926,
+          "stall_rate": 0.03279044045889267
+        },
+        "jump_max_m": 0.18008699894454594,
+        "reversal_rate_per_agent_s": 0.09552208986924196
+      },
+      "density": 1.1111111111111112,
+      "efficiency": 0.3651328440529449,
+      "lane_order_null": 0.09353868124987773,
+      "lane_order_phi": 0.1162867339055983,
+      "length": 30.0,
+      "mean_forward_speed": 0.4328265980350912,
+      "mean_speed": 0.6116528052713955,
+      "mean_wait_s": 2.8230000000000004,
+      "min_gap_m": -0.06112684751978281,
+      "overlap_pair_rate": 0.0031907583422261443,
+      "width": 6.0
+    },
+    "w6.sfm": {
+      "band_count": 2.3870967741935485,
+      "continuity": {
+        "gate": {
+          "accel_max": 28.026052989289177,
+          "accel_p99": 6.850246819504361,
+          "mean_speed": 0.45681839936906693,
+          "stall_rate": 0.06249451802473467
+        },
+        "gate_reversal_rate_per_agent_s": 0.7376687549633814,
+        "interior": {
+          "accel_max": 32.73178917869069,
+          "accel_p99": 5.519596500121462,
+          "mean_speed": 0.39478642950849085,
+          "stall_rate": 0.10293092539170161
+        },
+        "jump_max_m": 0.1813796611815915,
+        "reversal_rate_per_agent_s": 0.7614451935545776
+      },
+      "density": 1.1111111111111112,
+      "efficiency": 0.2643638157285873,
+      "lane_order_null": 0.0928372001492973,
+      "lane_order_phi": 0.3229522831612113,
+      "length": 30.0,
+      "mean_forward_speed": 0.31337550940443076,
+      "mean_speed": 0.42596119720056774,
+      "mean_wait_s": 2.0755,
+      "min_gap_m": 0.05045228696482351,
+      "overlap_pair_rate": 0.0,
+      "width": 6.0
+    }
+  },
+  "counterflow_density_sweep": {
+    "n120.orca": {
+      "density": 0.6666666666666666,
+      "efficiency": 0.5524131809414501,
+      "lane_order_null": 0.12349312284513042,
+      "lane_order_phi": 0.23683183577047703,
+      "mean_forward_speed": 0.6518114885227798,
+      "n_agents": 120
+    },
+    "n120.sfm": {
+      "density": 0.6666666666666666,
+      "efficiency": 0.3695467639818322,
+      "lane_order_null": 0.10033788585881168,
+      "lane_order_phi": 0.26907567730551063,
+      "mean_forward_speed": 0.4360410551740702,
+      "n_agents": 120
+    },
+    "n200.orca": {
+      "density": 1.1111111111111112,
+      "efficiency": 0.07291894187595574,
+      "lane_order_null": 0.02952068961145815,
+      "lane_order_phi": 0.02585165664701295,
+      "mean_forward_speed": 0.08643773919147092,
+      "n_agents": 200
+    },
+    "n200.sfm": {
+      "density": 1.1111111111111112,
+      "efficiency": 0.020270530312099307,
+      "lane_order_null": 0.05164140148993416,
+      "lane_order_phi": 0.049380970694669735,
+      "mean_forward_speed": 0.024028582523463564,
+      "n_agents": 200
+    },
+    "n40.orca": {
+      "density": 0.2222222222222222,
+      "efficiency": 0.8647208893753473,
+      "lane_order_null": 0.19965269448992487,
+      "lane_order_phi": 0.4249274671485651,
+      "mean_forward_speed": 1.0171190441896845,
+      "n_agents": 40
+    },
+    "n40.sfm": {
+      "density": 0.2222222222222222,
+      "efficiency": 0.8747389113060284,
+      "lane_order_null": 0.1515135298117596,
+      "lane_order_phi": 0.8595053559168201,
+      "mean_forward_speed": 1.0289026393543235,
+      "n_agents": 40
+    },
+    "n80.orca": {
+      "density": 0.4444444444444444,
+      "efficiency": 0.8259041538327818,
+      "lane_order_null": 0.11491683791977866,
+      "lane_order_phi": 0.37303380971751493,
+      "mean_forward_speed": 0.9705380604618393,
+      "n_agents": 80
+    },
+    "n80.sfm": {
+      "density": 0.4444444444444444,
+      "efficiency": 0.4825879114339211,
+      "lane_order_null": 0.09842136082963228,
+      "lane_order_phi": 0.4653281937471438,
+      "mean_forward_speed": 0.5670996245651975,
+      "n_agents": 80
+    }
+  },
+  "crossing": {
+    "orca": {
+      "continuity": {
+        "gate": {
+          "accel_max": 13.411383340689055,
+          "accel_p99": 3.9471638324302405,
+          "mean_speed": 1.0912468204340091,
+          "stall_rate": 0.00464516129032258
+        },
+        "gate_reversal_rate_per_agent_s": 0.10181321997428429,
+        "interior": {
+          "accel_max": 16.114215388140288,
+          "accel_p99": 3.913322553612767,
+          "mean_speed": 1.0245134856730533,
+          "stall_rate": 0.0034595959595959598
+        },
+        "jump_max_m": 0.18175490427230642,
+        "reversal_rate_per_agent_s": 0.1394826460209616
+      },
+      "efficiency": 0.9240930240753271,
+      "mean_speed": 1.0954151246401895,
+      "min_gap_m": -0.044963862267732746,
+      "overlap_pair_rate": 0.0005053218278883927
+    },
+    "sfm": {
+      "continuity": {
+        "gate": {
+          "accel_max": 29.957469320976923,
+          "accel_p99": 8.612729648238991,
+          "mean_speed": 0.9667765149259528,
+          "stall_rate": 0.004785271097773633
+        },
+        "gate_reversal_rate_per_agent_s": 0.38979709192475154,
+        "interior": {
+          "accel_max": 31.827994747784775,
+          "accel_p99": 5.820302304894763,
+          "mean_speed": 0.427426700421703,
+          "stall_rate": 0.16531333487599134
+        },
+        "jump_max_m": 0.18137966118159132,
+        "reversal_rate_per_agent_s": 0.6808846223492676
+      },
+      "efficiency": 0.5301288622950693,
+      "mean_speed": 0.6284120306474456,
+      "min_gap_m": 0.004215490723780468,
+      "overlap_pair_rate": 0.0
+    }
+  },
+  "determinism": {
+    "counterflow_w3.orca": {
+      "byte_identical": true,
+      "hash_run1": "5dfeb4b805fe22a9ca41a861b3fe5701e99c371491b75afc55f2a6811b128e21",
+      "hash_run2": "5dfeb4b805fe22a9ca41a861b3fe5701e99c371491b75afc55f2a6811b128e21"
+    },
+    "counterflow_w3.sfm": {
+      "byte_identical": true,
+      "hash_run1": "908206b556ac715df7b78d178ed6b7ab7cb417cc15feccd36d1a510213cdc6b8",
+      "hash_run2": "908206b556ac715df7b78d178ed6b7ab7cb417cc15feccd36d1a510213cdc6b8"
+    },
+    "crossing.orca": {
+      "byte_identical": true,
+      "hash_run1": "95b8be0dec302a6b18d2b8fc30db49f98f6c5c2e7ef2c083a441d7aa1edb8974",
+      "hash_run2": "95b8be0dec302a6b18d2b8fc30db49f98f6c5c2e7ef2c083a441d7aa1edb8974"
+    },
+    "crossing.sfm": {
+      "byte_identical": true,
+      "hash_run1": "8a23382c8f44e0bf7266bec6510af1ee82a7ad8fc3a0009f82a12434ecdfd707",
+      "hash_run2": "8a23382c8f44e0bf7266bec6510af1ee82a7ad8fc3a0009f82a12434ecdfd707"
+    },
+    "fd_periodic_rho1.5.orca": {
+      "byte_identical": true,
+      "hash_run1": "b5a908a99add66d77050eb78d5c0e2ab755d9e7a0c1334887cc1df58c1a6cbbb",
+      "hash_run2": "b5a908a99add66d77050eb78d5c0e2ab755d9e7a0c1334887cc1df58c1a6cbbb"
+    },
+    "fd_periodic_rho1.5.sfm": {
+      "byte_identical": true,
+      "hash_run1": "aaaaec628aaf606edc18db2fbfa8b296909a8e92c83c3f88ec6f35a9369f9d03",
+      "hash_run2": "aaaaec628aaf606edc18db2fbfa8b296909a8e92c83c3f88ec6f35a9369f9d03"
+    }
+  },
+  "dt_stability": {
+    "rho1.0.orca": {
+      "0.02": {
+        "speed_abs": 1.186273146015498,
+        "speed_max": 1.398189566968264,
+        "transient_min": 1.1825618156912938,
+        "v_forward": 1.1860578478189445
+      },
+      "0.05": {
+        "speed_abs": 1.1784635623941955,
+        "speed_max": 1.395228162935318,
+        "transient_min": 1.1748284936284152,
+        "v_forward": 1.1782460311646155
+      },
+      "0.1": {
+        "speed_abs": 1.1890995081674844,
+        "speed_max": 1.3803788589775146,
+        "transient_min": 1.1799464861004874,
+        "v_forward": 1.1888633145627092
+      },
+      "0.2": {
+        "speed_abs": 1.1834503474238116,
+        "speed_max": 1.3839232408764046,
+        "transient_min": 1.1795569648458701,
+        "v_forward": 1.183250534251776
+      },
+      "0.5": {
+        "speed_abs": 1.1741042212718773,
+        "speed_max": 1.3954832925672487,
+        "transient_min": 1.168890245473302,
+        "v_forward": 1.173814251886589
+      }
+    },
+    "rho1.0.sfm": {
+      "0.02": {
+        "speed_abs": 1.0771262641871282,
+        "speed_max": 1.2750168369590902,
+        "transient_min": 1.0180498232586284,
+        "v_forward": 1.0769008309856556
+      },
+      "0.05": {
+        "speed_abs": 1.0739675270931326,
+        "speed_max": 1.2747887760362215,
+        "transient_min": 1.0181209157644004,
+        "v_forward": 1.0736965580769007
+      },
+      "0.1": {
+        "speed_abs": 1.073269951049539,
+        "speed_max": 1.2661263523735509,
+        "transient_min": 1.0150879880275248,
+        "v_forward": 1.0730122518092569
+      },
+      "0.2": {
+        "speed_abs": 1.1819467861253619,
+        "speed_max": 1.8175490427230585,
+        "transient_min": 0.48270150228902425,
+        "v_forward": 0.6622651454726525
+      },
+      "0.5": {
+        "speed_abs": 1.1857245894785955,
+        "speed_max": 1.8175490427230585,
+        "transient_min": 0.1181312867879724,
+        "v_forward": 1.1304102832421787
+      }
+    },
+    "rho3.0.orca": {
+      "0.02": {
+        "speed_abs": 0.5311234571925716,
+        "speed_max": 1.8008699894454547,
+        "transient_min": -0.004153857887390186,
+        "v_forward": 0.44433078699034634
+      },
+      "0.05": {
+        "speed_abs": 0.3002239166496539,
+        "speed_max": 1.2424559108425461,
+        "transient_min": 0.17176227031296884,
+        "v_forward": 0.25475148048472873
+      },
+      "0.1": {
+        "speed_abs": 0.8807878381222956,
+        "speed_max": 1.6033728283127024,
+        "transient_min": 0.7446302091746764,
+        "v_forward": 0.8782037406876484
+      },
+      "0.2": {
+        "speed_abs": 1.0672557296944285,
+        "speed_max": 1.308899745969144,
+        "transient_min": 1.0497045058540027,
+        "v_forward": 1.0666114191378309
+      },
+      "0.5": {
+        "speed_abs": 1.1999824627915905,
+        "speed_max": 1.3836624376367825,
+        "transient_min": 1.1837629129777023,
+        "v_forward": 1.1997912858743347
+      }
+    },
+    "rho3.0.sfm": {
+      "0.02": {
+        "speed_abs": 0.976671495039094,
+        "speed_max": 1.4148868410098963,
+        "transient_min": -1.415938854973825,
+        "v_forward": 0.976440756926677
+      },
+      "0.05": {
+        "speed_abs": 0.9380814149125486,
+        "speed_max": 1.4020360903188431,
+        "transient_min": -1.4022630264099103,
+        "v_forward": 0.9377687600532694
+      },
+      "0.1": {
+        "speed_abs": 1.0916528973138921,
+        "speed_max": 1.8175490427230587,
+        "transient_min": -0.358875819006359,
+        "v_forward": 0.08349483365220858
+      },
+      "0.2": {
+        "speed_abs": 1.2875110257387488,
+        "speed_max": 1.800869989445455,
+        "transient_min": -0.07018808754023531,
+        "v_forward": 0.601795770696311
+      },
+      "0.5": {
+        "speed_abs": 1.254007488095202,
+        "speed_max": 1.8175490427230585,
+        "transient_min": -0.08150999885528128,
+        "v_forward": 0.9183101764324362
+      }
+    }
+  },
+  "engine_notes": {
+    "orca_pref_noise_works_and_is_deterministic": {
+      "changes_trajectory": true,
+      "hash_noise0": "1641d4c920df870c5af1a06df3bee2f3c4394e8bfe61b960a57b4e3852d0a3ca",
+      "hash_pref0.2_run1": "ef9a8eb0313952e0a9c6a326b5ec6d60f291606ab5ea6537e1a9e342a289dc68",
+      "hash_pref0.2_run2": "ef9a8eb0313952e0a9c6a326b5ec6d60f291606ab5ea6537e1a9e342a289dc68",
+      "note": "orca_min の pref_noise は seed 固定の専用 Generator を消費するので、揺らぎを入れても同一 seed なら軌跡はバイト一致(確率項と決定論は両立する)。",
+      "reproducible": true
+    },
+    "wallcrowd_drops_fluctuation_xi": {
+      "hash_noise0": "3f9af015c281e0521ef5231d8ae9a83a11085ad44797d1c559c431891b91e444",
+      "hash_noise2.0": "3f9af015c281e0521ef5231d8ae9a83a11085ad44797d1c559c431891b91e444",
+      "identical": true,
+      "note": "indoor_flow.WallCrowd.forces() は sfm_core.Crowd.forces() を上書きしており揺らぎ項 ξ を含まない。壁ありの経路では noise パラメータが完全に無効(= レーン形成の標準的な対称性の破れ機構が使えない)。src/ は未変更・実測のみ。"
+    }
+  },
+  "env": {
+    "neighbor_cap": 12,
+    "neighbor_dist_orca": 6.0,
+    "numpy": "2.5.0",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python": "3.12.10",
+    "quick": false,
+    "rvo2_binding": "unavailable (see orca_min.py docstring)",
+    "total_wall_s": 691.0855841999874
+  },
+  "fundamental_diagram": {
+    "dt=0.02": [
+      {
+        "mean_v0": 1.1326677438001933,
+        "n_agents": 12,
+        "rho": 0.2,
+        "speed_orca": 1.1329774659296534,
+        "speed_sfm": 1.1239018981717406,
+        "transient_min_orca": 1.1326513100968398,
+        "transient_min_sfm": 1.1174846688724116,
+        "v_orca": 1.1329447908079138,
+        "v_sfm": 1.123736345114038,
+        "weidmann_rescaled": 1.132554522365215,
+        "weidmann_vf1.34": 1.3398660536386762
+      },
+      {
+        "mean_v0": 1.1648742576620563,
+        "n_agents": 30,
+        "rho": 0.5,
+        "speed_orca": 1.1650846807922568,
+        "speed_sfm": 1.1313396288416788,
+        "transient_min_orca": 1.1622185162650336,
+        "transient_min_sfm": 1.1243215416012786,
+        "v_orca": 1.1648941713936978,
+        "v_sfm": 1.130973348916396,
+        "weidmann_rescaled": 1.1286898721585252,
+        "weidmann_vf1.34": 1.298375699131641
+      },
+      {
+        "mean_v0": 1.1852142478831174,
+        "n_agents": 60,
+        "rho": 1.0,
+        "speed_orca": 1.186273146015498,
+        "speed_sfm": 1.0771262641871282,
+        "transient_min_orca": 1.1825618156912938,
+        "transient_min_sfm": 1.0180498232586284,
+        "v_orca": 1.1860578478189445,
+        "v_sfm": 1.0769008309856556,
+        "weidmann_rescaled": 0.9358441583418865,
+        "weidmann_vf1.34": 1.0580628560768004
+      },
+      {
+        "mean_v0": 1.1701521666534573,
+        "n_agents": 90,
+        "rho": 1.5,
+        "speed_orca": 1.1613414892353757,
+        "speed_sfm": 0.6985920806469054,
+        "transient_min_orca": 0.9857275103793081,
+        "transient_min_sfm": 0.4733802527726071,
+        "v_orca": 1.161144625752794,
+        "v_sfm": 0.6984920361225477,
+        "weidmann_rescaled": 0.7043248491141213,
+        "weidmann_vf1.34": 0.8065577492473501
+      },
+      {
+        "mean_v0": 1.1799347137443936,
+        "n_agents": 120,
+        "rho": 2.0,
+        "speed_orca": 1.1415250193173345,
+        "speed_sfm": 0.7782194886988554,
+        "transient_min_orca": 0.07313690741824051,
+        "transient_min_sfm": -1.0432836523152555,
+        "v_orca": 1.1414145904737636,
+        "v_sfm": 0.7657443244627495,
+        "weidmann_rescaled": 0.5338222068789367,
+        "weidmann_vf1.34": 0.6062384205544558
+      },
+      {
+        "mean_v0": 1.186431899429326,
+        "n_agents": 180,
+        "rho": 3.0,
+        "speed_orca": 0.5311234571925716,
+        "speed_sfm": 0.976671495039094,
+        "transient_min_orca": -0.004153857887390186,
+        "transient_min_sfm": -1.415938854973825,
+        "v_orca": 0.44433078699034634,
+        "v_sfm": 0.976440756926677,
+        "weidmann_rescaled": 0.29279613426485124,
+        "weidmann_vf1.34": 0.330694766470473
+      }
+    ],
+    "dt=0.1": [
+      {
+        "mean_v0": 1.1326677438001933,
+        "n_agents": 12,
+        "rho": 0.2,
+        "speed_orca": 1.132976861739286,
+        "speed_sfm": 1.1239151896142137,
+        "transient_min_orca": 1.13257484081889,
+        "transient_min_sfm": 1.1171644182017266,
+        "v_orca": 1.132943981387812,
+        "v_sfm": 1.1237502588597124,
+        "weidmann_rescaled": 1.132554522365215,
+        "weidmann_vf1.34": 1.3398660536386762
+      },
+      {
+        "mean_v0": 1.1648742576620563,
+        "n_agents": 30,
+        "rho": 0.5,
+        "speed_orca": 1.1651710396826955,
+        "speed_sfm": 1.1306954760178358,
+        "transient_min_orca": 1.1621956139789613,
+        "transient_min_sfm": 1.1241524748720735,
+        "v_orca": 1.1649797599515141,
+        "v_sfm": 1.1303318592543647,
+        "weidmann_rescaled": 1.1286898721585252,
+        "weidmann_vf1.34": 1.298375699131641
+      },
+      {
+        "mean_v0": 1.1852142478831174,
+        "n_agents": 60,
+        "rho": 1.0,
+        "speed_orca": 1.1890995081674844,
+        "speed_sfm": 1.073269951049539,
+        "transient_min_orca": 1.1799464861004874,
+        "transient_min_sfm": 1.0150879880275248,
+        "v_orca": 1.1888633145627092,
+        "v_sfm": 1.0730122518092569,
+        "weidmann_rescaled": 0.9358441583418865,
+        "weidmann_vf1.34": 1.0580628560768004
+      },
+      {
+        "mean_v0": 1.1701521666534573,
+        "n_agents": 90,
+        "rho": 1.5,
+        "speed_orca": 1.157554471688251,
+        "speed_sfm": 0.6484420360426535,
+        "transient_min_orca": 1.1186348871956844,
+        "transient_min_sfm": 0.3931239613048179,
+        "v_orca": 1.1574489632738802,
+        "v_sfm": 0.6482371065801625,
+        "weidmann_rescaled": 0.7043248491141213,
+        "weidmann_vf1.34": 0.8065577492473501
+      },
+      {
+        "mean_v0": 1.1799347137443936,
+        "n_agents": 120,
+        "rho": 2.0,
+        "speed_orca": 1.1541990911348838,
+        "speed_sfm": 0.6855004696540608,
+        "transient_min_orca": 0.9800092974967488,
+        "transient_min_sfm": -0.687898158372165,
+        "v_orca": 1.1541246253819695,
+        "v_sfm": 0.38234269405936244,
+        "weidmann_rescaled": 0.5338222068789367,
+        "weidmann_vf1.34": 0.6062384205544558
+      },
+      {
+        "mean_v0": 1.186431899429326,
+        "n_agents": 180,
+        "rho": 3.0,
+        "speed_orca": 0.8807878381222956,
+        "speed_sfm": 1.0916528973138921,
+        "transient_min_orca": 0.7446302091746764,
+        "transient_min_sfm": -0.358875819006359,
+        "v_orca": 0.8782037406876484,
+        "v_sfm": 0.08349483365220858,
+        "weidmann_rescaled": 0.29279613426485124,
+        "weidmann_vf1.34": 0.330694766470473
+      }
+    ]
+  },
+  "gate_stitching": {
+    "blind.orca": {
+      "gate": {
+        "accel_max": 23.375054168884244,
+        "accel_p99": 7.168740498743521,
+        "mean_speed": 0.7730934602834741,
+        "stall_rate": 0.09384243076095725
+      },
+      "gate_reversal_rate_per_agent_s": 0.2459016393442623,
+      "interior": {
+        "accel_max": 19.65481705806474,
+        "accel_p99": 2.117795934994798,
+        "mean_speed": 0.42756766292279513,
+        "stall_rate": 0.1238863960440078
+      },
+      "jump_max_m": 0.18008699894454402,
+      "mean_wait_s": 0.020000000000000004,
+      "min_gap_m": -0.20723973178939237,
+      "n_gate_events": 79,
+      "overlap_pair_rate": 0.005509186370574858,
+      "reversal_rate_per_agent_s": 0.1202324057631516
+    },
+    "blind.sfm": {
+      "gate": {
+        "accel_max": 30.659037447377468,
+        "accel_p99": 14.251502891176948,
+        "mean_speed": 0.6691340824830053,
+        "stall_rate": 0.01778242677824268
+      },
+      "gate_reversal_rate_per_agent_s": 0.7492719089224251,
+      "interior": {
+        "accel_max": 32.38017985526398,
+        "accel_p99": 5.630763190772477,
+        "mean_speed": 0.21681552961501915,
+        "stall_rate": 0.48956764332211294
+      },
+      "jump_max_m": 0.18175490427230787,
+      "mean_wait_s": 0.013500000000000002,
+      "min_gap_m": 0.02355894373944256,
+      "n_gate_events": 54,
+      "overlap_pair_rate": 0.0,
+      "reversal_rate_per_agent_s": 0.6130144472361809
+    },
+    "guarded.orca": {
+      "gate": {
+        "accel_max": 15.961489945610522,
+        "accel_p99": 5.1533610154744895,
+        "mean_speed": 0.9095135162874851,
+        "stall_rate": 0.011111111111111112
+      },
+      "gate_reversal_rate_per_agent_s": 0.1234991423670669,
+      "interior": {
+        "accel_max": 16.783595529960778,
+        "accel_p99": 2.1764706966288423,
+        "mean_speed": 0.407377968187361,
+        "stall_rate": 0.10574970053643039
+      },
+      "jump_max_m": 0.17672659067637073,
+      "mean_wait_s": 0.213,
+      "min_gap_m": -0.07419684840095508,
+      "n_gate_events": 70,
+      "overlap_pair_rate": 0.005590033603010984,
+      "reversal_rate_per_agent_s": 0.12196729980061749
+    },
+    "guarded.sfm": {
+      "gate": {
+        "accel_max": 30.659037447377468,
+        "accel_p99": 9.339862662508448,
+        "mean_speed": 0.5146764213810098,
+        "stall_rate": 0.07597788244931394
+      },
+      "gate_reversal_rate_per_agent_s": 0.6947890818858561,
+      "interior": {
+        "accel_max": 32.38017985526398,
+        "accel_p99": 5.71688498395,
+        "mean_speed": 0.22047530997795006,
+        "stall_rate": 0.4749266862170088
+      },
+      "jump_max_m": 0.18175490427230787,
+      "mean_wait_s": 0.14850000000000002,
+      "min_gap_m": 0.05018096881474432,
+      "n_gate_events": 54,
+      "overlap_pair_rate": 0.0,
+      "reversal_rate_per_agent_s": 0.6537636278099839
+    }
+  },
+  "throughput": {
+    "counterflow_w3.orca": {
+      "agent_steps_per_s": 57344.392638886326,
+      "realtime_factor": 28.672196319443163,
+      "sim_s_simulated": 30.0,
+      "steps": 300,
+      "wall_s": 1.0463098001200706,
+      "wall_s_for_200agents_1h_dt0.05": 251.11435202881694,
+      "wall_s_for_200agents_1h_dt0.1": 125.55717601440847
+    },
+    "counterflow_w3.sfm": {
+      "agent_steps_per_s": 38111.73382152108,
+      "realtime_factor": 19.05586691076054,
+      "sim_s_simulated": 30.0,
+      "steps": 300,
+      "wall_s": 1.5743183000013232,
+      "wall_s_for_200agents_1h_dt0.05": 377.83639200031763,
+      "wall_s_for_200agents_1h_dt0.1": 188.91819600015882
+    },
+    "crossing.orca": {
+      "agent_steps_per_s": 66998.92924314234,
+      "realtime_factor": 33.49946462157117,
+      "sim_s_simulated": 30.0,
+      "steps": 300,
+      "wall_s": 0.8955367000307888,
+      "wall_s_for_200agents_1h_dt0.05": 214.9288080073893,
+      "wall_s_for_200agents_1h_dt0.1": 107.46440400369465
+    },
+    "crossing.sfm": {
+      "agent_steps_per_s": 37585.53999460006,
+      "realtime_factor": 18.79276999730003,
+      "sim_s_simulated": 30.0,
+      "steps": 300,
+      "wall_s": 1.596358599839732,
+      "wall_s_for_200agents_1h_dt0.05": 383.12606396153564,
+      "wall_s_for_200agents_1h_dt0.1": 191.56303198076782
+    }
+  }
+}
