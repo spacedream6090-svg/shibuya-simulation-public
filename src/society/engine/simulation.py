@@ -679,6 +679,24 @@ class Simulation:
         if self.workcfg["enabled"] and self.workcfg["ledger"]["enabled"]:
             from ..observer.org_ledger import OrgLedger
             self.org_ledger_sc = OrgLedger(self.out_dir)
+        # ---- 観測チャンネル o_c(t)(第80バッチ。既定 OFF=サイドカー不在=完全 no-op)----
+        # 驚き駆動発火の**入力側**の定義(cognition/channels.py)を step ごとに読み取り専用で
+        # 計算し、channels.parquet へ書くだけ。ON でも L1/L2/L3・乱数・LLM 呼数は不変。
+        # 較正テーブル(壊れていたら即エラー)と σ_c 凍結(無ければ absent)の来歴もここで 1 回だけ採る。
+        from ..cognition import calib as _calib_mod
+        from ..cognition import channels as _channels_mod
+        raw_ch = (cfg.get("cognition", {}) or {}).get("channels", None)
+        raw_ch = (OmegaConf.to_container(raw_ch, resolve=True)
+                  if OmegaConf.is_config(raw_ch) else raw_ch)
+        self.channelscfg = _channels_mod.build_cfg(raw_ch)
+        self.channels_sc = None
+        self.cognition_calib = None
+        self.cognition_sigma = None
+        if self.channelscfg["enabled"]:
+            from ..observer.channels import ChannelsSidecar
+            self.channels_sc = ChannelsSidecar(self.out_dir, _channels_mod.COLUMNS)
+            self.cognition_calib = _calib_mod.load_calib(self.channelscfg["calib_file"])
+            self.cognition_sigma = _calib_mod.load_sigma(self.channelscfg["sigma_file"])
         # 職場束ね直し(work.bind_workplace。既定 OFF=現行の work_node 付与と完全同一=バイト一致)。
         # ON 時: pool 経路の L2/L3(occupation が persona._WORK_CAT に載らず work_node を持たない個体)を
         # 台帳 workplace_poi.node へ org_id で束ね直し、接客(serve)/産出(org_output)の網羅率を上げる。
@@ -1458,6 +1476,8 @@ class Simulation:
                 self.indoor_tracks._resumed = True
             if self.org_ledger_sc is not None:    # B4: org_ledger サイドカーも分割実行の canonical を保つ
                 self.org_ledger_sc._resumed = True
+            if self.channels_sc is not None:      # 第80: 観測チャンネルも二重記録しない(canonical 先頭結合)
+                self.channels_sc._resumed = True
         if every > 0:
             save_config(self.cfg, self.out_dir)   # 途中再開に備え config を先出しする
         for step in range(start, int(self.cfg.run.n_steps)):
@@ -1478,6 +1498,8 @@ class Simulation:
                     self.indoor_tracks.flush_segment()
                 if self.org_ledger_sc is not None:  # B4: org_ledger サイドカーも対でセグメント化
                     self.org_ledger_sc.flush_segment()
+                if self.channels_sc is not None:    # 第80: 観測チャンネルも対でセグメント化
+                    self.channels_sc.flush_segment()
                 did_flush = True
             if flush_every > 0 and not did_flush \
                     and (step + 1) % flush_every == 0:
@@ -1488,6 +1510,8 @@ class Simulation:
                     self.indoor_tracks.flush_segment()
                 if self.org_ledger_sc is not None:
                     self.org_ledger_sc.flush_segment()
+                if self.channels_sc is not None:
+                    self.channels_sc.flush_segment()
         return self.finalize()
 
     def _agents_json_records(self) -> list:
@@ -1529,6 +1553,8 @@ class Simulation:
             self.indoor_tracks.finalize()
         if self.org_ledger_sc is not None:        # B4: 組織日次系列サイドカーを結合(part→canonical)
             self.org_ledger_sc.finalize()
+        if self.channels_sc is not None:          # 第80: 観測チャンネルを結合(part→canonical)
+            self.channels_sc.finalize()
         # B4 item#4: 会社観測(indoor_fields/ledger)ON かつ org 配属があるランは agents.json を再出力し
         # org_id/org_role を載せる(org 配属は run 中の遅延初期化=__init__ 時点では未付与のため)。
         # OFF は再出力しない=既存 agents.json とバイト一致(ゴールデン非該当)。

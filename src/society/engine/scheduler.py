@@ -1433,6 +1433,17 @@ def _interstitial_on(sim) -> bool:
         return False
 
 
+def _channels_on(sim, step: int) -> bool:
+    """観測チャンネル(第80)をこの step で採るか。既定 OFF = サイドカー不在で即 False。
+
+    サイドカーの有無だけを見る属性チェック(毎 step 呼ばれるので config を掘らない)。
+    """
+    if getattr(sim, "channels_sc", None) is None:
+        return False
+    every = int(getattr(sim, "channelscfg", {}).get("every_steps", 1) or 1)
+    return int(step) % every == 0
+
+
 def _isl_record(sim, kind: str, payload: dict):
     """1イベントを実行時バッファ用の軽量レコード (cat, val) に写す(該当なしは None)。決定論。"""
     if kind == "arrive":
@@ -4568,6 +4579,9 @@ def run_step(sim, step: int) -> None:
     # 行間補間(P2 S2): この step 開始時点の logger.events 長を控える(末で増分を各個体バッファへ
     # 振り分ける)。OFF は -1 で以降の蓄積を完全にスキップ=状態も出力もバイト一致。
     _isl_idx = len(sim.logger.events) if _interstitial_on(sim) else -1
+    # 観測チャンネル(第80。既定 OFF=sim.channels_sc None=-1 で以降を完全スキップ)。
+    # この step で新規に記録される L1(受信発話・掲示視認)の起点を控える(_isl と同じ流儀)。
+    _ch_idx = len(sim.logger.events) if _channels_on(sim, step) else -1
     # L2 業務の実体(work.service。既定OFF=-1でこの step の接客帰属を完全スキップ=バイト一致)。
     _work_idx = len(sim.logger.events) if _work_service_on(sim) else -1
     _ensure_orgs(sim)                              # 組織台帳の遅延初期化(既定OFF=no-op)
@@ -4681,6 +4695,13 @@ def run_step(sim, step: int) -> None:
     # バッファを空にしているので、以降はこの step 分から「前回発火以降」が積み直る。
     if _isl_idx >= 0:
         _isl_accumulate(sim, _isl_idx)
+
+    # 観測チャンネル o_c(t)(第80。既定 OFF は上の _ch_idx=-1 でここに入らない)。
+    # **読むだけ**: 世界状態から決定論計算してサイドカーへ積むだけで、L1/L2/L3・乱数・
+    # LLM 呼数のいずれも触らない。L3 スナップショットの直前=同じ step 終了時の世界を見る。
+    if _ch_idx >= 0:
+        from ..cognition import channels as _channels_mod
+        sim.channels_sc.add_rows(_channels_mod.observe(sim, step, sim_min, _ch_idx))
 
     sim.logger.log_metrics(step, collect(sim))
     if step % int(sim.cfg.observer.snapshot_every) == 0:

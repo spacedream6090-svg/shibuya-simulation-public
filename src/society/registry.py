@@ -248,6 +248,12 @@ FEATURES: tuple[Feature, ...] = (
        "LLM 一括発行(未命中のみ並行発行→id 順 apply)。LLM 発行経路そのものを差し替える"),
     _f("cognition.policy_cache.enabled", "journal", True, "none",
        "方針キャッシュ。過去の LLM 出力を物理量キーで再利用して呼をスキップする"),
+    _f("cognition.channels.enabled", "strict", False, "none",
+       "観測チャンネル o_c(t)(第80バッチ。驚き駆動発火の入力側の定義)。外界(混雑/遭遇/受信発話/"
+       "掲示/遅延/天候)・身体(各ゲージ)・予測不成立(第81 まで枠のみ)の 14 本を step ごとに"
+       "決定論計算し、観測サイドカー channels.parquet へ書くだけ。**読み取り専用・乱数ゼロ・"
+       "LLM ゼロ・プロンプト不変**なので ON でも L1/L2/L3 はバイト一致(サイドカーが 1 本増える)。"
+       "σ_c は scripts/measure_sigma.py がこの parquet から実測し data/calib/sigma_c.json へ凍結する"),
 
     # ---- freedom(LLM の自由記述をそのまま行動にする層=全部 journal)----
     _f("freedom.open_actions", "journal", False, "possible",

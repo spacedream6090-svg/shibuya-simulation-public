@@ -1,0 +1,88 @@
+# ============================================================================
+# 認知タイミングの較正テーブル(第80バッチ 2026-08-01)
+#
+# 正典: docs/plans/source/physics-instructions.md Part P0(3)
+#       「思考頻度・反応時間の分布をハードコードせず、較正テーブルとして外部化してください。
+#         文脈カテゴリ(歩行中/会話中/作業中/休息中)× 刺激種別ごとに、思考着手までの
+#         遅延分布と基本周期のパラメータを持たせます。**初期値は仮置きでよいですが、
+#         私が後から人間の実測データ(反応時間研究・行動観察データ)で差し替えられる
+#         構造にしてください。** テーブルの内容は metrics 同様ハッシュ化して manifest に載せます」
+#
+# ★★ このファイルの数値は **すべて仮置き(provisional)** である。★★
+#    人間の実測(反応時間研究・行動観察データ)に**まだ一度も**合わせ込んでいない。
+#    ここに書いてある値を「較正済み」として論文・提出物に書いてはならない。
+#    差し替え手順は下の provenance.replace_procedure を参照。
+#
+# 読み手: src/society/cognition/calib.py(検証 + sha256 → run_manifest.json)
+# 消費者: 第81バッチ(閾値発火 + 定期発火の基本周期)/ 第82バッチ(watch spec)
+#         → **第80バッチ時点ではまだ誰も値を消費しない**(読む・検証する・ハッシュするだけ)。
+#
+# 単位: base_period.mean_min = 分 / onset_delay.median_s = 秒
+# 分布: onset_delay は「刺激が来てから思考に着手するまでの遅延」。裾の重い正の量なので
+#       対数正規を既定にする(反応時間分布の標準的な当てはめ)。median_s は中央値、
+#       sigma は対数スケールの標準偏差(= 中央値の ×exp(±sigma) が ±1σ 帯)。
+# ============================================================================
+schema: 1
+version: "0.1-provisional"
+
+provenance:
+  status: provisional
+  fitted_to: none
+  note: >-
+    初期値は仮置き。base_period は「人の意思決定は 10 分単位でもそう間違っていない」
+    (cognition-design-record.md §3.1)を基準点にし、文脈で伸縮させただけの推測値。
+    onset_delay は単純反応時間(~0.2s)より一桁大きい「注意を切り替えて考え始めるまで」の
+    オーダーとして置いた推測値。**いずれも実測ではない。**
+  replace_procedure: >-
+    実測データを得たら本ファイルの数値だけを書き換える(キー構造・contexts/stimuli の
+    並びは変えない=src/society/cognition/calib.py の検証が構造を固定している)。
+    version と provenance.fitted_to を必ず更新すること。sha256 は自動で manifest に載る。
+
+# 軸(並び・綴りともに src/society/cognition/calib.py の CONTEXTS / STIMULI と一致必須)
+contexts: [walking, talking, working, resting]
+stimuli: [social, environmental, internal, signage]
+
+# ---- 文脈ごとの基本思考周期 ----
+# mean_min: 次の定期発火までの平均間隔[分]。cv: 変動係数(0=規則的、大きいほど不規則)。
+# 現行の「1 step = 10 分で全員が思考」は「全文脈 mean_min: 10 / 他の発火源なし」の
+# 特殊ケースとして表現できる(P0(2) の後方互換の要)。
+base_period:
+  walking:                      # 歩行中: 環境が変わり続けるので周期は短め
+    mean_min: 8.0
+    cv: 0.6
+  talking:                      # 会話中: ターンごとに考える。最も短い
+    mean_min: 2.0
+    cv: 0.5
+  working:                      # 作業中: 課題に集中し外界への周期的注意は落ちる
+    mean_min: 15.0
+    cv: 0.7
+  resting:                      # 休息中: 最も長い。ただし内発的な想起は internal 側で入る
+    mean_min: 20.0
+    cv: 0.9
+
+# ---- 文脈 × 刺激種別ごとの「思考着手までの遅延」分布 ----
+# social        = 話しかけられた・発話を聞いた・メッセージを受け取った
+# environmental = 混雑・遅延・天候・進行の阻害など外界の物理量の変化
+# internal      = 身体ゲージの閾値突破・内省・約束時刻の接近(設計 §6-3: 内省も第一級の発火源)
+# signage       = 街頭掲示・案内表示など受動的な視覚情報
+onset_delay:
+  walking:
+    social:        { dist: lognormal, median_s: 1.2, sigma: 0.55 }
+    environmental: { dist: lognormal, median_s: 0.8, sigma: 0.50 }
+    internal:      { dist: lognormal, median_s: 2.5, sigma: 0.80 }
+    signage:       { dist: lognormal, median_s: 1.5, sigma: 0.60 }
+  talking:
+    social:        { dist: lognormal, median_s: 0.6, sigma: 0.40 }
+    environmental: { dist: lognormal, median_s: 2.0, sigma: 0.70 }
+    internal:      { dist: lognormal, median_s: 3.0, sigma: 0.85 }
+    signage:       { dist: lognormal, median_s: 4.0, sigma: 0.90 }
+  working:
+    social:        { dist: lognormal, median_s: 2.0, sigma: 0.70 }
+    environmental: { dist: lognormal, median_s: 3.0, sigma: 0.80 }
+    internal:      { dist: lognormal, median_s: 1.8, sigma: 0.75 }
+    signage:       { dist: lognormal, median_s: 6.0, sigma: 1.00 }
+  resting:
+    social:        { dist: lognormal, median_s: 1.0, sigma: 0.55 }
+    environmental: { dist: lognormal, median_s: 1.5, sigma: 0.65 }
+    internal:      { dist: lognormal, median_s: 1.2, sigma: 0.70 }
+    signage:       { dist: lognormal, median_s: 2.5, sigma: 0.80 }

@@ -113,6 +113,7 @@ def build(sim) -> dict:
     """sim から manifest dict を組む(副作用なし・純関数的)。"""
     from .. import ablate as _ablate_mod
     from .. import weather as _weather_mod
+    from ..cognition import calib as _calib_mod
     from ..config import REPO_ROOT
     from ..engine import checkpoint
 
@@ -189,6 +190,10 @@ def build(sim) -> dict:
         # weather_params_sha256 / weather_source_sha256 + 実ファイルの sha256 と出典表示。
         # 既定 synthetic ではキー自体を出さない(既存 manifest と同形)。
         **({"weather": _wea} if (_wea := _weather_mod.provenance(sim)) else {}),
+        # 第80バッチ: 認知の凍結入力の来歴(観測チャンネル ON のときだけ)。
+        # チャンネル定義 hash + 較正テーブル sha256 + σ_c 凍結 sha256(未生成なら absent)。
+        # 既定 OFF ではキー自体を出さない(既存 manifest と同形=天候来歴と同じ流儀)。
+        **({"cognition": _cog} if (_cog := _calib_mod.provenance(sim)) else {}),
         "code": {
             "python": sys.version.split()[0],
             "platform": platform.platform(),

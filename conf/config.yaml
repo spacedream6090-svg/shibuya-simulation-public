@@ -830,6 +830,19 @@ cognition:
     per_agent_max: 16     # 個体あたりキャッシュ上限
     global_max: 4096      # 全体 LRU 上限
     max_relax: 2          # near-match 緩和の最大段(0=完全一致/1=+場所種別/2=+時間帯)
+  # ---- 観測チャンネル o_c(t)(第80バッチ 2026-08-01・**既定 OFF**)----
+  # 驚き駆動発火(cognition-design-record.md §2.3-2.4)の入力側 o_c を、外界/身体/予測不成立の
+  # 3 源で定義して観測サイドカー channels.parquet へ書き出す層。定義は
+  # src/society/cognition/channels.py が唯一の源(14 本。うち予測不成立は第81 まで値=null の枠)。
+  # ON にしても **世界は変わらない**: 読み取り専用・乱数ゼロ・LLM ゼロ・L1/L2/L3 バイト不変で、
+  # サイドカーが 1 本増えるだけ(第77 live_viewer / 第78 state_hash と同じ「観測はシムを変えない」)。
+  # σ_c(発火判定式の分母)は scripts/measure_sigma.py がこの parquet から実測して
+  # data/calib/sigma_c.json へ凍結する。較正テーブルと σ_c の sha256 は run_manifest.json へ。
+  channels:
+    enabled: false
+    every_steps: 1        # 観測の採取間隔(1=毎 step。位相は step=0 を含む=L3 と揃う)
+    sigma_file: ""        # 空=data/calib/sigma_c.json(無くてもランは落とさない=来歴に absent と残す)
+    calib_file: ""        # 空=conf/cognition/calib_default.yaml(壊れていたら即エラー)
 
 # ---- 開放行動+価値の4軸(第17バッチ 2026-07-10。既定 OFF=現行と完全同一)----
 # LLM 自身が自由記述で行動を決める "do" をメニューに追加し、価値(実用/感情/社会/認識)で

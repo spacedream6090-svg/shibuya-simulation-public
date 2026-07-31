@@ -240,6 +240,11 @@ TABLE: tuple[tuple[str, str, str], ...] = (
     ("observer.flush_every_steps", INVARIANT,
      "L1 part 書き出しの I/O 頻度。世界の因果に触れないので実験者の指定どおりにする"),
     ("observer.state_hash.interval", INVARIANT, "状態ハッシュの採取頻度。観測装置の設定"),
+    ("cognition.channels.every_steps", INVARIANT,
+     "観測チャンネル o_c(t) の採取間隔(第80バッチ)。世界の因果に一切触れない観測装置の設定で、"
+     "σ_c を測る母集団の粒度は実験者が指定する量。state_hash.interval と同じ扱い"
+     "(snapshot_every のように実時間粒度を保つ量ではない: Δt を変えたら『何 step ごとに"
+     "採るか』も実験者が測りたい粒度に合わせて指定し直す)"),
     ("beliefs.fact_kinds.event_host", INVARIANT, "fact 種の写像定義(数値ではない)"),
     ("drive.fail_decay", INVARIANT, "抽選落ち 1 回あたりの減衰(出来事単位)"),
     ("drive.fire_reset", INVARIANT, "発火 1 回あたりのリセット係数(出来事単位)"),
