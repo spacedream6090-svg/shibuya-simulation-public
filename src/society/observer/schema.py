@@ -302,6 +302,13 @@ register_event_kind("cog_fire",  "認知イベントが期限を迎えた(スケ
                                  "{reason, due, ctx, s, theta, contrib, interrupt, active, granted}")
 register_event_kind("cog_event", "既存機構が担う第一級の認知イベント(会話返答/夜内省/朝計画)"
                                  "{reason, via, ctx}")
+# ---- 監視仕様 + g/θ 更新則 第82バッチ(cognition.watch / cognition.g_update ON のみ)。
+#      設計 §2.2(watch spec)・§2.5(g)・§2.6(θ の恒常性)。
+#      watch_spec は**読めなかったことも記録する**(構造化出力の遵守率が観測量)。
+register_event_kind("watch_spec", "監視仕様(期待値 ô + 名前付きトリガ)の受理結果"
+                                  "{status, clamped, n_expect?, n_trigger?, names?}")
+register_event_kind("cog_theta",  "閾値 θ の恒常性を日境界で 1 回適用した"
+                                  "{day, fbar, fired, theta_mult}")
 
 
 @dataclass

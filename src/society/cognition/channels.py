@@ -75,6 +75,11 @@ class Channel:
     unit: str
     description: str
     implemented: bool = True
+    # ★ プロンプトに出してよい**短い中立ラベル**(第82バッチ watch spec 用)。
+    #   `id` は body.state.* が factors 層のキー(= 因子名)を含むので**プロンプトへ出せない**。
+    #   ここには因子名も評価語も入れない(no-fingerprint 契約)。`spec_sha256` の対象外なので
+    #   ラベルを足しても既存の σ_c 凍結ファイルは無効化されない。
+    label: str = ""
 
     @property
     def column(self) -> str:
@@ -91,39 +96,49 @@ class Channel:
 _EXTERNAL: tuple[Channel, ...] = (
     Channel("ext.crowd_local", EXTERNAL, "count",
             "局所混雑度 = 同じ場所(路上は同一ノード / 屋内は同一建物の同一階)に居る"
-            "自分以外の人数。範囲外に居るときは 0(誰とも同席していない)"),
+            "自分以外の人数。範囲外に居るときは 0(誰とも同席していない)",
+            label="まわりの人の多さ"),
     Channel("ext.encounter", EXTERNAL, "count",
             "遭遇数 = 知覚半径(world.perception_radius_m)の内側に居る**起きている**他者の数。"
-            "判定は world/perception.py と同一(同一文脈+距離+視線遮蔽が据えてあれば LOS)"),
+            "判定は world/perception.py と同一(同一文脈+距離+視線遮蔽が据えてあれば LOS)",
+            label="近くにいる人の数"),
     Channel("ext.heard", EXTERNAL, "count",
             "受信発話数 = この step に自分が聞いた対面発話(L1 kind='hear')+ 受け取った"
-            "1対1メッセージ(L1 kind='dm' の payload.to が自分)の件数"),
+            "1対1メッセージ(L1 kind='dm' の payload.to が自分)の件数",
+            label="耳や画面に入る話の量"),
     Channel("ext.signage", EXTERNAL, "count",
-            "街頭掲示の視認件数 = この step に自分が見た掲出(L1 kind='ad_exposure')の件数"),
+            "街頭掲示の視認件数 = この step に自分が見た掲出(L1 kind='ad_exposure')の件数",
+            label="目に入る貼り紙・掲示の数"),
     Channel("ext.transit_delay", EXTERNAL, "flag",
             "環境情報(当日値): 鉄道が止まっているか(1=運休/麻痺・0=平常)。"
-            "災害・遅延機構が無効なランでは常に 0 = 定数チャンネル(σ=0 として扱われる)"),
+            "災害・遅延機構が無効なランでは常に 0 = 定数チャンネル(σ=0 として扱われる)",
+            label="電車が止まっているか(1=止まっている)"),
     Channel("ext.weather_temp", EXTERNAL, "degC",
-            "環境情報(当日値): その日の最高気温。天候機構が無効なランでは **null**"),
+            "環境情報(当日値): その日の最高気温。天候機構が無効なランでは **null**",
+            label="その日の暑さ(度)"),
 )
 
 _BODY_GAUGES: tuple[Channel, ...] = (
     Channel("body.drive", BODY, "level",
-            "欲求ゲージ(0-1)。出来事で溜まり思考で減る、既存の発火機構の主ゲージ"),
+            "欲求ゲージ(0-1)。出来事で溜まり思考で減る、既存の発火機構の主ゲージ",
+            label="何か言いたい・動きたい気持ちの強さ(0-1)"),
     Channel("body.boredom", BODY, "level",
             "退屈/好奇心ゲージ(0-1)。長居で溜まり移動・新奇で減る。"
-            "機構が無効なランでは **null**(0 で埋めない)"),
+            "機構が無効なランでは **null**(0 で埋めない)",
+            label="退屈さ(0-1)"),
     Channel("body.fatigue", BODY, "level",
-            "疲労ゲージ(0-1)。活動で溜まり睡眠で回復する。健康機構が無効なランでは常に 0"),
+            "疲労ゲージ(0-1)。活動で溜まり睡眠で回復する。健康機構が無効なランでは常に 0",
+            label="疲れ具合(0-1)"),
     Channel("body.arousal", BODY, "level",
-            "覚醒度(core affect の第2軸)。感情ハブが無効なランでは常に既定値=定数"),
+            "覚醒度(core affect の第2軸)。感情ハブが無効なランでは常に既定値=定数",
+            label="気持ちの高ぶり(0-1)"),
 )
 
 _PREDICTION: tuple[Channel, ...] = (
     Channel("pred.unmet", PREDICTION, "count",
             "予測不成立(『来るはずの誰か/何かが来ない』)。**第81バッチで期待値 ô が入るまで"
             "値は未使用**= 常に null。列だけ先に確保してスキーマ変更を避けるための枠",
-            implemented=False),
+            implemented=False, label="来ると思ったものが来ない回数"),
 )
 
 
@@ -135,8 +150,11 @@ def _state_channels() -> tuple[Channel, ...]:
     from ..factors.registry import STATE_INIT
     return tuple(
         Channel(f"body.state.{key}", BODY, "level",
-                "経験で動く内部状態ゲージ(名称の定義は factors 層が持つ)")
-        for key in sorted(STATE_INIT)
+                "経験で動く内部状態ゲージ(名称の定義は factors 層が持つ)",
+                # ★ラベルも**位置**でしか名指ししない: id には factors 層のキーが入るので
+                #   プロンプトに出せない(第82 watch spec はラベルの方を使う)。
+                label=f"自分についての感じ方{i + 1}(0-1)")
+        for i, key in enumerate(sorted(STATE_INIT))
     )
 
 

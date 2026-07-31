@@ -294,6 +294,15 @@ def provenance(sim) -> dict | None:
     fire_prov = _fire.provenance(sim)
     if fire_prov is not None:
         out["fire"] = fire_prov
+    # ---- 第82バッチ: 監視仕様(ô)と g/θ 更新則。どちらも既定 OFF = キー自体が生えない ----
+    from . import plasticity as _plasticity
+    from . import watch as _watch
+    watch_prov = _watch.provenance(sim)
+    if watch_prov is not None:
+        out["watch"] = watch_prov
+    g_prov = _plasticity.provenance(sim)
+    if g_prov is not None:
+        out["g_update"] = g_prov
     calib = getattr(sim, "cognition_calib", None)
     if calib:
         out["calib"] = {"file": rel_path(calib["path"]), "sha256": calib["sha256"],

@@ -32,7 +32,13 @@ STEM = "channels"
 
 
 class ChannelsSidecar:
-    """観測チャンネル行の追記バッファ + セグメント/finalize(IndoorTracks と対の設計)。"""
+    """観測チャンネル行の追記バッファ + セグメント/finalize(IndoorTracks と対の設計)。
+
+    ★ファイル名の幹はクラス属性 `STEM`(第82バッチで g/θ 軌跡サイドカーが同じ機構を
+      そのまま使うため)。列は int32 キー 3 本 + float32 値列という同じ形をしている。
+    """
+
+    STEM = STEM
 
     def __init__(self, out_dir, columns):
         self.out_dir = Path(out_dir)
@@ -66,9 +72,9 @@ class ChannelsSidecar:
         """既存 part 群の最大 index + 1(resume で採番衝突を避ける)。"""
         mx = -1
         if self.out_dir.is_dir():
-            for p in self.out_dir.glob(f"{STEM}.part-*.parquet"):
+            for p in self.out_dir.glob(f"{self.STEM}.part-*.parquet"):
                 try:
-                    mx = max(mx, int(p.name[len(f"{STEM}.part-"):].split(".")[0]))
+                    mx = max(mx, int(p.name[len(f"{self.STEM}.part-"):].split(".")[0]))
                 except ValueError:
                     pass
         return mx + 1
@@ -78,7 +84,7 @@ class ChannelsSidecar:
         self.out_dir.mkdir(parents=True, exist_ok=True)
         if self.rows:
             pq.write_table(self._table(self.rows),
-                           self.out_dir / f"{STEM}.part-{self._seg:04d}.parquet",
+                           self.out_dir / f"{self.STEM}.part-{self._seg:04d}.parquet",
                            compression="zstd")
             self._n_flushed += len(self.rows)
             self.rows = []
@@ -93,8 +99,8 @@ class ChannelsSidecar:
         """
         self.out_dir.mkdir(parents=True, exist_ok=True)
         table = self._table(self.rows) if self.rows else None
-        parts = sorted(self.out_dir.glob(f"{STEM}.part-*.parquet"))
-        canonical = self.out_dir / f"{STEM}.parquet"
+        parts = sorted(self.out_dir.glob(f"{self.STEM}.part-*.parquet"))
+        canonical = self.out_dir / f"{self.STEM}.parquet"
         if not parts:
             if table is None:
                 return None
@@ -111,3 +117,17 @@ class ChannelsSidecar:
         for p in parts:
             p.unlink()
         return canonical
+
+
+class CognitionGSidecar(ChannelsSidecar):
+    """感度 g / 閾値倍率 θ の**全軌跡**サイドカー(第82バッチ・g_update ON のみ)。
+
+    設計 §2.7「`g_i(0)` と g の全軌跡をログする」/ §8「`g` ベクトルの時間発展 =
+    注意の向き先の軌跡。**分散の拡大 = 役割分化の一次証拠**」。
+    `scripts/analyze_g.py` がこの parquet だけを読んで g(0) 分散 vs Δg の分散分解を出す。
+
+    ChannelsSidecar と同じ形(int32 キー 3 本 + float32 値列)なので実装は STEM だけ差す。
+    観測層なので**動力学はこのバッファを読まない**(記録と動力学の分離)。
+    """
+
+    STEM = "cognition_g"

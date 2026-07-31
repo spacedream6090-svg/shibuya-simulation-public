@@ -44,6 +44,8 @@ from .. import worldview as worldview_mod
 from ..net import infoenv as infoenv_mod
 from ..cognition import deliberate, drive, planning, routine
 from ..cognition import fire as fire_mod
+from ..cognition import plasticity as plasticity_mod
+from ..cognition import watch as watch_mod
 from ..cognition import reflection as reflection_mod
 from ..cognition.reflection import maybe_reflect
 from ..economy import CIVIL_SERVANTS, civil_servant_pay, gig_profile, price_of
@@ -1991,7 +1993,13 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
                                      # =真偽台帳の値・ID・文字列は build_prompt へ到達しない。
                                      verify_actions=truth_ledger_mod.verify_actions_on(sim),
                                      p2_offers=p2_offers,
-                                     dialog_history=dialog_history)
+                                     dialog_history=dialog_history,
+                                     # 第82: 監視仕様 watch(既定 OFF は None=1行も
+                                     # 足さない=バイト一致)。§6-3 の model-revision は
+                                     # 驚き発火のときだけ中立 1 行が増える。
+                                     watch_section=watch_mod.section(sim),
+                                     revision_line=watch_mod.revision_line(
+                                         sim, agent, step, trigger))
     rng_key = f"deliberate/{agent.id}/{step}"
     response, call_id, cached = sim.llm.generate(
         prompt, rng_key=rng_key,
@@ -2003,11 +2011,35 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
                          kind="llm_deliberate", x=agent.x, y=agent.y,
                          llm_call_id=call_id, payload={"trigger": trigger}))
     action = deliberate.parse_action(response)
+    # 第82: 監視仕様の受理(ホワイトリスト検証→数値クランプ→不正なら**前回仕様を維持**)。
+    # 行動のパース成否とは独立(行動が壊れていても watch だけ読めることがある)。
+    # 既定 OFF は即 return で 1 バイトも触らない。
+    watch_mod.apply(sim, agent, response, step, sim_min)
+    _model_revision_beliefs(sim, agent, step, sim_min, trigger)
     if action is None:                             # D16: 壊れたら沈黙して続行
         _log_reject(sim, agent, response, trigger, step, sim_min)
     else:
         deliberate.store_action(sim, agent, step, sim_min, trigger, action)
     return action
+
+
+def _model_revision_beliefs(sim, agent, step: int, sim_min: int,
+                            trigger: str) -> None:
+    """model-revision(§6-3): 驚き発火では**信念の確信度も**決定論規則で見直す。
+
+    計画書 §6-3「予測誤差が大きいときに起きるのは『単に考える』ではなく**世界モデルの
+    書き換え**」。ô(監視仕様)の書き換えは LLM が行うが、**信念台帳の側は第73の既存
+    機構を呼ぶだけ**(新しい規則を発明しない・乱数ゼロ・LLM 呼ゼロ)。
+    真偽台帳は cognition/ から触れない契約なので、接続はここ(engine 側)に置く。
+    """
+    if watch_mod.revision_line(sim, agent, step, trigger) is None:
+        return
+    if not truth_ledger_mod.enabled(sim):
+        return
+    cfg = sim.watchcfg
+    truth_ledger_mod.revise_on_surprise(
+        sim, agent, step, sim_min, factor=float(cfg["belief_revision"]),
+        max_facts=int(cfg["belief_max_facts"]))
 
 
 def _log_reject(sim, agent, response: str, trigger: str,
@@ -2165,6 +2197,13 @@ def _phase_drive(sim, step: int, sim_min: int) -> None:
                                       "reason": reason}))
         if granted:
             granted_ids.add(agent.id)
+            if fire_on:
+                # 第82(model-revision §6-3): この step の**認知イベントの発火源**を控える。
+                # プロンプトへ出るのは中立な 1 行だけで、発火源の語彙(periodic/salience/…)は
+                # 1 文字も出さない(第81 の no-fingerprint テストをそのまま維持する)。
+                # 同席(face)で表現形が会話になっても、発火源が驚きなら世界モデルの
+                # 書き換えは起きる(= 表現形と認知モードは別軸)。
+                agent._fire_src = (int(step), due[agent.id]["reason"])
         if granted and null_series:                # 対照: 発火に紐付けたダミー呼び出し
             _null_calls(sim, agent, step, sim_min)
     if fire_on:                                    # スケジュール列そのものを L1 に残す(P0-4)
@@ -4743,6 +4782,11 @@ def run_step(sim, step: int) -> None:
     # 閾値発火(第81。既定 OFF は _fire_idx=-1 で完全 no-op)。この step 末の o_c(t) を
     # 各個体へ凍結し、次 tick の S 判定の唯一の入力にする(全員が同じ state(t) を読む)。
     fire_mod.observe_end(sim, step, sim_min, _fire_idx)
+
+    # 感度 g / 閾値倍率 θ の全軌跡(第82・設計 §2.7/§8。既定 OFF は sidecar 不在)。
+    # **読むだけ**の観測層で、動力学はこのバッファを読まない(channels と同じ構造)。
+    if getattr(sim, "cognition_g_sc", None) is not None and plasticity_mod.due(sim, step):
+        sim.cognition_g_sc.add_rows(plasticity_mod.rows(sim, step, sim_min))
 
     sim.logger.log_metrics(step, collect(sim))
     if step % int(sim.cfg.observer.snapshot_every) == 0:

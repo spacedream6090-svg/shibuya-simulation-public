@@ -178,6 +178,10 @@ def save(sim, step: int, path: str | Path) -> Path:
             # cognition.fire OFF のランでは None = 挙動不変(load は .get で旧 ckpt 互換)。
             "cogq": (sim.cogq.state() if getattr(sim, "cogq", None) is not None
                      else None),
+            # 第82バッチ: θ 恒常性の日境界の進行(**日オーダーの時定数**なので、これを
+            # 保存しないと resume 直後に「初日扱い」へ戻って 1 日ぶんの恒常性が飛ぶ)。
+            # g / ē / credit / 監視仕様(_fire_watch)は agents pickle に自然同梱される。
+            "g_day": int(getattr(sim, "_g_day", -1)),
             # 第71バッチ: LLM 入出力ジャーナルの確定点(ファイル名 → {records, bytes})。
             # mark() が flush してから採るので、この時点のファイル末尾は必ず gzip メンバ境界
             # = 安全な切り詰め点。resume(load)がここまで巻き戻すことで、「checkpoint 後に
@@ -306,6 +310,8 @@ def load(sim, path: str | Path) -> int:
     if getattr(sim, "cogq", None) is not None:
         from ..cognition.fire import CogQueue as _CogQueue
         sim.cogq = _CogQueue.restore(rt.get("cogq"))
+    # 第82: θ 恒常性の日境界(旧 checkpoint 互換 = 無ければ -1 = 従来どおり初日扱い)。
+    sim._g_day = int(rt.get("g_day", -1))
     if hasattr(sim, "_journal_rewind"):         # 第71: LLM ジャーナルを確定点まで巻き戻す
         sim._journal_rewind(rt.get("llm_journal"))
 

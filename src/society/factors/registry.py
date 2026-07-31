@@ -296,3 +296,71 @@ def sample_traits(rng: np.random.Generator, tail_frac: float = 0.1) -> dict[str,
         else:
             traits[name] = float(np.clip(rng.normal(0.5, 0.18), 0.0, 1.0))
     return traits
+
+
+# --------------------------------------------------------------------------- #
+# 認知感度 g の個体パラメータ(第82バッチ 2026-08-01)
+#
+# 正典: docs/plans/source/cognition-design-record.md §2.5
+#   「**LLM は g を設定しない。** ペルソナが初期値と動き方を決め、履歴が動かす」
+#   「**ペルソナが決めるのは `g⁰`、`η`、`λ` の 3 つ。** g そのものではなく
+#     『g の動き方』をペルソナが決める、という構造にする」
+#
+# 本 module に置く理由(no-fingerprint 契約 design §11): 因子名を綴ってよいのは
+# factors/ だけ。cognition/ は**戻り値の数値しか見ない**(drive_params と同格)。
+# 乱数を 1 draw も引かない純関数 = 呼び出し位置に関係なく draw 順不変。
+# --------------------------------------------------------------------------- #
+def cognition_params(traits: dict[str, float]) -> dict[str, float]:
+    """traits → 感度 g の「動き方」+ 閾値 θ の個体成分(**すべて決定論・乱数ゼロ**)。
+
+    返す量(cognition 側はこのキー名しか知らない):
+      g0     … 感度の基準値 g⁰ の全体スケール(引き戻し先)
+      eta    … 可塑性 η(動きやすさ)
+      lam    … 引き戻し λ(性格の永続性。**この項がないと履歴が性格を上書きして全員収束する**)
+      theta0 … 閾値 θ の個体倍率(1.0 = 較正テーブルどおり)
+      bias_external / bias_body / bias_prediction
+             … 観測チャンネルの**源**ごとの初期配分(条件 P = ペルソナ整合的な異質性)。
+               源の名前は cognition/channels.py が持つ分類で、因子名ではない。
+
+    ヒューリスティック v1(§2.5 の定性記述からの素朴な写像。較正は第83パイロット):
+      - 思考頻度の傾性が高い → 感度が高く(g0↑)、可塑性も高い(eta↑)、閾値は低め(theta0↓)
+      - リスク許容が高い → 外界のほうへ注意が寄る(bias_external↑ / bias_body↓)
+      - 内的統制が高い → 自分の基準へ戻る力が強い(lam↑ = 履歴に流されにくい)
+    """
+    nfc = float(traits.get("nfc", 0.5))
+    risk = float(traits.get("risk_tolerance", 0.5))
+    locus = float(traits.get("internal_locus", 0.5))
+    return {
+        "g0": float(np.clip(1.0 + 0.60 * (nfc - 0.5) * 2.0, 0.20, 2.50)),
+        "eta": float(np.clip(0.06 + 0.04 * (nfc - 0.5) * 2.0, 0.005, 0.30)),
+        "lam": float(np.clip(0.05 + 0.03 * (locus - 0.5) * 2.0, 0.005, 0.30)),
+        "theta0": float(np.clip(1.0 - 0.25 * (nfc - 0.5) * 2.0, 0.40, 1.80)),
+        "bias_external": float(np.clip(1.0 + 0.50 * (risk - 0.5) * 2.0, 0.30, 2.00)),
+        "bias_body": float(np.clip(1.0 - 0.50 * (risk - 0.5) * 2.0, 0.30, 2.00)),
+        "bias_prediction": 1.0,
+    }
+
+
+def flat_cognition_params(value: float = 0.5) -> dict[str, float]:
+    """`cognition_params` の**個体差ゼロ版**(条件 F/N の土台)。
+
+    trait を全部 `value` にしたときの戻り値と厳密に一致する(= フラット条件は
+    「全員が平均的なペルソナ」ではなく「ペルソナ由来の個体差が無い」状態)。
+    """
+    return cognition_params({k: float(value) for k in sorted(TRAITS)})
+
+
+def outcome_scalar(states: dict[str, float]) -> float:
+    """state ベクトル → 「ニーズ充足・ゴール進捗がどれだけ進んでいるか」[0,1]。
+
+    設計 §2.5 の `r_ic`(感作項)の材料。**発火後の行動によるニーズ充足・ゴール進捗の
+    改善分**を測るために、cognition 側が「差分を取れる 1 本のスカラ」を必要とする。
+    その中身(どの state をどの向きで数えるか)は因子の意味を知る本 module の責務で、
+    cognition/ は差分の数値しか見ない。
+
+    向き: 自己効力感・当事者意識は正、不満は負。欠測キーは中立値(0.5 / 0.0)で扱う。
+    """
+    pos = (float(states.get("efficacy", 0.5))
+           + float(states.get("ownership", 0.1))) * 0.5
+    neg = float(states.get("grievance", 0.0))
+    return float(np.clip(0.5 + 0.5 * (pos - neg), 0.0, 1.0))

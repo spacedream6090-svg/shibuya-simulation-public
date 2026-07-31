@@ -59,8 +59,56 @@ class MockBackend(LLMBackend):
         return {"type": "weekly_event", "title": f"{place}の朝市",
                 "place": place_name, "every_days": int(rng.integers(1, 8))}
 
+    # ---- 監視仕様 watch(第82バッチ・cognition.watch ON のプロンプトにだけ載る節)----
+    # プロンプトに記号一覧("    c01 = …")が現れたときだけ、その記号を使った**スキーマ
+    # 準拠の決定論応答**を本文 JSON に足す。mock でも配線(検証→クランプ→S への反映)が
+    # 実際に回る = 実 LLM 無しで回帰を張れる。マーカーが無い(既定 OFF)ランでは
+    # **この分岐に入らず乱数も引かない**= 従来と 1 バイトも変わらない。
+    _WATCH_MARK = '"watch"'
+    _OPS = (">", ">=", "<", "<=")
+
+    def _watch_symbols(self, prompt: str) -> list[str]:
+        out = []
+        for line in prompt.splitlines():
+            s = line.strip()
+            if len(s) > 4 and s[0] == "c" and s[1:3].isdigit() and s[3:6] == " = ":
+                out.append(s[:3])
+        return out
+
+    def _with_watch(self, body: str, prompt: str, rng_key: str) -> str:
+        """本文 JSON に "watch" 節を足す(**専用 stream**なので本文の draw 順を乱さない)。"""
+        syms = self._watch_symbols(prompt)
+        if not syms:
+            return body
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            return body
+        if not isinstance(data, dict):
+            return body
+        rng = self.hub.stream("mock_watch", rng_key, prompt)
+        n = int(rng.integers(1, min(4, len(syms)) + 1))
+        picks = sorted(int(i) for i in rng.choice(len(syms), size=n, replace=False))
+        expect = {syms[i]: round(float(rng.uniform(0.0, 1.0)), 3) for i in picks}
+        triggers = []
+        if rng.random() < 0.5:
+            i = int(rng.integers(len(syms)))
+            triggers.append({"name": f"{syms[i]}の変化", "ch": syms[i],
+                             "op": self._OPS[int(rng.integers(len(self._OPS)))],
+                             "value": round(float(rng.uniform(0.0, 1.0)), 3)})
+        data["watch"] = {"expect": expect, "triggers": triggers}
+        return json.dumps(data, ensure_ascii=False)
+
     def generate(self, prompt: str, *, rng_key: str, temperature: float,
                  max_tokens: int, think: bool = False) -> str:
+        body = self._generate_body(prompt, rng_key=rng_key, temperature=temperature,
+                                   max_tokens=max_tokens, think=think)
+        if self._WATCH_MARK in prompt:
+            return self._with_watch(body, prompt, rng_key)
+        return body
+
+    def _generate_body(self, prompt: str, *, rng_key: str, temperature: float,
+                       max_tokens: int, think: bool = False) -> str:
         # think は mock では無視(実LLMの思考モードは応答本文には影響しない前提)。
         # プロンプト全文で乱数を引く(信念など後方の変化も応答に反映=実LLMの近似)
         rng = self.hub.stream("mock", rng_key, prompt)

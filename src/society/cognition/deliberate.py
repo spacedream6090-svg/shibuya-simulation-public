@@ -156,7 +156,9 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
                  explicit_nothing: bool = False,
                  verify_actions: bool = False,
                  p2_offers: str | None = None,
-                 dialog_history: list | None = None) -> str:
+                 dialog_history: list | None = None,
+                 watch_section: str | None = None,
+                 revision_line: str | None = None) -> str:
     """個別文脈(時刻・場所・活動・気分・記憶・直近発話)を渡し、内容の固定化を防ぐ。
 
     pull_query が渡された時だけ(agentic_pull=true)、その文で決定論の記憶想起を
@@ -354,6 +356,16 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
         lines.append(_equip_section(agent, venture_cost))
     if p2_offers:                        # 生活の自己決定 P2(freedom.p2.* 有効時のみ。中立提示・客観条件つき)
         lines.append(p2_offers)          # 促進・誘導なし(scheduler が客観条件で組み立て済み)
+    # 監視仕様 watch(第82バッチ・cognition.watch 有効時のみ)。既定 OFF は None=1行も
+    # 足さない=バイト一致(_DO_LINE / p2_offers と完全同型の seam)。
+    # ★ 中身は「記号 = 中立ラベル」の一覧と JSON の形だけ。チャンネル id(= factors 層の
+    #   キーを含みうる文字列)は 1 つも出さない(no-fingerprint 契約。watch.py 参照)。
+    if watch_section:
+        lines.append(watch_section)
+    # model-revision(計画書 §6-3)。**驚き発火のときだけ**足す中立 1 行。
+    # 誘導語彙(「予測」「期待値」「驚き」等の機構語・評価語)を含まない記述に徹する。
+    if revision_line:
+        lines.append(revision_line)
     return "\n".join(lines)
 
 

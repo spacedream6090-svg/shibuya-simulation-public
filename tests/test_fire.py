@@ -524,9 +524,23 @@ def test_context_classification_is_deterministic_and_covers_the_table(tmp_path):
 # --------------------------------------------------------------------------- #
 # (H) no-fingerprint: 発火機構はプロンプトに漏れない
 # --------------------------------------------------------------------------- #
-def test_fire_reason_never_reaches_the_prompt(tmp_path):
-    """発火理由は L1 の cog_fire にだけ出す(プロンプト語彙は従来のまま)。"""
-    sim = Simulation(_cfg("fp", 30, 24, **FULL), out_dir=tmp_path / "fp")
+@pytest.mark.parametrize("extra", [
+    {},                                                    # 第81 の素の fire ON
+    {"cognition.watch.enabled": "true"},                   # 第82: watch 節が増える
+    {"cognition.watch.enabled": "true",                    # 第82: g/θ 更新も ON
+     "cognition.g_update.enabled": "true"},
+    {"cognition.g_update.enabled": "true",                 # 第82: 実験条件 N
+     "experiment.g_init.mode": "noise"},
+])
+def test_fire_reason_never_reaches_the_prompt(tmp_path, extra):
+    """発火理由は L1 の cog_fire にだけ出す(プロンプト語彙は従来のまま)。
+
+    第82バッチで watch 節と model-revision の 1 行がプロンプトに増えたので、
+    **増えた後も**発火源の語彙・実験条件の語彙・因子名が出ないことを固定する
+    (増分だけを足すのではなく、条件を変えて同じ検査を掛け直すのが目的)。
+    """
+    name = "fp" + str(abs(hash(tuple(sorted(extra.items())))) % 10_000)
+    sim = Simulation(_cfg(name, 30, 24, **FULL, **extra), out_dir=tmp_path / name)
     seen: list[str] = []
     inner = sim.llm.generate
 
@@ -538,7 +552,10 @@ def test_fire_reason_never_reaches_the_prompt(tmp_path):
     sim.run()
     assert seen, "LLM が 1 度も呼ばれていない"
     blob = "\n".join(seen)
-    for token in ("periodic", "salience", "cog_fire", "認知イベント", "発火時刻"):
+    for token in ("periodic", "salience", "cog_fire", "認知イベント", "発火時刻",
+                  # 第82: 機構語・実験条件語・因子名(チャンネル id 経由の漏洩を含む)
+                  "g_update", "g_init", "experiment", "感度", "慣れ", "感作",
+                  "予測誤差", "監視仕様", "efficacy", "ownership", "body.state"):
         assert token not in blob, f"発火機構の語がプロンプトに漏れている: {token}"
 
 
@@ -576,11 +593,14 @@ def test_manifest_declares_the_firing_mechanism(tmp_path):
     fire = man["cognition"]["fire"]
     assert fire["sources"] == list(F.SOURCES)
     assert fire["n_usable_channels"] > 0
-    # ★暫定実装であることが来歴に正直に書いてある(第82 で差し替わる箇所)
+    # ★第82 の 2 トグル(watch / g_update)が OFF のままなら、第81 の暫定実装で走ったと
+    #   来歴に正直に書いてある(ON にしたときの宣言は tests/test_watch.py が固定する)
     assert "persistence" in fire["expectation_model"]
     assert fire["g_policy"].startswith("fixed_1.0")
-    assert fire["trigger_dsl"].startswith("not_implemented")
+    assert fire["trigger_dsl"].startswith("disabled")
     assert fire["theta_source"] == "calib_table(provisional)"
+    assert "watch" not in man["cognition"], "watch OFF なのに来歴キーが生えた"
+    assert "g_update" not in man["cognition"], "g_update OFF なのに来歴キーが生えた"
     assert man["cognition"]["calib"]["status"] == "provisional"
 
 

@@ -699,6 +699,27 @@ class Simulation:
         self.cogq = _fire_mod.CogQueue() if self.firecfg["enabled"] else None
         self._fire_plan_due = ()               # 朝計画の対象者(記録専用。OFF は常に空)
         self._fire_usable = None               # usable チャンネル索引のメモ(初回に確定)
+        # ---- 監視仕様 watch(ô=LLM 出力+トリガ DSL)と g/θ 更新則(第82バッチ)----
+        # どちらも **fire ON が前提**の既定 OFF。OFF では module が 1 度も呼ばれない。
+        from ..cognition import plasticity as _plasticity_mod
+        from ..cognition import watch as _watch_mod
+        _raw_cog = (cfg.get("cognition", {}) or {})
+        raw_watch = _raw_cog.get("watch", None)
+        raw_watch = (OmegaConf.to_container(raw_watch, resolve=True)
+                     if OmegaConf.is_config(raw_watch) else raw_watch)
+        self.watchcfg = _watch_mod.build_cfg(raw_watch)
+        raw_g = _raw_cog.get("g_update", None)
+        raw_g = (OmegaConf.to_container(raw_g, resolve=True)
+                 if OmegaConf.is_config(raw_g) else raw_g)
+        self.gcfg = _plasticity_mod.build_cfg(raw_g)
+        # 初期値条件 F/N/P(§2.7)。experiment ブロックの下= flat_traits と同じ置き場。
+        _ginit = cfg.get("experiment", {}) or {}
+        _ginit = (_ginit.get("g_init", None) if hasattr(_ginit, "get") else None)
+        _ginit = (OmegaConf.to_container(_ginit, resolve=True)
+                  if OmegaConf.is_config(_ginit) else _ginit)
+        self.ginitcfg = _plasticity_mod.build_init_cfg(_ginit)
+        self._g_day = -1                       # θ 恒常性の日境界(OFF は使われない)
+        self.cognition_g_sc = None
         self.channels_sc = None
         self.cognition_calib = None
         self.cognition_sigma = None
@@ -710,6 +731,12 @@ class Simulation:
         if self.channelscfg["enabled"] or self.firecfg["enabled"]:
             self.cognition_calib = _calib_mod.load_calib(self.channelscfg["calib_file"])
             self.cognition_sigma = _calib_mod.load_sigma(self.channelscfg["sigma_file"])
+        # g/θ の全軌跡サイドカー(§2.7「g_i(0) と g の全軌跡をログする」)。
+        # 観測層なので動力学はこのバッファを読まない = ON でも L1/L2/L3 は変えない。
+        if _plasticity_mod.enabled(self) and self.gcfg["log_every_steps"]:
+            from ..observer.channels import CognitionGSidecar
+            self.cognition_g_sc = CognitionGSidecar(
+                self.out_dir, _plasticity_mod.columns(self))
         # 職場束ね直し(work.bind_workplace。既定 OFF=現行の work_node 付与と完全同一=バイト一致)。
         # ON 時: pool 経路の L2/L3(occupation が persona._WORK_CAT に載らず work_node を持たない個体)を
         # 台帳 workplace_poi.node へ org_id で束ね直し、接客(serve)/産出(org_output)の網羅率を上げる。
@@ -1491,6 +1518,8 @@ class Simulation:
                 self.org_ledger_sc._resumed = True
             if self.channels_sc is not None:      # 第80: 観測チャンネルも二重記録しない(canonical 先頭結合)
                 self.channels_sc._resumed = True
+            if self.cognition_g_sc is not None:   # 第82: g/θ 軌跡サイドカーも同様
+                self.cognition_g_sc._resumed = True
         if every > 0:
             save_config(self.cfg, self.out_dir)   # 途中再開に備え config を先出しする
         for step in range(start, int(self.cfg.run.n_steps)):
@@ -1513,6 +1542,8 @@ class Simulation:
                     self.org_ledger_sc.flush_segment()
                 if self.channels_sc is not None:    # 第80: 観測チャンネルも対でセグメント化
                     self.channels_sc.flush_segment()
+                if self.cognition_g_sc is not None:  # 第82: g/θ 軌跡も対でセグメント化
+                    self.cognition_g_sc.flush_segment()
                 did_flush = True
             if flush_every > 0 and not did_flush \
                     and (step + 1) % flush_every == 0:
@@ -1525,6 +1556,8 @@ class Simulation:
                     self.org_ledger_sc.flush_segment()
                 if self.channels_sc is not None:
                     self.channels_sc.flush_segment()
+                if self.cognition_g_sc is not None:
+                    self.cognition_g_sc.flush_segment()
         return self.finalize()
 
     def _agents_json_records(self) -> list:
@@ -1568,6 +1601,8 @@ class Simulation:
             self.org_ledger_sc.finalize()
         if self.channels_sc is not None:          # 第80: 観測チャンネルを結合(part→canonical)
             self.channels_sc.finalize()
+        if self.cognition_g_sc is not None:       # 第82: g/θ 軌跡を結合(part→canonical)
+            self.cognition_g_sc.finalize()
         # B4 item#4: 会社観測(indoor_fields/ledger)ON かつ org 配属があるランは agents.json を再出力し
         # org_id/org_role を載せる(org 配属は run 中の遅延初期化=__init__ 時点では未付与のため)。
         # OFF は再出力しない=既存 agents.json とバイト一致(ゴールデン非該当)。

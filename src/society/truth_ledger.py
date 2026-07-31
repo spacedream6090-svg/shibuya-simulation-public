@@ -756,6 +756,47 @@ def _pending_pass(sim, cfg: dict, step: int, sim_min: int) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# model-revision(第82バッチ・計画書 §6-3。engine から驚き発火のときだけ呼ばれる)
+# --------------------------------------------------------------------------- #
+def revise_on_surprise(sim, agent, step: int, sim_min: int, *,
+                       factor: float, max_facts: int) -> int:
+    """予測外れの発火で、**未検証の伝聞信念**の確信度を決定論的に引き下げる。
+
+    計画書 §6-3:「予測誤差が大きいときに起きるのは『単に考える』ではなく**世界モデルの
+    書き換え**」。ô(監視仕様)の書き換えは LLM が担い、こちらは**台帳側の既存機構
+    (`_set_belief`)を呼ぶだけ**の決定論規則である。
+
+    規則(意図的に最小):
+      - 対象は `verified is None` かつ `src != "direct"` の信念だけ。
+        **自分で目撃した/現場で確かめた信念は動かさない**(証拠の等級を尊重する)。
+      - 確信度に `factor`(<1)を掛ける。値(value)は変えない — 「どちらが本当か」を
+        コードが決めてしまわないため。動かすのは**確信の度合い**だけ。
+      - 直近取得(step 降順)の `max_facts` 件まで。イベント量を有界にする。
+
+    乱数ゼロ・LLM 呼ゼロ。beliefs OFF や対象なしでは 1 件も記録しない(= 0 を返す)。
+    """
+    if not enabled(sim) or max_facts <= 0 or not (0.0 <= factor < 1.0):
+        return 0
+    cfg = cfg_of(sim)
+    facts = facts_of(sim)
+    bels = beliefs_of(agent)
+    targets = [fid for fid, rec in bels.items()
+               if rec.get("verified") is None and rec.get("src") != "direct"
+               and fid in facts]
+    targets.sort(key=lambda fid: (-int(bels[fid]["step"]), fid))   # 決定論の全順序
+    n = 0
+    for fid in targets[:max_facts]:
+        rec = bels[fid]
+        _set_belief(sim, cfg, agent, facts[fid], value=float(rec["value"]),
+                    conf=float(rec["conf"]) * float(factor), src=str(rec["src"]),
+                    parent=int(rec["from"]), hop=int(rec["hop"]),
+                    cause="model_revision", verified=None,
+                    step=step, sim_min=sim_min)
+        n += 1
+    return n
+
+
+# --------------------------------------------------------------------------- #
 # phase(scheduler から毎 step 1 回)
 # --------------------------------------------------------------------------- #
 def phase(sim, step: int, sim_min: int) -> None:

@@ -16,13 +16,15 @@
     S_i(t) = Σ_c  g_ic · |o_c(t) − ô_ic| / σ_c  +  Σ_j w_ij·[trigger_j]
     発火 ⟺ S_i(t) > θ_i(t)                                     (設計 §2.3)
 
-**本バッチの限界を先に書く**(第82 で差し替わる箇所):
-  - ô(期待値)は **プレースホルダ = 前回の認知イベント時点の観測値**(persistence 予測)。
-    設計 §2.2 の「LLM が出力する watch spec」は **第82バッチ**で差し替える。
-  - g(感度)は usable な全チャンネルで **1.0 固定**。更新則(慣れ/感作/引き戻し)は第82。
-  - 名前付きトリガ Σ_j w_ij·[trigger_j] は **未実装**(DSL は第82)。したがって現状の S は
-    第1項のみ。この module は w/trigger の口だけ開けてある(`_TRIGGER_TERM = 0.0`)。
-  - θ は較正テーブルの**仮値**(実測に合わせ込んでいない)。較正は第83のパイロット。
+**第82バッチで埋まった箇所**(この 3 つは既定 OFF の追加トグルで入る):
+  - ô(期待値)= `cognition.watch.enabled` ON で **LLM の watch spec**(`watch.py`)。
+    OFF のままなら第81 の persistence 予測(前回の認知イベント時点の観測値)。
+  - g(感度)= `cognition.g_update.enabled` ON で **履歴が動かす**(`plasticity.py`:
+    慣れ ē / 感作 r / 引き戻し λ)。OFF のままなら全 usable チャンネルで **1.0 固定**。
+  - 名前付きトリガ Σ_j w_ij·[trigger_j] = watch ON で **制約付き DSL**(`watch.py`)。
+    OFF のままなら恒等 0(= S は第1項のみ)。
+  - θ = 較正テーブルの**仮値** × conf スケール × 個体倍率(g_update ON で恒常性が動く)。
+    θ の絶対水準の較正そのものは**第83のパイロット**のまま。
 
 決定論(離散イベントシミュレーションの標準作法)
 ------------------------------------------------
@@ -105,12 +107,12 @@ SOURCES: tuple[str, ...] = (PERIODIC, SALIENCE, INTERNAL, SOCIAL)
 # 文脈カテゴリ(較正テーブル conf/cognition/calib_default.yaml の contexts と同一)
 WALKING, TALKING, WORKING, RESTING = "walking", "talking", "working", "resting"
 
-# 名前付きトリガ項 Σ_j w_ij·[trigger_j]。**第82バッチで DSL が入るまで恒等 0**。
+# 名前付きトリガ項 Σ_j w_ij·[trigger_j] の既定値(watch OFF では恒等 0)。
 # (0 を足す分岐をここに残しておくのは、S の定義式が設計 §2.3 と 1 対 1 で読めるようにするため)
 _TRIGGER_TERM = 0.0
 
-# 感度 g。設計 §2.5 の更新則(慣れ/感作/引き戻し)は**第82バッチ**。本バッチは全 usable
-# チャンネルで 1.0 固定 = 「S はチャンネル間で σ 正規化した偏差の単純和」。
+# 感度 g の既定値。`cognition.g_update` OFF では全 usable チャンネルで 1.0 固定
+# = 「S はチャンネル間で σ 正規化した偏差の単純和」(第81 の挙動)。
 _G_FIXED = 1.0
 
 
@@ -285,42 +287,66 @@ def usable_channels(sim) -> tuple[tuple[int, str, float], ...]:
     return out
 
 
-def salience_of(obs: tuple | None, pred: tuple | None,
-                usable: tuple[tuple[int, str, float], ...],
-                max_contrib: int) -> tuple[float, list]:
-    """S = Σ_c g·|o_c − ô_c|/σ_c(+ トリガ項=第82まで 0)と寄与内訳を返す。
+def terms_of(obs: tuple | None, pred: tuple | None,
+             usable: tuple[tuple[int, str, float], ...],
+             g: dict | None = None) -> tuple[dict, dict]:
+    """`({位置: |o−ô|/σ}, {位置: g·|o−ô|/σ})` を返す(**S の材料の唯一の計算点**)。
 
-    `pred`(= ô)が未確定(まだ 1 度も認知イベントを経ていない)なら S=0。
-    片側でも欠測(None)のチャンネルは**寄与に数えない**(0 で埋めない)。
+    第1要素は **g を掛ける前の生の σ 正規化誤差** = 慣れ ē の入力(設計 §2.5)。
+    第2要素は S への寄与そのもの = credit assignment の按分比の元。
+    片側でも欠測(None)のチャンネルはどちらにも入れない(0 で埋めない)。
     """
     if obs is None or pred is None or not usable:
-        return 0.0, []
-    total = 0.0
-    parts: list[tuple[float, str]] = []
-    for i, cid, sigma in usable:
+        return {}, {}
+    errs: dict[int, float] = {}
+    parts: dict[int, float] = {}
+    for i, _cid, sigma in usable:
         o, p = obs[i], pred[i]
         if o is None or p is None:
             continue
-        contrib = _G_FIXED * abs(float(o) - float(p)) / sigma
-        if contrib <= 0.0:
-            continue
-        total += contrib
-        parts.append((contrib, cid))
-    total += _TRIGGER_TERM
-    parts.sort(key=lambda t: (-t[0], t[1]))
-    top = [[cid, round(v, 4)] for v, cid in parts[:max_contrib]] if max_contrib else []
+        err = abs(float(o) - float(p)) / sigma
+        errs[i] = err
+        weight = _G_FIXED if g is None else float(g.get(i, _G_FIXED))
+        contrib = weight * err
+        if contrib > 0.0:
+            parts[i] = contrib
+    return errs, parts
+
+
+def salience_of(obs: tuple | None, pred: tuple | None,
+                usable: tuple[tuple[int, str, float], ...],
+                max_contrib: int, g: dict | None = None,
+                trigger: float = _TRIGGER_TERM) -> tuple[float, list]:
+    """S = Σ_c g_ic·|o_c − ô_c|/σ_c + Σ_j w_ij·[trigger_j] と寄与内訳を返す(設計 §2.3)。
+
+    `pred`(= ô)が未確定(まだ 1 度も認知イベントを経ていない)なら第1項は 0。
+    `g=None` は「感度 1.0 固定」(= `cognition.g_update` OFF = 第81 の挙動)、
+    `trigger=0.0` は「名前付きトリガなし」(= `cognition.watch` OFF)。
+    """
+    _errs, parts = terms_of(obs, pred, usable, g)
+    by_id = {i: cid for i, cid, _s in usable}
+    total = sum(parts.values()) + float(trigger)
+    ranked = sorted(((v, by_id[i]) for i, v in parts.items()),
+                    key=lambda t: (-t[0], t[1]))
+    top = [[cid, round(v, 4)] for v, cid in ranked[:max_contrib]] if max_contrib else []
     return total, top
 
 
-def theta_of(sim, ctx: str) -> float:
-    """閾値 θ(文脈別・**較正テーブルの仮値** × conf の全体スケール)。
+def theta_of(sim, ctx: str, agent=None) -> float:
+    """閾値 θ(文脈別・**較正テーブルの仮値** × conf の全体スケール × 個体倍率)。
 
-    設計 §2.6 の「θ_i もペルソナ由来 + 履歴で動かす」「恒常性項」は**第82/83バッチ**。
+    個体倍率(設計 §2.6「θ_i もペルソナ由来 + 履歴で動かす」)は `plasticity.py` が持つ。
+    `cognition.g_update` OFF・`agent=None` では 1.0 = 第81 と同一の値。
     """
     table = (getattr(sim, "cognition_calib", None) or {}).get("table") or {}
     row = (table.get("salience") or {}).get(ctx) or {}
-    base = float(row.get("theta", 0.0))
-    return base * float(sim.firecfg["theta_scale"])
+    base = float(row.get("theta", 0.0)) * float(sim.firecfg["theta_scale"])
+    if agent is None:
+        return base
+    from . import plasticity as _plasticity
+    if not _plasticity.enabled(sim):
+        return base
+    return base * _plasticity.theta_mult(sim, agent)
 
 
 # --------------------------------------------------------------------------- #
@@ -425,6 +451,8 @@ def due_events(sim, step: int, sim_min: int, active) -> dict[int, dict]:
     副作用は「キューの更新」「ô の更新」「social イベントの L1 記録」だけで、
     **S の計算は全員ぶんを凍結観測から先に済ませてから**行う(ダブルバッファ)。
     """
+    from . import plasticity as _plasticity
+    from . import watch as _watch
     cfg = sim.firecfg
     sources = cfg["sources"]
     q: CogQueue = sim.cogq
@@ -432,6 +460,11 @@ def due_events(sim, step: int, sim_min: int, active) -> dict[int, dict]:
     max_contrib = cfg["max_contrib"]
     plan_due = frozenset(getattr(sim, "_fire_plan_due", ()) or ())
     agents = list(sim.agents)
+    watch_on = _watch.enabled(sim)
+    plastic_on = _plasticity.enabled(sim)
+    # 第82: θ の恒常性は**日境界 1 回**(設計 §2.6「μ の時定数は日オーダー」)。
+    # ここに置くのは「S 判定より前」かつ「1 tick に 1 回」を同時に満たす唯一の点だから。
+    _plasticity.day_boundary(sim, step, sim_min)
 
     # ---- 0) 予約の無い個体を「今」に予約する ----
     #  初回は全員がここを通る(= 現行の「毎 step 全員が申請対象」と同じ位相から始まる)。
@@ -444,14 +477,33 @@ def due_events(sim, step: int, sim_min: int, active) -> dict[int, dict]:
     q.seeded = True
 
     # ---- 1) read フェーズ(凍結観測から全員ぶんの S を先に計算する)----
+    #  ô = watch ON なら LLM の監視仕様(未指定チャンネルは persistence へ後退)
+    #  g = g_update ON なら履歴が動かした感度(OFF は 1.0 固定)
+    #  トリガ項 = watch ON なら Σ_j w_ij·[trigger_j](OFF は恒等 0)
     ctx_of: dict[int, str] = {}
     s_of: dict[int, tuple[float, list]] = {}
+    parts_of: dict[int, dict] = {}
+    trig_of: dict[int, list] = {}
     for agent in agents:
+        aid = int(agent.id)
         obs = getattr(agent, "_fire_obs", None)
-        ctx = context_of(agent, obs)
-        ctx_of[int(agent.id)] = ctx
-        s_of[int(agent.id)] = salience_of(obs, getattr(agent, "_fire_pred", None),
-                                          usable, max_contrib)
+        ctx_of[aid] = context_of(agent, obs)
+        base_pred = getattr(agent, "_fire_pred", None)
+        pred = _watch.expectation(sim, agent, base_pred) if watch_on else base_pred
+        g = _plasticity.g_of(sim, agent) if plastic_on else None
+        trig_w, trig_names = (_watch.trigger_term(sim, agent, obs) if watch_on
+                              else (_TRIGGER_TERM, []))
+        errs, parts = terms_of(obs, pred, usable, g)
+        by_id = {i: cid for i, cid, _s in usable}
+        ranked = sorted(((v, by_id[i]) for i, v in parts.items()),
+                        key=lambda t: (-t[0], t[1]))
+        top = ([[cid, round(v, 4)] for v, cid in ranked[:max_contrib]]
+               if max_contrib else [])
+        s_of[aid] = (sum(parts.values()) + float(trig_w), top)
+        parts_of[aid] = parts
+        trig_of[aid] = trig_names
+        if plastic_on:                             # 慣れ ē の更新 + credit 窓の回収
+            _plasticity.observe_tick(sim, agent, errs, sim_min)
 
     # ---- 2) 割込みの登録(驚き / 内部)。**より早い時刻へのみ**繰り上げる ----
     active_ids = {int(a.id) for a in active}
@@ -461,7 +513,7 @@ def due_events(sim, step: int, sim_min: int, active) -> dict[int, dict]:
             if aid not in active_ids:
                 continue
             s_val, _ = s_of[aid]
-            theta = theta_of(sim, ctx_of[aid])
+            theta = theta_of(sim, ctx_of[aid], agent)
             if theta > 0.0 and s_val > theta:
                 q.advance(aid, int(sim_min), SALIENCE)
     if INTERNAL in sources:
@@ -489,6 +541,8 @@ def due_events(sim, step: int, sim_min: int, active) -> dict[int, dict]:
                                           "ctx": ctx_of[aid]}))
             # 「考えた」ので期待値を更新し、次の定期発火を先送りする
             agent._fire_pred = getattr(agent, "_fire_obs", None)
+            if plastic_on:                         # 認知イベント 1 回 = g 更新 1 回
+                _plasticity.on_event(sim, agent, parts_of.get(aid, {}), sim_min, SOCIAL)
             q.schedule(aid, int(sim_min) + _period_min(sim, agent, ctx_of[aid], step),
                        PERIODIC)
 
@@ -501,12 +555,15 @@ def due_events(sim, step: int, sim_min: int, active) -> dict[int, dict]:
         ctx = ctx_of.get(aid, WALKING)
         s_val, contrib = s_of.get(aid, (0.0, []))
         out[aid] = {"reason": reason, "at": int(at), "s": s_val,
-                    "theta": theta_of(sim, ctx), "contrib": contrib,
+                    "theta": theta_of(sim, ctx, agent), "contrib": contrib,
                     "interrupt": reason in (SALIENCE, INTERNAL), "ctx": ctx,
-                    "active": aid in active_ids}
-        # 認知イベントを通ったので期待値を更新(ô = 今の観測 = persistence 予測)。
-        # ★第82バッチで LLM の watch spec 出力に差し替える箇所。
+                    "active": aid in active_ids, "trig": trig_of.get(aid, [])}
+        # 認知イベントを通ったので persistence 予測を更新する。watch ON では、この上に
+        # **LLM が出した ô** が重なる(監視仕様の差し替えは推論後に watch.apply が行う)。
+        # 監視仕様に**有効期限は無い**(設計 §2.2)ので、上書きされるまで前回仕様が生きる。
         agent._fire_pred = getattr(agent, "_fire_obs", None)
+        if plastic_on:                             # 認知イベント 1 回 = g 更新 1 回
+            _plasticity.on_event(sim, agent, parts_of.get(aid, {}), sim_min, reason)
         q.schedule(aid, int(sim_min) + _period_min(sim, agent, ctx, step), PERIODIC)
 
     # ---- 5) 次 tick の横断判定のために現ゲージを控える ----
@@ -526,16 +583,18 @@ def log_events(sim, step: int, sim_min: int, due: dict[int, dict],
         agent = sim.agent_by_id.get(aid)
         if agent is None:
             continue
+        payload = {"reason": rec["reason"], "due": int(at), "ctx": rec["ctx"],
+                   "s": round(float(rec["s"]), 4),
+                   "theta": round(float(rec["theta"]), 4),
+                   "contrib": rec["contrib"],
+                   "interrupt": bool(rec["interrupt"]),
+                   "active": bool(rec["active"]),
+                   "granted": bool(aid in granted)}
+        if rec.get("trig"):        # 成立した名前付きトリガ(watch OFF はキー自体が生えない)
+            payload["trig"] = list(rec["trig"])
         sim.logger.log(Event(
             step=step, sim_min=sim_min, agent_id=aid, kind="cog_fire",
-            x=agent.x, y=agent.y,
-            payload={"reason": rec["reason"], "due": int(at), "ctx": rec["ctx"],
-                     "s": round(float(rec["s"]), 4),
-                     "theta": round(float(rec["theta"]), 4),
-                     "contrib": rec["contrib"],
-                     "interrupt": bool(rec["interrupt"]),
-                     "active": bool(rec["active"]),
-                     "granted": bool(aid in granted)}))
+            x=agent.x, y=agent.y, payload=payload))
 
 
 # --------------------------------------------------------------------------- #
@@ -585,9 +644,24 @@ def provenance(sim) -> dict | None:
         "theta_scale": cfg["theta_scale"],
         "n_usable_channels": len(usable),
         "usable_channels": [cid for _i, cid, _s in usable],
-        # ★正直な宣言(第82 で差し替わる暫定実装)
-        "expectation_model": "persistence(前回の認知イベント時点の観測値)",
-        "g_policy": "fixed_1.0(更新則は第82バッチ)",
-        "trigger_dsl": "not_implemented(第82バッチ)",
-        "theta_source": "calib_table(provisional)",
+        # ★正直な宣言: 第82 の 2 トグルがそれぞれ OFF なら第81 の暫定実装のまま走る
+        "expectation_model": ("llm_watch_spec(未指定チャンネルは persistence へ後退)"
+                              if _watch_on(sim)
+                              else "persistence(前回の認知イベント時点の観測値)"),
+        "g_policy": ("history_update(慣れ/感作/引き戻し=設計 §2.5)"
+                     if _plastic_on(sim) else "fixed_1.0(更新則は既定 OFF)"),
+        "trigger_dsl": ("whitelist_dsl(ops + 記号 + 数値クランプ)"
+                        if _watch_on(sim) else "disabled(cognition.watch OFF)"),
+        "theta_source": ("calib_table(provisional) × homeostasis(daily)"
+                         if _plastic_on(sim) else "calib_table(provisional)"),
     }
+
+
+def _watch_on(sim) -> bool:
+    from . import watch as _watch
+    return _watch.enabled(sim)
+
+
+def _plastic_on(sim) -> bool:
+    from . import plasticity as _plasticity
+    return _plasticity.enabled(sim)
