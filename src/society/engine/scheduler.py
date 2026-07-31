@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 
+from .. import ablate as ablate_mod
 from .. import annual as annual_mod
 from .. import chance as chance_mod
 from .. import commerce as commerce_mod
@@ -800,7 +801,9 @@ def _phase_planning(sim, step: int, sim_min: int) -> None:
 
     起床時刻は個体差があるため呼び出しは自然に時間分散する。k 条件に依らず全員・毎朝
     1回(R1)。外・睡眠中はスキップ(その日は予約済み扱いのまま=二重生成しない)。"""
-    if not sim.planningcfg["enabled"]:
+    # ablate.llm_off(第78): 朝の一日計画は LLM 呼なので撃たない(= planning.enabled=false と
+    # 同じ状態。既存の「計画なし」経路は routine.decide が素で扱える=新しい分岐を作らない)。
+    if not sim.planningcfg["enabled"] or ablate_mod.llm_off(sim):
         return
     bl = (sim.cfg.get("engine", {}) or {}).get("batch_llm", {}) or {}
     if bool(bl.get("enabled", False)):
@@ -1142,6 +1145,20 @@ def _hear_words(sim, listener, words: list[str], from_id: int, channel: str,
     """語の聴取(対面/SNS/DM/検索/ニュース共通)。未知語は検索キューにも積む。"""
     if not words:
         return
+    # ---- ablate.propagation_off(第78バッチ・既定 OFF=この分岐に入らない)----
+    # **語彙(内容)は他エージェントから渡さない**が、「話しかけられた」という交流の**量**は
+    # 従来どおり残す(= 会話量は不変で語彙授受だけが止まる = 専門化スコアの帰無モデル)。
+    #
+    # 判定は **チャネル名ではなく from_id >= 0**(= 送り手がエージェント)で行う。
+    # チャネルは face / dm / sns / event / flyer と増えてきた歴史があり、名前の列挙は
+    # 新チャネルが増えるたびに穴になる。「人から来たか、世界(媒体)から来たか」は
+    # from_id の符号が構造的に表しているので、そちらを唯一の判定にする。
+    #   from_id >= 0 … 他エージェント発(face/dm/sns 投稿/イベント/貼り紙)→ **遮断**
+    #   from_id < 0  … 媒体発("news")・自分で調べた("search")→ 世界チャネルなので通す
+    if from_id >= 0 and from_id != listener.id and ablate_mod.propagation_off(sim):
+        if channel in ("face", "dm"):
+            drive.add(listener, "addressed", sim.drivecfg)
+        return
     unknown = [w for w in words if w not in listener.adopted]
     # 多言語の伝播障壁(後続波 H5): 話者と聞き手の言語が異なるなら採用閾値を上げる(異言語間は
     # 語が広まりにくい)。diversity OFF は barrier=0=on_hear が従来と完全同一(バイト一致)。
@@ -1312,13 +1329,23 @@ def _select_partner(sim, agent, hearers):
     変わらない。返す人(宛先)だけが変わる。
 
     "nearest"(既定): 最寄り1人(距離同点は id 小)=現行の min() と一字一句同一。
-    "closeness": score = closeness(話者→候補)·10.0 − dist_m·0.1 の argmax(同点は id 昇順)。"""
+    "closeness": score = closeness(話者→候補)·10.0 − dist_m·0.1 の argmax(同点は id 昇順)。
+
+    第78バッチ ablate.shuffle_partners: ON のとき、下の構造的な順位づけ(遭遇優先・
+    closeness・nearest)を **同席者からの一様乱択**へ置き換える(専用 stream・always-draw)。
+    悪評による候補外し(gossip)は「順位づけ」ではなく**資格の絞り込み**なので残す
+    (= 誰と会話が起きるかの母集団は他条件と同じに保ち、順位づけだけを壊す)。"""
     if not hearers:
         return None
     # 負の評判(第61バッチ c): 悪評を知る相手を返答相手選択から後退させる(B3b の遭遇優先と同じ相手
     # 選択層。全員が悪評対象なら素通り=会話は必ず起き相手だけ変わる)。OFF は分岐に入らない=ゴールデン維持。
     if gossip_mod.enabled(sim):
         hearers = gossip_mod.demote_partners(sim, agent, hearers)
+    # ablate.shuffle_partners(第78): **always-draw**。OFF でも 1 本引いて None を受け取り、
+    # 従来の決定論選択へ落ちる(新 stream なので既存 stream の draw 順には干渉しない)。
+    shuffled = ablate_mod.pick_partner(sim, agent, hearers)
+    if shuffled is not None:
+        return shuffled
     # B3b 遭遇→ペアリング(indoor.encounter.pairing): 直近(前 step)の屋内遭遇相手が同席者に
     # 居れば、そこから (遭遇 duration 降順, id 昇順) の決定論で1人を優先返答相手にする(乱数なし・R1)。
     # 該当者ゼロなら下の nearest/closeness へ後退。hearer 集合・会話発生・LLM 呼数は不変(相手だけ変わる)。
@@ -1786,6 +1813,14 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
                partner_id: int | None = None) -> dict | None:
     """LLM に発話/行動を生成させる。解釈不能なら None(沈黙)。
     予算は欲求フェーズ(_phase_drive)で消費済み(発火権を得た者だけが来る)。"""
+    # ---- ablate.llm_off(第78バッチ・既定 OFF=この 2 行は素通り)----
+    # LLM を 1 本も呼ばず即 None を返す。呼び出し元(_decide)は既存の「解釈不能=沈黙」経路と
+    # 同じく routine.decide(既存のニーズ充足ロジック + POI 選好)へ後退する。
+    # ★新しいヒューリスティックは 1 つも足していない(比較のベースラインなので素朴さに価値がある)。
+    # ★プロンプトを 1 つも組まないので、この分岐に入った時点で「実験条件がプロンプトに現れる」
+    #   経路は原理的に存在しない(fingerprint_risk=none の根拠)。
+    if ablate_mod.llm_off(sim):
+        return None
     radius = float(sim.cfg.world.perception_radius_m)
     # B3b 屋内 LOS ゲート(indoor.los): 同席文脈(発火プロンプトの近傍リスト)を壁 LOS+距離で絞る。
     # occluder=None(既定/los OFF)は従来と完全にバイト一致。ここは「プロンプトに載る同席者」だけを
@@ -2112,13 +2147,17 @@ def _feed_texts(sim, agent, step: int, sim_min: int) -> list[str]:
     """タイムラインを「@著者名: 本文」形式で見せる(場所・時刻の宣言化を防ぐ)。
 
     推薦(Wave G6)ON なら意見整合で選別された TL を見せる(infoenv.timeline)。OFF は従来の
-    時系列 TL(sim.net.timeline_for をそのまま呼ぶ=バイト一致)。"""
+    時系列 TL(sim.net.timeline_for をそのまま呼ぶ=バイト一致)。
+
+    ablate.propagation_off(第78): TL は**他者が書いた本文をプロンプトへ直に注入する経路**
+    なので、ON では 1 件も渡さない([] = build_prompt が TL 行を出さない)。既読マーク等の
+    net 側の進行は timeline() を呼ぶこと自体で従来どおり進む(= 呼数・イベントは不変)。"""
     out = []
     for p in infoenv_mod.timeline(sim, agent, step, sim_min):
         meta = sim.agent_by_id.get(p["author"])
         who = "公式" if p["author"] == -1 or meta is None else meta.name
         out.append(f"@{who}: {p['text']}")
-    return out
+    return [] if ablate_mod.propagation_off(sim) else out
 
 
 def _fire_llm(sim, agent, reason: str, step: int, sim_min: int,
@@ -2177,6 +2216,12 @@ def _decide(sim, agent, step: int, sim_min: int) -> dict:
         if sim.budget.take():
             speaker = sim.agent_by_id.get(speaker_id)
             reply_to = (speaker.name, said) if speaker is not None else None
+            # ablate.propagation_off(第78): **返答の LLM 呼はこれまでどおり撃つ**(予算も
+            # 消費済み=呼数の構造が不変)が、相手の発話内容はプロンプトへ 1 文字も入れない。
+            # reply_to=None にすると build_prompt は状況行そのものを出さない(=「話しかけ
+            # られたのに内容が空」という不自然な行は生まれない)。
+            if ablate_mod.propagation_off(sim):
+                reply_to = None
             action = _llm_speak(sim, agent, "reply", step, sim_min,
                                 reply_to=reply_to, partner_id=speaker_id)
             agent.conv_turns_left -= 1
@@ -2291,6 +2336,10 @@ def _phone(sim, agent, step: int, sim_min: int) -> dict | None:
             react_rng = sim.hub.stream("sns_react", agent.id, step)
             like_prob = float(ncfg.get("like_prob", 0.15))
             reshare_prob = float(ncfg.get("reshare_prob", 0.03))
+            # propagation_off(第78): SNS も「他者の書いた内容が自分の文脈に入る」経路。
+            # 語彙の授受と本文の記憶化だけを切り、閲覧の発生・いいね/リシェアの抽選・
+            # drive/覚醒/意見のスカラーは従来どおり(= 閲覧量と呼数の構造を保つ)。
+            _prop_off = ablate_mod.propagation_off(sim)
             for post in feed:
                 pv = valence(post["text"])
                 _hear_words(sim, agent, post["items"], post["author"],
@@ -2314,7 +2363,9 @@ def _phone(sim, agent, step: int, sim_min: int) -> dict | None:
                 if reshare:
                     _sns_react(sim, agent, post, "reshare", "sns_reshare",
                                step, sim_min)
-            if affect_on and sim.affectcfg["salience_k"] > 0:
+            if _prop_off:                           # 本文は記憶へ入れない(合成文も入れない)
+                pass
+            elif affect_on and sim.affectcfg["salience_k"] > 0:
                 # 注意の容量制約(Cowan): 同時知覚の TL 投稿を salience 上位 K だけ記憶へ符号化する。
                 # 反応(意見/いいね/著者への drive)は全 item に効いたまま=発火・呼数は不変(R1)。
                 # 入力解像度LOD(第30バッチ): ゲートが有効なときだけ K を個体別に上書き
@@ -2559,18 +2610,27 @@ def _apply(sim, agent, action: dict, step: int, sim_min: int) -> None:
                              kind="dm", x=agent.x, y=agent.y,
                              payload={"to": to, "text": action["text"]}))
         # 会話(DM)からの予定抽出→双方の帳簿へ記入(既定 OFF=no-op)。to にも入れる。
+        # propagation_off: 受信者の帳簿へは書かない(送信者自身の抽出は自己読み取りなので残す)。
+        _prop_off = ablate_mod.propagation_off(sim)
         _record_appointments(sim, agent, action["text"],
-                             [to] if to is not None else [], step, sim_min)
+                             ablate_mod.heard_ids(
+                                 sim, [to] if to is not None else []),
+                             step, sim_min)
         if recipient is not None and recipient.loc != "outside" \
                 and not recipient.sleeping:
-            recipient.remember(f"{agent.name}からメッセージ:「{action['text']}」",
-                               kind="dm")
+            # propagation_off: 本文は受信者の記憶へ入れない(合成文も入れない)。
+            # `_last_dm_from`(誰から来たか)と drive/覚醒は残す=「着信はあったが内容が
+            # 文脈に入らない」= DM の発生量と返信の発火構造は保たれる。
+            if not _prop_off:
+                recipient.remember(f"{agent.name}からメッセージ:「{action['text']}」",
+                                   kind="dm")
             recipient._last_dm_from = agent.id
             v_dm = valence(action["text"])
             # 関係台帳(Wave G2 の交流符号=DM の感情価)。OFF は従来の record_contact と完全同一。
             # 第65バッチ: DM も文面から同じ係数を1回算出して両方向へ(既定 OFF=1.0)。
-            mag_dm = _quality_mag(sim, agent, recipient.id, action["text"], sim_min)
-            _contact(sim, recipient, agent.id, agent.name, action["text"],
+            _dtext = ablate_mod.heard_text(sim, action["text"])
+            mag_dm = _quality_mag(sim, agent, recipient.id, _dtext, sim_min)
+            _contact(sim, recipient, agent.id, agent.name, _dtext,
                      v_dm, step, sim_min, mag_dm)
             _contact(sim, agent, recipient.id, recipient.name, "",
                      v_dm, step, sim_min, mag_dm)
@@ -2618,6 +2678,11 @@ def _apply(sim, agent, action: dict, step: int, sim_min: int) -> None:
     if kind == "speak":
         radius = float(sim.cfg.world.perception_radius_m)
         hearers = hearers_of(agent, sim.agents, radius)
+        # ablate.propagation_off(第78・既定 OFF=False=以下は全て従来経路)。
+        # 「発話は通常どおり生成する / 内容は他者の文脈へ一切入らない」を実現するための
+        # 唯一の判定。**聞き手集合・イベント・返答権の付与・接触台帳は触らない**
+        # (= 会話量と LLM 呼数の構造を保つ)。切るのは内容だけ。
+        _prop_off = ablate_mod.propagation_off(sim)
         # 返答保証: 返答権を渡す相手を決定論選択(既定 nearest=最寄り1人=現行と同一。
         # prompts.reply_partner=closeness で関係加重の宛先へ)。hearer 集合は不変=聞く人は
         # 変わらない・返す人だけが変わる。乱数なし=R1。
@@ -2625,21 +2690,26 @@ def _apply(sim, agent, action: dict, step: int, sim_min: int) -> None:
             partner = _select_partner(sim, agent, hearers)
             if (not partner.sleeping and partner.conv_turns_left > 0
                     and step >= partner.conv_cooldown_until):
-                partner._reply_to = (agent.id, action["text"])
+                # propagation_off: 返答権は渡す(呼数不変)が、相手の状態に本文を残さない。
+                partner._reply_to = (agent.id,
+                                     ablate_mod.heard_text(sim, action["text"]))
             # 対話履歴(prompts.dialog_history=true のみ)。話者と相手の相手別バッファへ同一発話を
             # 積む(次回 social/reply のプロンプトに直近2往復を注入)。OFF は _dialog_on=false →
             # 一切触らない=状態変化なし=バイト一致。
             if _dialog_on(sim):
                 _dialog_push(agent, partner.id, agent.name, action["text"])
-                _dialog_push(partner, agent.id, agent.name, action["text"])
+                if not _prop_off:                  # 相手側へは積まない(自己連続性だけ残す)
+                    _dialog_push(partner, agent.id, agent.name, action["text"])
         words = [w for w in action.get("use_items", []) if w in agent.adopted]
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                              kind="speak", x=agent.x, y=agent.y,
                              payload={"text": action["text"], "items": words,
                                       "hearers": [a.id for a in hearers]}))
         # 会話(対面)からの予定抽出→話者と聞き手全員の帳簿へ記入(既定 OFF=no-op)。
+        # propagation_off: 聞き手の帳簿へは書かない(話者自身の抽出は自己読み取りなので残す)。
         _record_appointments(sim, agent, action["text"],
-                             [h.id for h in hearers], step, sim_min)
+                             ablate_mod.heard_ids(sim, [h.id for h in hearers]),
+                             step, sim_min)
         for word in words:
             sim.labels.use(agent, word, step=step, sim_min=sim_min, logger=sim.logger)
         agent.remember(f"「{action['text']}」と話した", kind="said")
@@ -2670,19 +2740,26 @@ def _apply(sim, agent, action: dict, step: int, sim_min: int) -> None:
             _arouse(sim, hearer, "heard", step, sim_min,
                     valence_abs=abs(v_text), addressed=1.0,
                     novelty=(1.0 if words else 0.0))
-            hearer.remember(f"{agent.name}が「{action['text']}」と言っていた",
-                            kind="heard",
-                            importance_bonus=_imp_bonus(sim, hearer,
-                                                        novelty=(1.0 if words else 0.0)))
+            # propagation_off: **聞き手の記憶に発話文を積まない**(合成文の代入もしない=
+            # 他条件に現れない痕跡を作らないため)。記憶に何も残らない=「静かな街」になる。
+            if not _prop_off:
+                hearer.remember(f"{agent.name}が「{action['text']}」と言っていた",
+                                kind="heard",
+                                importance_bonus=_imp_bonus(
+                                    sim, hearer, novelty=(1.0 if words else 0.0)))
             sim.net.add_contact(agent.id, hearer.id)   # 対面で知り合い→DM可・フォロー
             # 関係台帳(Wave G2 の交流符号=発話の感情価)。OFF は従来の record_contact と完全同一。
             # 第65バッチ: 交流の**量**に載る係数を(話者,聞き手)1組につき1回だけ算出し両方向へ
             # 同じ値で渡す(既定 OFF=1.0=従来と同値)。算出は society 層=engine は運ぶだけ。
-            mag = _quality_mag(sim, agent, hearer.id, action["text"], sim_min)
-            _contact(sim, hearer, agent.id, agent.name, action["text"],
+            # propagation_off: 本文を渡さない(quality は中立係数へ・rel["last"] も空になる)。
+            _htext = ablate_mod.heard_text(sim, action["text"])
+            mag = _quality_mag(sim, agent, hearer.id, _htext, sim_min)
+            _contact(sim, hearer, agent.id, agent.name, _htext,
                      v_text, step, sim_min, mag)
             _contact(sim, agent, hearer.id, hearer.name, "",
                      v_text, step, sim_min, mag)
+            # propagation_off の遮断は _hear_words 内で一元化(語彙は渡さず「話しかけられた」
+            # という交流の量だけ残す)。ここは従来どおり実 words を渡す。
             _hear_words(sim, hearer, words, agent.id, "face", step, sim_min)
             # 聞いた言葉の感情価(SIMCA: affective)+ 語の使用の目撃(代理経験)。
             # in-group 判定=グループ所属の照合だけ engine が行い、倍率(不透明 float)を渡す。
@@ -4564,7 +4641,9 @@ def run_step(sim, step: int) -> None:
                                                    # _apply 後=この step の発話・世界イベントを同 step で取り込む / collect(L2)前
 
     _bl = (sim.cfg.get("engine", {}) or {}).get("batch_llm", {}) or {}
-    if bool(_bl.get("enabled", False)):
+    if ablate_mod.llm_off(sim):
+        pass                                       # ablate.llm_off(第78): 夜の内省も撃たない
+    elif bool(_bl.get("enabled", False)):
         _phase_reflect_batched(sim, step, sim_min,
                                workers=int(_bl.get("workers", 8)))
     else:

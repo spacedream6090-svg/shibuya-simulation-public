@@ -806,6 +806,15 @@ class Simulation:
                                  path=self.out_dir / "llm_cache.jsonl",
                                  mode=cache_mode,
                                  journal=_new_journal("llm_journal.jsonl.gz"))
+        # 第78バッチ: アブレーション設定の正準化(既定=全 OFF=述語が全て False=挙動不変)と、
+        # 認知階層 ablate.cognitive_tier の FleetLLM への焼き付け(構築時 1 回だけ・以降不変)。
+        # fleet 非使用ランでは small/mid は縮退して full と同一 → WARNING で告知する。
+        from .. import ablate as _ablate_mod
+        raw_ablate = cfg.get("ablate", None)
+        raw_ablate = (OmegaConf.to_container(raw_ablate, resolve=True)
+                      if OmegaConf.is_config(raw_ablate) else raw_ablate)
+        self.ablatecfg = _ablate_mod.build_cfg(raw_ablate)
+        _ablate_mod.apply_fleet_tier(self)
 
         nodes = self.dests or sorted(self.city.graph.nodes)
         # ペルソナ名簿(scripts/build_personas.py 生成物。無ければ手続き生成)
@@ -1011,6 +1020,15 @@ class Simulation:
         # 第71バッチ: ラン来歴(git SHA・config hash・seed・モデル・cache_mode・全スイッチ・
         # 開始時刻)を run_manifest.json に固定する。**書くだけ・読む経路なし**(R1)。
         manifest_mod.write(self)
+        # 第78バッチ: 状態ハッシュチェーン(既定 OFF=None=run() のフックが即 no-op)。
+        # ON のときだけ chain を作る。**書くだけ・読む経路なし**(R1)。
+        from ..observer import state_hash as _state_hash_mod
+        _shcfg = _state_hash_mod.cfg_of_config(cfg)
+        self.state_hash = (
+            _state_hash_mod.StateHashChain(self.out_dir,
+                                           interval=_shcfg["interval"],
+                                           float_digits=_shcfg["float_digits"])
+            if _shcfg["enabled"] else None)
 
     # ------------------------------------------------------ LLM ジャーナル(第71)
     # ObserverLogger の flush_segment / checkpoint と同じ「checkpoint が真の境界」流儀で、
@@ -1422,6 +1440,11 @@ class Simulation:
             save_config(self.cfg, self.out_dir)   # 途中再開に備え config を先出しする
         for step in range(start, int(self.cfg.run.n_steps)):
             scheduler.run_step(self, step)
+            # 第78バッチ: 状態ハッシュチェーン(既定 OFF=self.state_hash is None=分岐 1 回だけ)。
+            # step 完了の直後・checkpoint/flush の**前**に採る(= 採る時点の世界が
+            # 「step 終了時の世界」で一意に定まる)。書くだけでシムは読まない(R1)。
+            if getattr(self, "state_hash", None) is not None:
+                self.state_hash.update(self, step)
             did_flush = False
             if every > 0 and (step + 1) % every == 0:
                 checkpoint.save(self, step + 1,

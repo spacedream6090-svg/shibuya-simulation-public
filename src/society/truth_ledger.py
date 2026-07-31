@@ -776,6 +776,12 @@ def phase(sim, step: int, sim_min: int) -> None:
         if utt is not None and int(e.agent_id) >= 0:
             utterances.append((e, utt[0], utt[1]))
     _witness_pass(sim, cfg, step, sim_min)
+    # ablate.propagation_off(第78バッチ): 伝聞は「他者の発話本文から相手の信念を書き換える」
+    # 経路そのものなので、この対照条件では 1 件も通さない(直接目撃 _witness_pass と
+    # 現場確認 _pending_pass は物理経路なので残す)。既定 OFF=従来どおり全件通る。
+    from . import ablate as _ablate_mod
+    if _ablate_mod.propagation_off(sim):
+        utterances = []
     _transmit_pass(sim, cfg, utterances, step, sim_min)
     _pending_pass(sim, cfg, step, sim_min)
 

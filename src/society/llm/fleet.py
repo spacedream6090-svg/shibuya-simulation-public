@@ -66,6 +66,12 @@ class FleetLLM(LLMBackend):
                 self._tiers[str(purpose)] = pool
         self._default = self._tiers.get("default", list(self.servers))
         self._cooldown: dict[str, float] = {}
+        # 第78バッチ(認知階層アブレーション ablate.cognitive_tier): None=既定=従来どおり
+        # purpose 別の振り分け。文字列を入れると **全 purpose** をそのティアのプールへ
+        # 強制する(= 下位ティアへ落とす対照条件)。書き込みは society/ablate.py が
+        # 構築時に 1 回だけ行い、以降は不変(ラン途中で変えない=指紋を作らない)。
+        # 存在しないティア名を入れても素通り(_pool が既定へ後退)= 縮退は ablate 側が告知する。
+        self.force_tier: str | None = None
 
     @staticmethod
     def _parse_key(rng_key: str) -> tuple[str, str | None]:
@@ -75,6 +81,12 @@ class FleetLLM(LLMBackend):
         return purpose, agent
 
     def _pool(self, purpose: str) -> list[str]:
+        # 認知階層アブレーション: force_tier が立っていれば purpose を無視して
+        # そのプールへ寄せる(そのティアが未定義なら従来どおりの振り分けへ後退)。
+        if self.force_tier is not None:
+            forced = self._tiers.get(self.force_tier)
+            if forced:
+                return forced
         pool = self._tiers.get(purpose, self._default)
         return pool if pool else list(self.servers)
 

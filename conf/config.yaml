@@ -1350,6 +1350,22 @@ observer:
   # **書くだけ・読む経路なし** = L1/L2/L3・summary・決定論・LLM 呼数のいずれにも影響しない。
   # 同じ out_dir を再利用/resume したときは前回分の要点を history に畳んで残す(来歴を失わない)。
   run_manifest: true
+  # ---- 状態ハッシュチェーン(第78バッチ 2026-07-31・**既定 OFF**)----
+  # 検証ラン(run.mode=verify)専用の装置。ON にすると各 step の終了時に world state の
+  # **正準シリアライズ**(dict/set はキーでソート・浮動小数は固定桁十進・集約順固定)を
+  # sha256 し、**前 step のハッシュを混ぜてチェーン**にして runs/<name>/state_hash.jsonl
+  # へ 1 行 1 step で書く。1 レコードでも書き換われば以降のチェーンが全部ずれるので、
+  # 「同じ seed で同じ世界が再生されたか」を L1 バイト比較より軽く・機械的に判定できる。
+  # 正準化の流儀は engine/checkpoint.py の config_hash(sort_keys=True の JSON)を再利用。
+  # **書くだけ・読む経路なし**(R1)= L1/L2/L3・summary・乱数・LLM 呼数のいずれも変えない。
+  #   受入基準 T1: 同一 seed の 2 ラン(mock)でチェーンが完全一致する
+  #   受入基準 T6: engine.batch_llm.workers を 1 と 4 に変えてもチェーンが一致する
+  # interval: 1(既定)= 毎 step。大きくすると n step ごとにだけ計算して書く(性能の逃げ道。
+  #   チェーンは「記録した step どうし」で繋がるので、間隔を変えたラン同士は比較できない)。
+  state_hash:
+    enabled: false
+    interval: 1                 # 何 step ごとにハッシュを採るか(1=毎 step)
+    float_digits: 6             # 浮動小数の固定桁十進(正準化。桁を変えると全ハッシュが変わる)
   y_weights: null               # Y外部(世界改変量)の4層合成重み。既定 null=合成せず列を出すのみ。
                                 # ★合成式は B段でユーザーと決定(analyze 側で使用)。例:
                                 # y_weights: { spatial: 1.0, resource: 1.0, symbolic: 1.0, network: 1.0 }
@@ -1393,6 +1409,60 @@ observer:
   initial_frame:
     days: 0                     # 0=OFF(summary にキーなし)。1 で初日、2 で 2 日分を窓にする
     top_kinds: 20               # 記録するイベント種の上限(件数降順→種名昇順の決定論で切る)
+
+# ============================================================
+# アブレーション(第78バッチ 2026-07-31。dual-mode-observe-verify-plan.md §2 第78行 /
+# dual-mode-instructions.md Phase 1 / dual-mode-instruments.md Part C(2)・Part D)。
+# **対照条件のスイッチだけ**を置く層で、世界の機構は 1 つも増えない。
+# 既定は全て OFF(cognitive_tier は "full")= 現行挙動と完全同一(golden L1 バイト一致)。
+# 実装は src/society/ablate.py に集約。再現性等級は src/society/registry.py に宣言済み。
+# ★アブレーションは「差分でしか主張しない」ための装置。単独ランの数値に合否を付けないこと。
+# ============================================================
+ablate:
+  # ---- (1) LLM を使わない対照 ----
+  # true にすると **LLM を 1 本も呼ばず**、既存のルール層だけで世界を回す:
+  #   熟慮(_llm_speak)は即 None=沈黙 → routine.decide(既存のニーズ充足 + POI 選好)へ後退。
+  #   朝の一日計画(planning)と夜の内省(reflection)も撃たない。
+  # ルールは **既存のものだけ**で構成し、新しい凝ったヒューリスティックは足していない
+  # (比較のベースラインなので素朴であることに価値がある=原指示 Phase 1)。
+  # ★呼数 k は当然 0 になる(affects_k=true と正直に宣言してある)。
+  # ★controls.mode=null_series(内容非結合のダミー呼)とは**軸が別**。併用すると
+  #   ダミー呼だけが残る(矛盾した設定)ので、対照ランでは controls.mode=none にすること。
+  llm_off: false
+  # ---- (2) 伝播を止める対照(語彙の専門化スコアの帰無モデル)----
+  # true にすると、発話は**通常どおり生成される**(= LLM 呼の発生箇所・本数の構造は不変)が、
+  # その**内容が他エージェントの文脈に一切入らない**。切る/保つの線引きは:
+  #   切る … 他者の記憶へ積む発話文・他者の対話履歴・他者へ渡る語彙(adopted)・
+  #          他者の予定帳簿への抽出・他者の信念(伝聞)・SNS タイムライン本文・DM 本文。
+  #   保つ … 自分の発話の記憶(自己連続性)・同席者の顔ぶれ・`hear` の発生・接触台帳
+  #          (会話量)・返答権の付与(= 返答の LLM 呼はこれまでどおり撃たれる)。
+  # この条件で専門化スコアが落ちなければ、その専門化は相互作用ではなく**ペルソナのプロンプト
+  # 由来**だったと結論する(Part C の狙い)。
+  # ★no-fingerprint: 合成文(「誰かが何か言っていた」等)は**注入しない**。他条件に現れない
+  #   新種の痕跡になり語彙指標も汚すため。残る痕跡は「周りは居るが誰も何も言わない街」で、
+  #   これは原理的に消せない = fingerprint_risk="known" として登録してある。
+  propagation_off: false
+  # ---- (3) 認知階層のダイヤル(Part D)----
+  # llm.fleet の割当を強制的に下位ティアへ落とす。現象ごとに「それが消える知能の下限」を測る。
+  #   full  … 既定(上書きなし)
+  #   mid   … model.tiers の "mid" プールへ全 purpose を強制
+  #   small … model.tiers の "small" プールへ全 purpose を強制
+  #   rule  … LLM を使わないルール層(= llm_off と同一の層。呼数 0)
+  # ★正直な縮退宣言: FleetLLM を使っていないラン(mock / 単一 vLLM / ollama)や、
+  #   model.tiers に該当プールが無いランでは **small / mid は 1 バイトも効かず full と同一**に
+  #   なる。黙って「ティアを下げた」ことにはせず、起動時 WARNING と run_manifest.json の
+  #   ablate.tier_effective に「効いていない理由」を必ず出す。
+  # ★実時間の漏れ防止: ティアを変えるとレイテンシが変わるが、世界時間は sim clock のみが
+  #   供給する(src に datetime.now() は grep ゼロ)ので世界の挙動には漏れない。
+  cognitive_tier: full
+  # ---- (4) 相手選択をランダムにする対照 ----
+  # true にすると、発話の返答権/宛先を関係グラフ(closeness)でも距離(nearest)でもなく
+  # **同席者からの一様乱択**にする。関係構造が効いているのか、単に会話量が効いているのかを
+  # 分離する(Part C(2))。聞き手の集合(hearers)は変えない=会話量・呼数は不変。
+  # ★専用 stream "shuffle_partners" から **always-draw**(ON/OFF に関わらず候補が 1 人以上
+  #   いれば必ず 1 本引く)。RngHub はステートレスなので新 stream の消費は既存 stream の
+  #   draw 順に干渉しない = 既定 OFF は golden バイト一致のまま draw 数も不変。
+  shuffle_partners: false
 
 # ============================================================
 # 実験セル(第74バッチ IDEA④ 2026-07-31)。**対照条件の宣言だけ**を置く層で、

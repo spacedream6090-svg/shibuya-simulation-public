@@ -235,8 +235,13 @@ def _apply_effects(sim, a, b, plan: dict, step: int, sim_min: int) -> None:
     _shift_opinion(sim, a, b.opinion, b.id, step, sim_min)
     _shift_opinion(sim, b, a.opinion, a.id, step, sim_min)
     # (4) 語彙接触(complex contagion): 片方が知る未知語をもう片方が聞く。
-    _hear_word(sim, b, plan["word_ab"], a.id, step, sim_min)
-    _hear_word(sim, a, plan["word_ba"], b.id, step, sim_min)
+    #     ablate.propagation_off(第78): C2 は発話テキストを持たないが**語彙は渡している**ので、
+    #     語彙の専門化の帰無モデルとしてはここも切らなければ穴になる。会話の発生・drive・
+    #     関係・意見(スカラー)は残す=会話量は不変で語彙授受だけが止まる。
+    from . import ablate as _ablate_mod
+    if not _ablate_mod.propagation_off(sim):
+        _hear_word(sim, b, plan["word_ab"], a.id, step, sim_min)
+        _hear_word(sim, a, plan["word_ba"], b.id, step, sim_min)
     # (5) C2→C1 昇格: 帰結が顕著(強い意見差・関係の転機)なら drive を余分に押し上げる
     #     (未知語接触は (4) の unknown_word で既に押し上げ済み)。次 step の _phase_drive が
     #     フル LLM 発話(C1)を自然に発火する接続点。scale は不透明量(整合度/tier)から。

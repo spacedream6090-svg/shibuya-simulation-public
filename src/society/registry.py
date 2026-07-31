@@ -401,6 +401,31 @@ FEATURES: tuple[Feature, ...] = (
        "L2 に LLM 健全性 KPI 3列を足す(観測専用・累積カウンタ)"),
     _f("observer.echo.enabled", "strict", False, "none",
        "L2 にエコー/自己反復 5列を足す(観測専用・常設)"),
+    # 第78バッチ: 状態ハッシュチェーン(verify 用)。記録専用でシムは読まない=strict。
+    _f("observer.state_hash.enabled", "strict", False, "none",
+       "各 step の world state を正準シリアライズ→sha256→前 step と連鎖させて "
+       "state_hash.jsonl に書く(記録専用・シムは読まない・T1/T6 の判定装置)"),
+
+    # ---- ablate(第78バッチ: アブレーション 4 種。対照条件のスイッチだけ)----
+    # 全て既定 OFF。repro_tier=strict の根拠は「機構を**外す**方向の決定論ゲート」で
+    # あること(LLM の自由文を新たに読む経路を 1 つも足さない)。
+    _f("ablate.llm_off", "strict", True, "none",
+       "LLM を 1 本も呼ばず既存のルール層(routine.decide=ニーズ充足 + POI 選好)だけで回す。"
+       "計画・内省も撃たない。**呼数 k は 0 になる**ので affects_k=True。"
+       "プロンプトが 1 つも組まれない=当人から観測できる差分が存在しない=risk none"),
+    _f("ablate.propagation_off", "strict", False, "known",
+       "発話は通常どおり生成する(呼の発生箇所は不変)が、内容が他エージェントの文脈へ"
+       "一切入らない。専門化スコアの帰無モデル。**合成文は注入しない**方針のため"
+       "『周りは居るが誰も何も言わない街』として原理的に観測されうる=risk known"),
+    _f("ablate.cognitive_tier", "strict", True, "possible",
+       "llm.fleet の割当を強制下位へ(rule/small/mid/full)。rule は LLM を使わないルール層"
+       "=呼数が変わるので affects_k=True。small/mid はモデルが変わり応答の質感が変わる"
+       "=possible。fleet 非使用ランでは small/mid は縮退して full と同一(manifest に明示)",
+       off_value="full"),
+    _f("ablate.shuffle_partners", "strict", False, "possible",
+       "対話の返答権/宛先を関係グラフでなく同席者からの一様乱択にする(専用 stream・"
+       "always-draw)。聞き手集合は不変=会話量・呼数は不変。関係の近い相手が隣に居ても"
+       "返答が来ない=間柄行との不整合に気づく余地が原理的にある=possible"),
 
     # ---- experiment(第74バッチ IDEA④: 対照セルの宣言。決定論=strict)----
     _f("experiment.flat_traits.enabled", "strict", False, "none",

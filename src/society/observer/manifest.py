@@ -86,6 +86,17 @@ def event_schema_sha256() -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+@lru_cache(maxsize=1)
+def metrics_spec() -> dict:
+    """指標定義コードの凍結ハッシュ(第78バッチ・Part G)。プロセス内で 1 回だけ計算する。
+
+    「指標コードが 1 文字でも変われば hash が変わる」ことが要件(受入基準 T7)。
+    対象ファイルの列挙は observer/metrics_spec.py の SPEC_FILES が唯一の源。
+    """
+    from . import metrics_spec as _spec
+    return _spec.compute()
+
+
 def collect_toggles(cfg) -> dict:
     """resolved config の**真偽値リーフを全部**ドット記法で平坦化する。
 
@@ -100,6 +111,7 @@ def collect_toggles(cfg) -> dict:
 # --------------------------------------------------------------------- 構築
 def build(sim) -> dict:
     """sim から manifest dict を組む(副作用なし・純関数的)。"""
+    from .. import ablate as _ablate_mod
     from ..config import REPO_ROOT
     from ..engine import checkpoint
 
@@ -115,6 +127,7 @@ def build(sim) -> dict:
     model = cfg.get("model", {}) or {}
     started = time.time()
     calendar = (cfg.get("world", {}) or {}).get("calendar", {}) or {}
+    _spec = metrics_spec()
 
     man = {
         "schema": SCHEMA,
@@ -127,6 +140,12 @@ def build(sim) -> dict:
         # resume 可否判定に使われる方(揮発キー除外)。checkpoint と同じ定義を再利用する。
         "config_determinism_sha256": checkpoint.config_hash_from_container(resolved),
         "event_schema_sha256": event_schema_sha256(),
+        # 第78バッチ Part G: 指標定義コードの凍結ハッシュ。事後に指標をいじると値が変わる。
+        #   metrics_spec_hash … 対象ファイル群 + **ファイルリスト自体**の正規化ハッシュ
+        #   metrics_spec      … 内訳(どのファイルのどの hash を採ったか)+ 欠測一覧
+        "metrics_spec_hash": _spec["metrics_spec_hash"],
+        "metrics_spec": {"schema": _spec["schema"], "n_files": _spec["n_files"],
+                         "files": _spec["files"], "missing": _spec["missing"]},
         # 第72バッチ: ランモード(none/observe/journal/verify)。比較ガードが最初に見る場所。
         "run_mode": features["run_mode"],
         "run": {
@@ -161,6 +180,10 @@ def build(sim) -> dict:
         },
         "k": {"writeback": str(cfg.get("k", {}).get("writeback", "free"))},
         "controls": {"mode": str(cfg.get("controls", {}).get("mode", "none"))},
+        # 第78バッチ: アブレーション 4 種。**全 OFF のランではキー自体を出さない**
+        # (既存ランの manifest と同形を保つ)。ON のときは cognitive_tier が実際に
+        # 効いたか(fleet 非使用ランでの縮退)も tier_effective に正直に残す。
+        **({"ablate": _ablate} if (_ablate := _ablate_mod.describe(sim)) else {}),
         "code": {
             "python": sys.version.split()[0],
             "platform": platform.platform(),

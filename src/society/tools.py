@@ -29,6 +29,17 @@ from .rules import apply_bonus
 from .world.clock import STEP_MINUTES
 
 
+def _prop_off_tools(sim) -> bool:
+    """ablate.propagation_off(第78バッチ)。既定 OFF=False=従来経路そのまま。
+
+    tools 層は「他エージェントが書いた文字列(告知文・貼り紙・提案文)」を別の
+    エージェントの記憶へ運ぶ経路を複数持つ。伝播を止める対照条件では、その**本文**だけを
+    落とす(掲示・賛否・招待という**行為**とその会計は従来どおり起こる=呼数の構造が不変)。
+    """
+    from . import ablate as _ablate_mod
+    return _ablate_mod.propagation_off(sim)
+
+
 def build_tools_cfg(raw: dict | None) -> dict:
     raw = dict(raw or {})
     return {
@@ -677,9 +688,14 @@ class Tools:
             rec = sim.agent_by_id.get(rid)
             if rec is None or rec.loc == "outside" or rec.sleeping:
                 continue
-            rec.remember(f"{host.name}からの誘い:「{text}」", kind="dm")
+            # ablate.propagation_off(第78): 告知 DM の**本文**は受信者の文脈へ入れない
+            # (誰から来たか・drive・招待の受理という交流の量は残す=呼数の構造が不変)。
+            from . import ablate as _ablate_mod
+            _atext = _ablate_mod.heard_text(sim, text)
+            if _atext:
+                rec.remember(f"{host.name}からの誘い:「{_atext}」", kind="dm")
             rec._last_dm_from = host.id
-            rec.mem.record_contact(host.id, host.name, step, text)
+            rec.mem.record_contact(host.id, host.name, step, _atext)
             host.mem.record_contact(rid, rec.name, step)
             drive.add(rec, "dm_received", sim.drivecfg)
             self.invite(rec, event_id)
@@ -1249,7 +1265,8 @@ class Tools:
                     if review is not None \
                             and not self._vote_yes(agent, pr, routes["vote"]):
                         review["opposed"].add(agent.id)   # 反対に回る(署名しない)
-                        agent.remember(f"提案に反対した:「{pr['text'][:20]}」")
+                        if not _prop_off_tools(sim):   # 第78: 提案者の本文は文脈へ入れない
+                            agent.remember(f"提案に反対した:「{pr['text'][:20]}」")
                         continue
                 elif is_labor and getattr(agent, "org_id", None) == org \
                         and _is_employee(agent):        # 職域: 同じ org の同僚は職場露出で賛同(偏り)
@@ -1259,7 +1276,8 @@ class Tools:
                 pr["supporters"].add(agent.id)
                 self._log(sim, step, sim_min, agent, "proposal_support",
                           {"proposal_id": pid, "author": pr["author"]})
-                agent.remember(f"提案に賛同した:「{pr['text'][:20]}」")
+                if not _prop_off_tools(sim):           # 第78: 提案者の本文は文脈へ入れない
+                    agent.remember(f"提案に賛同した:「{pr['text'][:20]}」")
             if pr["passed"] or len(pr["supporters"]) < thr:
                 continue
             # 審議・パブコメ段階(制度深化 第9バッチ・既定 OFF=即成立/即投票のまま)。署名到達で
@@ -1580,7 +1598,9 @@ class Tools:
                 sim_min=sim_min, logger=sim.logger, scale=0.8)
             if d_v:
                 drive.add(agent, "state_change", sim.drivecfg, scale=abs(d_v))
-            agent.remember(f"貼り紙を見た:「{f['text'][:20]}」")
+            from . import ablate as _ablate_mod
+            if not _ablate_mod.propagation_off(sim):   # 第78: 作者の本文は文脈へ入れない
+                agent.remember(f"貼り紙を見た:「{f['text'][:20]}」")
             apply_bonus(getattr(sim, "rulebook", None), sim, agent, "flyer_view",
                         step, sim_min)                 # 制度DSL: bonus(flyer_view)
 

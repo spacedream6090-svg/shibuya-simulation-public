@@ -314,12 +314,19 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
             lines.append(f"書き出しの注意: 「この時間の{city_name}は…」のような情景報告の"
                          "決まり文句で始めない。具体的な出来事・固有名詞・相手への"
                          "問いかけなど、毎回違う切り口で。")
-    elif surprise == "reply" and reply_to is not None:
-        lines.append(f"状況: {reply_to[0]}に話しかけられた:「{reply_to[1]}」。"
-                     "相手に自然に返事をする(speak で)。")
-        if variety_hint:                 # 改善 P3(既定 OFF): 返答もオウム返し・定型を避ける
-            lines.append("返事の注意: 相手の言葉のオウム返しや決まり文句を避け、"
-                         "自分の経験・予定・意見を一つ足して返す。")
+    elif surprise == "reply":
+        # reply_to=None のときは状況行を **1 行も出さない**。到達するのは
+        #   (a) 話者が名簿から引けなかった保険経路(従来は下の jp 辞書で KeyError=潜在バグ)
+        #   (b) ablate.propagation_off(第78): 返答の LLM 呼は撃つが相手の発話内容を
+        #       プロンプトへ入れない対照条件
+        # の 2 つ。**合成の状況文を代わりに置かない**(他条件に現れない痕跡を作らないため)。
+        # reply_to があるときの出力は従来と一字一句同一(ゴールデン維持)。
+        if reply_to is not None:
+            lines.append(f"状況: {reply_to[0]}に話しかけられた:「{reply_to[1]}」。"
+                         "相手に自然に返事をする(speak で)。")
+            if variety_hint:             # 改善 P3(既定 OFF): 返答もオウム返し・定型を避ける
+                lines.append("返事の注意: 相手の言葉のオウム返しや決まり文句を避け、"
+                             "自分の経験・予定・意見を一つ足して返す。")
     elif surprise == "post":
         lines.append("状況: スマホでSNSを開いた。いま感じていること、目にした光景、"
                      "タイムラインへの反応など、何か一つを短くつぶやく(post で)。"
