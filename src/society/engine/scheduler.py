@@ -3577,8 +3577,10 @@ def _phase_calendar_weather(sim, step: int, sim_min: int) -> None:
     if wea["enabled"]:
         w = weather.weather_for(sim, day)
         sim.today_weather = w
-        sim.today_weather_line = weather.weather_line(w)
-        payload = {"cond": w["cond"], "temp_hi": w["temp_hi"]}
+        sim.today_weather_line = weather.weather_line(w, wea)
+        # payload は synthetic では従来どおり {cond, temp_hi} の2キーのまま(L1 バイト一致)。
+        # generated / table のときだけ観測用の列(最低気温・降水・湿度・暑さ指数)を足す。
+        payload = weather.event_payload(w, wea)
         if cal["enabled"]:                          # 暦がある日は日付・曜日・休日も併記
             payload["date"] = calendar.date_of(cal, sim_min).isoformat()
             payload["weekday"] = calendar.weekday_jp(cal, sim_min)

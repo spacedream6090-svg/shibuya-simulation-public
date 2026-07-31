@@ -106,7 +106,10 @@ register_event_kind("media_use",     "娯楽メディアの利用(TV/動画/ゲ�
 register_event_kind("study",         "学校の授業・学習(教科・講義){org, subject, role}")
 register_event_kind("production",    "職場での産出(財・サービスの実態){org, output, kind}")
 # ---- 第7バッチ(ユーザー要望 2026-07-07: 日付・天気)----
-register_event_kind("weather",       "その日の天気(日次・世界イベント agent_id=-1){date, weekday, cond, temp_hi, holiday?}")
+register_event_kind("weather",       "その日の天気(日次・世界イベント agent_id=-1){date, weekday, cond, temp_hi, holiday?}"
+                                     "。weather.mode=generated/table では観測用に "
+                                     "{temp_lo, temp_hi_c, temp_lo_c, precip_mm, humid, wbgt, source} を併記"
+                                     "(既定 synthetic では従来どおり cond/temp_hi のみ)")
 # ---- 長期予定・スケジュール帳(第7バッチ 2026-07-07。会話からの自動記入。既定 OFF)----
 register_event_kind("appointment",   "予定の設定(会話からの自動記入){day, when, what, place, with}")
 register_event_kind("appointment_kept", "予定の遵守(予定時間帯に該当場所に居た。任意観測){day, when, what, place}")

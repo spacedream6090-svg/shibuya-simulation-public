@@ -288,9 +288,12 @@ class Simulation:
         raw_wea = (OmegaConf.to_container(raw_wea, resolve=True)
                    if OmegaConf.is_config(raw_wea) else raw_wea)
         # 月別気候テーブルは envpack(場所の値)から与える(基盤に東京の気候を残さない)。
+        # 第80バッチ W2: 生成器パラメータ / 実測表のパスも同じ流儀で envpack 経由。
         self.weathercfg = _weather_mod.build_cfg(
             raw_wea, monthly=self.envpackcfg["climate"]["monthly"],
-            neutral=self.envpackcfg["climate"]["neutral"])
+            neutral=self.envpackcfg["climate"]["neutral"],
+            gen_params=self.envpackcfg["climate"].get("gen_params"),
+            table_file=self.envpackcfg["climate"].get("table"))
         # 長期予定・スケジュール帳(第7バッチ 2026-07-07。既定 OFF=現行挙動と完全同一)。
         # 会話由来の決定論抽出(追加 LLM 呼び出しゼロ)。calendarcfg を相対日→絶対日の解決に使う。
         raw_sched = cfg.get("schedule", None)
@@ -1572,6 +1575,14 @@ class Simulation:
             summary["world_mod"] = self.worldmod.summary()
         if getattr(self, "heights_stat", None) is not None:
             summary["building_heights"] = dict(self.heights_stat)
+        # ---- 天候の来歴 第80バッチ W2(weather.mode=generated / table のときだけ)----
+        # 入力データのハッシュがラン成果物に残らない、という指摘への最初の実例:
+        # weather_params_sha256(較正パラメータ)+ 実測データの sha256 + フォールバック件数。
+        # 既定 synthetic では None を返すのでキー自体を出さない(既存ランと同形)。
+        from .. import weather as _weather_prov
+        _wprov = _weather_prov.provenance(self)
+        if _wprov is not None:
+            summary["weather"] = _wprov
         # ---- 初期フレーム共変量 第74バッチ IDEA④(observer.initial_frame.days: 0 = 既定 OFF)----
         # 確定済みの l1_events.parquet(直前の logger.flush)を読み直す **完全な事後処理**。
         # OFF ではこのブロックが即 None を返し summary にキーを足さない=既存ランと同形。

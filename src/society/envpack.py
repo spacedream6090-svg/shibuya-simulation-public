@@ -79,6 +79,11 @@ def build_cfg(raw: dict | None) -> dict:
     monthly = _monthly(climate.get("monthly"))
     neutral_raw = climate.get("neutral")
     neutral = ([float(x) for x in neutral_raw] if neutral_raw else None)
+    # 第80バッチ W2: 生成型の天候(weather.mode=generated / table)が読む静的ファイルの
+    # パス。**場所の値**なのでここ(envpack)を通す(src に東京固有のパスを書かない)。
+    # 未指定なら None = 既定 synthetic では 1 バイトも使われない。
+    gen_params = climate.get("gen_params")
+    table_file = climate.get("table")
 
     return {
         "lexicon": {
@@ -90,5 +95,7 @@ def build_cfg(raw: dict | None) -> dict:
         "culture": {"events": events},
         "media": media_out,
         "origin": {"landmark": str(origin.get("landmark", ""))},
-        "climate": {"monthly": monthly, "neutral": neutral},
+        "climate": {"monthly": monthly, "neutral": neutral,
+                    "gen_params": (str(gen_params) if gen_params else None),
+                    "table": (str(table_file) if table_file else None)},
     }

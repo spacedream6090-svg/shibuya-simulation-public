@@ -156,6 +156,18 @@ def save(sim, step: int, path: str | Path) -> Path:
             "tl_facts": getattr(sim, "_tl_facts", None),
             "tl_keys": getattr(sim, "_tl_keys", None),
             "tl_stats": getattr(sim, "_tl_stats", None),
+            # 第80バッチ W2(検収で顕在化した**既存ギャップ**): 日付・天気の日境界進行
+            # (_cal_day)と当日確定値(date_line / weather / weather_line)。従来未保存
+            # だったため、weather.enabled=true の mid-day resume は再開直後の 1 step で
+            # _phase_calendar_weather が同じ日を再処理し、**weather イベントを二重記録**
+            # (+ rain_grievance>0 なら不快感を二重加算)していた=resume≠straight。
+            # 第62 joint / 第70 echo / 第75 dunbar と同じ型のギャップ。天気の値そのものは
+            # 日インデックスの決定論関数なので保存しない(復元は当日値のキャッシュのみ)。
+            # calendar/weather OFF のランでは -1/None = 挙動不変(load は .get で旧 ckpt 互換)。
+            "cal_day": getattr(sim, "_cal_day", -1),
+            "today_date_line": getattr(sim, "today_date_line", None),
+            "today_weather": getattr(sim, "today_weather", None),
+            "today_weather_line": getattr(sim, "today_weather_line", None),
             # 第71バッチ: LLM 入出力ジャーナルの確定点(ファイル名 → {records, bytes})。
             # mark() が flush してから採るので、この時点のファイル末尾は必ず gzip メンバ境界
             # = 安全な切り詰め点。resume(load)がここまで巻き戻すことで、「checkpoint 後に
@@ -272,6 +284,14 @@ def load(sim, path: str | Path) -> int:
     if tls is not None:
         sim._tl_stats = tls
     sim._tl_watermark = 0                       # fresh logger=total 0 から再走査(gossip と同流儀)
+    # 第80バッチ W2: 日付・天気の日境界進行と当日確定値(旧 checkpoint 互換=無ければ従来どおり
+    # -1/None=再開直後に当日を作り直す)。生成モードの日別系列は保存しない — 再構築が
+    # (master_seed, params, 起点の日) の純関数で、生成は逐次=prefix 安定だから同一系列になる。
+    sim._cal_day = rt.get("cal_day", -1)
+    if "today_weather" in rt:
+        sim.today_date_line = rt.get("today_date_line")
+        sim.today_weather = rt.get("today_weather")
+        sim.today_weather_line = rt.get("today_weather_line")
     if hasattr(sim, "_journal_rewind"):         # 第71: LLM ジャーナルを確定点まで巻き戻す
         sim._journal_rewind(rt.get("llm_journal"))
 

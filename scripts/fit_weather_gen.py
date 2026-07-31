@@ -56,7 +56,6 @@ docs/research/weather-generator-design.md §1「リサーチ結果」。
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import sys
@@ -69,53 +68,37 @@ SCHEMA_VERSION = 1
 DEFAULT_IN = REPO_ROOT / "data" / "snapshot" / "weather_tokyo_aug.json"
 DEFAULT_OUT = REPO_ROOT / "data" / "snapshot" / "weather_gen_params.json"
 
+# ★第80バッチ(W2)で **生成器の本体は src/society/weather_gen.py へ移した**。
+#   実装の二重化(同じ AR(1) を fit 側と sim 側に 2 本書く)を避けるため、本スクリプトは
+#   src の実装を import して使う=「fit が出す系列」と「シムが出す系列」は原理的に同一。
+#   本スクリプトの公開名(STATES / RAIN / wbgt_ono2014 / label_state / payload_sha256 …)は
+#   後方互換のためそのまま残す(既存テストは無改修で緑)。
+sys.path.insert(0, str(REPO_ROOT / "src"))
+from society import weather_gen as WG                          # noqa: E402
+
 # 天気状態(現行 weather.py の cond 4種と同じ語。雪は8月は確率0で保持)。
-STATES = ["晴", "曇", "雨", "雪"]
+STATES = list(WG.STATES)
 ACTIVE_STATES = ["晴", "曇", "雨"]          # 8月に実際に出る3状態
-RAIN = 2
+RAIN = WG.RAIN
 
 # 小野ら(2014)「通常観測気象要素を用いた WBGT の推定」日生気誌 50(4), 147-157。
 # 環境省 熱中症予防情報サイト(https://www.wbgt.env.go.jp/wbgt_detail.php)掲載の推定式:
 #   WBGT = 0.735*Ta + 0.0374*RH + 0.00292*Ta*RH + 7.619*SR − 4.557*SR² − 0.0572*WS − 4.064
 #   Ta[℃] 気温 / RH[%] 相対湿度 / SR[kW/m²] 全天日射量 / WS[m/s] 平均風速
-WBGT_ONO2014 = {
-    "ta": 0.735, "rh": 0.0374, "ta_rh": 0.00292,
-    "sr": 7.619, "sr2": -4.557, "ws": -0.0572, "const": -4.064,
-}
+WBGT_ONO2014 = WG.WBGT_ONO2014
 # 実測 WBGT の定義式(参考。本スクリプトでは使わない=湿球/黒球温度を持っていない)。
-WBGT_MEASURED = {"tw": 0.7, "tg": 0.2, "ta": 0.1}
+WBGT_MEASURED = WG.WBGT_MEASURED
 # 日射量の代理に使う仮定(★仮定であることを必ず添えて出す)。
-SR_CLEAR_KW = 0.75      # 快晴日の日中平均 全天日射量[kW/m²](東京・8月の目安)
-DAYLENGTH_H = 13.3      # 8月中旬の東京の可照時間[h]の目安
+SR_CLEAR_KW = WG.SR_CLEAR_KW      # 快晴日の日中平均 全天日射量[kW/m²](東京・8月の目安)
+DAYLENGTH_H = WG.DAYLENGTH_H      # 8月中旬の東京の可照時間[h]の目安
 
-
-def wbgt_ono2014(ta, rh, sr, ws):
-    """小野ら(2014)推定式。ta[℃], rh[%], sr[kW/m²], ws[m/s] → WBGT[℃]。"""
-    c = WBGT_ONO2014
-    return (c["ta"] * ta + c["rh"] * rh + c["ta_rh"] * ta * rh
-            + c["sr"] * sr + c["sr2"] * sr * sr + c["ws"] * ws + c["const"])
-
-
-def sr_proxy(sunshine_h):
-    """日照時間[h] → 全天日射量[kW/m²] の**代理**(★実測ではない・線形近似)。"""
-    return SR_CLEAR_KW * np.clip(np.asarray(sunshine_h, dtype=float) / DAYLENGTH_H, 0.0, 1.0)
+wbgt_ono2014 = WG.wbgt_ono2014
+sr_proxy = WG.sr_proxy
+label_state = WG.label_state
+payload_sha256 = WG.payload_sha256
 
 
 # ------------------------------------------------------------------ 実測の読み込みとラベル付け
-def label_state(day: dict, wet_mm: float) -> int:
-    """実測1日 → 天気状態の添字。雨 = 日降水量 ≥ wet_mm(気象庁の降水日の定義 1.0mm に合わせる)。
-
-    晴/曇 は気象庁自身の「天気概況(昼)」の先頭語で分ける(晴・快晴 → 晴、それ以外 → 曇)。
-    日照時間の閾値で切るより、気象庁の判定をそのまま使うほうが恣意性が少ない。
-    """
-    if (day.get("snow_cm") or 0.0) > 0.0:
-        return STATES.index("雪")
-    if (day.get("precip_mm") or 0.0) >= wet_mm:
-        return RAIN
-    head = (day.get("cond_day") or "")
-    return 0 if head.startswith(("晴", "快晴")) else 1
-
-
 def load_history(path: Path, years: tuple[int, int], month: int, wet_mm: float):
     doc = json.loads(path.read_text(encoding="utf-8"))
     days = [d for d in doc["days"]
@@ -473,78 +456,20 @@ def simulate(pm: dict, n_years: int, seg_len: int, seed: int,
 
     返り値の各配列は shape (n_years*seg_len,)。年ごとに区切られている。
     `year_effect=False` は「年効果を外した」比較用(低周波成分の寄与を測るため)。
+
+    ★本体は `src/society/weather_gen.generate_segment`(シムが使うのと同じ実装)。
+      ここは「1本の rng を年ごとに連続消費する」ループだけを持つ薄い殻。
     """
     rng = np.random.Generator(np.random.PCG64(np.random.SeedSequence([int(seed)])))
-    trans = np.array(pm["markov3"]["transition"], float)
-    trans = trans / trans.sum(axis=1, keepdims=True)   # 丸め(6桁)で 1.0 を割るのを直す
-    cum = np.cumsum(trans, axis=1)
-    marg = np.array(pm["markov3"]["marginal"], float)
-    marg_cum = np.cumsum(marg / marg.sum())
-    a_mat = np.array(pm["temp"]["ar1"]["A"], float)
-    b_mat = np.array(pm["temp"]["ar1"]["B"], float)
-    ye = pm["temp"]["year_effect"]
-    sd_y = np.array([ye["sd_hi"], ye["sd_lo"]], float)
-    corr_y = float(ye["corr"])
-    cov_y = np.array([[sd_y[0] ** 2, corr_y * sd_y[0] * sd_y[1]],
-                      [corr_y * sd_y[0] * sd_y[1], sd_y[1] ** 2]])
-    try:
-        chol_y = np.linalg.cholesky(cov_y)
-    except np.linalg.LinAlgError:
-        chol_y = np.diag(sd_y)
-    mean_hi = np.array([pm["temp"]["per_state"][s]["mean_hi"] for s in STATES])
-    sd_hi = np.array([pm["temp"]["per_state"][s]["sd_hi"] for s in STATES])
-    mean_lo = np.array([pm["temp"]["per_state"][s]["mean_lo"] for s in STATES])
-    sd_lo = np.array([pm["temp"]["per_state"][s]["sd_lo"] for s in STATES])
-    b_hi = float(pm["temp"]["month_trend_hi_per_day"])
-    b_lo = float(pm["temp"]["month_trend_lo_per_day"])
-    d_ref = float(pm["d_ref"])
-    rh_mean = np.array([pm["humidity"]["per_state"][s]["mean"] for s in STATES])
-    beta_rh = float(pm["humidity"]["beta_on_temp_hi_anom"])
-    rh_sd = float(pm["humidity"]["resid_sd"])
-    g_shape = float(pm["precip"]["gamma_shape"])
-    g_scale = float(pm["precip"]["gamma_scale"])
-    clip = pm["temp"].get("clip") or {}
-    hi_min = float(clip.get("hi_min", -1e9))
-    hi_max = float(clip.get("hi_max", 1e9))
-    lo_min = float(clip.get("lo_min", -1e9))
-    lo_max = float(clip.get("lo_max", 1e9))
-    n_clipped = 0
-
+    prep = WG.prepare(pm)
+    segs = [WG.generate_segment(rng, prep, seg_len, day_start=day_start,
+                                year_effect=year_effect) for _ in range(n_years)]
     n = n_years * seg_len
-    out_state = np.zeros(n, int)
-    out_hi = np.zeros(n)
-    out_lo = np.zeros(n)
-    out_rh = np.zeros(n)
-    out_pr = np.zeros(n)
-    for y in range(n_years):
-        yeff = chol_y @ rng.standard_normal(2) if year_effect else np.zeros(2)
-        chi = rng.standard_normal(2)
-        s = int(np.searchsorted(marg_cum, rng.random()))
-        for t in range(seg_len):
-            i = y * seg_len + t
-            if t > 0:
-                s = int(np.searchsorted(cum[s], rng.random()))
-                chi = a_mat @ chi + b_mat @ rng.standard_normal(2)
-            dom = day_start + t
-            hi = mean_hi[s] + b_hi * (dom - d_ref) + yeff[0] + sd_hi[s] * chi[0]
-            lo = mean_lo[s] + b_lo * (dom - d_ref) + yeff[1] + sd_lo[s] * chi[1]
-            # ★正規 AR(1) は上側の裾を出しすぎる(実測 hi の歪度 −1.2 = 左に歪んだ分布)。
-            #   物理的な箍として、凍結実測の全期間レンジ ± margin で切る(モデルではなくガード)。
-            if hi > hi_max or hi < hi_min or lo > lo_max or lo < lo_min:
-                n_clipped += 1
-            hi = min(hi_max, max(hi_min, hi))
-            lo = min(lo_max, max(lo_min, lo))
-            if lo > hi:                       # 現行 weather.py:70-71 と同じ後段ガード
-                lo = hi
-            rh = rh_mean[s] + beta_rh * (hi - mean_hi[s] - yeff[0]) + rh_sd * rng.standard_normal()
-            out_state[i] = s
-            out_hi[i] = hi
-            out_lo[i] = lo
-            out_rh[i] = min(100.0, max(10.0, rh))
-            out_pr[i] = rng.gamma(g_shape, g_scale) if s == RAIN else 0.0
-    return {"state": out_state, "temp_hi": out_hi, "temp_lo": out_lo,
-            "humid_mean": out_rh, "precip_mm": out_pr,
-            "share_clipped": n_clipped / max(1, n)}
+    n_clipped = sum(s["n_clipped"] for s in segs)
+    cat = {k: np.concatenate([s[k] for s in segs])
+           for k in ("state", "temp_hi", "temp_lo", "humid_mean", "precip_mm")}
+    cat["share_clipped"] = n_clipped / max(1, n)
+    return cat
 
 
 def simulate_synthetic_current(n_years: int, seg_len: int, seed: int, month: int = 8) -> dict:
@@ -923,19 +848,6 @@ def main(argv: list[str] | None = None) -> int:
           f"KS(連長 実測vs現行) D={ks['spell_len_observed_vs_current']['D']}")
     print(f"  payload_sha256={result['meta']['payload_sha256']}")
     return 0
-
-
-def _canonical(obj) -> str:
-    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def payload_sha256(doc: dict) -> str:
-    """壁時計時刻を除いた本体のハッシュ(同入力→同値)。"""
-    payload = {k: v for k, v in doc.items() if k != "meta"}
-    meta = {k: v for k, v in doc["meta"].items()
-            if k not in ("payload_sha256", "fitted_at_utc")}
-    payload["meta"] = meta
-    return hashlib.sha256(_canonical(payload).encode("utf-8")).hexdigest()
 
 
 if __name__ == "__main__":

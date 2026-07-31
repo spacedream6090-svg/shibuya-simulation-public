@@ -165,6 +165,12 @@ envpack:
       11: [17, 9, 0.20, 0.0]
       12: [12, 4, 0.15, 0.05]
     neutral: [21, 12, 0.22, 0.0]         # calendar OFF(季節なし)時の既定気候(env 非依存フォールバック)
+    # ---- 生成型の天候(weather.mode=generated / table)が読む静的ファイル(第80バッチ W2)----
+    # gen_params: 実測から較正した確率生成器のパラメータ(scripts/fit_weather_gen.py 生成)。
+    # table:      凍結した実測の日別値(scripts/fetch_weather_history.py 生成。出典=気象庁)。
+    # どちらも weather.mode=synthetic(既定)では 1 バイトも読まない。
+    gen_params: data/snapshot/weather_gen_params.json
+    table: data/snapshot/weather_tokyo_aug.json
 
 model:
   backend: mock         # mock | ollama | vllm(本選)
@@ -1695,6 +1701,21 @@ inner_life:
 weather:
   enabled: false                # ★ON 推奨(本番): true(暦とともに現代生活の再現)
   rain_grievance: 0.0           # ★ON 推奨: 0.01(雨天の日の不快感。0.0=天気イベント・文脈行のみで grievance 不変)
+  # ---- 天候の決め方(第80バッチ W2。正典 docs/research/weather-generator-design.md)----
+  # synthetic … 既定=現行のまま(月別テーブル + ±3℃ 一様)。**既存ランとバイト一致**。
+  #             ただし構造的欠陥がある: 8月は 32±3 なので上限35℃・36℃以上は確率0・
+  #             日間自己相関ゼロ・年ごとの差もほぼ無い(=連続猛暑が原理的に出ない)。
+  # generated … 較正済み確率生成器(実測30年から較正。3状態マルコフ+2変量AR(1)+年効果)。
+  #             再現性等級 strict(静的ファイル+シードの純関数・ラン中のネットワーク呼び出しゼロ)。
+  #             パラメータは envpack.climate.gen_params(場所の値)。較正済みでない月は
+  #             synthetic へ自動フォールバックし、件数と理由を summary/manifest に残す。
+  # table     … 凍結した実測日別データを実日付(world.calendar.start_date 基準)で引く。
+  #             乱数を1つも引かない完全決定論。凍結範囲外の日付は synthetic へフォールバック。
+  #             データは envpack.climate.table。★ON 時は world.calendar.enabled=true が要る。
+  mode: synthetic               # synthetic(既定) | generated | table
+  # true で天気1行に「最低気温・湿度・降水・猛暑日・暑さ指数(推定)」を追記する。
+  # ★プロンプトが変わる。mode=synthetic では無視する(既定モードの文言は絶対に変えない)。
+  extra_prompt_fields: false
 
 # ---- 長期予定・スケジュール帳(第7バッチ 2026-07-07)----
 # ON 時: 会話(speak/DM)に未来の日付・時刻が入っていれば決定論パーサで抽出し、話者と

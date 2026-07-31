@@ -112,6 +112,7 @@ def collect_toggles(cfg) -> dict:
 def build(sim) -> dict:
     """sim から manifest dict を組む(副作用なし・純関数的)。"""
     from .. import ablate as _ablate_mod
+    from .. import weather as _weather_mod
     from ..config import REPO_ROOT
     from ..engine import checkpoint
 
@@ -184,6 +185,10 @@ def build(sim) -> dict:
         # (既存ランの manifest と同形を保つ)。ON のときは cognitive_tier が実際に
         # 効いたか(fleet 非使用ランでの縮退)も tier_effective に正直に残す。
         **({"ablate": _ablate} if (_ablate := _ablate_mod.describe(sim)) else {}),
+        # 第80バッチ W2: 天候の入力データ来歴(weather.mode=generated / table のときだけ)。
+        # weather_params_sha256 / weather_source_sha256 + 実ファイルの sha256 と出典表示。
+        # 既定 synthetic ではキー自体を出さない(既存 manifest と同形)。
+        **({"weather": _wea} if (_wea := _weather_mod.provenance(sim)) else {}),
         "code": {
             "python": sys.version.split()[0],
             "platform": platform.platform(),

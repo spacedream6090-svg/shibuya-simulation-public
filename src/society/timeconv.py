@@ -262,6 +262,12 @@ TABLE: tuple[tuple[str, str, str], ...] = (
     ("services.services.*.daily_rate", INVARIANT,
      "1日あたりの利用率。per-step 化は free_steps_ref(STEPS 側)が担うので二重変換しない"),
     ("services.self_dev.decay", INVARIANT, "skill/fitness の日次減衰"),
+    # 天候(第7バッチ / 第80バッチ W2)は **日次確定**(1 日 1 回 sim に載る)。
+    # rain_grievance は「その日1回の加算量」、mode は文字列、生成器のパラメータは
+    # 日別値の較正なので、いずれも Δt を変えても意味が変わらない。
+    ("weather.rain_grievance", INVARIANT, "悪天候の日に 1 日 1 回だけ加える不快感の量(日次)"),
+    ("weather.mode", INVARIANT, "天候の決め方(文字列)。生成も表引きも日別値=Δt 非依存"),
+    ("weather.extra_prompt_fields", INVARIANT, "プロンプト1行の内容(真偽値)。時間量ではない"),
     ("relations.decay_per_day", INVARIANT, "日次の風化"),
     ("relations.rep_decay_per_day", INVARIANT, "日次の風化"),
     ("gossip.decay_prob", INVARIANT, "悪評を 1 日で忘れる確率(日次)"),

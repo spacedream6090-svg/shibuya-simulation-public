@@ -491,6 +491,20 @@ FEATURES: tuple[Feature, ...] = (
        "『趣味・関心: ◯◯』を発火プロンプトへ注入"),
     _f("weather.enabled", "strict", False, "possible",
        "天気(気温・降水・降雪)。暦からの決定論+専用 stream"),
+    # 第80バッチ W2(天候の生成型実データ化)。strict の根拠: generated は
+    # 「静的ファイル(較正済みパラメータ)+ マスターシード」の純関数で、ラン中の
+    # ネットワーク呼び出しはゼロ・LLM の自由文を 1 バイトも読まない。table は乱数すら
+    # 引かない完全決定論。fingerprint_risk=possible: 気温の分布が変わり、猛暑日が
+    # 連続しうる(既定 synthetic では 36℃以上が構造的に出ない)=プロンプトの天気1行が
+    # 変わる。off_value="synthetic" = 現行動作。
+    _f("weather.mode", "strict", False, "possible",
+       "天候の決め方(synthetic=現行合成 / generated=較正済み確率生成器 / table=凍結実測の"
+       "実日付引き)。較正済みでない月・凍結範囲外の日付は synthetic へ自動フォールバックし、"
+       "件数と理由を summary.json と run_manifest.json の weather ブロックに残す",
+       off_value="synthetic"),
+    _f("weather.extra_prompt_fields", "strict", False, "possible",
+       "天気1行に最低気温・湿度・降水・猛暑日・暑さ指数(推定)を追記する。mode=synthetic "
+       "では無視する(既定モードのプロンプト文言は 1 バイトも変えない)"),
     _f("schedule.enabled", "journal", False, "possible",
        "長期予定・スケジュール帳。**発話テキスト(LLM 出力)から予定を抽出**して帳簿に積む"),
     _f("schedule.inject_prompt", "journal", False, "possible",
