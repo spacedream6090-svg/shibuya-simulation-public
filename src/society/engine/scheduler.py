@@ -18,6 +18,7 @@ from .. import conversation as conversation_mod
 from .. import disaster as disaster_mod
 from .. import diversity as diversity_mod
 from .. import dunbar as dunbar_mod
+from .. import envfeedback as envfb_mod
 from .. import freedom_p2 as freedom_p2_mod
 from .. import gossip as gossip_mod
 from .. import goods as goods_mod
@@ -938,6 +939,10 @@ def _phase_wake_and_returns(sim, step: int, sim_min: int) -> None:
             via_station = (agent.return_gateway == sim.city.station_node)
             if via_station and not sim.transit.has_service(sim_min):
                 continue                          # 終電後は帰れない(始発待ち)
+            # 環境フィードバック 規則1(第84。既定 OFF=常に False=バイト一致): 電車が遅れている
+            # ぶんだけ帰着が遅れる(1 回の帰還につき max_hold_steps を超えて待たせない=上限)。
+            if via_station and envfb_mod.hold_return(sim, agent, step, sim_min):
+                continue
             agent.loc = "street"
             agent.node = agent.return_gateway
             agent.x, agent.y = sim.city.node_xy(agent.node)
@@ -1100,6 +1105,12 @@ def _try_exit(sim, agent, step: int, sim_min: int) -> None:
                 agent.trip_mode = used_mode
                 return                             # exit_intent 維持 → 縁で再試行
         agent.exit_intent = False                  # 終電後: 出かけるのをやめる
+        return
+    # 環境フィードバック 規則1/2(第84。既定 OFF=常に False=バイト一致): 遅延ぶん・入場規制中は
+    # 改札を通れない=駅に留まる(exit_intent は維持。再試行は _phase_move 直後の pending_exits)。
+    # 運行の有無(上)を先に見る=運休は遅延より上位の制約。待ちの合計は max_hold_steps で
+    # 頭打ち=必ず通す安全弁があるので駅に溜まり続けない(T5)。
+    if via_station and envfb_mod.hold_exit(sim, agent, step, sim_min):
         return
     agent.exit_intent = False
     agent.loc = "outside"
@@ -4650,6 +4661,9 @@ def run_step(sim, step: int) -> None:
     # 閾値発火(第81。既定 OFF=-1 で以降を完全スキップ)。step 末に o_c(t) を採って各個体へ
     # **凍結**し、次 tick の S 判定はその 1 枚のスナップショットだけを読む(ダブルバッファ)。
     _fire_idx = len(sim.logger.events) if fire_mod.enabled(sim) else -1
+    # 環境フィードバック(第84。既定 OFF=-1 で以降を完全スキップ)。改札の流入レートを
+    # 「この step に駅ノードへ入った件数」で測るため、L1 の起点を控える(_isl/_ch と同じ流儀)。
+    _env_idx = len(sim.logger.events) if envfb_mod.enabled(sim) else -1
     # L2 業務の実体(work.service。既定OFF=-1でこの step の接客帰属を完全スキップ=バイト一致)。
     _work_idx = len(sim.logger.events) if _work_service_on(sim) else -1
     _ensure_orgs(sim)                              # 組織台帳の遅延初期化(既定OFF=no-op)
@@ -4695,6 +4709,11 @@ def run_step(sim, step: int) -> None:
     _phase_planning(sim, step, sim_min)            # 起床/帰還の直後 step に朝の一日計画
     _phase_tools(sim, step, sim_min)               # イベント開始で会場へ発つ→次の移動で反映
     _phase_move(sim, step, sim_min)
+    # 環境フィードバック(第84。既定 OFF=空 tuple=ループ 0 回=バイト一致): 前 step までに
+    # 遅延/入場規制で待たされ、駅に留まっている個体の**再試行**。_try_exit は「到着した step」
+    # にしか呼ばれないので、待たせた個体にはここでしか通る口が無い。
+    for _held in envfb_mod.pending_exits(sim, step):
+        _try_exit(sim, _held, step, sim_min)
     # 位置確定後: 共同行動/夕食共食の同席観測(既定OFF=no-op。第44バッチ)。編成→収束は済み、
     # ここで実際に POI/home で2人以上同席したグループを joint_activity で1件記録する。
     joint_mod.observe(sim, step, sim_min)          # 共同行動(S-R3)
@@ -4771,6 +4790,13 @@ def run_step(sim, step: int) -> None:
     # バッファを空にしているので、以降はこの step 分から「前回発火以降」が積み直る。
     if _isl_idx >= 0:
         _isl_accumulate(sim, _isl_idx)
+
+    # 環境フィードバック(第84・設計 §4.5「step 末に集約状態から一括」。既定 OFF=即 return)。
+    # ★ここで**世界の位置は 1 つも動かさない**: 集約量から環境状態(遅延・入場規制・待ち行列)を
+    #   進めるだけで、それを読むのは次 step 以降の作用点(改札・帰還・行き先候補)。step 途中で
+    #   計算すると step 内の処理順が結果に混入して同期バリア(第81)の意味が消える。
+    # ★観測チャンネル(下)より前に置く: ext.transit_delay がこの step 末の遅延を見る。
+    envfb_mod.update(sim, step, sim_min, _env_idx)
 
     # 観測チャンネル o_c(t)(第80。既定 OFF は上の _ch_idx=-1 でここに入らない)。
     # **読むだけ**: 世界状態から決定論計算してサイドカーへ積むだけで、L1/L2/L3・乱数・

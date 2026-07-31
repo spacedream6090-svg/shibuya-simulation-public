@@ -229,6 +229,13 @@ def _world_values(sim) -> tuple[float, float | None]:
     transit = getattr(sim, "transit", None)
     delay = 1.0 if (transit is not None
                     and bool(getattr(transit, "suspended", False))) else 0.0
+    if delay == 0.0:
+        # 第84バッチ: 環境フィードバック 規則1 の内生的な遅延(ホーム密度→停車時間延長)。
+        # 本チャンネルは第80 では災害の運休しか見ておらず、災害 OFF のランでは定数(σ=0)
+        # だった。ここが 1 になるのは **エージェントの行動が作った遅延**であって、外から
+        # 与えたショックではない(= 環が閉じたことの観測側の証拠)。OFF は常に 0.0=不変。
+        from .. import envfeedback as _envfb
+        delay = _envfb.delay_flag(sim)
     weather = getattr(sim, "today_weather", None)
     temp: float | None = None
     if isinstance(weather, dict) and weather.get("temp_hi") is not None:

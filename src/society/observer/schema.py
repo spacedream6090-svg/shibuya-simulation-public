@@ -309,6 +309,15 @@ register_event_kind("watch_spec", "監視仕様(期待値 ô + 名前付きト�
                                   "{status, clamped, n_expect?, n_trigger?, names?}")
 register_event_kind("cog_theta",  "閾値 θ の恒常性を日境界で 1 回適用した"
                                   "{day, fbar, fired, theta_mult}")
+# ---- 環境フィードバック(エージェント → 環境)第84バッチ(env.feedback ON のみ・既定 OFF=0件)。
+#      設計 §4.2 の最小 3 規則(ホーム密度→停車時間延長→遅延伝播 / 改札飽和→入場規制 /
+#      POI 占有>容量→待ち行列→他 POI へ流出)。§4.3「どのエージェントの行動が、どの物理量を、
+#      どれだけ動かし、どの閾値を超えたか」を 1 種のイベントで辿れるようにする。
+#      世界側の発火は agent_id=-1、個体が待たされた記録は当人の agent_id で出す。
+#      実装 src/society/envfeedback.py。**プロンプトには 1 バイトも足さない**。
+register_event_kind("env_feedback", "集約物理量の閾値超過でコード側が発火した環境イベント"
+                                    "{rule, metric, value, threshold, excess, node?, phase?, "
+                                    "delay_min?, injected_min?, until_step?, effect?, wait_steps?}")
 
 
 @dataclass

@@ -337,7 +337,12 @@ def test_open_hours_narrowing_closes_shops(tmp_path):
 
 # ============================================================ 予約フィールド(未消費)
 def test_reserved_fields_recorded_but_not_consumed(tmp_path):
-    """gate_capacity / open_hours.pois は受理・記録されるが世界には効かない(正直な記録)。"""
+    """gate_capacity / open_hours.pois は受理・記録されるが世界には効かない(正直な記録)。
+
+    ★第84バッチ以降の条件つき: gate_capacity は **env.feedback.gate が有効なときだけ**
+    消費される(consumed=true になる)。このランは env.feedback 既定 OFF なので第67 の契約
+    (未消費)がそのまま成り立つ。消費側の検証は tests/test_envfeedback.py にある。
+    """
     path = _profile(tmp_path, "reserved",
                     {"name": "reserved",
                      "gate_capacity": {"main": 0.5},

@@ -123,15 +123,30 @@ def is_open_poi(cfg: dict, poi: dict, sim_min: int) -> bool:
 
 
 def filter_open(sim, pois: list, sim_min: int) -> list:
-    """行き先候補 pois から閉店中の POI を除外する(commerce ON 時のみ)。
+    """行き先候補 pois から閉店中・混雑中の POI を除外する(該当機構が ON のときだけ)。
 
     OFF(または未設定)なら pois をそのまま返す=候補・以降の draw 順とも不変(バイト一致)。ON 時は
     is_open(時刻の純関数)で決定論フィルタ。R1: 除外は物理位置=co-location を変えうるが k 非依存
-    (時刻・config のみ参照)=compute_matched 下の k 不変性で担保。"""
-    if not enabled(sim):
-        return pois
-    cfg = sim.commercecfg
-    return [p for p in pois if is_open_poi(cfg, p, sim_min)]
+    (時刻・config のみ参照)=compute_matched 下の k 不変性で担保。
+
+    第84バッチ(環境フィードバック 規則3): 占有>容量で待ち行列になっているノードもここで外す。
+    **新しい選択ヒューリスティックは足さない**=既存の「候補から消えたら別の候補が選ばれる」
+    経路をそのまま使う(= 他 POI へ流出)。★安全弁: 除外で候補が全滅するときは除外しない
+    (行き先を失って世界が固まるのを防ぐ=発散対策の上限側)。env.feedback OFF なら空集合。
+    """
+    from . import envfeedback as _envfb
+    blocked = _envfb.blocked_nodes(sim)
+    if not enabled(sim) and not blocked:
+        return pois                                 # ★同一オブジェクトを返す(既存の契約)
+    out = pois
+    if enabled(sim):
+        cfg = sim.commercecfg
+        out = [p for p in out if is_open_poi(cfg, p, sim_min)]
+    if blocked:
+        kept = [p for p in out if p.get("node") not in blocked]
+        if kept:
+            out = kept
+    return out
 
 
 def tick_shop_state(sim, step: int, sim_min: int) -> None:

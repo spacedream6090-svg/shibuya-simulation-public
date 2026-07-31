@@ -621,6 +621,34 @@ FEATURES: tuple[Feature, ...] = (
        "観光・多言語・犯罪・治安"),
     _f("society_diversity.avoid_danger", "strict", False, "none",
        "危険地帯を自由時間の行き先から避ける"),
+    # ---- 環境フィードバック(エージェント → 環境。第84バッチ・設計 §4)----
+    _f("env.feedback.enabled", "strict", False, "possible",
+       "環境フィードバック最小 3 規則(第84バッチ。設計 §4)。これまで一方向だった"
+       "『環境 → エージェント』に逆向きの矢印を 1 本通し、**行動 → 集約物理量 → 閾値超過 →"
+       "環境イベント → 知覚 → 行動**の環を閉じる。規則は §4.2 の最小構成 3 本のみ"
+       "(ホーム密度→停車時間延長→遅延伝播 / 改札飽和→入場規制 / POI 占有>容量→待ち行列→"
+       "他 POI へ流出)。★エージェントは環境イベントを宣言できない(§4.1)= 発火判定は"
+       "すべてコード側の集約量で、LLM 呼び出し 0 本・乱数 0 本の完全決定論=strict。"
+       "★affects_k=false: generate() の呼び出し点を 1 つも足さない。遅延・規制で"
+       "co-location が変わり発火数が間接的に動きうるのは commerce/disaster/health と同型で、"
+       "ここを true にすると本リポジトリのほぼ全機能が true になる(レジストリ冒頭の方針)。"
+       "★fingerprint_risk=possible: プロンプトの文面・欄は 1 バイトも変えないが、"
+       "『駅から出られない』『行きたかった店が候補に無い』という**当人にとって観測可能な"
+       "世界の事実**が ON のときだけ起きる(commerce の閉店除外と同じ等級)。"
+       "★発散対策(§4.4)は 3 規則すべてに減衰項+上限を入れて T5 で実測固定してある。"
+       "既定 OFF では envfeedback.py が 1 度も状態を作らない=L1/L2/L3・乱数・呼数バイト一致"),
+    _f("env.feedback.transit.enabled", "strict", False, "possible",
+       "規則1: ホーム負荷(駅ノードの同時滞在人数 + その step の乗降人数)が閾値を超えると"
+       "停車時間が延び、遅延が回復運転項 γ<1 で次の発車へ持ち越される。遅延は駅からの"
+       "退出/帰還を待たせ、第80 の観測チャンネル ext.transit_delay を初めて非ゼロ分散にする"),
+    _f("env.feedback.gate.enabled", "strict", False, "possible",
+       "規則2: 改札への流入レートが処理能力(world.mod.gate_capacity の係数を掛けた"
+       "capacity_per_min×Δt)を超えると入場規制が発動する。**第67バッチの予約フィールド"
+       "gate_capacity をここで初めて消費する**(summary の consumed が true になる)"),
+    _f("env.feedback.poi.enabled", "strict", False, "possible",
+       "規則3: POI ノードの占有が容量を超えると待ち行列イベントを出し、そのノードを"
+       "一定 step のあいだ行き先候補から外す(既存の commerce.filter_open 経路を使う="
+       "新しい選択ヒューリスティックを足さない)"),
 )
 
 BY_ID: dict[str, Feature] = {f.id: f for f in FEATURES}

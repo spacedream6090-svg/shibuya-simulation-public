@@ -178,6 +178,15 @@ def save(sim, step: int, path: str | Path) -> Path:
             # cognition.fire OFF のランでは None = 挙動不変(load は .get で旧 ckpt 互換)。
             "cogq": (sim.cogq.state() if getattr(sim, "cogq", None) is not None
                      else None),
+            # 第84バッチ: 環境フィードバックの状態(遅延[分]・入場規制の解除/クールダウン step・
+            # 待ち行列で除外中の POI ノード → 解除 step・累積カウンタ)。**これを保存しないと
+            # resume 直後に遅延 0・規制なしへ戻り、環境の履歴(回復運転で減衰していく途中の値)が
+            # 消える**= resume≠straight。第62 joint / 第70 echo / 第75 dunbar / 第80 W2 と同じ型の
+            # 中央管理。個体側の待ち(_env_exit_wait / _env_exit_held / _env_ret_*)は agents pickle
+            # に自然同梱される。POI ノード除外は dict(集合ではない)ので反復順は決定論。
+            # env.feedback OFF のランでは属性自体が生えない → None=挙動不変(load は .get で
+            # 旧 checkpoint 互換)。
+            "envfb_state": getattr(sim, "_envfb", None),
             # 第82バッチ: θ 恒常性の日境界の進行(**日オーダーの時定数**なので、これを
             # 保存しないと resume 直後に「初日扱い」へ戻って 1 日ぶんの恒常性が飛ぶ)。
             # g / ē / credit / 監視仕様(_fire_watch)は agents pickle に自然同梱される。
@@ -310,6 +319,10 @@ def load(sim, path: str | Path) -> int:
     if getattr(sim, "cogq", None) is not None:
         from ..cognition.fire import CogQueue as _CogQueue
         sim.cogq = _CogQueue.restore(rt.get("cogq"))
+    # 第84: 環境フィードバックの状態(旧 checkpoint 互換=無ければ素通り=OFF ランは無風)。
+    efb = rt.get("envfb_state")
+    if efb is not None:
+        sim._envfb = efb
     # 第82: θ 恒常性の日境界(旧 checkpoint 互換 = 無ければ -1 = 従来どおり初日扱い)。
     sim._g_day = int(rt.get("g_day", -1))
     if hasattr(sim, "_journal_rewind"):         # 第71: LLM ジャーナルを確定点まで巻き戻す

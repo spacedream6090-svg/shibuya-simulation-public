@@ -628,6 +628,20 @@ class Simulation:
         self._infra_until_day = -1                 # インフラ障害の解除日(day-index。exclusive)
         self._infra_kind = None                    # 発生中の障害種別(停電/通信断/断水)
         self.today_disaster_line = None            # 当日の災害1行(disaster 有効かつ発生中のみ非 None)
+        # 環境フィードバック(エージェント → 環境。第84バッチ 2026-08-01。設計 §4)。既定 OFF=完全同一。
+        # 集約物理量の閾値超過で**コード側が**環境イベントを発火する層(§4.1: エージェントは
+        # 環境イベントを宣言できない)。規則は §4.2 の最小 3 本(ホーム密度→停車時間延長→遅延伝播 /
+        # 改札飽和→入場規制 / POI 占有>容量→待ち行列→他 POI へ流出)。LLM 0 本・乱数 0 本=strict。
+        # disaster の直後に置く=どちらも「世界側の事象」だが、災害は**外生ショック**、こちらは
+        # **エージェントの行動が作った内生の事象**という対比が読めるようにしてある。
+        # OFF=env_feedback 0 件・状態(_envfb)すら生えない=L1 バイト一致・draw 不変。実装 envfeedback.py。
+        from .. import envfeedback as _envfb_mod
+        raw_envfb = (cfg.get("env", None) or {})
+        raw_envfb = (OmegaConf.to_container(raw_envfb, resolve=True)
+                     if OmegaConf.is_config(raw_envfb) else dict(raw_envfb))
+        self.envfbcfg = _envfb_mod.build_cfg(raw_envfb.get("feedback"))
+        # 第67 の予約フィールド world.mod.gate_capacity を「消費済み」に記録し直す(正直な summary)。
+        _envfb_mod.mark_gate_capacity_consumed(self)
         # 生活の偶発イベント層(第54バッチ 2026-07-23。純観察=不確実性許容モードの柱。既定 OFF=現行挙動と完全同一)。
         # 臨時収入/財布紛失(money±)+ 偶然の出会い(closeness+)を単一 chance_event に束ね、日境界に専用 stream
         # "chance"((agent, day) 個体別キー)で抽選する。効果は money/relations/記憶のみ=ドライブ/発火に流さない

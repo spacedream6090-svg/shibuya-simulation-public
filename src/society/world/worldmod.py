@@ -10,7 +10,7 @@ scenario が「実行中に起きる摂動(時間軸あり)」なのに対し、
   2. `edge_speed_scale`  … 指定エッジ集合の速度係数(歩道幅の代理)。走行コスト長へ写して
                             経路選択と移動所要 step の双方に効かせる(CityMap.scale_edge_cost)
   3. `open_hours`        … 営業時間のオーバーライド(cat 単位。POI 単位は予約=後述)
-  4. `gate_capacity`     … 駅ゲート容量の係数(**予約フィールド・本バッチでは未消費**=後述)
+  4. `gate_capacity`     … 駅ゲート容量の係数(第67では予約=未消費。**第84バッチで消費開始**=後述)
 
 エッジ集合の指定は 2 通り(どちらも同一セレクタ構造):
   - `edges`: `[[u, v], ...]` の明示リスト(順不同。`{u: .., v: ..}` 形式も受ける)
@@ -31,10 +31,15 @@ no-fingerprint 契約: このファイルは `world/` 配下=静的検査の対�
   しない**。地図・エッジ属性・commerce 設定のいずれも触らない=新イベント 0 件・新状態なし・
   L1 バイト一致・draw 数同一(乱数は元々使わない)。
 
-★ `gate_capacity` について正直な但し書き: 現行エンジンに「駅ゲートの容量」という概念は存在しない
-  (`world.edge_capacity` は道路エッジの混雑減速であって改札ではない)。したがって本バッチでは
-  **スキーマ上のフィールドとして受理・検証・summary への記録までを行い、実効は持たせない**。
-  値を消費するのは将来バッチ(計画書レーン3 の H_B / 屋外物理層)。
+★ `gate_capacity` について(第67 の但し書き → 第84 で解消): 第67 時点のエンジンには「駅ゲートの
+  容量」という概念が存在しなかった(`world.edge_capacity` は道路エッジの混雑減速であって改札では
+  ない)ため、**スキーマ上のフィールドとして受理・検証・summary への記録までを行い、実効は
+  持たせない**予約フィールドだった。**第84バッチ(環境フィードバック 規則2「改札スループット
+  飽和 → 入場規制」)がこれを消費する**: `env.feedback.gate` が有効なとき、改札の処理能力
+  (`env.feedback.gate.capacity_per_min` × Δt)にこの係数を掛ける(= 「もし改札が半分の広さ
+  だったら」という反実仮想)。`env.feedback` が無効なランでは第67 と同じ「未消費」のまま
+  (summary の `reserved_not_consumed.gate_capacity.consumed` が false)。
+  消費されたときは同じ場所に `consumed: true` と `consumer` が入る(正直な記録)。
 ★ `scenario.shock_closure` との併用は本バッチでは想定していない: 両者は同じ `edge["closed"]`
   フラグを使い、shock_closure の解除は「自分が閉じた集合」を無条件に pop するため、静的条件で
   閉じたエッジまで開いてしまう。併用が要るようになったら scenario 側の解除を「自分が立てた分
@@ -167,8 +172,9 @@ class WorldMod:
         if applied_rules:
             self.applied["edge_speed_scale"] = applied_rules
 
-        # 3) 駅ゲート容量 = 予約フィールド(現行エンジンに容量概念が無い。冒頭 docstring 参照)。
-        #    値の検証と記録だけ行い、世界には一切触れない(=未消費であることを summary で明示)。
+        # 3) 駅ゲート容量。ここでは**値の検証と記録だけ**行い、地図・グラフには一切触れない
+        #    (ワールド構築時に効かせる相手が無い)。実際に読むのは第84バッチの環境フィードバック
+        #    規則2(envfeedback.gate_scale)で、そのランでは consumed が true に書き換わる。
         gate = dict(_to_plain(self.doc.get("gate_capacity")) or {})
         if gate:
             for k, v in gate.items():

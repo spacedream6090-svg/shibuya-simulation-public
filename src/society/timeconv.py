@@ -195,6 +195,15 @@ TABLE: tuple[tuple[str, str, str], ...] = (
 
     # ---- 毎 step の予算 ----
     ("lod.max_llm_per_step", RATE, "LLM 発火の step 上限(1日あたりの総量を保つ)"),
+    ("env.feedback.transit.dwell_sec_per_pax", RATE,
+     "超過1人あたりの停車時間延長[秒]。**1 step ぶんの注入量**として使うので、Δt が伸びれば"
+     "その step に含まれる発車回数が増える=線形にスケールする(第84バッチ)"),
+    ("env.feedback.transit.dwell_cap_min", RATE,
+     "1 step ぶんの注入の上限[分]。上の注入量そのものの天井なので**同じ次元=同じスケール**で"
+     "動かす(不変にすると Δt を細かくしたとき天井だけが相対的に高くなる。第84バッチ)"),
+    ("env.feedback.transit.recovery", KEEP,
+     "回復運転項 γ<1。**毎 step 遅延に掛ける残存割合**なので Δt でべき変換する"
+     "(γ' = γ^(Δt/10))。線形にすると Δt を細かくしたとき遅延が消えなくなる(第84バッチ)"),
 
     # ---- step 単位の持続長・窓・TTL・クールダウン(逆比例)----
     ("world.outside_steps", STEPS, "範囲外滞在の長さ [step]"),
@@ -223,6 +232,12 @@ TABLE: tuple[tuple[str, str, str], ...] = (
     ("services.services.*.stay", STEPS, "サービス滞在 [step]"),
     ("delivery.min_eta_steps", STEPS, "配送 ETA の下限 [step]"),
     ("delivery.max_eta_steps", STEPS, "配送 ETA の上限 [step]"),
+    # ---- 環境フィードバック(第84バッチ)。持続長・上限は実時間で保つ ----
+    ("env.feedback.transit.max_hold_steps", STEPS,
+     "1 回の退出/帰還で待たせる合計の上限 [step]。実時間で同じ長さを保つ(発散対策の安全弁)"),
+    ("env.feedback.gate.hold_steps", STEPS, "入場規制の継続 [step]"),
+    ("env.feedback.gate.cooldown_steps", STEPS, "規制解除後に再発動しない期間 [step]"),
+    ("env.feedback.poi.hold_steps", STEPS, "混雑 POI を行き先候補から外す長さ [step]"),
 
     # ---- 不変(理由つき)。棚卸し grep のヒットを取りこぼさないための宣言 ----
     ("envpack.media.video", INVARIANT,
@@ -298,6 +313,17 @@ TABLE: tuple[tuple[str, str, str], ...] = (
     ("cognition.g_update.log_every_steps", INVARIANT,
      "g/θ 軌跡サイドカーの採取間隔。観測装置の設定で世界の因果に触れない"
      "(cognition.channels.every_steps と同じ扱い)"),
+    # ---- 環境フィードバック(第84バッチ)の不変量。人数・物理分は Δt に依存しない ----
+    ("env.feedback.log_every_steps", INVARIANT,
+     "環境イベントの記録間引き。観測装置の設定(cognition.channels.every_steps と同じ扱い)"),
+    ("env.feedback.transit.platform_threshold", INVARIANT, "ホーム密度の閾値[人](頭数)"),
+    ("env.feedback.transit.delay_cap_min", INVARIANT,
+     "遅延の絶対上限[分]。**世界の物理時間**(15 分の遅れは Δt に関わらず 15 分)なので不変"),
+    ("env.feedback.transit.flag_min", INVARIANT, "観測チャンネルを 1 にする遅延[分](物理時間)"),
+    ("env.feedback.gate.capacity_per_min", INVARIANT,
+     "改札の処理能力[人/分]。**毎分レート**なので Δt 非依存(コード側が Δt を掛ける)"),
+    ("env.feedback.poi.capacity", INVARIANT, "POI ノードの収容人数[人](頭数)"),
+    ("env.feedback.poi.max_nodes", INVARIANT, "同時に除外できるノード数の上限(件数)"),
     ("experiment.g_init.flat_value", INVARIANT, "条件 F/N の trait 定数(無次元)"),
     ("experiment.g_init.sigma0", INVARIANT, "条件 N のノイズ相対分散 σ₀(無次元)"),
     ("beliefs.fact_kinds.event_host", INVARIANT, "fact 種の写像定義(数値ではない)"),
