@@ -647,7 +647,7 @@ def _route_to(sim, agent, node: str) -> bool:
     # 既存の move_to 経路と同じ既定に揃える(engine の到着処理がこれらを読む)。
     agent.exit_intent = False
     agent.homing = False
-    agent._pending_stay = 2
+    agent._pending_stay = sim.clock.dur_steps(2)
     agent._pending_activity = ""
     agent._ride_pending = None
     return True

@@ -747,13 +747,14 @@ def _bus_ride_hold(sim, agent, dest, step: int) -> None:
     if not ride or ride.get("mode") != "bus" or "wait_s" not in ride:
         return
     speeds = sim.cfg.world.modes.speeds
-    car_m_per_s = float(speeds["car"]) / 600.0
+    car_m_per_s = float(speeds["car"]) / sim.clock.step_seconds
     fx, fy = sim.city.node_xy(agent.node)
     tx, ty = sim.city.node_xy(dest)
     free_s = math.hypot(fx - tx, fy - ty) / max(1e-6, car_m_per_s)
     delay_s = max(0.0, float(ride["ride_s"]) - free_s)
     ride["delay_s"] = round(delay_s, 1)
-    hold = transit_live.quantize_hold(float(ride["wait_s"]), delay_s)
+    hold = transit_live.quantize_hold(float(ride["wait_s"]), delay_s,
+                                      sim.clock.step_seconds)
     if hold > 0:
         agent._taxi_hold_until = step + hold
 
@@ -1110,7 +1111,8 @@ def _try_exit(sim, agent, step: int, sim_min: int) -> None:
             # 流入通勤者: 翌朝の到着時刻(arrival_min)に再流入(往復時刻を安定させる)
             agent.return_at = step + _steps_until_tod(sim_min, agent.arrival_min)
         else:
-            agent.return_at = step + agent.sleep_steps + int(rng.integers(0, 7))
+            agent.return_at = (step + agent.sleep_steps
+                               + sim.clock.dur_steps(int(rng.integers(0, 7))))
         agent.reflect_step = step + 1              # 帰路の電車で今日を内省(k 処置)
     else:
         span = sim.cfg.world.outside_steps
@@ -1615,7 +1617,7 @@ def _phase_org_accumulate(sim, step: int, sim_min: int) -> None:
         ent = _org_day_entry(sim, a.org_id)
         ent["workers"].add(int(a.id))
         if ind_on and str(getattr(a, "ind_space_type", "")) in zones:
-            ent["attendance_min"] += STEP_MINUTES
+            ent["attendance_min"] += sim.clock.step_minutes
 
 
 def _emit_org_day(sim, step: int, sim_min: int, day: int) -> list:
@@ -2503,7 +2505,7 @@ def _apply(sim, agent, action: dict, step: int, sim_min: int) -> None:
         agent.trip_mode = used_mode
         agent.exit_intent = bool(action.get("exit"))
         agent.homing = bool(action.get("homing"))
-        agent._pending_stay = int(action.get("stay_steps", 2))
+        agent._pending_stay = int(action.get("stay_steps", sim.clock.dur_steps(2)))
         agent._pending_activity = str(action.get("activity", ""))
         agent._ride_pending = action.get("ride")   # 交通機関の乗車(到着時に課金)。無ければ None
         agent.activity = "commuting" if action.get("activity") == "commuting" else ""
@@ -3371,7 +3373,8 @@ def _apply_free_action(sim, agent, action: dict, step: int, sim_min: int) -> Non
             agent.edge_offset = 0.0
             agent.dest = dest
             agent.trip_mode = used_mode
-            agent._pending_stay = max(1, min(24, round(minutes / 10)))
+            agent._pending_stay = max(1, min(sim.clock.dur_steps(24),
+                                            round(minutes / sim.clock.step_minutes)))
             agent._pending_activity = ""
         else:
             dest = None
@@ -3912,7 +3915,8 @@ def _phase_health(sim, step: int, sim_min: int) -> None:
         if agent.visitor:
             continue
         rng = sim.hub.stream("health", agent.id, step)  # 新 stream(既存 draw 順に影響しない)
-        ill = health_mod.roll_illness(agent, cfg, rng, step)
+        ill = health_mod.roll_illness(agent, cfg, rng, step,
+                                      sim.clock.steps_per_day)
         if ill is not None:
             _log_health(sim, agent, "illness", ill, step, sim_min)
             if ill["state"] == "onset":
@@ -4288,13 +4292,14 @@ def _meeting_zone(zone_types: list, meeting_types: list, exclude=None):
     return None
 
 
-def _indoor_cell_offset(building: str, floor: int, step: int) -> float:
+def _indoor_cell_offset(building: str, floor: int, step: int,
+                        step_seconds: float = float(STEP_MINUTES * 60)) -> float:
     """遷移の step 内オフセット秒 [0,600)(2層タイムライン: t = step*600 + offset + サブ時刻)。
 
     セル(建物,階)+step の安定ハッシュ=決定論・run.seed 非依存・resume 不変。1セル1積分に共通の
     オフセットを与え(遭遇の相対時刻整合を保つ)、正直な近似: 個別遷移ごとではなくセル単位の offset。"""
     return indoor_flow_mod._stable_uniform(f"{building}:{int(floor)}:{int(step)}",
-                                           "indoor_offset") * float(STEP_MINUTES * 60)
+                                           "indoor_offset") * float(step_seconds)
 
 
 def _indoor_zone_point(layout: dict, zi: int, agent_id, building: str, floor: int):
@@ -4369,7 +4374,7 @@ def _indoor_meetings(sim, step: int, sim_min: int, cells: dict, icfg: dict) -> s
             if len(members) < min_party:
                 continue
             occurs, meet_min = _indoor_meeting_plan(sim, gk, day, prob, w0, w1)
-            if not (occurs and meet_min <= tod < meet_min + STEP_MINUTES):
+            if not (occurs and meet_min <= tod < meet_min + sim.clock.step_minutes):
                 continue
             cell = sim.indoor.get(building, int(floor))
             if _meeting_zone(cell["zone_types"], mtypes) is None:
@@ -4515,8 +4520,9 @@ def _phase_indoor(sim, step: int, sim_min: int) -> None:
             by_recs = [{"agent_id": a.id, "pos": (a.ind_x, a.ind_y)} for a in byst]
             res = indoor_flow_mod.integrate_transition(layout, walls, doors, movers,
                                                        by_recs, params)
-            offset_s = _indoor_cell_offset(building, floor, step)
-            base_t = step * (STEP_MINUTES * 60) + offset_s
+            offset_s = _indoor_cell_offset(building, floor, step,
+                                           sim.clock.step_seconds)
+            base_t = step * sim.clock.step_seconds + offset_s
             dstmap = {m["agent_id"]: m["dst_zone"] for m in movers}
             if tracks is not None:
                 for (aid, t_sub, x, y) in res.samples:

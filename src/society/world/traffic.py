@@ -23,7 +23,8 @@ import networkx as nx
 from .geom import rdp
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-STEP_SECONDS = 600                       # 1 step = 10 分 = 600 秒
+STEP_SECONDS = 600                       # 正準 Δt での 1 step = 10 分 = 600 秒
+STEP_MINUTES = 10                        # 正準 Δt。実行時は TrafficFlow.step_minutes
 
 # 時間帯プロファイル(0時〜23時の相対重み。朝夕ピーク・深夜減)
 HOURLY = [0.20, 0.12, 0.10, 0.10, 0.15, 0.35, 0.60, 1.00, 1.35, 1.25,
@@ -41,13 +42,21 @@ def _hash_frac(text: str) -> float:
 
 class TrafficFlow:
     def __init__(self, city, router, hub, *, enabled: bool = True,
-                 cars_per_day: int = 30000, max_log: int = 120):
+                 cars_per_day: int = 30000, max_log: int = 120,
+                 step_minutes: int = STEP_MINUTES):
         self.city = city
         self.router = router
         self.hub = hub
         self.enabled = enabled and len(getattr(city, "car_gateways", [])) >= 2
         self.cars_per_day = int(cars_per_day)
         self.max_log = int(max_log)
+        # 中央 Δt(第79バッチ)。既定 10 = 従来の直書き(600 秒 / 6 step 毎時 / 144 step 毎日)。
+        self.step_minutes = int(step_minutes)
+        self.steps_per_hour = max(1, 60 // self.step_minutes)
+        self.steps_per_day = max(1, 1440 // self.step_minutes)
+        self.step_seconds = float(self.step_minutes) * 60.0
+        # 速度スケール(m/step)= RATE 類。Δt=10 で厳密に 1.0(恒等=バイト一致)。
+        self._v = self.step_minutes / float(STEP_MINUTES)
         self.gates = list(getattr(city, "car_gateways", []))
         self.cars: list[dict] = []          # {route:[nodes], node, offset, speed}
         self.n_active = 0                   # step をまたいで走行中の車
@@ -170,7 +179,8 @@ class TrafficFlow:
 
         # ---------------- ambient(現行実装。一切変更しない)----------------
         rng = self.hub.stream("traffic", step)
-        lam = self.cars_per_day * HOURLY[(sim_min % 1440) // 60] / (_HOURLY_SUM * 6)
+        lam = (self.cars_per_day * HOURLY[(sim_min % 1440) // 60]
+               / (_HOURLY_SUM * self.steps_per_hour))
         for _ in range(int(rng.poisson(lam))):
             car = self._spawn(rng)
             if car:
@@ -218,6 +228,8 @@ class TrafficFlow:
             if mode == "car" and len(path) >= 2:
                 # 実勢速度 20〜35km/h(信号込み)→ 1step(10分)あたり 3300〜5800m
                 speed = float(rng.uniform(3300.0, 5800.0))
+                if self._v != 1.0:              # m/step = RATE(Δt=10 では通らない)
+                    speed *= self._v
                 return {"route": path[1:], "node": path[0], "offset": 0.0,
                         "speed": speed}
         return None
@@ -259,11 +271,11 @@ class TrafficFlow:
         一様到着の期待待ち = r²·C/2。それを当該速度で走れた距離に読み替えて差し引く。"""
         r = self.signal_red.get(node, 0.0)
         delay_s = r * r * self.signal_cycle_s * 0.5
-        return speed * delay_s / STEP_SECONDS
+        return speed * delay_s / self.step_seconds
 
     def _step_od(self, step: int, sim_min: int) -> list[dict]:
         weight = HOURLY[(sim_min % 1440) // 60]
-        base = self.od_cars_per_day / 144.0 * (weight / _HOURLY_MEAN)
+        base = self.od_cars_per_day / float(self.steps_per_day) * (weight / _HOURLY_MEAN)
         lam_gate = base / len(self.od_gateways)
         # スポーン: 出入口ごとに Poisson。乱数は新 stream("car_spawn", gate_idx, step)。
         for gi, gate in enumerate(self.od_gateways):

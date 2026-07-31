@@ -21,6 +21,7 @@ from ..observer import manifest as manifest_mod
 from ..observer.logger import ObserverLogger
 from ..observer.provenance import ItemStore
 from ..rng import RngHub
+from .. import timeconv as _timeconv
 from ..world.clock import Clock, STEP_MINUTES
 from ..world.map import CityMap
 from ..world.routing import Router
@@ -103,19 +104,23 @@ def _parse_start_tod(v) -> int:
     return int(s) % 1440
 
 
-def _natural_wake_step(start_tod: int, bedtime_min: int, sleep_steps: int) -> int | None:
+def _natural_wake_step(start_tod: int, bedtime_min: int, sleep_steps: int,
+                       step_minutes: int = STEP_MINUTES) -> int | None:
     """開始時刻(分 of day)が自然な睡眠区間 [bedtime, bedtime+sleep) に入るなら、残りの睡眠を
-    step 数(1 step=STEP_MINUTES 分)へ切り上げて返す。区間外(=開始時に覚醒しているべき)は
+    step 数(1 step=step_minutes 分)へ切り上げて返す。区間外(=開始時に覚醒しているべき)は
     None。1440 分の円環で判定し、乱数を一切使わない決定論導出(初日コールドスタート改善の核)。
-    夜勤者(bedtime が日中側)や日中開始(将来 start 時刻をずらした場合)でも同じ式で自然に働く。"""
-    dur = int(sleep_steps) * STEP_MINUTES
+    夜勤者(bedtime が日中側)や日中開始(将来 start 時刻をずらした場合)でも同じ式で自然に働く。
+
+    step_minutes 既定 = 正準 10(第79バッチ以前の呼び出しと完全同一)。"""
+    sm = int(step_minutes)
+    dur = int(sleep_steps) * sm
     if dur <= 0:
         return None
     since = (int(start_tod) - int(bedtime_min)) % 1440    # 就寝からの経過分(円環)
     if since >= dur:
         return None                                        # もう起きているべき時刻=覚醒開始
     remain = dur - since                                   # 残りの睡眠(分)。since<dur なので >=1
-    return (remain + STEP_MINUTES - 1) // STEP_MINUTES      # step 数へ切り上げ(>=1)
+    return (remain + sm - 1) // sm                         # step 数へ切り上げ(>=1)
 
 
 class Simulation:
@@ -194,7 +199,12 @@ class Simulation:
         # 開始時刻(run.start_tod="HH:MM"。既定 "07:00"=420 分=現行値=バイト一致)。分 of day へ
         # 解釈して Clock へ渡す。day 境界・時刻表示・夜内省/朝計画・natural_start は全て clock 由来の
         # sim_min から決定論導出するので、この 1 点の配線だけで開始時刻の仮定が全経路へ波及する。
-        self.clock = Clock(start_min=_parse_start_tod(cfg.run.get("start_tod", "07:00")))
+        # 中央 Δt(第79バッチ)。run.dt_min 既定 10 = STEP_MINUTES = 従来と完全同一。
+        # 以後「1 step は何分か」は self.clock.step_minutes(および steps_per_day/
+        # steps_per_hour/step_seconds)だけが供給する = 単一源。
+        self.dt_min = _timeconv.dt_of(cfg)
+        self.clock = Clock(start_min=_parse_start_tod(cfg.run.get("start_tod", "07:00")),
+                           step_minutes=self.dt_min)
         self.logger = ObserverLogger(self.out_dir)
         self.items = ItemStore()
         # ---- 場所の意味づけ最小版 D1(labeling.place_binding。既定 OFF=完全 no-op=バイト一致)----
@@ -367,7 +377,8 @@ class Simulation:
             self.city, self.router, self.hub,
             enabled=bool(tcfg.get("enabled", True)),
             cars_per_day=int(tcfg.get("cars_per_day", 30000)),
-            max_log=int(tcfg.get("max_log", 120)))
+            max_log=int(tcfg.get("max_log", 120)),
+            step_minutes=self.dt_min)
         # インターネット層(SNS/ニュース/検索/DM)
         from ..net.internet import Internet
         ncfg = cfg.get("net", {})
@@ -704,7 +715,7 @@ class Simulation:
                 minute = int(ev.get("day", 0)) * 1440 + int(h) * 60 + int(m)
                 # event の day/time は絶対 sim 分(day*1440+時刻)。step = (sim分 - 開始分)/STEP。
                 # 開始分は clock.start_min(run.start_tod。既定 420=07:00 で従来の 7*60 とバイト一致)。
-                step = (minute - self.clock.start_min) // STEP_MINUTES
+                step = (minute - self.clock.start_min) // self.clock.step_minutes
                 if step >= 0:
                     self.world_events.append({**ev, "step": step})
         # 摂動シナリオ(#8: 封鎖/イベント注入)。既定 baseline = 完全 no-op。
@@ -869,7 +880,8 @@ class Simulation:
                                     drift=self.drivecfg["drift"],
                                     reflection=self.reflectcfg,
                                     place_name=self.place_name,
-                                    flat=self.flatcfg)
+                                    flat=self.flatcfg,
+                                    dt_min=self.dt_min)
                 self._init_agent_runtime(agent)
                 # 群のオントロジー(既定 OFF=no-op)。直接ランは tier=default(プール非使用)。
                 self._apply_ontology(agent, "default")
@@ -1131,7 +1143,8 @@ class Simulation:
             if agent.visitor or agent.commute:             # 自宅が圏外 = 対象外
                 continue
             wake_step = _natural_wake_step(start_tod, agent.bedtime_min,
-                                           agent.sleep_steps)
+                                           agent.sleep_steps,
+                                           self.clock.step_minutes)
             if wake_step is None:                          # 覚醒しているべき→従来どおり覚醒で着席
                 continue
             home = agent.home_node or ""
@@ -1212,7 +1225,7 @@ class Simulation:
         agent._heard_unknown = False
         agent._arrived_new = False
         agent._congestion = 1.0
-        agent._pending_stay = 2
+        agent._pending_stay = self.clock.dur_steps(2)
         agent._pending_activity = ""
         agent._ride_pending = None             # 交通機関の乗車(到着時に運賃を払う)
         agent._search_queue = []
@@ -1231,6 +1244,11 @@ class Simulation:
         agent.conv_turns_left = int(self.drivecfg["conv_max_turns"])
         agent.conv_cooldown_until = 0
         agent.mem.relations_max = self.relations_max   # B6: 台帳上限(既定0=無制限)
+        # 中央 Δt(第79バッチ): recency_decay は「毎 step の残存割合」= KEEP 類。
+        # 既定 Δt=10 では scale_keep が恒等(この行自体を通らない)=バイト一致。
+        if self.dt_min != _timeconv.CANON_DT_MIN:
+            agent.mem.recency_decay = _timeconv.scale_keep(agent.mem.recency_decay,
+                                                           self.dt_min)
         if self.actrcfg.get("enabled", False):
             # 個体別シードは run.seed から決定論導出(専用streamのみで消費=既存draw順不変)
             overrides = {k: v for k, v in self.actrcfg.items()
@@ -1309,7 +1327,8 @@ class Simulation:
                             drift=self.drivecfg["drift"],
                             reflection=self.reflectcfg,
                             place_name=self.place_name,
-                            flat=self.flatcfg)
+                            flat=self.flatcfg,
+                            dt_min=self.dt_min)
         agent.pool_pid = pid
         # party_size(L4 来街者 record に実在=同行人数)を保持(S-R5 party の実体化が読む。無ければ None)。
         agent.party_size = record.get("party_size")
@@ -1562,7 +1581,8 @@ class Simulation:
         if _ifcfg["days"] > 0:
             _if = _iframe.summarize(self.out_dir, _ifcfg["days"],
                                     _ifcfg["top_kinds"],
-                                    _norms_mod.cfg_of(self)["markers"])
+                                    _norms_mod.cfg_of(self)["markers"],
+                                    self.clock.step_minutes)
             if _if is not None:
                 summary["initial_frame"] = _if
         (self.out_dir / "summary.json").write_text(

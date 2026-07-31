@@ -151,8 +151,11 @@ class RuleBook:
 
     # ------------------------------------------------------------------ 制定
     def enact(self, rule, *, name: str, proposer: int, step: int,
-              day: int) -> dict | None:
-        """rule を検証して活性化する。有効なら record を返し、無効なら None。"""
+              day: int, steps_per_day: int = STEPS_PER_DAY) -> dict | None:
+        """rule を検証して活性化する。有効なら record を返し、無効なら None。
+
+        steps_per_day 既定 = 正準 144(第79バッチ以前の呼び出しと完全同一)。
+        Δt≠10 のランでは呼び出し側が clock.steps_per_day を渡す(制定期間は「日」で定義)。"""
         if not self.cfg["enabled"]:
             return None
         spec = self.validate(rule)
@@ -161,7 +164,7 @@ class RuleBook:
         rid = self._seq
         self._seq += 1
         dur = self.cfg["duration_days"]
-        expire_step = (step + dur * STEPS_PER_DAY) if dur > 0 else None
+        expire_step = (step + dur * int(steps_per_day)) if dur > 0 else None
         record = {**spec, "id": rid, "name": name, "proposer": int(proposer),
                   "enacted_step": int(step), "enacted_day": int(day),
                   "expire_step": expire_step, "last_fired_day": None, "spent": 0.0}

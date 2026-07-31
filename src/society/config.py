@@ -11,6 +11,7 @@ DEFAULT_CONFIG = REPO_ROOT / "conf" / "config.yaml"
 
 _INT_KEYS = [
     "run.seed", "run.n_agents", "run.n_steps",
+    "run.dt_min",                          # 中央 Δt(第79バッチ。既定 10=現行)
     "labeling.adopt_threshold", "lod.max_llm_per_step",
     "observer.snapshot_every", "world.edge_capacity",
     "k.reflect_period_days", "model.max_tokens", "model.reflect_max_tokens",
@@ -229,6 +230,11 @@ def load_config(overrides: list[str] | None = None,
     wb = OmegaConf.select(cfg, "k.writeback")
     if isinstance(wb, bool):
         OmegaConf.update(cfg, "k.writeback", "off" if not wb else "free")
+    # 中央 Δt(第79バッチ)。run.dt_min=10(既定)なら **1 バイトも触らない**(恒等パス)。
+    # 10 以外のときだけ timeconv の分類テーブルに従って定数を毎分レートから作り直す。
+    # 全経路がこの 1 箇所を通るので、変換点はここだけになる(散在させない)。
+    from .timeconv import apply_dt
+    cfg = apply_dt(cfg)
     return cfg
 
 

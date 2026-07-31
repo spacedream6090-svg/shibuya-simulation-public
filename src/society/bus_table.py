@@ -18,7 +18,8 @@ import json
 import math
 from pathlib import Path
 
-STEP_SECONDS = 600.0        # 1 step = 10 分 = 600s(L1 / world.modes と同じ)
+STEP_SECONDS = 600.0        # 正準 Δt での 1 step = 600s。**本 module では未使用**
+                            # (ダイヤは実時刻[分]で扱うので Δt に依存しない)
 _LON_M = 111320.0           # sumo_pipeline.project / build_map と同一の局所接平面定数
 _LAT_M = 110540.0
 

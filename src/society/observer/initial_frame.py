@@ -38,8 +38,11 @@ L2_COLUMNS = ("mean_grievance", "mean_drive", "n_fires", "n_drive_requests",
 _UTTERANCE_KINDS = ("speak", "sns_post", "dm")
 
 
-def steps_per_day() -> int:
-    return max(1, 1440 // int(STEP_MINUTES))
+def steps_per_day(step_minutes: int = STEP_MINUTES) -> int:
+    """1 日の step 数。既定 = 正準 Δt(10 分 → 144)。
+
+    第79バッチ: Δt≠10 のランでは呼び出し側が run.dt_min(= clock.step_minutes)を渡す。"""
+    return max(1, 1440 // int(step_minutes))
 
 
 def cfg_of_config(cfg_root) -> dict:
@@ -82,7 +85,8 @@ def _l2_means(run_dir: str, window: int) -> dict:
 
 
 def summarize(run_dir: str, days: int, top_kinds: int = 20,
-              markers: dict | None = None) -> dict | None:
+              markers: dict | None = None,
+              step_minutes: int = STEP_MINUTES) -> dict | None:
     """最初の `days` 日の解釈状態サマリ(ラン単位共変量)。days<=0 / L1 不在なら None。"""
     if int(days) <= 0:
         return None
@@ -92,7 +96,7 @@ def summarize(run_dir: str, days: int, top_kinds: int = 20,
     from . import measure as m
     from . import norms as _norms
 
-    spd = steps_per_day()
+    spd = steps_per_day(step_minutes)
     window = int(days) * spd
     md = dict(markers or {})
     marker_list = [s for s in (list(md.get("definite") or [])

@@ -126,7 +126,8 @@ def fatigue_threshold_delta(agent, cfg: dict) -> float:
 
 
 # ---------------------------------------------------------------- 病気(日次・新 stream "health")
-def roll_illness(agent, cfg: dict, rng, step: int) -> dict | None:
+def roll_illness(agent, cfg: dict, rng, step: int,
+                 steps_per_day: int = 144) -> dict | None:
     """病気の日次遷移(発症/回復)。副作用=agent.sick/agent.sick_until を更新。
 
     rng は呼び出し側(scheduler)が引く新 stream "health"(既存 draw 順に挿入しない=決定論・
@@ -143,7 +144,7 @@ def roll_illness(agent, cfg: dict, rng, step: int) -> dict | None:
     if p > 0.0 and rng.random() < p:
         days = int(cfg["illness_days"])
         agent.sick = True
-        agent.sick_until = step + days * 144
+        agent.sick_until = step + days * int(steps_per_day)
         return {"state": "onset", "days": days}
     return None
 

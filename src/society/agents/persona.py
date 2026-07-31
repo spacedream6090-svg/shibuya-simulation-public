@@ -68,7 +68,8 @@ def build_agent(agent_id: int, rng: np.random.Generator, nodes: list[str],
                 drift: dict | None = None,
                 reflection: dict | None = None,
                 place_name: str = "この街",
-                flat: dict | None = None) -> Agent:
+                flat: dict | None = None,
+                dt_min: int = 10) -> Agent:
     """entry(scripts/build_personas.py の名簿)があればそれを使い、
     無ければ手続き生成(v2 以前の互換動作: 全員居住者)。
 
@@ -187,6 +188,14 @@ def build_agent(agent_id: int, rng: np.random.Generator, nodes: list[str],
         part_time = assign_part_time(occupation, visitor, city, rng, economy)
         # 口座 E5(既定 OFF): 居住者は初期資産を口座8割/現金2割に分割(rng 不使用=決定論)。
         money, account = split_account(money, visitor, economy)
+
+    # ---- 中央 Δt(第79バッチ): sleep_steps は「睡眠の長さ [step]」= STEPS 類。
+    #   名簿経路・手続き生成経路のどちらも同じ 6.5〜8h を意図しているので、**draw は
+    #   一切変えず**(= 乱数列を動かさず)step 単位だけ Δt で読み替える。dt_min=10 は
+    #   scale_steps が int(n) をそのまま返す恒等パス = バイト一致。
+    if int(dt_min) != 10:
+        from ..timeconv import scale_steps
+        sleep_steps = scale_steps(sleep_steps, dt_min)
 
     # ---- 意見力学(FJ): 感受性(traits→写像)+ 初期アンカー N(0, 0.3) clip[-1,1]。----
     # ★ rng 消費は build_agent の**末尾**に置く(既存ストリームの draw 位置を動かさない

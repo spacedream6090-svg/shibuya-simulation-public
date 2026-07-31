@@ -28,7 +28,8 @@ from __future__ import annotations
 import hashlib
 import math
 
-STEP_SECONDS = 600.0        # 1 step = 10 分 = 600s(L1 / world.modes と同じ)
+STEP_SECONDS = 600.0        # 正準 Δt での 1 step = 10 分 = 600s(L1 / world.modes と同じ)
+                            # 実行時の値は live_cfg()["step_seconds"](run.dt_min 由来)
 
 
 def _stable_hash(text: str) -> int:
@@ -44,6 +45,9 @@ def live_cfg(cfg) -> dict | None:
     if not bool(live.get("enabled", False)):
         return None
     speeds = cfg.world.modes.speeds
+    # 中央 Δt(第79バッチ)。既定 10 → 600.0 = 従来の直書きと厳密同値。
+    from .timeconv import dt_of, step_seconds as _step_seconds
+    sec = _step_seconds(dt_of(cfg))
     # v-Ride-3 相乗り(既定 OFF=enabled false=v-Ride-1 と完全同一=単発配車のみ)。
     shared_raw = live.get("shared", {}) or {}
     shared = {
@@ -59,7 +63,8 @@ def live_cfg(cfg) -> dict | None:
         "max_wait_s": float(live.get("max_wait_s", 900.0)),
         "net": (str(live["net"]) if live.get("net") else None),
         # 自由流の基準速度(m/s)= car の m/step ÷ 600s。delay_s(信号・渋滞超過)算出に使う。
-        "car_m_per_s": float(speeds["car"]) / STEP_SECONDS,
+        "step_seconds": sec,
+        "car_m_per_s": float(speeds["car"]) / sec,
         "shared": shared,
     }
 
@@ -121,6 +126,8 @@ class TaxiLive:
         self.cfg = cfg
         self.bridge = bridge
         self.car_m_per_s = float(cfg["car_m_per_s"])
+        # 中央 Δt(第79バッチ)。旧 cfg(step_seconds 無し)は正準 600.0 へ落ちる。
+        self.step_seconds = float(cfg.get("step_seconds", STEP_SECONDS))
         # v-Ride-3 相乗り(既定 OFF)。enabled=false は _resolve_single だけを通る=v-Ride-1 と同一。
         self.shared = dict(cfg.get("shared") or {"enabled": False,
                                                  "capacity": 3, "max_detour_ratio": 1.4})
@@ -161,7 +168,7 @@ class TaxiLive:
         dist_m = math.hypot(from_xy[0] - to_xy[0], from_xy[1] - to_xy[1])
         free_s = dist_m / max(1e-6, self.car_m_per_s)        # 自由流(直線)の基準乗車秒
         delay_s = max(0.0, ride_s - free_s)                  # 信号・渋滞由来の超過(観測)
-        hold_steps = quantize_hold(wait_s, delay_s)
+        hold_steps = quantize_hold(wait_s, delay_s, self.step_seconds)
         self.n_matched += 1
         return {"matched": True,
                 "wait_s": round(wait_s, 1), "ride_s": round(ride_s, 1),
@@ -212,7 +219,8 @@ class TaxiLive:
             self.n_matched += 1
             return {"matched": True, "wait_s": round(wait_s, 1),
                     "ride_s": round(ride_s, 1), "delay_s": round(delay_s, 1),
-                    "hold_steps": quantize_hold(wait_s, delay_s), "shared": shared_n}
+                    "hold_steps": quantize_hold(wait_s, delay_s, self.step_seconds),
+                    "shared": shared_n}
         res = self._resolve_single(from_node=from_node, to_node=to_node,
                                    from_xy=from_xy, to_xy=to_xy, sim_min=sim_min)
         if res.get("matched"):

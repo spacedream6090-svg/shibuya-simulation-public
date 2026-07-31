@@ -650,11 +650,14 @@ class Tools:
         if not title:
             return
         hours = max(1, min(6, int(action.get("hours_later", 1))))
-        start_step = step + hours * 6
+        # 中央 Δt(第79バッチ): 「N 時間後」「分→step」の換算は clock が単一源。
+        # 既定 Δt=10 では steps_per_hour=6 / step_minutes=10 = 従来の直書きと同値。
+        start_step = step + hours * sim.clock.steps_per_hour
         start_min = sim.clock.sim_min(start_step)
         if (start_min % 1440) < 6 * 60:                # 深夜(0-6時)開始 → 翌朝9時に繰延
             day = start_min // 1440
-            start_step = (day * 1440 + 9 * 60 - sim.clock.start_min) // STEP_MINUTES
+            start_step = ((day * 1440 + 9 * 60 - sim.clock.start_min)
+                          // sim.clock.step_minutes)
         eid = self._event_seq
         self._event_seq += 1
         from .engine import scheduler
@@ -1468,7 +1471,8 @@ class Tools:
             return
         day = sim_min // 1440
         rec = rb.enact(rule_raw, name=pr["text"][:24], proposer=pr["author"],
-                       step=step, day=day)
+                       step=step, day=day,
+                       steps_per_day=sim.clock.steps_per_day)
         if rec is None:                        # 検証失敗 → 文言制度のまま(降格)
             return
         if recur is not None:                  # 再帰性: 客観カウント(OFF は no-op)

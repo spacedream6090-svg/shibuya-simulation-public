@@ -135,7 +135,8 @@ def _jitter_stay(agent, sim, base_steps: int, step: int, scfg,
     (勤務・通勤=mandatory)は揺らさない。1 step=10 分。専用 stream 'jitter_time'。"""
     if activity in _FIXED_ACTS or _cat_of(activity, what) == "mandatory":
         return base_steps
-    span = scfg["jitter_min"] * _motif_scale(agent, scfg) / 10.0   # 分→step
+    span = (scfg["jitter_min"] * _motif_scale(agent, scfg)
+            / float(sim.clock.step_minutes))                        # 分→step
     if span <= 0.0:
         return base_steps
     rng = sim.hub.stream("jitter_time", agent.id, step)
@@ -409,7 +410,8 @@ def _sick_home(agent, sim, sim_min: int, step: int, rng: np.random.Generator) ->
                 "homing": True}
     if agent.home_building and sim.city.has_building(agent.home_building):
         return {"type": "enter_building", "building": agent.home_building,
-                "floor": agent.home_floor, "stay_steps": 3}   # 自宅前 → 入って在宅
+                "floor": agent.home_floor,
+                "stay_steps": sim.clock.dur_steps(3)}   # 自宅前 → 入って在宅(30分)
     return {"type": "stay"}                        # 自宅建物なし → 路上で静養
 
 
@@ -482,7 +484,7 @@ def _plan_move(agent, sim, sim_min: int, step: int, rng, scfg=None) -> dict | No
     if not dest or dest == agent.node:
         return None
     what = str(item.get("what") or "")
-    base_stay = int(rng.integers(2, 5))
+    base_stay = sim.clock.dur_steps(int(rng.integers(2, 5)))   # 20-40分
     if scfg is not None:
         detour = _maybe_detour(agent, sim, dest, step, sim_min, scfg, what=what)  # L3 寄り道
         if detour is not None:
@@ -807,14 +809,15 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
         if agent.node == agent.work_node:
             if agent.work_building \
                     and sim.city.has_building(agent.work_building):
-                left_steps = max(1, (agent.work_end_min - m) // 10)
+                left_steps = max(1, sim.clock.min_to_steps(agent.work_end_min - m))
                 return {"type": "enter_building", "building": agent.work_building,
                         "floor": agent.work_floor, "stay_steps": left_steps,
                         "activity": "working"}
             # 路面の職場(屋台・配達拠点など): その場で勤務
             return {"type": "stay"}
         if agent.work_node:
-            return {"type": "move_to", "dest": agent.work_node, "stay_steps": 1,
+            return {"type": "move_to", "dest": agent.work_node,
+                    "stay_steps": sim.clock.dur_steps(1),
                     "mode": _choose_mode(agent, sim, agent.work_node, rng),
                     "activity": "commuting"}
 
@@ -823,12 +826,13 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
         pt = agent.part_time
         if agent.node == pt["node"]:
             if pt["building"] and sim.city.has_building(pt["building"]):
-                left_steps = max(1, (pt["end_min"] - m) // 10)
+                left_steps = max(1, sim.clock.min_to_steps(pt["end_min"] - m))
                 return {"type": "enter_building", "building": pt["building"],
                         "floor": pt["floor"], "stay_steps": left_steps,
                         "activity": "working"}
             return {"type": "stay"}                # 路面のバイト先: その場で勤務
-        return {"type": "move_to", "dest": pt["node"], "stay_steps": 1,
+        return {"type": "move_to", "dest": pt["node"],
+                "stay_steps": sim.clock.dur_steps(1),
                 "mode": _choose_mode(agent, sim, pt["node"], rng),
                 "activity": "commuting"}
 
@@ -865,7 +869,7 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
             if _curfew_suppressed(agent, sim, p["node"], sim_min, step):
                 return {"type": "stay"}              # 制度DSL: 時間帯×カテゴリの抑制
             dest = p["node"]
-            base_stay = int(rng.integers(2, 5))      # 2-4 step(短縮)
+            base_stay = sim.clock.dur_steps(int(rng.integers(2, 5)))  # 20-40分
             if scfg is not None:                     # L3 寄り道 + L2 継続ジッター(maintenance)
                 detour = _maybe_detour(agent, sim, dest, step, sim_min, scfg,
                                        activity="eating")
@@ -905,7 +909,7 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
     if blds and r < float(sim.cfg.world.building_enter_prob):
         bld = blds[int(rng.integers(len(blds)))]
         return {"type": "enter_building", "building": bld["id"],
-                "stay_steps": int(rng.integers(2, 7))}   # 2-6 step(短縮)
+                "stay_steps": sim.clock.dur_steps(int(rng.integers(2, 7)))}  # 20-60分
     # 自由時間の行き先。群集(大規模行事型)> 観光回遊(後続波 H5)> デート(後続波 H2)>
     # 趣味(後続波 H6)> 制度DSL の weekly_event ブースト > Lynch landmark > EPR の順。いずれも OFF・非該当では乱数を
     # 引かず None=以降は従来通り(不変)。観光回遊は観光客のランドマーク巡り(tourist_visit)へ寄せる。
@@ -947,7 +951,7 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
         return {"type": "stay"}
     if _curfew_suppressed(agent, sim, dest, sim_min, step):
         return {"type": "stay"}                      # 制度DSL: 時間帯×カテゴリの抑制
-    base_stay = int(rng.integers(1, 4))              # 1-3 step(短縮)
+    base_stay = sim.clock.dur_steps(int(rng.integers(1, 4)))  # 10-30分
     if scfg is not None:                             # L3 寄り道 + L2 継続ジッター(discretionary)
         detour = _maybe_detour(agent, sim, dest, step, sim_min, scfg)
         if detour is not None:
