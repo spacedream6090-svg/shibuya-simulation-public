@@ -117,6 +117,7 @@ from __future__ import annotations
 
 import re
 
+from . import dunbar as _dunbar
 from . import relations as _relations
 from . import schedule as _schedule
 
@@ -508,10 +509,20 @@ def weak_tie_candidates(sim, agent, day: int, slots: int, exclude) -> list:
     slots 体を決定論選択(乱数ゼロ=新 stream "invite" 不要。_rendezvous_poi と同じ純関数流儀)。
 
     pool は id 昇順に固定し、開始位置が日替わりで回る=同じ知人ばかり誘わない探索
-    (Granovetter 弱い紐帯の観測目的=計画書§4)。exclude(自分/既割当/既候補)と来街者は除外。"""
+    (Granovetter 弱い紐帯の観測目的=計画書§4)。exclude(自分/既割当/既候補)と来街者は除外。
+
+    第75バッチ(ダンバー認知枠。relations.dunbar 既定 OFF=pool も選択も従来と完全同一):
+    dunbar ON のときだけ **休眠関係(dormant)を pool に加える**。休眠紐帯は closeness を 0 へ
+    退避されて tier 0 になるため closeness 降順の同伴候補経路からは自動的に外れており、
+    **再会し得るのはこの探索枠だけ**=誘い選抜における一貫した1つの規則にする。理論根拠:
+    Levin, Walter & Murnighan 2011(Organization Science 22(4):923-939)= 休眠紐帯の再接続は
+    「新規性は弱い紐帯並み・信頼は強い紐帯並み」= 弱い紐帯と同じ探索の箱に入れるのが整合的。
+    ★明示的な意向(前日計画の with / 前日発話の明示キュー)は休眠でも通る(名指しの意向は
+    認知枠の淘汰より上位。_resolve_with / invite_cue_partners は名前で台帳を引くため無改変)。"""
     if slots <= 0:
         return []
     rc = getattr(sim, "relationscfg", None) or _relations.DEFAULTS
+    dunbar_on = _dunbar.enabled(sim)
     pool = []
     for oid in sorted((getattr(agent.mem, "relations", {}) or {})):
         if oid == agent.id or oid in exclude:
@@ -520,6 +531,9 @@ def weak_tie_candidates(sim, agent, day: int, slots: int, exclude) -> list:
         if o is None or o.visitor:
             continue
         rel = agent.mem.relations[oid]
+        if dunbar_on and rel.get("dormant"):
+            pool.append(oid)                # 休眠紐帯=再会の探索枠(dunbar ON 時のみ)
+            continue
         if _relations.tier_of(float(rel.get("closeness", 0.0)), rc) == 1:
             pool.append(oid)
     if not pool:

@@ -34,6 +34,7 @@ R1 呼数不変: generate() を1本も足さない。日次編成(_phase_joint=�
 """
 from __future__ import annotations
 
+from . import dunbar as _dunbar
 from . import gossip as _gossip
 from . import relations as _relations
 from . import relations_endo as _endo
@@ -500,6 +501,10 @@ def observe(sim, step: int, sim_min: int) -> None:
                    if (o := sim.agent_by_id.get(gid)) is not None and o.node == poi]
         if len(present) >= 2:
             grp["logged"] = True
+            # 第75バッチ(ダンバー認知枠。既定 OFF=即 return=バイト一致): 同席は関係の**維持**
+            # 行為=活性関係の last_step を進め、休眠中の相手なら再会させる(relation_rekindle)。
+            # 1グループ1日1回のこの地点だけで呼ぶ(毎 step の全ペア走査をしない)。
+            _dunbar.touch_group(sim, present, step, sim_min)
             leader = sim.agent_by_id.get(min(present))
             lx = leader.x if leader is not None else 0.0
             ly = leader.y if leader is not None else 0.0

@@ -139,6 +139,14 @@ def save(sim, step: int, path: str | Path) -> Path:
             # L2 が straight と食い違う(第62 joint / 第70 echo と同じ型のギャップ)。
             # processed カウンタは**プロセス内 logger 由来**なので保存しない(load 側で 0)。
             "norm_state": getattr(sim, "_norm_state", None),
+            # 第75バッチ IDEA⑤(ダンバー認知枠): 活性関係数の日次スナップ+休眠/再会の累積カウンタ
+            # (int/float のみ)。**休眠状態そのもの**(rel の dormant/dormant_closeness/
+            # dormant_step)と直近接触 step(rel の last_step)は agents pickle に自然同梱される
+            # ので、ここで中央管理するのは L2 3 列の材料だけ。保存しないと mid-day resume の
+            # dormant_total / rekindle_total(累積量)が straight と食い違う(第62 joint /
+            # 第70 echo / 第74 norm_state と同じ型のギャップ)。既定 OFF では state 自体が
+            # 生えない → None=挙動不変(load は .get で旧 checkpoint 互換)。
+            "dunbar_state": getattr(sim, "_dunbar_state", None),
             # 第73バッチ(真偽台帳 Part B): sim 側の台帳=fact レコード(_tl_facts)・重複判定キー
             # (_tl_keys)・累積カウンタ(_tl_stats)。**保存しないと resume 後に fact_id が振り直され、
             # 信念(agents pickle に自然同梱される _fact_beliefs)の参照先が全部迷子になる**
@@ -246,6 +254,9 @@ def load(sim, path: str | Path) -> int:
         sim._norm_state = nst
     sim._norm_processed = 0                     # fresh logger=total 0 から再走査(echo と同流儀)
     sim._norm_cache = None
+    dst = rt.get("dunbar_state")                # 第75 IDEA⑤: 認知枠タリー(旧 ckpt 互換=無ければ素通り)
+    if dst is not None:
+        sim._dunbar_state = dst
     # 第73 Part B: 真偽台帳(旧 checkpoint 互換=無ければ素通り=beliefs OFF の挙動不変)。
     # canary は module 側のプロセス内レジストリなので、復元した fact 分を再登録して武装を保つ。
     tlf = rt.get("tl_facts")

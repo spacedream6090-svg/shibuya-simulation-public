@@ -281,6 +281,15 @@ register_event_kind("belief_transmit", "伝聞の送出(話題が一致した発
                                        "{fact, fact_kind, to, channel, hop, topic, conf}")
 register_event_kind("belief_verify",   "検証行動(現場go/当事者ask/ネットnet)の実行と根拠"
                                        "{fact, fact_kind, how, about, match, outcome, evidence?}")
+# ---- ダンバー認知枠(関係の維持コスト)第75バッチ IDEA⑤(relations.dunbar ON のみ・既定 OFF=0件。
+#      全決定論・乱数ゼロ・LLM/generate ゼロ増・新 stream なし。実装 src/society/dunbar.py。
+#      設計 docs/research/hackathon1-analysis/ideas-shortlist.md §2 ⑦)。
+#      休眠は**削除ではない**: 台帳エントリ・count・記憶はそのまま残り、休眠前の closeness を
+#      退避して closeness=0(=tier 0)にする。再会は退避値 × rekindle_discount で復元する。
+register_event_kind("relation_dormant",  "関係の休眠=認知枠の上限超過で最弱の紐帯を不活性化"
+                                         "(退避であって削除ではない){other, closeness, from_tier, gap_days}")
+register_event_kind("relation_rekindle", "休眠関係の再会=再接触で割引つきに再活性化"
+                                         "{other, before, closeness, tier, gap_days}")
 
 
 @dataclass

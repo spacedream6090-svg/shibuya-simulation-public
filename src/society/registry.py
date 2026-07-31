@@ -338,6 +338,17 @@ FEATURES: tuple[Feature, ...] = (
        "誘う相手の選択を前日の計画・発話の自由文から内生化する"),
     _f("relations.endogenous_quality.enabled", "journal", False, "possible",
        "交流の質(closeness 増分)を発話内容から内生化する"),
+    # 第75バッチ IDEA⑤(ダンバー認知枠)。strict の根拠: 判定材料は closeness 台帳(数値)と
+    # 同居人名簿と config だけで、**LLM の自由文出力を一切読まない**(第65 quality が journal
+    # なのは発話本文を読むから=対照的)。乱数も 1 本も引かない(順序は closeness/id の全順序)。
+    # fingerprint_risk=possible: 休眠で tier が 0 に落ちるとプロンプトの間柄行が
+    # 「○○とは友人」→「○○とはN回話した仲」へ変わる(差分に気づく余地が原理的にある)。
+    _f("relations.dunbar.enabled", "strict", False, "possible",
+       "ダンバー認知枠(関係の維持コスト)。活性関係の総数が上限を超えたら最も弱い紐帯を"
+       "休眠(退避=削除でない)にし、再接触で割引つきに再活性化する"),
+    _f("relations.dunbar.protect_housemates", "strict", False, "none",
+       "同居人との関係を休眠の対象から外す(日々の共在で維持される紐帯を認知枠の淘汰から保護。"
+       "枠は消費するが落ちない)"),
     _f("friend_graph.enabled", "strict", False, "none",
        "現実的な友人ネットワークの生成(決定論+専用 stream)"),
     _f("hierarchy.enabled", "strict", False, "possible",

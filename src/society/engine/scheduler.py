@@ -16,6 +16,7 @@ from .. import commerce as commerce_mod
 from .. import conversation as conversation_mod
 from .. import disaster as disaster_mod
 from .. import diversity as diversity_mod
+from .. import dunbar as dunbar_mod
 from .. import freedom_p2 as freedom_p2_mod
 from .. import gossip as gossip_mod
 from .. import goods as goods_mod
@@ -108,8 +109,15 @@ def _contact(sim, actor, other_id: int, other_name: str, text: str,
     のみ(closeness を付けない=バイト一致)。ON なら符号つき closeness 更新 + tier 変化ログ。
 
     magnitude(第65バッチ)は _quality_mag が返す不透明係数(既定 1.0=従来と同値)。増減の
-    **量**にのみ載る=engine はここ以外の判定(発火・相手選択・段階)へ一切流さない。"""
+    **量**にのみ載る=engine はここ以外の判定(発火・相手選択・段階)へ一切流さない。
+
+    第75バッチ(ダンバー認知枠。relations.dunbar 既定 OFF=hook は即 return=バイト一致):
+    記録**前**に on_contact を呼ぶ(相手が休眠中なら割引つき再会=relation_rekindle)。
+    note_contact より前でなければならない(後だと当該交流分の closeness 増分が復元値で潰れる)。
+    上限の適用は日境界の 1 回に一本化してある(dunbar.enforce の docstring=毎接触だと休眠/再会が
+    振動する)。engine は「呼ぶだけ」で層の値・休眠規則を一切知らない(society/dunbar.py に閉じる)。"""
     if _relations_on(sim):
+        dunbar_mod.on_contact(sim, actor, other_id, step, sim_min)
         relations_mod.note_contact(actor, other_id, other_name, text, valence,
                                    sim.relationscfg, step, sim_min, sim.logger,
                                    magnitude)
@@ -3577,6 +3585,10 @@ def _phase_relations_day(sim, step: int, sim_min: int) -> None:
     # 第65バッチ: 会話由来 magnitude の当日タリーを日境界で初期化(OFF は None=状態も作らない
     # =バイト一致)。観測専用=closeness/イベント/乱数には触れない。
     relations_endo_mod.quality_day_state(sim, day)
+    # 第75バッチ(ダンバー認知枠): 減衰**後**の closeness で活性関係の上限を課し(超過分は最弱
+    # から休眠=relation_dormant)、L2 スカラーを焼き直す。全ペア走査はここ(1日1回)だけ=毎 step
+    # の走査は無い。既定 OFF は即 return(状態も作らない=バイト一致)。
+    dunbar_mod.day_phase(sim, step, sim_min)
 
 
 # ---------------------------------------------------------------- 負の評判の内生伝播(第61バッチ c)

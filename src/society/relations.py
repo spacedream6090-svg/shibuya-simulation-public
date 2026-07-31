@@ -179,6 +179,11 @@ def decay_day(sim, cfg: dict, step: int, sim_min: int) -> None:
         for other_id, rel in agent.mem.relations.items():
             if "closeness" not in rel:
                 continue
+            # 第75バッチ(ダンバー認知枠): 休眠中の関係は減衰させない(認知枠を消費しない=
+            # 休眠前の closeness を退避したまま凍結し、再会で割引復元する)。dunbar OFF では
+            # "dormant" キー自体が一度も生えないので、この分岐は常に False=バイト一致。
+            if rel.get("dormant"):
+                continue
             last_day = sim.clock.day(int(rel.get("last_step", 0)))
             if (today - last_day) <= grace:        # 今日(や猶予内)接触した相手は減衰しない
                 continue

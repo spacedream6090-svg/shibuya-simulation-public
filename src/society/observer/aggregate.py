@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from .. import dunbar as _dunbar
 from .. import gossip as _gossip
 from .. import relations_endo as _rendo
 from .. import status as _status_mod
@@ -807,6 +808,32 @@ def _invite_endo_share(sim):
 def _quality_magnitude_mean(sim):
     s = _rendo.quality_scalars(sim)
     return s.get("quality_magnitude_mean") if s else None
+
+
+# ---- ダンバー認知枠(関係の維持コスト)第75バッチ IDEA⑤(既定 OFF)。relations.dunbar.enabled=false
+#      (または relations OFF)は全て None=列なし=L2 不変(endo/quality 列と同型)。読むだけ・乱数ゼロ。
+#   active_relations_mean … 1 体あたりの活性関係数の平均(**日境界で焼き直す**=日内は一定)
+#   dormant_total         … いま休眠中の関係の総数(休眠/再会の発生時 ±1 で日内も正確)
+#   rekindle_total        … 再会の累積件数(単調非減少=resume 安全)
+#   タリーは dunbar.day_phase(日境界)と休眠/再会の発生点が積み、scalars() は読むだけ。
+def _dunbar_col(sim, key):
+    s = _dunbar.scalars(sim)
+    return s.get(key) if s else None
+
+
+@register_aggregator("active_relations_mean")
+def _active_relations_mean(sim):
+    return _dunbar_col(sim, "active_relations_mean")
+
+
+@register_aggregator("dormant_total")
+def _dormant_total(sim):
+    return _dunbar_col(sim, "dormant_total")
+
+
+@register_aggregator("rekindle_total")
+def _rekindle_total(sim):
+    return _dunbar_col(sim, "rekindle_total")
 
 
 # ---- 屋内エンジン配線 B3(indoor.enabled ON のみ・既定 OFF=None=列なし=L2 バイト不変)----

@@ -61,7 +61,8 @@ _EXTRA_L2_SERIES = ("speech_diversity", "deviation_mean",
                     "joint_endo_share", "joint_fulfill_rate",
                     "quality_magnitude_mean",
                     "echo_max", "self_similarity_mean", "echo_utterance_rate",
-                    "transmission_novel", "transmission_novel_rate")
+                    "transmission_novel", "transmission_novel_rate",
+                    "active_relations_mean", "dormant_total", "rekindle_total")
 
 plt.rcParams.update({
     "figure.facecolor": "white", "axes.facecolor": "white",
