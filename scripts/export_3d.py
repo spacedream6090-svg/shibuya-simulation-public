@@ -18,6 +18,13 @@
                       viewer3d 用 plateau_web.json)。既定 OFF=従来出力とバイト同一。
                       terrain.npz/json があれば地表グリッド(terrain_web.json)と建物 gz、
                       extras.npz があれば地下街/橋メッシュ(plateau_web.extras)も書き出す。
+                      ubld_lod4_mesh.npz(レーンA)があれば地下街 LOD4.1 の面種別つき
+                      メッシュ(plateau_web.ubld4)も足す(旧 extras.ubld の箱を置換)。
+  --plateau-tex     : テクスチャ付き LOD2.2(data/plateau/tiles_lod2/・レーンA産)を
+                      **分離版サイドカー** runs/<name>/plateau_tex.js(JSONP)へ書き出す。
+                      --plateau と併用必須。既定 OFF=このフラグ無しでは 1 バイトも変わらない。
+                      埋め込み版 viewer3d.html には入れない(アトラス 1/2 で 80MB ゲート超過が
+                      レーンA実測。分離版 viewer3d_lite.html + サイドカー 2 本が主経路)。
   --rich-tracks     : tracks.json の移動手段を細分化(タクシー=mode 3・電車で圏外=w -3)。
                       既定 OFF=tracks.json はバイト同一。--plateau と併用可。
   --tracks-binary   : tracks を量子化型付きバイナリ(scene3d/tracks.bin + tracks_meta.json)でも
@@ -36,6 +43,8 @@
   plateau_web.json — (--plateau 時のみ)照合建物の量子化メッシュ(int16×0.05m・base64)。
   tracks.bin / tracks_meta.json — (--tracks-binary 時のみ)量子化軌跡バイナリと、その JSON
                    ヘッダの同内容コピー(形式は scripts/tracks_bin.py の docstring)。
+  ../plateau_tex.js — (--plateau-tex 時のみ・scene3d ではなくラン直下)テクスチャ付き
+                   LOD2.2 のタイル別メッシュ+WebP アトラス data:URI(JSONP・分離版専用)。
 
 設計方針: sim⇄viz 疎結合(docs/lit/viz__plateau-pipeline-overview.md)。
   本スクリプトは l1_events.parquet を読むだけ。sim 本体には非依存。
@@ -386,6 +395,195 @@ def build_extras_web(extras: dict) -> dict:
             "n_triangles": int(len(F)),
         }
     return web
+
+
+# ---------------------------------------------------- 地下街 LOD4.1(梅 / レーンA産)
+def _load_ubld4(plateau_dir: Path) -> dict | None:
+    """ubld_lod4_mesh.npz + ubld_lod4.json(scripts/plateau_ubld_extract.py 産)を読む。
+
+    契約(レーンA コミット 5ff56c4):
+      npz: xyz(int16, (n,3) 量子化・origin_q オフセット付き) / origin_q(int64,(3,)) /
+           tri(uint32,(m,3)) / tri_kind(uint8,(m,)) / kind_names(<U, (k,))
+      json: params.quant_scale・mesh.kind_names・layers[{layer,z,...}](床面 z のピーク)
+    無ければ None(= plateau_web に ubld4 キーを出さない=旧ランと同じ形)。"""
+    npz_p = plateau_dir / "ubld_lod4_mesh.npz"
+    json_p = plateau_dir / "ubld_lod4.json"
+    if not (npz_p.exists() and json_p.exists()):
+        return None
+    meta = json.loads(json_p.read_text(encoding="utf-8"))
+    data = np.load(npz_p)
+    for key in ("xyz", "origin_q", "tri", "tri_kind"):
+        if key not in data:
+            raise SystemExit(f"[export_3d] ubld_lod4_mesh.npz に '{key}' が無い")
+    quant = float(meta.get("params", {}).get("quant_scale", PLATEAU_QUANT))
+    kinds = list(meta.get("mesh", {}).get("kind_names")
+                 or [str(s) for s in data["kind_names"]])
+    layers = [float(ly["z"]) for ly in meta.get("layers", [])]
+    return {"xyz": np.asarray(data["xyz"]),
+            "origin_q": np.asarray(data["origin_q"], dtype=np.int64),
+            "tri": np.asarray(data["tri"], dtype=np.int64),
+            "tri_kind": np.asarray(data["tri_kind"], dtype=np.uint8),
+            "kind_names": kinds, "layer_z": layers, "quant": quant}
+
+
+def build_ubld4_web(u: dict) -> dict:
+    """plateau_web.ubld4 用。既存 extras と同じ「絶対 int16×0.05m」に直して base64 化し、
+    面種別(tri_kind)と層(tri_layer)を付ける。
+
+    層は「三角形重心 z に最も近い床面ピーク」で決める(レーンA の assign_layer と同一規則)。
+    層分離そのものはレーンA が済ませた z ヒストグラムのピーク列をそのまま使う。"""
+    Q = u["xyz"].astype(np.int64) + u["origin_q"]           # 絶対量子化値
+    if Q.size and (int(np.abs(Q).max()) > 32767):
+        raise SystemExit("[export_3d] ubld4: 絶対量子化値が int16 に収まらない"
+                         f"(max={int(np.abs(Q).max())})")
+    tri = u["tri"]
+    zc = (Q[tri][:, :, 2].mean(axis=1) * u["quant"]) if len(tri) else np.zeros(0)
+    peaks = np.asarray(u["layer_z"], dtype=np.float64)
+    if peaks.size:
+        tri_layer = np.argmin(np.abs(zc[:, None] - peaks[None, :]), axis=1).astype(np.uint8)
+    else:
+        tri_layer = np.zeros(len(tri), dtype=np.uint8)
+    layers = [{"layer": i, "z": round(float(z), 3),
+               "n_triangles": int((tri_layer == i).sum())}
+              for i, z in enumerate(u["layer_z"])]
+    return {
+        "quant_scale": PLATEAU_QUANT,
+        "n_vertices": int(len(Q)),
+        "n_triangles": int(len(tri)),
+        "kind_names": list(u["kind_names"]),
+        "layers": layers,
+        "positions_b64": base64.b64encode(
+            np.ascontiguousarray(Q.astype("<i2")).tobytes()).decode("ascii"),
+        "indices_b64": base64.b64encode(
+            np.ascontiguousarray(tri.astype("<u4")).tobytes()).decode("ascii"),
+        "tri_kind_b64": base64.b64encode(
+            np.ascontiguousarray(u["tri_kind"].astype("<u1")).tobytes()).decode("ascii"),
+        "tri_layer_b64": base64.b64encode(
+            np.ascontiguousarray(tri_layer).tobytes()).decode("ascii"),
+    }
+
+
+# ------------------------------------------- テクスチャ付き LOD2.2(松 / レーンA産)
+PLATEAU_TEX_ATTRIBUTION = ("テクスチャ付き建物: 国土交通省 Project PLATEAU "
+                           "3D都市モデル(渋谷区 2025年度)3D Tiles を加工")
+
+
+def _tex_triangle_flags(z, has_atlas: bool) -> np.ndarray:
+    """三角形ごとの「テクスチャ付きプリミティブ由来か」フラグ。
+    アトラスを持たないタイルは全て非テクスチャ扱い(UV は 0 で意味を持たない)。"""
+    tri_n = int(z["tri"].shape[0])
+    flags = np.zeros(tri_n, dtype=bool)
+    if not has_atlas:
+        return flags
+    off = np.asarray(z["prim_tri_offsets"], dtype=np.int64)
+    ptex = np.asarray(z["prim_textured"], dtype=np.int64)
+    for p in range(len(ptex)):
+        if ptex[p]:
+            flags[off[p]:off[p + 1]] = True
+    return flags
+
+
+def build_plateau_tex(tiles_dir: Path) -> dict:
+    """data/plateau/tiles_lod2/(レーンA A-1)→ 分離版サイドカー用の dict。
+
+    設計:
+    - **batch_shadowed を落とす**。この tileset は refine=REPLACE なので、bbox と交差する
+      148 タイルには祖先タイルが持つ同一建物の低精細版が混ざる(686 batch)。そのまま描くと
+      同じ建物が二重に出る。レーンA が npz に入れた batch 番号の三角形を捨てる(実測 15.70%)。
+    - 残った三角形が参照する頂点だけに**詰め直す**(索引を uint16 に落とせる余地も作る)。
+    - 三角形は「テクスチャ付きプリミティブ由来 → 非テクスチャ」の順に並べ替える。
+      ビューアは 1 ジオメトリ 2 グループ(map 付き / 無彩色)で描く。
+    - アトラス WebP は data:URI(file:// で fetch できないため。既存 plateau_mesh.js と同じ思想)。
+    決定論: index.json のタイル順・np.unique の昇順・base64 のみ=同入力なら常にバイト同一。"""
+    idx_p = tiles_dir / "index.json"
+    if not idx_p.exists():
+        raise SystemExit(f"[export_3d] --plateau-tex: {tiles_dir}/index.json が無い。"
+                         " 先に tools/tiles3d_extract.py を実行する。")
+    index = json.loads(idx_p.read_text(encoding="utf-8"))
+    uv_scale = int(index.get("uv_scale", 65535))
+    tiles_out: list = []
+    n_v = n_tri_tex = n_tri_flat = n_drop = 0
+    n_atlas = 0
+    atlas_bytes = 0
+    for t in index["tiles"]:
+        z = np.load(tiles_dir / t["npz"])
+        tri = np.asarray(z["tri"], dtype=np.int64)
+        if len(tri) == 0:
+            continue
+        batch = np.asarray(z["batch"], dtype=np.int64)
+        sh = (np.asarray(z["batch_shadowed"], dtype=np.int64)
+              if "batch_shadowed" in z else np.zeros(0, dtype=np.int64))
+        keep = np.ones(len(tri), dtype=bool)
+        if sh.size:
+            keep = ~np.isin(batch[tri[:, 0]], sh)
+        n_drop += int((~keep).sum())
+        atlas_name = t.get("atlas")
+        raw_atlas = None
+        if atlas_name:
+            ap = tiles_dir / atlas_name
+            if ap.exists():
+                raw_atlas = ap.read_bytes()
+        istex = _tex_triangle_flags(z, raw_atlas is not None)
+        sel_tex = np.flatnonzero(keep & istex)
+        sel_flat = np.flatnonzero(keep & ~istex)
+        order = np.concatenate([sel_tex, sel_flat])
+        if order.size == 0:
+            continue
+        kt = tri[order]
+        used, inv = np.unique(kt, return_inverse=True)
+        F = inv.reshape(-1, 3)
+        xyz = np.asarray(z["xyz"])[used]
+        uv = np.asarray(z["uv"], dtype=np.uint16)[used]
+        xyz_dtype = "int32" if xyz.dtype == np.int32 else "int16"
+        qs = "<i4" if xyz_dtype == "int32" else "<i2"
+        idx_dtype = "uint16" if used.size <= 0xFFFF else "uint32"
+        fs = "<u2" if idx_dtype == "uint16" else "<u4"
+        rec = {
+            "id": int(t["id"]),
+            "origin_q": [int(v) for v in np.asarray(z["origin_q"]).tolist()],
+            "xyz_dtype": xyz_dtype,
+            "idx_dtype": idx_dtype,
+            "n_vertices": int(used.size),
+            "n_tex": int(sel_tex.size),
+            "n_flat": int(sel_flat.size),
+            "positions_b64": base64.b64encode(
+                np.ascontiguousarray(xyz.astype(qs)).tobytes()).decode("ascii"),
+            "uv_b64": base64.b64encode(
+                np.ascontiguousarray(uv.astype("<u2")).tobytes()).decode("ascii"),
+            "indices_b64": base64.b64encode(
+                np.ascontiguousarray(F.astype(fs)).tobytes()).decode("ascii"),
+            "atlas": (f"data:image/webp;base64,{base64.b64encode(raw_atlas).decode('ascii')}"
+                      if (raw_atlas is not None and sel_tex.size) else None),
+        }
+        if rec["atlas"] is not None:
+            n_atlas += 1
+            atlas_bytes += len(raw_atlas)
+        tiles_out.append(rec)
+        n_v += int(used.size)
+        n_tri_tex += int(sel_tex.size)
+        n_tri_flat += int(sel_flat.size)
+    return {
+        "schema": "plateau_tex/1",
+        "quant_scale": float(index.get("quant_scale", PLATEAU_QUANT)),
+        "uv_scale": uv_scale,
+        "n_tiles": len(tiles_out),
+        "n_vertices": n_v,
+        "n_triangles": n_tri_tex + n_tri_flat,
+        "n_triangles_textured": n_tri_tex,
+        "n_triangles_flat": n_tri_flat,
+        "n_triangles_dropped_shadowed": n_drop,
+        "n_atlas": n_atlas,
+        "atlas_source_bytes": atlas_bytes,
+        "attribution": PLATEAU_TEX_ATTRIBUTION,
+        "tiles": tiles_out,
+    }
+
+
+def write_plateau_tex(path: Path, tex: dict) -> Path:
+    """JSONP サイドカー(既存 plateau_mesh.js と同方式)。ASCII のみ=文字コード事故なし。"""
+    path.write_text("PLATEAU_TEX = "
+                    + json.dumps(tex, separators=(",", ":")) + ";", encoding="utf-8")
+    return path
 
 
 # ------------------------------------------------------------------ glb 生成
@@ -859,9 +1057,12 @@ def export_run(run_dir: Path, map_path: Path | None = None,
                plateau_dir: Path | None = None, rich_tracks: bool = False,
                low_mem: bool = False, tracks_binary: bool = False,
                write_tracks_json: bool = True,
-               chunk_bytes: int | None = None) -> dict:
+               chunk_bytes: int | None = None,
+               plateau_tex: bool = False) -> dict:
     if not tracks_binary and not write_tracks_json:
         raise SystemExit("[export_3d] --no-tracks-json は --tracks-binary と併用する")
+    if plateau_tex and plateau_dir is None:
+        raise SystemExit("[export_3d] --plateau-tex は --plateau(または --plateau-dir)と併用する")
     run_dir = Path(run_dir)
     if low_mem:                       # 追加専用: 出力バイトは既定経路と同一(load_track_events)
         events, track_ov = load_track_events(run_dir / "l1_events.parquet")
@@ -939,12 +1140,25 @@ def export_run(run_dir: Path, map_path: Path | None = None,
         extras = _load_extras(plateau_dir)                # extras.npz があれば地下街/橋を同梱
         if extras:                                        # 無ければ "extras" キー自体を出さない
             web["extras"] = build_extras_web(extras)
+        ubld4 = _load_ubld4(plateau_dir)                   # LOD4.1 地下街(面種別+層)
+        if ubld4 is not None:                              # 無ければ "ubld4" キー自体を出さない
+            web["ubld4"] = build_ubld4_web(ubld4)
         web_p = out_dir / "plateau_web.json"
         web_p.write_text(json.dumps(web, separators=(",", ":")), encoding="utf-8")
         res["plateau_web"] = web_p
         res["n_plateau"] = len(web["matched_ids"])
         if extras:
             res["n_extras"] = {k: v["n_triangles"] for k, v in web["extras"].items()}
+        if ubld4 is not None:
+            res["n_ubld4"] = web["ubld4"]["n_triangles"]
+    if plateau_tex:                                   # 追加専用: 既定 OFF=既存出力バイト同一
+        tex = build_plateau_tex(plateau_dir / "tiles_lod2")
+        tex_p = write_plateau_tex(run_dir / "plateau_tex.js", tex)
+        res["plateau_tex"] = tex_p
+        res["tex_stats"] = {k: tex[k] for k in
+                            ("n_tiles", "n_vertices", "n_triangles",
+                             "n_triangles_textured", "n_triangles_flat",
+                             "n_triangles_dropped_shadowed", "n_atlas")}
     if terrain is not None:
         tw_p = out_dir / "terrain_web.json"
         tw_p.write_text(json.dumps(build_terrain_web(terrain), separators=(",", ":")),
@@ -981,17 +1195,20 @@ def main(argv: list) -> int:
     chunk_bytes = None
     if "--chunk-mb" in argv:
         chunk_bytes = int(float(argv[argv.index("--chunk-mb") + 1]) * 1024 * 1024)
+    plateau_tex = "--plateau-tex" in argv
     res = export_run(run_dir, map_override, sample_agents=sample_agents,
                      step_stride=step_stride, plateau_dir=plateau_dir,
                      rich_tracks=rich_tracks, low_mem=low_mem,
                      tracks_binary=tracks_binary,
-                     write_tracks_json=write_tracks_json, chunk_bytes=chunk_bytes)
+                     write_tracks_json=write_tracks_json, chunk_bytes=chunk_bytes,
+                     plateau_tex=plateau_tex)
     keys = (("scene",)
             + (("tracks",) if "tracks" in res else ())
             + ("glb",)
             + (("tracks_bin", "tracks_meta") if "tracks_bin" in res else ())
             + (("plateau_web",) if "plateau_web" in res else ())
-            + (("terrain_web",) if "terrain_web" in res else ()))
+            + (("terrain_web",) if "terrain_web" in res else ())
+            + (("plateau_tex",) if "plateau_tex" in res else ()))
     for k in keys:
         sz = res[k].stat().st_size
         try:
@@ -1002,7 +1219,15 @@ def main(argv: list) -> int:
     tail = f"  plateau={res['n_plateau']}" if "n_plateau" in res else ""
     if "n_extras" in res:
         tail += f"  extras={res['n_extras']}"
+    if "n_ubld4" in res:
+        tail += f"  ubld4={res['n_ubld4']}三角形"
     print(f"  buildings={res['n_buildings']}  steps={res['n_steps']}{tail}")
+    if "tex_stats" in res:
+        s = res["tex_stats"]
+        print(f"  [tex] タイル {s['n_tiles']}(アトラス {s['n_atlas']})"
+              f"  三角形 {s['n_triangles']}(テクスチャ {s['n_triangles_textured']}"
+              f" / 無地 {s['n_triangles_flat']})"
+              f"  影落とし除外 {s['n_triangles_dropped_shadowed']}")
     return 0
 
 

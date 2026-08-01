@@ -13,6 +13,11 @@
     1万体×1日で 90.4MB(80MB ゲート超過)→ 約 26MB、10日でもほぼ同じに収まる。
     既定 OFF=このフラグ無しでは生成 HTML は従来とバイト同一。
 
+  分離版(viewer3d_lite.html)は、ラン直下に plateau_tex.js(export_3d --plateau-tex 産)が
+  あればテクスチャ付き PLATEAU LOD2.2 を描く(無テクスチャ plateau_mesh とは排他=置換)。
+  埋め込み版 viewer3d.html にはテクスチャを入れない(アトラス 1/2 は 80MB ゲート超過)。
+  plateau_web.json に ubld4 があれば地下街 LOD4.1 を面種別で塗り分ける(既定 OFF のまま)。
+
 データは runs/<name>/scene3d/{scene.json,tracks.json} を読む。無ければ export_3d を実行して生成。
 tracks.json が無く tracks.bin だけのラン(export_3d --no-tracks-json)も従来どおり開ける。
 移動補間は 2D ビューア(viz/make_viewer.py)の posAt/alongPath を移植し、同じ滑らかさを再現。
@@ -155,7 +160,10 @@ def build_html(run_name: str, scene_json: str, tracks_json: str,
                notable_json: str | None = None,
                indoor_json: str | None = None,
                tracks_binary: bool = False,
-               chunk_dir: str = "tracks_bin") -> str:
+               chunk_dir: str = "tracks_bin",
+               has_ubld4: bool = False,
+               plateau_tex_src: str | None = None,
+               tex_note: bool = False) -> str:
     three_js, orbit_js, lic = _read_vendor()
     html = _TEMPLATE
     html = html.replace("__RUN_NAME__", run_name)
@@ -167,8 +175,14 @@ def build_html(run_name: str, scene_json: str, tracks_json: str,
     # 以降は「データ存在時のみ注入」。無ければ一切触らない=データ無しラン同士はバイト同一。
     if plateau_json is not None or plateau_src is not None:
         html = _inject_plateau(html, plateau_json, plateau_src)
-    if has_extras:                      # plateau_web.extras(地下街/歩道橋)
+    if has_extras or has_ubld4:         # plateau_web.extras(地下街/歩道橋)
         html = _inject_extras(html)
+    if has_ubld4:                       # plateau_web.ubld4(地下街 LOD4.1・面種別+層)
+        html = _inject_ubld4(html)
+    if plateau_tex_src is not None:     # plateau_tex.js(テクスチャ付き LOD2.2・分離版のみ)
+        html = _inject_plateau_tex(html, plateau_tex_src)
+    elif tex_note:                      # 埋め込み版は注記だけ(80MB ゲート)
+        html = _inject_tex_note(html)
     if terrain_json is not None:        # terrain_web.json(地形起伏+接地)
         html = _inject_terrain(html, terrain_json)
     if mode_legend:                     # tracks.meta.mode_legend(移動手段)
@@ -262,6 +276,139 @@ _PLATEAU_BUILD = r"""// ---------- PLATEAU 実形状建物(照合済み建物の
   try { const s = document.querySelector('#hud .sub');
     if(s && PLATEAU_DATA.attribution) s.textContent += ' / ' + PLATEAU_DATA.attribution;
   } catch(e){}
+})();
+
+"""
+
+
+# ============================================================ テクスチャ LOD2.2(松 / B-1)
+def _inject_plateau_tex(html: str, tex_src: str) -> str:
+    """テクスチャ付き LOD2.2(plateau_tex.js サイドカー)の描画を注入する。
+
+    **_inject_plateau の後に呼ぶ**(_PLATEAU_DECL の PLATEAU_SKIP 行を書き換えるため)。
+    分離版(viewer3d_lite.html)専用: 埋め込み版はアトラス 1/2 で 80MB ゲートを超えるため
+    テクスチャを持たない(注記のみ・_inject_tex_note)。
+    ①サイドカー参照 ②宣言の差し替え ③無テクスチャ PLATEAU の停止(排他)
+    ④押出し箱の出し分け ⑤トグル ⑥タイル構築+配線 の 6 箇所を一意置換。"""
+    # ① サイドカー(plateau_mesh.js の後・scene-data の前)
+    anchor_data = '<script type="application/json" id="scene-data">'
+    html = _replace_once(html, anchor_data,
+                         f'<script src="{tex_src}"></script>\n' + anchor_data, "tex-data")
+    # ② PLATEAU_SKIP の意味を切り替える(テクスチャ版は bbox 内の全建物を実形状で持つので、
+    #    照合済みだけ skip すると未照合の押出し箱が実形状に突き刺さる)
+    anchor_skip = "const PLATEAU_SKIP = new Set(PLATEAU_DATA ? PLATEAU_DATA.matched_ids : []);"
+    html = _replace_once(html, anchor_skip, _TEX_DECL, "tex-decl")
+    # ③ 無テクスチャ PLATEAU メッシュとは排他(tex があればそちらが置換する)
+    anchor_off = "  if(!PLATEAU_DATA) return;"
+    html = _replace_once(html, anchor_off,
+                         "  if(!PLATEAU_DATA || PLATEAU_TEX_DATA) return;"
+                         "   // テクスチャ版と排他(置換)", "tex-plateau-off")
+    # ④ 押出し箱はテクスチャ OFF のときの代替表示に回す
+    anchor_vis = "  buildingMeshes.forEach(m=> m.visible = L3('lyBld'));"
+    html = _replace_once(html, anchor_vis,
+                         "  buildingMeshes.forEach(m=> m.visible = L3('lyBld') && !TEX_ON);",
+                         "tex-bldvis")
+    # ⑤ レイヤーパネルのトグル
+    anchor_panel = '      <label class="chk"><input type="checkbox" id="lyBld" checked> 建物</label>'
+    html = _replace_once(html, anchor_panel, anchor_panel + "\n" + _TEX_TOGGLE, "tex-panel")
+    # ⑥ 構築(道路の直前)+ 配線(ループの直前)
+    anchor_build = "// ---------- 道路(全ポリラインを 1 本の LineSegments に統合)"
+    html = _replace_once(html, anchor_build, _TEX_BUILD + anchor_build, "tex-build")
+    anchor_wire = "// ---------- ループ"
+    html = _replace_once(html, anchor_wire, _TEX_WIRE + anchor_wire, "tex-wire")
+    return html
+
+
+def _inject_tex_note(html: str) -> str:
+    """埋め込み版へ「テクスチャは分離版で」の注記だけ出す(データは入れない)。"""
+    anchor_panel = '      <label class="chk"><input type="checkbox" id="lyBld" checked> 建物</label>'
+    note = ('      <div class="op" style="margin-left:22px">テクスチャ表示は'
+            ' viewer3d_lite.html(+plateau_tex.js)で</div>')
+    return _replace_once(html, anchor_panel, anchor_panel + "\n" + note, "tex-note")
+
+
+_TEX_DECL = r"""const PLATEAU_TEX_DATA = (typeof PLATEAU_TEX !== 'undefined') ? PLATEAU_TEX : null;
+let TEX_ON = !!PLATEAU_TEX_DATA;
+// テクスチャ版は bbox 内の全建物を実形状で持つ。照合済みだけ押出しを止めると未照合の箱が
+// 実形状に突き刺さるので、tex がある時は skip を空にし「箱の集合」をまるごと
+// テクスチャ OFF 時の代替表示に回す(applyLayers が TEX_ON で出し分ける)。
+const PLATEAU_SKIP = new Set((PLATEAU_DATA && !PLATEAU_TEX_DATA) ? PLATEAU_DATA.matched_ids : []);"""
+
+_TEX_TOGGLE = ('      <label class="chk"><input type="checkbox" id="lyTex" checked>'
+               ' テクスチャ(PLATEAU LOD2.2)</label>')
+
+_TEX_BUILD = r"""// ---------- テクスチャ付き PLATEAU LOD2.2(plateau_tex.js)
+// 1 タイル = 1 ジオメトリ。テクスチャ付き三角形(前半)と無地の三角形(後半)を
+// 2 グループに分け、マテリアル配列 [map 付き, 無彩色] で描く(タイルあたり最大 2 ドローコール)。
+// UV は glTF 規約(原点=画像左上)のまま使い、テクスチャ側で flipY=false にする
+// (three.js の GLTFLoader と同じ扱い)。
+const texMeshes = [];
+(function buildPlateauTex(){
+  if(!PLATEAU_TEX_DATA) return;
+  const D = PLATEAU_TEX_DATA;
+  const q = D.quant_scale || 0.05, US = D.uv_scale || 65535;
+  const b64 = s => { const bin=atob(s); const u=new Uint8Array(bin.length);
+    for(let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i); return u; };
+  const flatMat = new THREE.MeshLambertMaterial({ color:NEUTRAL_BLD, side:THREE.DoubleSide });
+  for(const t of D.tiles){
+    const pb = b64(t.positions_b64).buffer;
+    const pi = (t.xyz_dtype === 'int32') ? new Int32Array(pb) : new Int16Array(pb);
+    const o0 = t.origin_q[0], o1 = t.origin_q[1], o2 = t.origin_q[2];
+    const pos = new Float32Array(pi.length);
+    for(let i=0;i<pi.length;i+=3){       // 量子化解除 → local-m (e,n,up) → three (e,up,-n)
+      pos[i]   =  (pi[i]   + o0) * q;
+      pos[i+1] =  (pi[i+2] + o2) * q;
+      pos[i+2] = -(pi[i+1] + o1) * q;
+    }
+    const uq = new Uint16Array(b64(t.uv_b64).buffer);
+    const uv = new Float32Array(uq.length);
+    for(let i=0;i<uq.length;i++) uv[i] = uq[i] / US;
+    const ib = b64(t.indices_b64).buffer;
+    const idx = (t.idx_dtype === 'uint32') ? new Uint32Array(ib) : new Uint16Array(ib);
+    const bg = new THREE.BufferGeometry();
+    bg.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    bg.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+    bg.setIndex(new THREE.BufferAttribute(idx, 1));
+    bg.computeVertexNormals();
+    let mesh;
+    if(t.n_tex > 0 && t.atlas){
+      const img = new Image();
+      const tex = new THREE.Texture(img);
+      tex.flipY = false;                 // glTF 規約の UV をそのまま使う
+      tex.encoding = THREE.sRGBEncoding; // renderer.outputEncoding=sRGB に合わせる
+      tex.anisotropy = 4;
+      img.onload = ()=>{ tex.needsUpdate = true; };
+      img.src = t.atlas;                 // data:image/webp;base64,...(file:// でも読める)
+      const texMat = new THREE.MeshLambertMaterial({ map:tex, side:THREE.DoubleSide });
+      if(t.n_flat > 0){
+        bg.addGroup(0, t.n_tex*3, 0);
+        bg.addGroup(t.n_tex*3, t.n_flat*3, 1);
+        mesh = new THREE.Mesh(bg, [texMat, flatMat]);
+      } else {
+        mesh = new THREE.Mesh(bg, texMat);
+      }
+    } else {
+      mesh = new THREE.Mesh(bg, flatMat);
+    }
+    texMeshes.push(mesh); scene.add(mesh);
+  }
+  try { const s = document.querySelector('#hud .sub');
+    if(s && D.attribution) s.textContent += ' / ' + D.attribution; } catch(e){}
+})();
+
+"""
+
+_TEX_WIRE = r"""// テクスチャ層の配線(ON=実形状テクスチャ / OFF=従来の押出し箱)
+(function wireTex(){
+  if(!PLATEAU_TEX_DATA) return;
+  const el = document.getElementById('lyTex');
+  function applyTex(){
+    TEX_ON = el ? el.checked : true;
+    texMeshes.forEach(o=> o.visible = TEX_ON);
+    applyLayers();                       // 押出し箱の可視は TEX_ON で決まる
+  }
+  if(el) el.onchange = ()=>{ applyTex(); saveSettings(); };
+  applyTex();
 })();
 
 """
@@ -391,6 +538,124 @@ const ugaiMeshes = [], bridgeMeshes = [];
 })();
 
 """
+
+# ============================================================ 地下街 LOD4.1(梅 / B-2)
+def _inject_ubld4(html: str) -> str:
+    """plateau_web.ubld4(面種別 kind + 層タグ付きメッシュ)を注入する。
+
+    _inject_extras の**後**に呼ぶ(旧 extras.ubld の箱表示行を潰すため)。ubld4 が無い
+    plateau_web(= 旧ラン)では呼ばれない → 生成 HTML は従来とバイト同一。
+    ①層チップ ②旧 ubld 箱の停止 ③面種別メッシュ構築+配線 の 3 箇所を一意置換。"""
+    anchor_panel = ('      <label class="chk"><input type="checkbox" id="lyUgai">'
+                    ' 地下街</label>\n')
+    html = _replace_once(html, anchor_panel, anchor_panel + _UBLD4_PANEL, "ubld4-panel")
+    anchor_old = ("  const u = meshOf(ex.ubld, 0x6f7fa8, 0.35, true);"
+                  "   // 地下街=地下色・半透明・地表クリップ")
+    html = _replace_once(
+        html, anchor_old,
+        "  const u = null;   // ubld4(LOD4.1 面種別メッシュ)が在るので旧 extras.ubld の箱は描かない",
+        "ubld4-old-off")
+    anchor_build = "// ---------- 道路(全ポリラインを 1 本の LineSegments に統合)"
+    html = _replace_once(html, anchor_build, _UBLD4_BUILD + anchor_build, "ubld4-build")
+    return html
+
+
+_UBLD4_PANEL = ('      <div class="op seg" id="ub4Chips" style="flex-wrap:wrap; gap:4px;">'
+                '</div>\n')
+
+_UBLD4_BUILD = r"""// ---------- 地下街 LOD4.1(plateau_web.ubld4)= 面種別の塗り分け + 層別表示
+// 床/地面=不透明・内壁/壁/仕切=半透明・扉/窓=強調色・階段等(installation)=別色・
+// 天井/屋根=ごく薄い蓋。層(レーンA が床面 z のピークで分離した 4 層)ごとに出し分ける。
+const ubld4Meshes = [];                     // [{layer, mesh}]
+(function buildUbld4(){
+  const U = (typeof PLATEAU_DATA!=='undefined' && PLATEAU_DATA) ? PLATEAU_DATA.ubld4 : null;
+  if(!U) return;
+  const b64 = s => { const bin=atob(s); const u=new Uint8Array(bin.length);
+    for(let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i); return u; };
+  const q = U.quant_scale || 0.05;
+  const pi = new Int16Array(b64(U.positions_b64).buffer);
+  const pos = new Float32Array(pi.length);
+  for(let i=0;i<pi.length;i+=3){          // local-m (e,n,up) -> three (e,up,-n)
+    pos[i] = pi[i]*q; pos[i+1] = pi[i+2]*q; pos[i+2] = -pi[i+1]*q; }
+  const idx = new Uint32Array(b64(U.indices_b64).buffer);
+  const kind = b64(U.tri_kind_b64), lay = b64(U.tri_layer_b64);
+  const names = U.kind_names || [];
+  const GRP = [ {key:'floor', color:0x9aa7c4, op:1.00},
+                {key:'wall',  color:0x6f7fa8, op:0.32},
+                {key:'door',  color:0xffb454, op:0.95},
+                {key:'inst',  color:0x3ba89c, op:0.80},
+                {key:'lid',   color:0x5a6580, op:0.16} ];
+  const OF = { floor:0, ground:0, interior_wall:1, wall:1, closure:1,
+               door:2, window:2, installation:3, ceiling:4, roof:4, other:4 };
+  // 地表クリップ(旧 extras と同一規則): 3 頂点すべてが地表より上の三角形は落とす。
+  // 新データの z 基準は健全(地表より上の頂点 2.85% / 旧 47.37%)が、残る地上突出=
+  // 地上への階段の天端が「地面から生えて」見えるため規則は維持する。
+  const buckets = new Map(); let cut = 0;
+  const nt = (idx.length/3)|0;
+  for(let ti=0; ti<nt; ti++){
+    const a=idx[ti*3]*3, b=idx[ti*3+1]*3, c=idx[ti*3+2]*3;
+    if(TERRAIN){ let above = 0;
+      if(pos[a+1] > groundAt(pos[a], -pos[a+2]) + 0.2) above++;
+      if(pos[b+1] > groundAt(pos[b], -pos[b+2]) + 0.2) above++;
+      if(pos[c+1] > groundAt(pos[c], -pos[c+2]) + 0.2) above++;
+      if(above === 3){ cut++; continue; } }
+    const nm = names[kind[ti]];
+    const gi = (OF[nm] !== undefined) ? OF[nm] : 4;
+    const key = lay[ti]*8 + gi;
+    let arr = buckets.get(key); if(!arr){ arr = []; buckets.set(key, arr); }
+    arr.push(pos[a],pos[a+1],pos[a+2], pos[b],pos[b+1],pos[b+2], pos[c],pos[c+1],pos[c+2]);
+  }
+  if(cut) console.info('ubld4: 地表より上の三角形を', cut, '枚クリップ');
+  const mats = GRP.map(g => new THREE.MeshLambertMaterial({ color:g.color,
+    side:THREE.DoubleSide, transparent:(g.op<1.0), opacity:g.op, depthWrite:(g.op>=1.0) }));
+  for(const key of [...buckets.keys()].sort((a,b)=>a-b)){
+    const arr = buckets.get(key); if(!arr.length) continue;
+    const bg = new THREE.BufferGeometry();
+    bg.setAttribute('position', new THREE.Float32BufferAttribute(arr, 3));
+    bg.computeVertexNormals();                       // 非索引=フラット法線(建築面向き)
+    const mesh = new THREE.Mesh(bg, mats[key % 8]);
+    mesh.renderOrder = -4;                           // 地形(-3)より先に描く
+    ubld4Meshes.push({ layer:(key/8)|0, mesh }); scene.add(mesh);
+  }
+  // ---- 層チップ(全部 / B1..Bn)+ 地下街トグル連動 ----
+  const chips = document.getElementById('ub4Chips');
+  const LY = U.layers || [];
+  let selLayer = -1;
+  function applyUbld4(){
+    const eu = document.getElementById('lyUgai');
+    const on = eu ? eu.checked : false;
+    for(const r of ubld4Meshes) r.mesh.visible = on && (selLayer < 0 || r.layer === selLayer);
+    // カットアウェイ: 地下は不透明な地表の下にあるので、ON の間だけ地表を薄くし
+    // OSM ドレープを退避する(OFF で applyLayers の状態へ戻す)。
+    const tm = window.terrainMesh;
+    if(tm){ tm.material.transparent = on; tm.material.opacity = on ? 0.28 : 1.0;
+      tm.material.depthWrite = !on; tm.material.needsUpdate = true; }
+    if(typeof OSM !== 'undefined' && OSM.mesh){
+      const eo = document.getElementById('lyOsm');
+      OSM.mesh.visible = on ? false : (eo ? eo.checked : true); }
+  }
+  if(chips){
+    let h = '<span style="color:#9aa4b2">層</span>';
+    h += '<button data-l="-1" class="on" style="padding:2px 6px;font-size:11px">全</button>';
+    for(let i=LY.length-1; i>=0; i--)     // 浅い層から B1, B2, ...
+      h += '<button data-l="'+i+'" style="padding:2px 6px;font-size:11px" title="z='
+        + LY[i].z + 'm / ' + LY[i].n_triangles + '面">B' + (LY.length-i) + '</button>';
+    chips.innerHTML = h;
+    chips.querySelectorAll('button').forEach(btn=>{ btn.onclick = ()=>{
+      selLayer = parseInt(btn.dataset.l, 10);
+      chips.querySelectorAll('button').forEach(b2=> b2.classList.remove('on'));
+      btn.classList.add('on'); applyUbld4(); }; });
+  }
+  const eu0 = document.getElementById('lyUgai');
+  if(eu0) eu0.addEventListener('change', applyUbld4);   // _EXTRAS_WIRE の onchange と共存
+  applyUbld4();
+  try { const s = document.querySelector('#hud .sub');
+    if(s && PLATEAU_DATA.attribution && s.textContent.indexOf('LOD4.1') < 0)
+      s.textContent += ' / 地下街 LOD4.1'; } catch(e){}
+})();
+
+"""
+
 
 _EXTRAS_WIRE = r"""// 地下街/歩道橋トグルの配線(applyLayers を触らず独立関数で)
 (function wireExtras(){
@@ -1114,11 +1379,18 @@ def main(argv: list) -> int:
                        else _strip_traffic(tracks_json))
     # データ存在フラグ(注入するか=バイト同一を崩すか の判定)。パースは 1 回だけ。
     has_extras = False
+    has_ubld4 = False
     if plateau_json is not None:
         try:
-            has_extras = bool(json.loads(plateau_json).get("extras"))
+            _pw = json.loads(plateau_json)
+            has_extras = bool(_pw.get("extras"))
+            has_ubld4 = bool(_pw.get("ubld4"))
         except Exception:
             has_extras = False
+            has_ubld4 = False
+    # テクスチャ付き LOD2.2 サイドカー(export_3d --plateau-tex 産)。分離版のみで使う。
+    tex_p = run_dir / "plateau_tex.js"
+    has_tex = tex_p.exists()
     mode_legend = None
     try:
         mode_legend = json.loads(tracks_json).get("meta", {}).get("mode_legend")
@@ -1132,7 +1404,8 @@ def main(argv: list) -> int:
                       plateau_json=plateau_json, terrain_json=terrain_json,
                       has_extras=has_extras, mode_legend=mode_legend,
                       notable_json=notable_json, indoor_json=indoor_json,
-                      tracks_binary=tracks_binary)
+                      tracks_binary=tracks_binary, has_ubld4=has_ubld4,
+                      tex_note=has_tex)
     out = run_dir / "viewer3d.html"
     out.write_text(html, encoding="utf-8")
     mb = out.stat().st_size / 1024 / 1024
@@ -1156,11 +1429,18 @@ def main(argv: list) -> int:
                           plateau_src="plateau_mesh.js", terrain_json=terrain_json,
                           has_extras=has_extras, mode_legend=mode_legend,
                           notable_json=notable_json, indoor_json=indoor_json,
-                          tracks_binary=tracks_binary)
+                          tracks_binary=tracks_binary, has_ubld4=has_ubld4,
+                          plateau_tex_src=("plateau_tex.js" if has_tex else None))
         lite_p = run_dir / "viewer3d_lite.html"
         lite_p.write_text(lite, encoding="utf-8")
         print(f"  {lite_p}  ({lite_p.stat().st_size/1024/1024:.2f} MB)"
               f"  + {side.name}  ({side.stat().st_size/1024/1024:.2f} MB)")
+        if has_tex:
+            tex_mb = tex_p.stat().st_size / 1024 / 1024
+            total = (lite_p.stat().st_size + side.stat().st_size
+                     + tex_p.stat().st_size) / 1024 / 1024
+            print(f"  + {tex_p.name}  ({tex_mb:.2f} MB)"
+                  f"  ← 分離版合計 {total:.2f} MB(埋め込み版にテクスチャは入れない)")
     return 0
 
 
