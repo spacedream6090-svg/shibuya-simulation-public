@@ -318,15 +318,26 @@ def section_notes(res, quick):
 
     h0 = _cf("sfm")
     h1 = _cf("sfm", solver_kw={"noise": 2.0, "noise_seed": 7})
+    h1b = _cf("sfm", solver_kw={"noise": 2.0, "noise_seed": 7})
     o0 = _cf("orca")
     o1 = _cf("orca", solver_kw={"pref_noise": 0.2, "noise_seed": 7})
     o1b = _cf("orca", solver_kw={"pref_noise": 0.2, "noise_seed": 7})
     res["engine_notes"] = {
         "wallcrowd_drops_fluctuation_xi": {
-            "hash_noise0": h0, "hash_noise2.0": h1, "identical": h0 == h1,
-            "note": "indoor_flow.WallCrowd.forces() は sfm_core.Crowd.forces() を上書きしており"
-                    "揺らぎ項 ξ を含まない。壁ありの経路では noise パラメータが完全に無効"
-                    "(= レーン形成の標準的な対称性の破れ機構が使えない)。src/ は未変更・実測のみ。"},
+            "hash_noise0": h0, "hash_noise2.0": h1, "hash_noise2.0_run2": h1b,
+            "identical": h0 == h1,
+            "changes_trajectory": h0 != h1, "reproducible": h1 == h1b,
+            "fixed_in": "竹-3 (2026-08-02)",
+            "note": "【2026-08-01 の実測=バグ】indoor_flow.WallCrowd.forces() が "
+                    "sfm_core.Crowd.forces() を上書きして揺らぎ項 ξ を落としており、壁ありの経路では "
+                    "noise パラメータが完全に無効だった(identical=true)。"
+                    "【竹-3 で修正済み】壁斥力 f_iW と近傍 cap を sfm_core.Crowd の引数へ移し、"
+                    "WallCrowd は forces() を上書きしなくなった=ξ は壁ありでも効く。"
+                    "以後この項目は identical=false・changes_trajectory=true・reproducible=true "
+                    "(同 seed でバイト一致=確率項と決定論の両立)が正常値。"
+                    "★ただし counterflow w6(ρ=1.11/m²)で ξ を入れてもレーン秩序 φ は改善しない"
+                    "(初期配置 seed 5 本の対照で φ 平均 0.264→0.219〜0.255・seed 間 sd 0.11〜0.14 の"
+                    "散らばりの内側)。ξ の大きさは未較正で、実装既定は noise=0.0(無効)のまま。"},
         "orca_pref_noise_works_and_is_deterministic": {
             "hash_noise0": o0, "hash_pref0.2_run1": o1, "hash_pref0.2_run2": o1b,
             "changes_trajectory": o0 != o1, "reproducible": o1 == o1b,

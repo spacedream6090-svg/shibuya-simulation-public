@@ -12,16 +12,28 @@
     Nature 407, 487-490.
         確定パラメータ  A = 2000 N, B = 0.08 m, τ = 0.5 s, m = 80 kg,
                         r ∈ [0.25, 0.35] m(一様), v_max = 1.3·v0
+        対壁斥力  f_iW = A_w·exp((r_i − d_iW)/B_w)·n_iW   … 壁→歩行者の法線方向
   詳細と出典アクセス日は docs/research/social-force-crowd.md §1 を参照。
 
 ────────────────────────────────────────────────────────────────────────
-本コアで【意図的に省略した項】(第1版・docs/plans の指示に従う):
-  (1) 対壁斥力 f_iW(壁・障害物からの斥力)。
-      → 理由: 案a は「開放円領域(円形の広場)」だけを扱い、建物外壁・車道縁石など
-        の障害物ジオメトリを持ち込まない。境界は円の外に出たら退場する扱いのみ。
-  (2) 物理接触項 — body force  k·g(r_ij−d_ij)·n_ij(弾性反発)と
+対壁斥力 f_iW(竹-3 バッチで追加。docs/research/physics-engine-selection.md「P2 決定」):
+  壁は 2D 線分集合 walls=[((x1,y1),(x2,y2)), …] として **任意引数** で受け取る。
+    walls=None(既定)= 壁項そのものが 1 度も評価されない = 従来の開放領域コアと
+    **完全後方互換**(既存の呼び出しは 1 バイトも挙動が変わらない)。
+  最近点探索は一様格子の空間ハッシュ(WallField)で行う(N×M の全ペア走査をしない)。
+    ハッシュは「距離 ≤ reach の壁を必ず含む」上位集合を返す(AABB をまたぐセル登録 +
+    reach/cell 分のリング探索)ので、結果は全ペア版と **完全に同値**(ビット一致)。
+    テスト tests/test_sfm_walls.py がこの同値性を全ペア参照実装との比較で固定する。
+    ★正直な例外: 壁が探索セル数より少ない極小ジオメトリ(既定で M ≤ 9)では、リング探索より
+      全ペアの方が安いので自動でそちらへ落ちる(WallField.pairs の安全弁)。結果は同一で、
+      O(N·M) が問題になる規模(壁が多い=地下街・通路網)では必ずハッシュ経路を通る。
+  最近傍1本ではなく閾値距離(既定 r_i + 2.0 m)以内の **全壁セグメントの合力**(Helbing 標準)。
+  合算順序は (個体 index, 壁 index) 昇順に固定(np.bincount の逐次加算)= 決定論。
+
+本コアで【意図的に省略した項】:
+  (1) 物理接触項 — body force  k·g(r_ij−d_ij)·n_ij(弾性反発)と
       sliding friction  κ·g(r_ij−d_ij)·Δv_t·t_ij(接線摩擦)。
-      (Helbing2000 のパニック弾性/摩擦。k=1.2e5, κ=2.4e5)
+      (Helbing2000 のパニック弾性/摩擦。k=1.2e5, κ=2.4e5)。壁側の接触項も同様に省略。
       → 理由: これらは高密度の押し合い・すり抜け防止(体の非圧縮)を担う項で、
         本用途(低〜中密度の「揉まれ方」= 減速・回避・レーン形成の再現)には不要。
   ∴ 本コアは超高密度(LOS F 相当)の圧潰・faster-is-slower は再現対象外。
@@ -33,8 +45,14 @@
   乱数は numpy.random.Generator を引数で受け取り、コア内部では seed しない。
   揺らぎ項 ξ(既定 noise=0.0 で無効)を有効化したときだけ Generator を消費する。
   noise=0.0 のときコアは完全に決定論的(同一入力→同一 float 配列)。
+  noise>0 でも「同一 seed の Generator を渡せば同一軌跡」= 決定論は seed 固定で保たれる。
+  ★ ξ は forces() の **唯一の合成点**で足す。屋内拡張(indoor_flow.WallCrowd)が
+    forces() を上書きして ξ を落としていたバグ(壁ありで noise 完全無効)は竹-3 で解消
+    した = 壁・近傍 cap は本コアの引数になり、派生クラスは forces() を上書きしない。
 """
 from __future__ import annotations
+
+import math
 
 import numpy as np
 
@@ -51,6 +69,171 @@ RADIUS_MAX = 0.35        # 半径上限 [m]
 CUTOFF_M = 2.0           # 斥力カットオフ半径 [m]。exp((r−d)/B) は B=0.08 で数m先は
 #                          ~0(d=接触+0.5mで数N)。§1.4 の近傍リスト/カットオフに対応。
 _EXP_ARG_MAX = 4.0       # exp 引数の上限(深い重なり時の overflow/暴走を防ぐ安全弁)
+
+# ── 対壁斥力 f_iW の確定パラメータ(Helbing, Farkas & Vicsek 2000 の壁項) ──
+WALL_A_DEFAULT = 2000.0  # 壁斥力の強さ A_w [N](対人 A と同値の標準値)
+WALL_B_DEFAULT = 0.08    # 壁斥力の特性距離 B_w [m]
+WALL_RANGE_M = 2.0       # 壁斥力の作用距離 [m](d_iW > r_i + これ で寄与 0)
+_MAX_CELLS_PER_SEG = 4096  # 1 セグメントが占める格子セル数の上限(超えた壁は常時候補へ退避)
+_CELL_CLIP = 1 << 30     # 格子座標のクリップ(int64 キー i*2^32+j の桁溢れ防止)
+_KEY_STRIDE = 1 << 32
+
+
+class WallField:
+    """壁セグメント集合 + 一様格子の空間ハッシュ(最近点探索の全ペア走査を避ける)。
+
+    walls: [((x1,y1),(x2,y2)), …](2D 線分の列。vision.building_walls と同形式)。
+
+    格子は「各セグメントの AABB が重なるセル全部」に seg index を登録する。点 p から
+    距離 R 以内に最近点 c を持つセグメントは必ず c を含むセルに登録されており、そのセルは
+    p のセルから Chebyshev 距離 ceil(R/cell) 以内にある。したがってリング探索
+    (2·ring+1)² セルの合併は **距離 R 以内の全セグメントの上位集合**になる(取りこぼし無し)。
+    → 空間ハッシュ版と全ペア版の力は(寄与 0 の余分な候補が混じるだけで)完全に一致する。
+
+    AABB が巨大なセグメント(_MAX_CELLS_PER_SEG 超)は格子に載せず「常時候補」に退避する
+    (登録セル数の爆発を防ぐ安全弁。正しさは変わらない=上位集合のまま)。
+    """
+
+    __slots__ = ("p1", "p2", "n_seg", "cell", "_ox", "_oy", "_keys", "_start",
+                 "_segs", "_always")
+
+    def __init__(self, walls, cell=None):
+        segs = [((float(s[0][0]), float(s[0][1])), (float(s[1][0]), float(s[1][1])))
+                for s in (walls or [])]
+        self.n_seg = len(segs)
+        if self.n_seg == 0:
+            raise ValueError("WallField needs at least one wall segment")
+        self.p1 = np.array([[s[0][0], s[0][1]] for s in segs], dtype=np.float64)
+        self.p2 = np.array([[s[1][0], s[1][1]] for s in segs], dtype=np.float64)
+        self.cell = float(cell if cell else (WALL_RANGE_M + RADIUS_MAX))
+        if not (self.cell > 0.0):
+            raise ValueError("cell must be > 0")
+
+        lo = np.minimum(self.p1, self.p2)
+        hi = np.maximum(self.p1, self.p2)
+        self._ox = float(lo[:, 0].min())
+        self._oy = float(lo[:, 1].min())
+        i0 = np.floor((lo[:, 0] - self._ox) / self.cell).astype(np.int64)
+        i1 = np.floor((hi[:, 0] - self._ox) / self.cell).astype(np.int64)
+        j0 = np.floor((lo[:, 1] - self._oy) / self.cell).astype(np.int64)
+        j1 = np.floor((hi[:, 1] - self._oy) / self.cell).astype(np.int64)
+        n_cells = (i1 - i0 + 1) * (j1 - j0 + 1)
+        big = n_cells > _MAX_CELLS_PER_SEG
+        self._always = np.nonzero(big)[0].astype(np.int64)   # 常時候補(seg index 昇順)
+
+        keys, owners = [], []
+        for m in np.nonzero(~big)[0]:
+            ii = np.arange(i0[m], i1[m] + 1, dtype=np.int64)
+            jj = np.arange(j0[m], j1[m] + 1, dtype=np.int64)
+            k = (ii[:, None] * _KEY_STRIDE + jj[None, :]).ravel()
+            keys.append(k)
+            owners.append(np.full(k.shape[0], m, dtype=np.int64))
+        if keys:
+            key_all = np.concatenate(keys)
+            own_all = np.concatenate(owners)
+            order = np.lexsort((own_all, key_all))           # key 昇順・同 key 内は seg 昇順
+            key_all, own_all = key_all[order], own_all[order]
+            uniq, start = np.unique(key_all, return_index=True)
+            self._keys = uniq
+            self._start = np.append(start, key_all.shape[0]).astype(np.int64)
+            self._segs = own_all
+        else:
+            self._keys = np.zeros(0, dtype=np.int64)
+            self._start = np.zeros(1, dtype=np.int64)
+            self._segs = np.zeros(0, dtype=np.int64)
+
+    # ── (個体, 壁)候補ペアの列挙 ──────────────────────────────────────────
+    def pairs(self, pos, reach):
+        """距離 reach 以内の壁を必ず含む候補ペア (agent_idx, seg_idx) を返す。
+
+        戻り値は (個体 index, 壁 index) の辞書順昇順・重複なし(合算順序=決定論)。"""
+        n = pos.shape[0]
+        if n == 0:
+            return (np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64))
+        ring = int(math.ceil(max(float(reach), 0.0) / self.cell))
+        # 安全弁: 探索リングが壁本数より大きくなる(=格子が細かすぎる/作用距離が極端)なら
+        # 全ペアの方が安く、結果も同一(候補は上位集合なので力はビット一致)。
+        n_off = (2 * ring + 1) ** 2
+        if n_off >= self.n_seg or n_off * n > 4_000_000:
+            return self.all_pairs(n)
+        ai = np.clip(np.floor((pos[:, 0] - self._ox) / self.cell),
+                     -_CELL_CLIP, _CELL_CLIP).astype(np.int64)
+        aj = np.clip(np.floor((pos[:, 1] - self._oy) / self.cell),
+                     -_CELL_CLIP, _CELL_CLIP).astype(np.int64)
+
+        keys_out = []
+        if self._keys.shape[0]:
+            offs = np.arange(-ring, ring + 1, dtype=np.int64)
+            di = np.repeat(offs, offs.shape[0])
+            dj = np.tile(offs, offs.shape[0])
+            # (n, n_off) の問い合わせキー → 一括 searchsorted
+            qk = ((ai[:, None] + di[None, :]) * _KEY_STRIDE
+                  + (aj[:, None] + dj[None, :]))
+            agent_q = np.repeat(np.arange(n, dtype=np.int64), di.shape[0])
+            qk = qk.ravel()
+            idx = np.searchsorted(self._keys, qk)
+            hit = (idx < self._keys.shape[0])
+            hit[hit] = self._keys[idx[hit]] == qk[hit]
+            idx = idx[hit]
+            agent_q = agent_q[hit]
+            cnt = (self._start[idx + 1] - self._start[idx])
+            total = int(cnt.sum())
+            if total:
+                rep = np.repeat(np.arange(cnt.shape[0], dtype=np.int64), cnt)
+                offs_in = (np.arange(total, dtype=np.int64)
+                           - np.repeat(np.cumsum(cnt) - cnt, cnt))
+                seg = self._segs[self._start[idx][rep] + offs_in]
+                keys_out.append(agent_q[rep] * self.n_seg + seg)
+        if self._always.shape[0]:
+            keys_out.append((np.arange(n, dtype=np.int64)[:, None] * self.n_seg
+                             + self._always[None, :]).ravel())
+        if not keys_out:
+            return (np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64))
+        # 重複除去 + 昇順(np.unique は昇順 = (個体, 壁) の辞書順)
+        flat = np.unique(np.concatenate(keys_out))
+        return (flat // self.n_seg, flat % self.n_seg)
+
+    def all_pairs(self, n):
+        """全ペア (agent_idx, seg_idx) 昇順(空間ハッシュとの同値検証・小規模向け参照実装)。"""
+        a = np.repeat(np.arange(n, dtype=np.int64), self.n_seg)
+        s = np.tile(np.arange(self.n_seg, dtype=np.int64), n)
+        return (a, s)
+
+
+def wall_forces_from_pairs(pos, radius, field, ai, si,
+                           wall_a=WALL_A_DEFAULT, wall_b=WALL_B_DEFAULT,
+                           wall_range=WALL_RANGE_M):
+    """候補ペア列から対壁斥力の合力 (N,2) を組む(Helbing2000 の f_iW)。
+
+        f_iW = A_w · exp((r_i − d_iW)/B_w) · n_iW        (d_iW > r_i + wall_range で 0)
+
+    d_iW = 個体中心から壁線分への最近点距離、n_iW = 壁 → 個体の単位法線。
+    合算は ai 昇順・同一個体内は si 昇順の **逐次加算**(np.bincount)に固定するので、
+    候補集合が「寄与 0 を除いて同じ」であれば全ペア版とビット単位で一致する。
+    """
+    n = pos.shape[0]
+    f = np.zeros((n, 2), dtype=np.float64)
+    if ai.shape[0] == 0:
+        return f
+    a = field.p1[si]                                  # (P,2) 線分始点
+    eseg = field.p2[si] - a                           # (P,2) 線分ベクトル
+    len2 = (eseg * eseg).sum(axis=1)
+    len2_safe = np.where(len2 > 1e-12, len2, 1.0)
+    p = pos[ai]
+    t = np.clip(((p - a) * eseg).sum(axis=1) / len2_safe, 0.0, 1.0)
+    closest = a + t[:, None] * eseg
+    dvec = p - closest                                # 壁 → 個体
+    dist = np.linalg.norm(dvec, axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        nvec = dvec / dist[:, None]
+    nvec = np.nan_to_num(nvec)
+    r_i = radius[ai]
+    arg = np.clip((r_i - dist) / wall_b, a_min=None, a_max=_EXP_ARG_MAX)
+    mag = np.where(dist <= r_i + wall_range, wall_a * np.exp(arg), 0.0)
+    contrib = mag[:, None] * nvec
+    f[:, 0] = np.bincount(ai, weights=contrib[:, 0], minlength=n)
+    f[:, 1] = np.bincount(ai, weights=contrib[:, 1], minlength=n)
+    return f
 
 
 class Crowd:
@@ -69,12 +252,24 @@ class Crowd:
         rng:    numpy.random.Generator。radius 抽選と揺らぎ ξ に使う(内部 seed 禁止)。
         noise:  揺らぎ ξ の標準偏差 [m/s²]。0.0(既定)で決定論・ξ 無効。
         arrive_radius: 目標到達判定半径 [m]。
+        walls:  壁線分 [((x1,y1),(x2,y2)), …] or None(既定)。None なら対壁斥力 f_iW は
+                一切評価されない=従来の開放領域コアと完全同一(後方互換)。
+        wall_a / wall_b / wall_range: f_iW の A_w [N] / B_w [m] / 作用距離 [m]。
+        wall_hash: True(既定)= 空間ハッシュで最近点探索。False = 全ペア(検証用の参照経路。
+                結果は空間ハッシュ版とビット一致する=テストで固定)。
+        wall_cell: 空間ハッシュ格子の一辺 [m]。None(既定)= wall_range + 半径上限。
+                値を変えても結果は不変(探索の粒度が変わるだけ)。
+        neighbor_cap: 対人斥力の近傍上限(最近傍 cap 体のみ寄与・距離昇順+index 昇順の
+                決定論選択)。None(既定)= 上限なし=従来どおり全近傍。
     """
 
     def __init__(self, pos, vel, goal, v0, radius=None, active=None,
                  mass=MASS_DEFAULT, tau=TAU_DEFAULT, a=A_DEFAULT, b=B_DEFAULT,
                  lambda_aniso=LAMBDA_DEFAULT, v_max_factor=V_MAX_FACTOR,
-                 rng=None, noise=0.0, arrive_radius=0.5):
+                 rng=None, noise=0.0, arrive_radius=0.5,
+                 walls=None, wall_a=WALL_A_DEFAULT, wall_b=WALL_B_DEFAULT,
+                 wall_range=WALL_RANGE_M, wall_hash=True, wall_cell=None,
+                 neighbor_cap=None):
         self.pos = np.asarray(pos, dtype=np.float64).reshape(-1, 2).copy()
         n = self.pos.shape[0]
         self.vel = np.asarray(vel, dtype=np.float64).reshape(-1, 2).copy()
@@ -97,6 +292,16 @@ class Crowd:
         self.rng = rng
         self.noise = float(noise)
         self.arrive_radius = float(arrive_radius)
+        # ── 対壁斥力 f_iW(walls=None なら field=None = 壁項を一度も評価しない) ──
+        self.wall_a = float(wall_a)
+        self.wall_b = float(wall_b)
+        self.wall_range = float(wall_range)
+        self.wall_hash = bool(wall_hash)
+        # 空間ハッシュ格子 [m]。既定 = 作用距離 + 半径上限(= リング 1 周で reach を覆う)。
+        self.wall_cell = float(wall_cell) if wall_cell else (self.wall_range + RADIUS_MAX)
+        self.wall_field = (WallField(walls, cell=self.wall_cell)
+                           if walls is not None and len(walls) else None)
+        self.neighbor_cap = None if neighbor_cap is None else int(neighbor_cap)
 
     # ── 希望方向 e_i(目標へ向かう単位ベクトル) ──
     def _desired_dir(self):
@@ -107,9 +312,30 @@ class Crowd:
         e[nz] = d[nz] / dist[nz, None]
         return e, dist
 
-    # ── 全力の合成(駆動 + 対人斥力[+揺らぎ]) ──
+    # ── 対壁斥力 f_iW(walls を渡したときだけ評価される) ──
+    def _wall_forces(self):
+        """壁からの斥力の合力 (N,2)。最近点探索は空間ハッシュ(wall_hash=False で全ペア)。"""
+        field = self.wall_field
+        if field is None:
+            return np.zeros_like(self.pos)
+        if self.wall_hash:
+            reach = float(self.radius.max()) + self.wall_range if self.radius.size else \
+                self.wall_range
+            ai, si = field.pairs(self.pos, reach)
+        else:
+            ai, si = field.all_pairs(self.pos.shape[0])
+        return wall_forces_from_pairs(self.pos, self.radius, field, ai, si,
+                                      wall_a=self.wall_a, wall_b=self.wall_b,
+                                      wall_range=self.wall_range)
+
+    # ── 全力の合成(駆動 + 対人斥力 + 対壁斥力[+揺らぎ]) ──
     def forces(self):
-        """各個体に働く合力 (N,2) [N] を返す。非アクティブ個体は 0。"""
+        """各個体に働く合力 (N,2) [N] を返す。非アクティブ個体は 0。
+
+        f_i = f_drive + Σ_j f_ij + Σ_W f_iW + ξ
+        ★ ξ はここが唯一の合成点(派生クラスは forces() を上書きしない)。壁ありでも
+          noise>0 なら ξ が効く(竹-3: WallCrowd が ξ を落としていたバグの構造的解消)。
+        """
         n = self.pos.shape[0]
         e, _ = self._desired_dir()
 
@@ -134,10 +360,20 @@ class Crowd:
             w = self.lam + (1.0 - self.lam) * (1.0 + cosphi) / 2.0
             # マスク: 非アクティブ相手 j / カットオフ外 / 自己 は寄与 0
             valid = self.active[None, :] & (d <= rr + CUTOFF_M)
+            # 近傍 cap(None=上限なし=従来経路): 各個体につき最近傍 cap 体のみ寄与。距離昇順の
+            # 安定ソートで順位を作り(index 昇順でタイブレーク)、cap 位以内だけ残す=決定論選択。
+            if self.neighbor_cap is not None and self.neighbor_cap < n - 1:
+                order = np.argsort(d, axis=1, kind="stable")      # 距離昇順の列 index
+                rank = np.argsort(order, axis=1, kind="stable")   # 各 j の順位
+                valid = valid & (rank < self.neighbor_cap)
             contrib = (w * mag)[:, :, None] * nij                 # (N,N,2)
             contrib[~valid] = 0.0
             f_rep = contrib.sum(axis=1)                           # (N,2)
             f = f + f_rep
+
+        # 対壁斥力 f_iW = A_w·exp((r_i − d_iW)/B_w)·n_iW(walls 未指定なら評価しない)
+        if self.wall_field is not None:
+            f = f + self._wall_forces()
 
         # 揺らぎ ξ(既定 noise=0 で無効・決定論)
         if self.noise > 0.0 and self.rng is not None:

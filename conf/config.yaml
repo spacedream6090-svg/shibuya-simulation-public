@@ -2545,3 +2545,32 @@ env:
       capacity: 12              # POI ノードの収容人数(超過で待ち行列。仮値・要較正)
       hold_steps: 3             # 行き先候補から外す長さ(自動失効=減衰項)
       max_nodes: 8              # 同時に外せるノード数の上限(候補の全滅を防ぐ上限)
+
+# ---- 微視歩行者物理(Social Force Model の確定パラメータ宣言。竹-3 バッチ 2026-08-02)----
+# 正典: docs/research/physics-engine-selection.md「★ P2 決定(2026-08-02・確定)」
+#   = ゾーン別ハイブリッド(既定エンジン=自前 SFM / 多方向交差流ゾーンのみ ORCA)。
+# ★本ブロックは【宣言だけ】: 2026-08-02 時点で **これを読むコードは存在しない**(src/ の
+#   grep で参照ゼロ)。値はすべて実装側の既定値(src/society/world/sfm_core.py の
+#   WALL_A_DEFAULT / WALL_B_DEFAULT / WALL_RANGE_M)と一致させてあり、ここを触らない限り
+#   一切の挙動は変わらない=どこからも自動で ON にならない(bool トグルを持たないので
+#   registry.py の repro_tier 宣言対象にもならない。将来トグルを足すときは strict で宣言する)。
+# ★physics.zones / エンジン切替(sfm|orca)・ORCA 統合は竹-4 の範囲=ここには**まだ書かない**。
+# 屋内(遷移駆動 SFM)の実パラメータは従来どおり indoor.sfm.* が正典(こちらは配線済み)。
+physics:
+  sfm:
+    # 対壁斥力 f_iW = A_w · exp((r_i − d_iW)/B_w) · n_iW   (Helbing, Farkas & Vicsek 2000)
+    #   d_iW = 個体中心 → 壁線分の最近点距離、n_iW = 壁 → 個体の単位法線。
+    #   閾値距離内の壁セグメント **全部** の合力(最近傍1本ではない=Helbing 標準)。
+    wall_A: 2000.0              # A_w [N] 壁斥力の強さ(対人 A と同値の Helbing2000 標準値)
+    wall_B: 0.08                # B_w [m] 壁斥力の特性距離(同上)
+    wall_range: 2.0             # 作用距離 [m]。d_iW > r_i + これ で寄与 0(exp は B=0.08 で数m先 ~0)
+    wall_hash_cell: 2.35        # 壁最近点探索の空間ハッシュ格子 [m](既定 = wall_range + 半径上限
+                                #   0.35 = リング1周ぶんで距離 reach 以内の壁を必ず含む)。
+                                #   全ペア走査版とビット一致することを tests/test_sfm_walls.py が固定。
+    # 揺らぎ項 ξ(Helbing&Molnár1995)。f に m·N(0, noise) を足す。0.0 = 無効 = 完全決定論。
+    #   ★竹-3 の修正点: 壁ありの経路(WallCrowd)で ξ が落ちていたバグを解消した。noise>0 でも
+    #     「同一 seed の Generator を渡せば同一軌跡」= 決定論は保たれる(seed 固定が条件)。
+    #   ★実測(reference/physics_bench・counterflow w6 ρ=1.11/m²)では ξ を入れると
+    #     レーン秩序 φ はむしろ下がった。値は**未較正**で、既定は 0.0(無効)のまま置く。
+    noise: 0.0                  # ξ の標準偏差 [m/s²]。0.0 = 無効(既定)
+    noise_seed: 20260802        # ξ 専用 Generator の seed(noise>0 のときだけ意味を持つ)

@@ -9,6 +9,9 @@ sfm_core.Crowd(開放領域の対人斥力・駆動項)を屋内へ拡張する�
   - 壁斥力 f_iW = A·exp((r_i − d_iW)/B)·n_iW(A=2000 N, B=0.08 m。Helbing2000 の壁項)。
     壁セグメント(vision.building_walls の形式 [((x1,y1),(x2,y2)), …])への最近点距離 d_iW と
     法線 n_iW(壁→個体)で法線方向の斥力を与える。
+    ★竹-3(2026-08-02)で **実装は sfm_core.Crowd へ移設**した(f_iW は Helbing 標準項であり
+      屋内固有ではないため)。本層は walls / wall_a / wall_b を素通しするだけで式を持たない
+      (二重実装の解消)。最近点探索は sfm_core.WallField の空間ハッシュ(全ペア走査なし)。
     【意図的な省略(コード註で正直に明記)】: 壁の物理接触項 — body force k·g(r−d)·n_iW と
       sliding friction κ·g(r−d)·Δv_t·t_iW — は入れない。屋内 10 分粒度の遷移は
       低密度(廊下・ドア前で数体)で、押し合いの非圧縮(体のめり込み防止)より
@@ -22,7 +25,10 @@ sfm_core.Crowd(開放領域の対人斥力・駆動項)を屋内へ拡張する�
     coplace(一方が静止=静止者 or 経路完了者)の 2 種。id_a < id_b 正規化・記録順は決定論。
 
 決定論(R1 doctrine #4):
-  id 昇順の固定配列・dt/上限固定・積分内乱数ゼロ。個体パラメータ(希望速度 v0・半径 radius)は
+  id 昇順の固定配列・dt/上限固定・積分内乱数ゼロ。integrate_transition は WallCrowd へ
+  rng も noise も渡さない(=竹-3 で復活した揺らぎ項 ξ は屋内経路では既定 OFF のまま・
+  ラン出力はバイト不変)。ξ を使うのは reference/physics_bench など明示的な実験だけ。
+  個体パラメータ(希望速度 v0・半径 radius)は
   agent_id からの blake2b 安定ハッシュ(run.seed 非依存・毎回同値)。src/society/ontology.py の
   _stable_uniform と同一流儀(hashlib=プロセス跨ぎ安定・RngHub の乱数列に無風)。
 
@@ -43,15 +49,18 @@ from dataclasses import dataclass
 import numpy as np
 
 from society.world import vision
-from society.world.sfm_core import Crowd, CUTOFF_M, _EXP_ARG_MAX
+from society.world.sfm_core import (Crowd, WALL_A_DEFAULT, WALL_B_DEFAULT,
+                                    WALL_RANGE_M)
 
 # ── 屋内拡張の確定パラメータ ──
-WALL_A = 2000.0      # 壁斥力の強さ [N]        … Helbing2000 の壁項(対人と同値の標準値)
-WALL_B = 0.08        # 壁斥力の特性距離 [m]     … Helbing2000
+# 壁項 A_w / B_w / 作用距離は sfm_core の f_iW と **同一の値を参照**する(竹-3 で一本化。
+# 別々に持つと「屋内だけ壁が違う」ズレが生まれるため、名前だけ本層に残して値は正典から引く)。
+WALL_A = WALL_A_DEFAULT   # 壁斥力の強さ [N]        … Helbing2000 の壁項(対人と同値の標準値)
+WALL_B = WALL_B_DEFAULT   # 壁斥力の特性距離 [m]     … Helbing2000
 NEIGHBOR_CAP = 12    # 対人斥力の近傍上限(最近傍のみ寄与・id 昇順で決定論選択)
 V0_MIN, V0_MAX = 1.0, 1.4       # 希望速度の一様域 [m/s](agent_id 安定ハッシュで抽選)
 RADIUS_MIN, RADIUS_MAX = 0.25, 0.35  # 半径の一様域 [m](Helbing2000)
-_WALL_CUTOFF_M = 2.0             # 壁斥力カットオフ [m](exp は B=0.08 で数m先 ~0)
+_WALL_CUTOFF_M = WALL_RANGE_M    # 壁斥力カットオフ [m](exp は B=0.08 で数m先 ~0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -381,7 +390,14 @@ def _collapse_collinear(pts, eps: float = 1e-6) -> list:
 # WallCrowd: sfm_core.Crowd + 壁斥力 + 近傍 cap + frozen(静止者)
 # ─────────────────────────────────────────────────────────────────────────────
 class WallCrowd(Crowd):
-    """Crowd の屋内拡張。壁斥力・対人斥力の近傍 cap・静止個体(frozen)を追加する。
+    """Crowd の屋内拡張。静止個体(frozen)だけを足す薄い派生クラス。
+
+    ★竹-3(2026-08-02)で構造を変更: 壁斥力 f_iW と対人斥力の近傍 cap は **sfm_core.Crowd 側の
+      引数**になった(walls=… / neighbor_cap=…)。本クラスはそれらを素通しするだけで、
+      forces() を **上書きしない**。
+      - 二重実装の解消: 壁斥力の式・空間ハッシュ探索は sfm_core.wall_forces_from_pairs の 1 箇所。
+      - ξ 欠落バグの構造的解消: forces() を上書きしないので、揺らぎ項 ξ(noise>0)が
+        壁ありの経路でも必ず効く(旧実装は forces() を上書きして ξ を落としていた)。
 
     frozen 個体(静止者 = 斥力源 + 接触対象だが動かない)は active=True のまま(=他個体へ斥力を
     及ぼし距離計算に入る)、step で速度 0・不動に固定する。Crowd.active(False=力を及ぼさない)とは
@@ -392,80 +408,14 @@ class WallCrowd(Crowd):
                  wall_a=WALL_A, wall_b=WALL_B, neighbor_cap=NEIGHBOR_CAP,
                  arrive_radius=0.5, **kw):
         super().__init__(pos, vel, goal, v0, radius=radius,
-                         arrive_radius=arrive_radius, **kw)
+                         arrive_radius=arrive_radius,
+                         walls=(list(walls) if walls else None),
+                         wall_a=wall_a, wall_b=wall_b,
+                         wall_range=kw.pop("wall_range", _WALL_CUTOFF_M),
+                         neighbor_cap=neighbor_cap, **kw)
         n = self.pos.shape[0]
         self.frozen = (np.zeros(n, dtype=bool) if frozen is None
                        else np.asarray(frozen, dtype=bool).reshape(-1).copy())
-        self.wall_a = float(wall_a)
-        self.wall_b = float(wall_b)
-        self.neighbor_cap = int(neighbor_cap)
-        # 壁セグメントを (M,2) の端点配列へ(空なら壁斥力オフ)。
-        segs = list(walls or [])
-        if segs:
-            self._wp1 = np.array([[s[0][0], s[0][1]] for s in segs], dtype=np.float64)
-            self._wp2 = np.array([[s[1][0], s[1][1]] for s in segs], dtype=np.float64)
-        else:
-            self._wp1 = self._wp2 = None
-
-    def forces(self):
-        """駆動 + 対人斥力(近傍 cap)+ 壁斥力。非アクティブは 0。決定論(乱数ゼロ)。"""
-        n = self.pos.shape[0]
-        e, _ = self._desired_dir()
-        # 駆動項: f_drive = m (v0 e − v) / τ(sfm_core.Crowd と同式)
-        f = self.mass * (self.v0[:, None] * e - self.vel) / self.tau
-
-        if n > 1:
-            # 対人斥力(全ペア)。diff_ij = pos_i − pos_j(j から i へ向かう)
-            diff = self.pos[:, None, :] - self.pos[None, :, :]     # (N,N,2)
-            d = np.linalg.norm(diff, axis=2)                       # (N,N)
-            np.fill_diagonal(d, np.inf)
-            rr = self.radius[:, None] + self.radius[None, :]
-            arg = np.clip((rr - d) / self.b, a_min=None, a_max=_EXP_ARG_MAX)
-            mag = self.a * np.exp(arg)
-            with np.errstate(invalid="ignore", divide="ignore"):
-                nij = diff / d[:, :, None]
-            nij = np.nan_to_num(nij)
-            cosphi = -np.einsum("ik,ijk->ij", e, nij)
-            w = self.lam + (1.0 - self.lam) * (1.0 + cosphi) / 2.0
-            valid = self.active[None, :] & (d <= rr + CUTOFF_M)
-            # 近傍 cap: 各個体につき最近傍 neighbor_cap 体のみ寄与。距離昇順の安定ソートで順位
-            # を作り(id 昇順=配列 index 昇順でタイブレーク)、cap 位以内だけ残す=決定論選択。
-            if self.neighbor_cap < n - 1:
-                order = np.argsort(d, axis=1, kind="stable")       # 距離昇順の列 index
-                rank = np.argsort(order, axis=1, kind="stable")    # 各 j の順位
-                valid = valid & (rank < self.neighbor_cap)
-            contrib = (w * mag)[:, :, None] * nij
-            contrib[~valid] = 0.0
-            f = f + contrib.sum(axis=1)
-
-        # 壁斥力 f_iW = A·exp((r_i − d_iW)/B)·n_iW(法線=壁→個体)。接触項(body/friction)は省略。
-        if self._wp1 is not None:
-            f = f + self._wall_forces()
-
-        f[~self.active] = 0.0
-        return f
-
-    def _wall_forces(self):
-        """各個体への壁斥力の合力 (N,2)。壁セグメントへの最近点距離と法線で計算(ベクトル化)。"""
-        pos = self.pos                                   # (N,2)
-        p1, p2 = self._wp1, self._wp2                    # (M,2)
-        eseg = p2 - p1                                   # (M,2)
-        len2 = (eseg * eseg).sum(axis=1)                 # (M,)
-        len2_safe = np.where(len2 > 1e-12, len2, 1.0)
-        rel = pos[:, None, :] - p1[None, :, :]           # (N,M,2)
-        t = (rel * eseg[None, :, :]).sum(axis=2) / len2_safe[None, :]   # (N,M)
-        t = np.clip(t, 0.0, 1.0)
-        closest = p1[None, :, :] + t[:, :, None] * eseg[None, :, :]     # (N,M,2)
-        dvec = pos[:, None, :] - closest                 # (N,M,2) 壁→個体
-        dist = np.linalg.norm(dvec, axis=2)              # (N,M)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            nvec = dvec / dist[:, :, None]
-        nvec = np.nan_to_num(nvec)
-        arg = np.clip((self.radius[:, None] - dist) / self.wall_b,
-                      a_min=None, a_max=_EXP_ARG_MAX)
-        mag = self.wall_a * np.exp(arg)                  # (N,M)
-        mag = np.where(dist <= self.radius[:, None] + _WALL_CUTOFF_M, mag, 0.0)
-        return (mag[:, :, None] * nvec).sum(axis=1)      # (N,2)
 
     def step(self, dt=0.1):
         """1 サブステップ Euler。frozen 個体は速度 0・不動(静止者=見える/押すが動かない)。"""
