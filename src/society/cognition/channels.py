@@ -55,6 +55,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 
+from .. import physics as _physics
 from ..world.perception import build_index, hearers_of
 
 SCHEMA = 1
@@ -308,6 +309,9 @@ def observe(sim, step: int, sim_min: int, since_idx: int) -> list[tuple]:
         aid = int(agent.id)
         key = _place_key(agent)
         crowd = float(counts.get(key, 1) - 1) if key is not None else 0.0
+        # 竹-4(P3): 物理ゾーンの実測近傍人数への差し替え。**配線のみ・既定 OFF**
+        # (physics.perception.channels=false のとき引数をそのまま返す=バイト一致)。
+        crowd = _physics.crowd_override(sim, agent, crowd)
         values: list[float | None] = [
             crowd,
             float(len(hearers_of(agent, index, radius))),

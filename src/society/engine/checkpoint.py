@@ -187,6 +187,14 @@ def save(sim, step: int, path: str | Path) -> Path:
             # env.feedback OFF のランでは属性自体が生えない → None=挙動不変(load は .get で
             # 旧 checkpoint 互換)。
             "envfb_state": getattr(sim, "_envfb", None),
+            # 竹-4(P3 境界縫合): ゲート通過の累計・境界連続性ヒストグラム・重なり最小値。
+            # **ゾーンの所有そのもの**(agent._phys_zone / _phys_pos / _phys_vel / _phys_path …)は
+            # agents pickle に自然同梱されるので、ここで中央管理するのは L2 の累積列と
+            # 検収指標の材料だけ(第62 joint / 第70 echo / 第75 dunbar と同じ型)。
+            # 保存しないと mid-day resume で zone_gate_*_total(累積量)が straight と食い違う。
+            # physics.zones OFF のランでは属性自体が生えない → None=挙動不変
+            # (load は .get で旧 checkpoint 互換)。
+            "phys_state": getattr(sim, "_phys_state", None),
             # 第82バッチ: θ 恒常性の日境界の進行(**日オーダーの時定数**なので、これを
             # 保存しないと resume 直後に「初日扱い」へ戻って 1 日ぶんの恒常性が飛ぶ)。
             # g / ē / credit / 監視仕様(_fire_watch)は agents pickle に自然同梱される。
@@ -323,6 +331,10 @@ def load(sim, path: str | Path) -> int:
     efb = rt.get("envfb_state")
     if efb is not None:
         sim._envfb = efb
+    # 竹-4: 物理ゾーンのタリー(旧 checkpoint 互換=無ければ素通り=OFF ランは無風)。
+    phs = rt.get("phys_state")
+    if phs is not None:
+        sim._phys_state = phs
     # 第82: θ 恒常性の日境界(旧 checkpoint 互換 = 無ければ -1 = 従来どおり初日扱い)。
     sim._g_day = int(rt.get("g_day", -1))
     if hasattr(sim, "_journal_rewind"):         # 第71: LLM ジャーナルを確定点まで巻き戻す

@@ -2554,7 +2554,8 @@ env:
 #   WALL_A_DEFAULT / WALL_B_DEFAULT / WALL_RANGE_M)と一致させてあり、ここを触らない限り
 #   一切の挙動は変わらない=どこからも自動で ON にならない(bool トグルを持たないので
 #   registry.py の repro_tier 宣言対象にもならない。将来トグルを足すときは strict で宣言する)。
-# ★physics.zones / エンジン切替(sfm|orca)・ORCA 統合は竹-4 の範囲=ここには**まだ書かない**。
+# ★竹-4(P3 境界縫合)で `physics.zones_enabled` / `physics.zones` / `physics.perception` を
+#   追加した(下段)。**既定は zones_enabled=false かつ zones=[] = 一切の新経路を通らない**。
 # 屋内(遷移駆動 SFM)の実パラメータは従来どおり indoor.sfm.* が正典(こちらは配線済み)。
 physics:
   sfm:
@@ -2574,3 +2575,62 @@ physics:
     #     レーン秩序 φ はむしろ下がった。値は**未較正**で、既定は 0.0(無効)のまま置く。
     noise: 0.0                  # ξ の標準偏差 [m/s²]。0.0 = 無効(既定)
     noise_seed: 20260802        # ξ 専用 Generator の seed(noise>0 のときだけ意味を持つ)
+
+  # ==== P3 境界縫合(竹-4 2026-08-02。**既定 OFF = 現行挙動と完全同一**)============
+  # 正典: docs/plans/source/physics-instructions.md Part P3 /
+  #       docs/research/physics-engine-selection.md ★P2 決定(2026-08-02)条件 1〜6。
+  # 実装: src/society/world/zones.py(宣言・幾何・ゲート)+ src/society/physics.py(実行)
+  #       + src/society/world/orca_core.py(ORCA。reference/physics_bench から昇格)。
+  #
+  # 何が起きるか(ON のとき): ゾーンのポリゴンを**通り抜ける**経路を持つ個体を、その step の
+  # 頭で物理が**所有**し(= グラフ移動をしない)、dt_sub 刻みでゾーンの中を実際に歩かせる。
+  # ゾーンの外へ出た時点で経路の折れ線へ射影してグラフ状態へ返す。
+  #   → **ON にすると世界が変わる**(位置・到着時刻が物理で決まる)。opt-in の世界変更機能で、
+  #     registry.py に physics.zones_enabled を strict / affects_k=false / risk=none で宣言済み。
+  #   → プロンプト文字列は 1 バイトも変わらない(第85 契約の body 欄は prompt_kwargs に出ない)。
+  #     「同一の位置系列なら文字列不変」を tests/test_physics_zones.py が固定する。
+  #
+  # OFF が保つ不変条件: zones_enabled=false(既定)または zones=[](既定)のとき、
+  #   physics.phase() は即 return・agent._phys_* 属性が 1 つも生えない・zone_gate イベント 0 件・
+  #   L2 に列なし・"physics" stream を 1 本も引かない・**L1 バイト一致**。
+  zones_enabled: false
+  perception:
+    # 物理 → 知覚(P3(3))。値は Perception.body の既存 3 欄(blocked/contact/local_density)へ。
+    density_radius_m: 2.0       # 局所密度を測る円の半径 [m](local_density = 円内人数 / 円の面積)
+    contact_gap_m: 0.05         # 体表間がこれ以下のサブステップを「接触」と数える [m]
+    # ★将来の発火チャンネル接続(ext.crowd 系)。**配線だけ**用意して既定 OFF。
+    #   true にすると ext.crowd_local の値が「同席人数」から「実測近傍人数」へ変わるので、
+    #   第80 の σ 較正をやり直す必要がある(だから既定は false)。
+    channels: false
+  # ゾーン宣言。**空 = 既定 = 物理 OFF**。
+  zones: []
+  # ---- 記入例(コメントアウト。ON にするときはこのブロックを zones: の下へ移す)----
+  # 交差点ゾーン: 開放平面の多方向交差流 = P2 決定の割当規則で **engine: orca**。
+  # 信号は既存の交差点表(data/crossings_shibuya.json)から引く(cycle/green/flash を実測値で)。
+  # crossing_id 250652228 は同表の 1 件(cycle_s 140 / green_s 37 / flash_s 10)。
+  # zones:
+  #   - id: scramble
+  #     engine: orca              # 交差流の実測: 効率 0.924 vs SFM 0.530・反転 1/5(P2 決定)
+  #     dt_sub: 0.05              # P2 条件1: 0.02–0.05(dt>=0.1 は SFM が rho>=1.5 で後退爆発)
+  #     polygon: [[-45, -45], [45, -45], [45, 45], [-45, 45]]   # 地図ローカル m(原点=交差点中心)
+  #     arrive_radius_m: 1.0
+  #     signal:
+  #       mode: table
+  #       path: data/crossings_shibuya.json
+  #       crossing_id: 250652228  # 赤の間は入場させない=縁石に溜まり、青で一斉横断(SignalGate)
+  #     orca:
+  #       pref_noise: 0.05        # 対称性の破れ(未較正。0.0 で乱数ゼロ)
+  #       radius_margin_m: 0.05   # P2 条件3(a) 半径マージン
+  #       separation_iters: 64    # P2 条件3(b) 決定論的な事後分離パス(反復上限)
+  #     gate:
+  #       min_gap_m: 0.10         # guarded: 入口がこの余裕ぶん空いていなければ入れない
+  #       band_m: 3.0             # 緩和帯(この帯の指標は内部と分けて出す)
+  #       max_hold_steps: 3       # 入場待ちの上限 step(安全弁)
+  #       max_zone_steps: 6       # ゾーン滞在の上限 step(安全弁)
+  # 地下通路ゾーンの例(壁あり = engine: sfm。地下街 LOD4.1 の壁線分を層指定で読む):
+  #   - id: underpass
+  #     engine: sfm
+  #     dt_sub: 0.05
+  #     polygon: [[-60, -80], [10, -80], [10, -20], [-60, -20]]
+  #     walls: { mode: layered_json, path: data/plateau/ubld_lod4.json, layers: [3] }
+  #     walkable: { mode: polygons_json, path: data/plateau/tran_lod3.json }

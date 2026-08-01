@@ -5,6 +5,7 @@ from typing import Any, Callable
 
 from .. import dunbar as _dunbar
 from .. import gossip as _gossip
+from .. import physics as _physics
 from .. import relations_endo as _rendo
 from .. import status as _status_mod
 from .. import truth_ledger as _truth
@@ -858,6 +859,42 @@ def _n_indoor_encounter(sim):
 @register_aggregator("n_indoor_meeting")
 def _n_indoor_meeting(sim):
     return _indoor_col(sim, "_indoor_n_meeting")
+
+
+# ---- P3 境界縫合 竹-4(physics.zones ON のみ・既定 OFF=None=列なし=L2 バイト不変)----
+#   zone_occupancy       … いまゾーンの中に居る頭数(per-step。累積でない=resume 安全)
+#   zone_density_mean    … ゾーン平均密度 [人/m²](その step の在ゾーン頭数の時間平均 / 面積)
+#   zone_dwell_mean_s    … これまでに退出した個体の滞在時間の**累積平均** [s](退出ゼロなら 0.0)
+#   zone_gate_enter_total / zone_gate_exit_total … 流入/流出の累計(単調非減少=resume 安全)
+#   タリーは physics.phase() が積み、scalars() は読むだけ(乱数ゼロ・LLM 呼ゼロ)。
+def _phys_col(sim, key):
+    s = _physics.scalars(sim)
+    return s.get(key) if s else None
+
+
+@register_aggregator("zone_occupancy")
+def _zone_occupancy(sim):
+    return _phys_col(sim, "zone_occupancy")
+
+
+@register_aggregator("zone_density_mean")
+def _zone_density_mean(sim):
+    return _phys_col(sim, "zone_density_mean")
+
+
+@register_aggregator("zone_dwell_mean_s")
+def _zone_dwell_mean_s(sim):
+    return _phys_col(sim, "zone_dwell_mean_s")
+
+
+@register_aggregator("zone_gate_enter_total")
+def _zone_gate_enter_total(sim):
+    return _phys_col(sim, "zone_gate_enter_total")
+
+
+@register_aggregator("zone_gate_exit_total")
+def _zone_gate_exit_total(sim):
+    return _phys_col(sim, "zone_gate_exit_total")
 
 
 # ---- 場所の意味づけ最小版 D1 第69バッチ(既定 OFF)。labeling.place_binding.enabled=false は

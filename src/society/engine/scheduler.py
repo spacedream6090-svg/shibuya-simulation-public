@@ -30,6 +30,7 @@ from .. import lodging as lodging_mod
 from .. import mobility as mobility_mod
 from .. import opinion as opinion_mod
 from .. import party as party_mod
+from .. import physics as physics_mod
 from .. import relations as relations_mod
 from .. import relations_endo as relations_endo_mod
 from .. import pov as pov_mod
@@ -978,8 +979,11 @@ def _phase_move(sim, step: int, sim_min: int) -> None:
     for agent in sim.agents:
         # SUMO ライブ連成の配車待ち(_taxi_hold_until>step)は移動しない=占有にも数えない(既定 OFF:
         # フラグ未設定→getattr=-1→常に含める=バイト一致)。
+        # P3 境界縫合(竹-4): 物理ゾーンが所有している個体もグラフ移動しない=占有にも数えない
+        # (既定 OFF: _phys_zone 属性が生えない→getattr=None→owned()=False=バイト一致)。
         if agent.loc == "street" and not agent.sleeping and agent.route \
-                and getattr(agent, "_taxi_hold_until", -1) <= step:
+                and getattr(agent, "_taxi_hold_until", -1) <= step \
+                and not physics_mod.owned(agent):
             key = _edge_key(agent.node, agent.route[0])
             occupancy[key] = occupancy.get(key, 0) + 1
 
@@ -993,6 +997,11 @@ def _phase_move(sim, step: int, sim_min: int) -> None:
         if getattr(agent, "_taxi_hold_until", -1) > step:
             agent._congestion = 1.0
             continue
+        # P3 境界縫合(竹-4): 物理ゾーンの所有下ではグラフ移動をしない(排他所有=同一時刻に
+        # 2 つのモデルへ属さない)。位置は physics.phase() が既に据えてある。既定 OFF は素通り。
+        if physics_mod.owned(agent):
+            agent._congestion = 1.0
+            continue
         if agent.loc != "street" or agent.sleeping or not agent.route:
             agent._congestion = 1.0
             continue
@@ -1002,7 +1011,10 @@ def _phase_move(sim, step: int, sim_min: int) -> None:
         agent._congestion = factor
 
         pts: list[tuple[float, float]] = [(agent.x, agent.y)]
-        budget_m = float(speeds[agent.trip_mode]) * factor
+        # P3 境界縫合(竹-4): この step の途中でゾーンを抜けた個体は、物理で使った秒数ぶん
+        # グラフ側の予算を減らす(= 二重移動の防止)。既定 OFF は係数 1.0=バイト一致。
+        budget_m = (float(speeds[agent.trip_mode]) * factor
+                    * physics_mod.budget_scale(sim, agent, step))
         moved = 0.0
         while budget_m > 0 and agent.route:
             edge_len = sim.city.edge_length(agent.node, agent.route[0])
@@ -2047,8 +2059,15 @@ def build_perception(sim, agent, material: dict):
             "loc": agent.loc,
             "companions": len(material["nearby_ids"]),
             # 進行の阻害・接触・局所密度は物理領域を持たない現行のグラフ世界には
-            # **存在しない**。捏造せず None で欠測を明示する(P3 で埋まる枠)。
+            # **存在しない**。捏造せず None で欠測を明示する。
             "blocked": None, "contact": None, "local_density": None}
+    # ---- 竹-4(P3(3) 物理→知覚): 直近のゾーン滞在で**実測した**値だけを入れる。
+    #  ゾーンに一度も入っていない個体・物理 OFF のランでは None のまま(欠測を捏造しない)。
+    #  ★この 3 欄は `prompt_kwargs()` に出ない = プロンプト文字列は 1 バイトも変わらない
+    #    (第85 契約の構造による no-fingerprint 保証。tests/test_physics_zones.py が固定)。
+    phys_body = physics_mod.body_of(agent)
+    if phys_body:
+        body.update(phys_body)
     internal = {"drive": float(getattr(agent, "drive", 0.0) or 0.0),
                 "fatigue": float(getattr(agent, "fatigue", 0.0) or 0.0),
                 "arousal": float(getattr(agent, "arousal", 0.0) or 0.0),
@@ -4807,6 +4826,10 @@ def run_step(sim, step: int) -> None:
     fire_mod.note_plan_due(sim, step)
     _phase_planning(sim, step, sim_min)            # 起床/帰還の直後 step に朝の一日計画
     _phase_tools(sim, step, sim_min)               # イベント開始で会場へ発つ→次の移動で反映
+    # P3 境界縫合(竹-4。既定 OFF=即 return=バイト一致): **_phase_move の直前**に置く。
+    # この時点の (x,y) が「この step の開始時の位置」= 2 層タイムラインの下層(dt_sub)が
+    # 刻むのはまさにこの step の 600 秒だから。物理が所有した個体は _phase_move が飛ばす。
+    physics_mod.phase(sim, step, sim_min)
     _phase_move(sim, step, sim_min)
     # 環境フィードバック(第84。既定 OFF=空 tuple=ループ 0 回=バイト一致): 前 step までに
     # 遅延/入場規制で待たされ、駅に留まっている個体の**再試行**。_try_exit は「到着した step」

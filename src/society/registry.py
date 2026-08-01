@@ -171,6 +171,24 @@ FEATURES: tuple[Feature, ...] = (
     _f("indoor.los.enabled", "strict", False, "possible",
        "屋内の同席リストを実座標距離+間仕切り壁 LOS で絞る(知覚の区画粒度化)"),
 
+    # ---- physics(竹-4 = P3 境界縫合。既定 OFF)----
+    _f("physics.zones_enabled", "strict", False, "none",
+       "局所物理ゾーン(P3 境界縫合)。ゾーンのポリゴンを通り抜ける経路の個体を step の頭で"
+       "物理が所有し(グラフ移動を止め)、dt_sub 刻みで実際に歩かせて、ゾーン外へ出たら経路へ"
+       "射影して返す。エンジンはゾーン別(sfm|orca。P2 決定=多方向交差流だけ orca)。"
+       "★ON は世界を変える(位置・到着時刻が物理で決まる)opt-in 機能。"
+       "repro_tier=strict: 固定 dt・agent.id 昇順・集約順序固定・乱数は用途別 stream "
+       "\"physics\" のみ(ORCA pref_noise / SFM ξ。0 なら 1 本も引かない)。"
+       "affects_k=false: generate() の呼び出し点を 1 つも足さない/減らさない。"
+       "混雑で滞在が伸びれば同席の相手・タイミングが変わり発火数が**間接的に**動くが、"
+       "それは registry の規約どおり False 側(位置・ゲージ経由の間接効果)。"
+       "fingerprint_risk=none: プロンプトの語彙・欄が 1 つも増減しない"
+       "(第85 契約の body 欄は prompt_kwargs() に出ない構造)。"
+       "物理で位置が変われば見える景色が変わるのは**正当な世界変化**であって実験条件の漏洩ではない"),
+    _f("physics.perception.channels", "strict", False, "none",
+       "発火チャンネル ext.crowd_local の値を物理の実測近傍人数へ差し替える(**配線のみ**)。"
+       "ON にすると第80 の σ 較正がやり直しになるため既定 OFF で据え置く"),
+
     # ---- economy ----
     _f("economy.enabled", "strict", False, "none",
        "経済 v0(賃金・消費・バイト・金銭圧力の心理接続)"),

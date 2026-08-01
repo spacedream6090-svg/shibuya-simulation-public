@@ -243,6 +243,15 @@ class Simulation:
         self.indoorcfg = _indoor_mod.build_engine_cfg(raw_indoor)
         self.indoor = _indoor_mod.indoor_from_cfg(self.city, cfg)   # None=既定 OFF
         self.indoorparams = _indoor_flow_mod.IndoorParams.from_cfg(self.indoorcfg["sfm"])
+        # ---- P3 境界縫合 竹-4(既定 OFF = ゾーン 0 件 = 一切の新経路を通らない)----
+        # `physics.zones_enabled: false`(既定)/ `physics.zones: []`(既定)のとき
+        # physcfg["zones"] は空 tuple になり、scheduler の physics.phase() が即 return する
+        # = agent._phys_* が 1 つも生えない = zone_gate 0 件 = L1 バイト一致。
+        from ..world import zones as _zones_mod
+        raw_phys = cfg.get("physics", None)
+        raw_phys = (OmegaConf.to_container(raw_phys, resolve=True)
+                    if OmegaConf.is_config(raw_phys) else raw_phys)
+        self.physcfg = _zones_mod.build_cfg(raw_phys, REPO_ROOT)
         self._indoor_meet_plan = {}                # (group,day)->(occurs,meet_min) 決定論キャッシュ(非pickle)
         self._indoor_encounters_step = []          # step 内一時状態(動力学→観測)。B3b が動力学として読む
         self._indoor_samples_step = []             # step 内一時状態(tracks 観測用)

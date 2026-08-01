@@ -318,6 +318,17 @@ register_event_kind("cog_theta",  "閾値 θ の恒常性を日境界で 1 回�
 register_event_kind("env_feedback", "集約物理量の閾値超過でコード側が発火した環境イベント"
                                     "{rule, metric, value, threshold, excess, node?, phase?, "
                                     "delay_min?, injected_min?, until_step?, effect?, wait_steps?}")
+# ---- P3 境界縫合(竹-4。physics.zones ON のみ・既定 OFF=0件)。グラフ世界 ⇄ 物理ゾーンの
+#      **唯一の出入口**。流入は「入口が空いていて(guarded)信号が青のとき」だけ確定し、
+#      流出は物理座標を経路の折れ線へ射影してグラフ状態を復元した時点で確定する。
+#      P3(2)「境界通過のログ(誰が・いつ・どのゲートを・何秒かけて)をジャーナルに記録する」。
+#      実装 src/society/physics.py。**プロンプトには 1 バイトも足さない**。
+register_event_kind("zone_gate", "物理ゾーンの境界通過(流入 enter / 流出 exit)"
+                                 "{zone, gate, dir, engine?, v0?, speed?, span_m?, "
+                                 "wait_s?, waited_steps?, reason?, dwell_s?, jump_m?, far?}"
+                                 "。span_m=ゾーン内区間のグラフ経路長 / wait_s=入場までの待ち"
+                                 "(信号ゾーンでは赤の縁石滞留。dwell_s には含まれない) / "
+                                 "dwell_s=実際に積分した滞在秒 / jump_m=グラフ復帰時の位置の跳び")
 
 
 @dataclass
