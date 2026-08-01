@@ -456,7 +456,9 @@ def build_glb(buildings: list, plateau: dict | None = None) -> bytes:
             _append_mesh(pm[0], pm[1], color, pos, nrm, col, idxs)
             continue
         base = float(b.get("base", 0.0))
-        top = base + float(b.get("height", FLOOR_HEIGHT))
+        # depth=(levels+below)*FH があればそれを使う(屋上が height に一致する)。
+        # 無い呼び出し(旧 dict/テスト)は従来どおり height を深さとして扱う。
+        top = base + float(b.get("depth", b.get("height", FLOOR_HEIGHT)))
         _extrude_building(b["footprint"], base, top, color, pos, nrm, col, idxs)
 
     if not pos:
@@ -551,6 +553,10 @@ def build_scene(city: dict, buildings: list) -> dict:
             "below": below,
             "height": round(levels * FLOOR_HEIGHT, 2),
             "base": round(-below * FLOOR_HEIGHT, 2),
+            # 押出し深さ = 地下階分も含めた全高。base(=-below*FH)から depth だけ押し出すと
+            # 屋上が height に一致する。旧ビューアは depth に height を使っていたため、
+            # 地下階を持つ建物は屋上が below*FH だけ沈んでいた(B-3 是正)。
+            "depth": round((levels + below) * FLOOR_HEIGHT, 2),
             "cx": round(float(b.get("cx", 0.0)), 1),
             "cy": round(float(b.get("cy", 0.0)), 1),
         })
@@ -660,6 +666,37 @@ def load_track_events(parquet_path: Path,
 
 
 # ------------------------------------------------------------------ tracks.json
+W_INDOOR_BASE = 1000        # w = 1000 + bIdx*100 + floor(1..99)
+W_FLOOR_MAX = 99            # 1 建物あたり 2 桁 = 99 階まで(桁あふれは w が別建物を指す)
+
+
+def encode_indoor_w(bld_idx: dict, bld_levels: list, name, floor, stats: dict) -> int:
+    """屋内 w(1000 + bIdx*100 + floor)を**安全に**組む(B-1・表示側の防御)。
+
+    - 未知の建物名(bld_idx に無い)は idx0 に黙って落とすと「無関係な建物の中に人が居る」
+      表示になるため、w=0(路上)へ退避して件数を数える。
+    - floor は 1..min(levels,99) にクランプ(負値・0・桁あふれ・levels 超えを是正)。
+      sim 側(scheduler)の floor はここでは変えない=L1 は不変。表示だけを実在の階に収める。
+    stats は {"unknown": n, "clamped": n, "unknown_names": {name: n}} を積む。"""
+    bi = bld_idx.get(name)
+    if bi is None:
+        stats["unknown"] = stats.get("unknown", 0) + 1
+        names = stats.setdefault("unknown_names", {})
+        key = str(name)
+        names[key] = names.get(key, 0) + 1
+        return 0
+    try:
+        f = int(floor)
+    except (TypeError, ValueError):
+        f = 1
+    lv = bld_levels[bi] if 0 <= bi < len(bld_levels) else W_FLOOR_MAX
+    hi = max(1, min(int(lv or 1), W_FLOOR_MAX))
+    f2 = max(1, min(f, hi))
+    if f2 != f:
+        stats["clamped"] = stats.get("clamped", 0) + 1
+    return W_INDOOR_BASE + bi * 100 + f2
+
+
 def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
                        sample_agents: int | None = None,
                        step_stride: int = 1, rich_tracks: bool = False,
@@ -685,6 +722,8 @@ def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
     n_steps = (max((e["step"] for e in events), default=-1) + 1
                if n_steps_override is None else int(n_steps_override))
     bld_idx = {b["id"]: i for i, b in enumerate(buildings)}
+    bld_levels = [max(1, int(b.get("levels", 2) or 2)) for b in buildings]
+    w_stats: dict = {}                 # B-1: floor クランプ / 未知建物の件数(黙って落とさない)
 
     agent_ids = (sorted({e["agent_id"] for e in events if e["agent_id"] >= 0})
                  if agent_ids_override is None else list(agent_ids_override))
@@ -753,12 +792,12 @@ def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
                     code = 3
                 mv[i] = [code, pts]
             elif kind == "enter_building":
-                bi = bld_idx.get(p.get("building"), 0)
                 cur[i] = [round(float(e["x"]), 1), round(float(e["y"]), 1),
-                          1000 + bi * 100 + int(p.get("floor", 1))]
+                          encode_indoor_w(bld_idx, bld_levels,
+                                          p.get("building"), p.get("floor", 1), w_stats)]
             elif kind == "floor_move":
-                bi = bld_idx.get(p.get("building"), 0)
-                cur[i][2] = 1000 + bi * 100 + int(p.get("floor", 1))
+                cur[i][2] = encode_indoor_w(bld_idx, bld_levels,
+                                            p.get("building"), p.get("floor", 1), w_stats)
             elif kind == "exit_building":
                 cur[i] = [round(float(e["x"]), 1), round(float(e["y"]), 1), 0]
             elif kind == "exit_area":
@@ -797,6 +836,12 @@ def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
     if rich_tracks:                                 # 追加専用: 既定 OFF=現行と同一
         meta["mode_legend"] = {"0": "徒歩", "1": "自転車", "2": "車", "3": "タクシー"}
         meta["away_train"] = -3
+    if w_stats.get("clamped") or w_stats.get("unknown"):     # silent cap 禁止
+        top = sorted(w_stats.get("unknown_names", {}).items(),
+                     key=lambda kv: (-kv[1], str(kv[0])))[:3]
+        print(f"  [tracks] 屋内 w の是正: floor クランプ {w_stats.get('clamped', 0)}件"
+              f" / 未知建物 {w_stats.get('unknown', 0)}件は路上(w=0)へ退避"
+              + (f"  上位={top}" if top else ""))
     return {
         "meta": meta,
         "agents": agents_slim,
@@ -839,11 +884,23 @@ def export_run(run_dir: Path, map_path: Path | None = None,
             if b["id"] in plateau["meshes"]:
                 b["height"] = round(plateau["heights"][b["id"]], 2)  # LOD 実測で上書き
                 b["plateau"] = 1                                     # 追加専用キー
+                # 実効階高(B-2): levels は sim 側の意味を保つため据え置き、実測高との
+                # 整合は floorH = height/levels で表す。ビューアの屋内フロア高はこれを使う
+                # (levels*3.5 と実測高が食い違う建物で人が屋根を突き抜けるのを止める)。
+                lv = max(1, int(b.get("levels", 1) or 1))
+                b["floorH"] = round(b["height"] / lv, 3)
+                b["depth"] = round(b["height"] - b["base"], 2)       # 押出し深さも実測へ
     # 地表グリッド(--plateau 時・terrain.npz/json がある場合のみ)。無ければ従来どおり gz なし。
     terrain = _load_terrain(plateau_dir) if plateau_dir is not None else None
     if terrain is not None:
         for b in scene["buildings"]:
-            b["gz"] = _sample_terrain_gz(terrain, b["cx"], b["cy"])  # 追加専用キー
+            # A-6: 重心1点ではなく footprint 頂点の最小地表高。斜面上の建物で
+            # 「基準面が実際の足元より高い」= 山側の壁が地面に埋まる/谷側が浮く のを防ぐ
+            # (谷側の隙間は viewer 側の 3m スカートで埋める)。
+            fp = b.get("footprint") or []
+            gz = [_sample_terrain_gz(terrain, p[0], p[1]) for p in fp]
+            b["gz"] = round(min(gz), 1) if gz else _sample_terrain_gz(
+                terrain, b["cx"], b["cy"])                            # 追加専用キー
     tracks = reconstruct_tracks(events, buildings, agents_meta,
                                 sample_agents=sample_agents,
                                 step_stride=step_stride, rich_tracks=rich_tracks,

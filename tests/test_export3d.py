@@ -444,10 +444,14 @@ def test_export_plateau_terrain_extras_integration(tmp_path):
     assert "terrain_web" in res and "plateau_web" in res
 
     scene = json.loads(res["scene"].read_text(encoding="utf-8"))
-    # 全建物に gz が付与され、平面上の重心高と一致
+    # 全建物に gz が付与され、**footprint 頂点の最小地表高**と一致(A-6)。
+    # 重心1点だと斜面で山側の壁が地面に埋まるため、最小値=足元の最も低い点を基準にする。
     for bl in scene["buildings"]:
         assert "gz" in bl
-        assert bl["gz"] == pytest.approx(round(a * bl["cx"] + b * bl["cy"] + d, 1), abs=1e-9)
+        want = min(round(a * p[0] + b * p[1] + d, 1) for p in bl["footprint"])
+        assert bl["gz"] == pytest.approx(want, abs=1e-9)
+        # 斜面なので重心高より必ず低い(等しいのは水平地形のときだけ)
+        assert bl["gz"] <= round(a * bl["cx"] + b * bl["cy"] + d, 1) + 1e-9
 
     tw = json.loads(res["terrain_web"].read_text(encoding="utf-8"))
     assert tw["quant"] == 0.1 and tw["nx"] == 40 and tw["ny"] == 40
@@ -455,6 +459,97 @@ def test_export_plateau_terrain_extras_integration(tmp_path):
     web = json.loads(res["plateau_web"].read_text(encoding="utf-8"))
     assert "extras" in web and set(web["extras"]) == {"ubld", "brid"}
     assert web["extras"]["ubld"]["n_triangles"] == 1
+
+
+# ================================================================ 屋内 w の是正(B-1/B-2)
+def test_encode_indoor_w_clamps_floor_to_levels():
+    """floor は 1..min(levels,99) にクランプ。負値・0・levels 超え・桁あふれを是正する
+    (w=1000+bIdx*100+floor は floor が 2 桁を超えると別建物を指してしまう)。"""
+    bld_idx = {"bA": 0, "bB": 1}
+    lv = [10, 200]                      # bB は levels>99(桁あふれ源)
+    st = {}
+    assert E3D.encode_indoor_w(bld_idx, lv, "bA", 3, st) == 1000 + 0 * 100 + 3
+    assert E3D.encode_indoor_w(bld_idx, lv, "bA", 10, st) == 1000 + 0 * 100 + 10
+    assert E3D.encode_indoor_w(bld_idx, lv, "bA", 25, st) == 1000 + 0 * 100 + 10   # >levels
+    assert E3D.encode_indoor_w(bld_idx, lv, "bA", 0, st) == 1000 + 0 * 100 + 1
+    assert E3D.encode_indoor_w(bld_idx, lv, "bA", -3, st) == 1000 + 0 * 100 + 1
+    assert E3D.encode_indoor_w(bld_idx, lv, "bB", 150, st) == 1000 + 1 * 100 + 99  # 2桁上限
+    assert st["clamped"] == 4
+    assert "unknown" not in st
+    # クランプ後は必ず「その建物の枠(100 未満)」に収まる = 別建物を指さない
+    for f in (-99, 0, 1, 7, 99, 100, 12345):
+        w = E3D.encode_indoor_w(bld_idx, lv, "bB", f, {})
+        assert 1 <= (w - 1000) % 100 <= 99
+        assert (w - 1000) // 100 == 1
+
+
+def test_encode_indoor_w_unknown_building_falls_back_to_street():
+    """未知の建物名は idx0(無関係な建物)ではなく w=0(路上)へ退避し、件数を数える。"""
+    st = {}
+    assert E3D.encode_indoor_w({"bA": 0}, [5], "存在しないビル", 2, st) == 0
+    assert E3D.encode_indoor_w({"bA": 0}, [5], None, 2, st) == 0
+    assert st["unknown"] == 2
+    assert st["unknown_names"]["存在しないビル"] == 1
+    assert "clamped" not in st
+
+
+def test_reconstruct_tracks_clamps_and_reports(tmp_path, capsys):
+    """イベント経路の通し: levels 超え floor はクランプ、未知建物は w=0、報告が出る。"""
+    rows = []
+
+    def add(step, aid, kind, x, y, payload):
+        rows.append({"step": step, "sim_min": 7 * 60 + step * 10, "agent_id": aid,
+                     "kind": kind, "x": float(x), "y": float(y),
+                     "payload": json.dumps(payload, ensure_ascii=False),
+                     "rng_stream": "", "llm_call_id": ""})
+
+    for a in range(3):
+        add(0, a, "arrive", 0, 0, {"name": "路上"})
+    add(1, 0, "enter_building", 5, 5, {"building": "bB", "floor": 99})   # levels=3
+    add(2, 1, "enter_building", 5, 5, {"building": "無い建物", "floor": 2})
+    add(3, 2, "enter_building", 5, 5, {"building": "bA", "floor": -1})   # 負値
+    buildings = _synthetic_map()["buildings"]
+    agents = [{"id": i, "name": f"a{i}", "occupation": "?", "visitor": False}
+              for i in range(3)]
+    tracks = E3D.reconstruct_tracks(rows, buildings, agents)
+    bidx = {b["id"]: i for i, b in enumerate(buildings)}
+    lv = {b["id"]: int(b.get("levels", 2)) for b in buildings}
+    w0 = tracks["positions"][1][0][2]
+    assert (w0 - 1000) // 100 == bidx["bB"]
+    assert (w0 - 1000) % 100 == lv["bB"]            # 99 → levels(=3)
+    assert tracks["positions"][2][1][2] == 0        # 未知建物 → 路上
+    w2 = tracks["positions"][3][2][2]
+    assert (w2 - 1000) // 100 == bidx["bA"] and (w2 - 1000) % 100 == 1   # 負値 → 1F
+    out = capsys.readouterr().out
+    assert "floor クランプ" in out and "未知建物" in out
+
+
+def test_scene_depth_and_plateau_floor_height(tmp_path):
+    """scene.json: 押出し深さ depth=(levels+below)*FH(地下階建物の屋上沈み対策)と、
+    PLATEAU 実測高で上書きした建物の実効階高 floorH=height/levels。"""
+    run_dir, map_path = _write_events_run(tmp_path, "e_fh", _rich_events(), 6)
+    # depth は plateau 無しでも常に出る(押出しの唯一の権威)
+    res0 = E3D.export_run(run_dir, map_path)
+    scene0 = json.loads(res0["scene"].read_text(encoding="utf-8"))
+    bA0 = next(b for b in scene0["buildings"] if b["id"] == "bA")   # levels=10, below=2
+    assert bA0["depth"] == pytest.approx((10 + 2) * 3.5)
+    assert bA0["base"] + bA0["depth"] == pytest.approx(bA0["height"])
+    assert "floorH" not in bA0                      # 実測高が無ければ出さない
+
+    pdir = tmp_path / "plateau_fh"
+    _write_min_plateau(pdir)                        # bA を実測 35.0m に上書き
+    res = E3D.export_run(run_dir, map_path, plateau_dir=pdir)
+    scene = json.loads(res["scene"].read_text(encoding="utf-8"))
+    bA = next(b for b in scene["buildings"] if b["id"] == "bA")
+    assert bA["plateau"] == 1
+    assert bA["height"] == pytest.approx(35.0)
+    assert bA["levels"] == 10                       # levels は据え置き(sim 側の意味を保つ)
+    assert bA["floorH"] == pytest.approx(3.5)       # 35.0 / 10
+    assert bA["depth"] == pytest.approx(35.0 - bA["base"])
+    # 最上階の床(gz + (levels-1)*floorH)は屋根(gz + height)を超えない
+    assert (bA["levels"] - 1) * bA["floorH"] <= bA["height"]
+    bB = next(b for b in scene["buildings"] if b["id"] == "bB")     # 非照合
+    assert "floorH" not in bB and "plateau" not in bB
 
 
 def test_export_plateau_without_terrain_extras_no_new_keys(tmp_path):

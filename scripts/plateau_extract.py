@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import argparse
+import array
 import json
 import math
 import sys
@@ -436,14 +437,25 @@ def compute_ground0_dem(dem_files, lat0, lon0, axis, radius=50.0):
 
 
 # =============================================================== 新 stage: terrain
-def collect_tin_points(dem_files, lat0, lon0, axis, rect, progress=True):
-    """DEM の dem:TINRelief 内 gml:Triangle(gml:posList)頂点を iterparse で読み、
-    local-m 矩形 rect=[xmin,ymin,xmax,ymax](+margin)内に落ちる頂点だけを収集する。
+def collect_tin_triangles(dem_files, lat0, lon0, axis, rect, progress=True):
+    """DEM の dem:TINRelief 内 gml:Triangle(gml:posList)を **三角形のまま** 読む。
+
+    TIN は「頂点群」ではなく「三角形分割された曲面」なので、面(接続関係)を保持したまま
+    渡せば下流で重心座標(barycentric)補間ができる= TIN を厳密に評価できる。旧実装は
+    三角形を捨てて頂点だけ返しており、下流が最近傍 IDW で近似せざるを得なかった
+    (格子点が三角形内部にあってもスパイクが出る原因)。
 
     重い全走査を避けるため、posList 先頭トークン(緯度)による粗プレフィルタで帯外の
     三角形を早期スキップ(既存 dem スキャンと同方式)。処理済み三角形はコンテナ単位で
-    clear してメモリを一定に保つ。戻り値: (P[(e,n,z_raw)...] float64, n_points)。
-    z は生標高(ground0 差引きは呼び出し側)。cm 量子化で重複頂点を除去。"""
+    clear してメモリを一定に保つ。
+
+    クリップ規則: **1 頂点でも rect(+margin)内なら三角形ごと残す**(全頂点を保持)。
+    旧 collect_tin_points は頂点単位で捨てていたため、境界の三角形が壊れていた。
+    リング頂点数が 4 以上(閉環 or 多角形パッチ)なら閉じ点を落として扇形三角形化する。
+
+    戻り値: (P[(e,n,z_raw)...] float64 (n,3), T int64 (m,3), n_points)。
+    z は生標高(ground0 差引きは呼び出し側)。cm 量子化で重複頂点を統合し、T はその
+    統合後の頂点索引を指す。"""
     lat_i, lon_i = axis
     mlon = M_PER_DEG_LON_EQ * math.cos(math.radians(lat0))
     xmin, ymin, xmax, ymax = rect
@@ -452,7 +464,9 @@ def collect_tin_points(dem_files, lat0, lon0, axis, rect, progress=True):
     lathi = lat0 + (ymax + marg) / M_PER_DEG_LAT
     lonlo = lon0 + (xmin - marg) / mlon
     lonhi = lon0 + (xmax + marg) / mlon
-    pts = []
+    xlo, xhi = xmin - marg, xmax + marg
+    ylo, yhi = ymin - marg, ymax + marg
+    flat = array.array("d")            # 三角形ごとに 9 要素(x,y,z)×3 を平積み
     for path in dem_files:
         t0 = time.time()
         kept = 0
@@ -466,38 +480,55 @@ def collect_tin_points(dem_files, lat0, lon0, axis, rect, progress=True):
                 continue
             if name == "posList" and el.text:
                 sp = el.text.split()
-                if len(sp) >= 3:
+                if len(sp) >= 9:
                     try:
                         first = float(sp[lat_i])
                     except ValueError:
                         first = None
                     if first is not None and latlo - 0.002 <= first <= lathi + 0.002:
+                        ring = []
+                        inside = False
                         for i in range(0, len(sp) - 2, 3):
                             lat = float(sp[i + lat_i])
                             lon = float(sp[i + lon_i])
-                            if latlo <= lat <= lathi and lonlo <= lon <= lonhi:
-                                e = (lon - lon0) * mlon
-                                n = (lat - lat0) * M_PER_DEG_LAT
-                                if (xmin - marg <= e <= xmax + marg
-                                        and ymin - marg <= n <= ymax + marg):
-                                    pts.append((e, n, float(sp[i + 2])))
-                                    kept += 1
+                            e = (lon - lon0) * mlon
+                            n = (lat - lat0) * M_PER_DEG_LAT
+                            ring.append((e, n, float(sp[i + 2])))
+                            if (latlo <= lat <= lathi and lonlo <= lon <= lonhi
+                                    and xlo <= e <= xhi and ylo <= n <= yhi):
+                                inside = True
+                        if inside:
+                            if len(ring) >= 4 and ring[0] == ring[-1]:
+                                ring = ring[:-1]           # 閉環の重複末尾を落とす
+                            for j in range(1, len(ring) - 1):    # 扇形三角形化
+                                for v in (ring[0], ring[j], ring[j + 1]):
+                                    flat.extend(v)
+                                kept += 1
                 el.clear()
             elif name in ("Triangle", "Polygon"):
                 cnt += 1
                 if container is not None and cnt % 50000 == 0:
                     container.clear()
         if progress:
-            print(f"  [terrain] {Path(path).name}  tin_pts_kept={kept}  "
+            print(f"  [terrain] {Path(path).name}  tin_tris_kept={kept}  "
                   f"{time.time() - t0:.1f}s", flush=True)
-    if pts:
-        P = np.asarray(pts, dtype=np.float64)
-        rk = np.round(P[:, :2] / 0.01).astype(np.int64)
-        _, ui = np.unique(rk, axis=0, return_index=True)
-        P = P[ui]
+    if len(flat):
+        A = np.frombuffer(flat, dtype=np.float64).reshape(-1, 3)
+        rk = np.round(A[:, :2] / 0.01).astype(np.int64)
+        _uq, ui, inv = np.unique(rk, axis=0, return_index=True, return_inverse=True)
+        P = A[ui]
+        T = np.asarray(inv, dtype=np.int64).reshape(-1, 3)
     else:
         P = np.zeros((0, 3), dtype=np.float64)
-    return P, P.shape[0]
+        T = np.zeros((0, 3), dtype=np.int64)
+    return P, T, P.shape[0]
+
+
+def collect_tin_points(dem_files, lat0, lon0, axis, rect, progress=True):
+    """collect_tin_triangles の頂点だけ版(後方互換の薄いラッパ)。
+    戻り値: (P[(e,n,z_raw)...] float64, n_points)。"""
+    P, _T, n = collect_tin_triangles(dem_files, lat0, lon0, axis, rect, progress)
+    return P, n
 
 
 def _index_runs(arr):
@@ -515,16 +546,118 @@ def _index_runs(arr):
     return runs
 
 
-def rasterize_tin_to_grid(points, x0, y0, cell_m, nx, ny, bucket_m=12.0, k=3):
+def rasterize_barycentric(points, tris, x0, y0, cell_m, nx, ny):
+    """TIN 三角形を重心座標(barycentric)補間で規則格子へラスタ化する (ny,nx)。
+
+    各三角形について、その xy バウンディングボックスに入る格子点の重心座標
+    (λ0,λ1,λ2) を解析的に解き、三角形内部(全 λ ≥ -eps)の格子点にだけ
+    z = λ0*z0 + λ1*z1 + λ2*z2 を書き込む。**TIN 面上の厳密値**なので、
+    最近傍 IDW のような「近い頂点に引っ張られるスパイク」が原理的に出ない
+    (平面 TIN なら誤差 0・任意 TIN でも面の線形補間そのもの)。
+
+    三角形の外に落ちる格子点(TIN の凸包外・欠測域)は nan のまま返す
+    = 呼び出し側が最近傍で埋めるか 0 埋めするかを決める。
+    退化三角形(面積 0)は寄与しない。共有辺で 2 枚が同じ格子点を覆う場合は
+    後勝ちだが、辺上では両者の値が一致するので結果は順序非依存。"""
+    H = np.full((ny, nx), np.nan, dtype=np.float64)
+    P = np.asarray(points, dtype=np.float64)
+    T = np.asarray(tris, dtype=np.int64)
+    if P.shape[0] == 0 or T.shape[0] == 0 or nx <= 0 or ny <= 0:
+        return H
+    inv_c = 1.0 / cell_m
+    ax, ay, az = P[T[:, 0], 0], P[T[:, 0], 1], P[T[:, 0], 2]
+    bx, by, bz = P[T[:, 1], 0], P[T[:, 1], 1], P[T[:, 1], 2]
+    cx, cy, cz = P[T[:, 2], 0], P[T[:, 2], 1], P[T[:, 2], 2]
+    det = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+    # 格子添字のバウンディングボックス(端は内側に丸める=格子点だけ見る)
+    i0 = np.ceil((np.minimum(np.minimum(ax, bx), cx) - x0) * inv_c).astype(np.int64)
+    i1 = np.floor((np.maximum(np.maximum(ax, bx), cx) - x0) * inv_c).astype(np.int64)
+    j0 = np.ceil((np.minimum(np.minimum(ay, by), cy) - y0) * inv_c).astype(np.int64)
+    j1 = np.floor((np.maximum(np.maximum(ay, by), cy) - y0) * inv_c).astype(np.int64)
+    np.clip(i0, 0, nx - 1, out=i0)
+    np.clip(i1, 0, nx - 1, out=i1)
+    np.clip(j0, 0, ny - 1, out=j0)
+    np.clip(j1, 0, ny - 1, out=j1)
+    live = (det != 0.0) & (i0 <= i1) & (j0 <= j1)
+    eps = 1e-9
+    for t in np.flatnonzero(live):
+        ii = np.arange(i0[t], i1[t] + 1, dtype=np.float64)
+        jj = np.arange(j0[t], j1[t] + 1, dtype=np.float64)
+        gx = x0 + ii * cell_m
+        gy = y0 + jj * cell_m
+        dx = gx - cx[t]
+        dy = (gy - cy[t])[:, None]
+        l0 = ((by[t] - cy[t]) * dx + (cx[t] - bx[t]) * dy) / det[t]
+        l1 = ((cy[t] - ay[t]) * dx + (ax[t] - cx[t]) * dy) / det[t]
+        l2 = 1.0 - l0 - l1
+        m = (l0 >= -eps) & (l1 >= -eps) & (l2 >= -eps)
+        if not m.any():
+            continue
+        z = l0 * az[t] + l1 * bz[t] + l2 * cz[t]
+        sub = H[j0[t]:j1[t] + 1, i0[t]:i1[t] + 1]
+        np.copyto(sub, z, where=m)
+    return H
+
+
+def _fill_nearest(H, points, x0, y0, cell_m, nx, ny, bucket_m=12.0):
+    """H の nan セルだけを最近傍 TIN 頂点の z で埋める(三角形外=凸包外の縁取り用)。
+    バケット空間ハッシュで 1 リングから最大 8 リングまで拡張して探す。埋めた数を返す。"""
+    P = np.asarray(points, dtype=np.float64)
+    holes = np.argwhere(~np.isfinite(H))
+    if P.shape[0] == 0 or holes.shape[0] == 0:
+        return 0
+    px, py, pz = P[:, 0], P[:, 1], P[:, 2]
+    buckets: dict = {}
+    bi = np.floor((px - x0) / bucket_m).astype(np.int64)
+    bj = np.floor((py - y0) / bucket_m).astype(np.int64)
+    for n, key in enumerate(zip(bi.tolist(), bj.tolist())):
+        buckets.setdefault(key, []).append(n)
+    filled = 0
+    for j, i in holes:
+        gx = x0 + i * cell_m
+        gy = y0 + j * cell_m
+        bx = int(math.floor((gx - x0) / bucket_m))
+        by = int(math.floor((gy - y0) / bucket_m))
+        cand: list = []
+        r = 1
+        while True:
+            cand = []
+            for u in range(bx - r, bx + r + 1):
+                for v in range(by - r, by + r + 1):
+                    a = buckets.get((u, v))
+                    if a:
+                        cand.extend(a)
+            if cand or r >= 8:
+                break
+            r += 1
+        if not cand:
+            continue
+        idx = np.asarray(cand, dtype=np.int64)
+        d2 = (px[idx] - gx) ** 2 + (py[idx] - gy) ** 2
+        H[j, i] = float(pz[idx[int(np.argmin(d2))]])
+        filled += 1
+    return filled
+
+
+def rasterize_tin_to_grid(points, x0, y0, cell_m, nx, ny, bucket_m=12.0, k=3,
+                          tris=None):
     """TIN 頂点群 points[(x,y,z)...] を規則格子へラスタ化した標高グリッド (ny,nx) を返す。
 
-    手法(単純化・docstring 明記): 各格子点 (i,j) の座標 (x0+i*cell, y0+j*cell) について、
+    tris(三角形索引 (m,3))を渡した場合 = **重心座標補間**(rasterize_barycentric)。
+    TIN 面上の厳密値なので推奨経路。三角形の外に落ちたセルだけ最近傍頂点で埋める。
+
+    tris=None(後方互換)= 旧手法: 各格子点 (i,j) の座標 (x0+i*cell, y0+j*cell) について、
     一様バケット空間ハッシュで近傍 TIN 頂点を集め、**最近傍 k(=3)頂点の距離加重平均**
     (重み w=1/(distance+eps))で標高を推定する。平面 TIN(定数勾配)なら格子点を
-    ±0.2m 程度で復元できる。近傍が全く得られないセルは nan(呼び出し側で 0 埋め)。
+    ±0.2m 程度で復元できるが、実 TIN では面を無視するため段差でスパイクが出る。
+    近傍が全く得られないセルは nan(呼び出し側で 0 埋め)。
 
     バケット近傍は 1 リングから開始し、候補が k 未満なら最大 8 リングまで拡張する。
     格子点は列 i・行 j の連続ランごとにまとめて cdist をベクトル化評価する。"""
+    if tris is not None and len(tris):
+        H = rasterize_barycentric(points, tris, x0, y0, cell_m, nx, ny)
+        _fill_nearest(H, points, x0, y0, cell_m, nx, ny, bucket_m=bucket_m)
+        return H
     H = np.full((ny, nx), np.nan, dtype=np.float64)
     P = np.asarray(points, dtype=np.float64)
     if P.shape[0] == 0 or nx <= 0 or ny <= 0:
@@ -999,10 +1132,14 @@ def run_terrain(citygml_dir, map_path, out_dir, dem_dir, origin, buffer_m, radiu
           flush=True)
     print(f"[terrain] scanning DEM: {[p.name for p in dem_files]}", flush=True)
 
-    P, n_tin = collect_tin_points(dem_files, origin[0], origin[1], axis, rect)
-    print(f"[terrain] tin_points(dedup)={n_tin}  rasterizing...", flush=True)
+    P, T, n_tin = collect_tin_triangles(dem_files, origin[0], origin[1], axis, rect)
+    print(f"[terrain] tin_points(dedup)={n_tin}  tin_triangles={len(T)}  "
+          f"rasterizing(barycentric)...", flush=True)
     t0 = time.time()
-    H_elev = rasterize_tin_to_grid(P, x0, y0, cell_m, nx, ny)
+    # 主経路=重心座標補間(TIN 面上の厳密値)。TIN 凸包の外に落ちたセルだけ最近傍で埋める。
+    H_elev = rasterize_barycentric(P, T, x0, y0, cell_m, nx, ny)
+    n_outside = int((~np.isfinite(H_elev)).sum())
+    n_filled = _fill_nearest(H_elev, P, x0, y0, cell_m, nx, ny)
     Hz = H_elev - ground0
     covered = np.isfinite(Hz)
     n_nan = int((~covered).sum())
@@ -1010,6 +1147,7 @@ def run_terrain(citygml_dir, map_path, out_dir, dem_dir, origin, buffer_m, radiu
         Hz = np.where(covered, Hz, 0.0)
     heights = Hz.astype(np.float32)  # (ny,nx) row-major・単位=メートル・量子化なし
     print(f"[terrain] raster done {time.time() - t0:.1f}s  "
+          f"tin_outside_cells={n_outside}(最近傍で {n_filled} 埋め)  "
           f"uncovered_cells={n_nan}", flush=True)
 
     out_dir = Path(out_dir)
@@ -1022,8 +1160,12 @@ def run_terrain(citygml_dir, map_path, out_dir, dem_dir, origin, buffer_m, radiu
         "x0": round(float(x0), 4), "y0": round(float(y0), 4),
         "cell_m": cell_m, "nx": nx, "ny": ny,
         "ground0": round(float(ground0), 4), "n_tin_points": int(n_tin),
+        "n_tin_triangles": int(len(T)),
         "z_min_m": round(float(zc.min()), 3), "z_max_m": round(float(zc.max()), 3),
         "uncovered_cells": n_nan, "ground0_source": g0_src,
+        # 透明性: 重心座標で厳密に決まったセル以外(=TIN 凸包外)と、その最近傍埋め件数
+        "interp": "barycentric", "tin_outside_cells": n_outside,
+        "nearest_filled_cells": n_filled,
     }
     json_path.write_text(json.dumps(meta, ensure_ascii=False, separators=(",", ":")),
                          encoding="utf-8")

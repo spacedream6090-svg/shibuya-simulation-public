@@ -271,6 +271,118 @@ def test_rasterize_empty_points_returns_nan():
     assert np.isnan(H).all()
 
 
+def _planar_tin(a, b, c, lo=-40.0, hi=40.0, step=4.0):
+    """平面 z=a*x+b*y+c を張る三角形 TIN(格子を対角線で 2 分割)。"""
+    coords = np.arange(lo, hi + step, step)
+    pts, idx = [], {}
+    for x in coords:
+        for y in coords:
+            idx[(float(x), float(y))] = len(pts)
+            pts.append((float(x), float(y), a * x + b * y + c))
+    tris = []
+    for i in range(len(coords) - 1):
+        for j in range(len(coords) - 1):
+            x0, x1 = float(coords[i]), float(coords[i + 1])
+            y0, y1 = float(coords[j]), float(coords[j + 1])
+            tris.append((idx[(x0, y0)], idx[(x1, y0)], idx[(x1, y1)]))
+            tris.append((idx[(x0, y0)], idx[(x1, y1)], idx[(x0, y1)]))
+    return np.asarray(pts, dtype=np.float64), np.asarray(tris, dtype=np.int64)
+
+
+def test_rasterize_barycentric_is_exact_on_tin_surface():
+    """重心座標補間は TIN 面上の厳密値(平面 TIN なら誤差 0)。
+    最近傍 IDW(旧手法)は同じ入力で必ず有限の誤差を残す = 置換の根拠。"""
+    a, b, c = 0.02, -0.01, 30.0
+    P, T = _planar_tin(a, b, c)
+    x0, y0, cell = -30.0, -30.0, 2.0
+    nx = ny = int(round((30.0 - x0) / cell)) + 1
+    H = PE.rasterize_tin_to_grid(P, x0, y0, cell, nx, ny, tris=T)
+    assert np.isfinite(H).all()
+    ii, jj = np.meshgrid(np.arange(nx), np.arange(ny))
+    want = a * (x0 + ii * cell) + b * (y0 + jj * cell) + c
+    assert np.abs(H - want).max() < 1e-9
+    # 旧経路(tris 無し)は同一入力で誤差が残る
+    H_old = PE.rasterize_tin_to_grid(P, x0, y0, cell, nx, ny)
+    assert np.abs(H_old - want).max() > 1e-6
+
+
+def test_rasterize_barycentric_reproduces_tin_step():
+    """段差(隣り合う三角形の z が不連続)を平滑化せずそのまま返す。
+    IDW は近傍平均なので段差を鈍らせる = 実地形の崖が消える/偽の傾斜が出る。"""
+    # x<0 は z=0、x>0 は z=5 の 2 枚(x=0 で段差)
+    P = np.array([[-10, -10, 0.0], [0, -10, 0.0], [0, 10, 0.0], [-10, 10, 0.0],
+                  [0.001, -10, 5.0], [10, -10, 5.0], [10, 10, 5.0], [0.001, 10, 5.0]],
+                 dtype=np.float64)
+    T = np.array([[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7]], dtype=np.int64)
+    x0, y0, cell, nx, ny = -8.0, -8.0, 2.0, 9, 9
+    H = PE.rasterize_tin_to_grid(P, x0, y0, cell, nx, ny, tris=T)
+    xs = x0 + np.arange(nx) * cell
+    for i, x in enumerate(xs):
+        col = H[:, i]
+        assert np.isfinite(col).all()
+        # x=0 は下側パッチの縁(z=0)。段差は中間値を作らず 0 か 5 のどちらか。
+        assert np.allclose(col, 0.0 if x <= 0 else 5.0), f"x={x} col={col[:3]}"
+    # IDW(旧手法)は段差の両側を平均して中間値を作る = 崖が鈍る
+    H_old = PE.rasterize_tin_to_grid(P, x0, y0, cell, nx, ny)
+    mid = H_old[(H_old > 0.5) & (H_old < 4.5)]
+    assert mid.size > 0
+
+
+def test_rasterize_barycentric_nan_outside_hull_then_nearest_fill():
+    """TIN の外は nan(=どの三角形にも属さない)で返り、最近傍埋めで解消される。
+    「どこまでが実測でどこからが外挿か」を数えられることが重要(silent fill 禁止)。"""
+    P, T = _planar_tin(0.01, 0.0, 5.0, lo=-10.0, hi=10.0, step=5.0)
+    x0, y0, cell, nx, ny = -20.0, -20.0, 5.0, 9, 9
+    H = PE.rasterize_barycentric(P, T, x0, y0, cell, nx, ny)
+    n_out = int((~np.isfinite(H)).sum())
+    assert n_out > 0                                   # 外周は TIN 外
+    assert np.isfinite(H[4, 4])                        # 中心(0,0)は TIN 内
+    n_filled = PE._fill_nearest(H, P, x0, y0, cell, nx, ny)
+    assert n_filled == n_out
+    assert np.isfinite(H).all()
+
+
+def test_collect_tin_triangles_keeps_faces(tmp_path):
+    """DEM から三角形(接続関係)を保持して読む。1 頂点でも矩形内なら三角形ごと残す。"""
+    tris = []
+
+    def node(x, y, z):
+        lat, lon = PE.local_to_latlon(x, y, LAT0, LON0)
+        return (lat, lon, z)
+
+    # 矩形(±30m)内の三角形 1 枚 + 1 頂点だけ内側の三角形 1 枚 + 完全に外側 1 枚
+    tris.append((node(0, 0, 10.0), node(10, 0, 11.0), node(0, 10, 12.0)))
+    tris.append((node(25, 25, 13.0), node(400, 25, 14.0), node(25, 400, 15.0)))
+    tris.append((node(600, 600, 16.0), node(700, 600, 17.0), node(600, 700, 18.0)))
+    tri_xml = ["<gml:Triangle><gml:exterior><gml:LinearRing><gml:posList>"
+               + " ".join(f"{la} {lo} {z}" for (la, lo, z) in (t[0], t[1], t[2], t[0]))
+               + "</gml:posList></gml:LinearRing></gml:exterior></gml:Triangle>"
+               for t in tris]
+    relief = ('<dem:ReliefFeature gml:id="r"><dem:reliefComponent>'
+              '<dem:TINRelief gml:id="t"><dem:tin><gml:TriangulatedSurface>'
+              '<gml:trianglePatches>' + "".join(tri_xml)
+              + '</gml:trianglePatches></gml:TriangulatedSurface></dem:tin>'
+              '</dem:TINRelief></dem:reliefComponent></dem:ReliefFeature>')
+    dem_dir = tmp_path / "dem"
+    dem_dir.mkdir()
+    _write_gml(dem_dir, "533935_dem_6697_op.gml", [relief])
+
+    P, T, n = PE.collect_tin_triangles([dem_dir / "533935_dem_6697_op.gml"],
+                                       LAT0, LON0, (0, 1),
+                                       [-30.0, -30.0, 30.0, 30.0], progress=False)
+    assert T.shape[1] == 3
+    assert len(T) == 2                      # 完全に外側の 1 枚だけ落ちる
+    assert n == P.shape[0] == 6             # 各三角形の 3 頂点(全頂点を保持)
+    assert T.max() < P.shape[0] and T.min() >= 0
+    # 頂点 z が保存されている(内側三角形の 10/11/12 が揃う)
+    assert {round(float(z), 3) for z in P[:, 2]} >= {10.0, 11.0, 12.0}
+    # 後方互換ラッパは頂点だけ返す
+    P2, n2 = PE.collect_tin_points([dem_dir / "533935_dem_6697_op.gml"],
+                                   LAT0, LON0, (0, 1),
+                                   [-30.0, -30.0, 30.0, 30.0], progress=False)
+    assert n2 == n and P2.shape == P.shape
+
+
 # ------------------------------------------------------------- extras (ubld)
 def _ubld_xml(gml_id, surfaces):
     """uro:UndergroundBuilding + bldg:lod1Solid(CompositeSurface)の合成 XML。"""

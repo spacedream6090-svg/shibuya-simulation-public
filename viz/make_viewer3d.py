@@ -302,17 +302,26 @@ _TERRAIN_SETUP = r"""// ---------- 地形起伏(terrain_web.json)。TERRAIN を�
   tmesh.position.set(cx, 0, -cy); tmesh.renderOrder = -3;
   window.terrainMesh = tmesh; scene.add(tmesh);
   if(flatGround) flatGround.visible = false;   // 平面地面は起伏へ置換
-  // OSM 地図テクスチャを地形にドレープ(既存 OSM 平面を細分化+変位)
+  if(gridHelper) gridHelper.visible = false;   // 地形があるとグリッドは地中/地上で乱れるだけ
+  // OSM 地図テクスチャを **地形サーフェスそのもの**(同一 geometry)へ平面 UV 投影で貼る。
+  // 旧実装は「地形とは別のドレープ平面」を 240 セグメント上限で作っていたため、実効間隔
+  // 14.5m ≫ 地形格子 2m となり、面積の 1/3 が不透明な地形サーフェスの下に潜って
+  // 地図が溶けて見えた。頂点を共有すれば交差は構造的に起こり得ない(残るのは同一平面の
+  // z-fight だけ = polygonOffset + depthWrite:false + renderOrder で決着する)。
   try { if(OSM.mesh && OSM.mesh.geometry.parameters){
     const p = OSM.mesh.geometry.parameters;
-    const segx = Math.min(240, Math.max(1, Math.round(p.width/cell)));
-    const segy = Math.min(240, Math.max(1, Math.round(p.height/cell)));
-    const og = new THREE.PlaneGeometry(p.width, p.height, segx, segy); og.rotateX(-Math.PI/2);
-    const ocx = OSM.mesh.position.x, ocz = OSM.mesh.position.z, oa = og.attributes.position;
-    for(let k=0;k<oa.count;k++){ const wx=ocx+oa.getX(k), wy=-(ocz+oa.getZ(k));
-      oa.setY(k, groundAt(wx,wy) + 0.05); }   // 地表のわずか上(z-fight 回避)
-    oa.needsUpdate = true; og.computeVertexNormals();
-    OSM.mesh.geometry.dispose(); OSM.mesh.geometry = og;
+    const ox0 = OSM.mesh.position.x - p.width/2,   ox1 = OSM.mesh.position.x + p.width/2;
+    const oy0 = -OSM.mesh.position.z - p.height/2, oy1 = -OSM.mesh.position.z + p.height/2;
+    const uv = geo.attributes.uv;
+    for(let k=0;k<pa.count;k++){ const wx=cx+pa.getX(k), wy=cy-pa.getZ(k);
+      uv.setXY(k, (wx-ox0)/(ox1-ox0), (wy-oy0)/(oy1-oy0)); }   // 地図矩形の外は uv∉[0,1]
+    uv.needsUpdate = true;
+    const dmat = OSM.mesh.material;      // 既存マテリアル(map/opacity/配線)をそのまま使う
+    dmat.polygonOffset = true; dmat.polygonOffsetFactor = -1; dmat.polygonOffsetUnits = -1;
+    const dm = new THREE.Mesh(geo, dmat);
+    dm.position.copy(tmesh.position); dm.renderOrder = -1; dm.visible = OSM.mesh.visible;
+    scene.remove(OSM.mesh); OSM.mesh.geometry.dispose();
+    scene.add(dm); OSM.mesh = dm;        // 以後 applyLayers/不透明度スライダはそのまま効く
   } } catch(e){ console.warn('OSM drape failed', e); }
 })();
 
@@ -325,7 +334,9 @@ def _inject_extras(html: str) -> str:
     が無ければメッシュ 0 個。パネルにトグル「地下街」「歩道橋」を追加し applyExtras で配線。"""
     anchor_panel = ('      <label class="chk"><input type="checkbox" id="lyLabels" checked>'
                     ' ラベル(建物名)</label>')
-    panel_add = ('      <label class="chk"><input type="checkbox" id="lyUgai" checked>'
+    # 地下街は既定 OFF: ubld の z 上端は +2.79m あり、地形の 81.7% がそれより低いため
+    # ON のままだと「地面から半透明の箱が生えている」絵になる(A-2)。
+    panel_add = ('      <label class="chk"><input type="checkbox" id="lyUgai">'
                  ' 地下街</label>\n'
                  '      <label class="chk"><input type="checkbox" id="lyBridge" checked>'
                  ' 歩道橋</label>\n')
@@ -344,13 +355,28 @@ const ugaiMeshes = [], bridgeMeshes = [];
   const ex = PLATEAU_DATA.extras;
   const b64 = s => { const bin=atob(s); const u=new Uint8Array(bin.length);
     for(let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i); return u; };
-  function meshOf(part, color, opacity){
+  function meshOf(part, color, opacity, clipGround){
     if(!part || !part.positions_b64 || !part.indices_b64) return null;
     const q = part.quant_scale || 0.05;
     const pi = new Int16Array(b64(part.positions_b64).buffer);
     const pos = new Float32Array(pi.length);
     for(let i=0;i<pi.length;i+=3){ pos[i]=pi[i]*q; pos[i+1]=pi[i+2]*q; pos[i+2]=-pi[i+1]*q; }
-    const idx = new Uint32Array(b64(part.indices_b64).buffer);
+    let idx = new Uint32Array(b64(part.indices_b64).buffer);
+    // 地表クリップ(A-2): 3 頂点すべてが地表より上にある三角形を落とす。地下構造物の
+    // 天板が地形を突き抜けて「地面から生えて」見えるのを、描画順ではなく形状で止める。
+    if(clipGround && TERRAIN){
+      const keep = []; let cut = 0;
+      for(let i=0;i<idx.length;i+=3){
+        let above = 0;
+        for(let k=0;k<3;k++){ const v = idx[i+k]*3;
+          if(pos[v+1] > groundAt(pos[v], -pos[v+2]) + 0.2) above++; }
+        if(above === 3){ cut++; continue; }
+        keep.push(idx[i], idx[i+1], idx[i+2]);
+      }
+      if(cut){ console.info('extras: 地表より上の三角形を', cut, '枚クリップ');
+        idx = new Uint32Array(keep); }
+      if(idx.length === 0) return null;
+    }
     const bg = new THREE.BufferGeometry();
     bg.setAttribute('position', new THREE.BufferAttribute(pos,3));
     bg.setIndex(new THREE.BufferAttribute(idx,1)); bg.computeVertexNormals();
@@ -358,9 +384,9 @@ const ugaiMeshes = [], bridgeMeshes = [];
       transparent:(opacity<1.0), opacity:opacity, depthWrite:(opacity>=1.0) });
     return new THREE.Mesh(bg, mat);
   }
-  const u = meshOf(ex.ubld, 0x6f7fa8, 0.35);   // 地下街=地下色・半透明
-  if(u){ ugaiMeshes.push(u); scene.add(u); }
-  const br = meshOf(ex.brid, 0xb8bec7, 1.0);    // 歩道橋=無彩色・不透明
+  const u = meshOf(ex.ubld, 0x6f7fa8, 0.35, true);   // 地下街=地下色・半透明・地表クリップ
+  if(u){ u.renderOrder = -4; ugaiMeshes.push(u); scene.add(u); }  // 地形より先に描く
+  const br = meshOf(ex.brid, 0xb8bec7, 1.0, false);   // 歩道橋=無彩色・不透明(地上構造物)
   if(br){ bridgeMeshes.push(br); scene.add(br); }
 })();
 
@@ -663,8 +689,8 @@ def _inject_indoor(html: str, indoor_json: str) -> str:
     anchor_build = "// ---------- ループ"
     html = _replace_once(html, anchor_build, _INDOOR_MAIN + anchor_build, "indoor-main")
     # placeAgents: 屋内エージェントは実座標/推定区画へ
-    anchor_place = ("    _p.set(x, groundAt(x, y) + upOf(w), -y);"
-                    "   // 地形があれば地表高に接地")
+    anchor_place = ("    _p.set(x, footY(x, y, w) + AG_LIFT, -y);"
+                    "   // 足元アンカー(屋外=地表 / 屋内=フロア面)")
     html = _replace_once(html, anchor_place, _INDOOR_PLACE, "indoor-place")
     return html
 
@@ -675,7 +701,7 @@ _INDOOR_TOGGLE = ('      <label class="chk"><input type="checkbox" id="lyIndoor"
 _INDOOR_PLACE = r"""    let _ax=x, _ay=y;                       // 屋内=実座標(samples)or 推定区画(floorLayout3d)
     if(w>=1000 && typeof window.__indoorXY==='function'){ const _r=window.__indoorXY(i, w, t);
       if(_r){ _ax=_r[0]; _ay=_r[1]; } }
-    _p.set(_ax, groundAt(_ax, _ay) + upOf(w), -_ay);   // 地形があれば地表高に接地"""
+    _p.set(_ax, footY(_ax, _ay, w) + AG_LIFT, -_ay);   // 足元アンカー(屋外=地表/屋内=フロア面)"""
 
 # ---- ③ 名寄せ + skip(トップレベル・buildBuildings より前に実行)----
 _INDOOR_DECL = r"""// ========== 屋内オーバレイ: floor_layouts の名寄せ(部分一致・双方向=sim indoor._match と同一)
@@ -798,9 +824,9 @@ _INDOOR_MAIN = r"""// ========== 屋内オーバレイ本体: floorLayout3d(n_ov
       const sfp=b.footprint; if(!sfp || sfp.length<3) continue;
       const shape=new THREE.Shape(); shape.moveTo(sfp[0][0], sfp[0][1]);
       for(let i=1;i<sfp.length;i++) shape.lineTo(sfp[i][0], sfp[i][1]);
-      const hh=Math.max(b.height||FH, 1.0); let geo;
+      const hh=Math.max(b.depth||b.height||FH, 1.0)+BLD_SKIRT; let geo;   // buildBuildings と同式
       try { geo=new THREE.ExtrudeGeometry(shape,{ depth:hh, bevelEnabled:false, steps:1 }); } catch(e){ continue; }
-      geo.translate(0,0,(b.base||0)+(b.gz||0)); geo.applyMatrix4(rot);
+      geo.translate(0,0,(b.base||0)+(b.gz||0)-BLD_SKIRT); geo.applyMatrix4(rot);
       const kind=(KIND_COLOR[b.kind]!==undefined)? b.kind : 'generic';
       const mat=new THREE.MeshLambertMaterial({ color:NEUTRAL_BLD, transparent:true, opacity:1.0 });
       mat.userData.kindColor=KIND_COLOR[kind]; mat.userData.indoorShell=true;
@@ -846,7 +872,8 @@ _INDOOR_MAIN = r"""// ========== 屋内オーバレイ本体: floorLayout3d(n_ov
     const pmat=new THREE.MeshBasicMaterial({ map:tex, transparent:true, opacity:0.9,
       depthWrite:false, side:THREE.DoubleSide });
     const mesh=new THREE.Mesh(pgeo, pmat);
-    const gz=groundAt(b.cx, b.cy), yy=gz + Math.max((f-1),0)*FH + 0.15;
+    // フロア板は建物の地上階床(gz)から実効階高で積む = upOf(w) と同じ式(B-3 整合)
+    const yy=(b.gz||0) + Math.max((f-1),0)*floorHOf(b) + 0.15;
     mesh.position.set((bb[0]+bb[2])/2, yy, -(bb[1]+bb[3])/2); mesh.renderOrder=2;
     return mesh;
   }
@@ -1219,6 +1246,7 @@ __THREE_LICENSE__
       <label class="chk"><input type="checkbox" id="lyBld" checked> 建物</label>
       <label class="chk"><input type="checkbox" id="lyClass"> 分類色(建物を用途で色分け)</label>
       <label class="chk"><input type="checkbox" id="lyAgent" checked> エージェント</label>
+      <div class="op">大きさ <input type="range" id="agSize" min="1" max="6" step="0.5" value="2"><span id="agSizeV">×2.0</span></div>
       <label class="chk"><input type="checkbox" id="lyCars" checked> 車</label>
       <label class="chk"><input type="checkbox" id="lyRoad" checked> 道路</label>
       <label class="chk"><input type="checkbox" id="lyRail" checked> 電車・線路</label>
@@ -1377,12 +1405,19 @@ const OSM = { mesh:null, opacity:0.9, loaded:false, load:null, ensureLoaded:null
   const nx=tx1-tx0+1, ny=ty1-ty0+1, nTiles=nx*ny;
   if(nTiles<1 || nTiles>96) return;                    // 安全弁(異常/過大は無地地面のまま)
   // 3) タイルグリッド全体を 1 枚のキャンバスに合成
-  const canvas = document.createElement('canvas'); canvas.width=nx*256; canvas.height=ny*256;
+  //    外周 1px を **透明枠** として空けておく: 地形へ貼るとき地図矩形の外は uv∉[0,1] に
+  //    なるが、ClampToEdge がこの透明枠を拾うので「地図の無い所は素の地形色」になる
+  //    (枠が無いと端のタイル色が外側へ引き伸ばされる)。offset/repeat で内側を 0..1 に
+  //    対応させるため、平面ドレープ(地形なしラン)の見た目は従来と同一。
+  const canvas = document.createElement('canvas');
+  canvas.width=nx*256+2; canvas.height=ny*256+2;
   const g2d = canvas.getContext('2d');
   const tex = new THREE.CanvasTexture(canvas);
   tex.encoding = THREE.sRGBEncoding;   // outputEncoding=sRGB 下で地図の色を正しく表示
   tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter;
   tex.generateMipmaps = false; tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.offset.set(1/canvas.width, 1/canvas.height);
+  tex.repeat.set((nx*256)/canvas.width, (ny*256)/canvas.height);
   try { const maxA = renderer.capabilities.getMaxAnisotropy(); tex.anisotropy = Math.min(8, maxA||1); } catch(e){}
   // 4) 地面平面(タイルグリッドが覆う世界矩形にぴったり合わせる)
   const wxL=(tx0*256-mx0)/ppm, wxR=((tx1+1)*256-mx0)/ppm;   // 西→東
@@ -1399,7 +1434,7 @@ const OSM = { mesh:null, opacity:0.9, loaded:false, load:null, ensureLoaded:null
   OSM.load = function(){ if(OSM.loaded) return; OSM.loaded = true;
     for(let ty=ty0; ty<=ty1; ty++) for(let tx=tx0; tx<=tx1; tx++){
       const img = new Image(); img.crossOrigin='anonymous';
-      const dx=(tx-tx0)*256, dy=(ty-ty0)*256;
+      const dx=(tx-tx0)*256+1, dy=(ty-ty0)*256+1;   // +1 = 外周の透明枠を残す
       img.onload = ()=>{ try{ g2d.drawImage(img, dx, dy, 256, 256); tex.needsUpdate=true; }catch(e){} };
       img.onerror = ()=>{};
       img.src = `https://tile.openstreetmap.org/${z}/${tx}/${ty}.png`;
@@ -1408,6 +1443,9 @@ const OSM = { mesh:null, opacity:0.9, loaded:false, load:null, ensureLoaded:null
 })();
 
 // ---------- 建物(kind ごとにジオメトリを統合 = 少ないドローコール)
+const BLD_SKIRT = 3.0;     // 押出しを下方へ延長する量[m](斜面での足元の隙間隠し・A-6)
+// 建物の実効階高: PLATEAU 実測高がある建物は height/levels(=floorH)、無ければ既定 FH。
+function floorHOf(b){ return (b && b.floorH) ? b.floorH : FH; }
 const buildingMats = [];
 const buildingMeshes = [];
 (function buildBuildings(){
@@ -1419,11 +1457,14 @@ const buildingMeshes = [];
     const shape = new THREE.Shape();
     shape.moveTo(fp[0][0], fp[0][1]);
     for(let i=1;i<fp.length;i++) shape.lineTo(fp[i][0], fp[i][1]);
-    const h = Math.max(b.height || FH, 1.0);
+    // 押出し深さ: base から depth 分。depth が無い旧 scene.json は従来どおり height。
+    // 地下階を持つ建物は depth=(levels+below)*FH でないと屋上が below*FH 沈む(B-3)。
+    // さらに SKIRT 分だけ下へ伸ばして、斜面での「足元の隙間」を隠す(A-6)。
+    const h = Math.max(b.depth || b.height || FH, 1.0) + BLD_SKIRT;
     let geo;
     try { geo = new THREE.ExtrudeGeometry(shape, { depth:h, bevelEnabled:false, steps:1 }); }
     catch(e){ continue; }
-    geo.translate(0, 0, (b.base || 0) + (b.gz || 0));   // gz(地表高)があれば地形に接地
+    geo.translate(0, 0, (b.base || 0) + (b.gz || 0) - BLD_SKIRT);   // gz=地表高で地形に接地
     geo.applyMatrix4(rot);
     const kind = KIND_COLOR[b.kind] !== undefined ? b.kind : 'generic';
     const a = acc[kind] || (acc[kind] = { pos:[], norm:[] });
@@ -1465,11 +1506,22 @@ function applyBuildingPalette(useClass){
 let roadObj = null;
 (function buildRoads(){
   const pos = [];
+  // 地形がある時は「地形セル幅以下」に再分割してから接地する(A-5)。道路セグメントは
+  // p90=45.5m あり、両端だけを地表に載せると起伏をまたぐ区間が空中/地中を貫いていた。
+  const SUB = TERRAIN ? TERRAIN.cell : 0;
   for(const r of SCENE.roads){
     const g = r.g;
     for(let i=1;i<g.length;i++){
-      pos.push(g[i-1][0], groundAt(g[i-1][0], g[i-1][1]) + 0.4, -g[i-1][1]);
-      pos.push(g[i][0],   groundAt(g[i][0],   g[i][1])   + 0.4, -g[i][1]);
+      const ax=g[i-1][0], ay=g[i-1][1], bx=g[i][0], by=g[i][1];
+      let n = 1;
+      if(SUB > 0){ n = Math.max(1, Math.ceil(Math.hypot(bx-ax, by-ay) / SUB)); }
+      for(let s=0;s<n;s++){
+        const t0=s/n, t1=(s+1)/n;
+        const x0=ax+(bx-ax)*t0, y0=ay+(by-ay)*t0;
+        const x1=ax+(bx-ax)*t1, y1=ay+(by-ay)*t1;
+        pos.push(x0, groundAt(x0, y0) + 0.4, -y0);
+        pos.push(x1, groundAt(x1, y1) + 0.4, -y1);
+      }
     }
   }
   const bg = new THREE.BufferGeometry();
@@ -1494,8 +1546,10 @@ const railSurfaceObjs = [], subwayObjs = [];
       const m = new THREE.Mesh(tube, mat); m.userData.rail = true;
       subwayObjs.push(m); scene.add(m);
     } else {
+      // 地上線路は地表に載る(A-4): 絶対 y=0.6 だと地形の 67% に埋没していた。
+      // 地下鉄(上の分岐)は絶対 z=-8m が正しいのでそのまま。
       const pos = [];
-      for(const p of g){ pos.push(p[0], (r.z||0)+0.6, -p[1]); }
+      for(const p of g){ pos.push(p[0], groundAt(p[0], p[1]) + (r.z||0) + 0.6, -p[1]); }
       const bg = new THREE.BufferGeometry();
       bg.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
       const m = new THREE.Line(bg, new THREE.LineBasicMaterial({ color:0x9aa4b2 }));
@@ -1522,7 +1576,7 @@ const labelSprites = [];
     const tex = new THREE.CanvasTexture(cv); tex.anisotropy = 4;
     const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map:tex,
       transparent:true, opacity:0.9, depthTest:true }));
-    sp.position.copy(V(b.cx, b.cy, (b.height||FH) + 10));
+    sp.position.copy(V(b.cx, b.cy, (b.gz||0) + (b.height||FH) + 10));   // A-7: gz 加算
     sp.scale.set(64, 16, 1);
     labelSprites.push(sp); scene.add(sp);
   }
@@ -1537,8 +1591,15 @@ function capsuleGeometry(r, h){
     pts.push(new THREE.Vector2(Math.cos(a)*r, h/2 + Math.sin(a)*r)); }
   return new THREE.LatheGeometry(pts, 10);
 }
+// 人間比の素寸法(半径0.45m・全高1.8m=胴 0.9m + 半球 0.45m×2)を「1.0倍」とし、
+// 表示倍率はスライダーで変える(既定 2.0 = 遠景での視認性優先)。旧実装は
+// 半径2.6m・全高10.2m を **中心配置** していたため足元が 4m 埋まっていた(B-5)。
+const AG_R = 0.45, AG_BODY = 0.9;
+const AG_HALF = AG_BODY/2 + AG_R;        // 素寸法の半高 = 0.9m
+let agScale = 2.0;                       // 表示倍率(UI スライダー)
+let AG_LIFT = AG_HALF * agScale;         // 足元アンカー用の持ち上げ量
 const NA = TRACKS.ids.length;
-const agentGeo = capsuleGeometry(2.6, 5.0);
+const agentGeo = capsuleGeometry(AG_R, AG_BODY);
 const agentMat = new THREE.MeshLambertMaterial({ color:0xffffff });
 const agents = new THREE.InstancedMesh(agentGeo, agentMat, NA);
 agents.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
@@ -1578,11 +1639,27 @@ function posAt(t){ const s0=Math.floor(t), f=t-s0;
     if(b[2]!==0) return [a[0], a[1], 0];
     return [a[0]+(b[0]-a[0])*f, a[1]+(b[1]-a[1])*f, 0]; });
 }
-// w -> up(高さ)
+// w -> 足元の接地面 y[m](屋内=そのフロアの床面 / 路上=地表)。
+// 旧実装は「地表からの相対高」を返し placeAgents が groundAt に足していたため、
+// 屋内でも足す基準が「エージェント位置の地表」= 建物基準面とズレていた(B-3)。
+// いまは屋内は建物の地上階床(gz)から実効階高で積む絶対値を返す。
 function upOf(w){
-  if(w >= 1000){ const floor = (w-1000) % 100; return Math.max((floor-0.5)*FH, 0.8); }
-  return 1.2; // 路上
+  if(w >= 1000){
+    const bi = Math.floor((w-1000)/100);
+    let floor = (w-1000) % 100;
+    if(!(floor >= 0)) floor = 1;
+    floor = Math.max(0, Math.min(99, floor));          // B-4: 表示側の上限ガード
+    const b = SCENE.buildings[bi];
+    // 基準面は「建物の地上階の床」= gz(地表高)。base(=-below*FH)は地下階の押出し
+    // 下端であって階番号の原点ではない(sim の floor は 1=地上階)。base を足すと
+    // 地下階を持つ建物で 1F の人が地下に沈むので使わない。
+    if(b) return (b.gz||0) + Math.max(floor-1, 0) * floorHOf(b);
+    return Math.max((floor-1)*FH, 0);                  // 建物不明(旧 tracks)の退避
+  }
+  return 0; // 路上 = 地表(呼び出し側が groundAt を使う)
 }
+// 足元の接地面(屋内=フロア面の絶対 y / 屋外=地形の高さ)
+function footY(x, y, w){ return (w >= 1000) ? upOf(w) : groundAt(x, y); }
 
 // ---------- 色分け
 const OCC_HUE = {};
@@ -1638,16 +1715,26 @@ function updateSky(min){
 // ---------- 毎フレームのエージェント/車の配置
 const _m = new THREE.Matrix4(), _q = new THREE.Quaternion(),
       _p = new THREE.Vector3(), _s = new THREE.Vector3(1,1,1), _hide = new THREE.Vector3(0,0,0);
+const _sa = new THREE.Vector3(agScale, agScale, agScale);   // エージェント表示倍率
 function placeAgents(t){
   const pos = posAt(t);
   for(let i=0;i<NA;i++){
     const [x,y,w] = pos[i];
     if(w === -1 || w === -2 || w === -3){  // 範囲外・睡眠・電車圏外は隠す
       _m.compose(_p.set(0,-9999,0), _q, _hide); agents.setMatrixAt(i,_m); continue; }
-    _p.set(x, groundAt(x, y) + upOf(w), -y);   // 地形があれば地表高に接地
-    _m.compose(_p, _q, _s); agents.setMatrixAt(i, _m);
+    _p.set(x, footY(x, y, w) + AG_LIFT, -y);   // 足元アンカー(屋外=地表 / 屋内=フロア面)
+    _m.compose(_p, _q, _sa); agents.setMatrixAt(i, _m);
   }
   agents.instanceMatrix.needsUpdate = true;
+}
+// 表示倍率スライダー(人間比 1.0 倍を基準)。InstancedMesh のスケールで反映する。
+function setAgentScale(v){
+  agScale = Math.max(0.5, Math.min(8, Number(v) || 1));
+  AG_LIFT = AG_HALF * agScale;
+  _sa.set(agScale, agScale, agScale);
+  const el = document.getElementById('agSizeV');
+  if(el) el.textContent = '×' + agScale.toFixed(1);
+  placeAgents(t);
 }
 function placeCars(t){
   const s0 = Math.floor(t), f = t - s0;
@@ -1704,7 +1791,7 @@ function applyLayers(){
   setDayNight(L3('lyDayNight'));
   const osmOn = L3('lyOsm');
   if(OSM.mesh){ OSM.mesh.visible = osmOn; if(osmOn && OSM.ensureLoaded) OSM.ensureLoaded(); }
-  if(gridHelper) gridHelper.visible = !osmOn;
+  if(gridHelper) gridHelper.visible = !osmOn && !TERRAIN;   // A-7: 地形注入時は常時非表示
   document.getElementById('osmAttr').style.display = osmOn ? 'block' : 'none';
 }
 ['lyBld','lyClass','lyAgent','lyCars','lyRoad','lyRail','lyUnder','lyLabels','lyDayNight','lyOsm'].forEach(id=>{
@@ -1714,6 +1801,9 @@ function applyLayers(){
 osmOp.oninput = ()=>{ OSM.opacity = Number(osmOp.value);
   if(OSM.mesh) OSM.mesh.material.opacity = OSM.opacity;
   osmOpV.textContent = Math.round(OSM.opacity*100)+'%'; saveSettings(); };
+// エージェントの大きさ(人間比 1.0 = 半径0.45m・全高1.8m)
+const agSize = document.getElementById('agSize');
+if(agSize) agSize.oninput = ()=>{ setAgentScale(agSize.value); saveSettings(); };
 document.getElementById('lyHdr').onclick = ()=>{ const b = document.getElementById('lyBody');
   const off = b.style.display === 'none'; b.style.display = off ? 'block' : 'none';
   document.getElementById('lyHdr').textContent = off ? 'レイヤー ▾' : 'レイヤー ▸'; };
@@ -1732,12 +1822,13 @@ const LS_KEY = 'shibuya3d:__RUN_NAME__';
 function saveSettings(){ try{ localStorage.setItem(LS_KEY, JSON.stringify({
   lyBld:L3('lyBld'), lyClass:L3('lyClass'), lyAgent:L3('lyAgent'), lyCars:L3('lyCars'), lyRoad:L3('lyRoad'),
   lyRail:L3('lyRail'), lyUnder:L3('lyUnder'), lyLabels:L3('lyLabels'),
-  lyDayNight:L3('lyDayNight'), lyOsm:L3('lyOsm'), osmOp:OSM.opacity,
+  lyDayNight:L3('lyDayNight'), lyOsm:L3('lyOsm'), osmOp:OSM.opacity, agScale,
   xray:document.getElementById('xray').checked, colorMode })); }catch(e){} }
 function loadSettings(){ try{ const s = JSON.parse(localStorage.getItem(LS_KEY) || 'null'); if(!s) return;
   ['lyBld','lyClass','lyAgent','lyCars','lyRoad','lyRail','lyUnder','lyLabels','lyDayNight','lyOsm','xray'].forEach(k=>{
     const el = document.getElementById(k); if(el && typeof s[k] === 'boolean') el.checked = s[k]; });
   if(typeof s.osmOp === 'number'){ OSM.opacity = s.osmOp; osmOp.value = s.osmOp; }
+  if(typeof s.agScale === 'number' && agSize){ agSize.value = s.agScale; }
   if(s.colorMode){ colorMode = s.colorMode;
     document.querySelectorAll('#colorSeg button').forEach(b=> b.classList.toggle('on', b.dataset.c===colorMode)); }
 }catch(e){} }
@@ -1801,6 +1892,7 @@ loadSettings();
   for(const m of buildingMats){ m.opacity = o; } }
 if(OSM.mesh) OSM.mesh.material.opacity = OSM.opacity;
 osmOpV.textContent = Math.round(OSM.opacity*100)+'%';
+setAgentScale(agSize ? agSize.value : agScale);
 applyLayers();
 saveSettings();
 refreshColors();
