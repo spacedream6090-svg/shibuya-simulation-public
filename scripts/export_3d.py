@@ -25,6 +25,10 @@
                       --plateau と併用必須。既定 OFF=このフラグ無しでは 1 バイトも変わらない。
                       埋め込み版 viewer3d.html には入れない(アトラス 1/2 で 80MB ゲート超過が
                       レーンA実測。分離版 viewer3d_lite.html + サイドカー 2 本が主経路)。
+                      **--tracks-binary を自動で立てる**(標準経路)。分離版の軌跡を
+                      チャンク遅延ロードへ逃がさないと 80MB ゲートに収まらないため
+                      (実測は docs/plans/plateau-3d.md のサイズ表)。tracks.json も従来どおり
+                      書くので、埋め込み版の自己完結性は変わらない。
   --rich-tracks     : tracks.json の移動手段を細分化(タクシー=mode 3・電車で圏外=w -3)。
                       既定 OFF=tracks.json はバイト同一。--plateau と併用可。
   --tracks-binary   : tracks を量子化型付きバイナリ(scene3d/tracks.bin + tracks_meta.json)でも
@@ -1063,6 +1067,10 @@ def export_run(run_dir: Path, map_path: Path | None = None,
         raise SystemExit("[export_3d] --no-tracks-json は --tracks-binary と併用する")
     if plateau_tex and plateau_dir is None:
         raise SystemExit("[export_3d] --plateau-tex は --plateau(または --plateau-dir)と併用する")
+    if plateau_tex:
+        # 標準経路(縮退策②): テクスチャ 65MB を積む分、軌跡は分離版から追い出す。
+        # tracks.json は書いたままなので埋め込み版 viewer3d.html は自己完結を保つ。
+        tracks_binary = True
     run_dir = Path(run_dir)
     if low_mem:                       # 追加専用: 出力バイトは既定経路と同一(load_track_events)
         events, track_ov = load_track_events(run_dir / "l1_events.parquet")

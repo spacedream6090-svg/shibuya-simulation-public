@@ -209,6 +209,98 @@ def _min_run(tmp_path: Path):
     return run, mp
 
 
+def _write_min_plateau(pdir: Path, osm_id: str = "b1"):
+    """最小 plateau 一式(1 建物を実測メッシュ化)。test_export3d の同名ヘルパと同型。"""
+    pdir.mkdir(parents=True, exist_ok=True)
+    V = np.array([[0, 0, 0], [8, 0, 0], [8, 8, 20]], dtype=np.float32)
+    F = np.array([[0, 1, 2]], dtype=np.int32)
+    np.savez(pdir / "plateau_mesh.npz", V=V, F=F,
+             building_offsets=np.array([0, 1], dtype=np.int32))
+    (pdir / "plateau_index.json").write_text(json.dumps({
+        "ground0_source": "test",
+        "buildings": [{"gml_id": "g0", "height": 20.0, "base": 0.0,
+                       "footprint": [[0, 0], [8, 0], [8, 8]], "n_tris": 1, "lod": 2}],
+    }), encoding="utf-8")
+    (pdir / "plateau_match.json").write_text(
+        json.dumps({"matches": {osm_id: {"gml_id": "g0"}}}), encoding="utf-8")
+
+
+# ----------------------------------------------------------------- 4b. 縮退策①(サイドカー)
+def test_slim_plateau_drops_only_merged_mesh_arrays():
+    web = {"quant_scale": 0.05, "n_vertices": 3, "n_triangles": 1,
+           "matched_ids": ["b1"], "positions_b64": "A" * 4096,
+           "indices_b64": "B" * 2048, "colors_b64": "C" * 1024,
+           "ground0_source": "test", "attribution": "x",
+           "extras": {"brid": {"n_triangles": 1}}, "ubld4": {"n_triangles": 2}}
+    text = json.dumps(web, separators=(",", ":"))
+    slim = json.loads(MV3._slim_plateau_for_tex(text))
+    # 落ちるのは統合メッシュ 3 配列だけ
+    assert set(web) - set(slim) == {"positions_b64", "indices_b64", "colors_b64"}
+    assert set(slim) - set(web) == {"merged_mesh_omitted"}
+    for k, v in slim.items():
+        if k != "merged_mesh_omitted":
+            assert v == web[k]                       # 残したキーは値まで同一
+    assert len(json.dumps(slim, separators=(",", ":"))) < len(text)
+    # 配列が無い JSON(既に縮退済み)は原文をそのまま返す=二重処理で壊れない
+    assert MV3._slim_plateau_for_tex(json.dumps(slim, separators=(",", ":"))) \
+        == json.dumps(slim, separators=(",", ":"))
+
+
+def test_plateau_tex_implies_tracks_binary(tmp_path):
+    """縮退策②の標準化: --plateau-tex は tracks.bin を自動で書く(tracks.json は残す)。"""
+    run, mp = _min_run(tmp_path)
+    pdir = tmp_path / "p"
+    _write_min_plateau(pdir)
+    d = pdir / "tiles_lod2"
+    _write_tiles_dir(d, [_write_tile(d, 0, n_prim_tex=1, n_prim_flat=1)])
+    res = E3D.export_run(run, mp, plateau_dir=pdir, plateau_tex=True)
+    assert (run / "scene3d" / "tracks.bin").exists()
+    assert (run / "scene3d" / "tracks_meta.json").exists()
+    assert (run / "scene3d" / "tracks.json").exists()    # 埋め込み版の自己完結は維持
+    assert (run / "plateau_tex.js").exists()
+    assert "tracks_bin" in res and "plateau_tex" in res
+    # --plateau だけなら従来どおり tracks.bin は書かない
+    run2, mp2 = _min_run(tmp_path / "b")
+    E3D.export_run(run2, mp2, plateau_dir=pdir)
+    assert not (run2 / "scene3d" / "tracks.bin").exists()
+    assert not (run2 / "plateau_tex.js").exists()
+
+
+def test_lite_only_binary_tracks_and_slim_sidecar(tmp_path):
+    """一気通し: tex ありランでは分離版だけがチャンク遅延ロード+縮退サイドカーになる。"""
+    run, mp = _min_run(tmp_path)
+    pdir = tmp_path / "p"
+    _write_min_plateau(pdir)
+    d = pdir / "tiles_lod2"
+    _write_tiles_dir(d, [_write_tile(d, 0, n_prim_tex=1, n_prim_flat=1)])
+    E3D.export_run(run, mp, plateau_dir=pdir, plateau_tex=True)
+    assert MV3.main([str(run)]) == 0
+    emb = (run / "viewer3d.html").read_text(encoding="utf-8")
+    lite = (run / "viewer3d_lite.html").read_text(encoding="utf-8")
+    # ② 埋め込み版は単一ファイル自己完結のまま / 分離版だけチャンク遅延ロード
+    assert "TRACKS_LAZY" not in emb
+    assert "TRACKS_LAZY" in lite and '<script src="plateau_tex.js"></script>' in lite
+    chunks = sorted((run / "tracks_bin").glob("chunk_*.js"))
+    assert chunks, "チャンクが書かれていない"
+    # ① tex 経路のサイドカーは統合メッシュ配列を持たない
+    side = (run / "plateau_mesh.js").read_text(encoding="utf-8")
+    pm = json.loads(side[len("PLATEAU_MESH = "):-1])
+    assert "positions_b64" not in pm and "merged_mesh_omitted" in pm
+    assert "matched_ids" in pm
+    web = json.loads((run / "scene3d" / "plateau_web.json")
+                     .read_text(encoding="utf-8"))
+    for k in ("positions_b64", "indices_b64", "colors_b64"):
+        assert k in web and web[k] not in side      # 実データが載っていない
+    # tex 無しラン: サイドカーは plateau_web.json の素の写し(1 バイトも変えない)
+    run2, mp2 = _min_run(tmp_path / "b")
+    E3D.export_run(run2, mp2, plateau_dir=pdir)
+    assert MV3.main([str(run2)]) == 0
+    side2 = (run2 / "plateau_mesh.js").read_text(encoding="utf-8")
+    web2 = (run2 / "scene3d" / "plateau_web.json").read_text(encoding="utf-8")
+    assert side2 == "PLATEAU_MESH = " + web2 + ";"
+    assert "TRACKS_LAZY" not in (run2 / "viewer3d_lite.html").read_text(encoding="utf-8")
+
+
 def test_default_export_writes_no_tex_sidecar_and_is_stable(tmp_path):
     run, mp = _min_run(tmp_path)
     E3D.export_run(run, mp)
@@ -319,8 +411,10 @@ def test_viewer_tex_replaces_plateau_mesh_and_boxes():
                           plateau_src="plateau_mesh.js", plateau_tex_src="plateau_tex.js")
     assert '<script src="plateau_tex.js"></script>' in html
     assert 'id="lyTex"' in html
-    # 排他: テクスチャがあれば無テクスチャ PLATEAU メッシュは作らない
-    assert "if(!PLATEAU_DATA || PLATEAU_TEX_DATA) return;" in html
+    # 排他: テクスチャがあれば無テクスチャ PLATEAU メッシュは作らない。
+    # 縮退策①でサイドカーから統合メッシュ配列が消えるので、その不在も退避条件にする。
+    assert ("if(!PLATEAU_DATA || PLATEAU_TEX_DATA"
+            " || !PLATEAU_DATA.positions_b64) return;") in html
     # 押出し箱はテクスチャ OFF のときだけ出す
     assert "m.visible = L3('lyBld') && !TEX_ON" in html
     # 照合済み skip は tex 時に無効化(未照合の箱が実形状に刺さるのを防ぐ)
@@ -442,6 +536,29 @@ def test_quickjs_tex_decode_matches_python(tmp_path):
     assert got["groups"] == [[0, rec["n_tex"] * 3, 0],
                              [rec["n_tex"] * 3, rec["n_flat"] * 3, 1]]
     assert got["mats"] == 2
+
+
+def test_quickjs_build_plateau_bails_on_slim_sidecar():
+    """縮退サイドカー(統合メッシュ配列なし)で buildPlateau が例外を出さない。
+
+    tex 在時は排他で即 return。plateau_tex.js を消して分離版だけ開いた場合でも
+    positions_b64 の不在を見て押出し箱へ退避する(atob(undefined) で落ちない)。"""
+    quickjs = pytest.importorskip("quickjs")
+    html = MV3.build_html("t", _scene_json(), _tracks_json(),
+                          plateau_src="plateau_mesh.js", plateau_tex_src="plateau_tex.js")
+    m = re.search(r"(// -+ PLATEAU 実形状建物[\s\S]*?)\n// -+ (テクスチャ付き|道路)", html)
+    assert m
+    slim = {"quant_scale": 0.05, "n_vertices": 3, "n_triangles": 1,
+            "matched_ids": ["b1"], "attribution": "x",
+            "merged_mesh_omitted": "plateau_tex.js supersedes it"}
+    for tex in ("{}", "null"):
+        ctx = quickjs.Context()
+        ctx.eval(_JS_STUB)
+        ctx.eval("var buildingMats = [], buildingMeshes = [];")
+        ctx.eval("var PLATEAU_TEX_DATA = " + tex + ";")
+        ctx.eval("var PLATEAU_DATA = " + json.dumps(slim) + ";")
+        ctx.eval(m.group(1))                       # 例外が出たらここで失敗
+        assert ctx.eval("buildingMeshes.length") == 0
 
 
 def test_quickjs_ubld4_layers_kinds_and_ground_clip(tmp_path):

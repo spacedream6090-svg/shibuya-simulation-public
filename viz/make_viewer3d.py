@@ -17,6 +17,10 @@
   あればテクスチャ付き PLATEAU LOD2.2 を描く(無テクスチャ plateau_mesh とは排他=置換)。
   埋め込み版 viewer3d.html にはテクスチャを入れない(アトラス 1/2 は 80MB ゲート超過)。
   plateau_web.json に ubld4 があれば地下街 LOD4.1 を面種別で塗り分ける(既定 OFF のまま)。
+  テクスチャ経路の 80MB ゲート対策(標準経路・docs/plans/plateau-3d.md のサイズ表):
+    ① plateau_mesh.js から統合メッシュ配列を落とす(tex が置換するので読まれない)
+    ② scene3d/tracks.bin があれば**分離版だけ**軌跡をチャンク遅延ロードにする
+       (埋め込み版は「単一ファイルで完結」を保つため触らない)
 
 データは runs/<name>/scene3d/{scene.json,tracks.json} を読む。無ければ export_3d を実行して生成。
 tracks.json が無く tracks.bin だけのラン(export_3d --no-tracks-json)も従来どおり開ける。
@@ -298,10 +302,14 @@ def _inject_plateau_tex(html: str, tex_src: str) -> str:
     #    照合済みだけ skip すると未照合の押出し箱が実形状に突き刺さる)
     anchor_skip = "const PLATEAU_SKIP = new Set(PLATEAU_DATA ? PLATEAU_DATA.matched_ids : []);"
     html = _replace_once(html, anchor_skip, _TEX_DECL, "tex-decl")
-    # ③ 無テクスチャ PLATEAU メッシュとは排他(tex があればそちらが置換する)
+    # ③ 無テクスチャ PLATEAU メッシュとは排他(tex があればそちらが置換する)。
+    #    positions_b64 の有無も見るのは、tex 経路の plateau_mesh.js が統合メッシュ配列を
+    #    載せない(縮退策①)ため。サイドカーだけ残して plateau_tex.js を消しても
+    #    例外を出さず押出し箱へ退避する。
     anchor_off = "  if(!PLATEAU_DATA) return;"
     html = _replace_once(html, anchor_off,
-                         "  if(!PLATEAU_DATA || PLATEAU_TEX_DATA) return;"
+                         "  if(!PLATEAU_DATA || PLATEAU_TEX_DATA"
+                         " || !PLATEAU_DATA.positions_b64) return;"
                          "   // テクスチャ版と排他(置換)", "tex-plateau-off")
     # ④ 押出し箱はテクスチャ OFF のときの代替表示に回す
     anchor_vis = "  buildingMeshes.forEach(m=> m.visible = L3('lyBld'));"
@@ -317,6 +325,28 @@ def _inject_plateau_tex(html: str, tex_src: str) -> str:
     anchor_wire = "// ---------- ループ"
     html = _replace_once(html, anchor_wire, _TEX_WIRE + anchor_wire, "tex-wire")
     return html
+
+
+# 分離版サイドカーのうち、テクスチャ経路では **一度も読まれない** 統合メッシュ配列。
+# buildPlateau が tex 在時に即 return する(_inject_plateau_tex ③)ので落として安全。
+_TEX_DEAD_KEYS = ("positions_b64", "indices_b64", "colors_b64")
+
+
+def _slim_plateau_for_tex(plateau_json: str) -> str:
+    """縮退策①: テクスチャ版の plateau_mesh.js から統合メッシュ配列を外す。
+
+    残すもの = matched_ids / extras(歩道橋)/ ubld4(地下街)/ 出典 など、
+    テクスチャ経路でも実際に読まれるキー。**tex が無い経路では呼ばない**ので、
+    従来の plateau_mesh.js は 1 バイトも変わらない。
+    再直列化は export_3d と同じ separators なので、落としたキー以外は原文と同じ並び。"""
+    data = json.loads(plateau_json)
+    dropped = [k for k in _TEX_DEAD_KEYS if k in data]
+    if not dropped:
+        return plateau_json
+    slim = {k: v for k, v in data.items() if k not in _TEX_DEAD_KEYS}
+    # 何をなぜ落としたかをサイドカー自身に書き残す(黙って欠けさせない)
+    slim["merged_mesh_omitted"] = "plateau_tex.js supersedes it (" + ",".join(dropped) + ")"
+    return json.dumps(slim, separators=(",", ":"))
 
 
 def _inject_tex_note(html: str) -> str:
@@ -1391,6 +1421,19 @@ def main(argv: list) -> int:
     # テクスチャ付き LOD2.2 サイドカー(export_3d --plateau-tex 産)。分離版のみで使う。
     tex_p = run_dir / "plateau_tex.js"
     has_tex = tex_p.exists()
+    # 縮退策②: tex がある時は**分離版だけ**軌跡をチャンク遅延ロードにする。
+    # 埋め込み版 viewer3d.html は「単一ファイルで完結」が存在理由なので触らない
+    # (--tracks-binary を明示した時だけ、従来どおり両方がバイナリ経路になる)。
+    lite_binary = tracks_binary
+    lite_tracks_json = tracks_json
+    if has_tex and not tracks_binary:
+        _bin_p = run_dir / "scene3d" / "tracks.bin"
+        _meta_p = run_dir / "scene3d" / "tracks_meta.json"
+        if _bin_p.exists() and _meta_p.exists():
+            lite_tracks_json = _meta_p.read_text(encoding="utf-8")
+            if "--no-traffic" in flags:
+                lite_tracks_json = _mark_no_traffic(lite_tracks_json)
+            lite_binary = True
     mode_legend = None
     try:
         mode_legend = json.loads(tracks_json).get("meta", {}).get("mode_legend")
@@ -1423,24 +1466,37 @@ def main(argv: list) -> int:
                   "・LOD 簡略化・分離版の利用を検討。")
         # 分離版: 軽量 HTML + サイドカー(同フォルダに置けば file:// で動く)
         side = run_dir / "plateau_mesh.js"
-        side.write_text("PLATEAU_MESH = " + plateau_json + ";",
-                        encoding="utf-8")
-        lite = build_html(run_dir.name, scene_json, tracks_json,
+        # 縮退策①: tex 経路では統合メッシュ配列を載せない(buildPlateau が読まない)。
+        # tex が無ければ plateau_json をそのまま書く=従来とバイト同一。
+        side.write_text("PLATEAU_MESH = "
+                        + (_slim_plateau_for_tex(plateau_json) if has_tex else plateau_json)
+                        + ";", encoding="utf-8")
+        lite = build_html(run_dir.name, scene_json, lite_tracks_json,
                           plateau_src="plateau_mesh.js", terrain_json=terrain_json,
                           has_extras=has_extras, mode_legend=mode_legend,
                           notable_json=notable_json, indoor_json=indoor_json,
-                          tracks_binary=tracks_binary, has_ubld4=has_ubld4,
+                          tracks_binary=lite_binary, has_ubld4=has_ubld4,
                           plateau_tex_src=("plateau_tex.js" if has_tex else None))
         lite_p = run_dir / "viewer3d_lite.html"
         lite_p.write_text(lite, encoding="utf-8")
         print(f"  {lite_p}  ({lite_p.stat().st_size/1024/1024:.2f} MB)"
               f"  + {side.name}  ({side.stat().st_size/1024/1024:.2f} MB)")
+        chunk_bytes = 0
+        if lite_binary and not tracks_binary:      # 分離版だけバイナリ = ここで書き出す
+            n_chunks, chunk_bytes = _write_tracks_chunks(run_dir)
+            print(f"  + {run_dir / 'tracks_bin'}  ({n_chunks} チャンク・"
+                  f"{chunk_bytes/1024/1024:.2f} MB)  ← 分離版のみ遅延ロード")
+        elif tracks_binary:
+            chunk_bytes = sum(p.stat().st_size
+                              for p in (run_dir / "tracks_bin").glob("chunk_*.js"))
         if has_tex:
             tex_mb = tex_p.stat().st_size / 1024 / 1024
             total = (lite_p.stat().st_size + side.stat().st_size
-                     + tex_p.stat().st_size) / 1024 / 1024
+                     + tex_p.stat().st_size + chunk_bytes) / 1024 / 1024
+            gate = "以内" if total <= 80 else "超過"
             print(f"  + {tex_p.name}  ({tex_mb:.2f} MB)"
-                  f"  ← 分離版合計 {total:.2f} MB(埋め込み版にテクスチャは入れない)")
+                  f"  ← 分離版合計 {total:.2f} MB(80MB ゲート{gate}"
+                  f"・埋め込み版にテクスチャは入れない)")
     return 0
 
 
