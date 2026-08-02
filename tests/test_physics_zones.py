@@ -658,12 +658,13 @@ def test_physics_body_is_measured_and_never_reaches_the_prompt(tmp_path):
     percept = scheduler.build_perception(sim, agent, material)
     assert percept.body["blocked"] == body["blocked"]
     # 契約の中心: prompt_kwargs は material と完全に等しい(body は出ない)。
-    # material は _gather_material の生の出力なので、_llm_speak が後から足す 3 欄
-    # (interstitial_digest / watch_section / revision_line)は比較の対象外にする。
+    # material は _gather_material の生の出力なので、_llm_speak が後から足す 4 欄
+    # (interstitial_digest / watch_section / revision_line / engaged_section=第87)は
+    # 比較の対象外にする。
     kw = percept.prompt_kwargs()
     assert {k: v for k, v in kw.items() if k in material} == material
     assert set(kw) - set(material) == {"interstitial_digest", "watch_section",
-                                       "revision_line"}
+                                       "revision_line", "engaged_section"}
     for f in contract.NON_PROMPT_FIELDS:
         assert f not in contract.PROMPT_KEYWORDS
     assert "blocked" not in percept.text_blob()

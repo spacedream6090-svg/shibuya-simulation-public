@@ -243,6 +243,22 @@ FEATURES: tuple[Feature, ...] = (
        "day_plan v1(構造化された朝の計画)。ブロック 4〜8 + contingency ≤3 の列挙型スキーマ・"
        "スキーマ/物理検証→決定的修復→前日計画/既定ルーチンへのフォールバック・"
        "priority×flex による割り込み(could は LLM を呼ばず削り must 危機だけ再計画)"),
+    _f("cognition.engaged.enabled", "journal", True, "possible",
+       "engaged モード = AUTOPILOT / ENGAGED の 2 状態機械(第87バッチ。設計 §8)。"
+       "第81 fire が答えた『いつ考えるか』(= 点)の上に『いつまで考えるか』(= 区間)を"
+       "載せる層。突入 5 条件(S>θ_in / 社会的直接性 / 実行不能例外 / 欲求臨界 / 予定思考)と"
+       "脱出 4 条件(解消 / 減衰=ヒステリシス θ_out<θ_in / ターン上限 / プリエンプト)。"
+       "★affects_k=true: エピソードが既存発火を束ねるので LLM 呼数が変わる。ただし"
+       "**generate() の呼び出しサイトは 1 つも増やさない**(呼ぶのは従来どおり reply / "
+       "発話 / 内省の 3 経路だけ)。定型応答経路はむしろ呼数を減らす向きに効く。"
+       "★journal 等級: 会話の終結を LLM の自由文出力(end 欄)から読むので事後再生に"
+       "llm_cache/llm_journal が要る。"
+       "★fingerprint_risk=possible を正直に宣言する: ON のとき**会話ターンのプロンプトにだけ**"
+       "『切り上げるなら end と書いてよい』の 1 節が増える(= 終結の宣言路そのもので、"
+       "§8 が要求した設計なので隠さない)。機構語(発火・驚き・閾値・エピソード・不応期・"
+       "自動操縦)も実験条件語も因子名も 1 文字も出さない。"
+       "★cognition.fire OFF では完全 no-op(watch / g_update と同じ前提関係)。"
+       "★乱数 stream を 1 本も引かない(高解像度層の選定も _stable_hash の決定論)"),
     _f("routine.stochastic.enabled", "strict", False, "none",
        "確率的実行=行動のゆらぎ(骨格 motif・時刻ジッター・寄り道・中断)"),
     _f("routine.stochastic.gumbel.enabled", "strict", False, "none",
@@ -707,6 +723,13 @@ ALLOWLIST: dict[str, str] = {
     # 落とすと「watch 節はあるが驚き発火の 1 行が無い」対照条件になる=解析用の内部レバー。
     "cognition.watch.model_revision":
         "watch 内部の提示形の指定(watch.enabled が親トグル。単独では何も起きない)",
+    # 第87バッチ: engaged 機能**内部**の形の指定であって独立した機能トグルではない
+    # (cognition.engaged.enabled が OFF なら 1 バイトも効かない)。どちらも
+    # 「その規則を切ったらどうなるか」を見るための解析用の内部レバー。
+    "cognition.engaged.wrapup":
+        "ターン上限で切り上げターンを挟むかの指定(engaged.enabled が親トグル)",
+    "cognition.engaged.sign_memory":
+        "プリエンプト時に兆しメモリを書くかの指定(engaged.enabled が親トグル)",
 }
 
 

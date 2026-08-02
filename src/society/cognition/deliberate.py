@@ -158,7 +158,8 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
                  p2_offers: str | None = None,
                  dialog_history: list | None = None,
                  watch_section: str | None = None,
-                 revision_line: str | None = None) -> str:
+                 revision_line: str | None = None,
+                 engaged_section: str | None = None) -> str:
     """個別文脈(時刻・場所・活動・気分・記憶・直近発話)を渡し、内容の固定化を防ぐ。
 
     pull_query が渡された時だけ(agentic_pull=true)、その文で決定論の記憶想起を
@@ -366,6 +367,12 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
     # 誘導語彙(「予測」「期待値」「驚き」等の機構語・評価語)を含まない記述に徹する。
     if revision_line:
         lines.append(revision_line)
+    # engaged モード(第87バッチ・cognition.engaged ON かつ**会話ターンのみ**)。既定 OFF は
+    # None=1行も足さない=バイト一致(watch_section と完全同型の seam)。
+    # ★中身は「切り上げるなら end と書いてよい」という終結の宣言路だけ。機構語・実験条件語・
+    #   因子名は 1 文字も出さない(engaged.prompt_section 参照)。
+    if engaged_section:
+        lines.append(engaged_section)
     return "\n".join(lines)
 
 
@@ -479,12 +486,25 @@ def parse_action(response: str) -> dict | None:
                 return value.strip()
         return None
 
+    def _end_flag(out: dict) -> dict:
+        """会話の終結宣言(closing move)。**キーが無ければ 1 バイトも触らない**。
+
+        第87バッチで新設した唯一の出力欄(調査の結果、現行スキーマに終了意思を表す欄は
+        存在しなかった)。先例は Generative Agents の `iterative_convo_v1` が要求する
+        「この発話で会話は終わったか」の JSON boolean(Park et al. 2023)。
+        受理は ON/OFF に関わらず常に寛容(= OFF は「提示されないだけ」= P2 の move_home や
+        explicit_nothing と同じ流儀)。消費するのは engaged ON のときだけ。
+        """
+        if data.get("end") is True or data.get("end_conversation") is True:
+            out["end"] = True
+        return out
+
     if kind == "speak":
         text = _text_of("text", "content", "message", "say", "speech")
         if text:
-            return {"type": "speak", "text": text,
-                    "use_items": [t for t in data.get("use_terms", [])
-                                  if isinstance(t, str)]}
+            return _end_flag({"type": "speak", "text": text,
+                              "use_items": [t for t in data.get("use_terms", [])
+                                            if isinstance(t, str)]})
         return None
     if kind == "coin_label":
         word = _text_of("word", "label", "name")
@@ -502,7 +522,7 @@ def parse_action(response: str) -> dict | None:
     if kind == "dm":
         text = _text_of("text", "content", "message")
         if text:
-            return {"type": "dm", "text": text}
+            return _end_flag({"type": "dm", "text": text})
         return None
     if kind == "host_event":
         title = _text_of("title", "name", "text")

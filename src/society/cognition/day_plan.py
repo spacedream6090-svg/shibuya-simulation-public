@@ -925,6 +925,12 @@ def apply(sim, agent, step: int, sim_min: int, response: str,
                                               "aim": b["purpose"],
                                               "priority": b["priority"],
                                               "flex": b["flex"]} for b in blocks]}))
+    # 第87(engaged)脱出条件 (1) 解消: 「**検証を通る計画が生成されたとき**」(設計 §8)。
+    # 後退(fallback)した計画は解消ではない — 世界を止めないための応急処置であって、
+    # 例外を解決したわけではないから。既定 OFF は完全 no-op。
+    if fallback is None:
+        from . import engaged as _engaged
+        _engaged.note_resolved(sim, agent)
 
 
 # --------------------------------------------------------------------------- #

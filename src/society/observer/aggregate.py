@@ -10,6 +10,7 @@ from .. import relations_endo as _rendo
 from .. import status as _status_mod
 from .. import truth_ledger as _truth
 from ..cognition import day_plan as _day_plan
+from ..cognition import engaged as _engaged
 from . import assets as _assets
 from . import deviation as _dev
 from . import echo as _echo
@@ -884,6 +885,44 @@ def _plan_slide_total(sim):
 @register_aggregator("plan_replan_total")
 def _plan_replan_total(sim):
     return _dayplan_col(sim, "plan_replan_total")
+
+
+# ---- engaged モード 第87バッチ(既定 OFF)。cognition.engaged.enabled=false(または
+#      cognition.fire OFF)は全て None=列なし=L2 不変(day_plan 列と同型)。読むだけ。
+#   engaged_episodes_total … 突入したエピソードの累計(単調非減少=resume 安全)
+#   engaged_turns_total    … エピソード内の LLM ターンの累計
+#   engaged_stay_min_total … 脱出済みエピソードの滞在[分]の累計(§8「engaged 滞在時間」の材料)
+#   engaged_turns_mean     … 1 エピソードあたりのターン数
+#   engaged_template_total … 定型応答(LLM 呼ゼロ)で流した回数
+#   タリーは engaged._start / _end / note_turn が積み、scalars() は読むだけ。
+def _engaged_col(sim, key):
+    s = _engaged.scalars(sim)
+    return s.get(key) if s else None
+
+
+@register_aggregator("engaged_episodes_total")
+def _engaged_episodes_total(sim):
+    return _engaged_col(sim, "engaged_episodes_total")
+
+
+@register_aggregator("engaged_turns_total")
+def _engaged_turns_total(sim):
+    return _engaged_col(sim, "engaged_turns_total")
+
+
+@register_aggregator("engaged_stay_min_total")
+def _engaged_stay_min_total(sim):
+    return _engaged_col(sim, "engaged_stay_min_total")
+
+
+@register_aggregator("engaged_turns_mean")
+def _engaged_turns_mean(sim):
+    return _engaged_col(sim, "engaged_turns_mean")
+
+
+@register_aggregator("engaged_template_total")
+def _engaged_template_total(sim):
+    return _engaged_col(sim, "engaged_template_total")
 
 
 # ---- 屋内エンジン配線 B3(indoor.enabled ON のみ・既定 OFF=None=列なし=L2 バイト不変)----

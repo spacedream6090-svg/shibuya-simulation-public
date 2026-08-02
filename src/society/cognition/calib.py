@@ -303,6 +303,11 @@ def provenance(sim) -> dict | None:
     g_prov = _plasticity.provenance(sim)
     if g_prov is not None:
         out["g_update"] = g_prov
+    # ---- 第87バッチ: engaged モード(AUTOPILOT/ENGAGED)。既定 OFF = キー自体が生えない ----
+    from . import engaged as _engaged
+    eg_prov = _engaged.provenance(sim)
+    if eg_prov is not None:
+        out["engaged"] = eg_prov
     calib = getattr(sim, "cognition_calib", None)
     if calib:
         out["calib"] = {"file": rel_path(calib["path"]), "sha256": calib["sha256"],

@@ -155,6 +155,13 @@ def save(sim, step: int, path: str | Path) -> Path:
             # 同じ型のギャップ)。既定 OFF では state 自体が生えない → None=挙動不変
             # (load は .get で旧 checkpoint 互換)。
             "dayplan_state": getattr(sim, "_dayplan_state", None),
+            # 第87バッチ engaged モード: エピソード数/ターン/滞在分/脱出理由の累積タリー
+            # (int と素の dict のみ)。**エピソードそのもの**(agent._engaged)と不応期
+            # (agent._engaged_refr)は agents pickle に自然同梱されるので、ここで中央管理
+            # するのは L2 5 列と summary.engaged の材料だけ(第75 dunbar / 第86 day_plan と
+            # 同じ型)。保存しないと mid-day resume で累積列が straight と食い違う。
+            # 既定 OFF では state 自体が生えない → None=挙動不変(load は .get で旧 ckpt 互換)。
+            "engaged_state": getattr(sim, "_engaged_state", None),
             # 第73バッチ(真偽台帳 Part B): sim 側の台帳=fact レコード(_tl_facts)・重複判定キー
             # (_tl_keys)・累積カウンタ(_tl_stats)。**保存しないと resume 後に fact_id が振り直され、
             # 信念(agents pickle に自然同梱される _fact_beliefs)の参照先が全部迷子になる**
@@ -311,6 +318,9 @@ def load(sim, path: str | Path) -> int:
     dps = rt.get("dayplan_state")               # 第86 day_plan v1(旧 ckpt 互換=無ければ素通り)
     if dps is not None:
         sim._dayplan_state = dps
+    egs = rt.get("engaged_state")               # 第87 engaged(旧 ckpt 互換=無ければ素通り)
+    if egs is not None:
+        sim._engaged_state = egs
     # 第73 Part B: 真偽台帳(旧 checkpoint 互換=無ければ素通り=beliefs OFF の挙動不変)。
     # canary は module 側のプロセス内レジストリなので、復元した fact 分を再登録して武装を保つ。
     tlf = rt.get("tl_facts")

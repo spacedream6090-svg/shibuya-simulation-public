@@ -504,6 +504,13 @@ def due_events(sim, step: int, sim_min: int, active) -> dict[int, dict]:
         trig_of[aid] = trig_names
         if plastic_on:                             # 慣れ ē の更新 + credit 窓の回収
             _plasticity.observe_tick(sim, agent, errs, sim_min)
+    # 第87(engaged)がこの tick の S と文脈を読むための控え。**この 2 行は fire 自身の
+    # 挙動に一切影響しない**(sim 属性への代入だけ・L1/乱数/プロンプト不変)。fire が OFF
+    # なら due_events そのものが呼ばれないので既定ランでは 1 度も実行されない。
+    # ★engaged が S を再計算しないための唯一の口: watch(ô)・g_update(感度)が入った
+    #   ときも「発火が見た S」と「エピソードが見る S」が原理的に食い違わない。
+    sim._fire_s = s_of
+    sim._fire_ctx = ctx_of
 
     # ---- 2) 割込みの登録(驚き / 内部)。**より早い時刻へのみ**繰り上げる ----
     active_ids = {int(a.id) for a in active}

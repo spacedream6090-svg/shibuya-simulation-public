@@ -429,6 +429,11 @@ _NON_PROMPT_WORLD_READER_MODULES = frozenset({
     # commerce の営業時刻)を読まないと成立しない。プロンプト構築層ではない(schema_prompt は
     # cfg しか見ない)ので、routine.py と同じ扱いで台帳へ載せる。P3 で契約経路へ寄せる対象。
     "day_plan.py",
+    # 第87バッチ engaged モード: AUTOPILOT/ENGAGED の状態機械。突入/脱出の判定に world
+    # (在場集合・同席・ニーズゲージ・認知イベントキュー・S の控え)を読むのが本務で、
+    # プロンプト構築層ではない。**watch.py と完全に同じ位置づけ**(watch も section() /
+    # revision_line() で 1 節を組むが、組む材料は cfg と自分の状態だけ)。P3 で契約経路へ。
+    "engaged.py",
 })
 
 

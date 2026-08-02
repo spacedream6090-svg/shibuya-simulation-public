@@ -144,12 +144,38 @@ class MockBackend(LLMBackend):
                            "blocks": blocks, "if_then": cont},
                           ensure_ascii=False)
 
+    # ---- 会話の終結宣言 end(第87バッチ・cognition.engaged ON のプロンプトにだけ載る節)----
+    # プロンプトに終結の宣言路(engaged.PROMPT_MARK)が現れたときだけ、speak/dm 本文へ
+    # `"end": true/false` を足す。**専用 stream**なので本文の draw 順を乱さない(_with_watch と
+    # 同型)。切り上げターン(「締めくくる」の文言)では必ず true を返す = 上限到達で会話が
+    # ちゃんと閉じる経路が mock でも踏まれる。マーカーが無い(既定 OFF)ランではこの分岐に
+    # 入らず乱数も引かない = 従来と 1 バイトも変わらない。
+    _END_MARK = "話を続けるかどうか:"
+    _WRAPUP_MARK = "締めくくるつもりで"
+    _END_PROB = 0.2                 # 通常ターンで切り上げを申し出る確率(実 LLM の代役)
+
+    def _with_end(self, body: str, prompt: str, rng_key: str) -> str:
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            return body
+        if not isinstance(data, dict) or data.get("action") not in ("speak", "dm"):
+            return body
+        if self._WRAPUP_MARK in prompt:
+            data["end"] = True
+        else:
+            rng = self.hub.stream("mock_end", rng_key, prompt)
+            data["end"] = bool(rng.random() < self._END_PROB)
+        return json.dumps(data, ensure_ascii=False)
+
     def generate(self, prompt: str, *, rng_key: str, temperature: float,
                  max_tokens: int, think: bool = False) -> str:
         body = self._generate_body(prompt, rng_key=rng_key, temperature=temperature,
                                    max_tokens=max_tokens, think=think)
         if self._WATCH_MARK in prompt:
-            return self._with_watch(body, prompt, rng_key)
+            body = self._with_watch(body, prompt, rng_key)
+        if self._END_MARK in prompt:
+            body = self._with_end(body, prompt, rng_key)
         return body
 
     def _generate_body(self, prompt: str, *, rng_key: str, temperature: float,

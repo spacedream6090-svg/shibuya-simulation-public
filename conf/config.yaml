@@ -970,6 +970,53 @@ cognition:
   #   channels/fire が OFF のランでは salience は空 = 欠測(0.0 で埋めない)。
   contract:
     enabled: false
+  # ---- engaged モード = AUTOPILOT / ENGAGED の 2 状態機械(第87バッチ 2026-08-03・**既定 OFF**)----
+  # 原文書: docs/plans/source/design-discussion-20260802.md §8(突入5条件・脱出4条件・補助規則3つ)。
+  # 第81(fire)が答えたのは「いつ考えるか」= **点**。ここが足すのは「いつまで考えるか」= **区間**。
+  #   AUTOPILOT … スクリプト実行・LLM 呼びゼロ / ENGAGED … 会話・再計画・内省のエピソード
+  # 突入5条件: (1) S>θ_in (2) 社会的直接性=話しかけられたら即突入(関係の薄い定型接触は
+  #   1ターンのテンプレ応答=LLM 呼ゼロで流す) (3) 実行不能例外(第86 plan_exception)
+  #   (4) 欲求臨界(ニーズ閾値の上向き横断) (5) 予定思考(朝計画=全員・夜内省=高解像度層)
+  # 脱出4条件: (1) 解消(会話は**双方**の別れ挨拶=Schegloff&Sacks 1973 の terminal exchange /
+  #   再計画は検証を通る計画の生成) (2) 減衰(S < θ_out=ratio×θ_in。**ヒステリシス**)
+  #   (3) ターン上限(切り上げターンを1回挟んで自然終了) (4) プリエンプト(must 期限・欲求臨界
+  #   → 中断内容を1行だけ兆しメモリへ=「あとで考えよう」の再燃フック)
+  # 補助規則: 不応期(脱出後30分は同種刺激の θ を引き上げ)/ **会話は両者 ENGAGED が成立条件**
+  #   (片方 AUTOPILOT なら挨拶で終わる)/ 全エピソードのログ(L1 episode_start / episode_end)
+  # ★**fire ON が前提**(watch / g_update と同じ)。cognition.fire が OFF なら完全 no-op。
+  # ★ON は journal 等級・affects_k=true: エピソードが既存発火を束ねるので呼数が変わる。
+  #   ただし **generate() の呼び出しサイトは 1 つも増やさない**(§6 の予算整合)。
+  # ★fingerprint_risk=possible: ON のとき会話ターンのプロンプトに「切り上げるなら end と
+  #   書いてよい」の 1 節が増える(=終結の宣言路。§8 が要求した設計なので隠さない)。
+  #   機構語・実験条件語・因子名は 1 文字も出さない。
+  # ★乱数 stream を 1 本も引かない(全段決定論。高解像度層の選定も _stable_hash)。
+  # R1: enabled=false で新イベント 0 件・L2 に列なし・manifest にキーなし・プロンプト 1 バイト不変。
+  # 実装 src/society/cognition/engaged.py。
+  engaged:
+    enabled: false
+    # ---- §8 の初期パラメータ(**すべて較正対象**)------------------------------------ #
+    # 較正目標(§8): 縦煙テストの最初の1シミュ日で
+    #   ・1人あたり平均エピソード数 **4〜8 件/日**
+    #   ・**engaged 滞在時間が起床時間の 1〜2 割**
+    # に収まるよう調整する。最大のリスクは θ_in の較正(低すぎれば予算崩壊・高すぎれば
+    # 誰も考えない世界)で、θ_in 自体は cognition.fire.theta_scale と較正テーブル側の量。
+    theta_out_ratio: 0.5      # θ_out = ratio × θ_in。**必ず 1 未満**(これが無いと閾値境界で発振)。
+                              # 文献の唯一の推奨は Canny 1986 の high:low=2:1〜3:1(=0.33〜0.5)で
+                              # §8 の 0.5 はその帯の端。認知科学側に標準値は無い=掃引対象。
+    turn_cap: 12              # 会話のターン上限(退行ループの保険)。Generative Agents は 8 ラウンド、
+                              # CAMEL は 40 メッセージで同じ役割を果たす(フラグは助言・上限が権威)。
+    replan_cap: 3             # 再計画の試行上限(= 思考系エピソードの実効ターン上限)
+    refractory_min: 30        # 不応期[シミュ内分]。脱出後この間は**同種**トリガの θ を引き上げる
+    refractory_mult: 2.0      # 不応期中に θ_in へ掛ける倍率(1.0=不応期を無効化)
+    min_stay_min: 10          # 最短滞在[分]。閾値ギャップだけでは止まらない dithering の保険
+                              # (O'Brien & Arkin 2020: 駆動量がなめらかに境界を往復する場合)
+    talk_idle_min: 20         # 会話が生きているとみなす無音の上限[分]。超えたら減衰判定に入る
+    familiar_closeness: 1.0   # relations ON: これ未満の親密度からの接触は定型で流す
+    familiar_contacts: 2      # relations OFF: 同上を接触回数で測る(closeness が台帳に無いため)
+    reflect_frac: 0.05        # 夜内省をエピソード化する割合(§8「高解像度層のみ」。第88 の
+                              # cognitive_tier が入るまでの暫定。_stable_hash の決定論選定=乱数ゼロ)
+    wrapup: true              # ターン上限で切り上げターンを 1 回挟む(false=即終了)
+    sign_memory: true         # プリエンプト時に兆しメモリを 1 行書く(既存 remember に kind="sign")
 
 # ---- 開放行動+価値の4軸(第17バッチ 2026-07-10。既定 OFF=現行と完全同一)----
 # LLM 自身が自由記述で行動を決める "do" をメニューに追加し、価値(実用/感情/社会/認識)で

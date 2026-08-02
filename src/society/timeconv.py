@@ -336,6 +336,28 @@ TABLE: tuple[tuple[str, str, str], ...] = (
     ("planning.day_plan.transfer_min", INVARIANT, "移動/準備の最小時間[分](物理時間)"),
     ("planning.day_plan.max_slide_min", INVARIANT, "累積ずらしの上限[分](物理時間)"),
     ("planning.day_plan.day_end_min", INVARIANT, "計画が収まるべき終端。分 of day の時刻"),
+    # ---- engaged モード(第87バッチ)。★時間量は**すべてシミュ内の分**で持つ ----
+    # エピソードは「区間」なので step で持つと Δt を変えたとき『30 分の不応期』の意味が
+    # 変わってしまう。ターン上限・試行上限は**件数**、比率・倍率は**無次元**なので不変。
+    ("cognition.engaged.theta_out_ratio", INVARIANT,
+     "θ_out / θ_in の比(無次元)。ヒステリシス幅であって時間量ではない"),
+    ("cognition.engaged.turn_cap", INVARIANT,
+     "会話のターン上限[回]。**やりとりの回数**であって step 数ではない"
+     "(Δt を細かくしても『12 往復で切り上げる』の意味は変わらない)"),
+    ("cognition.engaged.replan_cap", INVARIANT, "再計画の試行上限[回](件数)"),
+    ("cognition.engaged.refractory_min", INVARIANT,
+     "不応期[分]。**実時間の分**なので Δt に依らず 30 分は 30 分"
+     "(drive.refractory_steps が step 単位なのと対照的=認知時間の分離の実装上の意味)"),
+    ("cognition.engaged.refractory_mult", INVARIANT, "不応期中の θ_in 倍率(無次元)"),
+    ("cognition.engaged.min_stay_min", INVARIANT,
+     "エピソードの最短滞在[分]。物理時間なので Δt 非依存(Δt を細かくしたときに"
+     "初めて効く dithering 対策)"),
+    ("cognition.engaged.talk_idle_min", INVARIANT,
+     "会話が生きているとみなす無音の上限[分](物理時間)"),
+    ("cognition.engaged.familiar_closeness", INVARIANT, "親密度の閾値(無次元)"),
+    ("cognition.engaged.familiar_contacts", INVARIANT, "接触回数の閾値(件数)"),
+    ("cognition.engaged.reflect_frac", INVARIANT,
+     "夜内省をエピソード化する人口割合(無次元。per-day レートですらない)"),
     ("env.feedback.poi.capacity", INVARIANT, "POI ノードの収容人数[人](頭数)"),
     ("env.feedback.poi.max_nodes", INVARIANT, "同時に除外できるノード数の上限(件数)"),
     ("experiment.g_init.flat_value", INVARIANT, "条件 F/N の trait 定数(無次元)"),

@@ -735,6 +735,13 @@ class Simulation:
         raw_g = (OmegaConf.to_container(raw_g, resolve=True)
                  if OmegaConf.is_config(raw_g) else raw_g)
         self.gcfg = _plasticity_mod.build_cfg(raw_g)
+        # ---- engaged モード(第87バッチ。**fire ON が前提**の既定 OFF)----
+        # 発火(点)の上にエピソード(区間)を載せる層。OFF では module が 1 度も呼ばれない。
+        from ..cognition import engaged as _engaged_mod
+        raw_engaged = _raw_cog.get("engaged", None)
+        raw_engaged = (OmegaConf.to_container(raw_engaged, resolve=True)
+                       if OmegaConf.is_config(raw_engaged) else raw_engaged)
+        self.engagedcfg = _engaged_mod.build_cfg(raw_engaged)
         # ---- Perception / Intent 契約(第85バッチ P1。既定 OFF=従来経路)----
         # ON では scheduler の材料収集 → build_prompt が world → Perception → prompt に
         # 一本化される(プロンプト文字列は 1 バイトも変わらない = ON/OFF で世界一致)。
@@ -1718,6 +1725,14 @@ class Simulation:
         _dpprov = _day_plan_prov.provenance(self)
         if _dpprov is not None:
             summary["day_plan"] = _dpprov
+        # ---- engaged モード 第87バッチ(cognition.engaged.enabled=false = 既定 OFF はキーなし)----
+        # 原文書 §8 補助規則 3 が「全エピソードのログ(トリガー種別・滞在時間・ターン数・
+        # 脱出理由・モデルID)を記録し思考量の個体差の観測量とする」と明記しているので、
+        # エピソード単位の内訳(種別/トリガ/脱出理由/滞在ヒストグラム)を summary へ残す。
+        from ..cognition import engaged as _engaged_prov
+        _egprov = _engaged_prov.provenance(self)
+        if _egprov is not None:
+            summary["engaged"] = _egprov
         # ---- 初期フレーム共変量 第74バッチ IDEA④(observer.initial_frame.days: 0 = 既定 OFF)----
         # 確定済みの l1_events.parquet(直前の logger.flush)を読み直す **完全な事後処理**。
         # OFF ではこのブロックが即 None を返し summary にキーを足さない=既存ランと同形。

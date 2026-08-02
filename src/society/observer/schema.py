@@ -350,6 +350,24 @@ register_event_kind("plan_slide",       "計画ブロックを後ろへずらし
                                         "{act, place, start, slid, priority}")
 register_event_kind("plan_replan",      "must が脅かされたので再計画した(plan_version が上がる)"
                                         "{version, n_must, freed, at}")
+# ---- engaged モード(第87バッチ・cognition.engaged ON のみ・既定 OFF=0件)。
+#      AUTOPILOT / ENGAGED の 2 状態機械。実装 src/society/cognition/engaged.py。
+#      原文書 §8 補助規則 3「全エピソードのログ(トリガー種別・滞在時間・ターン数・
+#      脱出理由・モデルID)を記録し思考量の個体差の観測量とする」の実体。
+register_event_kind("episode_start",    "ENGAGED エピソードに突入した"
+                                        "{kind(talk|replan|reflect), "
+                                        "trigger(social|plan_exception|need|scheduled|salience), "
+                                        "model, theta_in, theta_out, s, partner?}")
+register_event_kind("episode_end",      "ENGAGED エピソードから脱出した"
+                                        "{kind, trigger, exit(resolved|decay|turn_cap|preempt), "
+                                        "turns, stay_min, steps, model, closed_self, closed_other}")
+register_event_kind("episode_closing",  "会話の別れ挨拶(closing move)を出した。**双方**が"
+                                        "出したときだけ解消になる{partner, turns}")
+register_event_kind("engaged_template", "関係の薄い相手からの定型接触を 1 ターンのテンプレで"
+                                        "流した(**LLM 呼びゼロ**){len}")
+register_event_kind("sign_memory",      "プリエンプトで中断した内容を1行だけ兆しメモリへ"
+                                        "書いた(「あとで考えよう」の再燃フック)"
+                                        "{kind, turns, stay_min}")
 
 
 @dataclass

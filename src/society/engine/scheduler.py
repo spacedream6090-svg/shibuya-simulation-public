@@ -45,6 +45,7 @@ from .. import work as work_mod
 from .. import worldview as worldview_mod
 from ..net import infoenv as infoenv_mod
 from ..cognition import deliberate, drive, planning, routine
+from ..cognition import engaged as engaged_mod
 from ..cognition import fire as fire_mod
 from ..cognition import perception_contract as contract_mod
 from ..cognition import plasticity as plasticity_mod
@@ -2110,6 +2111,8 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
     material["interstitial_digest"] = _isl_take(sim, agent)
     material["watch_section"] = watch_mod.section(sim)
     material["revision_line"] = watch_mod.revision_line(sim, agent, step, trigger)
+    # 第87: 会話ターンだけに載る終結の宣言路(既定 OFF は None=1行も足さない=バイト一致)。
+    material["engaged_section"] = engaged_mod.prompt_section(sim, agent, trigger)
     # ---- 第85バッチ: 契約経路(既定 OFF)------------------------------------- #
     #  ON では world → Perception → prompt に一本化する。**プロンプト文字列は 1 バイトも
     #  変わらない**(prompt_kwargs() が material と完全に等しい dict を返す)= P1(3)
@@ -2131,6 +2134,10 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                          kind="llm_deliberate", x=agent.x, y=agent.y,
                          llm_call_id=call_id, payload={"trigger": trigger}))
+    # 第87: LLM を 1 回通した = エピソードのターンが 1 進んだ(**唯一の計上点**)。
+    # 表現形(発話/返答/投稿/DM/独り言)によらず「1 回の思考」なので同じ 1 ターン。
+    # 既定 OFF・エピソード不在なら完全 no-op。
+    engaged_mod.note_turn(sim, agent, step, sim_min)
     action = deliberate.parse_action(response)
     # ---- 第85バッチ: Intent 契約(既定 OFF)--------------------------------- #
     #  思考の出力を型化して世界へ返す唯一の経路。`Intent` は移動目標・急ぎ度・回避傾向・
@@ -2269,8 +2276,26 @@ def _phase_drive(sim, step: int, sim_min: int) -> None:
     forced: set = set()
     granted_ids: set = set()
     if fire_on:
+        # ---- 第87バッチ: engaged モード(既定 OFF=以下 3 行はすべて no-op / 恒等)----
+        #  pre_tick … 生きているエピソードの継続を「今」へ繰り上げる(点 → 区間の実体)。
+        #             due_events の**前**に置くので、繰り上げた個体は S 計算・ô 更新・
+        #             plasticity・再スケジュールの通常経路をそのまま通る(fire の内部規約を
+        #             1 つも迂回しない)。
+        #  update  … 脱出 4 条件 → 突入 5 条件の順に評価し、**割込み権**を返す。
+        #             ここで返った id は下の `forced` に合流して抽選を飛ばす確定発火になる
+        #             (= 対面会話・驚き割込みと同格。新しい呼び出しサイトではない)。
+        engaged_mod.pre_tick(sim, step, sim_min)
         due = fire_mod.due_events(sim, step, sim_min, active)
         forced = {aid for aid, ev in due.items() if ev["interrupt"]}
+        # 対面会話が起きうる個体(= 下の requesters ループが face と判定する集合)。
+        # engaged が「話しかける側」の突入を判定するために要る。ON のときだけ組む
+        # (空間索引があるので O(N) の近傍参照。判定式は下の face と厳密に同じ)。
+        face_ids = frozenset(
+            a.id for a in active
+            if step >= a.conv_cooldown_until
+            and hearers_of(a, _percept(sim), radius)) \
+            if engaged_mod.enabled(sim) else frozenset()
+        forced |= engaged_mod.update(sim, step, sim_min, due, active, face_ids)
         requesters = [a for a in active
                       if a.id in due and step >= a.refractory_until
                       and (a.id in forced or logistic or a.drive >= _eff_thr(a))]
@@ -2418,6 +2443,16 @@ def _decide(sim, agent, step: int, sim_min: int) -> dict:
 
     # 返答保証: 話しかけられたら抽選なしで必ずLLMで返答(予算があれば)。
     if agent._reply_to is not None:
+        # ---- 第87バッチ: 関係の薄い相手からの定型接触は 1 ターンのテンプレで流す(§8 突入 2)。
+        #  **LLM を 1 本も呼ばず・予算も取らず**返す = ENGAGED に突入しない = この後
+        #  _apply(speak) の handoff_ok が返答権を渡さないので、やりとりは 1 ターンで終わる。
+        #  既定 OFF は reply_mode が常に "engage" = 従来経路(バイト一致)。
+        if engaged_mod.reply_mode(sim, agent) == "template":
+            agent._reply_to = None
+            agent.conv_turns_left -= 1
+            if agent.conv_turns_left <= 0:
+                agent.conv_cooldown_until = step + sim.drivecfg["conv_cooldown_steps"]
+            return engaged_mod.template_reply(sim, agent, step, sim_min)
         speaker_id, said = agent._reply_to
         agent._reply_to = None
         if sim.budget.take():
@@ -2896,10 +2931,19 @@ def _apply(sim, agent, action: dict, step: int, sim_min: int) -> None:
         if hearers:
             partner = _select_partner(sim, agent, hearers)
             if (not partner.sleeping and partner.conv_turns_left > 0
-                    and step >= partner.conv_cooldown_until):
+                    and step >= partner.conv_cooldown_until
+                    # 第87: **会話は両者 ENGAGED が成立条件**(§8 補助規則 2)。話者が
+                    # AUTOPILOT(通りすがりの独り言・定型で流した側)なら返答権を渡さない
+                    # = 相手は返さない = 挨拶で終わる。既定 OFF は常に True=従来経路。
+                    and engaged_mod.handoff_ok(sim, agent, partner)):
                 # propagation_off: 返答権は渡す(呼数不変)が、相手の状態に本文を残さない。
                 partner._reply_to = (agent.id,
                                      ablate_mod.heard_text(sim, action["text"]))
+            # 第87: closing move(別れの挨拶)。**双方**が出したときだけ解消になる
+            # (Schegloff & Sacks 1973 の terminal exchange = 片方の pre-closing は申し出)。
+            # 既定 OFF・end 欄なしなら完全 no-op。
+            if action.get("end"):
+                engaged_mod.note_closing(sim, agent, partner, step, sim_min)
             # 対話履歴(prompts.dialog_history=true のみ)。話者と相手の相手別バッファへ同一発話を
             # 積む(次回 social/reply のプロンプトに直近2往復を注入)。OFF は _dialog_on=false →
             # 一切触らない=状態変化なし=バイト一致。
