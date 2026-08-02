@@ -216,6 +216,16 @@ model:
                         #   1台7GPU:      servers: ["http://localhost:8000", ..., "http://localhost:8006"]  → FleetLLM(艦隊)
                         #   複数ノード:   servers: ["http://node1:8000", "http://node2:8000", ...]          → FleetLLM(艦隊)
   timeout_s: 120        # 1 リクエストのタイムアウト秒(vllm のみ)
+  # ---- 1 呼の絶対時限(第86バッチ保守 M-1。全 HTTP backend 共通・mock は対象外)----
+  call_deadline_s: 300  # 呼び出し**開始からの**上限秒。0 以下で無効(= 従来どおり)。
+                        #   なぜ timeout_s と別に要るか: timeout_s は urlopen のソケット
+                        #   タイムアウト = **無通信区間**しか測れない。トークンが細々流れ続ける
+                        #   病的生成では一度も無通信 120s に達せず、2026-08-02 夜間ランで
+                        #   **1 呼が 1 時間 47 分**張り付いた(10日ランの停止要因)。
+                        #   超過は既存のタイムアウト→fallback 経路に合流し、件数を
+                        #   summary.json の llm_deadline_exceeded(0 件ならキー自体を出さない)
+                        #   と scripts/watchdog_llm.py が拾う。実 LLM 実測 3.05s/呼 に対し
+                        #   既定 300s は 100 倍のマージン=正常呼には一切影響しない。
   # tiers:              # 任意: purpose(rng_key 先頭: reflect/deliberate/... )別のサーバ振り分け。既定 null=全 URL を default プールへ。
   #   reflect: ["http://localhost:8000"]                       # 内省=重い/大モデル1本に寄せる
   #   default: ["http://localhost:8001", "http://localhost:8002"]  # 会話・投稿=小モデル群
@@ -813,6 +823,13 @@ pool:
   dir: data/persona_pool     # P5 生成物(L1-L5 シャード + meta.json)のルート
   present_cap: 300           # 日次の総在場数の上限(層優先で充足)。ON 時は N=在場数
   dormant_cap: 0             # ドーマント退避ストアの上限(0=無制限)。>0 で LRU 退避(有界=persona-pool §3.3)
+  # ---- 退避スリム状態の台帳幅(第86バッチ保守 M-3。既定=現行値=挙動不変)----
+  relations_cap: 20          # 退避する関係台帳の件数(接触回数の多い上位)。
+                             #   ★dunbar(relations.dunbar)ON との相互作用: 休眠した関係は
+                             #     closeness=0 に退避されるうえ接触回数も伸びないので、20 件切りだと
+                             #     **再会する前に台帳から落ちやすい**(第75バッチ実測の持ち越し)。
+                             #     忘却/再会を観察するランではここを広げる(例 60)。
+  episodes_cap: 30           # 退避する統合エピソードの件数(直近から)。同上の理由で広げられる口。
 
 # ---- LLM一括発行(P2-S6b・既定OFF=バイト一致)----
 # 個体間で独立なLLMフェーズ(朝計画。夜内省は次段)を「build id順→未命中のみ並行発行→

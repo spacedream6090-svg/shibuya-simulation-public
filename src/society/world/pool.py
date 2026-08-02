@@ -150,9 +150,42 @@ class DormantStore:
 _EP_CAP = 30        # 退避する統合エピソードの上限(persona-pool §3.3: 非前景の episodes を小さく)
 _REL_CAP = 20       # 退避する関係台帳の上限(接触回数の多い上位)
 
+# 実効値(conf: pool.relations_cap / pool.episodes_cap)。既定は上の素値=挙動不変。
+# ★なぜ引数ではなくモジュール状態か: dehydrate の呼び出し口は
+#   `_phase_pool_rotation`(engine/scheduler.py)の 1 行だけで、そこは sim も cfg も
+#   引数に持たない汎用フェーズである。Simulation が pool を据えるときに一度 configure()
+#   するのが、呼び出し口を書き換えずに conf を通す最小の経路
+#   (pool 無効のランでは configure すら呼ばれず、値は素値のまま)。
+_caps = {"ep": _EP_CAP, "rel": _REL_CAP}
 
-def dehydrate(agent, *, ep_cap: int = _EP_CAP, rel_cap: int = _REL_CAP) -> dict:
-    """present エージェント → 退避スリム状態(記憶・信念・所持金・関係上位を持続)。"""
+
+def configure(*, rel_cap: int | None = None, ep_cap: int | None = None) -> None:
+    """dehydrate の既定上限を conf 値で据える(Simulation 構築時に 1 回)。
+
+    第75バッチ実測の持ち越し(M-3): dunbar(認知枠)の**休眠**関係は closeness=0 に
+    退避されるが、`dehydrate` の関係台帳は「接触回数の多い上位 20 件」で切られるため、
+    休眠した弱い紐帯はプール退場のたびに**再会する前に台帳から落ちやすい**。
+    観察ラン(dunbar ON + pool ON)ではここを広げて「忘却/再会」の軌跡を保てるようにする。
+    既定値は現行の素値そのままなので、指定しない限り挙動は 1 バイトも変わらない。
+    """
+    if rel_cap is not None:
+        _caps["rel"] = max(0, int(rel_cap))
+    if ep_cap is not None:
+        _caps["ep"] = max(0, int(ep_cap))
+
+
+def caps() -> dict:
+    """いま有効な退避上限(観測・テスト用)。"""
+    return dict(_caps)
+
+
+def dehydrate(agent, *, ep_cap: int | None = None, rel_cap: int | None = None) -> dict:
+    """present エージェント → 退避スリム状態(記憶・信念・所持金・関係上位を持続)。
+
+    ep_cap / rel_cap を省くと configure() で据えた実効値(既定 = 30 / 20)を使う。
+    """
+    ep_cap = _caps["ep"] if ep_cap is None else int(ep_cap)
+    rel_cap = _caps["rel"] if rel_cap is None else int(rel_cap)
     mem = agent.mem
     rels = sorted(mem.relations.items(),
                   key=lambda kv: (-int(kv[1].get("count", 0)), kv[0]))[:rel_cap]

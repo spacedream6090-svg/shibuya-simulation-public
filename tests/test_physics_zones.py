@@ -776,3 +776,74 @@ def test_registry_declares_physics_zones():
     assert f.affects_k is False
     assert f.fingerprint_risk == "none"
     assert ids["physics.perception.channels"].repro_tier == "strict"
+
+
+# =========================================================================== #
+# (12) 竹-4 持ち越し②(第86バッチ保守 M-4): 所有中のノード基準同席が古くならない
+# =========================================================================== #
+def _three_node_path(sim, agent):
+    """agent.node から始まる連結 3 ノード(n0-n1-n2)を地図から採る。"""
+    g = sim.city.graph
+    n0 = agent.node
+    for n1 in sorted(g.neighbors(n0)):
+        for n2 in sorted(g.neighbors(n1)):
+            if n2 != n0:
+                return [n0, n1, n2]
+    raise AssertionError("3 ノードの連結経路が地図から採れない")
+
+
+def test_owned_agent_node_advances_across_interior_nodes(tmp_path):
+    """ゾーン内で経路ノードを跨いだ時点で `agent.node` が進む。
+
+    入れる前は入場ゲートのノードに固定されたままで、ノード基準の同席
+    (cognition/channels._place_key = ("node", agent.node) → ext.crowd_local)が
+    「実際には先を歩いている個体」を入口に居ることにして数えていた。
+    退場時の射影復元(_release)と同じ「直前に通過したノード」意味論に揃える。
+    """
+    from society.cognition import channels as channels_mod
+
+    sim = _sim(tmp_path, "nodetrack", n=6, steps=1, zone_specs=[_zone()])
+    zone = sim.physcfg["zones"][0]
+    agent = sim.agents[0]
+    path = _three_node_path(sim, agent)
+    agent.x, agent.y = sim.city.node_xy(path[0])
+    rec = P._admit_record(sim, zone, agent, path, [], 0)
+    rec["waiting"] = False
+    agent._phys_zone = zone.id
+    members = [rec]
+    engine = P._build_engine(zone, members, None)
+
+    assert agent.node == path[0]                    # 入場時は入口ノード
+    assert channels_mod._place_key(agent) == ("node", path[0])
+
+    # 中間ノード n1 に到達した状態で通過点前進を回す
+    engine.pos[0, 0], engine.pos[0, 1] = sim.city.node_xy(path[1])
+    released = P._advance_and_collect(sim, zone, members, engine)
+    assert rec["wp"] == 2, "通過点が前進していない(テスト前提が崩れた)"
+    assert agent.node == path[1], "所有中に agent.node が進んでいない(竹-4 持ち越し②)"
+    assert channels_mod._place_key(agent) == ("node", path[1])
+    assert not released                              # まだ経路の途中
+
+    # 終端 n2 に到達 → 退場が確定し、_release がグラフ状態を整合させる
+    engine.pos[0, 0], engine.pos[0, 1] = sim.city.node_xy(path[2])
+    P._writeback(members, engine)
+    released = P._advance_and_collect(sim, zone, members, engine)
+    assert released == members
+    P._release(sim, zone, agent, 0, 0, P._new_state(), rec=rec)
+    assert not P.owned(agent)
+    if agent.route:                                  # 復帰後は node/route が地図と整合
+        assert sim.city.graph.has_edge(agent.node, agent.route[0])
+
+
+def test_owned_node_update_is_deterministic_and_draws_no_rng(tmp_path):
+    """同 seed 2 ランで zone_gate 列と最終ノードが一致(node 追従は決定論の純関数)。"""
+    def once(name):
+        sim = _run(tmp_path, name, n=24, steps=6, zone_specs=[_zone()])
+        gates = [[e.step, e.agent_id, e.payload["dir"], e.payload["zone"]]
+                 for e in _kind(sim, "zone_gate")]
+        return gates, {a.id: a.node for a in sim.agents}
+
+    g1, n1 = once("nd1")
+    g2, n2 = once("nd2")
+    assert g1 == g2 and n1 == n2
+    assert g1, "ゾーンを誰も通っていない(テスト前提が崩れた)"

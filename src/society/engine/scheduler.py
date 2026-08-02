@@ -3569,7 +3569,10 @@ def _apply_free_action(sim, agent, action: dict, step: int, sim_min: int) -> Non
         paid = cost
     dest = None
     where = action.get("where")
-    if where and not agent.sleeping and agent.activity != "working":
+    # 建物内では route を張らない(exit_building が node を入口へ張り替えるため、
+    # 屋内から張った route は非隣接エッジになり _phase_move が KeyError で落ちる。
+    # truth_ledger._route_to / tools._free_to_move と同一の guard)
+    if where and not agent.sleeping and agent.activity != "working" and not agent.building:
         dest = _free_dest(sim, str(where))
     if dest and dest != agent.node:
         path, used_mode = sim.router.route(agent.node, dest, "walk")

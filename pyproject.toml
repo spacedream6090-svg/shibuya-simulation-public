@@ -16,6 +16,13 @@ dev = ["pytest>=8.0"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+# 第86バッチ保守 M-2: サブプロセスを**実際に起動する**テストの並列フレーク対策。
+# pytest-xdist 3.8 の loadgroup 分配 = `@pytest.mark.xdist_group("名前")` が付いた
+# テストを**同じワーカーへ集める**(= 互いに並列に走らない)。ここを addopts に置くのは、
+# 常用のフルゲート `python -m pytest tests -q -n auto` にオプションを足させないため
+# (既定の `--dist load` のままだとマーカーが無視されて対策が効かない)。
+# -n を付けない実行では分配モード自体が働かないので完全に無害。
+addopts = ["--dist", "loadgroup"]
 markers = [
     "slow: 重い合成データ・スケール検証(`-m 'not slow'` でスキップ可)",
 ]

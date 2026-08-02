@@ -563,3 +563,95 @@ def test_export_plateau_without_terrain_extras_no_new_keys(tmp_path):
     assert all("gz" not in bl for bl in scene["buildings"])
     web = json.loads(res["plateau_web"].read_text(encoding="utf-8"))
     assert "extras" not in web
+
+
+# ================================================================ 竹-4 持ち越し①(M-4)
+# 物理ゾーン(physics.zones)に所有されている間、その個体はグラフ移動をしないので
+# move_segment が 1 件も出ず、位置が入口で固まったまま出口で瞬間移動する。
+# zone_gate(enter/exit。どちらも位置を持つ)で挟んで直線補間する(w=0=路上扱い)。
+def _zone_events():
+    """agent0 が step2 でゾーンへ入り step6 で出る(その間 move_segment ゼロ)。
+    agent1 は同じ区間を普通に歩く(ゾーンに入らない=補間の対象外)。"""
+    rows = []
+
+    def add(step, aid, kind, x, y, payload):
+        rows.append({"step": step, "sim_min": 7 * 60 + step * 10, "agent_id": aid,
+                     "kind": kind, "x": float(x), "y": float(y),
+                     "payload": json.dumps(payload, ensure_ascii=False),
+                     "rng_stream": "", "llm_call_id": ""})
+
+    for a in range(2):
+        add(0, a, "arrive", 0, 0, {"name": "路上"})
+    add(2, 0, "zone_gate", 0, 0, {"zone": "z1", "gate": "g0", "dir": "enter",
+                                  "engine": "orca", "wait_s": 0.0})
+    add(6, 0, "zone_gate", 80, 40, {"zone": "z1", "gate": "g1", "dir": "exit",
+                                    "reason": "gate", "dwell_s": 41.0, "jump_m": 0.2})
+    add(1, 1, "move_segment", 10, 5, {"mode": "walk", "pts": [[0, 0], [10, 5]]})
+    return rows
+
+
+def test_zone_gate_gap_is_linearly_interpolated(tmp_path):
+    """所有中(step3〜5)の位置が enter→exit の直線で埋まり、実績が meta に出る。"""
+    run_dir, map_path = _write_events_run(tmp_path, "e_zone", _zone_events(), 2)
+    res = E3D.export_run(run_dir, map_path)
+    tracks = json.loads(res["tracks"].read_text(encoding="utf-8"))
+    idx = {a: i for i, a in enumerate(tracks["ids"])}
+    i0 = idx[0]
+    # 入場 step は入口位置、退場 step は出口位置
+    assert tracks["positions"][2][i0] == [0.0, 0.0, 0]
+    assert tracks["positions"][6][i0] == [80.0, 40.0, 0]
+    # 途中は 1/4, 2/4, 3/4 の直線内分(w=0=路上)
+    assert tracks["positions"][3][i0] == [20.0, 10.0, 0]
+    assert tracks["positions"][4][i0] == [40.0, 20.0, 0]
+    assert tracks["positions"][5][i0] == [60.0, 30.0, 0]
+    # 補間の実績(黙って埋めない)
+    zi = tracks["meta"]["zone_interp"]
+    assert zi == {"method": "linear", "segments": 1, "frames": 3, "unclosed": 0}
+    # ゾーンに入らなかった個体は従来どおり(補間は他人に波及しない)
+    assert tracks["positions"][3][idx[1]] == [10.0, 5.0, 0]
+
+
+def test_zone_gate_unclosed_segment_is_reported_not_guessed(tmp_path):
+    """ラン終端で所有中だった区間は**埋めずに件数だけ**出す(出口位置を捏造しない)。"""
+    rows = [r for r in _zone_events() if not (r["kind"] == "zone_gate"
+                                              and "exit" in r["payload"])]
+    rows.append({"step": 6, "sim_min": 7 * 60 + 60, "agent_id": 1,   # ラン長を保つ
+                 "kind": "arrive", "x": 10.0, "y": 5.0,
+                 "payload": json.dumps({"name": "路上"}, ensure_ascii=False),
+                 "rng_stream": "", "llm_call_id": ""})
+    run_dir, map_path = _write_events_run(tmp_path, "e_zone_open", rows, 2)
+    tracks = json.loads(E3D.export_run(run_dir, map_path)["tracks"]
+                        .read_text(encoding="utf-8"))
+    i0 = {a: i for i, a in enumerate(tracks["ids"])}[0]
+    zi = tracks["meta"]["zone_interp"]
+    assert zi["segments"] == 0 and zi["frames"] == 0 and zi["unclosed"] == 1
+    for step in (3, 4, 5):                       # 入口で固まったまま(正直な欠測)
+        assert tracks["positions"][step][i0] == [0.0, 0.0, 0]
+
+
+def test_runs_without_zones_are_byte_identical(tmp_path):
+    """zone_gate が 1 件も無いラン(= 物理 OFF の既存ラン)は出力が従来と同一。
+
+    zone_interp キーが生えないこと + 2 回実行のバイト一致で「追加専用」を固定する。
+    """
+    run_dir, map_path = _write_events_run(tmp_path, "e_nozone", _rich_events(), 6)
+    b1 = E3D.export_run(run_dir, map_path)["tracks"].read_bytes()
+    b2 = E3D.export_run(run_dir, map_path)["tracks"].read_bytes()
+    assert b1 == b2
+    assert "zone_interp" not in json.loads(b1.decode("utf-8"))["meta"]
+
+
+def test_zone_gate_interpolation_respects_step_stride(tmp_path):
+    """step_stride で間引いても、出力されるフレームだけが正しく埋まる。"""
+    run_dir, map_path = _write_events_run(tmp_path, "e_zone_lod", _zone_events(), 2)
+    import pyarrow.parquet as _pq
+    events = _pq.read_table(run_dir / "l1_events.parquet").to_pylist()
+    city = json.loads(map_path.read_text(encoding="utf-8"))
+    tracks = E3D.reconstruct_tracks(events, city.get("buildings", []), [],
+                                    step_stride=2)
+    i0 = {a: i for i, a in enumerate(tracks["ids"])}[0]
+    # 出力フレームは step 0,2,4,6(frame = step//2)。埋まるのは step4 の 1 点だけ
+    assert tracks["positions"][1][i0] == [0.0, 0.0, 0]      # step2 = 入場
+    assert tracks["positions"][2][i0] == [40.0, 20.0, 0]    # step4 = 中点(補間)
+    assert tracks["positions"][3][i0] == [80.0, 40.0, 0]    # step6 = 退場
+    assert tracks["meta"]["zone_interp"]["frames"] == 1

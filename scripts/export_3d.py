@@ -815,7 +815,12 @@ def build_scene(city: dict, buildings: list) -> dict:
 TRACK_COLUMNS = ("step", "sim_min", "agent_id", "kind", "x", "y", "payload")
 TRACK_KINDS = ("arrive", "enter_area", "enter_building", "exit_area", "exit_building",
                "floor_move", "move_segment", "reflect", "ride", "sleep_start",
-               "speak", "traffic_flow", "wake_up")
+               "speak", "traffic_flow", "wake_up",
+               # 竹-4 持ち越し①(第86バッチ保守 M-4): 物理ゾーンに所有されている間は
+               # move_segment が 1 件も出ない(グラフ移動をしないため)ので、この 2 点
+               # (enter/exit の位置)が**ゾーン通過区間の唯一の手掛かり**になる。
+               # 物理ゾーン OFF のランには 1 行も存在しない = 既存出力はバイト不変。
+               "zone_gate")
 
 
 def load_track_events(parquet_path: Path,
@@ -920,7 +925,15 @@ def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
 
     *_override(--low-mem 経路・既定 None=従来どおり events から算出):
     load_track_events が「間引きで落とした行にしか無い情報」を先に集計して渡すための口。
-    None のときは一切参照されないので、既定経路は従来とバイト同一。"""
+    None のときは一切参照されないので、既定経路は従来とバイト同一。
+
+    竹-4 持ち越し①(第86バッチ保守 M-4): 物理ゾーン(physics.zones)に所有されている間、
+    その個体は**グラフ移動をしない**ので move_segment が 1 件も出ず、位置が入口で固まって
+    出口で瞬間移動する。zone_gate(enter/exit。どちらも位置を持つ)で挟んで**直線補間**し、
+    w=0(路上)として埋める。実績は meta["zone_interp"](= {method, segments, frames,
+    unclosed})に残す。★これは実軌跡ではない: 物理の dt_sub 刻みの実軌跡は L1 に記録されて
+    いない(将来課題)。zone_gate が 1 件も無いラン(= 物理 OFF の既存ラン)では
+    この経路を一度も通らず、出力は従来とバイト同一。"""
     n_steps = (max((e["step"] for e in events), default=-1) + 1
                if n_steps_override is None else int(n_steps_override))
     bld_idx = {b["id"]: i for i, b in enumerate(buildings)}
@@ -969,6 +982,10 @@ def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
                     taxi_steps.add((e["agent_id"], e["step"]))
     positions, moves, traffic = [], [], []
     cur = [[0.0, 0.0, 0] for _ in agent_ids]
+    # 竹-4 持ち越し①: ゾーン所有中(zone_gate enter → exit)の位置の穴。
+    #   zone_open[i] = (enter step, (x, y)) / zone_fills = 埋める区間
+    zone_open: dict[int, tuple[int, tuple[float, float]]] = {}
+    zone_fills: list[tuple[int, int, tuple[float, float], int, tuple[float, float]]] = []
     for step in range(n_steps):
         mv = [None] * len(agent_ids)
         tr_step = {"n": 0, "segs": []}
@@ -1013,10 +1030,44 @@ def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
                 cur[i][2] = -2
             elif kind == "wake_up":
                 cur[i][2] = 0 if cur[i][2] == -2 else cur[i][2]
+            elif kind == "zone_gate":
+                # 物理ゾーンの流入/流出。所有中は move_segment が出ないので、この 2 点で
+                # 区間を挟んで**直線補間**する(後段の post-pass。w=0=路上扱い)。
+                # 順序: physics.phase() は _phase_move の**直前**なので、同 step の
+                # move_segment は zone_gate より後に来る = 退場した step の最終位置は
+                # move_segment 側が正しく上書きする。
+                xy = (round(float(e["x"]), 1), round(float(e["y"]), 1))
+                cur[i] = [xy[0], xy[1], 0]
+                if p.get("dir") == "enter":
+                    zone_open[i] = (step, xy)
+                else:                                  # "exit"(reason は問わない)
+                    opened = zone_open.pop(i, None)
+                    if opened is not None and step - opened[0] >= 2:
+                        zone_fills.append((i, opened[0], opened[1], step, xy))
         if step % stride == 0:                     # LOD: K step ごとに1フレームだけ出力
             positions.append([list(p) for p in cur])
             moves.append(mv)
             traffic.append(tr_step)
+
+    # ---- 竹-4 持ち越し①: ゾーン所有中の位置を enter→exit の直線で埋める(post-pass)----
+    # なぜ post-pass か: 埋める先(exit の位置)は未来の行なので、前向き 1 パスでは書けない。
+    # ★正直な限界: これは**実軌跡ではなく直線近似**である。物理(SFM/ORCA)は dt_sub=0.05s で
+    #   局所回避しながら曲がって歩くが、その軌跡は L1 に一切残っていない(記録すると 1 個体
+    #   1 step あたり最大 12000 点)。実軌跡の記録は将来課題。ここで埋めるのは
+    #   「ゾーンに入った人が入口で固まって見え、出口で瞬間移動する」表示上の欠落だけである。
+    n_interp_frames = 0
+    for i, s0, (x0, y0), s1, (x1, y1) in zone_fills:
+        span = s1 - s0
+        for s in range(s0 + 1, s1):
+            if s % stride:
+                continue                       # 出力されないフレームは埋めない
+            f = s // stride
+            if f >= len(positions):
+                continue
+            t = (s - s0) / span
+            positions[f][i] = [round(x0 + (x1 - x0) * t, 1),
+                               round(y0 + (y1 - y0) * t, 1), 0]
+            n_interp_frames += 1
 
     start_min = step_min.get(0, DEFAULT_START_MIN)
     emitted = list(range(0, n_steps, stride))
@@ -1038,6 +1089,15 @@ def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
     if rich_tracks:                                 # 追加専用: 既定 OFF=現行と同一
         meta["mode_legend"] = {"0": "徒歩", "1": "自転車", "2": "車", "3": "タクシー"}
         meta["away_train"] = -3
+    # 竹-4 持ち越し①: 補間の実績(追加専用キー。ゾーン 0 件のランでは出さない=既存出力と同一)
+    if zone_fills or zone_open:
+        meta["zone_interp"] = {"method": "linear", "segments": len(zone_fills),
+                               "frames": n_interp_frames,
+                               "unclosed": len(zone_open)}
+        print(f"  [tracks] ゾーン所有中の位置を直線補間: 区間 {len(zone_fills)} 本 /"
+              f" フレーム {n_interp_frames} 点"
+              + (f" / 未閉 {len(zone_open)} 件(ラン終端で所有中)" if zone_open else "")
+              + " ※実軌跡ではなく enter→exit の直線近似")
     if w_stats.get("clamped") or w_stats.get("unknown"):     # silent cap 禁止
         top = sorted(w_stats.get("unknown_names", {}).items(),
                      key=lambda kv: (-kv[1], str(kv[0])))[:3]

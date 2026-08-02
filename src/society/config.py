@@ -26,6 +26,8 @@ _INT_KEYS = [
     "planning.max_items", "transit_ride.bus.headway_steps",
     # 制度DSL(ユーザー構想 2026-07-06)の整数パラメータ
     "rules.max_active", "rules.duration_days",
+    # ペルソナプール退避の台帳幅(第86バッチ保守 M-3。既定=現行値=挙動不変)
+    "pool.relations_cap", "pool.episodes_cap",
 ]
 _FLOAT_KEYS = [
     "world.walk_speed_m_per_step", "world.perception_radius_m",
@@ -35,6 +37,7 @@ _FLOAT_KEYS = [
     "opinion.w_face", "opinion.w_dm", "opinion.w_sns",  # FJ 意見更新の説得重み(#16)
     "net.like_prob", "net.reshare_prob",    # SNS 反応の確率(#14)
     "model.timeout_s",                      # 本選 vllm: 1 リクエストのタイムアウト秒
+    "model.call_deadline_s",                # 1 呼の絶対時限秒(M-1。0 以下=無効)
     "world.traffic.through_ratio",          # 交通 od: 通過交通の比率(ambient では未使用)
     "world.traffic.signal_cycle_s",         # 交通 od: 信号周期秒
     # 交通機関(ユーザー要望 2026-07-06)の小数パラメータ

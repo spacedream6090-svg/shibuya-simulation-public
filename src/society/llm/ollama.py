@@ -14,19 +14,24 @@ import urllib.error
 import urllib.request
 
 from .base import LLMBackend
+from .deadline import DEFAULT_DEADLINE_S, request_json
 
 FORMAT_MODES = ("none", "json")   # "schema" は将来拡張(単一行動の狙い撃ち用)
 
 
 class OllamaBackend(LLMBackend):
     def __init__(self, model: str, host: str = "http://localhost:11434",
-                 timeout_s: float = 120.0, format_mode: str = "json"):
+                 timeout_s: float = 120.0, format_mode: str = "json",
+                 deadline_s: float = DEFAULT_DEADLINE_S):
         if format_mode not in FORMAT_MODES:
             raise ValueError(f"model.format '{format_mode}' は未対応({FORMAT_MODES})。")
         self.name = f"ollama/{model}"
         self.model = model
         self.host = host.rstrip("/")
         self.timeout_s = timeout_s
+        # 呼び出し開始からの絶対時限(M-1)。timeout_s は無通信区間しか測れないので、
+        # 細々と流れ続ける病的生成はこちらでしか止まらない(llm/deadline.py 冒頭)。
+        self.deadline_s = float(deadline_s)
         self.format_mode = format_mode
         # キャッシュキー拡張(CachedLLM._key が参照): 既定 "json" は None=従来キーと同一
         # (過去ランの llm_cache.jsonl 再生互換を保つ)。"none" のみ別キー。
@@ -51,9 +56,11 @@ class OllamaBackend(LLMBackend):
             f"{self.host}/api/generate", data=body,
             headers={"Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+            data = request_json(req, timeout_s=self.timeout_s,
+                                deadline_s=self.deadline_s)
             return data.get("response", "")
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        except (urllib.error.URLError, TimeoutError, OSError,
+                json.JSONDecodeError) as exc:
+            # DeadlineExceeded は TimeoutError の派生 = ここに合流する(専用の分岐は要らない)
             # D16: 失敗は上位で fallback(routine)に落ちるよう「壊れた応答」を返す
             return f"__ollama_error__: {exc}"

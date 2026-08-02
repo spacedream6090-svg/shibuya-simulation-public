@@ -676,12 +676,24 @@ def _advance_and_collect(sim, zone, members, engine) -> list:
             gx, gy = rec["wp_xy"]
             if math.hypot(x - gx, y - gy) >= ar:
                 break
+            reached = path[rec["wp"]]  # いま到達したグラフノード(= これから「直前ノード」になる)
             prev = rec["wp_xy"]
             rec["wp"] += 1
             rec["wp_xy"] = sim.city.node_xy(path[rec["wp"]])
             engine.goal[i, 0], engine.goal[i, 1] = rec["wp_xy"]
             rec["seg_dir"] = _unit(rec["wp_xy"][0] - prev[0], rec["wp_xy"][1] - prev[1])
             rec["sign"] = 0            # 区間が変わった瞬間を反転に数えない
+            # ★竹-4 持ち越し②(第86バッチ保守 M-4): 所有中も **agent.node を進める**。
+            #   これを入れる前は、ゾーンに入った瞬間の入場ゲートノードのまま所有が続くので、
+            #   ノード基準の同席判定(cognition/channels._place_key の ("node", agent.node)・
+            #   ext.crowd_local)が「実際には 100m 先を歩いている個体」を入口に居ることにして
+            #   数えていた(横断中の群衆が丸ごと 1 ノードに溜まって見える)。
+            #   意味論は `_release` の射影復元と同じ「直前に通過したノード」= path[i]。
+            #   route は所有中に消費されない(_phase_move が飛ばす)ので触らない。退場時に
+            #   (node, route, edge_offset) を射影で組み直す既存の手順はそのまま効く。
+            #   決定論: 到達判定 (arrive_radius) の純関数で、乱数も LLM も増えない。
+            #   既定 OFF(physics.zones_enabled=false)ではこの関数自体が呼ばれない。
+            rec["agent"].node = reached
         gx, gy = rec["wp_xy"]
         reached_exit = (rec["wp"] >= last and math.hypot(x - gx, y - gy) < ar)
         if reached_exit or (rec["seen_inside"] and not zone.contains(x, y)):

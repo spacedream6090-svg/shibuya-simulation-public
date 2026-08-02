@@ -16,7 +16,17 @@ import shlex
 import sys
 from pathlib import Path
 
+import pytest
+
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+
+# 第86バッチ保守 M-2: このモジュールは**実際に子プロセスを起動して監督ループを回す**
+# (ダミー子の「N 回クラッシュ→成功」「進捗せずストール」は poll_sec とストール判定の
+# **実時間**に依存し、最後の 1 本は実 run.py を丸ごと走らせる)。xdist の既定 `--dist load`
+# では他のテストと同時に走って CPU を奪い合い、ストール判定が誤発火する並列フレークを
+# 2 例観測した。loadgroup(pyproject の addopts)で同名グループを**同一ワーカーへ集約**し、
+# サブプロセスを起こすテスト同士が並列に走らないようにする。単体・直列実行では無影響。
+pytestmark = pytest.mark.xdist_group("subproc_run")
 
 
 def _load_watchdog():

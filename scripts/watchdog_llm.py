@@ -13,6 +13,11 @@ runs/ に残っている過去ランすべてに適用できる。
 - llm_calls        : l1b_llm.parquet の行数(= summary.json の llm_calls と一致するはず)
 - cache_hit_rate   : l1b の cached=True の割合
 - fallback_rate    : L1 kind="fallback" 件数 ÷ llm_calls
+- deadline_exceeded: 1 呼の**絶対時限**(model.call_deadline_s)に掛かった呼の件数
+                     (summary.json の llm_deadline_exceeded。第86バッチ保守 M-1)。
+                     読取タイムアウトでは止まらない「細々と流れ続ける病的生成」を切った件数で、
+                     **1 件でも出たら異常**(2026-08-02 夜間ランでは 1 呼が 1 時間 47 分張り付いた)。
+                     キーが無いランは 0 件 or 旧ラン = None(欠測を 0 と偽らない)。
 - purpose 内訳     : purpose ごとの呼数・キャッシュ率(plan_retry の多さ=計画の失敗の階段の指標)
 - L2 由来の系列    : observer.llm_health.enabled=true のランは l2_metrics の最終行も併記して
                      突合できる(両者が食い違ったら計装のバグ)
@@ -92,6 +97,27 @@ def _l1_fallbacks(run_dir: Path) -> int | None:
     return sum(1 for k in kinds if k == "fallback")
 
 
+def _deadline_exceeded(run_dir: Path) -> int | None:
+    """summary.json の llm_deadline_exceeded(M-1)。
+
+    Simulation.finalize は **0 件のときキー自体を出さない**(既存 summary とバイト一致を
+    保つため)。ここでは「summary はあるがキーが無い」= 0 件、「summary が無い/壊れている」
+    = None(欠測)として区別する。"""
+    summ = run_dir / "summary.json"
+    if not summ.exists():
+        return None
+    try:
+        s = json.loads(summ.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, ValueError, OSError):
+        return None
+    if not isinstance(s, dict):
+        return None
+    try:
+        return int(s.get("llm_deadline_exceeded", 0))
+    except (TypeError, ValueError):
+        return None
+
+
 def _l2_last(run_dir: Path) -> dict | None:
     """observer.llm_health.enabled=true のランのみ: L2 最終行の 3 列。"""
     path = run_dir / "l2_metrics.parquet"
@@ -124,6 +150,8 @@ def check_run(run_dir: Path) -> dict:
         # 朝の計画の「失敗の階段」の第1段(再試行)の割合 = fallback が拾えない失敗の代理
         "plan_retry_rate": (round(plan_retry / plan_calls, 6)
                             if plan_calls else None),
+        # M-1: 絶対時限に掛かった呼(1 件でも異常。旧ラン/summary 欠落は None)
+        "deadline_exceeded": _deadline_exceeded(run_dir),
         "by_purpose": stats["by_purpose"],
         "l2_llm_health": _l2_last(run_dir),
     }
@@ -139,6 +167,8 @@ def _fmt(report: dict) -> str:
         f"(rate {_p(report['fallback_rate'])})",
         f"  cache_hit_rate : {_p(report['cache_hit_rate'])}",
         f"  plan_retry_rate: {_p(report['plan_retry_rate'])}",
+        "  deadline_exceed: " + ("n/a" if report["deadline_exceeded"] is None
+                                 else str(report["deadline_exceeded"])),
     ]
     if report["l2_llm_health"]:
         h = report["l2_llm_health"]
@@ -177,10 +207,13 @@ def main() -> None:
     bad = [r for r in reports
            if r["fallback_rate"] is not None
            and r["fallback_rate"] > args.fallback_warn]
+    # M-1: 絶対時限の超過は閾値なしで異常(1 件でも警告・終了コード 1)。
+    stuck = [r for r in reports if (r["deadline_exceeded"] or 0) > 0]
     if args.json:
         print(json.dumps({"reports": reports,
                           "fallback_warn": args.fallback_warn,
-                          "over_threshold": [r["run"] for r in bad]},
+                          "over_threshold": [r["run"] for r in bad],
+                          "deadline_exceeded_runs": [r["run"] for r in stuck]},
                          ensure_ascii=False, indent=2))
     else:
         for r in reports:
@@ -188,7 +221,11 @@ def main() -> None:
         for r in bad:
             print(f"[WARN] {r['run']}: fallback_rate="
                   f"{r['fallback_rate']:.4f} > {args.fallback_warn}", file=sys.stderr)
-    raise SystemExit(1 if bad else 0)
+        for r in stuck:
+            print(f"[WARN] {r['run']}: LLM 呼の絶対時限超過 "
+                  f"{r['deadline_exceeded']} 件(model.call_deadline_s)。"
+                  "病的生成でサーバに張り付いた呼がある", file=sys.stderr)
+    raise SystemExit(1 if (bad or stuck) else 0)
 
 
 if __name__ == "__main__":

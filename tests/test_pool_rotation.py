@@ -277,3 +277,116 @@ def test_on_dehydrate_saves_departed(small_pool, tmp_path):
     assert y not in {a.pool_pid for a in sim.agents}         # day1 は不在
     assert y in sim._dormant                                 # ドーマントに退避済み
     assert "__d0mark__" in sim._dormant.peek(y)["beliefs"]   # 退場時の記憶が保存された
+
+
+# ============================================================ M-3: 退避台帳の幅 × dunbar 休眠
+# 第75バッチ実測の持ち越し: dunbar(認知枠)で**休眠**した関係は closeness=0 に退避され、
+# 接触も止まるので count も伸びない。ところが pool の dehydrate は「接触回数の多い上位
+# rel_cap 件」で台帳を切るため、休眠した弱い紐帯は**再会する前に退場で消える**。
+# 第86バッチ保守 M-3 で conf キー pool.relations_cap / pool.episodes_cap を新設した
+# (既定 = 現行値 20 / 30 = 挙動不変。観察ランでのみ広げる)。
+def _rel(count: int, closeness: float, name: str) -> dict:
+    return {"name": name, "count": count, "last_step": 0, "last": "",
+            "closeness": closeness, "tier": 1}
+
+
+def _agent_with_ledger(agent, n_active: int, n_weak: int) -> list:
+    """活性 n_active 件(接触多)+ 弱い紐帯 n_weak 件(接触 1 回)を仕込む。返り値=弱い側の id。"""
+    agent.mem.relations = {}
+    for i in range(n_active):
+        agent.mem.relations[1000 + i] = _rel(50 + i, 8.0, f"active{i}")
+    weak = []
+    for i in range(n_weak):
+        oid = 2000 + i
+        agent.mem.relations[oid] = _rel(1, 1.0, f"weak{i}")
+        weak.append(oid)
+    return weak
+
+
+def test_m3_default_relations_cap_is_unchanged():
+    """既定は従来どおり 20 件切り(configure を呼ばなければ素値のまま)。"""
+    pool_mod.configure(rel_cap=pool_mod._REL_CAP, ep_cap=pool_mod._EP_CAP)
+    a = Agent(id=1, name="甲", age=30, occupation="会社員", persona="p",
+              traits={}, states={}, mem=MemoryStore())
+    weak = _agent_with_ledger(a, n_active=20, n_weak=5)
+    st = pool_mod.dehydrate(a)
+    assert len(st["relations"]) == 20
+    assert not (set(weak) & set(st["relations"])), "弱い紐帯が既定で残ってしまっている"
+    assert pool_mod.caps()["rel"] == 20
+
+
+def test_m3_widened_cap_keeps_the_weak_ties():
+    """configure(rel_cap=…) を広げると弱い紐帯が退避台帳に残る(既定へ必ず戻す)。"""
+    a = Agent(id=1, name="甲", age=30, occupation="会社員", persona="p",
+              traits={}, states={}, mem=MemoryStore())
+    weak = _agent_with_ledger(a, n_active=20, n_weak=5)
+    try:
+        pool_mod.configure(rel_cap=40)
+        st = pool_mod.dehydrate(a)
+    finally:
+        pool_mod.configure(rel_cap=pool_mod._REL_CAP)
+    assert len(st["relations"]) == 25
+    assert set(weak) <= set(st["relations"])
+    b = Agent(id=2, name="乙", age=30, occupation="会社員", persona="p",
+              traits={}, states={}, mem=MemoryStore())
+    pool_mod.hydrate(b, st)
+    assert set(weak) <= set(b.mem.relations)          # 往復しても残る
+
+
+def test_m3_config_keys_are_ints_and_default_to_current_values():
+    cfg = load_config([])
+    assert int(cfg.pool.relations_cap) == 20 == pool_mod._REL_CAP
+    assert int(cfg.pool.episodes_cap) == 30 == pool_mod._EP_CAP
+    over = load_config(["pool.relations_cap=60", "pool.episodes_cap=80"])
+    assert isinstance(over.pool.relations_cap, int) and over.pool.relations_cap == 60
+    assert isinstance(over.pool.episodes_cap, int) and over.pool.episodes_cap == 80
+
+
+def test_m3_dunbar_dormant_ties_survive_rotation_only_when_widened(small_pool, tmp_path):
+    """★相互作用(dunbar ON + pool ON): 休眠した紐帯は既定 20 件切りで退場時に消え、
+    pool.relations_cap を広げると退避台帳に残って**再会の可能性が保たれる**。
+
+    日境界のローテーションは `_phase_pool_rotation` を直接呼んで起こす(210 step 走らせる
+    必要はない)。退場者 y の台帳に「活性 20 件(接触多)+ 休眠 5 件(接触 1 回)」を仕込み、
+    休眠は dunbar の正規の遷移(_make_dormant)で作る = closeness 0 / dormant フラグ付き。
+    """
+    from society import dunbar as dunbar_mod
+    from society.engine import scheduler
+
+    s0, s1 = _presence_sets(small_pool)
+    y = sorted(s0 - s1)[0]                            # day0 present → day1 不在
+
+    def rotate(name: str, **ov) -> dict:
+        cfg = _pool_cfg(name, small_pool, n_steps=1,
+                        **{"relations.enabled": "true",
+                           "relations.dunbar.enabled": "true", **ov})
+        sim = Simulation(cfg, out_dir=tmp_path / name)
+        assert dunbar_mod.enabled(sim), "dunbar が ON になっていない"
+        ya = next(a for a in sim.agents if a.pool_pid == y)
+        weak = _agent_with_ledger(ya, n_active=20, n_weak=5)
+        for oid in weak:                              # 正規の遷移で休眠にする
+            dunbar_mod._make_dormant(sim, ya, oid, step=1, sim_min=10)
+        assert dunbar_mod.dormant_ids(ya) == weak
+        scheduler._phase_pool_rotation(sim, 144, 1440)   # 日境界(day1)を起こす
+        assert y not in {a.pool_pid for a in sim.agents}
+        saved = sim._dormant.peek(y)
+        assert saved is not None, "退場者が退避されていない"
+        return {"weak": weak, "relations": saved["relations"]}
+
+    narrow = rotate("m3n")                                   # 既定 20 件
+    assert len(narrow["relations"]) == 20
+    assert not (set(narrow["weak"]) & set(narrow["relations"])), \
+        "既定で休眠紐帯が残っている(この持ち越しの前提が崩れた)"
+
+    try:
+        wide = rotate("m3w", **{"pool.relations_cap": 40})   # 広げたラン
+    finally:
+        pool_mod.configure(rel_cap=pool_mod._REL_CAP, ep_cap=pool_mod._EP_CAP)
+    assert len(wide["relations"]) == 25
+    assert set(wide["weak"]) <= set(wide["relations"])
+
+    # 再来街(hydrate)したときに休眠のまま残っている = 再会の余地が保たれている
+    b = Agent(id=7, name="乙", age=30, occupation="会社員", persona="p",
+              traits={}, states={}, mem=MemoryStore())
+    pool_mod.hydrate(b, {"relations": wide["relations"]})
+    assert dunbar_mod.dormant_ids(b) == wide["weak"]

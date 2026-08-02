@@ -36,6 +36,7 @@ import urllib.error
 import urllib.request
 
 from .base import LLMBackend
+from .deadline import DEFAULT_DEADLINE_S, request_json
 
 # qwen3 が think=True 時に本文へ混ぜる思考ブロックを剥がす(ollama/vllm と同挙動に合わせる)
 _THINK_BLOCK = re.compile(r"^\s*<think>.*?</think>\s*", re.DOTALL)
@@ -43,12 +44,15 @@ _THINK_BLOCK = re.compile(r"^\s*<think>.*?</think>\s*", re.DOTALL)
 
 class OpenAICompatBackend(LLMBackend):
     def __init__(self, model: str, base_url: str = "https://api.openai.com/v1",
-                 api_key_env: str = "OPENAI_API_KEY", timeout_s: float = 120.0):
+                 api_key_env: str = "OPENAI_API_KEY", timeout_s: float = 120.0,
+                 deadline_s: float = DEFAULT_DEADLINE_S):
         self.name = f"api/{model}"           # ★URL 非依存(D13: キャッシュキー安定)
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.api_key_env = api_key_env       # ★キー本体ではなく「環境変数名」だけ保持する
         self.timeout_s = float(timeout_s)
+        # 呼び出し開始からの絶対時限(M-1。llm/deadline.py)。0 以下で無効=従来経路。
+        self.deadline_s = float(deadline_s)
 
     # ---- HTTP ----
     def _post(self, path: str, body: dict) -> dict:
@@ -60,8 +64,8 @@ class OpenAICompatBackend(LLMBackend):
             headers["Authorization"] = f"Bearer {key}"
         req = urllib.request.Request(
             f"{self.base_url}{path}", data=data, headers=headers)
-        with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        return request_json(req, timeout_s=self.timeout_s,
+                            deadline_s=self.deadline_s)
 
     def _body(self, prompt: str, temperature: float, max_tokens: int,
               think: bool, json_fmt: bool) -> dict:

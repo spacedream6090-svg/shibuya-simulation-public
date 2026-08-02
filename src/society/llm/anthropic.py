@@ -26,18 +26,23 @@ import urllib.error
 import urllib.request
 
 from .base import LLMBackend
+from .deadline import DEFAULT_DEADLINE_S, request_json
 
 _ANTHROPIC_VERSION = "2023-06-01"
 
 
 class AnthropicBackend(LLMBackend):
     def __init__(self, model: str, api_key_env: str = "ANTHROPIC_API_KEY",
-                 base_url: str = "https://api.anthropic.com", timeout_s: float = 120.0):
+                 base_url: str = "https://api.anthropic.com", timeout_s: float = 120.0,
+                 deadline_s: float = DEFAULT_DEADLINE_S):
         self.name = f"anthropic/{model}"     # ★URL 非依存(D13)
         self.model = model
         self.api_key_env = api_key_env       # ★キー本体ではなく「環境変数名」だけ保持する
         self.base_url = base_url.rstrip("/")
         self.timeout_s = float(timeout_s)
+        # 呼び出し開始からの絶対時限(M-1。llm/deadline.py)。HTTP を張る backend は
+        # 4 本とも同じ穴を持つので、ここだけ素通しにはしない。0 以下で無効=従来経路。
+        self.deadline_s = float(deadline_s)
 
     # ---- HTTP ----
     def _post(self, body: dict, key: str) -> dict:
@@ -49,8 +54,8 @@ class AnthropicBackend(LLMBackend):
         }
         req = urllib.request.Request(
             f"{self.base_url}/v1/messages", data=data, headers=headers)
-        with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        return request_json(req, timeout_s=self.timeout_s,
+                            deadline_s=self.deadline_s)
 
     @staticmethod
     def _extract(data: dict) -> str:

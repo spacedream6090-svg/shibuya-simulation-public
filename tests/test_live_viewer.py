@@ -619,6 +619,7 @@ def _chase_until_done(run_dir: Path, proc: subprocess.Popen, out_dir: Path,
 
 
 @pytest.mark.slow
+@pytest.mark.xdist_group("subproc_run")   # M-2: run.py を Popen で実走 = 直列化
 def test_integration_chase_matches_real_data(tmp_path):
     """mock ランを別プロセスで実走させながら追いかけ、実データと突き合わせる。"""
     out_root = tmp_path / "runs"
@@ -658,6 +659,7 @@ def test_integration_chase_matches_real_data(tmp_path):
 
 
 @pytest.mark.slow
+@pytest.mark.xdist_group("subproc_run")   # M-2: run.py を Popen で実走 = 直列化
 def test_integration_observation_does_not_change_the_run(tmp_path):
     """★最上位の検収: live_viewer 併走あり/なしで本体ランの出力がバイト一致。"""
     out_root = tmp_path / "runs"
@@ -689,6 +691,7 @@ def test_integration_observation_does_not_change_the_run(tmp_path):
 
 
 @pytest.mark.slow
+@pytest.mark.xdist_group("subproc_run")   # M-2: run.py を Popen で実走 = 直列化
 def test_cli_once_on_finished_run(tmp_path):
     """CLI: 終わったランに後から掛けても落ちない(part は既に消えている)。"""
     out_root = tmp_path / "runs"

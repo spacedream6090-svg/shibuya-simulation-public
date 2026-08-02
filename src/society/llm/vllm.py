@@ -21,6 +21,7 @@ import urllib.error
 import urllib.request
 
 from .base import LLMBackend
+from .deadline import DEFAULT_DEADLINE_S, request_json
 
 # qwen3 が think=True 時に本文へ混ぜる思考ブロックを剥がす(ollama は response のみ返す挙動に合わせる)
 _THINK_BLOCK = re.compile(r"^\s*<think>.*?</think>\s*", re.DOTALL)
@@ -28,13 +29,17 @@ _THINK_BLOCK = re.compile(r"^\s*<think>.*?</think>\s*", re.DOTALL)
 
 class VllmBackend(LLMBackend):
     def __init__(self, model: str, base_url: str = "http://localhost:8000",
-                 timeout_s: float = 120.0, format_mode: str = "json"):
+                 timeout_s: float = 120.0, format_mode: str = "json",
+                 deadline_s: float = DEFAULT_DEADLINE_S):
         if format_mode not in ("none", "json"):
             raise ValueError(f"model.format '{format_mode}' は未対応(none | json)。")
         self.name = f"vllm/{model}"          # ★URL 非依存(D13: キャッシュキー安定)
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.timeout_s = float(timeout_s)
+        # 呼び出し開始からの絶対時限(M-1。llm/deadline.py)。timeout_s では止まらない
+        # 「細々と流れ続ける病的生成」をここで切る。0 以下で無効=従来経路。
+        self.deadline_s = float(deadline_s)
         self._mode = "completions"           # 404 を見たら "chat" へ1度だけ切替
         self.format_mode = format_mode
         # キャッシュキー拡張(CachedLLM._key)。既定 "json"=None=従来キー互換。
@@ -46,8 +51,8 @@ class VllmBackend(LLMBackend):
         req = urllib.request.Request(
             f"{self.base_url}{path}", data=data,
             headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        return request_json(req, timeout_s=self.timeout_s,
+                            deadline_s=self.deadline_s)
 
     def _completions_body(self, prompt: str, temperature: float,
                           max_tokens: int, think: bool, json_fmt: bool) -> dict:

@@ -141,3 +141,35 @@ def test_r1_call_count_invariant(tmp_path):
     off = run("r1_off", False)
     assert on.llm.calls == off.llm.calls and on.llm.calls > 0, \
         f"呼数が一致しない: ON={on.llm.calls} OFF={off.llm.calls}"
+
+
+# ------------------------------------------------- 建物内 where guard(2026-08-03)
+def test_free_action_where_guard_inside_building(tmp_path, monkeypatch):
+    """建物内の個体は do の where で街路 route を張らない(回帰テスト)。
+
+    exit_building が node を入口へ張り替えるため、屋内から張った route は非隣接
+    エッジになり _phase_move が KeyError でクラッシュする実経路があった(2026-08-03
+    保守バッチ M-5 で実証。mock は do に where を返さないため完全に潜在化していた)。
+    truth_ledger._route_to / tools._free_to_move と同じ guard に揃えた。
+    """
+    from society.engine import scheduler as sched
+
+    sim = _sim(tmp_path, "whguard", **{"freedom.open_actions": "true"})
+    ag = sim.agents[0]
+    other = next(a.node for a in sim.agents[1:] if a.node != ag.node)
+    monkeypatch.setattr(sched, "_free_dest", lambda _sim, _w: other)
+    action = {"action": "do", "what": "散歩", "where": "どこか", "minutes": 30}
+
+    # 建物内: route を張らない
+    ag.building = "bldg-x"
+    ag.route = []
+    ag.dest = None
+    sched._apply_free_action(sim, ag, action, 1, 600)
+    assert not ag.route, "建物内なのに街路 route が張られた(M-5 の再発)"
+
+    # 対照: 建物外なら従来どおり張れる
+    ag.building = None
+    ag.route = []
+    ag.dest = None
+    sched._apply_free_action(sim, ag, action, 1, 600)
+    assert ag.route and ag.dest == other, "建物外の従来経路まで塞いでいる(過剰修正)"

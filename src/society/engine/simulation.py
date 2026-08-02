@@ -847,12 +847,15 @@ class Simulation:
             return j
 
         backend = str(cfg.model.backend)
+        # 1 呼の絶対時限(M-1)。mock は HTTP を張らないので対象外。0 以下で無効=従来経路。
+        deadline_s = float(cfg.model.get("call_deadline_s", 300.0))
         if backend == "mock":
             raw = MockBackend(self.hub)
         elif backend == "ollama":
             from ..llm.ollama import OllamaBackend
             raw = OllamaBackend(str(cfg.model.name),
-                                format_mode=str(cfg.model.get("format", "json")))
+                                format_mode=str(cfg.model.get("format", "json")),
+                                deadline_s=deadline_s)
         elif backend == "vllm":
             # 本選: OpenAI 互換 vLLM。servers が 1本=単一バックエンド、複数=艦隊ルータ。
             # tiers があれば(単一 URL でも)艦隊で purpose 別振り分けの seam を通す。
@@ -868,11 +871,12 @@ class Simulation:
             if len(servers) == 1 and not tiers:
                 from ..llm.vllm import VllmBackend
                 raw = VllmBackend(model_name, servers[0], timeout_s=timeout_s,
-                                  format_mode=fmt)
+                                  format_mode=fmt, deadline_s=deadline_s)
             else:
                 from ..llm.fleet import FleetLLM
                 raw = FleetLLM(servers, model_name, timeout_s=timeout_s,
-                               tiers=tiers, format_mode=fmt)
+                               tiers=tiers, format_mode=fmt,
+                               deadline_s=deadline_s)
         elif backend == "router":
             # 第23バッチ M2: 合成ルータ。purpose(rng_key 先頭)別に子バックエンドへ振り分ける。
             # ★子を各自 CachedLLM で包んでから router に渡す(キャッシュキーは子の name 由来=D13)。
@@ -954,6 +958,12 @@ class Simulation:
             self._pool = pool_mod.PoolStore(pool_dir)
             self._pool_present_cap = int(poolcfg.get("present_cap", 300))
             self._dormant = pool_mod.DormantStore(cap=int(poolcfg.get("dormant_cap", 0)))
+            # 退避スリム状態の台帳幅(M-3。既定 = 現行の素値 = 挙動不変)。dunbar の休眠関係が
+            # 「再会する前に台帳から落ちる」相互作用を観察ランで緩められるようにする口。
+            pool_mod.configure(rel_cap=int(poolcfg.get("relations_cap",
+                                                       pool_mod._REL_CAP)),
+                               ep_cap=int(poolcfg.get("episodes_cap",
+                                                      pool_mod._EP_CAP)))
             weekday = self._pool_weekday(0)
             day0 = presence_mod.present_for_day(
                 self._pool.presence_records(), 0, self._pool_present_cap, self.hub, weekday)
@@ -1162,30 +1172,35 @@ class Simulation:
         b = str(spec.get("backend", ""))
         name = str(spec.get("name", ""))
         timeout_s = float(spec.get("timeout_s", 120.0))
+        # 1 呼の絶対時限(M-1): 子 spec で個別指定でき、無ければ model.call_deadline_s。
+        deadline_s = float(spec.get("call_deadline_s",
+                                    self.cfg.model.get("call_deadline_s", 300.0)))
         if b == "mock":
             return MockBackend(self.hub)
         if b == "ollama":
             from ..llm.ollama import OllamaBackend
             return OllamaBackend(name, host=str(spec.get("host", "http://localhost:11434")),
                                  timeout_s=timeout_s,
-                                 format_mode=str(spec.get("format", "json")))
+                                 format_mode=str(spec.get("format", "json")),
+                                 deadline_s=deadline_s)
         if b == "vllm":
             from ..llm.vllm import VllmBackend
             return VllmBackend(name, str(spec.get("base_url", "http://localhost:8000")),
                                timeout_s=timeout_s,
-                               format_mode=str(spec.get("format", "json")))
+                               format_mode=str(spec.get("format", "json")),
+                               deadline_s=deadline_s)
         if b == "openai_compat":
             from ..llm.openai_compat import OpenAICompatBackend
             return OpenAICompatBackend(
                 name, base_url=str(spec.get("base_url", "https://api.openai.com/v1")),
                 api_key_env=str(spec.get("api_key_env", "OPENAI_API_KEY")),
-                timeout_s=timeout_s)
+                timeout_s=timeout_s, deadline_s=deadline_s)
         if b == "anthropic":
             from ..llm.anthropic import AnthropicBackend
             return AnthropicBackend(
                 name, api_key_env=str(spec.get("api_key_env", "ANTHROPIC_API_KEY")),
                 base_url=str(spec.get("base_url", "https://api.anthropic.com")),
-                timeout_s=timeout_s)
+                timeout_s=timeout_s, deadline_s=deadline_s)
         raise ValueError(f"router の子 backend '{b}' は未対応"
                          "(mock | ollama | vllm | openai_compat | anthropic)。")
 
@@ -1670,6 +1685,14 @@ class Simulation:
         # peak_rss_mb: プロセスのピーク常駐メモリ [MB]。取得できない環境ではキー自体を出さない
         #   (欠測を 0 と偽らない)。tracemalloc の Python ヒープ峰値とは別物(C++ バッファ込み)。
         summary["elapsed_sec"] = round(time.perf_counter() - self._t_start, 3)
+        # ---- M-1(第86バッチ保守): LLM 1 呼の絶対時限に掛かった件数 ----
+        # **0 件のときはキー自体を出さない**(mock/既定ランの summary.json は従来とバイト一致。
+        # peak_rss_mb と同じ「欠測を 0 と偽らない/無風なら足さない」流儀)。
+        # 源は society/llm/deadline.py のプロセス内カウンタ(全 HTTP backend が通る唯一の関門)。
+        from ..llm import deadline as _llm_deadline
+        _dl_exceeded = _llm_deadline.exceeded_count()
+        if _dl_exceeded:
+            summary["llm_deadline_exceeded"] = int(_dl_exceeded)
         peak_rss = _peak_rss_mb()
         if peak_rss is not None:
             summary["peak_rss_mb"] = peak_rss

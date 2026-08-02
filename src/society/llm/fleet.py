@@ -23,6 +23,7 @@ import time
 from collections.abc import Callable
 
 from .base import LLMBackend
+from .deadline import DEFAULT_DEADLINE_S
 from .vllm import VllmBackend
 
 log = logging.getLogger("society.llm.fleet")
@@ -39,7 +40,8 @@ class FleetLLM(LLMBackend):
                  tiers: dict[str, list[str]] | None = None,
                  cooldown_s: float = 30.0,
                  now: Callable[[], float] = time.monotonic,
-                 format_mode: str = "json"):
+                 format_mode: str = "json",
+                 deadline_s: float = DEFAULT_DEADLINE_S):
         if not servers:
             raise ValueError("FleetLLM には少なくとも1本の server URL が必要。")
         self.name = f"fleet/{model}"          # ★URL 非依存(D13)
@@ -51,8 +53,13 @@ class FleetLLM(LLMBackend):
         self.format_mode = format_mode
         self.cache_extra = None if format_mode == "json" else {"f": format_mode}
         # URL ごとに1バックエンド(name は全て同一=キャッシュを共有できる)
+        # 絶対時限(M-1)も子へ透過する。艦隊は 1 サーバの張り付きが失敗として
+        # 他サーバへ再分配されるべき事象なので、子が時限で "__vllm_error__" を
+        # 返せば既存のフェイルオーバ(cooldown)がそのまま働く。
+        self.deadline_s = float(deadline_s)
         self._backend: dict[str, VllmBackend] = {
-            u: VllmBackend(model, u, timeout_s=timeout_s, format_mode=format_mode)
+            u: VllmBackend(model, u, timeout_s=timeout_s, format_mode=format_mode,
+                           deadline_s=deadline_s)
             for u in self.servers}
         # tier プール(purpose → URL リスト)。既定は全 URL の default 1プール。
         self._tiers: dict[str, list[str]] = {}
@@ -62,7 +69,8 @@ class FleetLLM(LLMBackend):
                 for u in pool:                # tier だけに現れる URL も稼働対象へ登録
                     self._backend.setdefault(
                         u, VllmBackend(model, u, timeout_s=timeout_s,
-                                       format_mode=format_mode))
+                                       format_mode=format_mode,
+                                       deadline_s=deadline_s))
                 self._tiers[str(purpose)] = pool
         self._default = self._tiers.get("default", list(self.servers))
         self._cooldown: dict[str, float] = {}

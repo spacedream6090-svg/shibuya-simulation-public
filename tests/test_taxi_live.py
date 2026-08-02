@@ -316,6 +316,9 @@ def test_shared_sim_deterministic(tmp_path):
 # --------------------------------------------------------------------- SUMO 実走(環境ガード)
 @pytest.mark.skipif(not _sumo_available(),
                     reason="SUMO(sumo 実行ファイル+traci+car net)不在=実走テストは skip")
+# M-2: 実 SUMO を子プロセスで起こし traci ポートで喋る唯一のテスト。他のサブプロセス
+# 起動テストと同じ xdist グループへ入れて**並列に走らせない**(並列フレークを 1 例観測)。
+@pytest.mark.xdist_group("subproc_run")
 def test_sumo_bridge_determinism_same_seed(tmp_path):
     """[SUMO 実走] 同 seed 2 回で (wait_s, ride_s, delay_s, hold_steps) 列がバイト一致(go/no-go ②)。
     実 SUMO の taxi device + dispatch=traci をサブプロセスで回し、予約→pickup→dropoff の実秒が
