@@ -1816,6 +1816,14 @@ class Simulation:
         _plprov = _placebo_prov.provenance(self)
         if _plprov is not None:
             summary["placebo"] = _plprov
+        # ---- 退行シグナル監視 第91バッチ(observer.regression.enabled=false = 既定 OFF はキーなし)----
+        # 設計 §3 の 4 群を L2 列として出した仕様と、「語彙系から外した発話の総数」を残す。
+        # 除外総数を残すのは第87 の申し送り(定型応答は機構由来の定数なので語彙指標から
+        # 外すが、**黙って落とさない**)への対応。
+        from ..observer import regression as _reg_prov
+        _rgprov = _reg_prov.provenance(self)
+        if _rgprov is not None:
+            summary["regression"] = _rgprov
         # ---- 初期フレーム共変量 第74バッチ IDEA④(observer.initial_frame.days: 0 = 既定 OFF)----
         # 確定済みの l1_events.parquet(直前の logger.flush)を読み直す **完全な事後処理**。
         # OFF ではこのブロックが即 None を返し summary にキーを足さない=既存ランと同形。

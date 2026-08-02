@@ -135,6 +135,14 @@ def save(sim, step: int, path: str | Path) -> Path:
             # deque/dict/Counter のみ=pickle の集合反復順非保存の影響を受けない。
             # observer.echo.enabled=false のランでは state 自体が生えない → None=挙動不変。
             "echo_state": getattr(sim, "_echo_state", None),
+            # 第91バッチ(退行シグナル監視): rolling 窓の step バケツ deque + 窓合計。
+            # 第70 echo とまったく同じ型のギャップで、保存しないと mid-day resume の
+            # 監視 14 列が straight と食い違う(窓が空から再充填されるため)。
+            # processed カウンタは**プロセス内 logger 由来**なので保存しない(load 側で 0)。
+            # 集合は 1 つも使わず deque/dict/Counter のみ = pickle の集合反復順非保存の
+            # 影響を受けない。既定 OFF(observer.regression.enabled=false)では state 自体が
+            # 生えない → None=挙動不変(load は .get で旧 checkpoint 互換)。
+            "regression_state": getattr(sim, "_regression_state", None),
             # 第74バッチ IDEA③(規範化ステージ): 語ごとの 4 段階台帳(素の dict/list のみ)。
             # 既定 OFF(labeling.norm_stage.enabled=false)では state 自体が生えない → None=
             # 挙動不変。ON のときは L2 の 2 列が累積量なので、保存しないと mid-day resume の
@@ -324,6 +332,11 @@ def load(sim, path: str | Path) -> int:
         sim._echo_state = est_echo
     sim._echo_processed = 0                     # fresh logger=total 0 から再走査(assets と同流儀)
     sim._echo_cache = None
+    est_reg = rt.get("regression_state")         # 第91 退行シグナル窓(旧 ckpt 互換=無ければ素通り)
+    if est_reg is not None:
+        sim._regression_state = est_reg
+    sim._regression_processed = 0                # fresh logger=total 0 から再走査(echo と同流儀)
+    sim._regression_cache = None
     nst = rt.get("norm_state")                  # 第74 IDEA③: 規範化ステージ台帳(旧 ckpt 互換=無ければ素通り)
     if nst is not None:
         sim._norm_state = nst

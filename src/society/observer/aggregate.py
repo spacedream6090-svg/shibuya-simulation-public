@@ -17,6 +17,7 @@ from . import deviation as _dev
 from . import echo as _echo
 from . import lens as _lens
 from . import norms as _norms
+from . import regression as _regression
 from . import silence as _silence
 from . import structure as _struct
 
@@ -1125,6 +1126,89 @@ def _transmission_novel(sim):
 @register_aggregator("transmission_novel_rate")
 def _transmission_novel_rate(sim):
     return _echo_col(sim, "transmission_novel_rate")
+
+
+# ---- 退行シグナル監視 第91バッチ(設計 §3。**既定 OFF = 14 列とも生えない** = L2 バイト不変)。
+#      observer/regression.py が単一の源。読むだけ・乱数ゼロ・LLM 呼ゼロ・L1 イベント追加ゼロ・
+#      プロンプト 1 バイト不変(= ゴールデンは無風)。
+#      `cognition.fire` が OFF のランでは発火率 5 列(reg_fire_*)だけが更に消える
+#      (材料の cog_fire イベントが 1 件も出ないため。0 を並べて「張り付いている」と
+#       誤読させるより列ごと消すほうが正直)。
+#      定義と正直な限界は observer/regression.py の docstring を参照
+#      (母集団の定義・act のホワイトリスト・文字 n-gram・rolling 窓の自己相関)。
+def _reg_col(sim, key):
+    s = _regression.scalars(sim)
+    return s.get(key) if s else None
+
+
+@register_aggregator("reg_act_between_var")
+def _reg_act_between_var(sim):
+    return _reg_col(sim, "reg_act_between_var")
+
+
+@register_aggregator("reg_act_entropy_mean")
+def _reg_act_entropy_mean(sim):
+    return _reg_col(sim, "reg_act_entropy_mean")
+
+
+@register_aggregator("reg_act_agents")
+def _reg_act_agents(sim):
+    return _reg_col(sim, "reg_act_agents")
+
+
+@register_aggregator("reg_visit_entropy")
+def _reg_visit_entropy(sim):
+    return _reg_col(sim, "reg_visit_entropy")
+
+
+@register_aggregator("reg_visit_nodes")
+def _reg_visit_nodes(sim):
+    return _reg_col(sim, "reg_visit_nodes")
+
+
+@register_aggregator("reg_vocab_entropy")
+def _reg_vocab_entropy(sim):
+    return _reg_col(sim, "reg_vocab_entropy")
+
+
+@register_aggregator("reg_ngram_repeat_rate")
+def _reg_ngram_repeat_rate(sim):
+    return _reg_col(sim, "reg_ngram_repeat_rate")
+
+
+@register_aggregator("reg_vocab_tokens")
+def _reg_vocab_tokens(sim):
+    return _reg_col(sim, "reg_vocab_tokens")
+
+
+@register_aggregator("reg_vocab_excluded")
+def _reg_vocab_excluded(sim):
+    return _reg_col(sim, "reg_vocab_excluded")
+
+
+@register_aggregator("reg_fire_rate_p10")
+def _reg_fire_rate_p10(sim):
+    return _reg_col(sim, "reg_fire_rate_p10")
+
+
+@register_aggregator("reg_fire_rate_p50")
+def _reg_fire_rate_p50(sim):
+    return _reg_col(sim, "reg_fire_rate_p50")
+
+
+@register_aggregator("reg_fire_rate_p90")
+def _reg_fire_rate_p90(sim):
+    return _reg_col(sim, "reg_fire_rate_p90")
+
+
+@register_aggregator("reg_fire_zero_frac")
+def _reg_fire_zero_frac(sim):
+    return _reg_col(sim, "reg_fire_zero_frac")
+
+
+@register_aggregator("reg_fire_sat_frac")
+def _reg_fire_sat_frac(sim):
+    return _reg_col(sim, "reg_fire_sat_frac")
 
 
 # ---- 規範化ステージ 第74バッチ IDEA③(既定 OFF = 2 列とも消える = L2 バイト不変)。

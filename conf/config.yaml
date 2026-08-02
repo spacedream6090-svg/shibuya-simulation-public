@@ -1648,6 +1648,30 @@ observer:
     ngram: 4                    # 自己類似度の文字 n-gram の n
     sim_threshold: 0.6          # 直前の自分の発話との Jaccard がこれ以上ならエコー扱い
     min_utterances: 2           # echo_max の対象にする最小発話数(1 件で 1.0 になる退化を防ぐ)
+  # ---- 退行シグナル監視(第91バッチ 2026-08-03・**既定 OFF = 列が 1 つも生えない**)----
+  # 正典: docs/plans/source/design-discussion-20260802.md §3。
+  #   「監視すべき退行シグナルは、行動分散の単調減少、訪問地点エントロピーの低下、
+  #     発話の語彙エントロピー低下と n-gram 重複率上昇、発火率の 0 または飽和への張り付き」
+  # 25万人ランで最も怖いのは落ちることではなく **終了後に全員が同じ行動へ収束していたと
+  # 判明すること**(§3)。その 4 群を L2 の rolling 窓列として出す。
+  # ON で 9 列(reg_act_between_var / reg_act_entropy_mean / reg_act_agents /
+  #   reg_visit_entropy / reg_visit_nodes / reg_vocab_entropy / reg_ngram_repeat_rate /
+  #   reg_vocab_tokens / reg_vocab_excluded)。
+  # **`cognition.fire` も ON なら更に 5 列**(reg_fire_rate_p10/p50/p90 /
+  #   reg_fire_zero_frac / reg_fire_sat_frac)。fire OFF では材料(cog_fire)が 1 件も
+  #   出ないので、0 を並べて「張り付いている」と誤読させるより列ごと消す。
+  # 読むだけ・乱数ゼロ・LLM 呼ゼロ・L1 イベント追加ゼロ・プロンプト 1 バイト不変
+  # (= ゴールデン tests/data/golden_baseline_l1.json は無風)。
+  # ★横煙(N=25万)では **OFF のまま回すこと**。窓合計が在場個体数に比例して常駐する。
+  # 判定は事後の `python scripts/detect_regression.py <run>`(閾値は引数必須)。
+  # 定義・正直な限界は src/society/observer/regression.py の docstring を参照。
+  regression:
+    enabled: false
+    window_steps: 144           # rolling 窓(144 = 1 シミュ日)
+    ngram: 2                    # 語彙の文字 n-gram の n(analyze_specialization.py と同値)
+    exclude_template: true      # 第87 engaged の定型応答を語彙系から除外(件数は列に残す)
+    fire_sat_per_step: 1.0      # 発火率がこれ以上なら「飽和に張り付き」とみなす
+    min_agents: 2               # 個体間分散を出す最小個体数(1 人では分散が定義できない)
   # ---- 初期フレーム共変量 第74バッチ IDEA④(2026-07-31。既定 OFF=summary にキーを足さない)----
   # 「そのランが最初の N 日をどう解釈したか」を **ラン単位の共変量** として summary.json へ残す。
   # workplace チームの実測(初期の解釈枠がその後の分化の形を決める)を層別の材料にするための

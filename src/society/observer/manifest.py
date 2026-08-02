@@ -117,6 +117,7 @@ def build(sim) -> dict:
     from ..cognition import calib as _calib_mod
     from ..config import REPO_ROOT
     from ..engine import checkpoint
+    from . import regression as _regression_mod
 
     from ..registry import describe as _describe_features
 
@@ -200,6 +201,11 @@ def build(sim) -> dict:
         # 「agent_id と model_id の対応を必ずログに残す」の**来歴側**(個別対応は
         # agents.json と L1 mind_assign にある)。
         **({"mind": _mind} if (_mind := _mind_mod.provenance(sim)) else {}),
+        # 第91バッチ: 退行シグナル監視の仕様(窓幅・n-gram・除外の有無・実際に出た列名)。
+        # 既定 OFF ではキー自体を出さない(既存 manifest と同形)。列名を manifest に残すのは
+        # 「fire OFF のランには発火率 5 列が無い」を事後に判別できるようにするため。
+        **({"regression": _reg}
+           if (_reg := _regression_mod.provenance(sim)) else {}),
         "code": {
             "python": sys.version.split()[0],
             "platform": platform.platform(),

@@ -1,0 +1,178 @@
+# =============================================================================
+# 縦煙(TALL)プロファイル — N=2,500 を**全期間**(第91バッチ 2026-08-03)
+#
+# 正典: docs/plans/source/design-discussion-20260802.md §3
+#   「煙テストは二方向に切る。縦テスト(N=2,500程度を全期間)はメモリ肥大・退行的アトラクタ・
+#     語彙の単調収縮・会話ループを検出し、横テスト(N=25万を数シミュ時間)は OOM・スループット・
+#     計算量の爆発を検出する。**縦のほうが重要である**。25万人ランで最も怖いのは落ちることでは
+#     なく、終了後に全員が同じ行動へ収束していたと判明することだからである。」
+#
+# これは「基底 conf/config.yaml との差分だけ」を重ねる自己完結ファイル(OmegaConf.merge)。
+# --profile は 1 本しか渡せないので、必要な較正値はここへ取り込んである。
+#
+# 使い方(mock で配線を確かめる → 実 LLM で本走):
+#   python scripts/run.py --profile conf/smoke_tall.yaml run.name=smoke_tall_mock \
+#       model.backend=mock run.n_agents=200 run.n_steps=288          # 縮小版(検収で実走した構成)
+#   python scripts/run.py --profile conf/smoke_tall.yaml run.name=smoke_tall
+#   python scripts/run.py --resume runs/smoke_tall                    # 落ちたら続きから
+#
+# 判定(ラン中/ラン後。閾値は**引数必須**=ハードコードしない):
+#   python scripts/detect_regression.py runs/smoke_tall --alpha 0.05 --min-rel-slope 0.02
+#   python scripts/detect_regression.py runs/smoke_tall --quick --alpha 0.05 --min-rel-slope 0.02
+#   判定基準の根拠と較正手順: docs/research/regression-signals.md
+#
+# 監督つきで回す(第91 の --quick を定期実行するレシピも regression-signals.md §5 にある):
+#   python scripts/watchdog.py --run-dir runs/smoke_tall -- \
+#       --profile conf/smoke_tall.yaml run.name=smoke_tall run.out_dir=runs
+# =============================================================================
+
+# ============================================================================
+# (0) 規模と期間 — 「N=2,500 を全期間」
+# ============================================================================
+run:
+  seed: 42                 # 縦煙は**再現できること**が価値(退行を見つけたら同じ seed で追える)。
+                           # 観察目的で seed を選びたくない場合だけ run.seed=auto を dotlist で。
+  n_agents: 2500           # §3 の「N=2,500 程度」
+  n_steps: 1440            # 全期間 = 10 シミュ日(1 日 = 144 step)。本選の期間に合わせて調整する。
+                           # ★短縮するときは dotlist(run.n_steps=288 など)。
+
+agents:
+  # ★正直な前提: 現有の**平坦名簿**の最大は 500 件(data/persona_pool.json)なので、
+  #   2,500 体では既存名簿が巡回複製される(simulation.py の roster[agent_id % len(roster)])。
+  #   **同一ペルソナの複製は個体間分散を人工的に押し下げる** = 退行シグナル①が
+  #   偽陽性側へ寄る(= 安全側だが、絶対値を pool ランと比較してはいけない)。
+  #   2,500 件の**相異なる**名簿が要るなら、先に 1 行だけ前処理する(LLM 不使用・完全決定論):
+  #     python scripts/gen_personas.py --pool 8000 --sample 2500 --seed 42 \
+  #         --out data/personas_2500.json
+  #   そのうえで dotlist で agents.personas_file=data/personas_2500.json を渡す。
+  personas_file: data/personas_300_civic.json
+#
+# ★もう一つの選択肢 = P5 プール(data/persona_pool = 100 万件・全員相異なる)。
+#   pool: {enabled: true, present_cap: 2500, dormant_cap: 20000}
+#   ただし presence の**層優先**(resident > duty > workday_shift > cadence > stochastic)は
+#   cap で溢れた層を当日固有ランキングで切って break するので、cap=2,500 は
+#   **resident 層(約 3 万人)だけが日替わりで 2,500 人ずつ入れ替わる**構成になる。
+#   同じ顔ぶれが全期間続かない = 語彙収縮・会話ループ・関係固着という縦煙の主目的が
+#   観測しにくい。したがって既定は**平坦名簿(顔ぶれ固定)**にしてある。
+#   本選 25万は cap が resident+duty を飲み込むので、この歪みは 25万側では起きない。
+
+# ============================================================================
+# (1) 地図・暦・天候 — 日常が回る最小限(daily.yaml / longrun30.yaml の較正値)
+# ============================================================================
+world:
+  map: data/shibuya_osm_wide_v7.json
+  calendar:
+    enabled: true
+    start_date: "auto"
+    weekday_work: true     # 平日/週末の 1 周が 7 日で入る = 週次周期を退行と誤認しないため
+weather:
+  enabled: true
+  rain_grievance: 0.01
+
+# ============================================================================
+# (2) 連続した生活 — 「退行」を語れるだけの持続機構を入れる
+#     ★ここを切ると「毎日リセットされる世界」になり、単調収縮のしようがない。
+# ============================================================================
+routine:
+  stochastic:
+    enabled: true          # 骨格 motif + 時刻ジッター + 寄り道(行動分散の自然な下支え)
+drive:
+  boredom:
+    enabled: true          # 長居で退屈 → 未訪問 POI への内発的探索(訪問エントロピーの下支え)
+  drift:
+    enabled: true
+needs:
+  enabled: true
+schedule:
+  enabled: true
+relations:
+  enabled: true            # 関係の深化/断絶。会話ループは「同じ相手と同じ話」で起きる
+household:
+  enabled: true
+health:
+  enabled: true
+commerce:
+  enabled: true
+inner_life:
+  enabled: true
+organizations:
+  enabled: true
+  commute_to_poi: true
+  book: data/organizations_shibuya_wide.json
+prompts:
+  variety_hint: true       # 発話の定型化対策(= 語彙収縮への既存の唯一の対抗策)
+  dialog_history: true
+  reply_partner: closeness
+
+# ---- 記憶の保持(retention)= **肥大を検出するために敢えて無制限**にする ----
+# 縦煙の主目的の一つが「メモリ肥大」なので、上限で隠さない。
+# 実運用で RAM が足りなくなったら memory.relations_max / pool.*_cap を絞る前に、
+# **まず肥大の実測値を取る**(それがこの煙テストの成果物)。
+memory:
+  relations_max: 0         # 0 = 無制限(LRU 退避なし)= 台帳肥大がそのまま観測される
+reflection:
+  deep:
+    enabled: true
+  implicit_self:
+    enabled: true
+
+# ============================================================================
+# (3) 認知(第81/86/87/88)— 会話ループ・語彙収縮の**発生源**を ON にする
+#     ★本選でこれらを ON にするかは DP-U3(ユーザー判断)。ここは「煙テスト」なので、
+#       退行の発生源を全部載せて**最悪ケース**を見に行く構成にしてある。
+#       外して回したいときは dotlist(例 cognition.engaged.enabled=false)。
+# ============================================================================
+cognition:
+  fire:
+    enabled: true          # 驚き駆動発火。**これが ON のときだけ L2 に発火率 5 列が出る**
+  engaged:
+    enabled: true          # AUTOPILOT / ENGAGED エピソード(会話ループの主犯候補)
+planning:
+  day_plan:
+    enabled: true          # 朝の構造化計画 → ルール実行(退行的アトラクタが出るならここ)
+
+# ============================================================================
+# (4) 監視列 — 第91 の退行シグナル(§3 の 4 群)+ 既存の観測列
+# ============================================================================
+observer:
+  regression:
+    enabled: true          # ★本プロファイルの中心。ON で 9 列 +(fire ON なので)発火率 5 列
+    window_steps: 144      # 1 シミュ日の rolling 窓 = detect_regression の既定間引き幅
+    ngram: 2
+    exclude_template: true # 第87 定型応答(機構由来の固定文)を語彙系から除外・件数は列に残す
+    fire_sat_per_step: 1.0
+    min_agents: 2
+  llm_health:
+    enabled: true          # watchdog --fallback-warn の監視対象(パース失敗率)
+  echo:
+    enabled: true          # 既定 ON。エコー 5 列は語彙エントロピーの読み合わせに要る
+  initial_frame:
+    days: 1                # 初日の解釈枠を共変量として summary に残す(層別の材料)
+  # ---- 運用: メモリ肥大を「観測しつつ落ちない」ための刻み ----
+  checkpoint_every: 288    # 2 シミュ日ごとに完全状態を保存 + L1 を part 化(crash 耐性・resume)
+  flush_every_steps: 144   # 1 シミュ日ごとに L1 を part flush して RAM を解放(OOM 回避)
+                           # ★これを 0 のままにすると L1 バッファが全期間ぶん RAM に残る。
+                           #   N=2,500 × 10 日は L1 が数千万件級になるので必須。
+  snapshot_every: 72       # L3 スナップショット(12 → 72 に間引き。2,500 体では L3 が支配項になる)
+
+lens:
+  enabled: true
+  deviation:
+    enabled: true          # ペルソナ逸脱率(= 全員が同じ行動へ収束したかの別角度の観測)
+  structure:
+    enabled: true          # edge churn 系(関係の固着 = 退行の一形態)
+
+# ============================================================================
+# (5) LLM(バックエンドは**基底の既定=mock のまま**。実 LLM は dotlist / --profile 側で。
+#     例: model.backend=vllm model.host=... / conf/profiles/finals-vllm7.yaml の値を dotlist で)
+#     トークン上限だけは実 LLM 較正値(docs/research/token-budgets.md)を先に入れてある。
+# ============================================================================
+model:
+  max_tokens: 320
+  reflect_max_tokens: 768
+  plan_max_tokens: 448
+  reflect_think: false
+engine:
+  batch_llm:
+    enabled: true          # 朝計画の一括発行(実 LLM でスループットを出す)。mock/1 では逐次と同一経路
+    workers: 8

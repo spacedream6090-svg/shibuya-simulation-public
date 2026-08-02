@@ -526,6 +526,10 @@ FEATURES: tuple[Feature, ...] = (
        "L2 に LLM 健全性 KPI 3列を足す(観測専用・累積カウンタ)"),
     _f("observer.echo.enabled", "strict", False, "none",
        "L2 にエコー/自己反復 5列を足す(観測専用・常設)"),
+    # 第91バッチ: 退行シグナル監視(設計 §3)。L1 を読むだけで世界も乱数も 1 バイト触らない=strict。
+    _f("observer.regression.enabled", "strict", False, "none",
+       "L2 に退行シグナル列(行動分散・訪問エントロピー・語彙エントロピー/n-gram 重複率・"
+       "発火率の張り付き)を足す(観測専用・既定 OFF=列なし)"),
     # 第78バッチ: 状態ハッシュチェーン(verify 用)。記録専用でシムは読まない=strict。
     _f("observer.state_hash.enabled", "strict", False, "none",
        "各 step の world state を正準シリアライズ→sha256→前 step と連鎖させて "
@@ -771,6 +775,12 @@ ALLOWLIST: dict[str, str] = {
     # 「夜内省の選抜を第87 reflect_frac から高解像度層へ移すか」の内部レバー。
     "model.mind.tiers.high.reflect":
         "夜内省の対象を高解像度層にするかの指定(model.mind.enabled が親トグル)",
+    # 第91バッチ: 退行シグナル監視**内部**の形の指定であって独立した機能トグルではない
+    # (observer.regression.enabled が OFF なら列自体が生えない)。第87 の申し送り
+    # (機構由来の定型応答を語彙指標から外す)を切って影響を見るための解析用レバー。
+    "observer.regression.exclude_template":
+        "定型応答を語彙エントロピー/n-gram から除外するかの指定"
+        "(observer.regression.enabled が親トグル。観測列の定義であって世界の機能ではない)",
 }
 
 

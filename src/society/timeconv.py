@@ -221,6 +221,11 @@ TABLE: tuple[tuple[str, str, str], ...] = (
     ("ads.recall_steps", STEPS, "プロンプト注入の想起窓 [step]"),
     ("observer.snapshot_every", STEPS, "L3 スナップショットの間隔 [step](実時間の粒度を保つ)"),
     ("observer.echo.window_steps", STEPS, "エコー計測の rolling 窓 [step]"),
+    # 第91バッチ 退行シグナル監視(観測専用)。窓は実時間を保ち、飽和閾値は
+    # 「発火数/step」なので 1 日あたりの総量が保たれるようにスケールする(lod.max_llm_per_step と同型)。
+    ("observer.regression.window_steps", STEPS, "退行シグナルの rolling 窓 [step]"),
+    ("observer.regression.fire_sat_per_step", RATE,
+     "発火率が飽和に張り付いたとみなす閾値 [発火/step](1日あたりの総量を保つ)"),
     ("media.min_steps", STEPS, "視聴セッション長の下限 [step]"),
     ("media.max_steps", STEPS, "視聴セッション長の上限 [step]"),
     ("institution_routes.enforcement.detention_steps", STEPS, "拘束の長さ [step]"),
