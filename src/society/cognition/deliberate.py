@@ -373,6 +373,15 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
     #   因子名は 1 文字も出さない(engaged.prompt_section 参照)。
     if engaged_section:
         lines.append(engaged_section)
+    # プラセボ・アブレーション L1(第89バッチ・ablate.context_shuffle / persona_swap /
+    # context_sever)。**既定 OFF では agent に placebo 属性そのものが生えない**ので、
+    # ここは getattr 1 回で None を受けて素通り = 出力はバイト一致(ゴールデン維持)。
+    # ON でも「行数・接頭辞・区切り・項目数」は保たれ**中身だけ**が壊れる(society/ablate.py)。
+    # 発話・朝の計画・夜の内省・recall・一括発行の**全経路がここを通る**ので、作用点は
+    # この 3 行だけ = generate() の呼び出し点は 1 つも増減しない(affects_k=False)。
+    _placebo = getattr(agent, "placebo", None)
+    if _placebo is not None:
+        lines = _placebo.apply(agent, lines, step)
     return "\n".join(lines)
 
 

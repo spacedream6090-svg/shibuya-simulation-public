@@ -974,6 +974,10 @@ class Simulation:
                       if OmegaConf.is_config(raw_ablate) else raw_ablate)
         self.ablatecfg = _ablate_mod.build_cfg(raw_ablate)
         _ablate_mod.apply_fleet_tier(self)
+        # 第89バッチ: プラセボ L1(context_shuffle / persona_swap / context_sever)。
+        # 既定 OFF は sim._placebo=None=個体に属性を 1 つも生やさない=プロンプトはバイト一致。
+        # 名簿より前に据える(誕生の各経路 _init_agent_runtime が個体を結線するため)。
+        _ablate_mod.make_placebo(self)
 
         nodes = self.dests or sorted(self.city.graph.nodes)
         # ペルソナ名簿(scripts/build_personas.py 生成物。無ければ手続き生成)
@@ -1043,6 +1047,9 @@ class Simulation:
                 _mind_mod.assign(self, agent)
                 self.agents.append(agent)
         self.agent_by_id = {a.id: a for a in self.agents}
+        # 第89: ペルソナ対合(A↔B の相互交換)を名簿が出揃った時点で 1 回だけ組む。
+        # 専用 stream からのみ引く=既存 draw 順に干渉しない。既定 OFF は no-op。
+        _ablate_mod.finish_placebo(self)
         # S6a: pool ON かつ N 比例予算なら、当日の在場数を N に使う(1行の接続)。
         self._pool_update_budget()
         # 流入通勤者を朝の到着前=範囲外に置く(既存 visitor 帰還機構で朝 enter_area)。
@@ -1419,6 +1426,11 @@ class Simulation:
             base = int(self.actrcfg.get("seed", self.cfg.run.seed))
             agent.mem.actr = agent.mem.actr_config(
                 seed=base * 1_000_003 + agent.id, **overrides)
+        # 第89: プラセボ L1 への結線(既定 OFF は属性を 1 つも生やさない=no-op)。
+        # 名簿経路と pool ローテーション経路の**両方**がここを通るので、日境界で実体化される
+        # 個体(hydrate 再入場)も漏れなく結線される。
+        from .. import ablate as _ablate_placebo
+        _ablate_placebo.attach_agent(self, agent)
 
     # ---- 群のオントロジー(文化圏×経験の世界観共有群。2026-07-21)------------------
     def _apply_ontology(self, agent, tier: str, party_size=None) -> None:
@@ -1797,6 +1809,13 @@ class Simulation:
         _mdprov = _mind_prov.provenance(self)
         if _mdprov is not None:
             summary["mind"] = _mdprov
+        # ---- プラセボ L1 第89バッチ(ablate.* の 3 種。既定 OFF はキーなし)----
+        # 「壊した量」(書き換えた節の件数・ペルソナ交換数・対合が成立したか)を必ず残す。
+        # 件数 0 のランはプラセボとして無効=単調性の主張に使ってはいけない、が事後に判る。
+        from .. import ablate as _placebo_prov
+        _plprov = _placebo_prov.provenance(self)
+        if _plprov is not None:
+            summary["placebo"] = _plprov
         # ---- 初期フレーム共変量 第74バッチ IDEA④(observer.initial_frame.days: 0 = 既定 OFF)----
         # 確定済みの l1_events.parquet(直前の logger.flush)を読み直す **完全な事後処理**。
         # OFF ではこのブロックが即 None を返し summary にキーを足さない=既存ランと同形。

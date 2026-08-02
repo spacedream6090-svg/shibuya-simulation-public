@@ -54,7 +54,10 @@ def _mem_heard(sim) -> int:
 def test_defaults_are_all_off():
     cfg = A.build_cfg(None)
     assert cfg == {"llm_off": False, "propagation_off": False,
-                   "cognitive_tier": "full", "shuffle_partners": False}
+                   "cognitive_tier": "full", "shuffle_partners": False,
+                   # 第89バッチ: プラセボ L1 3 種(同一軸=相互排他。既定は全 OFF)
+                   "context_shuffle": False, "persona_swap": False,
+                   "context_sever": False}
     assert A.build_cfg({}) == cfg
 
 

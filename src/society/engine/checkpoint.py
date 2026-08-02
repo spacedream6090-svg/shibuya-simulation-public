@@ -27,6 +27,8 @@ import os
 import pickle
 from pathlib import Path
 
+from .. import ablate as _ablate_ckpt
+
 FORMAT = 1
 
 # resume で正当に変わりうるキー(整合性ハッシュから除外する)。
@@ -171,6 +173,12 @@ def save(sim, step: int, path: str | Path) -> Path:
             # 既定 OFF では空集合 = 何も起きない。sorted list で保存する(集合の反復順は
             # pickle 間で保証されないため=決定論監査の作法)。
             "mind_logged": sorted(getattr(sim, "_mind_logged", None) or ()),
+            # 第89バッチ(プラセボ L1): context_shuffle のドナー輪(節種ごと FIFO・上限固定)と
+            # 観測カウンタ。輪は「同一ラン内の直近の同種節」なので**跨ぐ状態**であり、保存しないと
+            # resume 直後の輪が空=最初の数プロンプトが sever へ後退して resume≠straight になる。
+            # ペルソナ対合表は構築時の名簿からの決定論導出なので保存しない(load 側で組み直す)。
+            # プラセボ OFF のランでは None=挙動不変(load は .get で旧 checkpoint 互換)。
+            "placebo_state": _ablate_ckpt.placebo_state(sim),
             # 第73バッチ(真偽台帳 Part B): sim 側の台帳=fact レコード(_tl_facts)・重複判定キー
             # (_tl_keys)・累積カウンタ(_tl_stats)。**保存しないと resume 後に fact_id が振り直され、
             # 信念(agents pickle に自然同梱される _fact_beliefs)の参照先が全部迷子になる**
@@ -330,6 +338,9 @@ def load(sim, path: str | Path) -> int:
     egs = rt.get("engaged_state")               # 第87 engaged(旧 ckpt 互換=無ければ素通り)
     if egs is not None:
         sim._engaged_state = egs
+    # 第89 プラセボ L1: 輪を戻し、pickle 復元された個体を構築時の Placebo へ繋ぎ直す
+    # (OFF は no-op。旧 ckpt 互換=無ければ輪は空のまま=OFF ランと同じ)。
+    _ablate_ckpt.placebo_restore(sim, rt.get("placebo_state"))
     mlg = rt.get("mind_logged")                 # 第88 心モデル固定(旧 ckpt 互換=無ければ素通り)
     if mlg is not None:
         sim._mind_logged = {int(x) for x in mlg}

@@ -552,6 +552,26 @@ FEATURES: tuple[Feature, ...] = (
        "always-draw)。聞き手集合は不変=会話量・呼数は不変。関係の近い相手が隣に居ても"
        "返答が来ない=間柄行との不整合に気づく余地が原理的にある=possible"),
 
+    # ---- ablate プラセボ L1(第89バッチ: 呼数・書式・乱数消費は同一のまま中身だけ壊す)----
+    # 正典 docs/plans/source/design-discussion-20260802.md §1。3 種とも
+    #   affects_k=False … プロンプト文字列を書き換えるだけで generate() の呼び出し点は不変
+    #   repro_tier=strict … LLM の自由文を新たに読む経路をひとつも足さない(決定論の書換)
+    #   fingerprint_risk=known … **中身を壊すのが定義**なので当人から観測できる差分が必ず出る。
+    #                            隠す方法は存在しない(隠せたらプラセボとして無効)。
+    _f("ablate.context_shuffle", "strict", False, "known",
+       "他者由来の文脈節(語彙・記憶・間柄・同席者・TL・直前のやりとり・返答の相手発話)を、"
+       "同一ラン内の別エージェントの**同種**の節と決定論的に入れ替える(専用 stream)。"
+       "ペルソナと自分の状態は保持=「文脈が正しいこと」だけを壊す。節の位置・区切り・"
+       "項目数は保つので書式は不変。見覚えのない出来事が自分の文脈として出る=risk known"),
+    _f("ablate.persona_swap", "strict", False, "known",
+       "プロンプトのペルソナ節を別エージェントのペルソナと**対合**(A↔B の相互交換)で"
+       "入れ替える。全単射なので人口のペルソナ分布は保存される。世界状態・文脈は正しいまま"
+       "=「人格と行動の結びつき」だけを壊す。自己紹介と自分の記憶・関係が食い違う=risk known"),
+    _f("ablate.context_sever", "strict", False, "known",
+       "文脈節を中立プレースホルダ('…')へ置換する(項目数・区切りは保つ)。第78 "
+       "propagation_off が**送り手側**で節ごと消すのに対し、こちらは世界状態を一切変えずに"
+       "**受け手側**で中身だけ潰す『文脈遮断の完全版』。節はあるが中身が無い=risk known"),
+
     # ---- experiment(第74バッチ IDEA④: 対照セルの宣言。決定論=strict)----
     _f("experiment.flat_traits.enabled", "strict", False, "none",
        "初期個体差ゼロ対照。全個体の traits を定数化して R²(k) の分母を実験的に消す"
