@@ -244,13 +244,14 @@ def enabled(sim) -> bool:
     return _fire.enabled(sim)
 
 
-def model_id(sim) -> str:
-    """このエピソードを回したモデルの識別子(第88 の 1 体 1 モデル束縛までは backend 名)。"""
-    llm = getattr(sim, "llm", None)
-    name = getattr(llm, "name", None)
-    if not name:
-        name = getattr(getattr(llm, "backend", None), "name", None)
-    return str(name or "unknown")
+def model_id(sim, agent=None) -> str:
+    """このエピソードを回したモデルの識別子。
+
+    第88(心モデル固定)が ON なら **その個体に誕生時固定されたモデル**。OFF のときだけ
+    従来どおり backend 名へ後退する(= 第87 までの暫定値。既存ランと同形)。
+    """
+    from .. import mind as _mind
+    return _mind.log_model_id(sim, agent)
 
 
 # --------------------------------------------------------------------------- #
@@ -408,9 +409,19 @@ def should_exit_decay(s: float, theta_in: float, cfg: dict,
     return float(s) < theta_out(float(theta_in), cfg)
 
 
-def turn_cap_of(kind: str, cfg: dict) -> int:
-    """種別ごとの実効ターン上限。会話は `turn_cap`、思考系は `replan_cap`(§8 の試行上限)。"""
-    return int(cfg["turn_cap"]) if kind == TALK else int(cfg["replan_cap"])
+def turn_cap_of(kind: str, cfg: dict, agent=None) -> int:
+    """種別ごとの実効ターン上限。会話は `turn_cap`、思考系は `replan_cap`(§8 の試行上限)。
+
+    第88: 高解像度層は**思考頻度の上限を緩和**する(§5「1〜5% のエージェントに大型モデルと
+    高頻度思考」)。倍率は conf `model.mind.tiers.high.cap_mult`(既定 1.0 = 無風)。
+    mind OFF では agent が倍率を持たない = 従来と 1 も変わらない。
+    """
+    base = int(cfg["turn_cap"]) if kind == TALK else int(cfg["replan_cap"])
+    if agent is None:
+        return base
+    from .. import mind as _mind
+    mult = _mind.cap_mult(agent)
+    return base if mult == 1.0 else max(1, int(base * mult))
 
 
 def simulate(s_series, theta_in: float, cfg: dict, dt_min: int = 10) -> list[str]:
@@ -441,9 +452,15 @@ def simulate(s_series, theta_in: float, cfg: dict, dt_min: int = 10) -> list[str
 def high_res(agent, cfg: dict) -> bool:
     """夜の内省をエピソード化する層に属するか(§8 突入 5「夜の内省は高解像度層」)。
 
-    第88 で `cognitive_tier` が入ったらそこへ委譲する。それまでは conf の割合指定を
-    `_stable_hash` で決定論に割り当てる(専用 stream を作らない = 乱数消費ゼロ)。
+    第88(心モデル固定+三層知能)が ON でその接続(`model.mind.tiers.high.reflect`)が
+    生きていれば、**高解像度層の判定はそちらが権威**になる(§5 の「高解像度層は夜内省の
+    対象」)。mind OFF / 接続 OFF では従来どおり conf の割合指定を `_stable_hash` で
+    決定論に割り当てる(専用 stream を作らない = 乱数消費ゼロ)。
     """
+    from .. import mind as _mind
+    over = _mind.reflect_override(agent)
+    if over is not None:
+        return over
     frac = float(cfg["reflect_frac"])
     if frac <= 0.0:
         return False
@@ -481,7 +498,7 @@ def _log(sim, agent, step: int, sim_min: int, kind: str, payload: dict) -> None:
 
 def _start(sim, agent, step: int, sim_min: int, kind: str, trigger: str,
            partner: int | None, s: float, theta_in: float, turns0: int = 0) -> dict:
-    ep = _new_episode(kind, trigger, step, sim_min, partner, model_id(sim))
+    ep = _new_episode(kind, trigger, step, sim_min, partner, model_id(sim, agent))
     ep["turns"] = int(turns0)
     agent._engaged = ep
     st = _state(sim)
@@ -616,7 +633,7 @@ def update(sim, step: int, sim_min: int, due: dict, active,
             _end(sim, agent, step, sim_min, X_RESOLVED)
             continue
         # (3) ターン上限: 会話だけは切り上げターンを 1 回挟んでから終える(§8)。
-        cap = turn_cap_of(ep["kind"], cfg)
+        cap = turn_cap_of(ep["kind"], cfg, agent)
         if int(ep["turns"]) >= cap:
             if ep["kind"] == TALK and cfg["wrapup"] and not ep["wrapup"]:
                 ep["wrapup"] = True                # この 1 ターンだけ延命(節が切り上げを促す)

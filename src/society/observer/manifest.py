@@ -112,6 +112,7 @@ def collect_toggles(cfg) -> dict:
 def build(sim) -> dict:
     """sim から manifest dict を組む(副作用なし・純関数的)。"""
     from .. import ablate as _ablate_mod
+    from .. import mind as _mind_mod
     from .. import weather as _weather_mod
     from ..cognition import calib as _calib_mod
     from ..config import REPO_ROOT
@@ -194,6 +195,11 @@ def build(sim) -> dict:
         # チャンネル定義 hash + 較正テーブル sha256 + σ_c 凍結 sha256(未生成なら absent)。
         # 既定 OFF ではキー自体を出さない(既存 manifest と同形=天候来歴と同じ流儀)。
         **({"cognition": _cog} if (_cog := _calib_mod.provenance(sim)) else {}),
+        # 第88バッチ: 心モデル固定(1 体 1 モデル)と三層知能配置。既定 OFF ではキー自体を
+        # 出さない(既存 manifest と同形=天候・認知来歴と同じ流儀)。原文書 §5 が要求する
+        # 「agent_id と model_id の対応を必ずログに残す」の**来歴側**(個別対応は
+        # agents.json と L1 mind_assign にある)。
+        **({"mind": _mind} if (_mind := _mind_mod.provenance(sim)) else {}),
         "code": {
             "python": sys.version.split()[0],
             "platform": platform.platform(),

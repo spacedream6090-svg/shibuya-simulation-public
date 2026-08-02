@@ -162,6 +162,15 @@ def save(sim, step: int, path: str | Path) -> Path:
             # 同じ型)。保存しないと mid-day resume で累積列が straight と食い違う。
             # 既定 OFF では state 自体が生えない → None=挙動不変(load は .get で旧 ckpt 互換)。
             "engaged_state": getattr(sim, "_engaged_state", None),
+            # 第88バッチ 心モデル固定: L1 `mind_assign` を出し終えた agent_id。
+            # **割当そのものは保存しない** — 誕生時固定は (master_seed, agent_id) の純関数
+            # (専用 stream mind_model / mind_tier)なので resume でも pool 再入場でも同じ
+            # モデルに戻り、agent.mind は agents pickle に自然同梱される。ここで中央管理
+            # するのは「もう記録したか」だけで、これが無いと resume 直後に全員ぶんの
+            # mind_assign を二重記録して resume≠straight になる(第80 W2 と同じ型)。
+            # 既定 OFF では空集合 = 何も起きない。sorted list で保存する(集合の反復順は
+            # pickle 間で保証されないため=決定論監査の作法)。
+            "mind_logged": sorted(getattr(sim, "_mind_logged", None) or ()),
             # 第73バッチ(真偽台帳 Part B): sim 側の台帳=fact レコード(_tl_facts)・重複判定キー
             # (_tl_keys)・累積カウンタ(_tl_stats)。**保存しないと resume 後に fact_id が振り直され、
             # 信念(agents pickle に自然同梱される _fact_beliefs)の参照先が全部迷子になる**
@@ -321,6 +330,14 @@ def load(sim, path: str | Path) -> int:
     egs = rt.get("engaged_state")               # 第87 engaged(旧 ckpt 互換=無ければ素通り)
     if egs is not None:
         sim._engaged_state = egs
+    mlg = rt.get("mind_logged")                 # 第88 心モデル固定(旧 ckpt 互換=無ければ素通り)
+    if mlg is not None:
+        sim._mind_logged = {int(x) for x in mlg}
+    # 割当表(_mind_binding)は保存しない=誕生時固定が純関数なので agents の属性から復元される。
+    from .. import mind as _mind_mod
+    if _mind_mod.enabled(sim):
+        sim._mind_binding = {int(a.id): m["model"] for a in sim.agents
+                             if (m := getattr(a, "mind", None))}
     # 第73 Part B: 真偽台帳(旧 checkpoint 互換=無ければ素通り=beliefs OFF の挙動不変)。
     # canary は module 側のプロセス内レジストリなので、復元した fact 分を再登録して武装を保つ。
     tlf = rt.get("tl_facts")

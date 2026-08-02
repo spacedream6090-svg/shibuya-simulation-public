@@ -300,17 +300,16 @@ def enabled(sim) -> bool:
     return bool(cfg_of(sim)["enabled"])
 
 
-def model_id(sim) -> str:
-    """この計画を書いたモデルの識別子。第88(1体1モデル束縛)までは**バックエンド名**。
+def model_id(sim, agent=None) -> str:
+    """この計画を書いたモデルの識別子。
 
-    `sim.llm` は CachedLLM のラッパなので、素の backend まで 1 段だけ降りて `.name` を採る
-    (キャッシュ層はモデルではない)。fleet 配下では `fleet/<model>` までしか判らない。
+    第88(心モデル固定)が ON なら **その個体に誕生時固定されたモデル**(= 実際にこの計画を
+    書いたモデル)。OFF のときだけ従来どおり `sim.llm` の backend 名へ後退する
+    (CachedLLM のラッパなので素の backend まで 1 段降りる。fleet 配下では
+    `fleet/<model>` までしか判らない = 第87 までの暫定値)。
     """
-    llm = getattr(sim, "llm", None)
-    name = getattr(llm, "name", None)
-    if not name:
-        name = getattr(getattr(llm, "backend", None), "name", None)
-    return str(name or "unknown")
+    from .. import mind as _mind
+    return _mind.log_model_id(sim, agent)
 
 
 # --------------------------------------------------------------------------- #
@@ -849,7 +848,7 @@ def apply(sim, agent, step: int, sim_min: int, response: str,
     cfg = cfg_of(sim)
     day = int(sim_min) // 1440
     day_min = day * 1440
-    mid = model_id(sim)
+    mid = model_id(sim, agent)
     st = _state(sim)
     row = _model_row(st, mid)
 

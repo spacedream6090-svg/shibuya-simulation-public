@@ -5,6 +5,7 @@ from typing import Any, Callable
 
 from .. import dunbar as _dunbar
 from .. import gossip as _gossip
+from .. import mind as _mind
 from .. import physics as _physics
 from .. import relations_endo as _rendo
 from .. import status as _status_mod
@@ -923,6 +924,27 @@ def _engaged_turns_mean(sim):
 @register_aggregator("engaged_template_total")
 def _engaged_template_total(sim):
     return _engaged_col(sim, "engaged_template_total")
+
+
+# ---- 心モデル固定+三層知能 第88バッチ(既定 OFF)。model.mind.enabled=false は
+#      全て None=列なし=L2 不変(engaged 列と同型)。読むだけ・乱数ゼロ・LLM 呼ゼロ。
+#   mind_models_present … いま在場している個体に固定されたモデルの**種類数**
+#   mind_high_agents    … いま在場している高解像度層の頭数(1〜5% の実効値の時系列)
+#   ★列名にモデル名を出さない: モデル構成は conf 依存なので、出すと列構成がランごとに
+#     変わって L2 の比較が壊れる。モデル別の内訳は summary.mind.by_model にある。
+def _mind_col(sim, key):
+    s = _mind.scalars(sim)
+    return s.get(key) if s else None
+
+
+@register_aggregator("mind_models_present")
+def _mind_models_present(sim):
+    return _mind_col(sim, "mind_models_present")
+
+
+@register_aggregator("mind_high_agents")
+def _mind_high_agents(sim):
+    return _mind_col(sim, "mind_high_agents")
 
 
 # ---- 屋内エンジン配線 B3(indoor.enabled ON のみ・既定 OFF=None=列なし=L2 バイト不変)----

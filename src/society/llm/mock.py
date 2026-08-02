@@ -32,8 +32,15 @@ _COMPLAINTS = [
 class MockBackend(LLMBackend):
     name = "mock"
 
-    def __init__(self, hub: RngHub):
+    def __init__(self, hub: RngHub, name: str | None = None):
         self.hub = hub
+        # 第88バッチ: 心モデル固定の検証用に **複数の mock サブモデル**(mock:a / mock:b …)を
+        # 名前だけ変えて立てられるようにする。name はキャッシュキー(D13)とキャッシュ/
+        # ジャーナルのファイル名に効くので、サブモデルごとに応答キャッシュが正しく分離される。
+        # 応答本文は名前に依存しない(= 決定論を保ったまま「経路の分離」だけを検証できる)。
+        # name=None(既定)は従来どおりクラス属性の "mock" = 既存ランとバイト一致。
+        if name:
+            self.name = str(name)
 
     def _coin_word(self, rng) -> str:
         parts = "".join(_SYLLABLES[int(rng.integers(len(_SYLLABLES)))]

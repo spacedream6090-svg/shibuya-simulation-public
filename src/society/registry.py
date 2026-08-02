@@ -259,6 +259,22 @@ FEATURES: tuple[Feature, ...] = (
        "自動操縦)も実験条件語も因子名も 1 文字も出さない。"
        "★cognition.fire OFF では完全 no-op(watch / g_update と同じ前提関係)。"
        "★乱数 stream を 1 本も引かない(高解像度層の選定も _stable_hash の決定論)"),
+    # 第88バッチ 心モデル固定 + 三層知能配置(設計 §5)。
+    # journal 等級の根拠: 個体ごとに**別のモデル**が自由文を書く。事後に再生するには
+    #   モデル別の llm_cache / llm_journal(子ごとに 1 本)が要る = 単体では非決定。
+    # ★affects_k=True を正直に宣言する: 解決層そのものは「どのモデルが答えるか」しか
+    #   変えない(generate() の呼び出しサイトは 1 つも増減しない)が、**高解像度層が夜内省の
+    #   選抜を第87 reflect_frac から引き継ぐ**ため、engaged ON のランでは ON/OFF で
+    #   エピソード集合が変わり、結果として呼数が動く。間接ではなく明示的な作用点。
+    # fingerprint_risk=none: プロンプトを 1 バイトも変えない(モデル名も層名もプロンプトに
+    #   出ない)。エージェントから見て「自分がどのモデルか」を観測する経路は存在しない。
+    _f("model.mind.enabled", "journal", True, "none",
+       "心モデル固定(1 体 1 モデルを誕生時に固定)+ 三層知能配置。会話・思考・価値判断は"
+       "その個体の固定モデルへ、機械的判断(経路・定型購買)は従来どおりルール層(LLM ゼロ)。"
+       "割当は専用 stream(mind_model / mind_tier)の決定論=既存 draw 順に無風・traits 非参照。"
+       "高解像度層(1〜5%)は大型モデル + 夜内省の対象 + 思考頻度の上限緩和。"
+       "★agent_id→model_id の対応を manifest / summary / agents.json / L1 mind_assign に"
+       "必ず残す(モデルと人格の交絡の記録=設計 §5 の明示要求)"),
     _f("routine.stochastic.enabled", "strict", False, "none",
        "確率的実行=行動のゆらぎ(骨格 motif・時刻ジッター・寄り道・中断)"),
     _f("routine.stochastic.gumbel.enabled", "strict", False, "none",
@@ -730,6 +746,11 @@ ALLOWLIST: dict[str, str] = {
         "ターン上限で切り上げターンを挟むかの指定(engaged.enabled が親トグル)",
     "cognition.engaged.sign_memory":
         "プリエンプト時に兆しメモリを書くかの指定(engaged.enabled が親トグル)",
+    # 第88バッチ: 高解像度層**内部**の形の指定であって独立した機能トグルではない
+    # (model.mind.enabled が OFF なら 1 バイトも効かない。frac=0 でも効かない)。
+    # 「夜内省の選抜を第87 reflect_frac から高解像度層へ移すか」の内部レバー。
+    "model.mind.tiers.high.reflect":
+        "夜内省の対象を高解像度層にするかの指定(model.mind.enabled が親トグル)",
 }
 
 

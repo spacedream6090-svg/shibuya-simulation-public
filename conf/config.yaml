@@ -242,6 +242,54 @@ model:
   #     # reflect: {backend: anthropic, name: "claude-haiku-4-5"}        # 例: 内省だけ API
   #     # plan: {backend: openai_compat, base_url: "http://localhost:11434/v1", name: "qwen3:8b"}
 
+  # ---- 心モデル固定 + 三層知能配置(第88バッチ 2026-08-03。**既定 OFF**=現行と完全一致)----
+  # 正典: docs/plans/source/design-discussion-20260802.md §5。実装 src/society/mind.py。
+  #   「心(会話・思考・価値判断)は 1 エージェント 1 モデルを誕生時に固定する」
+  #     理由 ①人格の一貫性 ②モデル差がそのまま人口の多様性(§1 の分散崩壊への最も安い対抗策)
+  #          ③面白いエージェントが見つかったときにモデル別分析ができる
+  #   「機械的判断(経路選択・定型購買)はモデル不問」= 本リポではそもそも LLM を呼んでいない
+  #     ルール層なので、ここは実装ではなく**確認**(tests/test_mind.py が固定している)。
+  #   「モデルと人格の交絡が生じるため、agent_id と model_id の対応は必ずログに残す」
+  #     → manifest.mind / summary.mind / agents.json(mind_model, mind_tier)/ L1 mind_assign。
+  # 三層(§5「知能は均質に配置しない」。人間の日常行動の 4 割強は習慣という実証への整合):
+  #   基底層   … 全員が習慣・スケジュールで動く(ほぼ無料)= **既存のルール層そのもの**。
+  #              本ブロックは基底層を 1 バイトも変えない(宣言だけ manifest に残す)。
+  #   思考層   … 驚き発火時のみ LLM。混成 fleet = 下の pool を重み付きで誕生時固定。
+  #   高解像度層 … 1〜5%。大型モデル + 夜内省の対象 + 思考頻度の上限緩和。
+  # 決定論: 割当は専用 stream("mind_model" / "mind_tier")だけを引く=既存 stream の draw 順に
+  #   無風。(master_seed, agent_id) の純関数なので resume でも pool 再入場でも同一モデルに戻る。
+  # ★実モデルのショートリスト(3B〜14B×5〜6本)は DP-U2 = ユーザー判断。ここは器だけ。
+  mind:
+    enabled: false      # true にすると pool が必須。false では解決層を組まない=現行とバイト一致
+    # purposes:         # 「心」と見なす呼び種(rng_key 先頭)。既定 = deliberate / plan / reflect / recall。
+    #                   #   ここに無い呼び(現状 "null" = D7 対照系列)と agent_id を持たない呼びは
+    #                   #   共有の既定バックエンド(= model.backend で組んだもの)が受ける。
+    #   - deliberate
+    #   - plan
+    #   - reflect
+    #   - recall
+    pool: []            # 心のモデル群。各要素 = router の子 spec(backend/name/host/base_url/…)+ weight。
+                        #   name が model_id(割当・ログ・summary の全てで使う識別子。一意必須)。
+                        #   例(mock 3 サブモデルでの検証。応答本文は同一でキャッシュだけ分かれる):
+                        #     - {backend: mock, name: "mock:a", weight: 1}
+                        #     - {backend: mock, name: "mock:b", weight: 2}
+                        #   例(本選):
+                        #     - {backend: vllm, name: "qwen3-8b",  base_url: "http://localhost:8000", weight: 3}
+                        #     - {backend: vllm, name: "llm-jp-3-13b", base_url: "http://localhost:8001", weight: 1}
+    tiers:
+      high:
+        frac: 0.0       # 高解像度層の割合(§5 は 1〜5% = 0.01〜0.05)。0=層なし=思考層のみ
+        name: ""        # 高解像度層の**大型モデル**(pool とは別の model_id)。空なら pool の割当のまま
+        # spec: {}      # 大型モデルの子 spec。省略時は pool 先頭と同じ backend 種別で名前だけ差し替える
+        reflect: true   # 夜の内省(§8 突入条件 5)の対象を高解像度層にする=第87 reflect_frac から権威を移す
+        cap_mult: 1.0   # 思考頻度の上限緩和。engaged の turn_cap / replan_cap にかける倍率(1.0=無風)
+        select: uniform # uniform(既定)= traits を 1 つも読まない一様抽選。
+                        #   ★これが既定である理由: 「あらかじめ賢い個体を選んでおく」と
+                        #     『誰が世界を変えるか』(k*)という問い自体が自壊する(サーベイ S-08)。
+                        #   traits = 指定 trait の上位 frac。**アブレーション専用の意図的な交絡**で、
+                        #     k* の主張には使えない(ON にすると manifest に警告が残る)。
+        select_trait: ""  # select: traits のときに読む agent.traits のキー
+
 world:
   map: data/shibuya_osm.json    # ★OSM 実道路網(渋谷駅中心 約1.0×0.7km)。旧: data/shibuya_core.json
   scenario: baseline            # baseline(既定=no-op)| shock_closure | shock_event(#8 摂動カタログ)

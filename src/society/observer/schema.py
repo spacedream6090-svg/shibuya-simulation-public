@@ -368,6 +368,13 @@ register_event_kind("engaged_template", "関係の薄い相手からの定型接
 register_event_kind("sign_memory",      "プリエンプトで中断した内容を1行だけ兆しメモリへ"
                                         "書いた(「あとで考えよう」の再燃フック)"
                                         "{kind, turns, stay_min}")
+# ---- 心モデル固定+三層知能(第88バッチ・model.mind ON のみ・既定 OFF=0件)。
+#      実装 src/society/mind.py。原文書 §5「モデルと人格の交絡が生じるため、agent_id と
+#      model_id の対応は必ずログに残す」の L1 側(集計は summary.mind / manifest.mind、
+#      個別対応は agents.json の mind_model / mind_tier にも残る)。
+register_event_kind("mind_assign",      "誕生時に固定された心のモデルと知能層"
+                                        "{model, tier(think|high)}。**この個体の"
+                                        "会話・思考・価値判断は以後すべてこのモデルが回す**")
 
 
 @dataclass

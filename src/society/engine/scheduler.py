@@ -27,6 +27,7 @@ from .. import household as household_mod
 from .. import inner_life as inner_life_mod
 from .. import joint as joint_mod
 from .. import lodging as lodging_mod
+from .. import mind as mind_mod
 from .. import mobility as mobility_mod
 from .. import opinion as opinion_mod
 from .. import party as party_mod
@@ -4480,6 +4481,35 @@ def _phase_workplace_bound_report(sim, step: int, sim_min: int) -> None:
                          kind="workplace_bound", x=0.0, y=0.0, payload=dict(stat)))
 
 
+def _phase_mind_report(sim, step: int, sim_min: int) -> None:
+    """心のモデル固定(第88)を L1 に残す(agent_id → model_id の**個別対応**)。
+
+    原文書 §5「モデルと人格の交絡が生じるため、agent_id と model_id の対応は必ずログに
+    残す」。割当そのものは誕生時(Simulation.__init__ / build_pool_agent)に済んでいて、
+    ここは**記録だけ**(乱数ゼロ・LLM ゼロ・状態を 1 バイトも書き換えない)。
+
+    出し終えた id は `_mind_logged` に控え、pool ローテーションで途中入場した個体も
+    その step に 1 件だけ出る。`_mind_logged` は checkpoint が中央管理するので、resume で
+    既出ぶんを二重に記録しない(= resume==straight)。既定 OFF は 1 件も出さない。
+    """
+    if not mind_mod.enabled(sim):
+        return
+    logged = sim._mind_logged
+    if len(logged) >= len(sim.agents):        # 既出だけ = 走査を丸ごと省く(常時のコストを消す)
+        return
+    for agent in sim.agents:
+        aid = int(agent.id)
+        if aid in logged:
+            continue
+        m = getattr(agent, "mind", None)
+        if not m:
+            continue
+        logged.add(aid)
+        sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=aid,
+                             kind="mind_assign", x=agent.x, y=agent.y,
+                             payload={"model": m["model"], "tier": m["tier"]}))
+
+
 # ---------------------------------------------------------------- 屋内エンジン配線(B3)
 # 屋内ミクロ状態=単一の真実。マクロ(建物内在館数)はこの集約。設計原則: ①認知/LLM step=10分は不変
 # (LLM 呼数・会話ペアリングに一切影響させない=それは次バッチ B3b)②物理は遷移駆動(空間遷移が起きた
@@ -4817,6 +4847,7 @@ def run_step(sim, step: int) -> None:
     sim_min = sim.clock.sim_min(step)
     _phase_pool_rotation(sim, step, sim_min)       # 日次境界: 在場ローテーション(既定OFF=no-op。W2 P3)
     _phase_workplace_bound_report(sim, step, sim_min)  # 起動時1回: 職場束ね直しの coverage 統計(既定OFF=no-op)
+    _phase_mind_report(sim, step, sim_min)         # 誕生時1回/個体: 心のモデル固定の記録(既定OFF=no-op。第88)
     # 行間補間(P2 S2): この step 開始時点の logger.events 長を控える(末で増分を各個体バッファへ
     # 振り分ける)。OFF は -1 で以降の蓄積を完全にスキップ=状態も出力もバイト一致。
     _isl_idx = len(sim.logger.events) if _interstitial_on(sim) else -1

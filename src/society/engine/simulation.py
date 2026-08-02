@@ -920,6 +920,51 @@ class Simulation:
                                  path=self.out_dir / "llm_cache.jsonl",
                                  mode=cache_mode,
                                  journal=_new_journal("llm_journal.jsonl.gz"))
+        # ---- 第88バッチ: 心モデル固定(1 体 1 モデル)の解決層 ------------------------- #
+        # 原文書 §5「心(会話・思考・価値判断)は 1 エージェント 1 モデルを誕生時に固定する」。
+        # ここで作るのは **dispatcher だけ**(新しいバックエンド型は 1 つも作らない):
+        #   default = ここまでに組み上がった self.llm(= 機械的判断・対照系列・agent_id を
+        #             持たない呼びの受け皿。原文書の「モデル不問の共有小型モデル」に対応)
+        #   children= pool(+ 高解像度層の大型モデル)を **各自 CachedLLM に包んで**渡す
+        #             = キャッシュキーは子の name 由来(D13)= モデル別に応答が分離される。
+        # 既定 OFF(model.mind.enabled=false)では self.llm を 1 バイトも触らない。
+        from .. import mind as _mind_mod
+        raw_mind = cfg.model.get("mind", None)
+        raw_mind = (OmegaConf.to_container(raw_mind, resolve=True)
+                    if OmegaConf.is_config(raw_mind) else raw_mind)
+        self.mindcfg = _mind_mod.build_cfg(raw_mind)
+        self._mind_binding: dict = {}          # agent_id → model_id(誕生時固定のメモ化)
+        self._mind_logged: set = set()         # L1 mind_assign を出し終えた agent_id
+        if self.mindcfg["enabled"]:
+            from ..llm.mind_router import MindRouter
+            entries = list(self.mindcfg["pool"])
+            _hi = self.mindcfg["high"]
+            if _hi["name"] and _hi["name"] not in {e["name"] for e in entries}:
+                # 高解像度層の大型モデル。spec 省略時は pool 先頭と同じ backend 種別で
+                # 名前だけ差し替える(mock 検証で "mock:hi" を立てるための最短経路)。
+                hspec = _hi["spec"]
+                if hspec is None:
+                    hspec = dict(entries[0]["spec"])
+                    hspec["name"] = _hi["name"]
+                entries.append({"name": _hi["name"], "weight": 0.0, "spec": hspec})
+            _mind_built: dict = {}
+            children: dict = {}
+            for entry in entries:
+                skey = json.dumps(entry["spec"], ensure_ascii=False, sort_keys=True)
+                if skey not in _mind_built:
+                    child = self._build_router_child(entry["spec"])
+                    safe = "".join(c if c.isalnum() or c in "._-" else "_"
+                                   for c in child.name)
+                    _mind_built[skey] = CachedLLM(
+                        child, enabled=bool(cfg.model.cache),
+                        path=self.out_dir / f"llm_cache.{safe}.jsonl",
+                        mode=cache_mode,
+                        journal=_new_journal(f"llm_journal.{safe}.jsonl.gz"))
+                children[entry["name"]] = _mind_built[skey]
+            self.llm = MindRouter(
+                self.llm, children,
+                resolve=lambda aid: _mind_mod.model_of_id(self, aid),
+                purposes=self.mindcfg["purposes"])
         # 第78バッチ: アブレーション設定の正準化(既定=全 OFF=述語が全て False=挙動不変)と、
         # 認知階層 ablate.cognitive_tier の FleetLLM への焼き付け(構築時 1 回だけ・以降不変)。
         # fleet 非使用ランでは small/mid は縮退して full と同一 → WARNING で告知する。
@@ -994,6 +1039,8 @@ class Simulation:
                 self._init_agent_runtime(agent)
                 # 群のオントロジー(既定 OFF=no-op)。直接ランは tier=default(プール非使用)。
                 self._apply_ontology(agent, "default")
+                # 第88: 心のモデルと知能層を誕生時に固定(既定 OFF=属性を生やさない=no-op)。
+                _mind_mod.assign(self, agent)
                 self.agents.append(agent)
         self.agent_by_id = {a.id: a for a in self.agents}
         # S6a: pool ON かつ N 比例予算なら、当日の在場数を N に使う(1行の接続)。
@@ -1183,7 +1230,9 @@ class Simulation:
         deadline_s = float(spec.get("call_deadline_s",
                                     self.cfg.model.get("call_deadline_s", 300.0)))
         if b == "mock":
-            return MockBackend(self.hub)
+            # 第88: name を渡すと mock サブモデル(mock:a / mock:b …)になる。
+            # 名前なし(従来の router 子指定)は "mock" のまま = 既存ランとバイト一致。
+            return MockBackend(self.hub, name=name or None)
         if b == "ollama":
             from ..llm.ollama import OllamaBackend
             return OllamaBackend(name, host=str(spec.get("host", "http://localhost:11434")),
@@ -1451,6 +1500,10 @@ class Simulation:
         # party_size(L4 来街者の record に実在=同行人数)は同行者構成軸のデータ駆動割当に使う(無ければ None)。
         self._apply_ontology(agent, str(record.get("presence", "resident")),
                              party_size=record.get("party_size"))
+        # 第88: 心のモデルと知能層を誕生時に固定(既定 OFF=属性を生やさない=no-op)。
+        # 割当は (master_seed, agent.id) の純関数なので、pool の再入場(hydrate)でも同一。
+        from .. import mind as _mind_mod
+        _mind_mod.assign(self, agent)
         # 職場束ね直し(work.bind_workplace。既定 OFF は no-op=work_node の付与状況とも不変)。
         self._bind_pool_workplace(agent, record)
         return agent
@@ -1639,6 +1692,10 @@ class Simulation:
                     if getattr(a, "ontology_group", None) else {}),
                  **({"ontology_axes": a.ontology_axes}
                     if getattr(a, "ontology_axes", None) else {}),
+                 # 第88バッチ: agent_id → model_id の対応(原文書 §5「モデルと人格の交絡が
+                 # 生じるため必ずログに残す」)。mind OFF ではキー自体が生えない=バイト一致。
+                 **({"mind_model": a.mind["model"], "mind_tier": a.mind["tier"]}
+                    if getattr(a, "mind", None) else {}),
                  # 第50バッチ T6: 信用内訳レンズの org 相関用(org 配属時のみ=非配属ランはバイト同一)
                  **({"org_id": a.org_id, "org_role": getattr(a, "org_role", "")}
                     if getattr(a, "org_id", None) else {})}
@@ -1733,6 +1790,13 @@ class Simulation:
         _egprov = _engaged_prov.provenance(self)
         if _egprov is not None:
             summary["engaged"] = _egprov
+        # ---- 心モデル固定+三層知能 第88バッチ(model.mind.enabled=false = 既定 OFF はキーなし)----
+        # 原文書 §5「モデルと人格の交絡が生じるため必ずログに残す」の集計側。
+        # モデル別の人数・呼数・キャッシュ命中に、第87 エピソード数と第86 修復率を統合する。
+        from .. import mind as _mind_prov
+        _mdprov = _mind_prov.provenance(self)
+        if _mdprov is not None:
+            summary["mind"] = _mdprov
         # ---- 初期フレーム共変量 第74バッチ IDEA④(observer.initial_frame.days: 0 = 既定 OFF)----
         # 確定済みの l1_events.parquet(直前の logger.flush)を読み直す **完全な事後処理**。
         # OFF ではこのブロックが即 None を返し summary にキーを足さない=既存ランと同形。
