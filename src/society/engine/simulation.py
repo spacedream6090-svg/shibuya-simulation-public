@@ -1711,6 +1711,13 @@ class Simulation:
         _wprov = _weather_prov.provenance(self)
         if _wprov is not None:
             summary["weather"] = _wprov
+        # ---- day_plan v1 第86バッチ(planning.day_plan.enabled=false = 既定 OFF はキーなし)----
+        # 原文書 §7 が「修復発生回数のモデル別集計はテストバッテリーの追加指標になる」と明記して
+        # いるので、修復・フォールバックの件数と率をモデル別に summary へ残す。
+        from ..cognition import day_plan as _day_plan_prov
+        _dpprov = _day_plan_prov.provenance(self)
+        if _dpprov is not None:
+            summary["day_plan"] = _dpprov
         # ---- 初期フレーム共変量 第74バッチ IDEA④(observer.initial_frame.days: 0 = 既定 OFF)----
         # 確定済みの l1_events.parquet(直前の logger.flush)を読み直す **完全な事後処理**。
         # OFF ではこのブロックが即 None を返し summary にキーを足さない=既存ランと同形。

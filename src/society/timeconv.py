@@ -322,6 +322,20 @@ TABLE: tuple[tuple[str, str, str], ...] = (
     ("env.feedback.transit.flag_min", INVARIANT, "観測チャンネルを 1 にする遅延[分](物理時間)"),
     ("env.feedback.gate.capacity_per_min", INVARIANT,
      "改札の処理能力[人/分]。**毎分レート**なので Δt 非依存(コード側が Δt を掛ける)"),
+    # ---- day_plan v1(第86バッチ)。計画の時間量は全て **世界の物理時間[分]** で持つ ----
+    # (step で持つと Δt を変えたとき「9 時から 1 時間」の意味が変わってしまう)。
+    ("planning.day_plan.walk_m_per_min", INVARIANT,
+     "移動時間見積りの徒歩速度[m/分]。**毎分レート**なので Δt 非依存"
+     "(world.modes.speeds.walk は m/step なので RATE 側。こちらは分あたりの物理速度)"),
+    ("planning.day_plan.round_min", INVARIANT,
+     "計画時刻の丸め幅[分]。人が予定を書くときの粒度であって step ではない"),
+    ("planning.day_plan.min_dur_min", INVARIANT, "ブロックの最小継続[分](物理時間)"),
+    ("planning.day_plan.max_dur_min", INVARIANT, "ブロックの最大継続[分](物理時間)"),
+    ("planning.day_plan.grace_min", INVARIANT,
+     "開始予定からの猶予[分]。『20 分遅れたら諦める』は Δt に依らず 20 分"),
+    ("planning.day_plan.transfer_min", INVARIANT, "移動/準備の最小時間[分](物理時間)"),
+    ("planning.day_plan.max_slide_min", INVARIANT, "累積ずらしの上限[分](物理時間)"),
+    ("planning.day_plan.day_end_min", INVARIANT, "計画が収まるべき終端。分 of day の時刻"),
     ("env.feedback.poi.capacity", INVARIANT, "POI ノードの収容人数[人](頭数)"),
     ("env.feedback.poi.max_nodes", INVARIANT, "同時に除外できるノード数の上限(件数)"),
     ("experiment.g_init.flat_value", INVARIANT, "条件 F/N の trait 定数(無次元)"),

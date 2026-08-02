@@ -9,6 +9,7 @@ from .. import physics as _physics
 from .. import relations_endo as _rendo
 from .. import status as _status_mod
 from .. import truth_ledger as _truth
+from ..cognition import day_plan as _day_plan
 from . import assets as _assets
 from . import deviation as _dev
 from . import echo as _echo
@@ -835,6 +836,54 @@ def _dormant_total(sim):
 @register_aggregator("rekindle_total")
 def _rekindle_total(sim):
     return _dunbar_col(sim, "rekindle_total")
+
+
+# ---- day_plan v1 第86バッチ(既定 OFF)。planning.day_plan.enabled=false(または planning OFF)
+#      は全て None=列なし=L2 不変(dunbar 列と同型)。読むだけ・乱数ゼロ・LLM 呼ゼロ。
+#   plan_blocks_mean    … 1 計画あたりのブロック数の平均(累積 blocks / 累積 plans)
+#   plan_exec_total     … 実行したブロックの累計(単調非減少=resume 安全)
+#   plan_repair_total   … 修復が起きた計画の累計 / plan_fallback_total … 後退した計画の累計
+#   plan_drop_total     … 自動削除されたブロックの累計 / plan_slide_total … ずらしの累計
+#   plan_replan_total   … must 危機による再計画の累計
+#   タリーは day_plan.apply / plan_action が積み、scalars() は読むだけ。
+def _dayplan_col(sim, key):
+    s = _day_plan.scalars(sim)
+    return s.get(key) if s else None
+
+
+@register_aggregator("plan_blocks_mean")
+def _plan_blocks_mean(sim):
+    return _dayplan_col(sim, "plan_blocks_mean")
+
+
+@register_aggregator("plan_exec_total")
+def _plan_exec_total(sim):
+    return _dayplan_col(sim, "plan_exec_total")
+
+
+@register_aggregator("plan_repair_total")
+def _plan_repair_total(sim):
+    return _dayplan_col(sim, "plan_repair_total")
+
+
+@register_aggregator("plan_fallback_total")
+def _plan_fallback_total(sim):
+    return _dayplan_col(sim, "plan_fallback_total")
+
+
+@register_aggregator("plan_drop_total")
+def _plan_drop_total(sim):
+    return _dayplan_col(sim, "plan_drop_total")
+
+
+@register_aggregator("plan_slide_total")
+def _plan_slide_total(sim):
+    return _dayplan_col(sim, "plan_slide_total")
+
+
+@register_aggregator("plan_replan_total")
+def _plan_replan_total(sim):
+    return _dayplan_col(sim, "plan_replan_total")
 
 
 # ---- 屋内エンジン配線 B3(indoor.enabled ON のみ・既定 OFF=None=列なし=L2 バイト不変)----

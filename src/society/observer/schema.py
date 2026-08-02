@@ -329,6 +329,27 @@ register_event_kind("zone_gate", "物理ゾーンの境界通過(流入 enter / 
                                  "。span_m=ゾーン内区間のグラフ経路長 / wait_s=入場までの待ち"
                                  "(信号ゾーンでは赤の縁石滞留。dwell_s には含まれない) / "
                                  "dwell_s=実際に積分した滞在秒 / jump_m=グラフ復帰時の位置の跳び")
+# ---- day_plan v1(第86バッチ・planning.day_plan ON のみ・既定 OFF=0件)。朝に LLM が出す
+#      構造化計画とその実行。実装 src/society/cognition/day_plan.py。
+#      plan_repair / plan_fallback の件数は summary.json の day_plan.by_model にモデル別で残る。
+register_event_kind("plan_created",     "朝の構造化計画が確定した(検証→修復→フォールバック後)"
+                                        "{n, version, src, model, n_cont, blocks[]}"
+                                        "。src=llm / prev_day / skeleton")
+register_event_kind("plan_repair",      "決定的ルールによる計画の修復が起きた"
+                                        "{ops{round|substitute|slide|truncate|drop|clip}, "
+                                        "n_schema_err, n_phys_err, model}")
+register_event_kind("plan_fallback",    "修復不能 → 前日の計画 or ペルソナ既定ルーチンへ後退"
+                                        "{kind(prev_day|skeleton), n, n_schema_err, "
+                                        "n_phys_err, model}")
+register_event_kind("plan_block_start", "計画ブロックの実行開始(ルールエンジンが無料で実行)"
+                                        "{act, place, aim, priority, flex, start, slid, version}")
+register_event_kind("plan_block_drop",  "計画ブロックの自動削除(LLM を呼ばずルールが削る)"
+                                        "{act, place, start, priority, flex, "
+                                        "reason(grace|slide_cap|fixed_past|replan|no_place)}")
+register_event_kind("plan_slide",       "計画ブロックを後ろへずらした(最小摂動の retime)"
+                                        "{act, place, start, slid, priority}")
+register_event_kind("plan_replan",      "must が脅かされたので再計画した(plan_version が上がる)"
+                                        "{version, n_must, freed, at}")
 
 
 @dataclass

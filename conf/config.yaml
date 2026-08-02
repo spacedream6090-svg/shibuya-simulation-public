@@ -688,6 +688,36 @@ planning:
       maintenance: 45
       discretionary: 60
 
+  # ---- day_plan v1(第86バッチ 2026-08-03。既定 OFF=現行の計画経路・プロンプト・mock と完全一致)----
+  # 原文書: docs/plans/source/design-discussion-20260802.md §6(決定と実行の分離)・§7(朝の計画スキーマ)。
+  # ON で朝の計画を「メタ+ブロック4〜8個+contingency最大3個」の**列挙型中心の浅い構造**へ差し替え、
+  # 日中はルールエンジンが無料で実行する(場所の具体解決はルール側=カテゴリ→習慣/距離/営業状態)。
+  # 空き時間はブロックにしない(未計画帯は既存の習慣ポリシー routine が埋める)。
+  # 検証3段: ①スキーマ(列挙・個数・型)②物理(移動時間・営業時間・場所カテゴリの実在)
+  #          ③決定的修復(時刻の丸め・ずらし・短縮・場所の差し替え・削除・件数上限)
+  #          ④修復不能 → 前日の計画 → ペルソナ既定ルーチン(世界を止めない)
+  # 割り込み: could+droppable は **LLM を呼ばず**ルールが削り、slideable は後ろへずらす。
+  #          must が脅かされたときだけ再計画(plan_version++)。cognition.fire ON のときのみ
+  #          内部発火 plan_exception を認知イベントキューへ前倒し登録する(engaged 本体は第87)。
+  # R1: enabled=false で新イベント 0 件・L2 に列なし・summary にキーなし・プロンプト 1 バイト不変。
+  #     ON でも generate() を 1 本も足さない(再試行なし)・乱数 stream を 1 本も引かない。
+  # 実装 src/society/cognition/day_plan.py。planning.framework とは排他(day_plan が優先)。
+  day_plan:
+    enabled: false            # ★本番はユーザー判断で ON。false=現行の朝計画と完全同一
+    min_blocks: 4             # 1日のブロック数の下限(原文書 §7: 4〜8)
+    max_blocks: 8             # 同・上限(超過は低優先・遅い方から clip)
+    max_conting: 3            # contingency(条件分岐)の上限(原文書 §7: 最大3個)
+    round_min: 10             # 時刻の丸め幅[分](= 正準 Δt)
+    min_dur_min: 10           # ブロックの最小継続[分]
+    max_dur_min: 600          # ブロックの最大継続[分](超過は truncate)
+    grace_min: 30             # 開始予定からこれだけ過ぎても始まらなければ割り込み判定に入る
+    walk_m_per_min: 80.0      # 移動時間の下限見積りに使う徒歩速度(world.modes.speeds.walk=800m/10分)
+    transfer_min: 5           # 同一地点でも要る最小の移動/準備時間[分]
+    max_slide_min: 180        # 1ブロックの累積ずらし上限[分](超えたら削除)
+    day_end_min: 1440         # 計画が収まるべき日の終端[分 of day]
+    mood_chars: 60            # 自由文欄(mood)の上限文字数
+    text_chars: 80            # 自由文欄(reason / note / carry)の上限文字数
+
 # ---- 確率的実行=行動のゆらぎ(P2 スライス S4。docs/plans/p2-interstitial-design.md §1 S4 /
 #      docs/research/interstitial-life.md §4.1 の実証3層 L1/L2/L3 + Gumbel)。既定 OFF=現行と完全同一 ----
 # LLM 非駆動の routine 実行に「人間らしいランダム性」を実証値で較正して注入する。摂動は専用 stream

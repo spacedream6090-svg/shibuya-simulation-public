@@ -147,6 +147,14 @@ def save(sim, step: int, path: str | Path) -> Path:
             # 第70 echo / 第74 norm_state と同じ型のギャップ)。既定 OFF では state 自体が
             # 生えない → None=挙動不変(load は .get で旧 checkpoint 互換)。
             "dunbar_state": getattr(sim, "_dunbar_state", None),
+            # 第86バッチ day_plan v1: 計画/ブロック/修復/後退/削除/ずらし/再計画の累積タリー
+            # (int/float と素の dict のみ=集合なし=決定論監査は自明)。**計画そのもの**
+            # (agent._dayplan / _dayplan_prev)は agents pickle に自然同梱されるので、ここで
+            # 中央管理するのは L2 7 列と summary.day_plan の材料だけ。保存しないと mid-day
+            # resume で累積列が straight と食い違う(第62 joint / 第70 echo / 第75 dunbar と
+            # 同じ型のギャップ)。既定 OFF では state 自体が生えない → None=挙動不変
+            # (load は .get で旧 checkpoint 互換)。
+            "dayplan_state": getattr(sim, "_dayplan_state", None),
             # 第73バッチ(真偽台帳 Part B): sim 側の台帳=fact レコード(_tl_facts)・重複判定キー
             # (_tl_keys)・累積カウンタ(_tl_stats)。**保存しないと resume 後に fact_id が振り直され、
             # 信念(agents pickle に自然同梱される _fact_beliefs)の参照先が全部迷子になる**
@@ -300,6 +308,9 @@ def load(sim, path: str | Path) -> int:
     dst = rt.get("dunbar_state")                # 第75 IDEA⑤: 認知枠タリー(旧 ckpt 互換=無ければ素通り)
     if dst is not None:
         sim._dunbar_state = dst
+    dps = rt.get("dayplan_state")               # 第86 day_plan v1(旧 ckpt 互換=無ければ素通り)
+    if dps is not None:
+        sim._dayplan_state = dps
     # 第73 Part B: 真偽台帳(旧 checkpoint 互換=無ければ素通り=beliefs OFF の挙動不変)。
     # canary は module 側のプロセス内レジストリなので、復元した fact 分を再登録して武装を保つ。
     tlf = rt.get("tl_facts")

@@ -99,6 +99,51 @@ class MockBackend(LLMBackend):
         data["watch"] = {"expect": expect, "triggers": triggers}
         return json.dumps(data, ensure_ascii=False)
 
+    # ---- 一日の予定表 day_plan v1(第86バッチ・planning.day_plan ON のときだけ)----
+    _DP_PLACES = ("home", "work", "food", "shop", "leisure", "service",
+                  "street", "landmark", "nightlife")
+    _DP_ACTS = ("meal", "shop", "leisure", "walk", "home", "visit", "personal",
+                "park", "meetup")
+    _DP_AIMS = ("sustenance", "errand", "enjoyment", "health", "rest",
+                "company", "care", "long_goal")
+    _DP_PRIOS = ("must", "should", "could")
+    _DP_FLEXES = ("fixed", "slideable", "droppable")
+    _DP_CONDS = ("rain", "crowded", "closed", "tired")
+    _DP_THENS = ("skip", "postpone", "go_home", "swap_indoor")
+
+    def _day_plan(self, rng) -> str:
+        """day_plan v1 のスキーマ準拠 JSON(決定論)。壊れ値も一定割合で混ぜる。"""
+        n = int(rng.integers(4, 9))                       # 4-8 ブロック
+        start = int(rng.integers(6, 10)) * 60             # 06:00-09:00 から始める
+        blocks = []
+        for _ in range(n):
+            dur = int(rng.integers(2, 10)) * 15           # 30-135 分
+            end = start + dur
+            place = self._DP_PLACES[int(rng.integers(len(self._DP_PLACES)))]
+            act = self._DP_ACTS[int(rng.integers(len(self._DP_ACTS)))]
+            if rng.random() < 0.06:                       # 列挙外(substitute 経路を踏む)
+                place = "cafe"
+            blocks.append({
+                "reason": "そうしたいから",       # ★理由欄を先頭に置く(スキーマ指示と同順)
+                "start": f"{start // 60:02d}:{start % 60:02d}",
+                "end": f"{end // 60:02d}:{end % 60:02d}",
+                "place": place, "act": act, "with": [],
+                "aim": self._DP_AIMS[int(rng.integers(len(self._DP_AIMS)))],
+                "priority": self._DP_PRIOS[int(rng.integers(3))],
+                "flex": self._DP_FLEXES[int(rng.integers(3))],
+                "note": ""})
+            start = end + int(rng.integers(0, 5)) * 15    # 0 分間隔も混ぜる(修復対象)
+            if start >= 23 * 60:
+                break
+        cont = []
+        for _ in range(int(rng.integers(0, 4))):
+            cont.append({"if": self._DP_CONDS[int(rng.integers(len(self._DP_CONDS)))],
+                         "then": self._DP_THENS[int(rng.integers(len(self._DP_THENS)))]})
+        return json.dumps({"action": "plan", "mood": "ふつう",
+                           "carry": "昨日の続きが少し気になる",
+                           "blocks": blocks, "if_then": cont},
+                          ensure_ascii=False)
+
     def generate(self, prompt: str, *, rng_key: str, temperature: float,
                  max_tokens: int, think: bool = False) -> str:
         body = self._generate_body(prompt, rng_key=rng_key, temperature=temperature,
@@ -121,6 +166,15 @@ class MockBackend(LLMBackend):
             if line.startswith("知っている言葉:"):
                 raw = line.split(":", 1)[1].strip()
                 known_terms = [t for t in raw.split("、") if t]
+
+        # 一日の予定表 day_plan v1(第86・planning.day_plan=true のときだけ prompt に
+        # "一日の予定表:" マーカーが載る)。**スキーマ準拠の決定論応答**を返す=mock でも
+        # 検証→修復→実行の配線が実際に回る(実 LLM 無しで回帰を張れる)。OFF ではこの
+        # マーカーが無い=下の従来分岐へ=バイト一致。
+        # 4〜8 ブロックを時刻順に置き、置きうる列挙値を rng で巡回する(意図的に一定割合で
+        # **列挙外・時刻逆転・過密**を混ぜ、修復経路が mock でも踏まれるようにする)。
+        if "一日の予定表:" in prompt:
+            return self._day_plan(rng)
 
         # 日課計画フレームワーク(P2 S1・planning.framework=true のときだけ prompt に
         # "計画スキーマ:" マーカーが載る)。スキーマ準拠の決定論応答を返す=mock でも

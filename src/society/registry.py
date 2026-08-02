@@ -231,6 +231,18 @@ FEATURES: tuple[Feature, ...] = (
        "朝の一日計画。LLM に予定 2〜5 件を立てさせ自由文の what/intent を行動の土台にする"),
     _f("planning.framework.enabled", "journal", False, "possible",
        "計画を型スキーマ+コンパイラへ拡張(LLM の計画出力を構造化して読む)"),
+    # 第86バッチ day_plan v1。journal の根拠: 機能の本体が **LLM の自由文/構造化出力を
+    # データとして消費する**(ブロック列がそのまま日中の行動になる)。
+    # ★affects_k=True を正直に宣言する: 既定(cognition.fire OFF)では朝 1 呼のまま呼数は
+    #   1 本も変わらない(再試行なし・修復とフォールバックは全て決定論)が、fire ON では
+    #   must 危機の再計画が **内部発火 plan_exception を認知イベントキューへ前倒し登録**する
+    #   = generate() の発生点そのものを動かす。間接経路ではなく明示的な作用点なので True。
+    # fingerprint_risk=possible: 朝のプロンプトの計画タスクが別書式に差し替わる
+    #   (当人から見て「今日の書き方が違う」= 差分に気づく余地が原理的にある)。
+    _f("planning.day_plan.enabled", "journal", True, "possible",
+       "day_plan v1(構造化された朝の計画)。ブロック 4〜8 + contingency ≤3 の列挙型スキーマ・"
+       "スキーマ/物理検証→決定的修復→前日計画/既定ルーチンへのフォールバック・"
+       "priority×flex による割り込み(could は LLM を呼ばず削り must 危機だけ再計画)"),
     _f("routine.stochastic.enabled", "strict", False, "none",
        "確率的実行=行動のゆらぎ(骨格 motif・時刻ジッター・寄り道・中断)"),
     _f("routine.stochastic.gumbel.enabled", "strict", False, "none",

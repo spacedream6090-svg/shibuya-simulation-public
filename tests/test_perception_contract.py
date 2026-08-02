@@ -424,6 +424,11 @@ _PLANNING_WORLD_READERS = ("_make_plan_framework", "_today_schedule_line",
 _NON_PROMPT_WORLD_READER_MODULES = frozenset({
     "calib.py", "channels.py", "fire.py", "plan_schema.py", "plasticity.py",
     "policy_cache.py", "routine.py", "watch.py",
+    # 第86バッチ day_plan v1: 計画の**物理検証**(移動時間・営業時間・場所カテゴリの実在)と
+    # **場所の具体解決**(習慣・距離・営業状態)は、定義上 world(city の POI・座標・
+    # commerce の営業時刻)を読まないと成立しない。プロンプト構築層ではない(schema_prompt は
+    # cfg しか見ない)ので、routine.py と同じ扱いで台帳へ載せる。P3 で契約経路へ寄せる対象。
+    "day_plan.py",
 })
 
 

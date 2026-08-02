@@ -14,6 +14,7 @@ import math
 
 import numpy as np
 
+from . import day_plan as _day_plan
 from . import drive as _drive
 from .. import commerce as _commerce
 from .. import delivery as _delivery
@@ -883,7 +884,12 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
                 "activity": "eating"}, step, sim_min)
 
     # ---- 朝の一日計画(土台): 現在の時間帯に一致する未消化の予定へ向かう ----
-    plan_move = _plan_move(agent, sim, sim_min, step, rng, scfg)
+    #  第86 day_plan v1(既定 OFF): ON のときだけ構造化ブロックの実行系へ差し替える
+    #  (**単一の作用点**)。OFF は従来の _plan_move をそのまま呼ぶ=バイト一致。
+    #  どちらも None = 空き時間 → 以降の既存の習慣ポリシーが埋める。
+    plan_move = (_day_plan.plan_action(agent, sim, sim_min, step, rng, scfg)
+                 if _day_plan.enabled(sim)
+                 else _plan_move(agent, sim, sim_min, step, rng, scfg))
     if plan_move is not None:
         return plan_move
 

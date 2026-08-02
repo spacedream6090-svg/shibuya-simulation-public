@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from .. import schedule as _schedule
 from ..observer.schema import Event
+from . import day_plan as _dayplan
 from . import plan_schema as _pf
 from . import policy_cache as _policy_cache
 from .deliberate import build_prompt, parse_action
@@ -50,7 +51,8 @@ def build_plan_prompt(agent, *, place_name: str, sim_min: int, step: int,
                       schedule_line: str | None = None,
                       interstitial_digest: str | None = None,
                       city_name: str = "",
-                      framework: dict | None = None) -> str:
+                      framework: dict | None = None,
+                      day_plan: dict | None = None) -> str:
     """build_prompt の文脈(ペルソナ・記憶・日記・信念)+ 所持金 + 計画タスク。
 
     ★ build_prompt の出力は既存の呼び出し(発話・内省)と共有するため一切変えない。
@@ -60,6 +62,9 @@ def build_plan_prompt(agent, *, place_name: str, sim_min: int, step: int,
     interstitial_digest は前回発火以降の客観ダイジェスト(P2 S2。既定 None=注入せず不変)。
     framework は日課計画フレームワーク設定(P2 S1)。None=既定 OFF=スキーマ指示を足さない
     =従来のプロンプトとバイト一致。有効時のみ末尾にスキーマ指示を1ブロック足す。
+    day_plan は day_plan v1 設定(第86)。None=既定 OFF=従来と完全一致。有効時は
+    **従来の計画タスクを置き換えて** day_plan v1 のスキーマ指示だけを載せる(出力の形が
+    別物なので併記しない)。framework とは排他(day_plan が優先)。
     """
     base = build_prompt(agent, place_name=place_name, surprise=None,
                         nearby_names=[], sim_min=sim_min, step=step,
@@ -68,6 +73,8 @@ def build_plan_prompt(agent, *, place_name: str, sim_min: int, step: int,
                         schedule_line=schedule_line,
                         interstitial_digest=interstitial_digest)
     money_line = f"\n今の所持金: 約{int(getattr(agent, 'money', 0.0))}円"
+    if day_plan is not None:                     # 第86: day_plan v1(従来タスクを置換)
+        return base + money_line + _dayplan.schema_prompt(day_plan)
     task = _PLAN_TASK if framework is None else _PLAN_TASK + _pf.schema_prompt(framework)
     return base + money_line + task
 
@@ -114,9 +121,14 @@ def build_plan_request(sim, agent, step: int, sim_min: int, place_name: str,
     """
     max_items = int(sim.planningcfg.get("max_items", 5))
     framework = _pf.framework_cfg(sim)               # None=既定 OFF=現行経路(バイト一致)
+    # 第86 day_plan v1(既定 OFF=None=以下すべて従来どおり)。ON のときは framework/policy_cache
+    # の両経路を抑止して day_plan の1本道にする(出力形式が別物なので混ぜない)。
+    dpcfg = _dayplan.cfg_of(sim) if _dayplan.enabled(sim) else None
+    if dpcfg is not None:
+        framework = None
     # ---- 行動方針キャッシュ P2 S7(既定 OFF=no-op=バイト一致)。simple 計画経路のみ対象 ----
     # framework 経路(P2 S1)はコンパイル/再試行を伴うため本スライスでは対象外(cache 不介入)。
-    if framework is None:
+    if framework is None and dpcfg is None:
         reused = _policy_cache.reuse_plan(sim, agent, step, sim_min)
         if reused is not None:                       # キャッシュ命中+ゲート通過 → LLM をスキップ
             from . import routine as _routine        # 遅延 import(循環回避)
@@ -138,7 +150,7 @@ def build_plan_request(sim, agent, step: int, sim_min: int, place_name: str,
                               weather_line=getattr(sim, "today_weather_line", None),
                               schedule_line=_today_schedule_line(sim, agent, sim_min),
                               interstitial_digest=interstitial_digest,
-                              framework=framework)
+                              framework=framework, day_plan=dpcfg)
     # 朝の計画だけ上限を分けられる seam(model.plan_max_tokens)。
     # 未設定 or 0/null は model.max_tokens にフォールバック=既定挙動は完全不変。
     _plan_mt = int(sim.cfg.model.get("plan_max_tokens", 0) or 0)
@@ -146,7 +158,8 @@ def build_plan_request(sim, agent, step: int, sim_min: int, place_name: str,
     return {"prompt": prompt, "rng_key": f"plan/{agent.id}/{step}",
             "temperature": float(sim.cfg.model.temperature),
             "max_tokens": plan_max_tokens,
-            "framework": framework, "max_items": max_items}
+            "framework": framework, "max_items": max_items,
+            "day_plan": dpcfg}
 
 
 def apply_plan_response(sim, agent, step: int, sim_min: int, req: dict,
@@ -157,6 +170,9 @@ def apply_plan_response(sim, agent, step: int, sim_min: int, req: dict,
                              "purpose": "plan", "step": step, "cached": cached})
     from . import routine as _routine                 # 遅延 import(循環回避)
     _routine.maybe_roll_motif(sim, agent, step)       # P2 S4 L1: 朝の計画確定後に骨格 motif を1日1回抽選(既定 OFF=no-op)
+    if req.get("day_plan") is not None:              # 第86 day_plan v1(検証→修復→フォールバック)
+        _dayplan.apply(sim, agent, step, sim_min, response, call_id)
+        return
     if framework is not None:                        # 日課計画フレームワーク経路(P2 S1)
         _make_plan_framework(sim, agent, step, sim_min, req["prompt"], response,
                              call_id, framework, max_items, req["max_tokens"])
