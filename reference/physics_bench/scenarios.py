@@ -71,7 +71,15 @@ def _park_slot(i):
 # A. 周期境界の一方向通路(基本図の測定)
 # ─────────────────────────────────────────────────────────────────────────────
 def run_fd_periodic(engine_kind, n_agents, length=20.0, width=3.0, dt=0.1,
-                    t_total=50.0, seed=20260801, record_every=1, engine_kw=None):
+                    t_total=50.0, seed=20260801, record_every=1, engine_kw=None,
+                    ghost_range=None):
+    """周期通路の基本図ラン。
+
+    ★P4-1 追加: `ghost_range`(既定 None = 従来の GHOST_RANGE=6.5 m)。
+      長距離 social 項(B2=2.8 m・カットオフ 3·B2≈8.4 m)を入れると、周期像の帯が
+      6.5 m では足りず周期性が破れるため。**既定値では従来と 1 バイトも変わらない**
+      (テスト: calibrate.py --self-check が同一ハッシュを確認する)。"""
+    g_range = GHOST_RANGE if ghost_range is None else float(ghost_range)
     ids = list(range(n_agents))
     v0, radius = agent_params(ids)
     rng = np.random.default_rng(seed)
@@ -94,9 +102,9 @@ def run_fd_periodic(engine_kind, n_agents, length=20.0, width=3.0, dt=0.1,
         # 目標は常に真正面 50m 先(希望方向 = +x を厳密に保つ)
         eng.goal[:, 0] = eng.pos[:, 0] + GOAL_AHEAD
         eng.goal[:, 1] = eng.pos[:, 1]
-        # 周期像(ゴースト): 端から GHOST_RANGE 以内の個体を ±length にコピー
-        left = eng.pos[:, 0] < GHOST_RANGE
-        right = eng.pos[:, 0] > length - GHOST_RANGE
+        # 周期像(ゴースト): 端から g_range 以内の個体を ±length にコピー
+        left = eng.pos[:, 0] < g_range
+        right = eng.pos[:, 0] > length - g_range
         gp = np.concatenate([eng.pos[left] + [length, 0.0],
                              eng.pos[right] - [length, 0.0]], axis=0)
         gv = np.concatenate([eng.vel[left], eng.vel[right]], axis=0)
@@ -283,4 +291,85 @@ def run_crossing(engine_kind, n_agents=200, size=20.0, band=6.0, dt=0.1,
                  meta={"scenario": "crossing", "engine": engine_kind,
                        "n_agents": n_agents, "size": size, "band": band,
                        "gate_mode": gate_mode, "stream": stream.tolist(),
+                       "mean_v0": float(v0.mean())})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# E. ボトルネック(P4-1 追加。既存 §8.2「定番シナリオ②が未実装」の穴を埋める)
+# ─────────────────────────────────────────────────────────────────────────────
+#   幾何は RiMEA Test 12 / Seyfried et al. 2009(HERMES)の標準形:
+#     部屋(room_len × room_width)→ 幅 w の開口 → 短い出口通路(exit_len)。
+#   全員が開口を目指し、開口線 x=room_len の通過時刻から specific flow J/w を測る。
+#   w ∈ {0.8, 1.0, 1.2, 1.6, 2.4} m を掃引する(§2.4 の参照値 ≈1.9 (m·s)⁻¹ は
+#   b=0.6–2.5 m の範囲なので、この掃引はその範囲に収まる)。
+#   ★Jülich 実測(hermes_bottleneck)は b=2.4–5.0 m なので **w=2.4 だけが重なる**。
+#     この非重複は README の限界節に明記する。
+BOTTLENECK_WIDTHS = (0.8, 1.0, 1.2, 1.6, 2.4)
+
+
+def _bottleneck_walls(room_len, room_width, w, exit_len, pad=1.0):
+    """部屋 + 開口 + 出口通路の壁線分。開口は y 方向の中央に幅 w。"""
+    lo = (room_width - w) / 2.0
+    hi = (room_width + w) / 2.0
+    return [((0.0, 0.0), (0.0, room_width)),                       # 部屋の奥
+            ((0.0, 0.0), (room_len, 0.0)),                         # 部屋の下辺
+            ((0.0, room_width), (room_len, room_width)),           # 部屋の上辺
+            ((room_len, 0.0), (room_len, lo)),                     # 隔壁(下)
+            ((room_len, hi), (room_len, room_width)),              # 隔壁(上)
+            ((room_len, lo), (room_len + exit_len + pad, lo)),     # 出口通路(下)
+            ((room_len, hi), (room_len + exit_len + pad, hi))]     # 出口通路(上)
+
+
+def run_bottleneck(engine_kind, w=1.2, n_agents=80, room_len=8.0, room_width=5.0,
+                   exit_len=2.0, dt=0.05, t_total=40.0, seed=20260805,
+                   engine_kw=None):
+    """部屋 → 幅 w の開口 → 出口通路。specific flow J/w を測るためのラン。
+
+    経路は 2 段ウェイポイント(開口の 1 m 先 → まっすぐ前方)。開口を抜けて
+    x > room_len + exit_len に達した個体は待機列へ退避(active=False)し、
+    以後は力学から切り離す(再投入しない = 有限人数の排出過程)。
+    乱数は初期配置のみ(積分ループ内はゼロ)= 決定論。"""
+    ids = list(range(n_agents))
+    v0, radius = agent_params(ids)
+    rng = np.random.default_rng(seed)
+    pos = _init_positions(rng, n_agents, 0.45, room_len - 0.45,
+                          0.45, room_width - 0.45, radius)
+    vel = np.zeros((n_agents, 2))
+    y_c = room_width / 2.0
+    goal = np.column_stack([np.full(n_agents, room_len + 1.0),
+                            np.full(n_agents, y_c)])
+    walls = _bottleneck_walls(room_len, room_width, w, exit_len)
+
+    eng = make_engine(engine_kind, pos=pos, vel=vel, goal=goal, v0=v0, radius=radius,
+                      walls=walls, neighbor_dist=NEIGHBOR_DIST, **(engine_kw or {}))
+
+    n_steps = int(round(t_total / dt))
+    P = np.zeros((n_steps + 1, n_agents, 2))
+    V = np.zeros((n_steps + 1, n_agents, 2))
+    W = np.zeros((n_steps + 1, n_agents), dtype=bool)
+    A = np.ones((n_steps + 1, n_agents), dtype=bool)
+    P[0], V[0] = eng.pos.copy(), eng.vel.copy()
+    done = np.zeros(n_agents, dtype=bool)
+    x_out = room_len + exit_len
+
+    for t in range(1, n_steps + 1):
+        past = eng.pos[:, 0] >= room_len
+        eng.goal[:, 0] = np.where(past, eng.pos[:, 0] + GOAL_AHEAD, room_len + 1.0)
+        eng.goal[:, 1] = np.where(past, eng.pos[:, 1], y_c)
+        eng.step(dt)
+        out = (~done) & (eng.pos[:, 0] > x_out)
+        if out.any():
+            done |= out
+        for i in np.nonzero(done)[0]:
+            eng.pos[i] = _park_slot(i)
+            eng.vel[i] = 0.0
+        W[t] = out
+        A[t] = ~done
+        P[t], V[t] = eng.pos.copy(), eng.vel.copy()
+
+    return Trace(pos=P, vel=V, wrap=W, active=A, dt=dt,
+                 meta={"scenario": "bottleneck", "engine": engine_kind,
+                       "n_agents": n_agents, "w": w, "room_len": room_len,
+                       "room_width": room_width, "exit_len": exit_len,
+                       "line_x": room_len, "n_evacuated": int(done.sum()),
                        "mean_v0": float(v0.mean())})

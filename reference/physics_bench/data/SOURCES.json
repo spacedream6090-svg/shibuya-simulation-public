@@ -1,0 +1,77 @@
+{
+  "license": "CC BY 4.0",
+  "source": "Forschungszentrum Juelich, Pedestrian Dynamics Data Archive",
+  "source_url": "https://ped.fz-juelich.de/database",
+  "accessed": "2026-08-05",
+  "datasets": {
+    "hermes_uni_closed": {
+      "status": "ok",
+      "runs": 24,
+      "samples": 6595,
+      "doi": "10.34735/ped.2009.13",
+      "steady_samples": 5239
+    },
+    "hermes_uni_open": {
+      "status": "ok",
+      "runs": 29,
+      "samples": 4134,
+      "doi": "10.34735/ped.2009.14",
+      "steady_samples": 3291
+    },
+    "basigo_uni_corr": {
+      "status": "ok",
+      "runs": 9,
+      "samples": 3134,
+      "doi": "10.34735/ped.2013.6",
+      "steady_samples": 2522
+    },
+    "hermes_bottleneck": {
+      "status": "ok",
+      "runs": 5,
+      "doi": "10.34735/ped.2009.6"
+    },
+    "basigo_crossing90": {
+      "status": "ok",
+      "runs": 43,
+      "samples": 13811,
+      "doi": "10.34735/ped.2013.4",
+      "note": "central 2x2 m; relative judgement only (multi-directional)"
+    }
+  },
+  "files": {
+    "juelich_bottleneck_flow.csv": {
+      "bytes": 463,
+      "sha256": "18750c93630dc83197cfe10f5270caa7c398d5e34a8ce6ecbb7f6eb03e889a90"
+    },
+    "juelich_crossing90_fd.csv": {
+      "bytes": 536729,
+      "sha256": "705020b467ea94e4e57669f12d242dd097ec1ec73f0db1b3c4614ea863e79885"
+    },
+    "juelich_fd_binned.csv": {
+      "bytes": 2496,
+      "sha256": "b1e375d81a14082ffb83280cd50a4e68384f3f4b0a0a8d775cc4075a147e8b54"
+    },
+    "juelich_fd_binned_basigo_uni_corr.csv": {
+      "bytes": 1539,
+      "sha256": "7265d66ac98e42ef88a81618677fecd10646906ec7718b890df7e0fa045041ee"
+    },
+    "juelich_fd_binned_hermes_uni_closed.csv": {
+      "bytes": 1943,
+      "sha256": "ad37d78fe54277ccbfc9feaafdf9517495408c64dcf23dbfb67827676aca600f"
+    },
+    "juelich_fd_binned_hermes_uni_open.csv": {
+      "bytes": 1706,
+      "sha256": "754be25cac7f7d4e0b39c63fb8a8e9ddbeb96181e9ce2c70383a5bd4053adbd2"
+    },
+    "juelich_fd_runs.csv": {
+      "bytes": 6098,
+      "sha256": "8a3685feb267b690aaa8897c8871825aeea6ab80465a37d8ecb89c2c2da27497"
+    },
+    "juelich_fd_samples.csv": {
+      "bytes": 892375,
+      "sha256": "25d32a6eb50b9321ff567a52c6bc6c0a9bc9fbc132f2b5c54ed9be5a42f74726"
+    }
+  },
+  "fd_total_samples": 13863,
+  "fd_steady_samples": 11052
+}
