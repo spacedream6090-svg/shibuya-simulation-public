@@ -32,6 +32,7 @@ from .. import mobility as mobility_mod
 from .. import opinion as opinion_mod
 from .. import party as party_mod
 from .. import physics as physics_mod
+from .. import provlink as provlink_mod
 from .. import relations as relations_mod
 from .. import relations_endo as relations_endo_mod
 from .. import pov as pov_mod
@@ -2157,6 +2158,11 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
         _log_reject(sim, agent, response, trigger, step, sim_min)
     else:
         deliberate.store_action(sim, agent, step, sim_min, trigger, action)
+        # IF-1(observer.llm_link。既定 OFF=この 1 行は即 return=キーを積まない)。
+        # role は l1b_llm に記録した purpose と**同じ値**(= trigger)を使う
+        # (新語彙を作らない。設計 provlink.py / if-lane-research.md §4-3-1)。
+        # ★store_action の**後**に積む: 方針キャッシュに一時キーを持ち込まない。
+        provlink_mod.stamp(sim, action, call_id, trigger)
     return action
 
 
@@ -2664,6 +2670,29 @@ def _phone(sim, agent, step: int, sim_min: int) -> dict | None:
 
 # ---------------------------------------------------------------- 行動適用
 def _apply(sim, agent, action: dict, step: int, sim_min: int) -> None:
+    """行為の適用(**唯一のディスパッチャ**)+ 来歴スコープの開閉(IF-1)。
+
+    observer.llm_link=true のときだけ、行為 dict に積まれた一時キー ``_prov``
+    (= その行為を決めた LLM 呼の ``(llm_call_id, role)``)を取り出し、
+    この ``_apply`` のあいだ **行為者自身が出す L1 イベント**へ刻む
+    (PROV の ``wasInformedBy`` 辺 1 本)。tools / P2 / verify / free_action の
+    サブディスパッチャは 1 行も改変せずに巻き込める(logger 側で刻むため)。
+
+    既定 OFF では ``_prov`` が**そもそも積まれない**ので ``prov is None`` の
+    分岐しか通らない = ゴールデン L1 バイト一致(構造による保証)。
+    """
+    prov = provlink_mod.take(action)
+    if prov is None:
+        _apply_action(sim, agent, action, step, sim_min)
+        return
+    sim.logger.set_prov(prov[0], prov[1], int(agent.id))
+    try:
+        _apply_action(sim, agent, action, step, sim_min)
+    finally:
+        sim.logger.clear_prov()
+
+
+def _apply_action(sim, agent, action: dict, step: int, sim_min: int) -> None:
     kind = action["type"]
 
     if kind in ("host_event", "post_flyer", "found_group", "propose",
@@ -2690,6 +2719,29 @@ def _apply(sim, agent, action: dict, step: int, sim_min: int) -> None:
         # (=wander 相当)= 既定 OFF のイベント 0 件・状態変化ゼロ。裁定は truth_ledger に
         # 閉じる(engine は真偽台帳の中身を読まない=呼ぶだけ)。LLM 呼ゼロ・乱数ゼロ。
         truth_ledger_mod.apply_verify(sim, agent, action, step, sim_min)
+        return
+
+    if kind in ("plan", "recall", "reflect"):
+        # ---- 明示分岐(監査 §5-2 の穴。第93バッチ IF-A)------------------------ #
+        #  この 3 種は **熟慮(deliberate)経路では文脈外**の行為である:
+        #    plan    … 朝の計画呼(cognition/planning.py)だけが消費する。日中の熟慮で
+        #              返ってきても実行できる予定表の入れ物が無い。
+        #    recall  … 内省の agentic pull 第 1 段(memory.agentic_pull)が消費する。
+        #    reflect … 夜の内省(cognition/reflection.py)が消費する。
+        #  従来はここまで if 連鎖を素通りして **無音の no-op** になっていた。
+        #  KNOWN_ACTIONS に含まれるので undefined_action にも落ちず、fallback にも
+        #  数えられない = 「LLM は行為を主張したのに世界のどこにも記録が無い」観測の穴。
+        #  ★世界への作用は従来どおり **完全 no-op**(1 バイトも動かさない)。
+        #    観測だけを足す = observer.llm_link ON のときにこの 1 件を出す。
+        #  ★fallback 集計との整合: kind は既存の "fallback" を再利用するので
+        #    observer.llm_health の llm_fallback_rate の分子に入る。payload の
+        #    reason("misrouted_action" / 従来の "parse_error")で事後に切り分けられる
+        #    (_log_reject の undefined_action 振り分けと同じ「分子は排他」の流儀)。
+        if provlink_mod.enabled(sim):
+            sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                                 kind="fallback", x=agent.x, y=agent.y,
+                                 payload={"reason": "misrouted_action",
+                                          "action": kind}))
         return
 
     if kind == "stay":

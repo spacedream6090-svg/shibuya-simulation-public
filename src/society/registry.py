@@ -243,6 +243,20 @@ FEATURES: tuple[Feature, ...] = (
        "day_plan v1(構造化された朝の計画)。ブロック 4〜8 + contingency ≤3 の列挙型スキーマ・"
        "スキーマ/物理検証→決定的修復→前日計画/既定ルーチンへのフォールバック・"
        "priority×flex による割り込み(could は LLM を呼ばず削り must 危機だけ再計画)"),
+    # 第93バッチ IF-A: contingency(if_then)の消費。第86 は書かせて格納するだけで
+    # **消費するコードが無かった**(監査 §5-1「デッドデータ」)ので、その穴を塞ぐ子トグル。
+    # journal 等級の根拠: 適用する条件・対処が **LLM の構造化出力**(plan["cont"])に由来する
+    #   = 親の day_plan.enabled と同じ理由(判定規則そのものは決定論)。
+    # affects_k=False: generate() の呼び出し点を 1 つも足さない(評価も適用も完全決定論・
+    #   乱数ゼロ)。行き先が変われば co-location 経由で発火数が間接的に動きうるのは
+    #   commerce / health / disaster と同型で、レジストリ冒頭の方針どおり False 側。
+    # fingerprint_risk=none: **プロンプトを 1 バイトも変えない**(if_then の書式は
+    #   day_plan ON なら本トグルの ON/OFF と無関係に schema_prompt へ載る)。
+    _f("planning.day_plan.use_contingency", "journal", False, "none",
+       "day_plan の contingency(if_then)を実行時に消費する。ブロック実行の直前に "
+       "CONDS 7 種を決定論評価し(前提機構が OFF の条件は常に不成立=捏造しない)、"
+       "最初に成立した 1 件だけ THENS 5 種を適用して plan_cont_fire を 1 件記録する。"
+       "1 ブロックにつき発火は高々 1 回(振動しない)"),
     _f("cognition.engaged.enabled", "journal", True, "possible",
        "engaged モード = AUTOPILOT / ENGAGED の 2 状態機械(第87バッチ。設計 §8)。"
        "第81 fire が答えた『いつ考えるか』(= 点)の上に『いつまで考えるか』(= 区間)を"
@@ -522,6 +536,20 @@ FEATURES: tuple[Feature, ...] = (
        "意見力学(Friedkin-Johnsen)。入力は発話から決定論で採った感情価スカラーのみ"),
     _f("observer.run_manifest", "strict", False, "none",
        "run_manifest.json を書く(記録専用・シムは読まない)"),
+    # 第93バッチ IF-1(行為 → 思考の来歴リンク)。設計 src/society/provlink.py /
+    # docs/research/if-lane-research.md §4(W3C PROV-DM の wasInformedBy + prov:role)。
+    # strict の根拠: L1 の**既存固定列 llm_call_id と payload の 1 キー**を埋めるだけの
+    #   記録専用層。LLM の自由文を新たに読む経路を 1 つも足さず、乱数も 1 本も引かない。
+    # affects_k=False: generate() の呼び出し点を足しも減らしもしない(既に撃った呼の id を
+    #   行為イベントへ写すだけ)。
+    # fingerprint_risk=none: プロンプトを 1 バイトも変えない(id は L1 にしか出ない)。
+    _f("observer.llm_link", "strict", False, "none",
+       "行為イベントへ (llm_call_id, role) の対を刻む(PROV の wasInformedBy 辺 1 本)。"
+       "role の語彙は l1b_llm の purpose と同一で新語彙を作らない。刻むのは**行為者自身が"
+       "出したイベントだけ**(聞き手側の hear/opinion_shift は別主体の activity)。"
+       "ON のときだけ、熟慮経路に迷い込んだ plan/recall/reflect を "
+       "fallback{reason:misrouted_action} として計上する(従来は無音の no-op=観測の穴)。"
+       "DAG はシム側に持たせない(捕集と組み立ての分離)= 観測がシムを変えない"),
     _f("observer.llm_health.enabled", "strict", False, "none",
        "L2 に LLM 健全性 KPI 3列を足す(観測専用・累積カウンタ)"),
     _f("observer.echo.enabled", "strict", False, "none",

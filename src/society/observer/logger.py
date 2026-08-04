@@ -50,6 +50,19 @@ class ObserverLogger:
         # fallback と**排他**(scheduler._log_reject がどちらか片方だけを出す)。
         # 出力には現れない内部カウンタ = 既定 OFF なら 0 のまま・L1/L2 ともバイト一致。
         self.n_undefined_action_events: int = 0
+        # ---- 行為 → 思考の来歴リンク IF-1(observer.llm_link。既定 OFF=常に None)----
+        # scheduler._apply が「いまこの行為を適用中」のあいだだけ
+        # (llm_call_id, role, 行為者 agent_id)を立てる。既定 OFF では
+        # scheduler が一時キー(_prov)を 1 度も積まないので **None のまま**
+        # = 下の分岐に入らない = 既存ランと L1 バイト一致。設計は society/provlink.py。
+        self._prov: tuple | None = None
+
+    # ---- 来歴スコープ(scheduler._apply が開閉する。observer.llm_link ON のみ)----
+    def set_prov(self, call_id: str, role: str, agent_id: int) -> None:
+        self._prov = (str(call_id), str(role), int(agent_id))
+
+    def clear_prov(self) -> None:
+        self._prov = None
 
     # ---- L1 ----
     def log(self, event: Event) -> None:
@@ -62,6 +75,13 @@ class ObserverLogger:
             self.n_fallback_events += 1
         elif event.kind == "undefined_action":     # 未定義行動レジスタ(既定 OFF では 0 件)
             self.n_undefined_action_events += 1
+        # PROV の wasInformedBy 辺 1 本(IF-1)。**行為者自身のイベントだけ**に刻む
+        # (聞き手の hear / opinion_shift は別の主体の activity なので刻まない)。
+        # 既に llm_call_id を持つイベント(llm_deliberate / plan_created 等)は上書きしない。
+        if self._prov is not None and event.agent_id == self._prov[2]:
+            if event.llm_call_id is None:
+                event.llm_call_id = self._prov[0]
+            event.payload.setdefault("llm_role", self._prov[1])
         self.events.append(event)
 
     # ---- L1b ----

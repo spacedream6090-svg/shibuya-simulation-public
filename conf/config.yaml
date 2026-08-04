@@ -765,6 +765,22 @@ planning:
     day_end_min: 1440         # 計画が収まるべき日の終端[分 of day]
     mood_chars: 60            # 自由文欄(mood)の上限文字数
     text_chars: 80            # 自由文欄(reason / note / carry)の上限文字数
+    # ---- contingency の消費(第93バッチ IF-A・**既定 OFF** = 第86 と完全同一)----
+    # 第86 は if_then(条件分岐)を LLM に書かせ検証・格納するが **消費するコードが無かった**
+    # (監査 §5-1「contingency がデッドデータ」)。ON にするとブロックの実行直前に
+    # `plan["cont"]` を **決定論**(乱数ゼロ・LLM ゼロ)で評価し、最初に成立した 1 件だけを
+    # 適用して plan_cont_fire を 1 件記録する。
+    #   条件: rain(当日の天気が雨/雪)/ crowded(env.feedback で待ち行列中の POI)/
+    #         closed(commerce の営業時間外)/ tired(health の fatigue_high 超え)/
+    #         no_money(economy の当該カテゴリ価格に所持金が届かない)/
+    #         late(割り込み処理で後ろへずらされた=slid>0)/ invited(joint の当日予定と時間帯が重なる)
+    #   ★前提機構が OFF の条件は**常に不成立**(捏造しない)。詳細は day_plan.py の docstring。
+    #   対処: skip(やめる)/ postpone(postpone_min 後ろへ)/ go_home(自宅へ)/
+    #         swap_indoor(屋外カテゴリを屋内へ)/ shorten(shorten_min 短縮)
+    # プロンプトは 1 バイトも変わらない(if_then の書式は day_plan ON なら本トグルと無関係に載る)。
+    use_contingency: false
+    postpone_min: 60          # then=postpone のずらし幅[分](max_slide_min を超えたら削除)
+    shorten_min: 30           # then=shorten の短縮幅[分](min_dur_min は下回らない)
 
 # ---- 確率的実行=行動のゆらぎ(P2 スライス S4。docs/plans/p2-interstitial-design.md §1 S4 /
 #      docs/research/interstitial-life.md §4.1 の実証3層 L1/L2/L3 + Gumbel)。既定 OFF=現行と完全同一 ----
@@ -1601,6 +1617,25 @@ observer:
   # **書くだけ・読む経路なし** = L1/L2/L3・summary・決定論・LLM 呼数のいずれにも影響しない。
   # 同じ out_dir を再利用/resume したときは前回分の要点を history に畳んで残す(来歴を失わない)。
   run_manifest: true
+  # ---- 行為 → 思考の来歴リンク IF-1(第93バッチ 2026-08-05・**既定 OFF**)----
+  # 正典: docs/research/llm-world-interface-audit.md §4/§6 IF-1 /
+  #       docs/research/if-lane-research.md §4(W3C PROV-DM の wasInformedBy + prov:role)。
+  # ON にすると「LLM が決めた行為」が生む L1 イベント(speak / sns_post / dm / spend /
+  # free_action / tools 系 / P2 系 / verify 系 …)に、**その行為を決めた LLM 呼**の
+  #   - llm_call_id … 既存の L1 固定列(これまで思考系イベントにしか入っていなかった)
+  #   - llm_role    … payload の新キー。**l1b_llm.parquet の purpose と同じ語彙**
+  #                   (social / reply / dm / post / solo / novel_place / congestion /
+  #                    unknown_word / plan)= 新語彙を 1 つも作らない
+  # を刻む。これで (step, agent_id) join に頼らず l1b_llm と 1:1 で突き合わせられる
+  # (同 step 複数発火の曖昧さが構造的に消える)。
+  # ★刻むのは **行為者自身が出したイベントだけ**(聞き手の hear / opinion_shift は
+  #   別主体の activity なので刻まない)。DAG の組み立ては事後の解析側の仕事で、
+  #   シム側はグラフを持たない(捕集と組み立ての分離=観測がシムを変えない)。
+  # ★ON のときだけ、熟慮経路に迷い込んだ plan / recall / reflect を
+  #   fallback{reason:"misrouted_action"} として 1 件記録する(従来は無音の no-op)。
+  # 読むだけ・乱数ゼロ・LLM 呼ゼロ・プロンプト 1 バイト不変。
+  # OFF では一時キーすら積まれない = ゴールデン L1 バイト一致。実装 src/society/provlink.py。
+  llm_link: false
   # ---- 状態ハッシュチェーン(第78バッチ 2026-07-31・**既定 OFF**)----
   # 検証ラン(run.mode=verify)専用の装置。ON にすると各 step の終了時に world state の
   # **正準シリアライズ**(dict/set はキーでソート・浮動小数は固定桁十進・集約順固定)を

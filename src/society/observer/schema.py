@@ -350,6 +350,16 @@ register_event_kind("plan_slide",       "計画ブロックを後ろへずらし
                                         "{act, place, start, slid, priority}")
 register_event_kind("plan_replan",      "must が脅かされたので再計画した(plan_version が上がる)"
                                         "{version, n_must, freed, at}")
+# ---- contingency の消費(第93バッチ IF-A・planning.day_plan.use_contingency ON のみ・
+#      既定 OFF=0 件)。第86 が書かせて格納するだけだった plan["cont"] を実行時に
+#      **決定論**で評価・適用した瞬間を 1 件だけ記録する(乱数ゼロ・LLM 呼ゼロ)。
+#      1 ブロックにつき高々 1 回(cond の評価順は LLM が書いた並びのまま=先頭一致)。
+register_event_kind("plan_cont_fire",   "計画の『もし〜なら』が成立して対処を適用した"
+                                        "{cond(rain|crowded|closed|tired|no_money|late|invited), "
+                                        "then(skip|postpone|go_home|swap_indoor|shorten), "
+                                        "block, act, place, start, applied}"
+                                        "。applied=false は条件は成立したが対処が空振り"
+                                        "(既に屋内だった等)= 世界は動いていない")
 # ---- engaged モード(第87バッチ・cognition.engaged ON のみ・既定 OFF=0件)。
 #      AUTOPILOT / ENGAGED の 2 状態機械。実装 src/society/cognition/engaged.py。
 #      原文書 §8 補助規則 3「全エピソードのログ(トリガー種別・滞在時間・ターン数・

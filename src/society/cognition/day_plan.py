@@ -86,6 +86,10 @@ R1 ドクトリン(既定 OFF=1 バイトも動かさない)
   生えない・**乱数 stream を 1 本も引かない**。
 - ON でも **generate() を 1 本も足さない**(朝 1 呼のまま・再試行なし)。修復・フォールバック・
   場所解決・割り込み処理は全て決定論(乱数ゼロ・LLM ゼロ)。
+- `planning.day_plan.use_contingency: false`(第93バッチ IF-A)では `plan["cont"]` を
+  **1 度も読まない** = 第86 の挙動と完全同一(plan_cont_fire 0 件)。ON でも評価・適用は
+  全て決定論(乱数ゼロ・LLM ゼロ)で、プロンプトは 1 バイトも変わらない
+  (if_then の書式は day_plan ON なら本トグルと無関係に `schema_prompt` へ載る)。
 - `must` が脅かされたときだけ「再計画」が起きる。本バッチの再計画は**ルール内の作り直し**
   (低優先の削除+ずらし+plan_version++)であり、LLM 呼を足さない。第81 の認知イベントキューが
   ON のときだけ、内部発火(INTERNAL)として **plan_exception** を前倒し登録する
@@ -176,6 +180,19 @@ CONDS: tuple[str, ...] = (
 )
 THENS: tuple[str, ...] = ("skip", "postpone", "go_home", "swap_indoor", "shorten")
 
+# then="swap_indoor" の差し替え表(第93 IF-A)。**屋外カテゴリだけ**を屋内へ寄せる。
+#   street → shop        … 戸外の用足しを店の中で済ませる
+#   leisure → cinema     … 屋外の遊び(公園・広場)を屋内の娯楽へ
+#   landmark / attraction → hall … 屋外の見どころを屋内の会場へ
+# 差し替え先が解決できないときは home(自宅)へ落とす。屋内カテゴリのブロックは何もしない
+# (条件成立は記録するが applied=false)。★新しい選択ヒューリスティックは足していない:
+# 差し替えた先の具体ノードは既存の resolve_place(習慣 → 距離 → node 昇順)が決める。
+OUTDOOR_PLACES: tuple[str, ...] = ("street", "leisure", "landmark", "attraction")
+INDOOR_SWAP: dict[str, str] = {
+    "street": "shop", "leisure": "cinema",
+    "landmark": "hall", "attraction": "hall",
+}
+
 # ---- 決定論写像(全て純関数・設定不要)----------------------------------------- #
 # act → 既定の場所カテゴリ(LLM が place を落とした/壊した時の substitute 先)。
 #   routine._PLAN_CAT(meal→food / shop→shop / leisure→leisure / park→leisure /
@@ -228,6 +245,9 @@ FALLBACK_KINDS: tuple[str, ...] = ("prev_day", "skeleton")
 # --------------------------------------------------------------------------- #
 DEFAULTS = {
     "enabled": False,
+    "use_contingency": False,    # 第93 IF-A: plan["cont"] を実行時に消費する(既定 OFF)
+    "postpone_min": 60,          # then=postpone のずらし幅[分]
+    "shorten_min": 30,           # then=shorten の短縮幅[分]
     "min_blocks": 4,             # スキーマが要求する最小ブロック数(§7: 4〜8)
     "max_blocks": 8,             # 同・最大(超過は clip=低優先から落とす)
     "max_conting": 3,            # contingency の最大件数(§7: 最大3個)
@@ -242,10 +262,11 @@ DEFAULTS = {
     "mood_chars": 60,            # 自由文欄の上限(mood)
     "text_chars": 80,            # 自由文欄の上限(reason / note / carry)
 }
-_BOOL_KEYS = ("enabled",)
+_BOOL_KEYS = ("enabled", "use_contingency")
 _INT_KEYS = ("min_blocks", "max_blocks", "max_conting", "round_min",
              "min_dur_min", "max_dur_min", "grace_min", "transfer_min",
-             "max_slide_min", "day_end_min", "mood_chars", "text_chars")
+             "max_slide_min", "day_end_min", "mood_chars", "text_chars",
+             "postpone_min", "shorten_min")
 _FLOAT_KEYS = ("walk_m_per_min",)
 
 
@@ -907,6 +928,12 @@ def apply(sim, agent, step: int, sim_min: int, response: str,
             "carry": _text((raw or {}).get("carry")
                            or (raw or {}).get("carryover"), cfg["text_chars"]),
             "blocks": blocks, "cont": conts, "src": fallback or "llm"}
+    # IF-1(observer.llm_link。既定 OFF ではキー自体を生やさない = 状態も出力も不変)。
+    # 「この計画を書いた朝の LLM 呼」を控えておき、日中にブロックを実行して生まれる
+    # 行為イベントから role="plan" で参照できるようにする(PROV の wasInformedBy)。
+    from .. import provlink as _provlink
+    if call_id and _provlink.enabled(sim):
+        plan["call_id"] = str(call_id)
     agent._dayplan = plan
     agent._dayplan_prev = [dict(b) for b in blocks]
     agent.day_plan = []          # 旧表現は使わない(routine の旧経路を確実に黙らせる)
@@ -1073,6 +1100,200 @@ def note_plan_exception(sim, agent, sim_min: int) -> None:
     agent._plan_exception = int(sim_min)          # 第87 が読む印(本バッチでは記録のみ)
 
 
+# --------------------------------------------------------------------------- #
+# contingency の消費(第93バッチ IF-A・use_contingency ON のみ・既定 OFF=0 件)
+#
+# 監査 §5-1 の穴: 第86 は if_then を最大 3 個 LLM に書かせ、検証して `plan["cont"]` へ
+# 格納するが **読むコードが無かった**(デッドデータ)。ここがその消費側。
+#
+# 契約
+# ----
+# - **完全決定論**: 乱数を 1 本も引かず、LLM を 1 本も呼ばず、プロンプトを 1 バイトも
+#   変えない(if_then の書式は day_plan ON なら本トグルと無関係に schema_prompt に載る)。
+# - 判定材料は **既存の世界状態だけ**。前提の機構が OFF の条件は **常に不成立**
+#   (欠測を「起きた」とも「起きなかった」とも捏造しないための片側倒し)。
+# - 評価点は **ブロックが「いま実行すべき」になった瞬間の 1 回だけ**(plan_action)。
+#   `_sweep`(割り込み処理)には置かない: あちらは priority×flex の規則が既に
+#   ずらす/削るを決めており、そこへ第 2 の規則を差し込むと同じブロックに 2 つの
+#   対処が重なる(振動する)。
+# - 成立したのは **最初の 1 件だけ**を適用する(cont の並びは LLM が書いた順のまま)。
+#   適用後は `cont_done` を立てて 1 ブロック 1 回に固定する(postpone の無限先送り防止)。
+#
+# 各条件が「評価できる」条件(= 前提機構)。**満たさないランでは常に False**:
+#   rain      … weather.enabled(sim.today_weather の cond が悪天候語)
+#   crowded   … env.feedback.enabled かつ env.feedback.poi.enabled
+#                (envfeedback.blocked_nodes = 待ち行列で塞がっている POI)
+#   closed    … commerce.enabled(営業時間表。_open_now と同一の判定)
+#   tired     … health.enabled(fatigue が既存閾値 fatigue_high 以上)
+#   no_money  … economy.enabled かつ **そのカテゴリに価格が定義されている**
+#                (food/cafe/shop/nightlife/leisure。service/office/education 等は
+#                 価格が無い = 判定不能なので常に False)
+#   late      … 前提なし(割り込み処理でずらされた = slid>0 が「遅れた」の実体)
+#   invited   … joint.enabled(当日の共同予定 band とブロックの時間帯が重なる)
+#
+# 評価**できない**条件は 1 つも無い(CONDS 7 種すべてに実装がある)が、上のとおり
+# 前提機構が OFF のランでは発火しない。これは「実装が無い」のではなく
+# 「その世界にはその現象が存在しない」ので、捏造せず False を返している。
+# --------------------------------------------------------------------------- #
+def _cond_rain(sim, agent, b: dict, cfg: dict, sim_min: int) -> bool:
+    """当日の天気が悪天候(雨・雪)か。weather OFF では today_weather が無い=False。"""
+    from .. import weather as _weather
+    w = getattr(sim, "today_weather", None)
+    # 悪天候語の定義は weather 側の単一源を参照する(二重定義を作らない)。
+    return bool(w) and str(w.get("cond", "")) in _weather._BAD_CONDS
+
+
+def _cond_crowded(sim, agent, b: dict, cfg: dict, sim_min: int) -> bool:
+    """行き先が待ち行列で塞がっているか(env.feedback 規則3の poi_hold)。"""
+    from .. import envfeedback as _envfb
+    node = b.get("node")
+    return bool(node) and node in _envfb.blocked_nodes(sim)
+
+
+def _cond_closed(sim, agent, b: dict, cfg: dict, sim_min: int) -> bool:
+    """行き先カテゴリがいま閉まっているか(commerce OFF では常に開店=False)。"""
+    return not _open_now(sim, b, sim_min)
+
+
+def _cond_tired(sim, agent, b: dict, cfg: dict, sim_min: int) -> bool:
+    """疲労が既存の「高疲労」閾値(health.fatigue_high)以上か。health OFF は False。"""
+    hcfg = getattr(sim, "healthcfg", None)
+    if not hcfg or not hcfg.get("enabled"):
+        return False
+    return float(getattr(agent, "fatigue", 0.0) or 0.0) >= float(hcfg["fatigue_high"])
+
+
+def _cond_no_money(sim, agent, b: dict, cfg: dict, sim_min: int) -> bool:
+    """行き先カテゴリの価格に所持金が届かないか。価格が定義されていなければ False。"""
+    from ..economy import price_of as _price_of
+    eco = getattr(sim, "economy", None)
+    if not eco or not eco.get("enabled"):
+        return False
+    price = float(_price_of(str(b["place"]), eco, getattr(sim, "rulebook", None)))
+    return price > 0.0 and float(getattr(agent, "money", 0.0) or 0.0) < price
+
+
+def _cond_late(sim, agent, b: dict, cfg: dict, sim_min: int) -> bool:
+    """このブロックが後ろへずらされているか(= 割り込み処理が「遅れ」と判定した実体)。"""
+    return int(b.get("slid", 0) or 0) > 0
+
+
+def _cond_invited(sim, agent, b: dict, cfg: dict, sim_min: int) -> bool:
+    """当日の共同予定(誘い)の時間帯がこのブロックと重なるか。joint OFF は False。"""
+    jt = getattr(agent, "joint_today", None)
+    if not jt:
+        return False
+    lo, hi = jt["band"]
+    return int(b["start"]) < int(hi) and int(lo) < int(b["end"])
+
+
+COND_FN = {"rain": _cond_rain, "crowded": _cond_crowded, "closed": _cond_closed,
+           "tired": _cond_tired, "no_money": _cond_no_money, "late": _cond_late,
+           "invited": _cond_invited}
+
+
+def _drop_block(sim, agent, b: dict, step: int, sim_min: int, reason: str) -> None:
+    """ブロックを削る(既存の drop 計上・イベントと同一形 = st['drop'] の保存則を守る)。"""
+    b["state"] = "dropped"
+    _state(sim)["drop"] += 1
+    _log(sim, agent, step, sim_min, "plan_block_drop",
+         {"act": b["act"], "place": b["place"], "start": b["start"],
+          "priority": b["priority"], "flex": b["flex"], "reason": reason})
+
+
+def _then_skip(sim, agent, b: dict, cfg: dict, step: int, sim_min: int) -> bool:
+    _drop_block(sim, agent, b, step, sim_min, "cont_skip")
+    return True
+
+
+def _then_postpone(sim, agent, b: dict, cfg: dict, step: int, sim_min: int) -> bool:
+    """postpone_min だけ後ろへずらす(既存 slide と同じ最小摂動の作法・継続は保つ)。"""
+    dur = int(b["end"]) - int(b["start"])
+    shift = int(cfg["postpone_min"])
+    start = _round_to(int(b["start"]) + shift, cfg["round_min"])
+    slid = int(b.get("slid", 0) or 0) + shift
+    if slid > int(cfg["max_slide_min"]) or start + dur > int(cfg["day_end_min"]):
+        _drop_block(sim, agent, b, step, sim_min, "cont_postpone")
+        return True
+    b["start"], b["end"], b["slid"] = start, start + dur, slid
+    _state(sim)["slide"] += 1
+    _log(sim, agent, step, sim_min, "plan_slide",
+         {"act": b["act"], "place": b["place"], "start": b["start"],
+          "slid": slid, "priority": b["priority"]})
+    return True
+
+
+def _then_go_home(sim, agent, b: dict, cfg: dict, step: int, sim_min: int) -> bool:
+    """行き先を自宅へ差し替える。自宅が無ければ削る(捏造しない)。"""
+    node = str(getattr(agent, "home_node", "") or "")
+    if not node:
+        _drop_block(sim, agent, b, step, sim_min, "cont_no_place")
+        return True
+    if b["place"] == "home" and b.get("node") == node:
+        return False                             # 既に自宅 = 空振り(世界は動かない)
+    b["place"], b["act"] = "home", "home"
+    b["purpose"] = ACT_PURPOSE["home"]
+    b["node"] = node
+    return True
+
+
+def _then_swap_indoor(sim, agent, b: dict, cfg: dict, step: int,
+                      sim_min: int) -> bool:
+    """屋外カテゴリを屋内へ差し替える。屋内ブロックなら空振り(applied=false)。"""
+    place = str(b["place"])
+    if place not in OUTDOOR_PLACES:
+        return False                             # もう屋内 = 何もしない
+    sub = INDOOR_SWAP[place]
+    node = resolve_place(sim, agent, sub, sim_min,
+                         from_node=getattr(agent, "node", ""))
+    if node is None:                             # 屋内の受け皿が無ければ自宅へ落とす
+        return _then_go_home(sim, agent, b, cfg, step, sim_min)
+    b["place"], b["node"] = sub, node
+    if b["act"] not in ACT_PLACE or ACT_PLACE[b["act"]] in OUTDOOR_PLACES:
+        b["act"] = next((a for a, p in ACT_PLACE.items() if p == sub), b["act"])
+        b["purpose"] = ACT_PURPOSE.get(b["act"], b["purpose"])
+    return True
+
+
+def _then_shorten(sim, agent, b: dict, cfg: dict, step: int, sim_min: int) -> bool:
+    """滞在を shorten_min だけ短くする(min_dur_min は下回らない)。"""
+    lo = int(cfg["min_dur_min"])
+    end = max(int(b["start"]) + lo, int(b["end"]) - int(cfg["shorten_min"]))
+    if end == int(b["end"]):
+        return False                             # もう最小 = 空振り
+    b["end"] = end
+    return True
+
+
+THEN_FN = {"skip": _then_skip, "postpone": _then_postpone,
+           "go_home": _then_go_home, "swap_indoor": _then_swap_indoor,
+           "shorten": _then_shorten}
+
+
+def apply_contingency(sim, agent, plan: dict, b: dict, cfg: dict,
+                      step: int, sim_min: int) -> bool:
+    """`plan["cont"]` を評価し、最初に成立した 1 件だけ適用する(決定論)。
+
+    返り値 = 発火したか。1 ブロックにつき高々 1 回(`cont_done` で固定)。
+    """
+    if b.get("cont_done"):
+        return False
+    for c in plan.get("cont") or ():
+        cond, then = str(c.get("if") or ""), str(c.get("then") or "")
+        fn, act_fn = COND_FN.get(cond), THEN_FN.get(then)
+        if fn is None or act_fn is None or not fn(sim, agent, b, cfg, sim_min):
+            continue
+        b["cont_done"] = True
+        # 同値の別ブロックを拾わないよう **同一性**で位置を採る(list.index は == 比較)。
+        index = next((i for i, x in enumerate(plan["blocks"]) if x is b), -1)
+        applied = bool(act_fn(sim, agent, b, cfg, step, sim_min))
+        _log(sim, agent, step, sim_min, "plan_cont_fire",
+             {"cond": cond, "then": then, "block": index, "act": b["act"],
+              "place": b["place"], "start": int(b["start"]), "applied": applied})
+        return True
+    return False
+
+
 def current_block(plan: dict, sim_min: int):
     """いま実行すべきブロック(開始済み・未消化・窓の中)。無ければ None = 空き時間。"""
     now = int(sim_min) % 1440
@@ -1097,6 +1318,15 @@ def plan_action(agent, sim, sim_min: int, step: int, rng, scfg=None):
     b = current_block(plan, sim_min)
     if b is None:
         return None
+    # ---- contingency の消費(第93 IF-A・既定 OFF=この 5 行は即素通り)------------ #
+    #  「いま実行すべきブロックが決まった直後・行き先を確定させる前」= 唯一の作用点。
+    #  適用の結果このブロックが消えた/窓から外れたら、この step は空き時間として扱う
+    #  (= 既存の習慣ポリシーが埋める。世界を止めない第86 の流儀と同じ)。
+    if cfg["use_contingency"] and plan.get("cont"):
+        if apply_contingency(sim, agent, plan, b, cfg, step, sim_min):
+            now = int(sim_min) % 1440
+            if b["state"] != "todo" or not (b["start"] <= now < b["end"]):
+                return None
     from . import routine as _routine
     dest = b["node"]
     if b["place"] == "street":                   # 戸外・特定しない = 行き先は習慣ポリシーへ委ねる
@@ -1140,7 +1370,13 @@ def plan_action(agent, sim, sim_min: int, step: int, rng, scfg=None):
     activity = ACT_ACTIVITY.get(b["act"], "")
     if activity:
         action["activity"] = activity
-    return _routine._augment_ride(agent, sim, action, step, sim_min)
+    out = _routine._augment_ride(agent, sim, action, step, sim_min)
+    # IF-1: この移動は「朝の計画」が決めたもの = その朝の LLM 呼へ辺を張る
+    # (role は l1b_llm の purpose と同じ "plan")。OFF では plan に call_id が
+    # 無いので stamp は即 return = 一時キーを積まない = バイト一致。
+    from .. import provlink as _provlink
+    _provlink.stamp(sim, out, plan.get("call_id"), "plan")
+    return out
 
 
 def _open_now(sim, b: dict, sim_min: int) -> bool:
