@@ -127,7 +127,12 @@ no-fingerprint の自己点検(propagation_off)
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import re
+from functools import lru_cache
+from pathlib import Path
 
 log = logging.getLogger("society.ablate")
 
@@ -143,6 +148,8 @@ _DEFAULTS = {
     "context_shuffle": False,
     "persona_swap": False,
     "context_sever": False,
+    # ---- プロンプト言い換え(第92バッチ SV-U1 B4 = S-16)。""=OFF / "v1".."v4"=ON ----
+    "prompt_paraphrase": "",
 }
 
 # プラセボ 3 種のキー(同一軸=相互排他の判定に使う唯一の源)
@@ -173,6 +180,16 @@ def build_cfg(block) -> dict:
             f"ablate.cognitive_tier='{tier}' は未知(有効値: {', '.join(TIERS)})。"
             "既定 full = 現行動作。")
     out["cognitive_tier"] = tier
+    mode = get("prompt_paraphrase", out["prompt_paraphrase"])
+    mode = "" if mode is None else str(mode).strip()
+    if mode:
+        names = sorted(paraphrase_sets())
+        if mode not in names:
+            raise ValueError(
+                f"ablate.prompt_paraphrase='{mode}' は未知"
+                f"(有効値: {', '.join(names) or '(表が空)'})。既定 '' = OFF = 現行動作。"
+                " セットは data/prompt_paraphrase_sets.json の凍結表が唯一の源。")
+    out["prompt_paraphrase"] = mode
     _check_placebo_exclusion(out)
     return out
 
@@ -186,8 +203,31 @@ def _check_placebo_exclusion(cfg: dict) -> None:
       重なると「消えた節」と「潰した節」を区別できない)→ ValueError。
     - llm_off との併用はプロンプトが 1 つも組まれないため**プラセボが 1 バイトも効かない**。
       落とすほどの矛盾ではない(llm_off が上位の条件)ので WARNING で告知して素通しする。
+
+    第92バッチ(S-16)で `prompt_paraphrase` を同じ軸へ入れた。理由は 2 つとも構造的である:
+    - プラセボは **SECTIONS の接頭辞リテラル一致**で文脈節を同定する
+      (tests/test_placebo.py が build_prompt の実出力に対して機械検証している)。
+      paraphrase は**その接頭辞そのものを言い換える**ので、併用すると節が同定できなくなり、
+      「入れ替えた/潰した」の効果が静かに無効化される(= 対照として解釈不能)。
+      docs/research/sv-items-research.md §3.4-1 の対策 (b)。
+    - propagation_off との併用も同じ理由で禁止(あちらは節を消し、こちらは節の見出しを変える)。
     """
     on = [k for k in PLACEBOS if cfg.get(k)]
+    para = str(cfg.get("prompt_paraphrase") or "")
+    if para and on:
+        raise ValueError(
+            f"ablate.prompt_paraphrase='{para}' と ablate.{on[0]} は併用できない。"
+            "プラセボは文脈節を**接頭辞リテラル一致**で同定するが、paraphrase はその接頭辞を"
+            "言い換えるため、節が同定できず書き換えが静かに無効化される"
+            "(docs/research/sv-items-research.md §3.4-1)。別々のランとして回すこと。")
+    if para and cfg.get("propagation_off"):
+        raise ValueError(
+            f"ablate.prompt_paraphrase='{para}' と ablate.propagation_off は併用できない。"
+            "propagation_off は節を消し、paraphrase は節の見出しを言い換える。重ねると"
+            "『消えた節』と『名前が変わった節』を区別できず差分の帰属先が失われる。")
+    if para and cfg.get("llm_off"):
+        log.warning("[ablate] llm_off=true のため ablate.prompt_paraphrase=%s は 1 バイトも効かない"
+                    "(プロンプトが 1 つも組まれない)。別ランで回すこと。", para)
     if len(on) > 1:
         raise ValueError(
             f"ablate のプラセボは同時に 1 つだけ有効にできる(指定: {', '.join(on)})。"
@@ -247,6 +287,11 @@ def context_sever(sim) -> bool:
     return bool(cfg_of(sim)["context_sever"])
 
 
+def prompt_paraphrase(sim) -> str:
+    """プロンプト言い換えセット名(""=OFF。第92バッチ S-16)。"""
+    return str(cfg_of(sim).get("prompt_paraphrase") or "")
+
+
 def placebo_mode(sim) -> str | None:
     """有効なプラセボの名前(全 OFF なら None)。相互排他なので高々 1 つ。"""
     c = cfg_of(sim)
@@ -260,6 +305,7 @@ def any_on(sim) -> bool:
     c = cfg_of(sim)
     return bool(c["llm_off"] or c["propagation_off"] or c["shuffle_partners"]
                 or c["cognitive_tier"] != "full"
+                or c.get("prompt_paraphrase")
                 or any(c.get(k) for k in PLACEBOS))
 
 
@@ -316,6 +362,9 @@ def describe(sim) -> dict | None:
            "shuffle_partners": bool(c["shuffle_partners"]),
            "tier_effective": tier_effectiveness(sim)}
     out.update({k: bool(c.get(k)) for k in PLACEBOS})   # 第89: 3 種の状態を必ず残す
+    out["prompt_paraphrase"] = str(c.get("prompt_paraphrase") or "")   # 第92: ""=OFF
+    if out["prompt_paraphrase"]:                 # 第92: 凍結表の来歴(OFF ではキーを足さない)
+        out["paraphrase"] = paraphrase_provenance(sim)
     mode = placebo_mode(sim)
     if mode is not None:                        # 第89: プラセボ L1(OFF ではキーを足さない)
         out["placebo"] = {
@@ -706,7 +755,10 @@ def make_placebo(sim):
 
 
 def attach_agent(sim, agent) -> None:
-    """個体 1 体をプラセボへ結線する(誕生時。既定 OFF は属性を 1 つも生やさない)。"""
+    """個体 1 体をプラセボ / 言い換えへ結線する(誕生時。既定 OFF は属性を 1 つも生やさない)。"""
+    pa = getattr(sim, "_paraphrase", None)
+    if pa is not None:                       # 第92: 状態を持たない(表引きだけ)ので登録不要
+        agent.paraphrase = pa
     pl = getattr(sim, "_placebo", None)
     if pl is None:
         return
@@ -734,7 +786,16 @@ def placebo_restore(sim, state) -> None:
     checkpoint の agents pickle には(プラセボ ON のランでは)Placebo が同梱されるが、
     正本は「今のプロセスが構築時に作った sim._placebo」の 1 つだけにする。ここで繋ぎ直さないと
     輪が 2 つに割れて resume != straight になる。
+
+    第92: prompt_paraphrase も同じ口で繋ぎ直す(状態を持たないので保存対象は無いが、
+    OFF のプロセスが ON の checkpoint を読んだときに属性が残るのを防ぐ)。
     """
+    pa = getattr(sim, "_paraphrase", None)
+    for agent in getattr(sim, "agents", ()) or ():
+        if pa is not None:
+            agent.paraphrase = pa
+        elif hasattr(agent, "paraphrase"):
+            del agent.paraphrase
     pl = getattr(sim, "_placebo", None)
     if pl is None:
         for agent in getattr(sim, "agents", ()) or ():
@@ -771,4 +832,162 @@ def provenance(sim) -> dict | None:
                    sections_severed=pl.n_sections_severed,
                    shuffle_starved=pl.n_shuffle_starved,
                    ring_cap=pl.cap)
+    return out
+
+
+# =========================================================================== #
+# プロンプト言い換え(第92バッチ SV-U1 B4 = サーベイ S-16)
+#   正典: docs/research/sv-items-research.md §3 / docs/research/llm-social-sim-survey.md §3 S-16
+#
+# 何を解く問題か
+# --------------
+# 「**言い回しを変えたら結論の符号が変わるか**」は一度も測っていない、というのが本リポジトリの
+# 明確な穴だった。分野の相場(Sclar et al. 2024 FormatSpread は書式だけで最大 76 accuracy point、
+# Ye et al. 2026 TRAILS は同一摂動の効果がモデル間で 1pp〜76pp)からして、
+# **頑健性は claim ごと・model ごとに測るもので仮定してはならない**。
+#
+# 判定(事前登録 前文 ④(b) と接続)
+#   1. 符号保存(必須): 全セットで主要結論 d_j の符号が保たれること。1 つでも反転したら
+#      その結論は「言い回しに依存する」として取り下げるか、言い回しを限定して報告する。
+#   2. 変動幅: spread_j = max_p d_j - min_p d_j を **seed 間レンジ**と比べる(S-05 の流用)。
+#   3. 報告は単一値でなく d_j = 中央値 [min, max](FormatSpread の提言)。
+#
+# 実装の約束(R1)
+#   - **凍結ルックアップ表のみ**。LLM で動的生成しない(生成すると呼数の構造保証=
+#     affects_k=False が壊れ、tests の呼数完全一致が成立しなくなる)。表は
+#     data/prompt_paraphrase_sets.json に置き、その sha256 を run_manifest に載せる。
+#   - **JSON キー・行動語彙(動詞名)は 1 文字も変えない**(パース互換)。表の対の
+#     どちら側にも保護語を含めない(tests/test_ablate_paraphrase.py が機械検査)。
+#   - 作用点は `cognition/deliberate.build_prompt` の末尾 1 箇所だけ(Placebo.apply と同型)。
+#     既定 OFF では個体に `paraphrase` 属性そのものが生えない = 出力はバイト一致。
+#   - 乱数を 1 本も引かない(表引きは決定論)。既存 stream の draw 順は無風。
+#   - **プラセボ 3 種 / propagation_off とは相互排他**(_check_placebo_exclusion 参照)。
+#
+# fingerprint_risk = known(正直な宣言)
+#   プロンプト文字列が変わる以上、「観測が世界を変えない」という主張は成立しない。
+#   応答が変われば発火ドライブが動き、実測の呼数も数 % 動く(propagation_off / flat_traits と
+#   同じ間接経路)。**呼び出しサイトの増減はゼロ**であることだけを構造として固定する。
+#
+# 予算上の注意(実運用)
+#   CachedLLM は内容アドレスキャッシュなので、プロンプトが変われば**全ミス**する。
+#   セット数だけ実 LLM 呼が増えるので、paraphrase ランは短ラン(≤24 step または 1 日)に
+#   限ること(ユーザー記憶 validation-runs-short)。10 日フルランを 4 本回す設計にしない。
+# =========================================================================== #
+PARAPHRASE_SCHEMA = "ablate.prompt_paraphrase/1"
+PARAPHRASE_REL = "data/prompt_paraphrase_sets.json"
+PARAPHRASE_FILE = Path(__file__).resolve().parents[2] / "data" / "prompt_paraphrase_sets.json"
+
+
+def _normalize_bytes(raw: bytes) -> str:
+    """BOM 除去 + 改行 LF 統一(observer/metrics_spec.py と同じ正規化)。
+
+    チェックアウト時の CRLF 変換で sha256 が動かないようにするため。
+    """
+    text = raw.decode("utf-8-sig")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+@lru_cache(maxsize=1)
+def paraphrase_doc() -> tuple[dict, str]:
+    """凍結表を 1 回だけ読む。返り値 = (doc, 正規化 sha256)。"""
+    try:
+        raw = PARAPHRASE_FILE.read_bytes()
+    except OSError as exc:
+        raise ValueError(
+            f"ablate.prompt_paraphrase の凍結表が読めない({PARAPHRASE_FILE}): {exc}") from exc
+    text = _normalize_bytes(raw)
+    doc = json.loads(text)
+    if doc.get("schema") != PARAPHRASE_SCHEMA:
+        raise ValueError(f"{PARAPHRASE_REL} の schema は {PARAPHRASE_SCHEMA!r} であること: "
+                         f"{doc.get('schema')!r}")
+    return doc, hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def paraphrase_sets() -> dict:
+    """セット名 → 仕様(level / desc / pairs)。表が壊れていれば ValueError。"""
+    return paraphrase_doc()[0].get("sets") or {}
+
+
+def paraphrase_digest() -> str:
+    return paraphrase_doc()[1]
+
+
+class Paraphrase:
+    """凍結表 1 セットぶんの置換器(状態を持たない=checkpoint 不要)。
+
+    **単一パスの同時置換**(最長一致優先)である理由: `str.replace` を順に掛けると
+    「A→B したあと B→C」の連鎖が起きて、表に無い文字列が生まれる。正規表現の
+    交替(長い置換元を先に並べる)で 1 回走査すれば、置換元は必ず**原文**の側だけを見る。
+    """
+
+    __slots__ = ("mode", "level", "pairs", "digest", "_re", "_table",
+                 "n_prompts", "n_lines_changed", "n_subs")
+
+    def __init__(self, mode: str, spec: dict, digest: str):
+        self.mode = mode
+        self.level = str(spec.get("level", ""))
+        self.pairs = [(str(s), str(d)) for s, d in (spec.get("pairs") or [])]
+        self.digest = digest
+        self._table = {s: d for s, d in self.pairs}
+        srcs = sorted(self._table, key=len, reverse=True)   # ★最長一致優先
+        self._re = re.compile("|".join(re.escape(s) for s in srcs)) if srcs else None
+        self.n_prompts = 0
+        self.n_lines_changed = 0
+        self.n_subs = 0
+
+    def apply(self, lines: list[str]) -> list[str]:
+        """組み上がった行リストを言い換えて返す。**行数は変えない**。"""
+        self.n_prompts += 1
+        if self._re is None:
+            return lines
+        out = list(lines)
+        for i, line in enumerate(out):
+            new, n = self._re.subn(lambda m: self._table[m.group(0)], line)
+            if n:
+                out[i] = new
+                self.n_lines_changed += 1
+                self.n_subs += n
+        return out
+
+
+def make_paraphrase(sim):
+    """prompt_paraphrase が指定されていれば Paraphrase を据える(OFF は None)。"""
+    mode = prompt_paraphrase(sim)
+    if not mode:
+        sim._paraphrase = None
+        return None
+    sets = paraphrase_sets()
+    if mode not in sets:                      # build_cfg が先に落とすので通常は到達しない
+        raise ValueError(f"ablate.prompt_paraphrase='{mode}' が凍結表に無い({PARAPHRASE_REL})")
+    sim._paraphrase = Paraphrase(mode, sets[mode], paraphrase_digest())
+    log.warning("[ablate.prompt_paraphrase=%s] プロンプトの言い回しを凍結表で差し替える"
+                "(level=%s / %d 対 / sha256=%s)。**この条件の世界は変わる**"
+                "(fingerprint_risk=known)。CachedLLM は全ミスするので短ランで回すこと。",
+                mode, sim._paraphrase.level, len(sim._paraphrase.pairs),
+                sim._paraphrase.digest[:12])
+    return sim._paraphrase
+
+
+def paraphrase_provenance(sim) -> dict:
+    """manifest の ablate.paraphrase ブロック(mode + 凍結表 sha256 + 適用量)。
+
+    sim が未結線(build_cfg だけ通した検査など)でも表から組めるようにしてある。
+    """
+    mode = prompt_paraphrase(sim)
+    doc, digest = paraphrase_doc()
+    spec = (doc.get("sets") or {}).get(mode) or {}
+    out = {"mode": mode,
+           "level": str(spec.get("level", "")),
+           "levels": list(spec.get("levels") or []),
+           "pairs": len(spec.get("pairs") or []),
+           "file": PARAPHRASE_REL,
+           "sets_sha256": digest,
+           "fingerprint_risk": "known",
+           "note": "凍結ルックアップ表による決定論の置換(LLM 生成なし・乱数なし)。"
+                   "JSON キーと行動語彙は変えない=パース互換。呼び出しサイトは増減ゼロだが、"
+                   "応答が変わるので実測の呼数と世界は変わる(変わらなければ検査として無意味)。"}
+    pa = getattr(sim, "_paraphrase", None)
+    if pa is not None:
+        out.update(prompts=pa.n_prompts, lines_changed=pa.n_lines_changed,
+                   substitutions=pa.n_subs)
     return out

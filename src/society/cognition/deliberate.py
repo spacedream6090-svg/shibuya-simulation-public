@@ -382,6 +382,18 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
     _placebo = getattr(agent, "placebo", None)
     if _placebo is not None:
         lines = _placebo.apply(agent, lines, step)
+    # プロンプト言い換え(第92バッチ・ablate.prompt_paraphrase = サーベイ S-16)。
+    # プラセボと**完全同型の seam**(既定 OFF では agent に paraphrase 属性が生えないので
+    # getattr 1 回で None を受けて素通り = 出力はバイト一致=ゴールデン維持)。
+    # ★ヘッダ定数(_HEADER_INTRO / _HEADER_FORMS / _EQUIP_INTRO …)は lines[0] と装備節に
+    #   そのまま入っているので、ここ 1 箇所で表引きすれば冒頭の固定文も同時に差し替わる。
+    #   置換は凍結表(data/prompt_paraphrase_sets.json)の単一パス同時置換で、JSON キーと
+    #   行動語彙(動詞名)は 1 文字も変えない = parse_action は不変(パース互換)。
+    # ★プラセボとは相互排他(ablate.build_cfg が構築時に落とす)。paraphrase は
+    #   SECTIONS の接頭辞そのものを言い換えるため、併用すると節が同定できなくなる。
+    _para = getattr(agent, "paraphrase", None)
+    if _para is not None:
+        lines = _para.apply(lines)
     return "\n".join(lines)
 
 

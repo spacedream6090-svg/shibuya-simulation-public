@@ -978,6 +978,10 @@ class Simulation:
         # 既定 OFF は sim._placebo=None=個体に属性を 1 つも生やさない=プロンプトはバイト一致。
         # 名簿より前に据える(誕生の各経路 _init_agent_runtime が個体を結線するため)。
         _ablate_mod.make_placebo(self)
+        # 第92バッチ: プロンプト言い換え(ablate.prompt_paraphrase = S-16)。既定 "" は
+        # sim._paraphrase=None=個体に属性を 1 つも生やさない=プロンプトはバイト一致。
+        # プラセボと同じ位置(名簿より前)に据える=誕生の全経路が attach_agent を通る。
+        _ablate_mod.make_paraphrase(self)
 
         nodes = self.dests or sorted(self.city.graph.nodes)
         # ペルソナ名簿(scripts/build_personas.py 生成物。無ければ手続き生成)
@@ -1816,6 +1820,12 @@ class Simulation:
         _plprov = _placebo_prov.provenance(self)
         if _plprov is not None:
             summary["placebo"] = _plprov
+        # ---- プロンプト言い換え 第92バッチ(ablate.prompt_paraphrase="" = 既定 OFF はキーなし)----
+        # manifest はラン開始時に書かれるので mode と凍結表 sha256 しか載らない。「実際に何行を
+        # 何回言い換えたか」(= 検査として有効だったか)は走り切ってからでないと判らないため、
+        # プラセボの provenance と同じ流儀でここに残す。0 件のランは検査として無効と事後に判る。
+        if _placebo_prov.prompt_paraphrase(self):
+            summary["prompt_paraphrase"] = _placebo_prov.paraphrase_provenance(self)
         # ---- 退行シグナル監視 第91バッチ(observer.regression.enabled=false = 既定 OFF はキーなし)----
         # 設計 §3 の 4 群を L2 列として出した仕様と、「語彙系から外した発話の総数」を残す。
         # 除外総数を残すのは第87 の申し送り(定型応答は機構由来の定数なので語彙指標から

@@ -11,12 +11,22 @@ mock LLM ラン では LLM 依存の行動頻度(発話・投稿・グループ�
 意味が薄いので、表では「LLM依存」と明記して機械系(睡眠・通勤・経済・事件率)と分ける。
 
 判定: ✅=バンド内 / 高=上限の何倍か / 低=下限の何分の1か。
+
+第92バッチ(SV-U1 B3・2026-08-05)で **個体間分散の節**を追加した(S-03)。
+「LLM は average personality を示し集団の行動的異質性を狭める」(Wu, Peng, Ito & Xiao 2025,
+arXiv:2506.19806)への直接の応答で、**平均が ✅ でも分散が現実の何割かを併記**する。
+実装の約束:
+  - Gini は**新規に書かない**。同ディレクトリの build_panel._gini(凍結対象外)を import。
+  - CV / 分位も scripts/model_battery/metrics.py の既存実装(cv / quantile)を import。
+  - 現実側は data/battery/reference/ の provenance JSON からのみ読む(捏造しない)。
+  - 本ファイルは metrics_spec_hash の SPEC_FILES 14 本に**含まれない**ので凍結は破れない。
 """
 from __future__ import annotations
 
 import argparse
 import bisect
 import json
+import math
 import os
 import statistics as st
 import sys
@@ -32,10 +42,18 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import build_panel as bp                       # noqa: E402  (活動復元の再利用=二重実装回避)
+from model_battery import metrics as bm        # noqa: E402  (cv / quantile の既存実装)
+from model_battery import reference as bref    # noqa: E402  (現実バンドの来歴強制ローダ)
 from society.observer.measure import stream_events  # noqa: E402
 
 MIN_PER_DAY = 1440
 MIN_PER_STEP = 10
+STEPS_PER_DAY = 144
+
+# 現実側の分散バンド(来歴つき)。読み込み失敗は「バンド無し」へ後退する(レポートは出る)。
+REF_DIR = os.path.join(_ROOT, "data", "battery", "reference")
+REF_CV_LB = "estat_activity_rate_cv_lower_bound"      # 行動時間の CV 下界(片側)
+REF_CONTACT = "sociopatterns_contact_heterogeneity"   # 接触・発話(現状すべて未取得)
 
 # --------------------------------------------------------------------------- #
 # 現実基準(近似バンド)。value の単位は metric ごとに合わせる。
@@ -242,6 +260,146 @@ def activity_summary(recon: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# ⑤個体間分散(第92バッチ SV-U1 B3 = S-03)
+#
+# 何を測るか: 「平均は現実バンドに入るが、個体間のばらつきが現実より痩せている」を検出する。
+#   Wu, Peng, Ito & Xiao (2025) arXiv:2506.19806 の提言②
+#   =「平均の一致と並べて**分散を明示的に報告せよ**」への直接の応答。
+#
+# 3 指標を併記する理由(単独では捉えられない変化があるため):
+#   CV       … σ/μ。スケール不変で散らばりをスカラー1個に落とす。
+#   Gini     … 集中度。CV と同一関数の L¹/L² ノルムの関係にあり強く相関するが同一ではない。
+#   上位10%  … Gini は「上位0.1%だけが伸びた」場合を見落とす。裾(= k* の主張の直撃点)を掴む。
+#
+# **観測単位は agent×day**(person-day)。現実側の行動者率が person-day 単位なので、
+# agent 単位に日平均してから CV を採ると分散が縮んで比較にならない。
+# --------------------------------------------------------------------------- #
+def _top_share(values, pct: float = 0.10):
+    """上位 pct 割合が占める合計の割合(winner-take-all)。総和<=0/空は None。
+
+    ★これは Gini ではない(Gini は build_panel._gini を import して使う=6個目を書かない)。
+    観測数 n に対し上位 ceil(n*pct) 件(最低1件)を採る。
+    """
+    xs = sorted((float(v) for v in values if v is not None), reverse=True)
+    if not xs:
+        return None
+    total = sum(xs)
+    if total <= 0:
+        return None
+    k = max(1, int(math.ceil(len(xs) * pct)))
+    return round(sum(xs[:k]) / total, 4)
+
+
+def _dispersion(values) -> dict:
+    """1 本の分布 → 個体間分散の要約。n<2 は全て None(データ不足を捏造しない)。"""
+    xs = [float(v) for v in values if v is not None]
+    out = {"n": len(xs), "mean": None, "cv": None, "gini": None,
+           "top10": None, "p50": None, "p90": None, "zero_share": None}
+    if len(xs) < 2:
+        return out
+    out["mean"] = sum(xs) / len(xs)
+    out["cv"] = round(bm.cv(xs), 4)                   # 既存実装(母集団 sd / mean)
+    out["gini"] = bp._gini(xs)                        # 既存実装(scripts 側・凍結対象外)
+    out["top10"] = _top_share(xs, 0.10)
+    out["p50"] = round(bm.quantile(xs, 0.5), 3)
+    out["p90"] = round(bm.quantile(xs, 0.9), 3)
+    out["zero_share"] = round(sum(1 for x in xs if x <= 0) / len(xs), 4)
+    return out
+
+
+# シムの活動カテゴリ(build_panel.reconstruct_activity)→ 社会生活基本調査 20 分類の対応。
+# **対応が曖昧なものは載せない**(load-bearing な捏造になるため):
+#   home  … 「在宅」は場所であって行動分類ではない(睡眠・家事・くつろぎ等に跨る)。
+#   other … 「判定不能」であって調査の「その他」ではない。
+# move だけは特別扱い: シムは通勤とそれ以外の移動を分離しないので、和集合の行動者率
+#   p_union <= 0.397 + 0.246 = 0.643 という**上からの**抑えを使う。CV 下界は p について
+#   単調減少なので、p の上界からは有効な下界が出る(p の下界を使うと下界にならない)。
+_VAR_ACT_TO_ESTAT = {
+    "sleep": "睡眠",
+    "work": "仕事",
+    "food": "食事",
+    "shop": "買い物",
+    "leisure": "テレビ・ラジオ・新聞・雑誌",
+    "move": "__move_union__",
+}
+
+
+def load_reference_bands() -> dict:
+    """現実側の分散バンドを data/battery/reference/ から読む(来歴強制)。
+
+    掟(model_battery/reference.py): 出典・ライセンス・取得日が揃わない参照は読み込まない。
+    **未取得は values=null** で入っているので、ここでは「無い」がそのまま伝播する。
+    """
+    out = {"cv_lower_bound": {}, "docs": [], "errors": []}
+    for ref_id in (REF_CV_LB, REF_CONTACT):
+        path = os.path.join(REF_DIR, f"{ref_id}.json")
+        try:
+            doc = bref.load(path)
+        except bref.ReferenceError as exc:       # 来歴違反・欠損は「バンド無し」へ後退
+            out["errors"].append(f"{ref_id}: {exc}")
+            continue
+        out["docs"].append(doc)
+        if ref_id != REF_CV_LB:
+            continue
+        series = doc.get("series") or {}
+        cats = (series.get("activity_participation_rate_week") or {}).get("categories") or []
+        lbs = (series.get("cv_lower_bound_by_activity") or {}).get("values") or []
+        for cat, lb in zip(cats, lbs):
+            out["cv_lower_bound"][cat] = lb
+        mv = (series.get("cv_lower_bound_move_union") or {}).get("values") or {}
+        if mv.get("cv_lower_bound") is not None:
+            out["cv_lower_bound"]["__move_union__"] = mv["cv_lower_bound"]
+    return out
+
+
+def variance_summary(recon: dict | None, speak_by_ad: dict, contact_by_ad: dict,
+                     agent_days: set) -> dict:
+    """agent×day 単位の 3 系統(行動時間・発話数・接触人数)の個体間分散。
+
+    行動時間は build_panel.reconstruct_activity の adc(=(aid, day, cat) → step 数)を
+    そのまま畳んで分/日にする(二重実装しない)。発話・接触は L1 の 1 パスで拾った
+    (aid, day) 台帳から作り、**その日 L1 に現れた agent は 0 も 1 件として数える**
+    (0 を落とすと「話す人だけ」の分布になり分散が過小評価される)。
+    """
+    rows: list[dict] = []
+
+    # ---- (1) 行動時間(活動別・分/日)----
+    if recon:
+        adc = recon["adc"]
+        by_ad: dict[tuple, dict] = defaultdict(lambda: defaultdict(float))
+        for (aid, d, c), n in adc.items():
+            by_ad[(aid, d)][c] += n * MIN_PER_STEP
+        # ★ L1 に実際にイベントが記録された agent×day に限る。活動復元は睡眠区間を
+        #   最終 step の先まで延ばすことがあり(sleep_start の until_step)、その端数日を
+        #   1 日として数えると分母が狂う。ここで揃えると発話・接触の行と n も一致する。
+        keys = [k for k in sorted(by_ad) if k in agent_days]
+        for cat in recon["cats"]:
+            vals = [by_ad[k].get(cat, 0.0) for k in keys]
+            rows.append({"group": "行動時間", "key": cat,
+                         "label": f"{_ACT_LABEL_JP.get(cat, cat)}(分/日)",
+                         "estat": _VAR_ACT_TO_ESTAT.get(cat),
+                         **_dispersion(vals)})
+
+    # ---- (2) 発話数/日・(3) 接触人数/日 ----
+    ads = sorted(agent_days)
+    if ads:
+        rows.append({"group": "発話", "key": "speak_per_day", "label": "発話数(回/人日)",
+                     "estat": None,
+                     **_dispersion([speak_by_ad.get(k, 0) for k in ads])})
+        rows.append({"group": "接触", "key": "contacts_per_day",
+                     "label": "接触人数(相異なる対面相手/人日)", "estat": None,
+                     **_dispersion([len(contact_by_ad.get(k, ())) for k in ads])})
+
+    bands = load_reference_bands()
+    for r in rows:
+        lb = bands["cv_lower_bound"].get(r.get("estat")) if r.get("estat") else None
+        r["cv_real_lb"] = lb
+        r["cv_ratio"] = (round(r["cv"] / lb, 3)
+                         if (lb and r.get("cv") is not None and lb > 0) else None)
+    return {"rows": rows, "n_agent_days": len(ads), "bands": bands}
+
+
+# --------------------------------------------------------------------------- #
 # 本体
 # --------------------------------------------------------------------------- #
 def analyze(run_dir: str) -> dict:
@@ -281,12 +439,31 @@ def analyze(run_dir: str) -> dict:
     joint_participants = 0
     joint_invites = 0
     joint_accepts = 0
+    # ---- S-03 個体間分散(第92バッチ): agent×day の台帳 ----
+    #   日の切り方は build_panel と同じ step//144(07:00 起点で夜間睡眠が同一日に収まる)。
+    #   ★メモリ: agent×day のキー数に比例する(接触は集合を持つ)。25 万体×10 日級では
+    #     bp.reconstruct_activity の adc((aid, day, cat))が既に同規模なので支配項ではない。
+    agent_days: set[tuple] = set()
+    speak_by_ad: Counter = Counter()
+    contact_by_ad: dict[tuple, set] = defaultdict(set)
 
     for e in stream_events(run_dir):
         k = e["kind"]
         p = e["payload"]
         aid = e["agent_id"]
         sm = e["sim_min"]
+        d_ad = e["step"] // STEPS_PER_DAY
+        if aid is not None and aid >= 0:
+            agent_days.add((aid, d_ad))
+        if k == "speak":
+            # 対面のみ(S-12: offline/online を混ぜない)。DM/SNS は接触人数に数えない。
+            speak_by_ad[(aid, d_ad)] += 1
+            for h in (p.get("hearers") or []):
+                h = int(h)
+                if h < 0 or h == aid:
+                    continue
+                contact_by_ad[(aid, d_ad)].add(h)
+                contact_by_ad[(h, d_ad)].add(aid)
         if k == "wake_up":
             if aid in res_ids:
                 ss = p.get("slept_steps")
@@ -451,11 +628,23 @@ def analyze(run_dir: str) -> dict:
     m["joint_invites"] = joint_invites or None
 
     # ---- ④生活時間配分(第31バッチ W3): build_panel の活動復元を再利用 ----
+    recon = None
     try:
         recon = bp.reconstruct_activity(stream_events(run_dir), agents)
         m["_activity"] = activity_summary(recon)
     except Exception:
         m["_activity"] = None
+
+    # ---- ⑤個体間分散(第92バッチ SV-U1 B3 = S-03)----
+    m["_variance"] = variance_summary(recon, speak_by_ad, contact_by_ad, agent_days)
+
+    # 既存 L2 の集中度列は**読むだけ**(観測系 aggregate.py は凍結対象なので触らない)。
+    # 無い列(そのランで lens が OFF)は None のまま=「―」で出す。
+    m["_l2_concentration"] = {}
+    for col in ("status_gini", "status_top10_share", "trust_gini",
+                "deviation_top_share", "asset_gini", "asset_top10_share"):
+        vals = [v for v in l2.get(col, []) if v is not None]
+        m["_l2_concentration"][col] = vals[-1] if vals else None
 
     m["_meta"] = {
         "run_dir": run_dir, "n_agents": n_all, "n_residents": n_res,
@@ -507,7 +696,69 @@ def render(m: dict) -> str:
         "> 現実バンドは公表統計の近似(出典名を明記)。バンド外=即誤りではなく調律候補。",
     ]
     lines += _render_activity(m.get("_activity"))
+    lines += _render_variance(m.get("_variance"), m.get("_l2_concentration"))
     return "\n".join(lines)
+
+
+def _render_variance(var: dict | None, l2conc: dict | None) -> list[str]:
+    """個体間分散の節(S-03)。**平均だけで「現実的」と言わないための表**。"""
+    L = ["", "## 個体間分散(S-03: 平均は合っても分散が痩せていないか)"]
+    if not var or not var.get("rows"):
+        L.append("(agent×day の観測が取れない=データ不足)")
+        return L
+    L.append(
+        "観測単位は **agent×day**(person-day)。現実側の行動者率が person-day 単位なので、"
+        "agent 単位に日平均してから CV を採ると分散が縮んで比較にならない。"
+        f"対象 agent×day = {var['n_agent_days']}。")
+    L.append("")
+    L.append("| 指標 | n | sim 平均 | sim CV | 現実 CV(下界) | **分散比** | sim Gini | "
+             "sim top10% | 中央値 | p90 | ゼロの割合 |")
+    L.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for r in var["rows"]:
+        L.append(
+            f"| {r['label']} | {r['n']} | {fmt(r['mean'])} | {fmt(r['cv'])} | "
+            f"{fmt(r['cv_real_lb'])} | {fmt(r['cv_ratio'])} | {fmt(r['gini'])} | "
+            f"{fmt(r['top10'])} | {fmt(r['p50'])} | {fmt(r['p90'])} | {fmt(r['zero_share'])} |")
+    L += [
+        "",
+        "### この表の読み方(★片側バンドの非対称性)",
+        "- **現実 CV は下界である**。公表されるのは行動者率 p・行動者平均時間 m・総平均時間 p·m "
+        "の3つだけで、個体内のばらつきは不明。下界は `Var(x) ≥ p(1−p)m²` ⇒ "
+        "`CV ≥ √((1−p)/p)`(= 行動者内のばらつきを 0 と仮定した最も保守的な値)。",
+        "- したがって **分散比 < 1 なら「シムの分散は現実より確実に痩せている」と言えるが、"
+        "分散比 ≥ 1 でも「十分」とは言えない**。この非対称性を報告から落とさないこと。",
+        "- 分散比が事前登録の閾値を下回った指標については、**主張を集団レベルの定性的パターンに"
+        "限定する**(Wu, Peng, Ito & Xiao 2025, arXiv:2506.19806 の基準③ → "
+        "docs/plans/stationarity-preregistration.md 前文 ③(d))。",
+        "- 現実 CV が「―」の行は**現実側の一次統計が未取得**という意味であり、合格ではない。",
+        "- 対応の曖昧な活動カテゴリ(在宅・判定不能)には現実側を当てていない"
+        "(「在宅」は場所であって行動分類ではなく、「判定不能」は調査の「その他」ではない)。",
+        "- 「移動」は通勤・通学とそれ以外の移動を分離しないため、和集合の行動者率の"
+        "**上界** p ≤ 0.643 から下界を採っている(p の下界を使うと下界にならない)。",
+        "- 発話数・接触人数の現実バンドは **未取得**(個体間分布を与える一次統計を特定できていない)。",
+    ]
+    for doc in var["bands"]["docs"]:
+        src = doc.get("source", {})
+        L.append(f"- 参照: {doc.get('title')} — {src.get('publisher')} "
+                 f"(取得 {src.get('accessed')} / status={doc.get('status')})")
+    for err in var["bands"]["errors"]:
+        L.append(f"- ⚠ 参照統計の読み込み失敗(バンド無しへ後退): {err}")
+    att = bref.attribution_lines(var["bands"]["docs"])
+    if att:
+        L.append("")
+        L.append("出典表記:")
+        L += att
+
+    L.append("")
+    L.append("### 既存 L2 の集中度列(**読むだけ**・ラン末値)")
+    L.append("| 列 | 値 |")
+    L.append("|---|---:|")
+    for col, v in (l2conc or {}).items():
+        L.append(f"| {col} | {fmt(v)} |")
+    L.append("")
+    L.append("> これらは observer 側(凍結対象 `metrics_spec_hash`)で計算済みの列であり、"
+             "本スクリプトは 1 バイトも再計算していない。列が「―」= そのランで該当 lens が OFF。")
+    return L
 
 
 def _render_activity(act: dict | None) -> list[str]:

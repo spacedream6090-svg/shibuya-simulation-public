@@ -57,7 +57,9 @@ def test_defaults_are_all_off():
                    "cognitive_tier": "full", "shuffle_partners": False,
                    # 第89バッチ: プラセボ L1 3 種(同一軸=相互排他。既定は全 OFF)
                    "context_shuffle": False, "persona_swap": False,
-                   "context_sever": False}
+                   "context_sever": False,
+                   # 第92バッチ: プロンプト言い換え(""=OFF。詳細は test_ablate_paraphrase.py)
+                   "prompt_paraphrase": ""}
     assert A.build_cfg({}) == cfg
 
 

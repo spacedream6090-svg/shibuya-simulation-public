@@ -576,6 +576,22 @@ FEATURES: tuple[Feature, ...] = (
        "propagation_off が**送り手側**で節ごと消すのに対し、こちらは世界状態を一切変えずに"
        "**受け手側**で中身だけ潰す『文脈遮断の完全版』。節はあるが中身が無い=risk known"),
 
+    # ---- ablate プロンプト言い換え(第92バッチ SV-U1 B4 = サーベイ S-16)----
+    #   affects_k=False … 凍結表の文字列置換だけで generate() の呼び出し点は不変
+    #                     (プラセボ 3 種と同じ構造。実測 k は応答経由で数 % 動く=間接効果)
+    #   repro_tier=strict … LLM の自由文を新たに読む経路をひとつも足さない(決定論の表引き・
+    #                       乱数ゼロ)。言い換え表は事前にオフラインで作った凍結資産。
+    #   fingerprint_risk=known … プロンプト文字列が変わる以上「観測が世界を変えない」は
+    #                            成立しない。隠す方法は存在しない(隠せたら検査として無効)。
+    _f("ablate.prompt_paraphrase", "strict", False, "known",
+       "プロンプトの言い回しを意味等価な凍結ルックアップ表で差し替える"
+       "(''=OFF / v1=語彙 / v2=文体 / v3=語彙+文体 / v4=語彙+文体+統語限定)。"
+       "表は data/prompt_paraphrase_sets.json のみが源で LLM 生成は禁止、sha256 を manifest へ。"
+       "JSON キーと行動語彙は変えない=パース互換。作用点は build_prompt 末尾 1 箇所で"
+       "呼び出しサイトは増減ゼロ。**主要結論の符号が言い回しに依存しないか**を測る"
+       "(Sclar et al. 2024 / Ye et al. 2026 TRAILS)。プラセボ 3 種・propagation_off とは相互排他",
+       off_value=""),
+
     # ---- experiment(第74バッチ IDEA④: 対照セルの宣言。決定論=strict)----
     _f("experiment.flat_traits.enabled", "strict", False, "none",
        "初期個体差ゼロ対照。全個体の traits を定数化して R²(k) の分母を実験的に消す"
