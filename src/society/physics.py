@@ -81,6 +81,16 @@ TransiTUM*, Transportation Research Procedia 2 (2014) 495–500)。
 RngHub はステートレスなので、新 stream を足しても既存の draw 順は 1 つも動かない
 (第75 shuffle_partners と同じ規約)。ORCA の `pref_noise` を 0 にすれば乱数はゼロ本。
 
+歩行物理の較正(P4-2 / P4-3。2026-08-05)
+-----------------------------------------
+`physics.sfm` の 3 ブロック(`far_field` / `v_of_s` / `wall`)を読み、SFM ゾーンの
+エンジンに適用する(`_CalibratedCrowd`)。**3 つとも既定 OFF/現行値**で、そのとき
+`_calib_kwargs()` は空 dict を返し `_build_engine` は素の `sfm_core.Crowd` を
+従来の引数のまま構築する = 演算順も引数も 1 バイト変わらない(golden 無風)。
+較正の実測は `reference/physics_bench/`(P4-1 = `calib_results.json` /
+P4-3 = `calib_p43_results.json`)。本体の `_CalibratedCrowd` はベンチの
+`ExtendedCrowd` と **バイト一致**する(tests/test_physics_calib.py が固定)。
+
 R1(既定 OFF = 完全 no-op)
 ---------------------------
 `physics.zones_enabled: false`(既定)または `physics.zones: []`(既定)のとき:
@@ -363,7 +373,10 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict) -> None:
     base_sec = float(sim_min) * 60.0
     pcfg = sim.physcfg["perception"]
 
-    engine = _build_engine(zone, members, rng) if members else None
+    # ★P4-2/P4-3 の較正(既定は空 dict = 従来の sfm_core.Crowd 経路そのまま)。
+    #   SFM ゾーンにだけ効く(ORCA ゾーンでは _build_engine が無視する)。
+    calib = _calib_kwargs(sim)
+    engine = _build_engine(zone, members, rng, calib) if members else None
     cont = st["cont"]
     cont["dt_sub"] = dt
     occ_sum = 0
@@ -378,7 +391,7 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict) -> None:
                 _writeback(members, engine)   # 入場の占有判定は**最新の位置**で行う
             if _admit(sim, zone, waiting, members, signal, base_sec + t, t,
                       step, sim_min, st):
-                engine = _build_engine(zone, members, rng)
+                engine = _build_engine(zone, members, rng, calib)
         if not members:
             if not waiting:
                 break                                 # ゾーンが空 = その場で打ち切り
@@ -405,7 +418,7 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict) -> None:
                 _release(sim, zone, rec["agent"], step, sim_min, st,
                          reason="gate", elapsed_s=rec["elapsed_s"], rec=rec,
                          used_s=used)
-            engine = _build_engine(zone, members, rng) if members else None
+            engine = _build_engine(zone, members, rng, calib) if members else None
         if engine is None and not waiting:
             break
 
@@ -556,9 +569,172 @@ def _graph_speed(sim, agent) -> float:
 
 
 # --------------------------------------------------------------------------- #
+# P4-2 / P4-3 歩行物理較正(**3 機能とも既定 OFF/現行値 = 完全恒等**)
+# --------------------------------------------------------------------------- #
+# 正典: docs/research/p4-calibration-research.md §4(Tordeux 型 V(s))/ §6.1(2 項構造)
+#       reference/physics_bench/out/calib_results.json(P4-1)/ calib_p43_results.json(P4-3)
+#
+# なぜ `sfm_core.py` ではなくここに置くのか
+# ----------------------------------------
+# 較正 3 機能は **ゾーン物理(physics.zones_enabled)の中でしか使わない**。
+# `sfm_core.Crowd` は屋内 SFM(indoor_flow)からも使われている共有コアなので、そこへ
+# 分岐を足すと「屋内には効かせないつもりの較正」が屋内の既定経路にも 1 分岐ぶん載る。
+# ベンチ(reference/physics_bench/engines.ExtendedCrowd)が採ったのと同じ
+# 「コアを継承して forces() に足すだけ」の構造をそのまま昇格させ、コアは無改変に保つ。
+#
+# OFF が保つ不変条件(数値的恒等)
+# --------------------------------
+# `_calib_kwargs()` が空 dict を返す限り `_build_engine` は **従来の `sfm_core.Crowd` を
+# 従来の引数のまま**構築する(派生クラスすら作らない)= 演算順も引数も 1 バイト変わらない。
+# 既定 conf では far_field.enabled=false / v_of_s.enabled=false / wall.{a,b} は
+# sfm_core の既定値と同値なので、空 dict になる。
+_EXP_ARG_MAX = 4.0        # sfm_core と同じ安全弁(深い重なりの overflow 防止)
+
+
+class _CalibratedCrowd(_sfm.Crowd):
+    """`sfm_core.Crowd` + 長距離 social 項 + Tordeux 型 V(s)(較正 ON のときだけ作る)。
+
+    (1) 長距離項 f2_ij = m · a2 · exp((r_i+r_j − d)/b2) · w(φ) · n_ij
+        カットオフは**体表間隔** `cutoff_factor·b2` [m]、その手前 `taper_m` [m] を
+        C¹ smoothstep で 0 へ落とす(Köster 2013 の言う「右辺の不連続」を作らない)。
+        異方性 w(φ) は短距離項と同じ λ(= `lambda_aniso`。P4-1 の λ 先行実験が
+        文献値 0.06–0.12 の仮説を棄却したので本体既定 0.5 を共有する)。
+        近傍 cap は **掛けない**: ρ=3 /m² では最近傍 12 体が半径 ~1.1 m 以内に入るため、
+        cap を掛けると「長距離項」が実質短距離項になり b2 が効かなくなる(P4-1 実測)。
+    (2) V(s) = min{v0, max{0, (s − l)/T}} を **駆動項の希望速度だけ** に適用。
+        v_max は __init__ が v0 から作った配列のままなので**速度上限は不変**。
+
+    ★ベンチ側 `ExtendedCrowd.forces_naive()` と同じ加算経路(super().forces() に
+      長距離項を足す)。ベンチはこの素朴経路が融合経路と **厳密に 0.0 差**であることを
+      実測で固定しているので、較正で得た数値はそのままここで再現される。
+    """
+
+    def __init__(self, *args, far_a2=0.0, far_b2=1.890, far_cutoff_factor=2.5,
+                 far_taper_m=1.0, v_of_s=False, vos_T=0.482, vos_l=0.297, **kw):
+        super().__init__(*args, **kw)
+        self.far_a2 = float(far_a2)
+        self.far_b2 = float(far_b2)
+        self.far_cutoff = float(far_cutoff_factor) * self.far_b2
+        self.far_taper = float(max(0.0, min(far_taper_m, self.far_cutoff)))
+        self.v_of_s = bool(v_of_s)
+        self.vos_T = float(vos_T)
+        self.vos_l = float(vos_l)
+        if self.v_of_s and not (self.vos_T > 0.0):
+            raise ValueError("v_of_s は T > 0 が必要")
+
+    # -- (1) 長距離 social 項 --------------------------------------------- #
+    def _far_forces(self):
+        n = self.pos.shape[0]
+        if n < 2 or self.far_a2 <= 0.0:
+            return np.zeros_like(self.pos)
+        e, _ = self._desired_dir()
+        diff = self.pos[:, None, :] - self.pos[None, :, :]        # j → i
+        d = np.linalg.norm(diff, axis=2)
+        np.fill_diagonal(d, np.inf)
+        rr = self.radius[:, None] + self.radius[None, :]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            nij = diff / d[:, :, None]
+        nij = np.nan_to_num(nij)
+        cosphi = -np.einsum("ik,ijk->ij", e, nij)
+        gap = d - rr                                              # 体表間隔 [m]
+        arg = np.clip(-gap / self.far_b2, a_min=None, a_max=_EXP_ARG_MAX)
+        mag = self.mass * self.far_a2 * np.exp(arg)               # [N]
+        w = self.lam + (1.0 - self.lam) * (1.0 + cosphi) / 2.0
+        valid = self.active[None, :] & (gap <= self.far_cutoff)
+        if self.far_taper > 0.0:
+            u = np.clip((self.far_cutoff - gap) / self.far_taper, 0.0, 1.0)
+            mag = mag * (u * u * (3.0 - 2.0 * u))                 # C¹ smoothstep
+        contrib = (w * mag)[:, :, None] * nij
+        contrib[~valid] = 0.0
+        return contrib.sum(axis=1)
+
+    # -- (2) 前方間隔 s と V(s) -------------------------------------------- #
+    def front_spacing(self):
+        """進行方向の最近前方者までの中心間距離 s_i [m](前方に誰も居なければ inf)。
+
+        「前方」= 進行方向成分が正、かつ横ずれが体半径和 (r_i+r_j) 以内
+        (= 実際に進路を塞いでいる相手)。横ずれが体幅より大きい相手は避けて通れるので
+        数えない。乱数ゼロ・比較と min だけ = 決定論。
+        """
+        n = self.pos.shape[0]
+        if n < 2:
+            return np.full(n, np.inf)
+        e, _ = self._desired_dir()
+        diff = self.pos[None, :, :] - self.pos[:, None, :]        # i → j
+        d = np.linalg.norm(diff, axis=2)
+        along = np.einsum("ik,ijk->ij", e, diff)
+        lateral2 = np.maximum(d * d - along * along, 0.0)
+        rr = self.radius[:, None] + self.radius[None, :]
+        ahead = self.active[None, :] & (along > 0.0) & (lateral2 <= rr * rr)
+        np.fill_diagonal(ahead, False)
+        return np.where(ahead, d, np.inf).min(axis=1)
+
+    def v_of_s_speed(self):
+        s = self.front_spacing()
+        return np.minimum(self.v0, np.maximum(0.0, (s - self.vos_l) / self.vos_T))
+
+    # -- 合成 -------------------------------------------------------------- #
+    def forces(self):
+        if not self.v_of_s:
+            return self._forces_with_far()
+        v0_saved = self.v0
+        self.v0 = self.v_of_s_speed()
+        try:
+            return self._forces_with_far()
+        finally:
+            self.v0 = v0_saved
+
+    def _forces_with_far(self):
+        f = super().forces()
+        if self.far_a2 > 0.0:
+            f = f + self._far_forces()
+            f[~self.active] = 0.0
+        return f
+
+
+def _calib_kwargs(sim) -> dict:
+    """`physics.sfm` の較正 3 機能 → `_CalibratedCrowd` の追加引数。
+
+    **既定(3 機能とも OFF/現行値)では空 dict** を返す = 従来の `sfm_core.Crowd` 経路。
+    """
+    s = (getattr(sim, "physcfg", None) or {}).get("sfm")
+    if not s:
+        return {}
+    kw: dict = {}
+    ff = s["far_field"]
+    if ff["enabled"]:
+        kw.update(far_a2=ff["a2"], far_b2=ff["b2"],
+                  far_cutoff_factor=ff["cutoff_factor"], far_taper_m=ff["taper_m"])
+    vs = s["v_of_s"]
+    if vs["enabled"]:
+        kw.update(v_of_s=True, vos_T=vs["T"], vos_l=vs["l"])
+    wl = s["wall"]
+    # 壁は sfm_core の既定値と同値なら **渡さない**(= 従来の呼び出しと 1 バイト同じ)。
+    if (wl["a"] != _sfm.WALL_A_DEFAULT) or (wl["b"] != _sfm.WALL_B_DEFAULT):
+        kw.update(wall_a=wl["a"], wall_b=wl["b"])
+    return kw
+
+
+def calib_describe(sim) -> dict:
+    """ON の較正だけを要約する(既定 OFF なら空 dict = manifest にキーが生えない)。"""
+    s = (getattr(sim, "physcfg", None) or {}).get("sfm")
+    if not s:
+        return {}
+    out: dict = {}
+    if s["far_field"]["enabled"]:
+        out["far_field"] = dict(s["far_field"])
+    if s["v_of_s"]["enabled"]:
+        out["v_of_s"] = dict(s["v_of_s"])
+    if (s["wall"]["a"] != _sfm.WALL_A_DEFAULT
+            or s["wall"]["b"] != _sfm.WALL_B_DEFAULT):
+        out["wall"] = dict(s["wall"])
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # エンジン構築 / 積分 / 計測
 # --------------------------------------------------------------------------- #
-def _build_engine(zone, members, rng):
+def _build_engine(zone, members, rng, calib=None):
     pos = np.array([r["pos"] for r in members], dtype=np.float64)
     vel = np.array([r["vel"] for r in members], dtype=np.float64)
     goal = np.array([r["wp_xy"] for r in members], dtype=np.float64)
@@ -575,11 +751,14 @@ def _build_engine(zone, members, rng):
             rng=rng, radius_margin=float(o["radius_margin_m"]),
             separation_iters=int(o["separation_iters"]))
     s = zone.sfm
-    return _sfm.Crowd(
+    # ★較正が全部既定なら calib は空 dict = 下の呼び出しは P4 以前と 1 バイト同一。
+    cls = _sfm.Crowd if not calib else _CalibratedCrowd
+    return cls(
         pos, vel, goal, v0, radius=radius, rng=rng, noise=float(s["noise"]),
         arrive_radius=zone.arrive_radius_m,
         walls=(zone.walls or None), wall_range=float(s["wall_range_m"]),
-        neighbor_cap=zone.neighbor_cap, v_max_factor=zone.v_max_factor)
+        neighbor_cap=zone.neighbor_cap, v_max_factor=zone.v_max_factor,
+        **(calib or {}))
 
 
 def _writeback(members, engine) -> None:

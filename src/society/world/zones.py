@@ -81,6 +81,30 @@ PERCEPTION_DEFAULTS = {
     "channels": False,
 }
 
+# `physics.sfm`(竹-3 の宣言ブロック + P4-2/P4-3 の較正ブロック)。
+# ★P4-2/P4-3(2026-08-05)で **far_field / v_of_s / wall だけが `physics.py` から読まれる**
+#   ようになった。wall_A / wall_B / wall_range / wall_hash_cell / noise / noise_seed は
+#   従来どおり「sfm_core の既定値の記録」で、本層は読まない(zone.sfm 側が正典)。
+#   既定値は 3 機能とも **現行挙動と完全に恒等**:
+#     far_field.enabled=false / v_of_s.enabled=false / wall.{a,b} = sfm_core の既定値
+#   = `physics.py` は従来どおり `sfm_core.Crowd` を**同じ引数で**構築する(golden 無風)。
+SFM_DEFAULTS = {
+    "wall_A": 2000.0,
+    "wall_B": 0.08,
+    "wall_range": 2.0,
+    "wall_hash_cell": 2.35,
+    "noise": 0.0,
+    "noise_seed": 20260802,
+    # P4-2: 長距離 social 項(VISSIM 2 項構造の欠落側)。既定 OFF。
+    "far_field": {"enabled": False, "a2": 0.119, "b2": 1.890,
+                  "cutoff_factor": 2.5, "taper_m": 1.0},
+    # P4-3: Tordeux 型の間隔ベース希望速度 V(s)=min{v0, max{0,(s−l)/T}}。既定 OFF。
+    #   T / l は P4-3 の較正値(calib_p43_results.json の 0.4823492 / 0.2965060 を丸めた値)。
+    "v_of_s": {"enabled": False, "T": 0.482, "l": 0.297},
+    # P4-3: 壁斥力。**既定 = sfm_core.WALL_A_DEFAULT / WALL_B_DEFAULT と同値**。
+    "wall": {"a": 2000.0, "b": 0.08},
+}
+
 ZONE_DEFAULTS = {
     "id": "",
     "polygon": (),                # [(x,y), …] 地図ローカル m。3 点以上。
@@ -346,8 +370,6 @@ def build_cfg(raw, repo_root: Path | None = None) -> dict:
     """
     raw = dict(raw or {})
     repo_root = repo_root or Path(".")
-    # `physics.sfm`(竹-3 の宣言ブロック)は sfm_core の既定値の記録であって本層は読まない。
-    # 未知キーの検出を効かせたまま、既知だが本層の対象外のキーだけを外す。
     unknown = sorted(set(raw) - {"sfm", "zones_enabled", "zones", "perception"})
     if unknown:
         raise KeyError(f"physics: 未知のキー {unknown}")
@@ -356,12 +378,40 @@ def build_cfg(raw, repo_root: Path | None = None) -> dict:
     perception["density_radius_m"] = float(perception["density_radius_m"])
     perception["contact_gap_m"] = float(perception["contact_gap_m"])
     perception["channels"] = bool(perception["channels"])
+    sfm = _build_sfm(raw.get("sfm"))
     zones: list[Zone] = []
     if enabled:
         for spec in (raw.get("zones", ()) or ()):
             zones.append(_build_zone(dict(spec), repo_root))
     _check_disjoint(zones)
-    return {"zones_enabled": enabled, "zones": tuple(zones), "perception": perception}
+    return {"zones_enabled": enabled, "zones": tuple(zones), "perception": perception,
+            "sfm": sfm}
+
+
+def _build_sfm(raw) -> dict:
+    """`physics.sfm` の正準化(P4-2/P4-3)。既定は**現行挙動と完全に恒等**。"""
+    out = _merge(SFM_DEFAULTS, raw)
+    ff = _merge(SFM_DEFAULTS["far_field"], out["far_field"])
+    ff["enabled"] = bool(ff["enabled"])
+    for k in ("a2", "b2", "cutoff_factor", "taper_m"):
+        ff[k] = float(ff[k])
+    if ff["enabled"] and not (ff["a2"] > 0.0 and ff["b2"] > 0.0
+                              and ff["cutoff_factor"] > 0.0 and ff["taper_m"] >= 0.0):
+        raise ValueError("physics.sfm.far_field: a2>0 / b2>0 / cutoff_factor>0 /"
+                         " taper_m>=0 が必要")
+    vs = _merge(SFM_DEFAULTS["v_of_s"], out["v_of_s"])
+    vs["enabled"] = bool(vs["enabled"])
+    vs["T"] = float(vs["T"])
+    vs["l"] = float(vs["l"])
+    if vs["enabled"] and not (vs["T"] > 0.0 and vs["l"] >= 0.0):
+        raise ValueError("physics.sfm.v_of_s: T>0 / l>=0 が必要")
+    wl = _merge(SFM_DEFAULTS["wall"], out["wall"])
+    wl["a"] = float(wl["a"])
+    wl["b"] = float(wl["b"])
+    if not (wl["a"] >= 0.0 and wl["b"] > 0.0):
+        raise ValueError("physics.sfm.wall: a>=0 / b>0 が必要")
+    out["far_field"], out["v_of_s"], out["wall"] = ff, vs, wl
+    return out
 
 
 def _build_zone(spec: dict, repo_root: Path) -> Zone:

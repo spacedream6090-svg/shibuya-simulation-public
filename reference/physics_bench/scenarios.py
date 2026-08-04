@@ -322,18 +322,27 @@ def _bottleneck_walls(room_len, room_width, w, exit_len, pad=1.0):
 
 def run_bottleneck(engine_kind, w=1.2, n_agents=80, room_len=8.0, room_width=5.0,
                    exit_len=2.0, dt=0.05, t_total=40.0, seed=20260805,
-                   engine_kw=None):
+                   engine_kw=None, start_xy=None):
     """部屋 → 幅 w の開口 → 出口通路。specific flow J/w を測るためのラン。
 
     経路は 2 段ウェイポイント(開口の 1 m 先 → まっすぐ前方)。開口を抜けて
     x > room_len + exit_len に達した個体は待機列へ退避(active=False)し、
     以後は力学から切り離す(再投入しない = 有限人数の排出過程)。
-    乱数は初期配置のみ(積分ループ内はゼロ)= 決定論。"""
+    乱数は初期配置のみ(積分ループ内はゼロ)= 決定論。
+
+    ★P4-3 追加: `start_xy`(既定 None = 従来と 1 バイトも変わらない)。
+      **単独歩行者の通過可否対照**(n_agents=1)のために初期位置を固定する口。
+      棄却サンプリングを通さないので、開口の正面から真っ直ぐ歩かせられる
+      (= 通れないのが群衆効果ではなく壁斥力の幾何であることを切り分ける)。"""
     ids = list(range(n_agents))
     v0, radius = agent_params(ids)
     rng = np.random.default_rng(seed)
-    pos = _init_positions(rng, n_agents, 0.45, room_len - 0.45,
-                          0.45, room_width - 0.45, radius)
+    if start_xy is None:
+        pos = _init_positions(rng, n_agents, 0.45, room_len - 0.45,
+                              0.45, room_width - 0.45, radius)
+    else:
+        pos = np.tile(np.asarray(start_xy, dtype=np.float64).reshape(1, 2),
+                      (n_agents, 1))
     vel = np.zeros((n_agents, 2))
     y_c = room_width / 2.0
     goal = np.column_stack([np.full(n_agents, room_len + 1.0),

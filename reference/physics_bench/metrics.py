@@ -347,6 +347,33 @@ def specific_flow(trace, line_x, width, trim=0.10, direction=+1):
             "t_first": float(times[0]), "t_last": float(times[-1])}
 
 
+def wall_clearance_min(pos_t, radius, walls, active_t=None, sample_every=1):
+    """壁との最小クリアランス [m] = min over (t, i) の (最近点距離 − r_i)。
+
+    **負なら壁貫通**(体が壁にめり込んでいる)。P4-3 の壁斥力較正で
+    「B_w を短くしたら貫通し始める」を機械判定するために使う。
+    幾何は sfm_core.wall_forces_from_pairs と同じ点-線分最近点距離。"""
+    if not walls:
+        return float("nan")
+    a = np.array([[s[0][0], s[0][1]] for s in walls], dtype=np.float64)
+    b = np.array([[s[1][0], s[1][1]] for s in walls], dtype=np.float64)
+    eseg = b - a
+    len2 = np.maximum((eseg * eseg).sum(axis=1), 1e-12)
+    worst = np.inf
+    for t in range(0, pos_t.shape[0], sample_every):
+        sel = slice(None) if active_t is None else np.nonzero(active_t[t])[0]
+        p = pos_t[t][sel]
+        r = np.asarray(radius)[sel]
+        if p.shape[0] == 0:
+            continue
+        rel = p[:, None, :] - a[None, :, :]                     # (N,M,2)
+        tt = np.clip((rel * eseg[None, :, :]).sum(axis=2) / len2[None, :], 0.0, 1.0)
+        closest = a[None, :, :] + tt[:, :, None] * eseg[None, :, :]
+        dist = np.linalg.norm(p[:, None, :] - closest, axis=2).min(axis=1)
+        worst = min(worst, float((dist - r).min()))
+    return worst
+
+
 def linear_fit_r2(x, y):
     """最小二乗の直線当てはめ → (slope, intercept, R²)。J(b) の線形性検査用
     (研究文書 §2.4: 流量は幅に対して段階状ではなく線形に増える)。"""

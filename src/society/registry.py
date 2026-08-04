@@ -188,6 +188,22 @@ FEATURES: tuple[Feature, ...] = (
     _f("physics.perception.channels", "strict", False, "none",
        "発火チャンネル ext.crowd_local の値を物理の実測近傍人数へ差し替える(**配線のみ**)。"
        "ON にすると第80 の σ 較正がやり直しになるため既定 OFF で据え置く"),
+    # ---- physics 較正(P4-2 / P4-3。既定 OFF = 現行挙動と数値的に恒等)----
+    _f("physics.sfm.far_field.enabled", "strict", False, "none",
+       "ゾーン SFM に**長距離 social 項**(VISSIM 製品版の 2 項構造のうち本リポジトリに"
+       "欠けていた側)を足す。f2_ij = m·a2·exp((r_i+r_j−d)/b2)·w(φ)·n_ij。"
+       "カットオフ規則(cutoff_factor·b2 + C¹ テーパー)は a2 とセットでしか意味を持たない。"
+       "repro_tier=strict: 位置と半径だけの純関数で乱数も LLM も 1 本も増えない。"
+       "affects_k=false: generate() の呼び出し点を足さない/減らさない。"
+       "fingerprint_risk=none: プロンプトの語彙・欄が 1 つも増減しない(物理層)。"
+       "★既定 OFF では `_CalibratedCrowd` を構築すらせず sfm_core.Crowd を"
+       "従来の引数のまま作る = golden L1 バイト一致"),
+    _f("physics.sfm.v_of_s.enabled", "strict", False, "none",
+       "ゾーン SFM の**駆動項の希望速度だけ**を Tordeux 型 V(s)=min{v0,max{0,(s−l)/T}} へ"
+       "差し替える(s = 進行方向の最近前方者までの中心間距離)。方向モデル・斥力・v_max は"
+       "SFM のまま = JuPedSim の Collision-Free Speed Model と同じ発想の最小適用。"
+       "repro_tier=strict / affects_k=false / fingerprint_risk=none は far_field と同じ理由。"
+       "★既定 OFF では V(s) を 1 度も評価しない = golden L1 バイト一致"),
 
     # ---- economy ----
     _f("economy.enabled", "strict", False, "none",

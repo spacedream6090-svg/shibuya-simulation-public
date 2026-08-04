@@ -2856,6 +2856,56 @@ physics:
     noise: 0.0                  # ξ の標準偏差 [m/s²]。0.0 = 無効(既定)
     noise_seed: 20260802        # ξ 専用 Generator の seed(noise>0 のときだけ意味を持つ)
 
+    # ==== P4-2 / P4-3 歩行物理較正(2026-08-05。**既定は現行挙動と完全に恒等**)========
+    # 正典: docs/research/p4-calibration-research.md §4/§6 /
+    #       docs/plans/if-sv-p4-plan.md P4-2・P4-3 行 /
+    #       reference/physics_bench/out/calib_results.json(P4-1)と calib_p43_results.json(P4-3)
+    # 実装: src/society/physics.py の `_CalibratedCrowd`(sfm_core.Crowd の薄い派生)。
+    #   **3 機能とも既定 OFF/現行値**。OFF のときは派生クラスすら作らず `sfm_core.Crowd` を
+    #   そのまま構築する = 演算順も引数も 1 バイト変わらない = golden L1 バイト一致。
+    #   ★これらは `physics.zones_enabled: true` のゾーン物理にだけ効く(屋内 indoor.sfm は別系統)。
+    #     さらに **engine: sfm のゾーンにだけ**効く(ORCA は力ベースではないので無関係)。
+    #
+    # ---- (1) 長距離 social 項(P4-2)----
+    # VISSIM 製品版 SFM は 2 項構造(短距離 25 m/s²・B 0.2 m + 長距離 0.5 m/s²・B 2.8 m)で、
+    # 本リポジトリは短距離項しか持っていない(A=2000 N ÷ 80 kg = 25 m/s² が短距離項と一致)。
+    #   f2_ij = m · a2 · exp((r_i+r_j − d)/b2) · w(φ) · n_ij     [N]
+    # ★カットオフ規則(cutoff_factor・taper_m)は **a2 とセットでしか意味を持たない**
+    #   (切って失う裾を a2 が吸収するため)。較正値だけ移して規則を変えてはいけない。
+    far_field:
+      enabled: false            # 既定 OFF(= 項が 1 度も評価されない)
+      a2: 0.119                 # A2 [m/s²] P4-1 の Nelder-Mead 収束先
+      b2: 1.890                 # B2 [m]    同上
+      cutoff_factor: 2.5        # 体表間隔 cutoff_factor·b2 [m] で打ち切る
+      taper_m: 1.0              # その手前 1 m を C¹ smoothstep で 0 へ落とす(不連続を作らない)
+    # ---- (2) 間隔ベース希望速度 V(s)(P4-3・Tordeux, Chraibi & Seyfried 2015)----
+    #   V(s) = min{ v0 , max{ 0 , (s − l)/T } }
+    #   s = 進行方向の最近前方者までの**中心間距離** [m](横ずれが体半径和以内の相手だけ)。
+    #   **駆動項の希望速度だけ**を差し替える(方向モデル・斥力・v_max は SFM のまま)。
+    #   原論文は v0=1.2 / l=0.3 / T=1 だが、それは単列歩行(体長 0.3 m)の値。本リポジトリの
+    #   体径は 0.5–0.7 m なので l・T は借りずに較正した(calib_p43_results.json)。
+    v_of_s:
+      enabled: false            # 既定 OFF(= V(s) を 1 度も評価しない)
+      T: 0.482                  # 時間ギャップ T [s]  ← P4-3 較正値(JSON は 0.4823492)
+      l: 0.297                  # 体長パラメータ l [m] ← P4-3 較正値(JSON は 0.2965060)
+    # ---- (3) 壁斥力(P4-3)----
+    #   f_iW = wall.a · exp((r_i − d_iW)/wall.b) · n_iW
+    #   **既定は現行 src と同じ 2000 N / 0.08 m**(= 何も変わらない)。
+    #   P4-1 の実測で b=0.08 は体半径に加えて片側 約 0.15 m の余分なクリアランスを要求し、
+    #   w ≤ 0.9 m の開口は**単独歩行者でも通れない**(Jülich には b=0.6 m の実験があり
+    #   実際の歩行者は通れるので、これはモデルの欠陥)。
+    #   ★P4-3 較正値(適用は conf で明示したときだけ。既定は 0.08 のまま):
+    #       b = 0.03  … 較正ハーネスの推奨(w=0.8 m まで単独通過・J(w) 線形性 R²=0.999)
+    #       b = 0.06  … 保守側の別解(目標「w=0.9 m 単独通過」を満たす **最大の** b
+    #                    = Helbing2000 の 0.08 からの乖離が最小)
+    #     どちらでも隔壁貫通は 0 名。壁面へのめり込み(体表クリアランス)はむしろ
+    #     現行 0.08 がいちばん悪い(−0.125 m → b=0.03 で −0.082 m)。
+    #     ただし **specific flow J/w は b を縮めても受入帯 [1.5,2.3] に届かない**
+    #     (0.59〜1.11)。水準不足は壁パラメータでは説明しきれない = 未解決。
+    wall:
+      a: 2000.0                 # A_w [N](Helbing2000 標準値。既定=現行)
+      b: 0.08                   # B_w [m](既定=現行。較正値は上のコメント/calib_p43_results.json)
+
   # ==== P3 境界縫合(竹-4 2026-08-02。**既定 OFF = 現行挙動と完全同一**)============
   # 正典: docs/plans/source/physics-instructions.md Part P3 /
   #       docs/research/physics-engine-selection.md ★P2 決定(2026-08-02)条件 1〜6。

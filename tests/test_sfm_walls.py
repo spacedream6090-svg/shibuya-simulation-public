@@ -410,16 +410,28 @@ def test_conf_physics_sfm_defaults_match_code():
     assert p["noise"] == 0.0                       # ξ は既定 OFF(未較正)
 
 
-def test_conf_physics_sfm_has_no_boolean_toggle():
-    """physics.sfm は bool トグルを持たない = どこからも自動で ON にならない宣言専用ブロック。
+def test_conf_physics_sfm_boolean_toggles_are_declared_and_off():
+    """physics.sfm の bool リーフは **既定 false** かつ registry.py に宣言済みであること。
 
-    (bool リーフがあれば registry.py の repro_tier 宣言が必須になる = 第72バッチの規約。
-     竹-3 では宣言だけを置き、エンジン切替 physics.zones[].engine は竹-4 の範囲。)
+    竹-3 の時点では bool リーフがゼロ(= 宣言専用ブロック)だったが、P4-2/P4-3
+    (2026-08-05)で較正トグル far_field.enabled / v_of_s.enabled が入った。
+    bool リーフがあれば registry.py の repro_tier 宣言が必須(第72バッチの規約)なので、
+    「宣言なしで bool が生える」ことをここで止める。
     """
+    from society import registry as _registry
+
     def _walk(node, path=""):
         if isinstance(node, dict):
             for k, v in node.items():
                 yield from _walk(v, f"{path}.{k}" if path else str(k))
         elif isinstance(node, bool):
-            yield path
-    assert list(_walk(_conf_physics())) == []
+            yield path, node
+
+    declared = {f.id for f in _registry.FEATURES}
+    found = dict(_walk(_conf_physics()))
+    assert set(found) == {"far_field.enabled", "v_of_s.enabled"}, \
+        f"physics.sfm に未知の bool リーフ: {sorted(found)}"
+    for path, value in found.items():
+        assert value is False, f"physics.sfm.{path} の既定が false でない"
+        assert f"physics.sfm.{path}" in declared, \
+            f"physics.sfm.{path} が registry.py に未宣言"

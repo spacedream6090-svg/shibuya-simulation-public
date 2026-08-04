@@ -213,6 +213,18 @@ FAR_TAPER_DEFAULT = 1.0   # C¹ テーパー幅 [m](カットオフ手前 1 m �
 #   VISSIM の n=5 相当の人数制限は短距離項側(src の neighbor_cap=12)に残っている。
 FAR_NEIGHBOR_CAP_DEFAULT = None
 
+# ── P4-3: Tordeux 型の間隔ベース希望速度 V(s)(既定 OFF)────────────────────────
+#   Tordeux, Chraibi & Seyfried (2015) "Collision-free speed model for pedestrian
+#   dynamics" (arXiv:1512.05597) の速度関数
+#       V(s) = min{ v0 , max{ 0 , (s − ℓ)/T } }
+#   を **駆動項の希望速度だけ** に適用する(方向モデル・斥力は SFM のまま)。
+#   原論文の使用値は v0=1.2 m/s, ℓ=0.3 m, T=1 s。ℓ=0.3 は単列歩行実験の体長で、
+#   本リポジトリの半径 0.25–0.35 m(体径 0.5–0.7 m)とは前提が違うので、
+#   **ℓ と T は較正対象**(値をそのまま借りない)。
+#   ★純度低下の防御は研究文書 §4(JuPedSim が製品モデルとして速度ベースを実装)。
+VOS_T_DEFAULT = 1.0       # 時間ギャップ T [s]
+VOS_L_DEFAULT = 0.3       # 体長パラメータ ℓ [m]
+
 
 class ExtendedCrowd(indoor_flow.WallCrowd):
     """WallCrowd(= src の SFM)に長距離 social 項を足した **ベンチ専用** サブクラス。
@@ -231,13 +243,21 @@ class ExtendedCrowd(indoor_flow.WallCrowd):
         cutoff_mode: "per_term"(既定・上の far_cutoff を使う)/
                      "hard"(短距離項と同じ CUTOFF_M=2.0 で切る = 現行構造の再現。
                             不連続の悪さを測るための対照)
+        v_of_s:     True で Tordeux 型 V(s) を駆動項の希望速度へ適用(既定 False)
+        vos_T / vos_l: V(s) の時間ギャップ T [s] / 体長 ℓ [m]
     """
 
     def __init__(self, *args, a2=FAR_A_DEFAULT, b2=FAR_B_DEFAULT, lambda_far=None,
                  far_cutoff=None, far_taper=FAR_TAPER_DEFAULT,
                  far_neighbor_cap=FAR_NEIGHBOR_CAP_DEFAULT,
-                 cutoff_mode="per_term", **kw):
+                 cutoff_mode="per_term",
+                 v_of_s=False, vos_T=VOS_T_DEFAULT, vos_l=VOS_L_DEFAULT, **kw):
         super().__init__(*args, **kw)
+        self.v_of_s = bool(v_of_s)
+        self.vos_T = float(vos_T)
+        self.vos_l = float(vos_l)
+        if self.v_of_s and not (self.vos_T > 0.0):
+            raise ValueError("vos_T must be > 0")
         self.a2 = float(a2)
         self.b2 = float(b2)
         self.lambda_far = float(self.lam if lambda_far is None else lambda_far)
@@ -310,7 +330,52 @@ class ExtendedCrowd(indoor_flow.WallCrowd):
         _, d, rr, nij, cosphi = self._pair_geometry()
         return self._far_contrib(d, rr, nij, cosphi).sum(axis=1)
 
+    # ── P4-3: 前方間隔 s と Tordeux 型 V(s) ─────────────────────────────────
+    def front_spacing(self):
+        """各個体の「進行方向の最近前方者までの中心間距離」s_i [m](前方に誰も居なければ inf)。
+
+        ★「前方」の定義(本ベンチの選択。原論文は単列歩行なので 2D への持ち上げが要る):
+          進行方向成分 along = (x_j − x_i)·e_i が正、かつ横ずれ lateral が
+          体半径和 (r_i + r_j) 以内 = **実際に進路を塞いでいる相手**だけを数える。
+          円錐角ではなく「体幅ぶんの回廊」で切るのは、すれ違いざまの相手で速度が
+          落ちないようにするため(横ずれが体幅より大きい相手は避けて通れる)。
+        決定論: 比較と min だけ。乱数ゼロ・順序依存なし。
+        """
+        n = self.pos.shape[0]
+        if n < 2:
+            return np.full(n, np.inf)
+        e, _ = self._desired_dir()
+        diff = self.pos[None, :, :] - self.pos[:, None, :]        # i → j
+        d = np.linalg.norm(diff, axis=2)
+        along = np.einsum("ik,ijk->ij", e, diff)
+        lateral2 = np.maximum(d * d - along * along, 0.0)
+        rr = self.radius[:, None] + self.radius[None, :]
+        ahead = self.active[None, :] & (along > 0.0) & (lateral2 <= rr * rr)
+        np.fill_diagonal(ahead, False)
+        return np.where(ahead, d, np.inf).min(axis=1)
+
+    def v_of_s_speed(self):
+        """V(s) = min{v0, max{0, (s − ℓ)/T}}(Tordeux et al. 2015 式)。"""
+        s = self.front_spacing()
+        return np.minimum(self.v0, np.maximum(0.0, (s - self.vos_l) / self.vos_T))
+
     def forces(self):
+        """f = 駆動(希望速度は v0 または V(s))+ 短距離斥力 + 長距離斥力 + 壁 + ξ。
+
+        v_of_s=True のときだけ、駆動項の希望速度を V(s) に差し替える
+        (v_max は __init__ で v0 から作った配列のままなので**上限は不変**)。
+        v_of_s=False なら _forces_core() をそのまま呼ぶ = 従来とバイト一致。
+        """
+        if not self.v_of_s:
+            return self._forces_core()
+        v0_saved = self.v0
+        self.v0 = self.v_of_s_speed()
+        try:
+            return self._forces_core()
+        finally:
+            self.v0 = v0_saved
+
+    def _forces_core(self):
         """f = 駆動 + 短距離斥力 + **長距離斥力** + 壁 + ξ。
 
         a2 <= 0 なら super().forces() をそのまま返す(= 本体とバイト一致)。
@@ -340,7 +405,9 @@ class ExtendedCrowd(indoor_flow.WallCrowd):
         return f
 
     def forces_naive(self):
-        """検証用の素朴経路: super().forces() + _far_forces()(幾何を 2 度作る)。"""
+        """検証用の素朴経路: super().forces() + _far_forces()(幾何を 2 度作る)。
+
+        比較相手は融合経路 `_forces_core()`(= v_of_s を掛ける前の中身)。"""
         f = super().forces()
         if self.a2 > 0.0:
             f = f + self._far_forces()
@@ -397,7 +464,10 @@ def verify_extended_matches_base(seed=20260805, n=40):
     outs = []
     for cls, kw in ((indoor_flow.WallCrowd, {}),
                     (ExtendedCrowd, {"a2": 0.0}),
-                    (ExtendedCrowd, {"a2": 0.0, "b2": 2.8, "far_cutoff": 9.0})):
+                    (ExtendedCrowd, {"a2": 0.0, "b2": 2.8, "far_cutoff": 9.0}),
+                    # P4-3: v_of_s=False(既定)は V(s) を 1 度も評価しない
+                    (ExtendedCrowd, {"a2": 0.0, "v_of_s": False,
+                                     "vos_T": 0.5, "vos_l": 0.6})):
         c = cls(pos=pos.copy(), vel=vel.copy(), goal=goal.copy(), v0=v0,
                 radius=rad, walls=walls, neighbor_cap=NEIGHBOR_CAP, **kw)
         for _ in range(50):
