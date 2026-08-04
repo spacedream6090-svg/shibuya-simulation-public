@@ -229,6 +229,12 @@ TABLE: tuple[tuple[str, str, str], ...] = (
     ("media.min_steps", STEPS, "視聴セッション長の下限 [step]"),
     ("media.max_steps", STEPS, "視聴セッション長の上限 [step]"),
     ("institution_routes.enforcement.detention_steps", STEPS, "拘束の長さ [step]"),
+    # 第95バッチ IF-C(噂)。TTL は実時間で同じ長さを保ち、生成上限は「件/step」なので
+    # 1 日あたりの総量が保たれるようにスケールする(lod.max_llm_per_step と同型)。
+    ("information.rumors.forget_steps", STEPS,
+     "噂の忘却 TTL [step](0=忘れない=無効の意味なので 0 のまま保たれる)"),
+    ("information.rumors.max_per_step", RATE,
+     "1 step に生む噂の上限 [件/step](1日あたりの総量を保つ安全弁)"),
     ("beliefs.witness_window", STEPS, "目撃可能な窓 [step]"),
     ("beliefs.fact_ttl_steps", STEPS, "fact の鮮度 [step]"),
     ("beliefs.verify_deadline_steps", STEPS, "現場確認の有効期限 [step]"),

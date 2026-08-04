@@ -311,6 +311,32 @@ FEATURES: tuple[Feature, ...] = (
        "(Masicampo & Baumeister 2011。Zeigarnik 効果は 2025 メタ分析で否定済みなので根拠にしない)。"
        "既定 silent は現行と 1 バイトも変わらない(イベント 0 件・記憶 0 行・プロンプト不変)",
        off_value="silent"),
+    # 第95バッチ IF-C: 情報オブジェクトの一般化 = 噂(設計 src/society/rumors.py /
+    # docs/research/if-lane-research.md §2 / llm-world-interface-audit.md §3)。
+    # strict の根拠: 噂の**誕生**は L1 の有限種の構造化イベントだけを源にし、文面は
+    #   (源イベント種, 場所名 or 人名) の純関数。源イベントの自由文(title / name)は
+    #   1 バイトも読まない。**伝播**は既存の会話接触に相乗りするだけで、発話テキストを
+    #   読みも書き換えもしない。**停止**(Maki-Thompson の stifler 化)は接触順だけで決まる
+    #   完全決定論で、乱数 stream を 1 本も引かない。
+    # ★affects_k=False: generate() の呼び出しサイトを 1 つも足さず・減らさず・プロンプトの
+    #   **節**も 1 つも増やさない。増えるのは既存「直近の出来事」欄の中身だけ(flyer / news /
+    #   dm と同じ帯域)で、そこ経由の間接的な発火数の揺れは本レジストリの規約どおり False。
+    # fingerprint_risk=possible: 伝聞の定型文 1 行が聞き手の記憶に入り次のプロンプトに載る
+    #   (当人から見て差分に気づく余地がある)。ただし文面は有限テンプレの純関数で、
+    #   実験条件も機構語も数値も 1 文字も漏れない。**item_id は絶対にプロンプトへ入れない**。
+    # ★正直な相互作用: ON のランでは凍結指標 c_transmission / n_transmission /
+    #   transmission_novel_rate(measure.py / stream.py / echo.py = 凍結 14 ファイル)に
+    #   噂の transmission が混ざる(あちらは item の kind を見ない)。既定 OFF では無風。
+    _f("information.rumors.enabled", "strict", False, "possible",
+       "Item.kind=\"rumor\" の宣言済み枠を実体化する。構造化イベント(既定 = event_host / "
+       "venture_open / enforcement の公共 3 種)から定型文の噂 Item を起こし、当事者と"
+       "同席者を初期 knower にする。伝播は既存の speak/dm に相乗りして transmission"
+       "(= provenance の既存 API)に載り、聞き手の記憶に定型文 1 行が入る"
+       "(**発話テキストは 1 バイトも変えない = 別チャネルの伝聞**)。"
+       "停止規則 stifle=mt(既定)は Maki & Thompson 1973 = 既に知っている相手へ語ったら"
+       "以後語らない(= 噂が止まる唯一の理由。理論的極限は最終 ignorant≈20%)。"
+       "指標は OASIS に揃えた scale / depth / max_breadth(解析 scripts/analyze_rumors.py)。"
+       "既定 OFF は Item 0 件・イベント 0 件・記憶 0 行・プロンプト不変(L1 バイト一致)"),
     # 第88バッチ 心モデル固定 + 三層知能配置(設計 §5)。
     # journal 等級の根拠: 個体ごとに**別のモデル**が自由文を書く。事後に再生するには
     #   モデル別の llm_cache / llm_journal(子ごとに 1 本)が要る = 単体では非決定。

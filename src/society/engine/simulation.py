@@ -1814,6 +1814,15 @@ class Simulation:
         _rjprov = _reject_prov.provenance(self)
         if _rjprov is not None:
             summary["rejection_notify"] = _rjprov
+        # ---- 噂(情報オブジェクト)第95バッチ IF-C(information.rumors.enabled=false = 既定はキーなし)----
+        # if-lane-research §2 が要求した「本シムの拡散曲線が Daley-Kendall / Maki-Thompson の
+        # 理論値(最終 ignorant≈20%・spreader ピーク≈0.307)とどれだけ違うか」の分母になる観測量。
+        # 何件生まれ・何件伝わり・何人が黙り・1 噂あたり何人に届いたか(reach 分布)を残す。
+        # 理論値との**判定**は解析側 scripts/analyze_rumors.py に置く(判定式を 1 箇所に保つ)。
+        from .. import rumors as _rumors_prov
+        _rmprov = _rumors_prov.provenance(self)
+        if _rmprov is not None:
+            summary["rumors"] = _rmprov
         # ---- 心モデル固定+三層知能 第88バッチ(model.mind.enabled=false = 既定 OFF はキーなし)----
         # 原文書 §5「モデルと人格の交絡が生じるため必ずログに残す」の集計側。
         # モデル別の人数・呼数・キャッシュ命中に、第87 エピソード数と第86 修復率を統合する。

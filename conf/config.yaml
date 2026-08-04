@@ -1340,6 +1340,52 @@ labeling:
                   "決まりです", "ということになった", "ルール", "取り決め",
                   "いつもどおり", "いつも通り", "そういうこと"]
 
+# ---- 情報オブジェクトの一般化 IF-C(第95バッチ 2026-08-05。**既定 OFF=現行と完全同一**)----
+# 監査 §3: 「語彙(coin_label)」だけが ID 付き Item + transmissions を持ち因果ループが完全に
+# 閉じている一方、「街で何が起きたか」の伝聞は無構造の発話テキストを流れるだけで、誰から誰へ
+# 何が伝わったかを機構として追えない。provenance.Item の kind には rumor が**宣言済み**なので、
+# その空き枠に実体を入れる(= 新スキーマは足さない・既存のカスケード木ツールがそのまま効く)。
+#
+# ★if-lane-research §2 の位置づけ: Generative Agents (Park et al. 2023) の拡散測定は
+#   **2日終了時点の自然言語インタビュー**で、ID つき情報オブジェクトを機構として持たない
+#   (幻覚率 1.3%)。本シムは走行中の台帳から誤差ゼロで測れる = **追随ではなく先行**。
+# ★足りなかったのは「噂が止まる理由」。Daley & Kendall 1964/1965 と Maki & Thompson 1973 の
+#   核心は「全員が知って飽和するから止まる」のではなく「**既知の相手に出会った語り手が
+#   語るのをやめる**から止まる」ことで、だから極限で 2 割が永久に知らないままになる
+#   (理論値: 最終 ignorant ≈ 20% / spreader ピーク = 1 − ln2 ≈ 0.3069)。
+#
+# 3つの設計判断(詳細と理由は src/society/rumors.py の docstring):
+#   (1) 源は**構造化イベントに限る**(自由文の解釈をしない)。文面は (源イベント種, 場所名 or
+#       人名) の**純関数**で、源イベントの自由文(title / name)は 1 バイトも読まない。
+#   (2) **発話テキストには噂を注入しない**。LLM が書いた文を機械が改竄すると会話の自然さが
+#       壊れ、改竄の有無が実験条件と相関すれば no-fingerprint 違反に直結する。噂は
+#       「その会話の傍らで伝わった伝聞」= 聞き手の**記憶に定型文 1 行**だけが載る別チャネル。
+#   (3) stifler 化は**完全決定論**(誰と誰が同席するかは既存の物理・接触過程が既に決めている
+#       ので、接触順だけで停止が決まる)= 乱数 stream を 1 本も引かない。
+#
+# R1: LLM 追加呼ゼロ・乱数ゼロ・プロンプトの節ゼロ増(増えるのは既存「直近の出来事」欄の中身)。
+#   OFF が保つ不変条件: Item 0 件(item_id の採番も動かない)・rumor_born/rumor_stifle/
+#   transmission いずれも 0 件・agent に _rumors 属性が生えない・sim に state が生えない・
+#   summary に rumors キーなし・プロンプト 1 バイト不変・L1 バイト一致(golden_baseline_l1.json)。
+# ★正直な相互作用: ON のランでは凍結指標(measure.py / stream.py / echo.py の c_transmission /
+#   n_transmission / transmission_novel_rate)に噂の伝播が混ざる(あちらは item の kind を
+#   見ない)。凍結 14 ファイルは 1 バイトも触れないので、切り分けは解析側
+#   scripts/analyze_rumors.py(item_id 接頭辞 "rumor-" で分離)で行う。既定 OFF では無風。
+information:
+  rumors:
+    enabled: false              # ★false=完全 no-op(バイト一致)。true で噂の誕生・伝播・停止が動く
+    # 噂の源にする L1 イベント種(**既定は公共の出来事 3 種だけ = 保守的**)。
+    # 実装が定型文を持つのは 5 種(rumors.SRC_SPECS): 下の 3 種 + partner_formed / relation_break。
+    # private な 2 種を既定から外す理由 = 当事者しか知り得ない出来事で「同席者が目撃する」規則が
+    # 意味を成さず、既存の負の評判機構(gossip.seed_events の relation_break)と二重になるため。
+    # リストは**置き換え**(既定に重ねない)= config を読めばそのランの源が一意に判る。
+    sources: ["event_host", "venture_open", "enforcement"]
+    stifle: mt                  # mt(既定・Maki & Thompson 1973)| none(止まらない=現行の伝播機構と同じ)
+    stifle_threshold: 1         # mt: 既に知っている相手へ語った回数がこれに達したら以後語らない
+    forget_steps: 0             # 忘却 TTL [step]。0=忘れない(既定)。>0 で日境界に掃引
+    max_per_step: 8             # 1 step に生む噂の上限(暴走の安全弁)
+    max_per_talk: 1             # 1 回の発話/DM で伝える噂の本数(知った順=古い順)
+
 rewards:
   enabled: false                # D9: 既定 off(過正当化の交絡を排除)
   amount_per_adoption: 300      # enabled 時、自分の造語が採用されるたび creator に与える報酬額(円)

@@ -36,6 +36,7 @@ from .. import provlink as provlink_mod
 from .. import reject as reject_mod
 from .. import relations as relations_mod
 from .. import relations_endo as relations_endo_mod
+from .. import rumors as rumors_mod
 from .. import pov as pov_mod
 from .. import b2b as b2b_mod
 from .. import delivery as delivery_mod
@@ -2957,6 +2958,10 @@ def _apply_action(sim, agent, action: dict, step: int, sim_min: int) -> None:
                 drive.add(recipient, "state_change", sim.drivecfg, scale=abs(d_v))
             words = [w for w in sorted(agent.adopted) if w in action["text"]]
             _hear_words(sim, recipient, words, agent.id, "dm", step, sim_min)
+            # 噂の相乗り IF-C(第95・既定 OFF=即 return=バイト一致)。**本文は触らない**:
+            # 送った DM の文面はそのままで、話者が知っている噂だけが「別チャネルの伝聞」として
+            # 受信者へ渡る(transmission 1 件 + 受信者の記憶 1 行)。LLM 呼ゼロ・乱数ゼロ。
+            rumors_mod.on_talk(sim, agent, [recipient], "dm", step, sim_min)
             # DM での意見更新(FJ、w=w_dm)。source=送信者。
             _shift_opinion(sim, recipient, v_dm, agent.id,
                            sim.opinioncfg["w_dm"], step, sim_min)
@@ -3100,6 +3105,12 @@ def _apply_action(sim, agent, action: dict, step: int, sim_min: int) -> None:
             # 対面での意見更新(FJ、w=w_face)。source=話者。
             _shift_opinion(sim, hearer, v_text, agent.id,
                            sim.opinioncfg["w_face"], step, sim_min)
+        # 噂の相乗り IF-C(第95・既定 OFF=即 return=バイト一致)。**発話テキストは 1 バイトも
+        # 変えない**(引数にも取らない): 話者が spreader である噂だけが「別チャネルの伝聞」として
+        # 聞き手へ渡り、聞き手の記憶に定型文 1 行が載る(transmission = 既存 API)。
+        # 既知の相手に語ってしまったら Maki-Thompson 流に stifler 化する(= 噂が止まる唯一の理由)。
+        # LLM 呼ゼロ・乱数ゼロ・世界状態(位置・所持金・関係・drive)は 1 つも動かさない。
+        rumors_mod.on_talk(sim, agent, hearers, "face", step, sim_min)
 
 
 # ---------------------------------------------------------------- 世界イベント
@@ -5037,6 +5048,9 @@ def run_step(sim, step: int) -> None:
                                                    # infoenv(誤情報)確定後・collect(L2)前=当日の負イベントを同 step でスキャン
     _phase_beliefs(sim, step, sim_min)             # 真偽台帳: fact 抽出→直接目撃→伝聞→現場確認(既定OFF=no-op。第73バッチ B)。
                                                    # _apply 後=この step の発話・世界イベントを同 step で取り込む / collect(L2)前
+    rumors_mod.phase(sim, step, sim_min)           # 情報オブジェクト IF-C: 構造化イベント→噂 Item の誕生+忘却掃引
+                                                   # (既定OFF=no-op。第95バッチ)。_apply 後=この step の行為イベントを
+                                                   # 同 step で拾う(伝播は次 step 以降の会話に乗る=1 step の遅れ)/ collect(L2)前
 
     _bl = (sim.cfg.get("engine", {}) or {}).get("batch_llm", {}) or {}
     if ablate_mod.llm_off(sim):

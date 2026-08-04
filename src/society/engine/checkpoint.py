@@ -181,6 +181,18 @@ def save(sim, step: int, path: str | Path) -> Path:
             # 既定 silent では state 自体が生えない → None=挙動不変(load は .get で
             # 旧 checkpoint 互換)。
             "reject_state": getattr(sim, "_reject_state", None),
+            # 第95バッチ IF-C(噂 = 情報オブジェクトの一般化): 噂 Item の台帳
+            # (item_id → 源イベント種 / ノード / 誕生 step / 発端者 / 到達人数)と
+            # 累積タリー・忘却掃引の日境界。**誰が何を知っているか**(agent._rumors)は
+            # agents pickle に自然同梱され、**Item 実体**(text / transmissions)は
+            # 既に "labels"(= sim.items と同一の ItemStore)へ同梱されているので、
+            # ここで中央管理するのは summary.rumors の材料と日カウンタだけ
+            # (第75 dunbar / 第94 IF-B と同じ型)。保存しないと mid-day resume で
+            # reach / born / stiflers が straight と食い違い、忘却掃引が同じ日を二重に走る。
+            # watermark(_rumor_watermark)はプロセス内 logger カウンタ由来なので**保存しない**
+            # (load で 0 に戻す = 第59 assets / 第61 gossip と同流儀)。
+            # 既定 OFF では state 自体が生えない → None=挙動不変(load は .get で旧 ckpt 互換)。
+            "rumor_state": getattr(sim, "_rumor_state", None),
             # 第88バッチ 心モデル固定: L1 `mind_assign` を出し終えた agent_id。
             # **割当そのものは保存しない** — 誕生時固定は (master_seed, agent_id) の純関数
             # (専用 stream mind_model / mind_tier)なので resume でも pool 再入場でも同じ
@@ -363,6 +375,9 @@ def load(sim, path: str | Path) -> int:
     rjs = rt.get("reject_state")                # 第94 IF-B(旧 ckpt 互換=無ければ素通り)
     if rjs is not None:
         sim._reject_state = rjs
+    rms = rt.get("rumor_state")                 # 第95 IF-C(旧 ckpt 互換=無ければ素通り)
+    if rms is not None:
+        sim._rumor_state = rms
     # 第89 プラセボ L1: 輪を戻し、pickle 復元された個体を構築時の Placebo へ繋ぎ直す
     # (OFF は no-op。旧 ckpt 互換=無ければ輪は空のまま=OFF ランと同じ)。
     _ablate_ckpt.placebo_restore(sim, rt.get("placebo_state"))

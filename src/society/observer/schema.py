@@ -397,6 +397,21 @@ register_event_kind("action_reject",   "裁定が行為を拒否し、当人へ�
                                        "move_to|verify), "
                                        "reason(no_money|no_room|absent|unreachable|"
                                        "no_target|no_witness|no_channel)}")
+# ---- 情報オブジェクトの一般化(第95バッチ IF-C・information.rumors.enabled のみ・既定 OFF=0件)。
+#      Item.kind="rumor" の**宣言済みの空き枠**に実体を入れる層。伝播そのものは既存の
+#      `transmission`(provenance.transmit)に乗るので、新イベントは誕生と停止の 2 種だけ。
+#      ★payload に自由文は 1 つも入らない(item_id は観測側の ID・src_kind は有限語彙・
+#        node は世界の識別子・knowers は agent_id 列)。噂の**本文**は L1 に出さず
+#        Item.text と聞き手の記憶にだけ載る。
+#      実装 src/society/rumors.py。設計 docs/research/if-lane-research.md §2
+#      (Daley-Kendall / Maki-Thompson の stifler 化・OASIS の scale/depth/max_breadth)。
+register_event_kind("rumor_born",      "構造化イベントから噂 Item が生まれた"
+                                       "{item_id, src_kind(event_host|venture_open|"
+                                       "enforcement|partner_formed|relation_break), "
+                                       "node, knowers(当事者+同席者の agent_id 昇順)}")
+register_event_kind("rumor_stifle",    "★語り手が黙った(Maki-Thompson の stifler 化: "
+                                       "既に知っている相手へ語った回数が閾値に達した)"
+                                       "= 噂が止まる唯一の理由 {item_id}")
 
 
 @dataclass
