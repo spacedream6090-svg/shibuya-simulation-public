@@ -160,7 +160,8 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
                  watch_section: str | None = None,
                  revision_line: str | None = None,
                  engaged_section: str | None = None,
-                 reject_line: str | None = None) -> str:
+                 reject_line: str | None = None,
+                 trace_line: str | None = None) -> str:
     """個別文脈(時刻・場所・活動・気分・記憶・直近発話)を渡し、内容の固定化を防ぐ。
 
     pull_query が渡された時だけ(agentic_pull=true)、その文で決定論の記憶想起を
@@ -225,6 +226,14 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
                                          # 既定 OFF は None=1行も足さない=バイト一致(ads_line と同型 seam)
     lines += [f"時刻: {_time_label(sim_min)}",
               f"場所: {place_name}"]
+    # 場所に残った痕跡(第96バッチ IF-D・world.traces 有効かつ現在ノードの最強痕跡が閾値超の
+    # ときのみ)。既定 OFF は None=1行も足さない=バイト一致(place_label_line と同型 seam)。
+    # ★中身は「この場所では最近、〈出来事種の定型語〉があったようだ。」の定型 1 行だけ。
+    #   強度・件数・階層名・実験条件・機構語は 1 文字も出さない(society/traces.py 参照)。
+    # ★「この場所」を指す文なので、**場所を名指しした直後**に置く(場所の呼ばれ方
+    #   place_label_line と隣接する 1 行欄の族。順序は golden 不変=OFF では行が無い)。
+    if trace_line:
+        lines.append(trace_line)
     if nearby_pois:
         lines.append(f"周りにある店・場所: {'、'.join(nearby_pois[:_poi_n])}")
     if scene_lines:                      # 構造化シーン記述 v0(scene_desc 有効時のみ。方向つき視界/

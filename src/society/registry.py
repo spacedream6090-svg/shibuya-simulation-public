@@ -337,6 +337,31 @@ FEATURES: tuple[Feature, ...] = (
        "以後語らない(= 噂が止まる唯一の理由。理論的極限は最終 ignorant≈20%)。"
        "指標は OASIS に揃えた scale / depth / max_breadth(解析 scripts/analyze_rumors.py)。"
        "既定 OFF は Item 0 件・イベント 0 件・記憶 0 行・プロンプト不変(L1 バイト一致)"),
+    # 第96バッチ IF-D: 痕跡 = 場所のイベント履歴(設計 src/society/traces.py /
+    # docs/research/if-lane-research.md §1 / llm-world-interface-audit.md §3)。
+    # strict の根拠: 集約(強度加算+上限クリップ)も蒸発(半減期の決定論減衰・日境界 1 回)も
+    #   完全決定論で、**乱数 stream を 1 本も引かない**。源は L1 の有限種の構造化イベントだけで、
+    #   源イベントの自由文(title / name / kind)は 1 バイトも読まない。プロンプトへ出るのは
+    #   (痕跡種) の純関数である定型 1 行だけ。
+    # ★affects_k=False: generate() の呼び出しサイトを 1 つも足さず・減らさず、プロンプトの
+    #   **節**も増やさない(増えるのは既存の 1 行欄の族に並ぶ 1 行だけ = place_label_line /
+    #   crowd_line と同じ帯域)。そこ経由の間接的な発火数の揺れは本レジストリの規約どおり False。
+    # fingerprint_risk=possible: 痕跡の定型 1 行がその node に居る者のプロンプトに載る
+    #   (当人から見て差分に気づく余地がある)。ただし文面は有限テンプレの純関数で、
+    #   **強度・件数・階層名・実験条件・機構語は 1 文字も出ない**。
+    # ★propagation(拡散)は**コードとして存在しない**(Parunak の propagation factor = 0 として
+    #   文献的に正当。node グラフ上の拡散は近傍列挙順依存で golden を壊しやすく、25 万体で
+    #   毎 step 掃引が乗り、「隣へ滲む」は情報オブジェクト IF-C の担当だから)。
+    _f("world.traces.enabled", "strict", False, "possible",
+       "監査 §3 の穴(場所のイベント履歴 = L1 に座標付きで残るがシム内から読む経路ゼロ)を"
+       "閉じ、node を Heylighen の言う medium にする。行為の副産物として node × 痕跡種の"
+       "強度が増え(集約)、日境界に半減期で薄れ(蒸発)、**その場に居合わせなかった者**の"
+       "プロンプトへ定型 1 行(最強 1 件のみ)が入る。TTL は 3 階層 = transient(揉め事・"
+       "半減期 ~3 時間)/ daily(出来事・摘発・144 step = 既存 flyer と同水準)/ "
+       "persistent(場所に定着した性格・減衰なし)。単一 TTL を全種に使うのは文献に反する"
+       "(Heylighen: 減衰速度は情報が陳腐化する速度に合わせる。古い痕跡は無関係ではなく誤誘導)。"
+       "**演算は集約と蒸発の 2 つだけで拡散は無い**(Parunak factor 0)。"
+       "既定 OFF は trace_mark 0 件・state なし・プロンプト不変(L1 バイト一致)"),
     # 第88バッチ 心モデル固定 + 三層知能配置(設計 §5)。
     # journal 等級の根拠: 個体ごとに**別のモデル**が自由文を書く。事後に再生するには
     #   モデル別の llm_cache / llm_journal(子ごとに 1 本)が要る = 単体では非決定。

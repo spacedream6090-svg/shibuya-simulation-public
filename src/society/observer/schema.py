@@ -412,6 +412,20 @@ register_event_kind("rumor_born",      "構造化イベントから噂 Item が�
 register_event_kind("rumor_stifle",    "★語り手が黙った(Maki-Thompson の stifler 化: "
                                        "既に知っている相手へ語った回数が閾値に達した)"
                                        "= 噂が止まる唯一の理由 {item_id}")
+# ---- 痕跡 = 場所のイベント履歴(第96バッチ IF-D・world.traces.enabled のみ・既定 OFF=0件)。
+#      監査 §3 の「場所のイベント履歴 = L1 に座標付きで全部残るがシム内から読む経路ゼロ」を
+#      閉じる層。node を Heylighen の言う **medium**(知覚でき、かつ変えられる世界の部分)に
+#      する = 行為が強度を残し(集約)、日境界で薄れ(蒸発)、後から来た者が 1 行で知覚する。
+#      ★**演算は集約と蒸発の 2 つだけ**(Parunak の propagation factor = 0 = 拡散なし)。
+#      ★出すのは**集約の 1 件だけ**。閲覧(後から来た者が読んだこと)は L1 に出さない
+#        (flyer_view と違い受動観測で毎 step 全在場者ぶん発生するため。総数は
+#         summary.traces.lines_injected に残す)。
+#      ★payload に自由文は 1 つも入らない(node は世界の識別子・kind と tier は有限語彙)。
+#      実装 src/society/traces.py。設計 docs/research/if-lane-research.md §1
+#      (Grassé 1959 / Heylighen 2011「減衰は欠陥ではなく機能」/ Parunak の flavor と 3 演算)。
+register_event_kind("trace_mark",      "行為の副産物として場所に痕跡が残った(集約)"
+                                       "{node, kind(enforcement|gathering|opening|"
+                                       "closing|trouble), tier(transient|daily|persistent)}")
 
 
 @dataclass

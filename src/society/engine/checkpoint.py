@@ -193,6 +193,17 @@ def save(sim, step: int, path: str | Path) -> Path:
             # (load で 0 に戻す = 第59 assets / 第61 gossip と同流儀)。
             # 既定 OFF では state 自体が生えない → None=挙動不変(load は .get で旧 ckpt 互換)。
             "rumor_state": getattr(sim, "_rumor_state", None),
+            # 第96バッチ IF-D(痕跡 = 場所のイベント履歴): 痕跡ストア本体
+            # (node → 種 → 強度 / 最終集約 step / 当事者名簿)と、蒸発の日境界・
+            # 前回蒸発 step・累積タリー。★噂(IF-C)や dunbar と違い、**状態の本体が
+            # sim 側にある**(場所に紐づくので agents pickle には載らない)= ここで
+            # 保存しないと resume 直後に街の痕跡が全部消え、L1 の trace_mark も
+            # プロンプトの 1 行も straight と食い違う。半減期減衰は「前回蒸発からの
+            # 経過 step」で計算するので、evap_step を保存すれば日境界を跨いだ resume でも
+            # straight と同じ強度に落ち着く。watermark(_trace_watermark)はプロセス内
+            # logger カウンタ由来なので**保存しない**(load で 0 に戻る = rumors と同流儀)。
+            # 既定 OFF では state 自体が生えない → None=挙動不変(load は .get で旧 ckpt 互換)。
+            "trace_state": getattr(sim, "_trace_state", None),
             # 第88バッチ 心モデル固定: L1 `mind_assign` を出し終えた agent_id。
             # **割当そのものは保存しない** — 誕生時固定は (master_seed, agent_id) の純関数
             # (専用 stream mind_model / mind_tier)なので resume でも pool 再入場でも同じ
@@ -378,6 +389,9 @@ def load(sim, path: str | Path) -> int:
     rms = rt.get("rumor_state")                 # 第95 IF-C(旧 ckpt 互換=無ければ素通り)
     if rms is not None:
         sim._rumor_state = rms
+    trs = rt.get("trace_state")                 # 第96 IF-D(旧 ckpt 互換=無ければ素通り)
+    if trs is not None:
+        sim._trace_state = trs
     # 第89 プラセボ L1: 輪を戻し、pickle 復元された個体を構築時の Placebo へ繋ぎ直す
     # (OFF は no-op。旧 ckpt 互換=無ければ輪は空のまま=OFF ランと同じ)。
     _ablate_ckpt.placebo_restore(sim, rt.get("placebo_state"))

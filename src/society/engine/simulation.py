@@ -1823,6 +1823,15 @@ class Simulation:
         _rmprov = _rumors_prov.provenance(self)
         if _rmprov is not None:
             summary["rumors"] = _rmprov
+        # ---- 痕跡(場所のイベント履歴)第96バッチ IF-D(world.traces.enabled=false = 既定はキーなし)----
+        # if-lane-research §1 が「減衰は欠陥ではなく機能」「単一 TTL を全種に使うのは文献に反する」と
+        # した設計の観測側。何件が場所に刻まれ(marks)・何件が薄れて消え(evaporated)・
+        # 何行が後から来た者のプロンプトへ入ったか(lines_injected)を種別内訳つきで残す。
+        # ★閲覧は L1 に出さない(受動観測で毎 step 大量発生する)ので、注入総数はここが唯一の観測点。
+        from .. import traces as _traces_prov
+        _trprov = _traces_prov.provenance(self)
+        if _trprov is not None:
+            summary["traces"] = _trprov
         # ---- 心モデル固定+三層知能 第88バッチ(model.mind.enabled=false = 既定 OFF はキーなし)----
         # 原文書 §5「モデルと人格の交絡が生じるため必ずログに残す」の集計側。
         # モデル別の人数・呼数・キャッシュ命中に、第87 エピソード数と第86 修復率を統合する。

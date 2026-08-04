@@ -235,6 +235,12 @@ TABLE: tuple[tuple[str, str, str], ...] = (
      "噂の忘却 TTL [step](0=忘れない=無効の意味なので 0 のまま保たれる)"),
     ("information.rumors.max_per_step", RATE,
      "1 step に生む噂の上限 [件/step](1日あたりの総量を保つ安全弁)"),
+    # 第96バッチ IF-D(痕跡)。半減期は実時間で同じ長さを保つ(0=減衰しない=無効の意味なので
+    # 0 のまま保たれる)。集約上限は「件/step」なので 1 日あたりの総量が保たれるようにする。
+    ("world.traces.half_life_steps.*", STEPS,
+     "痕跡の蒸発の半減期 [step](0=減衰しない persistent の意味なので 0 のまま保たれる)"),
+    ("world.traces.max_per_step", RATE,
+     "1 step に集約する痕跡の上限 [件/step](1日あたりの総量を保つ安全弁)"),
     ("beliefs.witness_window", STEPS, "目撃可能な窓 [step]"),
     ("beliefs.fact_ttl_steps", STEPS, "fact の鮮度 [step]"),
     ("beliefs.verify_deadline_steps", STEPS, "現場確認の有効期限 [step]"),

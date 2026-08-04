@@ -405,6 +405,61 @@ world:
     weekday_work: false         # ★ON 推奨: true(平日のみ勤務・登校。土日祝は休み)
     holidays: []                # 追加の休日(例: ["2026-04-29", "2026-05-05"])。土日は自動で休日
 
+  # ---- 痕跡 = 場所のイベント履歴 IF-D(第96バッチ 2026-08-05。**既定 OFF=現行と完全同一**)----
+  # 監査 §3 が挙げた穴: 「場所のイベント履歴 = L1 に座標付きで全部残るが**シム内から読む
+  # 経路がゼロ**」。Heylighen の用語ではこれは「medium ではない」状態そのもの(変えられるが
+  # 知覚できない = 海に石を投げる状態)で、街で何が起きても後から来た者は何も知り得なかった。
+  # 本ブロックは node を medium にする: 行為が強度を残し(集約)、時間が経てば薄れ(蒸発)、
+  # その場に居合わせなかった者が定型 1 行として知覚する。
+  #
+  # ★if-lane-research §1 の位置づけ: 既存の貼り紙(flyer)は node × TTL × 容量 × narrowcast の
+  #   **完全なスティグマジー実装**である。本ブロックはその構造を「意図的な掲示」から
+  #   「行為の副産物」へ一般化したもので、新機構の発明ではない。
+  # ★**演算は集約(aggregation)と蒸発(evaporation)の 2 つだけ**。Parunak の 3 演算のうち
+  #   propagation(拡散)は **factor = 0** として入れない(文献的に正当な設定)。理由は
+  #   (a) node グラフ上の拡散は近傍列挙順に依存し golden のバイト一致を壊しやすい
+  #   (b) 25 万体で O(node × kind) の毎 step 掃引が乗る
+  #   (c) 「隣の駅に噂が滲む」は情報オブジェクト(information.rumors)の担当。
+  #   実装 src/society/traces.py には拡散に相当するコードが 1 行も存在しない(テストが AST で固定)。
+  # ★減衰は欠陥ではなく**機能**(Heylighen):「枯れた餌場を指すフェロモン道は『無関係になった』
+  #   のではなく、無駄な旅を誘発する点で**誤誘導**になった」。減衰速度は「情報が陳腐化する速度」に
+  #   合わせるべきで、**単一の TTL 既定値を全種に使うのは文献に反する** → TTL 3 階層。
+  #
+  # R1: LLM 追加呼ゼロ・乱数ゼロ・プロンプトの節ゼロ増(増えるのは既存の 1 行欄の族に並ぶ 1 行)。
+  #   OFF が保つ不変条件: trace_mark 0 件・sim に state が生えない・agent に属性が生えない・
+  #   summary に traces キーなし・プロンプト 1 バイト不変・L1 バイト一致(golden_baseline_l1.json)。
+  traces:
+    enabled: false              # ★false=完全 no-op(バイト一致)。true で集約・蒸発・1行注入が動く
+    # 痕跡にする出来事の種類(**実装が定型語を持つのは traces.TRACE_SPECS の 5 種だけ**)。
+    #   enforcement ← L1 enforcement(摘発)     / gathering ← event_host(イベント開催)
+    #   opening     ← venture_open(出店)       / closing   ← venture_close(閉店)
+    #   trouble     ← crime・nuisance(窃盗・客引き/ナンパ/喧嘩/騒ぎ)
+    # ★chance_event は源にしない: windfall / loss / encounter の 3 種はいずれも**当人にしか
+    #   起きない私的な出来事**で payload に場所も無く、通りすがりの人が他人の落とし物を
+    #   「場所の性格」として読むことになるため(街の事件系は crime / nuisance が正しい対応物)。
+    # リストは**置き換え**(既定に重ねない)= config を読めばそのランの痕跡が一意に判る。
+    kinds: ["enforcement", "gathering", "opening", "closing", "trouble"]
+    # 種 → TTL 階層の割当(空 = 実装既定)。Parunak の flavor = 意味の違う場を混ぜないので、
+    # 種ごとに独立の強度を持つ(「賑わい」と「揉め事」を 1 つのスカラーに足し込まない)。
+    tier_of:
+      enforcement: daily        # 摘発 = その日のうちは意味を持つ
+      gathering: daily          # 集まり = 既存 flyer と同水準(1 日)
+      opening: persistent       # 出店 = その場所に定着した性格(商いがある街区)
+      closing: persistent       # 閉店 = 同上(商いが去った街区)
+      trouble: transient        # 揉め事・事故 = すぐ陳腐化する(数時間)
+    # TTL 3 階層の半減期(単位は step)。0 = **減衰しない**(persistent の意味)。
+    half_life_steps:
+      transient: 18             # ~3 時間: 事故・喧嘩級(その場の空気)
+      daily: 144               # 1 日: 出来事・摘発級(既存 tools.flyer_ttl_steps と同水準)
+      persistent: 0             # 減衰なし: 場所に定着した性格。★Ledger-State Stigmergy が
+                                #   警告した「蒸発しない媒体」を**明示的に選ぶ**枠であって、
+                                #   失効ロジックを忘れた状態ではない(下の drop_threshold は効く)
+    deposit: 1.0                # 出来事 1 件が置く強度
+    max_strength: 3.0           # 同種の上限(クリップ)= 同じことが何度起きても飽和する
+    line_threshold: 1.0         # この強度以上の痕跡だけが 1 行になる(最強 1 件のみ注入)
+    drop_threshold: 0.05        # これ未満に薄れた痕跡はレコードごと消える(明示的失効ロジック)
+    max_per_step: 32            # 1 step に集約する件数の上限(暴走時の L1 膨張を防ぐ安全弁)
+
 # ---- 空間レイヤ核(屋内ミクロ状態=シームレスズーム観察の土台。既定 OFF=現行挙動と完全同一)----
 # 全建物・全階の屋内間取り(vision.building_layout=決定論・ビューア floorLayout と同一系列)を
 # 「単一の真実」として保持し、区画(zone)に用途型(SpaceType)を決定論割当する層。実装

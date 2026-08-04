@@ -43,6 +43,7 @@ from .. import delivery as delivery_mod
 from .. import services as services_mod
 from .. import status as status_mod
 from .. import street as street_mod
+from .. import traces as traces_mod
 from .. import transit_live as transit_live
 from .. import truth_ledger as truth_ledger_mod
 from .. import work as work_mod
@@ -1943,6 +1944,10 @@ def _gather_material(sim, agent, trigger: str, step: int, sim_min: int, *,
     # 場所の意味づけ D1(labeling.place_binding・既定 OFF は None=1行も足さない=バイト一致)。
     # 現在ノードに束縛された語(採用者数が閾値以上)を中立 1 行に。決定論・乱数ゼロ・呼数不変=R1。
     place_label_line = sim.labels.place_line(getattr(agent, "node", None))
+    # 場所の痕跡 IF-D(第96バッチ・world.traces・既定 OFF は None=1行も足さない=バイト一致)。
+    # 現在ノードに残る痕跡のうち**最強 1 件**を中立 1 行に(強度・件数・階層名は出さない)。
+    # 集約時に同席していた当事者には出さない。決定論・乱数ゼロ・LLM 呼ゼロ=R1。
+    trace_line = traces_mod.line_for(sim, agent)
     # 構造化シーン記述 v0(scene_desc 有効時のみ。方向つき視界/注視対象/垂直関係の 2〜4 行)。
     # 決定論・追加 LLM 呼ゼロ・乱数ゼロの純関数。company(同席者=LOS 済み)を注視の人ソースに
     # 使う。OFF は None=1行も足さない=バイト一致(crowd_line と同型 seam)。
@@ -1989,6 +1994,7 @@ def _gather_material(sim, agent, trigger: str, step: int, sim_min: int, *,
             "disaster_line": getattr(sim, "today_disaster_line", None),
             "ads_line": ads_line,
             "place_label_line": place_label_line,
+            "trace_line": trace_line,
             "crowd_line": crowd_line,
             "wv_expect_line": wv_expect_line,
             "wv_self_line": wv_self_line,
@@ -5051,6 +5057,10 @@ def run_step(sim, step: int) -> None:
     rumors_mod.phase(sim, step, sim_min)           # 情報オブジェクト IF-C: 構造化イベント→噂 Item の誕生+忘却掃引
                                                    # (既定OFF=no-op。第95バッチ)。_apply 後=この step の行為イベントを
                                                    # 同 step で拾う(伝播は次 step 以降の会話に乗る=1 step の遅れ)/ collect(L2)前
+    traces_mod.phase(sim, step, sim_min)           # 痕跡 IF-D: 場所への集約(aggregation)+日境界の蒸発(evaporation)
+                                                   # (既定OFF=no-op。第96バッチ)。**演算はこの 2 つだけ**=拡散なし
+                                                   # (Parunak の propagation factor 0)。rumors の後=同じ L1 を別の
+                                                   # watermark で走査する独立層(噂は人へ・痕跡は場所へ)
 
     _bl = (sim.cfg.get("engine", {}) or {}).get("batch_llm", {}) or {}
     if ablate_mod.llm_off(sim):
