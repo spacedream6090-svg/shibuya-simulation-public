@@ -33,6 +33,7 @@ from .. import opinion as opinion_mod
 from .. import party as party_mod
 from .. import physics as physics_mod
 from .. import provlink as provlink_mod
+from .. import reject as reject_mod
 from .. import relations as relations_mod
 from .. import relations_endo as relations_endo_mod
 from .. import pov as pov_mod
@@ -2115,6 +2116,9 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
     material["revision_line"] = watch_mod.revision_line(sim, agent, step, trigger)
     # 第87: 会話ターンだけに載る終結の宣言路(既定 OFF は None=1行も足さない=バイト一致)。
     material["engaged_section"] = engaged_mod.prompt_section(sim, agent, trigger)
+    # 第94 IF-B: 再計画エピソード中だけに載る「予定が果たせなかった理由」1 行
+    # (既定 rejection_notify=silent は None=1行も足さない=バイト一致)。
+    material["reject_line"] = reject_mod.why_line(sim, agent)
     # ---- 第85バッチ: 契約経路(既定 OFF)------------------------------------- #
     #  ON では world → Perception → prompt に一本化する。**プロンプト文字列は 1 バイトも
     #  変わらない**(prompt_kwargs() が material と完全に等しい dict を返す)= P1(3)
@@ -2718,7 +2722,18 @@ def _apply_action(sim, agent, action: dict, step: int, sim_min: int) -> None:
         # 検証行動(第73バッチ Part B)。beliefs.verify_actions OFF では静かに無視
         # (=wander 相当)= 既定 OFF のイベント 0 件・状態変化ゼロ。裁定は truth_ledger に
         # 閉じる(engine は真偽台帳の中身を読まない=呼ぶだけ)。LLM 呼ゼロ・乱数ゼロ。
+        # ---- IF-B(第94): 空振り(no_target / no_witness / no_channel)の通知 ------- #
+        #  従来は L1 belief_verify に残るだけで**当人には何も届かない**(監査 §2-C)。
+        #  ★裁定 module(truth_ledger.py)は **observer/metrics_spec.py の凍結 14 ファイル**
+        #    なので 1 バイトも触らない。代わりにこの呼び出しが出した L1 の **outcome 1 語だけ**を
+        #    読んで通知する(fact の ID も値も canary も読まない=漏洩契約は無風)。
+        #  ★既定 silent ではスライスも走らない = 従来と完全同一。
+        if not reject_mod.enabled(sim):
+            truth_ledger_mod.apply_verify(sim, agent, action, step, sim_min)
+            return
+        _n0 = len(sim.logger.events)
         truth_ledger_mod.apply_verify(sim, agent, action, step, sim_min)
+        reject_mod.note_verify(sim, agent, sim.logger.events[_n0:], step, sim_min)
         return
 
     if kind in ("plan", "recall", "reflect"):
@@ -2791,6 +2806,9 @@ def _apply_action(sim, agent, action: dict, step: int, sim_min: int) -> None:
         path, used_mode = sim.router.route(agent.node, action["dest"],
                                            action.get("mode", "walk"))
         if len(path) < 2:
+            # IF-B(第94): 経路が張れない = 監査 §2-C の無音拒否(`len(path)<2: return`)。
+            # 既定 silent では 1 バイトも動かない(ゴールデン維持)。
+            reject_mod.notify(sim, agent, "move_to", "unreachable", step, sim_min)
             return
         agent.route = path[1:]
         agent.edge_offset = 0.0
@@ -3551,10 +3569,14 @@ def _apply_move_home(sim, agent, action, step, sim_min, p2) -> None:
     if total < deposit:                                # 敷金不足=現金不足点: 融資で補填(bank ON 時)
         total += _maybe_loan(sim, agent, deposit - total, step, sim_min)
         if total < deposit:                            # 融資後も払えない=引っ越せない(客観条件)
+            # IF-B(第94): 敷金不足。既定 silent は完全 no-op(従来と完全同一)。
+            reject_mod.notify(sim, agent, "move_home", "no_money", step, sim_min)
             return
     rng = sim.hub.stream("move_home", agent.id, step)  # 新 stream(既存 draw 順に不干渉)
     bld = freedom_p2_mod.pick_home(sim, agent, action.get("area"), rng)
     if bld is None:                                    # 空き住戸なし
+        # IF-B(第94): 空き住戸なし。★draw は上で済ませてあるので通知は draw 順に不干渉。
+        reject_mod.notify(sim, agent, "move_home", "no_room", step, sim_min)
         return
     old = agent.home_building
     dep = deposit                                      # 敷金の控除(口座→現金の順)
@@ -3621,8 +3643,15 @@ def _apply_partnership(sim, agent, action, step, sim_min, p2) -> None:
     target = next((c for c in company if c.name == to_name), None)
     if target is None:                                 # 名前の部分一致で救済
         target = next((c for c in company if to_name in c.name), None)
-    if target is None or getattr(target, "partner_id", None) is not None:
-        return                                         # 相手が近くにいない/既に交際中
+    if target is None:
+        # IF-B(第94): 相手が近傍にいない(監査 §2-C の「相手不在」)。silent は完全 no-op。
+        # ★「既に交際中」は本バッチの対象外(監査が挙げたのは相手不在の 1 件だけ。
+        #   理由コードを増やす前に対象一覧を監査と 1 対 1 に保つ)= 従来どおり無音。
+        reject_mod.notify(sim, agent, "propose_partnership", "absent",
+                          step, sim_min)
+        return
+    if getattr(target, "partner_id", None) is not None:
+        return                                         # 既に交際中(対象外=従来どおり無音)
     thr = freedom_p2_mod.partner_threshold(sim, p2)
     rel = agent.mem.relations.get(target.id)
     closeness = float(rel.get("closeness", 0.0)) if rel else 0.0

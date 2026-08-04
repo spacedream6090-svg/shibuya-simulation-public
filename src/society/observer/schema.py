@@ -385,6 +385,18 @@ register_event_kind("sign_memory",      "プリエンプトで中断した内容
 register_event_kind("mind_assign",      "誕生時に固定された心のモデルと知能層"
                                         "{model, tier(think|high)}。**この個体の"
                                         "会話・思考・価値判断は以後すべてこのモデルが回す**")
+# ---- 拒否通知の段階 conf 化(第94バッチ IF-B・cognition.rejection_notify != "silent" のみ・
+#      既定 "silent" では 0 件)。監査 §2-C の「無音拒否」= 裁定側が黙って return していた
+#      8 件に、当人への通知(定型文 1 行の記憶)と L1 の 1 件を足す。
+#      ★payload は **有限語彙 2 つだけ**(kind ∈ reject.KINDS / reason ∈ reject.REASONS)。
+#        自由文・数値・時刻・実験条件は 1 つも入らない = 同じ拒否は全条件で同一バイト列。
+#      実装 src/society/reject.py。設計 docs/research/if-lane-research.md §3(Inner Monologue の
+#      feedback 3 種 / Ovsiankina 効果。**Zeigarnik は 2025 メタ分析で否定済み**)。
+register_event_kind("action_reject",   "裁定が行為を拒否し、当人へ通知した"
+                                       "{kind(open_venture|move_home|propose_partnership|"
+                                       "move_to|verify), "
+                                       "reason(no_money|no_room|absent|unreachable|"
+                                       "no_target|no_witness|no_channel)}")
 
 
 @dataclass

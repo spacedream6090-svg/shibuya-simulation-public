@@ -172,6 +172,15 @@ def save(sim, step: int, path: str | Path) -> Path:
             # 同じ型)。保存しないと mid-day resume で累積列が straight と食い違う。
             # 既定 OFF では state 自体が生えない → None=挙動不変(load は .get で旧 ckpt 互換)。
             "engaged_state": getattr(sim, "_engaged_state", None),
+            # 第94バッチ IF-B(拒否通知): 通知件数・前倒し件数・縮退件数・失敗理由の
+            # 設定/降格/注入の累積タリー(int と素の dict のみ)。**失敗理由そのもの**
+            # (agent._plan_exception_why)と例外の印(agent._plan_exception)は
+            # agents pickle に自然同梱されるので、ここで中央管理するのは
+            # summary.rejection_notify の材料だけ(第86 day_plan / 第87 engaged と同じ型)。
+            # 保存しないと mid-day resume で summary の累積値が straight と食い違う。
+            # 既定 silent では state 自体が生えない → None=挙動不変(load は .get で
+            # 旧 checkpoint 互換)。
+            "reject_state": getattr(sim, "_reject_state", None),
             # 第88バッチ 心モデル固定: L1 `mind_assign` を出し終えた agent_id。
             # **割当そのものは保存しない** — 誕生時固定は (master_seed, agent_id) の純関数
             # (専用 stream mind_model / mind_tier)なので resume でも pool 再入場でも同じ
@@ -351,6 +360,9 @@ def load(sim, path: str | Path) -> int:
     egs = rt.get("engaged_state")               # 第87 engaged(旧 ckpt 互換=無ければ素通り)
     if egs is not None:
         sim._engaged_state = egs
+    rjs = rt.get("reject_state")                # 第94 IF-B(旧 ckpt 互換=無ければ素通り)
+    if rjs is not None:
+        sim._reject_state = rjs
     # 第89 プラセボ L1: 輪を戻し、pickle 復元された個体を構築時の Placebo へ繋ぎ直す
     # (OFF は no-op。旧 ckpt 互換=無ければ輪は空のまま=OFF ランと同じ)。
     _ablate_ckpt.placebo_restore(sim, rt.get("placebo_state"))

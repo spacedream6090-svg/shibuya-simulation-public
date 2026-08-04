@@ -843,3 +843,23 @@ def _j(blocks, cont=None):
     """テスト用: 生 dict(json.loads 済み相当)を作る。"""
     return {"action": "plan", "mood": "", "carry": "",
             "blocks": blocks, "if_then": cont or []}
+
+
+def test_note_resolved_fires_on_clean_plan_not_on_fallback(tmp_path, monkeypatch):
+    """第87 脱出条件(1)の回帰固定(IF-B 検収で発見した実バグ)。
+
+    fallback の「後退なし」値は ""(apply 内の初期値)で None は入らないため、
+    `if fallback is None:` では engaged.note_resolved が一度も呼ばれなかった。
+    真偽値判定(`if not fallback:`)で「検証を通る計画=解消」が発火することと、
+    フォールバック(応急処置)では発火しないことの両側を固定する。
+    """
+    from society.cognition import engaged as EG
+    calls = []
+    monkeypatch.setattr(EG, "note_resolved", lambda sim, agent: calls.append(agent.id))
+    sim, a = _agent_sim(tmp_path, "resolve_fire")
+    good = _resp([_blk("08:00", "09:00", place="food", act="meal"),
+                  _blk("18:00", "19:00", place="home", act="home")])
+    DP.apply(sim, a, 0, 8 * 60, good, None)
+    assert calls == [a.id], "検証を通った計画で note_resolved が発火していない"
+    DP.apply(sim, a, 200, 1440 + 8 * 60, "{壊れた", None)
+    assert calls == [a.id], "フォールバックは解消ではないのに note_resolved が発火した"

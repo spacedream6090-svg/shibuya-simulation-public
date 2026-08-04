@@ -159,7 +159,8 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
                  dialog_history: list | None = None,
                  watch_section: str | None = None,
                  revision_line: str | None = None,
-                 engaged_section: str | None = None) -> str:
+                 engaged_section: str | None = None,
+                 reject_line: str | None = None) -> str:
     """個別文脈(時刻・場所・活動・気分・記憶・直近発話)を渡し、内容の固定化を防ぐ。
 
     pull_query が渡された時だけ(agentic_pull=true)、その文で決定論の記憶想起を
@@ -310,6 +311,15 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
         turns = dialog_history[-4:]          # 直近2往復=最大4発話
         lines.append("直前のやりとり: "
                      + " → ".join(f"{spk}「{txt}」" for spk, txt in turns))
+    # 計画の失敗理由(第94バッチ IF-B・cognition.rejection_notify != "silent" かつ
+    # engaged の再計画エピソード中のみ)。既定 silent は None=1行も足さない=バイト一致
+    # (watch_section / engaged_section と完全同型の seam)。
+    # ★中身は「予定していた〈act〉が〈reason〉でできなかった。」の定型 1 行だけ。
+    #   機構語も実験条件語も因子名も数値も 1 文字も出さない(society/reject.py 参照)。
+    # ★下の状況行(何を出力するかの書式指示を含む)の**前**に置く: 書式の指示を
+    #   最後に残しておかないと、応答が失敗談への反応だけになって形式が崩れうるため。
+    if reject_line:
+        lines.append(f"状況: {reject_line}")
     if surprise == "social":
         lines.append("状況: 近くにいる人と自然に会話する。今この場所・この時間ならではの"
                      "話題(店、時間帯、出来事、気分)で、あなたらしい一言を speak で。")

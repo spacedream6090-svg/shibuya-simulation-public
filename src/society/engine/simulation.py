@@ -1806,6 +1806,14 @@ class Simulation:
         _egprov = _engaged_prov.provenance(self)
         if _egprov is not None:
             summary["engaged"] = _egprov
+        # ---- 拒否通知 第94バッチ IF-B(cognition.rejection_notify="silent" = 既定はキーなし)----
+        # 監査 §2-C の無音拒否に通知を入れた層。何がどれだけ拒否され、そのうち何件が
+        # 「今すぐ考える」へ前倒しされ、何件が engaged OFF で memory へ縮退したかを残す
+        # (アブレーション軸として事前登録するときの分母になる観測量)。
+        from .. import reject as _reject_prov
+        _rjprov = _reject_prov.provenance(self)
+        if _rjprov is not None:
+            summary["rejection_notify"] = _rjprov
         # ---- 心モデル固定+三層知能 第88バッチ(model.mind.enabled=false = 既定 OFF はキーなし)----
         # 原文書 §5「モデルと人格の交絡が生じるため必ずログに残す」の集計側。
         # モデル別の人数・呼数・キャッシュ命中に、第87 エピソード数と第86 修復率を統合する。

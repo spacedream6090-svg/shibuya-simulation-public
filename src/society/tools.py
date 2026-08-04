@@ -20,6 +20,7 @@ from __future__ import annotations
 from collections import defaultdict
 
 from . import commerce as commerce_mod
+from . import reject as _reject_mod
 from . import status as status_mod
 from .cognition import drive
 from .factors import update as factor_update
@@ -812,9 +813,15 @@ class Tools:
                 if need > 0.0:
                     scheduler._maybe_loan(sim, agent, need, step, sim_min)
                 if agent.money + agent.account + 1e-9 < cost:
-                    return                             # 融資後も不足=出店できない
+                    # IF-B(第94): 融資後も不足=出店できない。既定 silent は完全 no-op。
+                    _reject_mod.notify(sim, agent, "open_venture", "no_money",
+                                       step, sim_min)
+                    return
                 bank_funded = True
             else:
+                # IF-B(第94): 監査 §2-C の無音拒否の 1 件目。silent では従来と完全同一。
+                _reject_mod.notify(sim, agent, "open_venture", "no_money",
+                                   step, sim_min)
                 return                                 # 所持金不足(従来と完全同一)
         name = str(action.get("name", "")).strip()
         if not name:

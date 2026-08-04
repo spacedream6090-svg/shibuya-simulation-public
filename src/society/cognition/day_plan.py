@@ -869,6 +869,9 @@ def apply(sim, agent, step: int, sim_min: int, response: str,
     cfg = cfg_of(sim)
     day = int(sim_min) // 1440
     day_min = day * 1440
+    # 第94 IF-B: 前日の失敗理由は**持ち越さない**(未解決のまま日を跨いだら消す)。
+    # 朝の計画生成は 1 日 1 回なのでここが日境界の単一作用点。既定 silent は no-op。
+    _clear_why(sim, agent)
     mid = model_id(sim, agent)
     st = _state(sim)
     row = _model_row(st, mid)
@@ -954,7 +957,9 @@ def apply(sim, agent, step: int, sim_min: int, response: str,
     # 第87(engaged)脱出条件 (1) 解消: 「**検証を通る計画が生成されたとき**」(設計 §8)。
     # 後退(fallback)した計画は解消ではない — 世界を止めないための応急処置であって、
     # 例外を解決したわけではないから。既定 OFF は完全 no-op。
-    if fallback is None:
+    # 後退なしの値は ""(907行の初期値)であり None は入らない — `is None` だと恒偽で
+    # 脱出条件(1)が死ぬ(IF-B 検収で発見した実バグ。真偽値判定が正)。
+    if not fallback:
         from . import engaged as _engaged
         _engaged.note_resolved(sim, agent)
 
@@ -1048,6 +1053,15 @@ def _replan(sim, agent, plan: dict, cfg: dict, step: int, sim_min: int,
     if int(plan.get("replan_at", -1)) == int(sim_min):
         return
     plan["replan_at"] = int(sim_min)
+    # ---- IF-B(第94・cognition.rejection_notify != "silent" のみ)------------------ #
+    #  「何が失敗したか」を 1 件だけ控える。**先頭の must**(= 計画の並び順 = 決定論)を採り、
+    #  下のループが m をずらす/退役させる**前**に分類する(書き換わった値で理由を作らない)。
+    #  既定 silent では reject.note_why が即 return = agent に属性すら生えない。
+    why = None
+    if musts:
+        m0 = musts[0]
+        why = (str(m0["act"]),
+               "missed" if (m0["flex"] == "fixed" and now >= m0["end"]) else "late")
     freed, retired = 0, 0
     for m in musts:
         if m["flex"] != "fixed":                 # 最小摂動: 必要なぶんだけ「今」へずらす
@@ -1080,15 +1094,21 @@ def _replan(sim, agent, plan: dict, cfg: dict, step: int, sim_min: int,
     _log(sim, agent, step, sim_min, "plan_replan",
          {"version": int(plan["version"]), "n_must": len(musts), "freed": freed,
           "retired": retired, "at": now})
-    note_plan_exception(sim, agent, sim_min)
+    note_plan_exception(sim, agent, sim_min, why=why)
 
 
-def note_plan_exception(sim, agent, sim_min: int) -> None:
+def note_plan_exception(sim, agent, sim_min: int, why=None) -> None:
     """実行不能例外を第81 の認知イベントキューへ内部発火として前倒し登録する。
 
     `cognition.fire` が OFF(既定)なら**完全 no-op**(キューが存在しない)= LLM 呼数不変。
     ON のときだけ「いま考える」へ繰り上げる(= 設計 §8 突入条件(3) の先行実装。
     engaged エピソード本体は第87)。
+
+    `why`(第94 IF-B・既定 None)は「予定していた〈act〉が〈reason〉でできなかった」の
+    材料 2 語だけ。**渡されたときだけ**控え、engaged の REPLAN エピソード中の状況行に
+    1 行だけ載る(`cognition.rejection_notify` が silent なら属性すら生えない)。
+    ★拒否通知(reject.notify)経由の前倒しは why を渡さない — あちらは既に定型文 1 行を
+      記憶へ書いており、同じ内容をプロンプトに二重に置かないため。
     """
     from . import fire as _fire
     if not _fire.enabled(sim) or _fire.INTERNAL not in sim.firecfg["sources"]:
@@ -1098,6 +1118,9 @@ def note_plan_exception(sim, agent, sim_min: int) -> None:
         return
     q.advance(int(agent.id), int(sim_min), _fire.INTERNAL)
     agent._plan_exception = int(sim_min)          # 第87 が読む印(本バッチでは記録のみ)
+    if why is not None:                           # 第94 IF-B(既定 silent は即 return)
+        from .. import reject as _reject
+        _reject.note_why(sim, agent, why[0], why[1])
 
 
 # --------------------------------------------------------------------------- #
@@ -1294,6 +1317,12 @@ def apply_contingency(sim, agent, plan: dict, b: dict, cfg: dict,
     return False
 
 
+def _clear_why(sim, agent) -> None:
+    """第94 IF-B の**降格**(既定 silent では属性が無いので即 return = バイト一致)。"""
+    from .. import reject as _reject
+    _reject.clear_why(sim, agent)
+
+
 def current_block(plan: dict, sim_min: int):
     """いま実行すべきブロック(開始済み・未消化・窓の中)。無ければ None = 空き時間。"""
     now = int(sim_min) % 1440
@@ -1336,6 +1365,7 @@ def plan_action(agent, sim, sim_min: int, step: int, rng, scfg=None):
              {"act": b["act"], "place": b["place"], "aim": b["purpose"],
               "priority": b["priority"], "flex": b["flex"], "start": b["start"],
               "slid": int(b["slid"]), "version": int(plan["version"])})
+        _clear_why(sim, agent)                   # 第94 IF-B: 再計画が実った=侵入は止まる
         return None
     if dest is None or not _open_now(sim, b, sim_min):
         dest = resolve_place(sim, agent, b["place"], sim_min,
@@ -1354,6 +1384,9 @@ def plan_action(agent, sim, sim_min: int, step: int, rng, scfg=None):
          {"act": b["act"], "place": b["place"], "aim": b["purpose"],
           "priority": b["priority"], "flex": b["flex"], "start": b["start"],
           "slid": int(b["slid"]), "version": int(plan["version"])})
+    # 第94 IF-B(Masicampo & Baumeister 2011): **代替ブロックが動き出した時点**で
+    # 失敗理由を降格する(= 計画が立てば侵入思考は止まる)。既定 silent は完全 no-op。
+    _clear_why(sim, agent)
     if dest == getattr(agent, "node", ""):
         return None                              # もう居る = 移動しない(習慣ポリシーへ)
     stay = sim.clock.min_to_steps(max(cfg["min_dur_min"], b["end"] - b["start"]))

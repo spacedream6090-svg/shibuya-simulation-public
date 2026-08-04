@@ -148,6 +148,7 @@ class Perception:
     watch_section: str | None = None
     revision_line: str | None = None
     engaged_section: str | None = None
+    reject_line: str | None = None
     pull_query: str | None = None
 
     # ---- 提示規約(世界がプロンプトの**形**を決める定数。run 内で不変) ------- #
@@ -295,6 +296,7 @@ _KW_FIELDS: tuple[tuple[str, str, bool], ...] = (
     ("watch_section", "watch_section", False),
     ("revision_line", "revision_line", False),
     ("engaged_section", "engaged_section", False),
+    ("reject_line", "reject_line", False),
     ("pull_query", "pull_query", False),
     # 提示規約
     ("labeling_mode", "labeling_mode", False),

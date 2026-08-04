@@ -289,6 +289,28 @@ FEATURES: tuple[Feature, ...] = (
        "自動操縦)も実験条件語も因子名も 1 文字も出さない。"
        "★cognition.fire OFF では完全 no-op(watch / g_update と同じ前提関係)。"
        "★乱数 stream を 1 本も引かない(高解像度層の選定も _stable_hash の決定論)"),
+    # 第94バッチ IF-B: 拒否通知の段階 conf 化(設計 src/society/reject.py /
+    # docs/research/llm-world-interface-audit.md §2-C / if-lane-research.md §3)。
+    # strict の根拠: 通知文は **(行為種, 理由コード) の純関数**で、LLM の自由文を
+    #   1 バイトも読まない。判定材料は裁定側が既に持っている客観条件(所持金・空き住戸・
+    #   近傍の有無・経路の有無)だけで、乱数 stream も 1 本も引かない。
+    # ★affects_k=True を正直に宣言する: "engaged" 水準だけ、認知イベントを「今」へ前倒し
+    #   する(既存 note_plan_exception と同じ作用点)= generate() の**発生点**が動く。
+    #   "memory" 水準では 1 本も動かない。1 つの id で 3 水準を申告するので上位水準に合わせた
+    #   (ablate.llm_off が strict × affects_k=True を取るのと同じ組み合わせ)。
+    # fingerprint_risk=possible: memory / engaged では拒否の定型文 1 行が当人の記憶に入り、
+    #   次のプロンプトの「直近の出来事」に載る(= 当人から見て差分に気づく余地がある)。
+    #   ただし文面は有限語彙の純関数なので**実験条件は 1 文字も漏れない**。
+    _f("cognition.rejection_notify", "strict", True, "possible",
+       "無音だった裁定拒否 8 件(所持金不足の出店 / 敷金不足の転居 / 空き住戸なし / "
+       "交際申込の相手不在 / 経路が張れない / verify の no_target・no_witness・no_channel)へ "
+       "silent / memory / engaged の 3 水準の通知を入れる(Inner Monologue の "
+       "なし・記述・介入に 1 対 1)。memory=定型文 1 行 + L1 action_reject、"
+       "engaged=それに加えて認知イベントの前倒し(cognition.engaged OFF では memory へ縮退)。"
+       "day_plan の plan_exception には失敗理由を 1 行だけ載せ、**再計画が実ったら降格**する"
+       "(Masicampo & Baumeister 2011。Zeigarnik 効果は 2025 メタ分析で否定済みなので根拠にしない)。"
+       "既定 silent は現行と 1 バイトも変わらない(イベント 0 件・記憶 0 行・プロンプト不変)",
+       off_value="silent"),
     # 第88バッチ 心モデル固定 + 三層知能配置(設計 §5)。
     # journal 等級の根拠: 個体ごとに**別のモデル**が自由文を書く。事後に再生するには
     #   モデル別の llm_cache / llm_journal(子ごとに 1 本)が要る = 単体では非決定。
