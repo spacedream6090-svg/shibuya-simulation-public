@@ -406,6 +406,10 @@ def _write_report(path: str, r: dict) -> None:
                  "本 judge は**補助指標**であり、**κ ≥ 0.7 のときだけ**採用に足る。"
                  "judge は L1 の読み取り専用下流で、**シミュ本体へ一切逆流しない**。"
                  "ドシエは外向き行動ログのみで traits/persona/内省を含まない(R9)。\n")
+    lines.append("> **適用範囲(サーベイ §4.4)**: LLM 判定は**目標達成の次元**では人間評価とよく一致するが、"
+                 "**他の次元では大きな乖離が残る**と報告されている。本 judge はその**一致度が比較的高い側**の"
+                 "次元にあたる **world_changer の単一次元にのみ**用いる。κ ≥ 0.7 の採用条件・別ファミリの"
+                 "判定者推奨・シム本体への逆流不能という 3 条件は、分野の慣行より厳しい。\n")
     lines.append("## Setup")
     lines.append(f"- backend: `{r['backend']}`  model: `{r['model']}`")
     lines.append(f"- judges: {r['n_judges']}  temperatures: {r['temperatures']}")
