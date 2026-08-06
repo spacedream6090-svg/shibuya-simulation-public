@@ -207,6 +207,18 @@ TABLE: tuple[tuple[str, str, str], ...] = (
 
     # ---- step 単位の持続長・窓・TTL・クールダウン(逆比例)----
     ("world.outside_steps", STEPS, "範囲外滞在の長さ [step]"),
+    # ★§1.2 B1(第94バッチ OBS-U2): scenario の引数は基底 conf が `{}` なので
+    #   _iter_targets(実在キーのみ走査)にも棚卸し正規表現にも掛からない = 唯一の
+    #   「宣言しないと永久に見つからない」穴だった。ラン側が dotlist/profile で
+    #   world.scenario_params={at_step: 36, duration_steps: 18} を渡した瞬間に
+    #   実在キーになるので、ここに載せておけば apply_dt が拾う。at_step は**時点**だが
+    #   逆比例で正しい(Δt=10 の step 36 = Δt=1 の step 360 = 同じ実時刻)。
+    #   基底に実在しない唯一の宣言なので、tests/test_timeconv.py の
+    #   test_every_table_key_exists_in_shipped_config が理由つきで除外している。
+    ("world.scenario_params.at_step", STEPS,
+     "scenario 発動時点 [step]。実時刻を保つため逆比例(scale_steps は 0 を 0 のまま残す)"),
+    ("world.scenario_params.duration_steps", STEPS,
+     "scenario の継続時間 [step]。実時間の長さを保つため逆比例"),
     ("indoor.markov.dwell_steps", STEPS, "平均滞在 step(遷移確率 = 1/dwell)"),
     ("tools.permit_steps", STEPS, "許可待ちの長さ [step](0=待ちなし)"),
     ("tools.event_duration_steps", STEPS, "イベント開催時間 [step]"),
@@ -271,6 +283,12 @@ TABLE: tuple[tuple[str, str, str], ...] = (
     ("memory.relations_max", INVARIANT, "関係台帳の件数上限"),
     ("observer.flush_every_steps", INVARIANT,
      "L1 part 書き出しの I/O 頻度。世界の因果に触れないので実験者の指定どおりにする"),
+    ("observer.checkpoint_every", INVARIANT,
+     "完全状態を保存する I/O 頻度(第94バッチ OBS-U2 で宣言を補完。棚卸し正規表現に"
+     "掛からない綴りだったため未宣言のままだった)。flush_every_steps と同じ族=世界の"
+     "因果に触れない運用設定で、実験者が『何 step ごとに落ちても良いか』を指定する量。"
+     "★STEPS にすると Δt を変えるたび resume の刻みが黙って動く(既存の Δt=5 resume "
+     "テストの前提も崩れる)ので、明示的に不変とする"),
     ("observer.state_hash.interval", INVARIANT, "状態ハッシュの採取頻度。観測装置の設定"),
     ("cognition.channels.every_steps", INVARIANT,
      "観測チャンネル o_c(t) の採取間隔(第80バッチ)。世界の因果に一切触れない観測装置の設定で、"

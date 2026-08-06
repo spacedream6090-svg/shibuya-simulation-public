@@ -111,6 +111,15 @@ ZONE_DEFAULTS = {
     "engine": "sfm",              # "sfm" | "orca"(P2 決定: 既定 sfm・多方向交差流だけ orca)
     "dt_sub": 0.05,               # 物理サブステップ [s](P2 条件1: 0.02–0.05)
     "max_sub_steps": 12000,       # 1 世界 step で回すサブステップ上限(600s/0.05s = 12000)
+                                  # ★§1.2 B5 / R7(第94バッチ OBS-U2): これは **正準 Δt=10 の
+                                  #   step 長 600s** から導いた直書きであり、Δt に追随しない。
+                                  #   physics.py:331 は n_sub = min(max_sub_steps,
+                                  #   step_seconds/dt_sub) なので、Δt<10(1 分 = 1200 sub)では
+                                  #   上限に届かず無害だが、**Δt>10 では積分が黙って打ち切られる**
+                                  #   (Δt=20 で 24000 必要なのに 12000 で停止 = 半分の時間しか
+                                  #   進まない)。Δt 掃引を上方向にもやるなら、ここを
+                                  #   clock.step_seconds / dt_sub から導くよう直すこと。
+                                  #   OBS-U2(Δt=1)では踏まないので第94では据え置く。
     "arrive_radius_m": 1.0,       # 出口ゲートへの到達判定半径 [m]
     "neighbor_cap": 12,           # 対人相互作用の近傍上限(SFM/ORCA 共通)
     "v_max_factor": 1.3,          # 最高速度 = 希望速度 × これ(Helbing2000)

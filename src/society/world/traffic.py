@@ -51,6 +51,12 @@ class TrafficFlow:
         self.cars_per_day = int(cars_per_day)
         self.max_log = int(max_log)
         # 中央 Δt(第79バッチ)。既定 10 = 従来の直書き(600 秒 / 6 step 毎時 / 144 step 毎日)。
+        # ★TODO(§1.2 B4 / R6・第94バッチ OBS-U2 で棚卸し): 以下 4 行は Clock と同じ式を
+        #   **自前で再導出している第2の Δt 源**である(clock.py:26 の「派生量の単一源」設計に
+        #   反する)。TrafficFlow は Clock を持たず step_minutes だけを受け取る配線なので今は
+        #   追随するが、Clock 側の定義だけを将来変えると静かに不整合になる。直すなら
+        #   コンストラクタで clock を受け取り steps_per_hour / steps_per_day / step_seconds を
+        #   委譲する(第94では挙動を 1 ビットも変えないため据え置き)。
         self.step_minutes = int(step_minutes)
         self.steps_per_hour = max(1, 60 // self.step_minutes)
         self.steps_per_day = max(1, 1440 // self.step_minutes)

@@ -17,6 +17,8 @@ import csv
 import json
 from pathlib import Path
 
+from .clock import STEP_MINUTES
+
 
 def _to_min(text: str) -> int:
     parts = text.split(":")
@@ -119,9 +121,12 @@ class BusNetwork:
     ノードだけを採用する(合成データ・簡易 JSON の両方に対応)。"""
 
     def __init__(self, lines, city, stop_radius_m: float = 100.0,
-                 headway_steps: int = 1):
+                 headway_steps: int = 1, step_minutes: int = STEP_MINUTES):
         self.radius = float(stop_radius_m)
         self.headway = max(1, int(headway_steps))
+        # 中央 Δt(A3・第94バッチ OBS-U2)。serves() は sim_min を step 番号へ戻すので
+        # Δt を知る必要がある。既定 10 = 従来の直書きと厳密同値(traffic.py と同じ配線)。
+        self.step_minutes = max(1, int(step_minutes))
         self.lines: list[dict] = []
         for ln in (lines or []):
             stops: list[tuple[str, float, float]] = []
@@ -136,8 +141,12 @@ class BusNetwork:
                                    "stops": stops})
 
     def serves(self, sim_min: int) -> bool:
-        """この step に便があるか(headway ごと)。既定 headway=1 step なら常に True。"""
-        return ((sim_min // 10) % self.headway) == 0
+        """この step に便があるか(headway ごと)。既定 headway=1 step なら常に True。
+
+        A3: 分 → step は Δt に依存する(直書き 10 のままだと Δt=1 で同じ便判定が 10 step
+        続き、headway が実質 10 倍になる)。headway_steps 自体は timeconv の STEPS 類なので
+        config 側で ×10 され、ここが step_minutes で割れば実時間の便間隔が保存される。"""
+        return ((sim_min // self.step_minutes) % self.headway) == 0
 
     def _nearest(self, x: float, y: float, stops):
         best, best_d = None, self.radius

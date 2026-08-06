@@ -202,13 +202,24 @@ def build_env_overlay(env: str | Path) -> dict:
 def load_config(overrides: list[str] | None = None,
                 path: str | Path | None = None,
                 profile: str | Path | None = None,
-                env: str | Path | None = None) -> DictConfig:
+                env: str | Path | None = None,
+                apply_dt: bool = True) -> DictConfig:
     """基底 config.yaml(または path)に、env → profile 差分 YAML → dotlist の順で重ねる。
 
     env:     EnvPack(env/<place> ディレクトリ or env.yaml パス)。「場所」を束ねた manifest を
              既存 config キー群へ写像して重ねる(build_env_overlay)。
     profile: 本番用など「基底との差分だけ」を書いた YAML(conf/production.yaml 等)。
     優先順位: 基底 < env < profile < dotlist(env=「場所」、profile=「用途」なので profile が勝つ)。
+
+    apply_dt(第94バッチ OBS-U2):
+        既定 True = 末尾で `timeconv.apply_dt` を適用する(= 唯一の Δt 変換点)。
+        ★**run dir に保存済みの config.yaml を読み直すときは必ず False を渡す**。
+        save_config が書くスナップショットは既に `apply_dt` 済みでありながら `run.dt_min`
+        をそのまま保持しているため、再ロードで変換が **二重適用** される(`apply_dt` は
+        冪等ではない)。Δt=10 では恒等パス(timeconv.py の早期 return)なので露見しないが、
+        Δt≠10 では walk 速度 80→8 / refractory_steps 30→300 のように全定数が壊れ、
+        `--resume` が checkpoint の config_hash 照合で必ず ValueError になる。
+        False にしても config のバイト列には一切触れない(= Δt=10 は完全に無風)。
     """
     cfg = OmegaConf.load(Path(path) if path else DEFAULT_CONFIG)
     if env is not None:
@@ -236,8 +247,10 @@ def load_config(overrides: list[str] | None = None,
     # 中央 Δt(第79バッチ)。run.dt_min=10(既定)なら **1 バイトも触らない**(恒等パス)。
     # 10 以外のときだけ timeconv の分類テーブルに従って定数を毎分レートから作り直す。
     # 全経路がこの 1 箇所を通るので、変換点はここだけになる(散在させない)。
-    from .timeconv import apply_dt
-    cfg = apply_dt(cfg)
+    # apply_dt=False は「読み込んだ config が既に変換済み」= run dir のスナップショット再読込。
+    if apply_dt:
+        from .timeconv import apply_dt as _apply_dt
+        cfg = _apply_dt(cfg)
     return cfg
 
 

@@ -106,7 +106,13 @@ def main() -> None:
         # run dir に保存された config を土台に、追加 override(例: 新しい run.n_steps)を適用。
         # resume は保存済み seed で続行する(auto は無効=再現性を壊さない)。
         _seed_auto_ignored, overrides = _resolve_seed_auto(overrides)
-        cfg = load_config(overrides=overrides, path=run_dir / "config.yaml")
+        # ★apply_dt=False(第94バッチ OBS-U2): run dir の config.yaml は save_config が
+        # **apply_dt 済みの姿**で書いたスナップショットなのに run.dt_min を保持している。
+        # 既定どおり再変換すると Δt が二重適用され(walk 80→8 / refractory 30→300 …)、
+        # checkpoint の config_hash 照合で必ず ValueError になる(Δt≠10 固有。Δt=10 は
+        # apply_dt が恒等パスなので従来から無風=この行の追加でも 1 バイトも変わらない)。
+        cfg = load_config(overrides=overrides, path=run_dir / "config.yaml",
+                          apply_dt=False)
         sim = Simulation(cfg, out_dir=run_dir)     # 既存 run dir は消さずに続行する
         summary = sim.run(resume_from=run_dir)
         print(json.dumps(summary, ensure_ascii=False, indent=2))

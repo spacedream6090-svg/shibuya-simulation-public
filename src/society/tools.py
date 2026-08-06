@@ -1101,7 +1101,10 @@ class Tools:
             self.flyers_by_node[node] = keep
 
     def _ventures_close(self, sim, step, sim_min) -> None:
-        close_steps = self.cfg["venture_close_days"] * 144
+        # A8(第94バッチ OBS-U2 で新規発見・設計調査 §1.1 の A 級表に**無かった** 8 件目):
+        # 日 → step の 144 直書き。A6(破産制限)と完全に同型で、Δt=1 では売上ゼロ 3 日の
+        # 自動閉店が実時間 7.2 時間で成立してしまう。Δt=10 で `* 144` と厳密同値。
+        close_steps = self.cfg["venture_close_days"] * sim.clock.steps_per_day
         for owner in sorted(self.ventures):
             v = self.ventures[owner]
             if step - v["last_sale_step"] < close_steps:
@@ -1147,7 +1150,9 @@ class Tools:
                 continue
             if v.get("sales_total", 0.0) < min_sales:
                 continue
-            if (step - v["opened_step"]) // 144 < min_days:
+            # A5(第94バッチ OBS-U2): 144 直書き → Clock。★clock.day() の差分にはしない
+            # (start_tod 起因で境界が動き Δt=10 の挙動が変わる)。Δt=10 で厳密同値。
+            if (step - v["opened_step"]) // sim.clock.steps_per_day < min_days:
                 continue
             agent = sim.agent_by_id.get(owner)
             if agent is None or agent.visitor:

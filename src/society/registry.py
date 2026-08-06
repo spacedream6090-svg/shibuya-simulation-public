@@ -104,10 +104,14 @@ FEATURES: tuple[Feature, ...] = (
     # ---- run / k / controls / reflection ----
     _f("run.natural_start", "strict", False, "none",
        "開始時刻が就寝帯に入る居住者を就寝状態・自宅で着席させる(初日コールドスタート改善)"),
-    _f("run.dt_min", "strict", False, "none",
+    _f("run.dt_min", "strict", True, "none",
        "中央 Δt(1 step の分数。既定 10=正準=golden の世界)。timeconv.py の分類テーブルに従い"
        "レート/確率/step 長を config ロードの 1 箇所で変換する。10 のときはテーブルを走査せず"
-       "config を 1 バイトも触らない。Δt≠10 は乱数消費列が変わる別世界(統計量の同オーダーで検証)",
+       "config を 1 バイトも触らない。Δt≠10 は乱数消費列が変わる別世界(統計量の同オーダーで検証)。"
+       "★affects_k=True(第94バッチ OBS-U2 で False から訂正): affects_k の定義は"
+       "「generate() の呼び出し点を足す/減らす/**予算を変える**か」であり、Δt は RATE 類の"
+       "lod.max_llm_per_step を 300→30 に変える(1 日 cap 総量 43,200 は保存)。さらに Δt=10 では"
+       "CogQueue が周期発火で潰していた salience 割込みが解放され、呼数は実測 ×2.2〜2.4 になる",
        off_value=10),
     _f("k.writeback", "strict", False, "possible",
        "D7 の主実験条件(free/degraded/sham/off)。内省の書き戻し自由度。sham は当人の記憶と"

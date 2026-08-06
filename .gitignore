@@ -17,3 +17,5 @@ data/plateau/
 data/persona_pool/
 # Jülich 歩行者動力学アーカイブの生軌跡(CC BY 4.0・146MB。派生CSVのみ reference/physics_bench/data/ にコミット・取得手順は同 README.md)
 data/juelich_ped/
+# 解析スクリプトの実験出力(runs/ と同格・再生成可能)
+experiments/

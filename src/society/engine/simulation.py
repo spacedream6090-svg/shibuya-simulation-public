@@ -357,7 +357,8 @@ class Simulation:
             self.buses = BusNetwork(
                 getattr(self.transit, "bus_lines", []), self.city,
                 stop_radius_m=self.ridecfg["bus"]["stop_radius_m"],
-                headway_steps=self.ridecfg["bus"]["headway_steps"])
+                headway_steps=self.ridecfg["bus"]["headway_steps"],
+                step_minutes=self.clock.step_minutes)   # A3: 便判定の分→step 換算(既定 10=同値)
         # 実バスダイヤの静的表 v-Ride-2(既定 OFF=None=従来の簡易バス近似のまま=バイト一致)。
         # bus.enabled かつ bus_table.enabled かつ表が読めるときだけ BusTable を生成し、_ride_extra が
         # 従来近似の代わりに実ダイヤ近似(次便待ち+区間所要)を使う。設計: src/society/bus_table.py。
@@ -1294,7 +1295,11 @@ class Simulation:
             agent.node = gw
             agent.return_gateway = gw
             agent.x, agent.y = self.city.node_xy(gw)
-            agent.return_at = max(0, (arr_min - start_min) // 10)
+            # A9(第94バッチ OBS-U2 で新規発見・設計調査 §1.1 の A 級表に**無かった** 9 件目):
+            # 分 → step の 10 直書き。A1(_steps_until_tod)と同型で、Δt=1 だと流入通勤者の
+            # **初日の到着**だけが実時間 1/10 で早まる(2 日目以降は A1 の経路)。
+            # clock.min_to_steps は `int(分) // step_minutes` なので Δt=10 で厳密同値。
+            agent.return_at = max(0, self.clock.min_to_steps(arr_min - start_min))
 
     def _apply_natural_start(self) -> None:
         """初日コールドスタート改善(run.natural_start・既定 false=バイト一致)。
@@ -1423,6 +1428,9 @@ class Simulation:
         if self.dt_min != _timeconv.CANON_DT_MIN:
             agent.mem.recency_decay = _timeconv.scale_keep(agent.mem.recency_decay,
                                                            self.dt_min)
+            # A7(第94バッチ OBS-U2): ACT-R 基礎活性化の冪乗則忘却も実時間の関数。
+            # recency_decay と同じ block で配線する(= Δt=10 ではこの行を通らない)。
+            agent.mem.dt_min = self.dt_min
         if self.actrcfg.get("enabled", False):
             # 個体別シードは run.seed から決定論導出(専用streamのみで消費=既存draw順不変)
             overrides = {k: v for k, v in self.actrcfg.items()

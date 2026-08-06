@@ -150,15 +150,21 @@ def _quality_mag(sim, speaker, other_id: int, text: str, sim_min: int) -> float:
                                                 sim_min)
 
 
-def _steps_until_tod(cur_sim_min: int, target_min: int) -> int:
+def _steps_until_tod(cur_sim_min: int, target_min: int,
+                     step_minutes: int = STEP_MINUTES) -> int:
     """現在の sim_min から、次に time-of-day=target_min になるまでの step 数(正)。
 
     流入通勤者の帰宅(夕)→翌朝の到着(arrival_min)までの外部滞在を決める。二峰分布の
-    jitter は arrival_min 自体に内包済みなので、ここは決定論(乱数なし)。"""
+    jitter は arrival_min 自体に内包済みなので、ここは決定論(乱数なし)。
+
+    A1(第94バッチ OBS-U2): 分 → step 換算は Δt に依存する量なので `clock.min_to_steps`
+    と同じ式(`分 // step_minutes`)を使う。既定 Δt=10 では `delta // 10` と厳密に同値
+    (整数除算・同一被除数)= 従来と 1 ビットも変わらない。直書きのままだと Δt=1 で
+    外部滞在・宿のチェックアウト待ちが実時間 1/10 に縮む。"""
     delta = (int(target_min) - cur_sim_min % 1440) % 1440
     if delta == 0:
         delta = 1440                                   # 同時刻 = 次の周回(翌日)
-    return delta // 10
+    return delta // int(step_minutes)
 
 
 def _percept(sim):
@@ -1142,7 +1148,8 @@ def _try_exit(sim, agent, step: int, sim_min: int) -> None:
             agent.lodging_nights = 0               # 帰宅(範囲外退出)= 連泊カウントをリセット(Wave L)
         if getattr(agent, "commute", False) and agent.arrival_min >= 0:
             # 流入通勤者: 翌朝の到着時刻(arrival_min)に再流入(往復時刻を安定させる)
-            agent.return_at = step + _steps_until_tod(sim_min, agent.arrival_min)
+            agent.return_at = step + _steps_until_tod(sim_min, agent.arrival_min,
+                                                      sim.clock.step_minutes)
         else:
             agent.return_at = (step + agent.sleep_steps
                                + sim.clock.dur_steps(int(rng.integers(0, 7))))
@@ -3156,8 +3163,13 @@ def _phase_accounts_day(sim, step: int, sim_min: int) -> None:
     給料日(payday_dom): 月給者(本業日給を持つ会社員・店員)へ economy.wages×勤務日数を
     まとめ支給(口座へ)。給料日の翌日: 家賃 = 月収相当(period_income)×rent_share を口座
     から引き落とし。残高不足は rent_due に繰越し、翌日以降に回収+money_pressure が効く。
-    すべて決定論(乱数なし)。来街者は街の外に家=口座/家賃なし。"""
-    block_day = step // 144                        # run 開始ブロック=0(=暦の1日目)
+    すべて決定論(乱数なし)。来街者は街の外に家=口座/家賃なし。
+
+    A2(第94バッチ OBS-U2): 144 の直書きを `clock.steps_per_day` へ。★`clock.day()` には
+    しない — day() は sim_min//1440(深夜0時境界)なので start_tod="07:00" では境界 step が
+    102 になり、Δt=10 でも会計日が動いて golden が壊れる。`step // steps_per_day` なら
+    Δt=10 で `step // 144` と厳密同値(= 開始ブロック基準という現行の定義そのまま)。"""
+    block_day = step // sim.clock.steps_per_day     # run 開始ブロック=0(=暦の1日目)
     if block_day == getattr(sim, "_acct_day", -1):
         return
     sim._acct_day = block_day
@@ -3227,7 +3239,9 @@ def _eviction_bankruptcy_day(sim, agent, acc: dict, step: int, sim_min: int) -> 
             new_total = total - seized
             agent.money = min(agent.money, new_total)
             agent.account = new_total - agent.money
-        agent.bankrupt_until = step + int(acc["bankruptcy_restrict_days"]) * 144
+        # A6(第94バッチ OBS-U2): 日 → step の 144 直書きを Clock へ(Δt=10 で厳密同値)
+        agent.bankrupt_until = (step + int(acc["bankruptcy_restrict_days"])
+                                * sim.clock.steps_per_day)
         tools = getattr(sim, "tools", None)
         had_venture = bool(tools is not None
                            and tools.force_close_venture(sim, agent, step, sim_min,
@@ -3892,7 +3906,10 @@ def _phase_enforcement(sim, step: int, sim_min: int) -> None:
                                  kind="detention", x=a.x, y=a.y,
                                  payload={"target": a.id, "officer": officer.id,
                                           "rule_id": rule_id, "steps": det}))
-            a.remember(f"取り締まりで{det * 10}分間その場に留め置かれた")
+            # §1.2 B6(第94バッチ OBS-U2): step → 分の 10 直書きはプロンプト入力なので、
+            # Δt=1 だと本人が実際の 10 倍の拘束時間を信じる(認知汚染)。Δt=10 では
+            # step_minutes==10 = 文字列が 1 バイトも変わらない。
+            a.remember(f"取り締まりで{det * sim.clock.step_minutes}分間その場に留め置かれた")
 
 
 # ---------------------------------------------------------------- ツール(世界改変)
@@ -4453,7 +4470,8 @@ def _lodging_checkin(sim, agent, step: int, sim_min: int) -> None:
     _spend(sim, agent, price, "lodging", step, sim_min)
     agent.sleeping = True                          # 就寝(既存 sleep 機構)。checkout_hour まで眠る
     agent.activity = ""
-    agent.sleep_until = step + _steps_until_tod(sim_min, int(cfg["checkout_hour"]) * 60)
+    agent.sleep_until = step + _steps_until_tod(sim_min, int(cfg["checkout_hour"]) * 60,
+                                                sim.clock.step_minutes)
     agent.reflect_step = step + 1                  # 就寝直後の内省(自宅就寝・帰路退出と同格の k 処置。
     #                                                lodging の抽選は k を読まない=呼数の k 不変は保たれる)
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
@@ -4675,11 +4693,16 @@ def _meeting_zone(zone_types: list, meeting_types: list, exclude=None):
 
 
 def _indoor_cell_offset(building: str, floor: int, step: int,
-                        step_seconds: float = float(STEP_MINUTES * 60)) -> float:
-    """遷移の step 内オフセット秒 [0,600)(2層タイムライン: t = step*600 + offset + サブ時刻)。
+                        step_seconds: float) -> float:
+    """遷移の step 内オフセット秒 [0, step_seconds)(2層: t = step*step_seconds + offset + サブ時刻)。
 
     セル(建物,階)+step の安定ハッシュ=決定論・run.seed 非依存・resume 不変。1セル1積分に共通の
-    オフセットを与え(遭遇の相対時刻整合を保つ)、正直な近似: 個別遷移ごとではなくセル単位の offset。"""
+    オフセットを与え(遭遇の相対時刻整合を保つ)、正直な近似: 個別遷移ごとではなくセル単位の offset。
+
+    A4(第94バッチ OBS-U2): step_seconds は **必須引数**(既定値 600.0 を廃止)。以前は
+    呼び出し 2 箇所のうち片方だけが `clock.step_seconds` を渡し、もう片方は既定 600.0 を
+    使っていたため、Δt=1(step 長 60 秒)では step 内オフセットが step 長を超えていた。
+    必須化して再発を構造的に防ぐ。Δt=10 では両呼び出しとも 600.0 = 従来と完全同値。"""
     return indoor_flow_mod._stable_uniform(f"{building}:{int(floor)}:{int(step)}",
                                            "indoor_offset") * float(step_seconds)
 
@@ -4873,7 +4896,8 @@ def _phase_indoor(sim, step: int, sim_min: int) -> None:
             to_type = str(zone_types[dst])
             integrate = bool(from_zone is not None and sfm_on and src is not None)
             if from_zone is not None:                # 実遷移=space_move(L1)。placement は記録しない
-                offset_s = _indoor_cell_offset(building, floor, step)
+                offset_s = _indoor_cell_offset(building, floor, step,
+                                               sim.clock.step_seconds)
                 from_type = str(zone_types[from_zone]) if 0 <= from_zone < n_zones else ""
                 sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                                      kind="space_move", x=agent.x, y=agent.y,

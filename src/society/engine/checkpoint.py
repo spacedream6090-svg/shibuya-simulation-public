@@ -310,7 +310,11 @@ def load(sim, path: str | Path) -> int:
     if blob.get("config_hash") != expect:
         raise ValueError(
             "checkpoint の config が現在の config と不整合(決定論が壊れる)。"
-            " seed/n_agents/因子など resume 対象外のキーが変わっている可能性。")
+            " seed/n_agents/因子など resume 対象外のキーが変わっている可能性。"
+            " ★run.dt_min≠10 のランで出た場合はまず Δt の二重変換を疑うこと:"
+            " 保存済み config.yaml は apply_dt 済みなので、読み直すときは"
+            " load_config(path=…, apply_dt=False) でなければ全定数が二重に変換される"
+            "(scripts/run.py --resume は対応済み)。")
 
     # 状態オブジェクト(共有参照は 1 pickle 内で保存済み)
     sim.agents = blob["agents"]

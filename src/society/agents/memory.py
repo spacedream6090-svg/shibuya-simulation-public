@@ -42,13 +42,16 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from ..rng import _stable_hash
+from ..timeconv import CANON_DT_MIN
 
 # 自由文クエリを想起の文脈語へ分解する区切り(空白・句読点・括弧など)
 _QUERY_SPLIT = re.compile(r"[\s、。,.!?！？「」『』（）()\[\]・:：;；　/]+")
 
 # ACT-R 既定パラメータ(docs/research/memory-cognitive-research.md §実装スケッチ (f))。
 #   d   基礎活性化の減衰 = 0.5(ACT-R 標準 §1,§2)
-#   tau 想起閾値 = -2.0(ACT-R 既定。step 時間単位で単一参照が Δt≈e^4≈55step≈9h で τ 割れ)
+#   tau 想起閾値 = -2.0(ACT-R 既定。**正準 step(=10分)を時間単位として**単一参照が
+#       e^4≈55 正準 step ≈9h で τ 割れ。A7(第94)で MemoryStore.dt_min により経過 step を
+#       正準換算するので、この 9h という実時間の意味は Δt を変えても保存される)
 #   s   想起ノイズ尺度 = 0.5(ACT-R 既定。ガウス σ とは s=√3·σ/π)
 #   S   最大連想強度(fan)= 2.0(ACT-R 応用の代表値 §3)
 #   W   注意総重み = 1.0(W_j=W/n_cues §1)
@@ -97,6 +100,13 @@ class MemoryStore:
     recency_decay: float = 0.9983    # /step(= GA の 0.99/時 を10分stepに換算)
     relations_max: int = 0           # >0 で関係台帳の上限(B6)。0=無制限=従来と完全同一
     actr: dict | None = None         # ACT-R 活性化設定(None=OFF=現行 0.5:2:3=バイト一致)
+    # A7(第94バッチ OBS-U2): ACT-R 基礎活性化の時間単位。ACT-R の冪乗則忘却は **実時間**の
+    # 関数だが、実装は step 差をそのまま t に使っている。Δt を細かくすると同じ実時間が
+    # 大きな step 差になり、忘却が実時間で ~10/Δt 倍速になる(同じ Episode を評価する
+    # recency_decay は simulation.py:1423 で scale_keep 済み=記憶モジュール内に二重基準)。
+    # 経過 step を「正準 Δt(10 分)換算の step」へ読み替えて実時間基準に揃える。
+    # 既定 10 = CANON = 読み替えの分岐自体を通らない(= 従来と 1 ビットも変わらない)。
+    dt_min: int = 10
 
     # ---- ACT-R 設定の組み立て(有効化側/テストが使う)----
     @staticmethod
@@ -279,11 +289,19 @@ class MemoryStore:
         return B + beta + spread
 
     def _base_activation(self, ep: Episode, step: int, d: float) -> float:
-        """基礎活性化 B = ln(Σ_j (t_now − t_ref_j)^−d)。refs 未強化なら生成 step 一点を使う。"""
+        """基礎活性化 B = ln(Σ_j (t_now − t_ref_j)^−d)。refs 未強化なら生成 step 一点を使う。
+
+        A7: 経過 step は **正準 Δt(10 分)換算**へ読み替える(冪乗則忘却は実時間の関数)。
+        既定 Δt=10 では下の分岐に入らず従来式そのもの=バイト一致。"""
         refs = getattr(ep, "refs", None) or [ep.step]
         total = 0.0
+        if self.dt_min == CANON_DT_MIN:                 # ★恒等パス(既定): 従来式のまま
+            for t in refs:
+                total += max(1, step - t) ** (-d)
+            return math.log(total)
+        r = self.dt_min / float(CANON_DT_MIN)           # 1 step が正準の何倍の実時間か
         for t in refs:
-            total += max(1, step - t) ** (-d)
+            total += max(1.0, (step - t) * r) ** (-d)
         return math.log(total)
 
     def _recall_noise(self, agent_id: int, step: int, ep: Episode, s: float) -> float:
