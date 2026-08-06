@@ -74,6 +74,44 @@ Caiani et al. の行列も**部門別**(家計・消費財企業・資本財企�
     「街 + 街外」で保存が閉じると宣言する(Caiani の外国部門と同型)。シム改変ゼロ・
     本スクリプトの写像を変えるだけ。ただし「街の中で経済が回っていない」事実は変わらない。
 
+IF-E2(第97バッチ 2026-08-06)= **案B を採用して実装済み**(`economy.org_accounting`・既定 OFF)
+--------------------------------------------------------------------------------------------
+実装 `src/society/economy_sfc.py` / 設計 `docs/research/ifE2-org-accounting-research.md` §4-3。
+org が**スカラー預金 1 本**を持ち(Lengnick 2013 の M=wN / Caiani の σ×予想賃金支払で初期化)、
+賃金はそこから出て(不足は**自動当座借越**)、消費は台帳の静的索引で解決した受け手 org へ
+**実支払−消費税**として入る。受け手が街に居ない金は rest-of-world(渋谷域外)へ
+**チャネル別に**落ちる(SNA 2008 §26.2/26.5/26.6 = 行動方程式なし・残高制約なしの明示部門)。
+
+本スクリプトは ON のランで payload の相手方(`spend.payee` / `wage.payer` / `rent.payee` …)と
+サイドカー `finance.parquet`(部門別残高の日次 1 行)を読み、検査①を**残高を持つ全部門**で行う。
+
+| ラン(mock 40体2日・同一 conf の ON/OFF) | 総フロー | 漏れ比率 | 漏れの族 |
+|---|---:|---:|---|
+| organizations ON / org_accounting **OFF** | 2,504,269 | **96.04 %** | org 56.4 / wage 21.5 / spend 12.8 / venture_setup 5.0 / tax 4.3 |
+| 同 / org_accounting **ON**                 | 1,812,769 | **0.00 %**  | (なし。void 行・列とも 0) |
+| accounts+bank ON / org_accounting **OFF**  | 1,845,937 | **92.01 %** | org 76.4 / spend 18.7 / wage 2.6 / tax 1.9 / rent 0.4 |
+| 同 / org_accounting **ON**                 | 1,178,437 | **0.00 %**  | (なし) |
+
+検査①は household / org / bank / government / **rest-of-world** の 5 部門すべてで PASS
+(相対残差 8.98e-18 / 6.66e-08 / 0.0 / 0.0 / 3.80e-06 = payload の 0.1 円丸めノイズ)。
+**venture と void は原理的に observable にならない**ので、そう表示し続ける:
+venture は売上が即座に店主=家計へ抜ける**通過部門**で世界に残高そのものが無く、
+void は「相手方が存在しない金」の**検出器**である(装置は残したまま値をゼロにするのが、
+検査の網羅性を将来にわたって守る唯一の方法)。
+
+**ゼロと偽らない — ON でも残る 3 つの限界**
+  1. **RoW への依存はむしろ可視化された**。漏れが 0 になったのは金が閉じたからで、
+     街の経済が自立したからではない。mock ラン実測では受け手 org を特定できなかった消費
+     `unknown_payee` が 231,833 円、域内に客が居ない org の輸出代金 `export_production` が
+     666,000 円(org が受け取った域内消費 17,318 円の **38 倍**)。これが案B 固有の主結果。
+  2. **受け手の特定率**。台帳の静的索引 `(building, floor, POI種別)` → `(node, POI種別)` で
+     解決し、決まらない消費は RoW へ落とす。小ラン(台帳 42 社)では 15/299 件しか org へ
+     着地しない。研究文書 §3-c の全数測定では 11,010 社台帳で floor 鍵の一意率 56.8%。
+  3. **接続できていない金の経路が 4 つ残る**(`economy_sfc.UNCOVERED_KINDS`):
+     `rule_bonus`(rules.py)・`crime`(diversity.py)・`chance_event`(chance.py)は
+     IF-E2 の変更範囲外のファイルで残高を動かす。`b2b_trade` は帳簿 dict のみで残高を
+     動かさない。これらが点火するランでは不変量の外側に残る(summary へ件数を出す)。
+
 正直な限界(出力にも印字する)
 ------------------------------
 - **許容誤差はゼロにできない。** L1 payload も L3 スナップショットも 0.1 円単位に丸められており、
@@ -128,6 +166,9 @@ MONEY_KINDS: frozenset[str] = frozenset({
     "venture_sale", "venture_open", "deposit", "candidacy", "reward", "rule_bonus",
     "civic_service", "chance_event", "crime", "bankruptcy", "vc_investment",
     "enforcement", "tax", "b2b_trade", "move_home",
+    # IF-E2 案B: 域内に客が居ない org(office/education)への**輸出代金**が
+    # production の payload に revenue として載る(ON のときだけ。OFF はキーなし=金額ゼロ)。
+    "production",
 })
 
 #: 金額は payload に出るが**別のイベントで既に会計済み**の種(二重計上の禁止リスト)。
@@ -141,6 +182,9 @@ DERIVED_MONEY_KINDS: frozenset[str] = frozenset({
     "ride",             # _charge_ride: ride を記録した直後に _spend(cat=taxi/bus)
     "public_budget",    # 行政の残高観測(フローではない)
     "eviction",         # 立退き: arrears(滞納**残高**)を載せるが金は動かない
+    # ---- IF-E2 案B(economy.org_accounting ON のランでのみ現れる)----
+    "org_overdraft",    # org の預金が負に落ちた通知。金は wage 側で既に会計済み
+    "row_flow",         # その日の域外収支の**日次集計**。個々のフローは spend/wage 側で会計済み
 })
 
 
@@ -186,11 +230,37 @@ def _f(payload: dict, key: str, default: float = 0.0) -> float:
         return float(default)
 
 
-def spend_destination(cat: str) -> tuple[str, str]:
-    """消費 spend の受け取り部門と漏れタグ。venture だけが世界に受け皿を持つ。
+def party_sector(token) -> str | None:
+    """IF-E2 案B の payload トークン(payer / payee)→ 部門。無ければ None(= 従来の写像へ)。
 
-    戻り値 (dst, tag)。dst==VOID は「客が払った金を受け取る主体が世界に居ない」= 漏れ。"""
+    ON のランでは spend / wage / rent / venture_open / move_home / enforcement /
+    bankruptcy / deposit / candidacy / reward の payload に相手方が 1 語で載る:
+      "row:<channel>" = rest-of-world(渋谷域外)の窓口 / "venture" = 屋台 /
+      "government" = 行政 / "escrow" = 行政の預り金 / それ以外 = 台帳の org_id。
+    OFF のランでは 1 つも載らないので本関数は常に None を返す(= 従来の分類のまま)。"""
+    t = str(token or "")
+    if not t:
+        return None
+    if t.startswith("row:"):
+        return EXTERNAL
+    if t == "venture":
+        return VENTURE
+    if t in ("government", "escrow"):
+        return GOVERNMENT
+    return ORG
+
+
+def spend_destination(cat: str, payee=None) -> tuple[str, str]:
+    """消費 spend の受け取り部門と漏れタグ。
+
+    戻り値 (dst, tag)。dst==VOID は「客が払った金を受け取る主体が世界に居ない」= 漏れ。
+    IF-E2 案B(economy.org_accounting ON)では payload の payee が受け手を 1 語で
+    与えるので、それを最優先する(= spend 族の漏れが構造的に消える)。OFF は従来どおり
+    venture だけが世界に受け皿を持つ。"""
     c = str(cat or "")
+    sec = party_sector(payee)
+    if sec is not None:
+        return sec, f"spend:{c}" if c else "spend:?"
     if c == "venture":
         return VENTURE, "venture_purchase"
     return VOID, f"spend:{c}" if c else "spend:?"
@@ -216,13 +286,18 @@ def flows_for(kind: str, payload: dict, ctx: dict) -> list[Flow]:
     p = payload or {}
     out: list[Flow] = []
     if kind == "spend":
-        amt = _f(p, "amount")
-        dst, tag = spend_destination(p.get("cat"))
+        # IF-E2 ON で床クリップ(所持金 < 名目価格)が起きた spend だけ paid が載る。
+        # 実際に動いた額は paid なので、あるときはそちらを使う(無ければ名目 amount)。
+        amt = _f(p, "paid", _f(p, "amount"))
+        dst, tag = spend_destination(p.get("cat"), p.get("payee"))
         if amt:
             out.append(Flow(HOUSEHOLD, dst, amt, tag))
     elif kind == "wage":
         amt = _f(p, "amount")                      # 手取り(行政 ON 時は gross > amount)
         src, tag = WAGE_SOURCE_SECTOR.get(str(p.get("source") or ""), _WAGE_DEFAULT)
+        sec = party_sector(p.get("payer"))         # IF-E2: 支払側が payload に載る(OFF は None)
+        if sec is not None:
+            src = sec
         if amt:
             out.append(Flow(src, HOUSEHOLD, amt, tag))
     elif kind == "withdraw":
@@ -230,7 +305,8 @@ def flows_for(kind: str, payload: dict, ctx: dict) -> list[Flow]:
     elif kind == "rent":
         paid = _f(p, "paid")
         if paid:
-            out.append(Flow(HOUSEHOLD, VOID, paid, "rent:no_landlord"))
+            dst = party_sector(p.get("payee")) or VOID      # IF-E2: 不在家主 → RoW
+            out.append(Flow(HOUSEHOLD, dst, paid, "rent:no_landlord"))
     elif kind == "interest_paid":
         amt = _f(p, "amount")
         if amt:
@@ -252,32 +328,43 @@ def flows_for(kind: str, payload: dict, ctx: dict) -> list[Flow]:
     elif kind == "venture_open":
         cost = _f(p, "cost")
         if cost:
-            out.append(Flow(HOUSEHOLD, VOID, cost, "venture_setup_cost"))
+            dst = party_sector(p.get("payee")) or VOID      # IF-E2: 域外の内装業者・仕入
+            out.append(Flow(HOUSEHOLD, dst, cost, "venture_setup_cost"))
     elif kind == "move_home":
         dep = _f(p, "deposit")
         if dep:
-            out.append(Flow(HOUSEHOLD, VOID, dep, "move_home:deposit_no_landlord"))
+            dst = party_sector(p.get("payee")) or VOID      # IF-E2: 不在家主 → RoW
+            out.append(Flow(HOUSEHOLD, dst, dep, "move_home:deposit_no_landlord"))
     elif kind == "vc_investment":
         amt = _f(p, "amount")
         if amt:
             out.append(Flow(BANK, HOUSEHOLD, amt, "vc_investment"))
     elif kind == "deposit":
         amt, phase = _f(p, "amount"), str(p.get("phase") or "")
-        if amt and phase == "paid":                 # 供託=誰の残高でもない預かり金(escrow は未実装)
-            out.append(Flow(HOUSEHOLD, VOID, amt, "deposit:escrow_in"))
+        esc_in = party_sector(p.get("payee"))       # IF-E2: 行政の預り金(OFF は None=VOID)
+        esc_out = party_sector(p.get("payer"))
+        if amt and phase == "paid":                 # 供託=預かり金
+            out.append(Flow(HOUSEHOLD, esc_in or VOID, amt, "deposit:escrow_in"))
         elif amt and phase == "refund":
-            out.append(Flow(VOID, HOUSEHOLD, amt, "deposit:escrow_out"))
+            out.append(Flow(esc_out or VOID, HOUSEHOLD, amt, "deposit:escrow_out"))
         elif amt and phase == "forfeit":
-            out.append(Flow(VOID, GOVERNMENT, amt, "deposit:forfeit"))
+            # IF-E2 ON: 預り金 → 区の歳入 = **行政の内部振替**(行列に出さない。civil 源泉税と同型)。
+            # 行政が居ない世界だけ payee(RoW)へ出る。OFF は従来どおり VOID → 行政。
+            if esc_out is None:
+                out.append(Flow(VOID, GOVERNMENT, amt, "deposit:forfeit"))
+            elif esc_in is not None and esc_in != esc_out:
+                out.append(Flow(esc_out, esc_in, amt, "deposit:forfeit"))
         # phase == "insufficient" は金が動かない(拠出不能)
     elif kind == "candidacy":
         dep = _f(p, "deposit")
         if dep:
-            out.append(Flow(HOUSEHOLD, VOID, dep, "candidacy:escrow_in"))
+            dst = party_sector(p.get("payee")) or VOID      # IF-E2: 行政の預り金
+            out.append(Flow(HOUSEHOLD, dst, dep, "candidacy:escrow_in"))
     elif kind == "reward":
         amt = _f(p, "amount")
-        if amt:
-            out.append(Flow(EXTERNAL, HOUSEHOLD, amt, "reward"))   # D9 ablation の外生報酬
+        if amt:                                     # D9 ablation の外生報酬(IF-E2 ON でも RoW)
+            out.append(Flow(party_sector(p.get("payer")) or EXTERNAL,
+                            HOUSEHOLD, amt, "reward"))
     elif kind == "rule_bonus":
         amt = _f(p, "amount")
         if amt:                                     # 区が「発行」するが行政予算は減らない
@@ -299,11 +386,14 @@ def flows_for(kind: str, payload: dict, ctx: dict) -> list[Flow]:
     elif kind == "bankruptcy":
         seized = _f(p, "seized")
         if seized:
-            out.append(Flow(HOUSEHOLD, VOID, seized, "bankruptcy:seizure"))
+            dst = party_sector(p.get("payee")) or VOID      # IF-E2: 債権者不在 → RoW
+            out.append(Flow(HOUSEHOLD, dst, seized, "bankruptcy:seizure"))
     elif kind == "enforcement":
         pen = _f(p, "penalty")
         if pen:
-            dst = GOVERNMENT if ctx.get("government_on") else VOID
+            dst = party_sector(p.get("payee"))              # IF-E2(OFF は None)
+            if dst is None:
+                dst = GOVERNMENT if ctx.get("government_on") else VOID
             out.append(Flow(HOUSEHOLD, dst, pen, "enforcement:fine"))
     elif kind == "tax":
         amt = _f(p, "amount")
@@ -316,6 +406,12 @@ def flows_for(kind: str, payload: dict, ctx: dict) -> list[Flow]:
         amt = _f(p, "amount")
         if amt:
             out.append(Flow(ORG, ORG, amt, "b2b_trade"))           # 部門内(卸→小売)=行/列で相殺
+    elif kind == "production":
+        # IF-E2 案B: 域内に客が居ない org(全 org の 36.5%・従業者の 51.5%)の**輸出代金**。
+        # 地域会計では観光サテライト勘定(非居住者の域内消費=輸出)の逆向き適用にあたる。
+        rev = _f(p, "revenue")
+        if rev:
+            out.append(Flow(EXTERNAL, ORG, rev, "export:production"))
     return out
 
 
@@ -331,7 +427,7 @@ def move_for(kind: str, agent_id: int, payload: dict, accounts_on: bool) -> list
     p = payload or {}
     a = int(agent_id)
     if kind == "spend":
-        amt = _f(p, "amount")
+        amt = _f(p, "paid", _f(p, "amount"))         # IF-E2: 床クリップ時は実支払(paid)が正
         if accounts_on and str(p.get("src") or "") == "card":
             return [Move(a, acct=-amt, kind=kind)]
         return [Move(a, cash=-amt, kind=kind)]
@@ -601,6 +697,76 @@ def conserve_government(budget_rows: list[dict], flows: list[Flow],
             "levels": levels, "external": ext}
 
 
+#: finance.parquet の列 → 部門残高の取り出し方(IF-E2 案B。ON のランでのみ存在する)。
+#:   org        企業の預金(スカラー 1 本の総和)
+#:   bank       Bank.capital + VCFund.balance(どちらも金融部門)
+#:   external   RoW が**正味で吸収した**額 = row_out − row_in(街の外に残高は無い = SNA §26.6)
+FINANCE_BALANCE = {
+    ORG:        lambda r: _f(r, "org_balance"),
+    BANK:       lambda r: _f(r, "bank_capital") + _f(r, "vc_balance"),
+    EXTERNAL:   lambda r: _f(r, "row_out") - _f(r, "row_in"),
+    GOVERNMENT: lambda r: _f(r, "gov_balance") + _f(r, "escrow"),
+    HOUSEHOLD:  lambda r: _f(r, "household_balance"),
+}
+
+
+def conserve_sector(fin_rows: list[dict], flows: list[Flow], sector: str,
+                    rel_tol: float) -> dict:
+    """検査①の一般形(IF-E2 案B の finance.parquet を使う)。
+
+    「期首残高 + 流入 − 流出 = 期末残高」を、本スクリプトが L1 から**独立に**組んだ
+    フロー行列の部門純額と突き合わせる。窓は [最初の行の step, 最後の行の step) の
+    排他境界(finance の行は日境界フェーズの先頭 = その step の活動より前に採られるため。
+    行政の外部整合 conserve_government(b) と同じ規約)。
+
+    ★この検査が通ることが「org / 銀行 / RoW も**世界に実在する残高**として閉じている」の意味で、
+      案B の受入条件(検査①が全部門で成立)そのものである。"""
+    getter = FINANCE_BALANCE.get(sector)
+    if getter is None or len(fin_rows) < 2:
+        return {"sector": sector, "observable": False,
+                "reason": "finance.parquet が無い(economy.org_accounting=false)"}
+    rows = sorted(fin_rows, key=lambda r: int(r.get("step", 0)))
+    s0, s1 = int(rows[0].get("step", 0)), int(rows[-1].get("step", 0))
+    bal0, bal1 = getter(rows[0]), getter(rows[-1])
+    inflow = sum(f.amount for f in flows
+                 if f.dst == sector and f.src != sector and s0 <= f.step < s1)
+    outflow = sum(f.amount for f in flows
+                  if f.src == sector and f.dst != sector and s0 <= f.step < s1)
+    n_flows = sum(1 for f in flows
+                  if s0 <= f.step < s1 and (f.dst == sector or f.src == sector))
+    resid = (bal1 - bal0) - (inflow - outflow)
+    denom = inflow + outflow
+    rel = (abs(resid) / denom) if denom else 0.0
+    # 丸めの上限を**独立に**置く: 残高は無限精度で動くが L1 payload は 0.1 円に丸められるので、
+    # 1 フローあたり最大 0.05 円の誤差が乗る(docstring「許容誤差はゼロにできない」)。
+    # 相対誤差は「残高が大きく流量が小さい部門」(行政など)で過敏になるため、
+    # **相対 or 丸め上限のどちらかを満たせば PASS** とする(判定を甘くするのではなく、
+    # 丸めという既知の誤差源の大きさを明示的にモデル化する)。
+    abs_tol = 0.05 * max(n_flows, 1) + 0.1
+    return {"sector": sector, "observable": True, "from_step": s0, "to_step": s1,
+            "open_balance": round(bal0, 1), "close_balance": round(bal1, 1),
+            "total_abs_flow": round(denom, 3), "matrix_inflow": round(inflow, 1),
+            "matrix_outflow": round(outflow, 1), "total_residual": round(resid, 3),
+            "relative_residual": rel, "rel_tol": rel_tol,
+            "n_flows": n_flows, "abs_tol": round(abs_tol, 3),
+            "pass": rel <= max(rel_tol, 1e-6) or abs(resid) <= abs_tol}
+
+
+def revenue_actual_by_payee(events: list[dict]) -> dict[str, float]:
+    """IF-E2 案B の ON ランで、**受け手 org ごとの実売上**を spend の payee から直に集計する。
+
+    IF-E フェーズ1 の serve→spend 突合(スタッフ不在 220/222 で機能しなかった)と違い、
+    受け手は支払のその場で確定しているので突合そのものが要らない。"""
+    out: dict[str, float] = defaultdict(float)
+    for e in events:
+        if e["kind"] != "spend":
+            continue
+        payee = str((e["payload"] or {}).get("payee") or "")
+        if payee and party_sector(payee) == ORG:
+            out[payee] += _f(e["payload"], "amount")
+    return dict(out)
+
+
 def classifier_consistency(flows: list[Flow], moves: list[Move]) -> dict:
     """分類器の自己整合: フロー行列の**家計純額**と、家計個体の残高移動の合計が一致するか。
 
@@ -721,7 +887,8 @@ def _read_config(run_dir: Path) -> dict:
     """runs/<name>/config.yaml から検査に必要なトグルだけを取り出す(omegaconf 依存を避ける)。"""
     path = run_dir / "config.yaml"
     out = {"accounts_on": False, "government_on": False, "pool_on": False,
-           "org_ledger_on": False, "indoor_fields_on": False}
+           "org_ledger_on": False, "indoor_fields_on": False,
+           "org_accounting_on": False}
     if not path.exists():
         return out
     text = path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -752,6 +919,8 @@ def _read_config(run_dir: Path) -> dict:
                 out["org_ledger_on"] = b
             elif path_key == "work.service.indoor_fields":
                 out["indoor_fields_on"] = b
+            elif path_key == "economy.org_accounting.enabled":   # IF-E2 案B
+                out["org_accounting_on"] = b
     return out
 
 
@@ -812,9 +981,16 @@ def load_run(run_dir: Path) -> dict:
     if led_path.exists():
         ledger_rows = pq.read_table(led_path).to_pylist()
 
+    # IF-E2 案B: 部門別残高の日次サイドカー(org / 銀行 / VC / 行政 / 供託 / 家計 / RoW)。
+    # これがあると検査①が org・銀行・行政・RoW でも成立する(= 案B の受入条件)。
+    fin_rows: list[dict] = []
+    fin_path = run_dir / "finance.parquet"
+    if fin_path.exists():
+        fin_rows = pq.read_table(fin_path).to_pylist()
+
     return {"cfg": cfg, "events": events, "serve": serve_rows,
             "budget": budget_rows, "stock": stock_by_step, "ledger": ledger_rows,
-            "other_money": other_money, "run_dir": str(run_dir)}
+            "finance": fin_rows, "other_money": other_money, "run_dir": str(run_dir)}
 
 
 # --------------------------------------------------------------------------- #
@@ -847,12 +1023,19 @@ def resolve_tax_sources(events: list[dict]) -> dict[int, str]:
         if which == "consumption":
             for sp in spend_ix.get(key, ()):
                 if abs(_f(sp, "amount") - base) < 0.051:
-                    out[id(p)] = spend_destination(sp.get("cat"))[0]
+                    dst = spend_destination(sp.get("cat"), sp.get("payee"))[0]
+                    # IF-E2 の正直な限界: 屋台(venture)は既存実装が売上**全額**を店主へ渡すので
+                    # 内税ぶんを売り手が留保していない。その穴は RoW の tax_gap チャネルが埋める
+                    # (改名して隠さない)。ここも同じ相手方に揃えないと行列が閉じない。
+                    if dst == VENTURE and sp.get("payee"):
+                        dst = EXTERNAL
+                    out[id(p)] = dst
                     break
         elif which in ("income", "resident"):
             for wg in wage_ix.get(key, ()):
                 if abs(_f(wg, "gross") - base) < 0.051:
-                    out[id(p)] = WAGE_SOURCE_SECTOR.get(
+                    sec = party_sector(wg.get("payer"))   # IF-E2(OFF は None)
+                    out[id(p)] = sec if sec is not None else WAGE_SOURCE_SECTOR.get(
                         str(wg.get("source") or ""), _WAGE_DEFAULT)[0]
                     break
     return out
@@ -881,7 +1064,10 @@ def analyze(run: dict, rel_tol: float = 1e-6) -> dict:
 
     # 企業(org)部門: org_ledger の revenue_est / wage_paid は**どの主体の残高とも接続していない**。
     # 行列に明示的に載せることで、org 行・列のどれだけが未接続かが1目で見える。
-    for r in run["ledger"]:
+    # ★IF-E2 案B(org_accounting ON)では org が**実在の預金**を持ち、賃金は wage の payer・
+    #   売上は spend の payee として既に行列に載っている。ここで revenue_est(推定値)を
+    #   重ねると二重計上になるので、ON のランでは擬似フローを出さない。
+    for r in (() if cfg.get("org_accounting_on") else run["ledger"]):
         day = int(r.get("day", 0) or 0)
         est, wage = _f(r, "revenue_est"), _f(r, "wage_paid")
         if est:
@@ -923,11 +1109,29 @@ def analyze(run: dict, rel_tol: float = 1e-6) -> dict:
                               "reason": "public_budget イベントが 0 件(government OFF)"}
     for s in (ORG, VENTURE, BANK, EXTERNAL, VOID):
         checks[s] = {"sector": s, "observable": False, "reason": UNOBSERVABLE_REASON[s]}
+    # IF-E2 案B: finance.parquet があれば org / 銀行 / RoW の残高が観測できる = 検査①が成立する。
+    # 行政は public_budget 由来の既存検査(内部整合 + 外部整合)を主にし、供託(escrow)を
+    # 含む finance 由来の判定を external_finance として**併記**する(既存の判定を壊さない)。
+    fin = run.get("finance") or []
+    if len(fin) >= 2:
+        for s in (ORG, BANK, EXTERNAL):
+            checks[s] = conserve_sector(fin, flows, s, rel_tol)
+        gv_fin = conserve_sector(fin, flows, GOVERNMENT, rel_tol)
+        if checks[GOVERNMENT].get("observable"):
+            checks[GOVERNMENT]["external_finance"] = gv_fin
+        else:
+            checks[GOVERNMENT] = gv_fin
 
     spend_rows = [{"step": e["step"], "agent_id": e["agent_id"], "x": e["x"], "y": e["y"],
                    "cat": str(e["payload"].get("cat") or ""), "amount": _f(e["payload"], "amount")}
                   for e in events if e["kind"] == "spend"]
     gap = revenue_gap(run["ledger"], run["serve"], spend_rows)
+    # IF-E2 案B: 受け手 org ごとの**実売上**(突合不要 = 支払のその場で確定している)。
+    actual_by_payee = revenue_actual_by_payee(events)
+    gap["payee_revenue_total"] = round(sum(actual_by_payee.values()), 1)
+    gap["n_payee_orgs"] = len(actual_by_payee)
+    gap["payee_ratio"] = ((gap["total_revenue_est"] / gap["payee_revenue_total"])
+                          if gap["payee_revenue_total"] else None)
 
     total_flow = sum(matrix.values())
     created = sum(v["created"] for v in leaks.values())
@@ -951,6 +1155,13 @@ def analyze(run: dict, rel_tol: float = 1e-6) -> dict:
         "classifier_consistency": classifier_consistency(
             flows, [m for mv in moves_by_step.values() for m in mv]),
         "revenue_gap": gap,
+        # IF-E2 案B: 部門別残高の日次系列(finance.parquet)。期首/期末と RoW チャネル内訳。
+        "finance": {
+            "n_rows": len(run.get("finance") or []),
+            "open": ((run.get("finance") or [{}])[0] if run.get("finance") else {}),
+            "close": ((run.get("finance") or [{}])[-1] if run.get("finance") else {}),
+        },
+        "payee_revenue": {k: round(v, 1) for k, v in sorted(actual_by_payee.items())},
     }
 
 
@@ -968,7 +1179,8 @@ def render_markdown(rep: dict) -> str:
     L.append("")
     L.append(f"- ラン: `{rep['run_dir']}`")
     L.append(f"- トグル: accounts={cfg['accounts_on']} / government={cfg['government_on']} / "
-             f"org_ledger={cfg['org_ledger_on']} / serve.indoor_fields={cfg['indoor_fields_on']}")
+             f"org_ledger={cfg['org_ledger_on']} / serve.indoor_fields={cfg['indoor_fields_on']} / "
+             f"org_accounting={cfg.get('org_accounting_on', False)}")
     L.append(f"- 相対許容誤差 rel_tol = {rep['rel_tol']:g}")
     L.append("- 検査法の出典: Caiani et al. (2016) *JEDC* 69:375-408 §5.2 / Godley & Lavoie (2007)")
     L.append("")
@@ -1087,6 +1299,55 @@ def render_markdown(rep: dict) -> str:
         L.append("未分類の金額キーを持つイベント種: **なし**(既知の金の経路で閉じている)。")
     L.append("")
 
+    fin = rep.get("finance") or {}
+    if fin.get("n_rows"):
+        L.append("## 3-b. IF-E2 案B: 部門別残高と rest-of-world(渋谷域外)")
+        L.append("")
+        L.append("> org はスカラー預金 1 本を持ち(Lengnick 2013 の M=wN / Caiani の σ×予想賃金支払)、")
+        L.append("> 受け手が街に居ない金は RoW へ**チャネル別に**落ちる(SNA 2008 §26.2/26.5/26.6)。")
+        L.append("> 不変量 **Σ(全主体残高) + RoW 累積 = 一定**(ABCredit.jl 流のスカラー総マネー保存)。")
+        L.append("")
+        op, cl = fin.get("open") or {}, fin.get("close") or {}
+        L.append("| 部門 | 期首残高 | 期末残高 | 変化 |")
+        L.append("|---|---:|---:|---:|")
+        for label, key in (("企業(org)預金", "org_balance"),
+                           ("銀行 capital", "bank_capital"),
+                           ("VC ファンド", "vc_balance"),
+                           ("行政 予算", "gov_balance"),
+                           ("行政 預り金(供託)", "escrow"),
+                           ("家計(現金+口座)", "household_balance"),
+                           ("RoW 累計流入(街へ)", "row_in"),
+                           ("RoW 累計流出(街から)", "row_out")):
+            a, b = _f(op, key), _f(cl, key)
+            L.append(f"| {label} | {_num(a)} | {_num(b)} | {_num(b - a)} |")
+        L.append("")
+        L.append(f"org: {int(_f(cl, 'org_count'))} 社 / うち預金がマイナス(当座借越) "
+                 f"{int(_f(cl, 'org_negative'))} 社 / 最小残高 {_num(_f(cl, 'org_min'))}")
+        L.append("")
+        try:
+            ch = json.loads(cl.get("row_channels") or "{}")
+        except (TypeError, ValueError):
+            ch = {}
+        if ch:
+            L.append("**域外(RoW)チャネル別の累積**(= 街が域外にどう依存しているか):")
+            L.append("")
+            L.append("| チャネル | RoW → 街(流入) | 街 → RoW(流出) |")
+            L.append("|---|---:|---:|")
+            for name, v in sorted(ch.items(), key=lambda kv: -(kv[1]["in"] + kv[1]["out"])):
+                L.append(f"| `{name}` | {_num(v['in'])} | {_num(v['out'])} |")
+            L.append("")
+        pr = rep.get("payee_revenue") or {}
+        if pr:
+            top = sorted(pr.items(), key=lambda kv: -kv[1])[:15]
+            L.append(f"受け手 org が特定できた消費: **{len(pr)} 社 / 合計 "
+                     f"{_num(sum(pr.values()))}**(上位 15 社)")
+            L.append("")
+            L.append("| org_id | 実売上(spend.payee 由来) |")
+            L.append("|---|---:|")
+            for oid, v in top:
+                L.append(f"| `{oid}` | {_num(v)} |")
+            L.append("")
+
     L.append("## 4. 既知の断絶: revenue_est vs 実際の spend")
     L.append("")
     g = rep["revenue_gap"]
@@ -1105,6 +1366,10 @@ def render_markdown(rep: dict) -> str:
     L.append(f"| serve 件数 / うちスタッフ不在 | {g['n_serve']} / {g['n_serve_unstaffed']} |")
     L.append(f"| serve→spend 突合 成功 / 失敗 / 重複除去 | "
              f"{g['n_serve_matched']} / {g['n_serve_without_spend']} / {g['n_serve_dedup_dropped']} |")
+    if g.get("n_payee_orgs"):        # IF-E2 案B: 突合不要の実売上(支払のその場で受け手が確定)
+        L.append(f"| **payee 由来の実売上合計**(IF-E2) | {_num(g['payee_revenue_total'])} |")
+        L.append(f"| 比 est/payee 実売上 | "
+                 f"{('%.2f' % g['payee_ratio']) if g.get('payee_ratio') else '—'} |")
     L.append("")
     if g["rows"]:
         L.append("| org_id | revenue_est | spend 実測 | 乖離 | wage_paid |")

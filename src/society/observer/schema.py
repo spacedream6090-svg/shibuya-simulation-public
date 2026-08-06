@@ -427,6 +427,17 @@ register_event_kind("trace_mark",      "行為の副産物として場所に痕�
                                        "{node, kind(enforcement|gathering|opening|"
                                        "closing|trouble), tier(transient|daily|persistent)}")
 
+# ---- IF-E2 案B: org の会計主体化 + rest-of-world(economy.org_accounting。既定 OFF=0件)----
+#   実装 src/society/economy_sfc.py。設計 docs/research/ifE2-org-accounting-research.md §4-3。
+#   ★どちらも**金の移動そのものではない**(移動は既存の spend / wage の payload に payer / payee
+#     として載る)。analyze_accounting.py では DERIVED_MONEY_KINDS 側に入れて二重計上を防ぐ。
+register_event_kind("org_overdraft",   "org の預金が賃金支払で負に落ちた(自動当座借越。"
+                                       "Poledna / Mark-0 / CATS で最頻出の支払不能規約。"
+                                       "破綻処理は入れない){org, amount, balance, shortfall, reason}")
+register_event_kind("row_flow",        "その日の rest-of-world(渋谷域外)との資金収支。"
+                                       "『街が域外にどれだけ依存しているか』= 案B 固有の新しい研究量"
+                                       "{day, channels{ch:{in,out}}, in_total, out_total, net, org_balance}")
+
 
 @dataclass
 class Event:

@@ -20,6 +20,7 @@ from __future__ import annotations
 from collections import defaultdict
 
 from . import commerce as commerce_mod
+from . import economy_sfc as sfc_mod
 from . import reject as _reject_mod
 from . import status as status_mod
 from .cognition import drive
@@ -312,21 +313,30 @@ def _settle_candidacy_deposit(sim, agent, deposit, step, sim_min, *, refund) -> 
         return
     if refund:
         agent.money += deposit
+        cr_payload = {"candidacy": True, "amount": round(deposit, 1),
+                      "phase": "refund", "balance": round(agent.money, 1)}
+        esc = sfc_mod.escrow_out(sim, deposit)         # IF-E2(既定 OFF=キーなし)
+        if esc is not None:
+            cr_payload["payer"] = esc
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
-                             kind="deposit", x=agent.x, y=agent.y,
-                             payload={"candidacy": True, "amount": round(deposit, 1),
-                                      "phase": "refund", "balance": round(agent.money, 1)}))
+                             kind="deposit", x=agent.x, y=agent.y, payload=cr_payload))
         return
     gov = getattr(sim, "government", None)
+    collected = False
     if gov is not None and getattr(gov, "enabled", True):
         try:
             gov.collect("ward", deposit)               # 没収=区の歳入(government ON 時)
+            collected = True
         except Exception:
             pass
+    cf_payload = {"candidacy": True, "amount": round(deposit, 1), "phase": "forfeit"}
+    if sfc_mod.enabled(sim):                           # IF-E2: 預り金 → 区の歳入(内部振替)
+        sfc_mod.escrow_out(sim, deposit, to_government=True)
+        cf_payload["payer"] = "escrow"
+        if not collected:
+            cf_payload["payee"] = sfc_mod.row_out(sim, "fine_no_authority", deposit)
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
-                         kind="deposit", x=agent.x, y=agent.y,
-                         payload={"candidacy": True, "amount": round(deposit, 1),
-                                  "phase": "forfeit"}))
+                         kind="deposit", x=agent.x, y=agent.y, payload=cf_payload))
 
 
 def _council_budget(sim, step, sim_min, asm, cur) -> None:
@@ -594,9 +604,11 @@ class Tools:
         rem = deposit - pay
         if rem > 0.0:
             agent.account = float(getattr(agent, "account", 0.0)) - rem
+        cand_esc = sfc_mod.escrow_in(sim, deposit)      # IF-E2: 行政の預り金(既定 OFF=None)
         camp["candidates"][agent.id] = deposit
         self._log(sim, step, sim_min, agent, "candidacy",
                   {"day": sim_min // 1440, "deposit": round(deposit, 1),
+                   **({"payee": cand_esc} if cand_esc is not None else {}),
                    "age": int(getattr(agent, "age", 0)),
                    "balance": round(agent.money, 1)})
         sim.net.post(agent.id, "区議会議員選挙に立候補します。", [], step)
@@ -775,11 +787,16 @@ class Tools:
                                "supporters": {agent.id}, "passed": False,
                                "rule": action.get("rule")}   # 制度DSL: 機械可読スロット
         if deposit > 0.0:                              # 供託金の拠出(受理料。開票/否決まで預かり)
+            before_money = agent.money
             agent.money = max(0.0, agent.money - deposit)
             self.proposals[pid]["deposit"] = deposit
-            self._log(sim, step, sim_min, agent, "deposit",
-                      {"proposal_id": pid, "amount": round(deposit, 1),
-                       "phase": "paid", "balance": round(agent.money, 1)})
+            dep_payload = {"proposal_id": pid, "amount": round(deposit, 1),
+                           "phase": "paid", "balance": round(agent.money, 1)}
+            # IF-E2(既定 OFF=キーなし): 供託金は**行政の預り金**(escrow)= balance とは別勘定。
+            esc = sfc_mod.escrow_in(sim, before_money - agent.money)
+            if esc is not None:
+                dep_payload["payee"] = esc
+            self._log(sim, step, sim_min, agent, "deposit", dep_payload)
         self._log(sim, step, sim_min, agent, "proposal",
                   {"proposal_id": pid, "text": text})
         rec = getattr(sim, "recursion", None)         # 再帰性: 客観カウント(OFF は no-op)
@@ -852,12 +869,18 @@ class Tools:
                           {"name": name, "outcome": "denied"})
                 agent.remember(f"「{name}」の出店許可が下りなかった")
                 return
+        before_total = agent.money + float(getattr(agent, "account", 0.0) or 0.0)
         if bank_funded:                                # money を先に使い、不足分を口座から充当(E-W1 融資)
             from_acc = max(0.0, cost - agent.money)
             agent.money = max(0.0, agent.money - cost)
             agent.account = max(0.0, agent.account - from_acc)
         else:
             agent.money = max(0.0, agent.money - cost)
+        open_payee = None
+        if sfc_mod.enabled(sim):                       # IF-E2: 開業費の受け手=域外の内装業者・仕入
+            paid = before_total - (agent.money + float(getattr(agent, "account", 0.0) or 0.0))
+            if paid > 0.0:
+                open_payee = sfc_mod.row_out(sim, "procurement", paid)
         venture = {"owner": agent.id, "node": agent.node, "name": name,
                    "offer": offer, "price": self.cfg["venture_price"],
                    "opened_step": step, "last_sale_step": step + permit_steps,
@@ -871,6 +894,8 @@ class Tools:
                         "cost": round(cost, 1), "balance": round(agent.money, 1)}
         if unpermitted:                                 # 既定(permitted)は payload 不変=バイト一致
             open_payload["permitted"] = False
+        if open_payee is not None:                      # IF-E2(既定 OFF=キーなし)
+            open_payload["payee"] = open_payee
         self._log(sim, step, sim_min, agent, "venture_open", open_payload)
         if permit_steps > 0:                           # 許可制: 開業待ちを記録(既定 0=出さない)
             self._log(sim, step, sim_min, agent, "venture_permit",
@@ -1361,22 +1386,31 @@ class Tools:
         ax, ay = (author.x, author.y) if author is not None else (0.0, 0.0)
         if refund and author is not None:
             author.money += dep
+            rf_payload = {"proposal_id": pr["id"], "amount": round(dep, 1),
+                          "phase": "refund", "balance": round(author.money, 1)}
+            esc = sfc_mod.escrow_out(sim, dep)         # IF-E2: 預り金から返す(既定 OFF=キーなし)
+            if esc is not None:
+                rf_payload["payer"] = esc
             sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=pr["author"],
-                                 kind="deposit", x=ax, y=ay,
-                                 payload={"proposal_id": pr["id"],
-                                          "amount": round(dep, 1), "phase": "refund",
-                                          "balance": round(author.money, 1)}))
+                                 kind="deposit", x=ax, y=ay, payload=rf_payload))
             return
         gov = getattr(sim, "government", None)
+        collected = False
         if gov is not None and getattr(gov, "enabled", True):
             try:
                 gov.collect("ward", dep)               # 没収=区の歳入(government ON 時)
+                collected = True
             except Exception:
                 pass
+        ff_payload = {"proposal_id": pr["id"], "amount": round(dep, 1),
+                      "phase": "forfeit"}
+        if sfc_mod.enabled(sim):                       # IF-E2: 預り金 → 区の歳入(内部振替)
+            sfc_mod.escrow_out(sim, dep, to_government=True)
+            ff_payload["payer"] = "escrow"
+            if not collected:                          # 行政が居ない世界では域外が受け取る
+                ff_payload["payee"] = sfc_mod.row_out(sim, "fine_no_authority", dep)
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=pr["author"],
-                             kind="deposit", x=ax, y=ay,
-                             payload={"proposal_id": pr["id"],
-                                      "amount": round(dep, 1), "phase": "forfeit"}))
+                             kind="deposit", x=ax, y=ay, payload=ff_payload))
 
     def _pass_proposal(self, sim, pr, step, sim_min) -> None:
         """提案の成立処理(署名モード・投票可決の共通経路)。既存の proposal_passed 系を一切変えない。"""

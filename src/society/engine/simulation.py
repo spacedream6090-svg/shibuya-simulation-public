@@ -703,6 +703,15 @@ class Simulation:
         if self.workcfg["enabled"] and self.workcfg["ledger"]["enabled"]:
             from ..observer.org_ledger import OrgLedger
             self.org_ledger_sc = OrgLedger(self.out_dir)
+        # ---- IF-E2 案B: 部門別残高の日次サイドカー finance.parquet(既定 OFF=生成しない)----
+        # 検査①(Caiani の貨幣ストック保存)を org / 銀行 / 行政 / RoW でも成立させるための唯一の
+        # 観測点。記録と動力学の分離は org_ledger と同じ(動力学は add_rows/flush/finalize だけ)。
+        from .. import economy_sfc as _sfc_mod
+        self.sfccfg = _sfc_mod.build_cfg(
+            (cfg.get("economy", None) or {}).get("org_accounting", None))
+        self.finance_sc = None
+        if self.sfccfg["enabled"] and self.sfccfg["sidecar"]:
+            self.finance_sc = _sfc_mod.FinanceLedger(self.out_dir)
         # ---- 観測チャンネル o_c(t)(第80バッチ。既定 OFF=サイドカー不在=完全 no-op)----
         # 驚き駆動発火の**入力側**の定義(cognition/channels.py)を step ごとに読み取り専用で
         # 計算し、channels.parquet へ書くだけ。ON でも L1/L2/L3・乱数・LLM 呼数は不変。
@@ -1646,6 +1655,8 @@ class Simulation:
                 self.indoor_tracks._resumed = True
             if self.org_ledger_sc is not None:    # B4: org_ledger サイドカーも分割実行の canonical を保つ
                 self.org_ledger_sc._resumed = True
+            if self.finance_sc is not None:       # IF-E2: finance サイドカーも同様
+                self.finance_sc._resumed = True
             if self.channels_sc is not None:      # 第80: 観測チャンネルも二重記録しない(canonical 先頭結合)
                 self.channels_sc._resumed = True
             if self.cognition_g_sc is not None:   # 第82: g/θ 軌跡サイドカーも同様
@@ -1670,6 +1681,8 @@ class Simulation:
                     self.indoor_tracks.flush_segment()
                 if self.org_ledger_sc is not None:  # B4: org_ledger サイドカーも対でセグメント化
                     self.org_ledger_sc.flush_segment()
+                if self.finance_sc is not None:     # IF-E2: 部門別残高サイドカーも対でセグメント化
+                    self.finance_sc.flush_segment()
                 if self.channels_sc is not None:    # 第80: 観測チャンネルも対でセグメント化
                     self.channels_sc.flush_segment()
                 if self.cognition_g_sc is not None:  # 第82: g/θ 軌跡も対でセグメント化
@@ -1684,6 +1697,8 @@ class Simulation:
                     self.indoor_tracks.flush_segment()
                 if self.org_ledger_sc is not None:
                     self.org_ledger_sc.flush_segment()
+                if self.finance_sc is not None:
+                    self.finance_sc.flush_segment()
                 if self.channels_sc is not None:
                     self.channels_sc.flush_segment()
                 if self.cognition_g_sc is not None:
@@ -1727,12 +1742,16 @@ class Simulation:
 
     def finalize(self) -> dict:
         scheduler.finalize_org_day(self)          # B4: 最終日の org_output(by_org)/ledger 行を締める
+        from .. import economy_sfc as _sfc_fin     # IF-E2: 最終日の域外収支を締める(既定 OFF=no-op)
+        _sfc_fin.finalize(self)
         self._journal_close()                     # 第71: LLM ジャーナルの残バッファを確定させる
         paths = self.logger.flush()               # ↑ logger.flush の前=最終日 org_output も L1 に載る
         if self.indoor_tracks is not None:        # B3: 屋内軌跡サイドカーを結合(part→canonical)
             self.indoor_tracks.finalize()
         if self.org_ledger_sc is not None:        # B4: 組織日次系列サイドカーを結合(part→canonical)
             self.org_ledger_sc.finalize()
+        if self.finance_sc is not None:           # IF-E2: 部門別残高サイドカーを結合
+            self.finance_sc.finalize()
         if self.channels_sc is not None:          # 第80: 観測チャンネルを結合(part→canonical)
             self.channels_sc.finalize()
         if self.cognition_g_sc is not None:       # 第82: g/θ 軌跡を結合(part→canonical)
@@ -1840,6 +1859,14 @@ class Simulation:
         _trprov = _traces_prov.provenance(self)
         if _trprov is not None:
             summary["traces"] = _trprov
+        # ---- org の会計主体化 + rest-of-world IF-E2 案B(economy.org_accounting=false = 既定はキーなし)----
+        # 案B 固有の新しい研究量 =「この街の経済が域外にどれだけ依存しているか」。RoW のチャネル別
+        # 累積・org 預金の分布・当座借越の件数・受け手解決の段別件数・**接続できていない金の経路**
+        # (ゼロと偽らない)を残す。閉じた不変量 Σ(全主体残高)+RoW 累積 の現在値も併記する。
+        from .. import economy_sfc as _sfc_prov
+        _sfprov = _sfc_prov.provenance(self)
+        if _sfprov is not None:
+            summary["org_accounting"] = _sfprov
         # ---- 心モデル固定+三層知能 第88バッチ(model.mind.enabled=false = 既定 OFF はキーなし)----
         # 原文書 §5「モデルと人格の交絡が生じるため必ずログに残す」の集計側。
         # モデル別の人数・呼数・キャッシュ命中に、第87 エピソード数と第86 修復率を統合する。

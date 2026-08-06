@@ -606,6 +606,23 @@ economy:
     eviction_grievance: 0.10      # 立退きの生活不安(factors 経由の不透明 magnitude)
     bankruptcy_grievance: 0.15    # 破産の生活不安(同上)
 
+  # ---- IF-E2 案B: org の会計主体化 + rest-of-world(渋谷域外)部門(既定 OFF)----
+  # 設計: docs/research/ifE2-org-accounting-research.md §4-3 / 実装: src/society/economy_sfc.py
+  # ON にすると org が**スカラー預金 1 本**を持ち、賃金をそこから払い・消費をそこへ入れる。
+  # 受け手が街に居ない金は RoW(域外)へ**チャネル別に**落ち、
+  # 「Σ(全主体残高)+RoW 累積=一定」という閉じた不変量が立つ(IF-E の漏れ 71.8〜96.0% を閉じる)。
+  # 残高はエージェントのプロンプトに一切出さない(観測層のみ)= k 完全不変・no-fingerprint。
+  # false(既定)= 残高も state も L1 も payload キーも 1 つも生えない(ゴールデン L1 バイト一致)。
+  org_accounting:
+    enabled: false
+    sigma: 1.0                    # 初期預金 = σ × 月次賃金支払(Caiani et al. 2016。σ=1)
+    month_days: 30                # 「月次賃金支払」= 配属者の日給合計 × この日数
+    min_initial: 0.0              # 初期残高の下限(配属0の org の保護。0=下限なし)
+    export_production: true       # office/education 系 org(全体の36.5%・従業者の51.5%)の
+                                  # 輸出代金を RoW から入金(既存 revenue_est の式・発火点は不変で
+                                  # 相手方を void → RoW に付け替えるだけ)。false=輸出なし=当座借越へ
+    sidecar: true                 # finance.parquet(部門別残高の日次1行)を書く
+
 # ---- 「世界を変える」ツール群(4軸を最小で覆う affordance。中立提示・自然使用の観察)----
 # モノ=open_venture / 制度=propose / 人=host_event(勉強会) / 虚構=host_event・flyer・group。
 # R1: 提示・可否は k と無関係(所持金など客観条件のみ)。R4: 効果は客観カウント(LLM審判なし)。

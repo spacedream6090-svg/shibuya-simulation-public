@@ -84,6 +84,12 @@ def save(sim, step: int, path: str | Path) -> Path:
             # emit 時に必ず sorted 反復=pickle の集合反復順非保存の影響を受けない(determinism 監査済み)。
             "org_day": getattr(sim, "_org_day", {}),
             "org_ledger_day": getattr(sim, "_org_ledger_day", -1),
+            # 第97バッチ IF-E2 の前提工事(**既存欠陥**): オフィス産出の日境界進行。
+            # 未保存だったため work.service ON かつ office.by_org OFF のランで
+            # mid-day resume が同じ日の org_output を**二重記録**していた
+            # (実測: 288step / 150step 分割で 33 → 44 件)。第80 W2(weather の二重記録)と
+            # まったく同じ型のギャップ。OFF ランでは -1=挙動不変(load は .get で旧 ckpt 互換)。
+            "work_day": getattr(sim, "_work_day", -1),
             # 内部可動性 第60バッチ b: 転居/同棲の日境界進行(mid-day checkpoint でも resume==straight
             # を保つ)。新規の per-agent 状態(通勤既知値/同棲経過日/同棲フラグ)は agents pickle に自然
             # 同梱=ここは日カウンタのみ中央管理する。OFF ランでは -1=挙動不変(load は .get で旧 ckpt 互換)。
@@ -271,6 +277,22 @@ def save(sim, step: int, path: str | Path) -> Path:
             # 保存しないと resume 直後に「初日扱い」へ戻って 1 日ぶんの恒常性が飛ぶ)。
             # g / ē / credit / 監視仕様(_fire_watch)は agents pickle に自然同梱される。
             "g_day": int(getattr(sim, "_g_day", -1)),
+            # 第97バッチ IF-E2 案B(org の会計主体化 + rest-of-world): org のスカラー預金・
+            # RoW のチャネル別累積・行政の預り金(escrow)・受け手解決の段別件数。
+            # ★状態の本体が sim 側にある(場所でも個体でもなく世界の会計)ので、保存しないと
+            #   resume 直後に全 org の預金が消え、期首配賦が二重に走り、不変量
+            #   「Σ(全主体残高)+RoW 累積=一定」が resume で必ず破れる(第96 traces と同じ型)。
+            # 既定 OFF では state 自体が生えない → None=挙動不変(load は .get で旧 ckpt 互換)。
+            "sfc_state": getattr(sim, "_sfc_state", None),
+            # ★同バッチで塞ぐ**既存欠陥**: 非エージェントの残高 3 つ(行政 / 銀行 / VC ファンド)は
+            #   どれも checkpoint に入っておらず、resume で初期値へ戻っていた(研究文書 §3-0 の
+            #   「重要な構造的事実」)。いずれも sim 参照を持たない plain データなので
+            #   そのまま同梱できる(government.py の docstring が「将来 checkpoint 同梱も可能」と
+            #   予告していた形)。org 預金だけ保存して行政が戻ると非対称なバグになるため、
+            #   IF-E2 の前提工事として同時に塞ぐ。未構築のランでは None=従来どおり。
+            "government": getattr(sim, "government", None),
+            "bank": getattr(sim, "bank", None),
+            "vc_fund": getattr(sim, "vc_fund", None),
             # 第71バッチ: LLM 入出力ジャーナルの確定点(ファイル名 → {records, bytes})。
             # mark() が flush してから採るので、この時点のファイル末尾は必ず gzip メンバ境界
             # = 安全な切り詰め点。resume(load)がここまで巻き戻すことで、「checkpoint 後に
@@ -332,6 +354,7 @@ def load(sim, path: str | Path) -> int:
     sim._acct_day = rt.get("acct_day", -1)      # 旧 checkpoint 互換(無ければ -1)
     sim._org_day = rt.get("org_day", {})        # B4: 会社観測 per-day アキュムレータ(旧 checkpoint 互換)
     sim._org_ledger_day = rt.get("org_ledger_day", -1)
+    sim._work_day = rt.get("work_day", -1)      # 第97: オフィス産出の日境界(旧 ckpt 互換)
     sim._housing_day = rt.get("housing_day", -1)  # 第60バッチ b: 転居/同棲の日境界進行(旧 checkpoint 互換)
     sim._career_day = rt.get("career_day", -1)    # 第60バッチ b: career 日境界進行(旧 checkpoint 互換)
     sim._rel_day = rt.get("rel_day", -1)          # 第61検収補修: 社会関係 日境界進行(旧 checkpoint 互換)
@@ -396,6 +419,15 @@ def load(sim, path: str | Path) -> int:
     trs = rt.get("trace_state")                 # 第96 IF-D(旧 ckpt 互換=無ければ素通り)
     if trs is not None:
         sim._trace_state = trs
+    sfc = rt.get("sfc_state")                   # 第97 IF-E2(旧 ckpt 互換=無ければ素通り)
+    if sfc is not None:
+        sim._sfc_state = sfc
+    # 非エージェント残高 3 つ(既存欠陥の修復)。旧 checkpoint / 未構築ランでは None=従来どおり
+    # 遅延構築に任せる(= resume で初期値に戻る旧挙動)。
+    for _attr in ("government", "bank", "vc_fund"):
+        _obj = rt.get(_attr)
+        if _obj is not None:
+            setattr(sim, _attr, _obj)
     # 第89 プラセボ L1: 輪を戻し、pickle 復元された個体を構築時の Placebo へ繋ぎ直す
     # (OFF は no-op。旧 ckpt 互換=無ければ輪は空のまま=OFF ランと同じ)。
     _ablate_ckpt.placebo_restore(sim, rt.get("placebo_state"))

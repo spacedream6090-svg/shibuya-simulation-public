@@ -18,6 +18,7 @@ from .. import conversation as conversation_mod
 from .. import disaster as disaster_mod
 from .. import diversity as diversity_mod
 from .. import dunbar as dunbar_mod
+from .. import economy_sfc as sfc_mod
 from .. import envfeedback as envfb_mod
 from .. import freedom_p2 as freedom_p2_mod
 from .. import gossip as gossip_mod
@@ -425,6 +426,26 @@ def _ensure_orgs(sim) -> None:
                          assignments_path=sim.orgscfg.get("assignments"))
 
 
+def _sfc_arm(sim, step: int, sim_min: int) -> None:
+    """IF-E2(既定 OFF=即 return): 非エージェント残高を**先に**実体化してから org 預金を配る。
+
+    ``Government`` / ``Bank`` / ``VCFund`` はどれも遅延構築(``_gov`` / ``_bank`` /
+    ``tools._vc_fund``)で、初回アクセスの瞬間に conf の初期資本(区/都/国の予算・銀行資本・
+    ファンド原資)を**世界へ突然出現させる**。案B の不変量「Σ(全主体残高)+RoW 累積=一定」は
+    その出現を階段状のジャンプとして拾ってしまうので、ON のランでは step 先頭で 3 つとも
+    実体化して**期首の基準に含める**。構築自体は乱数を引かず L1 も出さない(=挙動不変)。"""
+    if not sfc_mod.enabled(sim):
+        return
+    _gov(sim)
+    if _bank_on(sim):
+        _bank(sim)
+    tools = getattr(sim, "tools", None)
+    vccfg = (getattr(sim, "economy", {}) or {}).get("vc") or {}
+    if tools is not None and vccfg.get("enabled"):
+        tools._vc_fund(sim, vccfg)
+    sfc_mod.arm(sim, step, sim_min)
+
+
 def _log_org_output(sim, agent, step: int, sim_min: int) -> None:
     """勤務完遂→産出(production)/ 登校完遂→学習(study)を1行記録(非LLM・乱数なし)。
 
@@ -447,19 +468,26 @@ def _log_org_output(sim, agent, step: int, sim_min: int) -> None:
     if out is None:
         return
     output, kind = out
-    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
-                         kind="production", x=agent.x, y=agent.y,
-                         payload={"org": str(org["id"]), "output": output,
-                                  "kind": kind}))
-    led = sim.org_ledger.setdefault(str(org["id"]), {"production_count": 0,
-                                                     "revenue_est": 0.0,
-                                                     "wage_paid": 0.0})
-    led["production_count"] += 1
+    # ★式(日給×revenue_margin)も発火条件も従来と 1 バイトも変えない。IF-E2 のために
+    #   計算を log の**前**へ移しただけで、OFF では payload も led も従来と完全同一。
     d_rev = d_wage = 0.0
     if _economy_on(sim):
         wage = float(sim.economy["wages"].get(str(org.get("wage_tier", "")), 0.0))
         d_rev = wage * float(sim.orgscfg["revenue_margin"])
         d_wage = wage
+    # IF-E2 案B(既定 OFF=0.0=payload 不変): 域内に客が居ない org(office/education)の輸出代金。
+    exported = sfc_mod.on_production(sim, org, d_rev)
+    prod_payload = {"org": str(org["id"]), "output": output, "kind": kind}
+    if exported:                       # RoW → org の実入金(行列に載る唯一の観測点)
+        prod_payload["revenue"] = round(float(exported), 1)
+    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                         kind="production", x=agent.x, y=agent.y,
+                         payload=prod_payload))
+    led = sim.org_ledger.setdefault(str(org["id"]), {"production_count": 0,
+                                                     "revenue_est": 0.0,
+                                                     "wage_paid": 0.0})
+    led["production_count"] += 1
+    if _economy_on(sim):
         led["revenue_est"] += d_rev
         led["wage_paid"] += d_wage
     if _org_ledger_on(sim):    # 会社観測データ層 B4: 日次アキュムレータへ同じ会計を積む(サイドカー用)
@@ -514,7 +542,8 @@ def _record_consumption_tax(sim, agent, price: float, cat: str,
 
 
 def _pay_wage(sim, agent, amount: float, step: int, sim_min: int,
-              source: str | None = None, fund_level: str | None = None) -> None:
+              source: str | None = None, fund_level: str | None = None,
+              payer_org: str | None = None) -> None:
     """賃金の支給(本業の勤務完遂・バイトのシフト完遂・自営の日銭・月給まとめ・公務員給与)。
 
     source を渡すと payload に載せる(自営の日銭は "gig"、月給は "salary"、公務員は "civil")。
@@ -523,7 +552,11 @@ def _pay_wage(sim, agent, amount: float, step: int, sim_min: int,
     行政 ON: 名目 gross から所得税+住民税を源泉徴収し**手取り(net)を入金**(payload.amount=手取り、
       追加キー gross/tax を載せる=手取り+税=名目)。fund_level 指定(公務員給与)なら gross を該当
       予算から歳出(expense)計上する(区職員=ward / 警察官・消防士=metro)。行政 OFF 時は
-      gross=net で追加キーも出さない=既存 wage payload とバイト一致。"""
+      gross=net で追加キーも出さない=既存 wage payload とバイト一致。
+    IF-E2 案B(economy.org_accounting。既定 OFF=完全 no-op=payload バイト一致): payer_org を
+      渡すと**その org の預金 gross を引き落とす**(不足は自動当座借越)。渡されない/台帳に無い
+      ときは rest-of-world(域外の雇用主・域外クライアント)が払う。どちらの場合も payload に
+      支払側を示す payer キーが 1 つ増える(= 個人→会社→個人 の追跡が org_id で繋がる)。"""
     if amount <= 0:
         return
     # T4 自助努力(第52バッチ): 自力累積(skill)の賃金乗数を1箇所だけ適用。全 wage 源(本業/バイト/
@@ -534,10 +567,15 @@ def _pay_wage(sim, agent, amount: float, step: int, sim_min: int,
         amount = float(amount) * mult
     gross = float(amount)
     tax_total = 0.0
+    payer = None
     if _government_on(sim):
         if fund_level is not None:                     # 公務員給与は予算が出所(歳出)
             sim.government.expense(fund_level, gross)
         amount, tax_total = _withhold_wage(sim, agent, gross, step, sim_min)  # 手取り
+    if fund_level is not None:                         # 公務員給与=行政が払う(既に歳出計上済み)
+        payer = "government" if sfc_mod.enabled(sim) else None
+    else:                                              # IF-E2: org / RoW が払う(既定 OFF=None)
+        payer = sfc_mod.on_wage(sim, agent, gross, source, payer_org, step, sim_min)
     if _accounts_on(sim):
         agent.account += amount
         agent.period_income += amount          # 月収相当(家賃=share×これ)
@@ -553,6 +591,8 @@ def _pay_wage(sim, agent, amount: float, step: int, sim_min: int,
     if tax_total > 0:                          # 行政 ON のみ: 名目と税を併記(会計の検証点)
         payload["gross"] = round(gross, 1)
         payload["tax"] = round(tax_total, 1)
+    if payer is not None:                      # IF-E2(既定 OFF=キーなし): 支払側 org / RoW チャネル
+        payload["payer"] = payer
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                          kind="wage", x=agent.x, y=agent.y, payload=payload))
 
@@ -583,9 +623,15 @@ def _spend(sim, agent, amount: float, cat: str, step: int, sim_min: int,
     chosen(P2 #7 buy・既定 False=既存呼び出しは payload 不変=バイト一致): LLM が発火時に
     能動選択した消費に payload へ chosen:true を添える(非発火の抽選消費と区別する観測用)。
     item(物流②・既定 None=既存呼び出しは payload 不変=バイト一致): 買った物(商品実体)を
-    payload へ添える(会計不変=金額は変えない)。"""
+    payload へ添える(会計不変=金額は変えない)。
+    IF-E2 案B(economy.org_accounting。既定 OFF=完全 no-op=payload バイト一致): 支払の**その場で**
+    受け手(org / venture / RoW)を台帳の静的索引で解決し、**実支払−消費税**を入金する
+    (venture 既存経路と同じ流儀=支払者を減らし受取者を増やすのが同一操作。Caiani の deposit
+    transfer)。payload に受け手を示す payee キーが 1 つ増える。"""
     if amount <= 0:
         return
+    sfc_on = sfc_mod.enabled(sim)
+    before = (agent.money + float(getattr(agent, "account", 0.0) or 0.0)) if sfc_on else 0.0
     if not _accounts_on(sim):
         agent.money = max(0.0, agent.money - amount)
         payload = {"amount": round(float(amount), 1),
@@ -594,6 +640,13 @@ def _spend(sim, agent, amount: float, cat: str, step: int, sim_min: int,
             payload["chosen"] = True
         if item is not None:
             payload["item"] = item
+        if sfc_on:                              # 受け手へ入金(実支払=床クリップ後の実際の減少額)
+            actual = before - (agent.money + float(getattr(agent, "account", 0.0) or 0.0))
+            payee = sfc_mod.on_spend(sim, agent, amount, actual, cat, step, sim_min)
+            if payee is not None:
+                payload["payee"] = payee
+            if abs(actual - float(amount)) > 1e-9:   # 床クリップで名目より少なく払った(正直開示)
+                payload["paid"] = round(actual, 1)
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                              kind="spend", x=agent.x, y=agent.y, payload=payload))
         if _government_on(sim):                 # 消費税を内訳計上(価格は名目不変)
@@ -624,6 +677,13 @@ def _spend(sim, agent, amount: float, cat: str, step: int, sim_min: int,
         payload["chosen"] = True
     if item is not None:                        # 物流②: 買った物(会計不変=金額は変えない)
         payload["item"] = item
+    if sfc_on:                                  # IF-E2: 受け手へ入金(現金+口座の実減少額が実支払)
+        actual = before - (agent.money + float(getattr(agent, "account", 0.0) or 0.0))
+        payee = sfc_mod.on_spend(sim, agent, amount, actual, cat, step, sim_min)
+        if payee is not None:
+            payload["payee"] = payee
+        if abs(actual - float(amount)) > 1e-9:  # 床クリップで名目より少なく払った(正直開示)
+            payload["paid"] = round(actual, 1)
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                          kind="spend", x=agent.x, y=agent.y, payload=payload))
     if _government_on(sim):                     # 消費税を内訳計上(価格は名目不変)
@@ -650,8 +710,11 @@ def _settle_work(sim, agent, step: int, sim_min: int) -> None:
         if main_done and _accounts_on(sim) and agent.wage > 0:
             agent.work_days += 1
         else:
+            # IF-E2(既定 OFF=引数は無視される): 本業の賃金は配属 org の預金から出る。
+            # バイト(part_time)は org でない職場なので払い手は RoW(域外/未帰属の雇用主)。
             _pay_wage(sim, agent, agent.wage if main_done else float(pt["pay"]),
-                      step, sim_min)
+                      step, sim_min,
+                      payer_org=(getattr(agent, "org_id", None) if main_done else None))
     if main_done and _orgs_on(sim):     # 組織: 勤務完遂→産出 / 登校完遂→学習(既定 OFF)
         _log_org_output(sim, agent, step, sim_min)
 
@@ -976,13 +1039,18 @@ def _phase_wake_and_returns(sim, step: int, sim_min: int) -> None:
                     if agent.money < base:
                         delta = base - agent.money
                         agent.money = base
+                        payload = {"amount": round(delta, 1),
+                                   "balance": round(agent.money, 1),
+                                   "to": "cash", "source": "home_refill"}
+                        # IF-E2(既定 OFF=キーなし): 来街者の域内消費は地域会計では
+                        # **サービスの輸出**(IRTS 2008 §4.21 / SNA §9.80)= RoW → 家計。
+                        payer = sfc_mod.on_wage(sim, agent, delta, "home_refill",
+                                                None, step, sim_min)
+                        if payer is not None:
+                            payload["payer"] = payer
                         sim.logger.log(Event(step=step, sim_min=sim_min,
                                              agent_id=agent.id, kind="wage",
-                                             x=agent.x, y=agent.y,
-                                             payload={"amount": round(delta, 1),
-                                                      "balance": round(agent.money, 1),
-                                                      "to": "cash",
-                                                      "source": "home_refill"}))
+                                             x=agent.x, y=agent.y, payload=payload))
 
 
 # ---------------------------------------------------------------- 移動
@@ -1246,11 +1314,15 @@ def _hear_words(sim, listener, words: list[str], from_id: int, channel: str,
                 # D9 過正当化 ablation: 採用に外的報酬を付与(既定off=完全に現状維持)
                 if getattr(sim, "rewards_on", False):
                     creator.money += sim.reward_amount
+                    rw_payload = {"amount": round(float(sim.reward_amount), 1),
+                                  "balance": round(creator.money, 1)}
+                    # IF-E2(既定 OFF=キーなし): ablation の外生報酬は域外(実験装置)から来る。
+                    if sfc_mod.enabled(sim):
+                        rw_payload["payer"] = sfc_mod.row_in(
+                            sim, "shock", float(sim.reward_amount))
                     sim.logger.log(Event(
                         step=step, sim_min=sim_min, agent_id=creator.id,
-                        kind="reward", x=creator.x, y=creator.y,
-                        payload={"amount": round(float(sim.reward_amount), 1),
-                                 "balance": round(creator.money, 1)}))
+                        kind="reward", x=creator.x, y=creator.y, payload=rw_payload))
 
 
 # ---------------------------------------------------------------- 意見更新(FJ)
@@ -3148,13 +3220,16 @@ def _phase_world_events(sim, step: int, sim_min: int) -> None:
 # ---------------------------------------------------------------- 口座 E5(月次境界)
 def _log_rent(sim, agent, amount: float, paid: float, step: int, sim_min: int,
               phase: str) -> None:
+    payload = {"amount": round(float(amount), 1),
+               "paid": round(float(paid), 1),
+               "carry": round(agent.rent_due, 1),
+               "account": round(agent.account, 1),
+               "phase": phase}
+    # IF-E2(既定 OFF=キーなし): 家主が街に居ない → 域外の不動産所有者(RoW)が受け取る。
+    if sfc_mod.enabled(sim) and float(paid) > 0.0:
+        payload["payee"] = sfc_mod.row_out(sim, "rent_landlord", float(paid))
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
-                         kind="rent", x=agent.x, y=agent.y,
-                         payload={"amount": round(float(amount), 1),
-                                  "paid": round(float(paid), 1),
-                                  "carry": round(agent.rent_due, 1),
-                                  "account": round(agent.account, 1),
-                                  "phase": phase}))
+                         kind="rent", x=agent.x, y=agent.y, payload=payload))
 
 
 def _phase_accounts_day(sim, step: int, sim_min: int) -> None:
@@ -3190,7 +3265,9 @@ def _phase_accounts_day(sim, step: int, sim_min: int) -> None:
             salary = agent.wage * agent.work_days      # 月給まとめ = 日給 × 勤務日数
             agent.last_salary = salary
             agent.work_days = 0
-            _pay_wage(sim, agent, salary, step, sim_min, source="salary")
+            # IF-E2(既定 OFF=無視): 月給まとめの流出も配属 org の預金から(§3-a の初期残高が効く点)
+            _pay_wage(sim, agent, salary, step, sim_min, source="salary",
+                      payer_org=getattr(agent, "org_id", None))
         if dom == rent_dom and not agent.evicted:      # 立退き中=住居なし→家賃は発生しない
             rent = agent.period_income * share         # 月収相当 × rent_share
             inc0 = agent.period_income                 # 控除前の月収(与信の income に使う)
@@ -3246,13 +3323,15 @@ def _eviction_bankruptcy_day(sim, agent, acc: dict, step: int, sim_min: int) -> 
         had_venture = bool(tools is not None
                            and tools.force_close_venture(sim, agent, step, sim_min,
                                                          reason="bankruptcy"))
+        bk_payload = {"debt": round(debt, 1), "seized": round(seized, 1),
+                      "keep": round(keep, 1), "until_step": agent.bankrupt_until,
+                      "venture_closed": had_venture}
+        # IF-E2(既定 OFF=キーなし): 圧縮された資産の債権者が街に居ない → RoW が受け取る。
+        if sfc_mod.enabled(sim) and seized > 0.0:
+            bk_payload["payee"] = sfc_mod.row_out(sim, "seizure", seized)
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                              kind="bankruptcy", x=agent.x, y=agent.y,
-                             payload={"debt": round(debt, 1),
-                                      "seized": round(seized, 1),
-                                      "keep": round(keep, 1),
-                                      "until_step": agent.bankrupt_until,
-                                      "venture_closed": had_venture}))
+                             payload=bk_payload))
         if had_venture:                                # 店の倒産は社会に見える(報道)
             sim.net.publish_news("店じまい", "経営難で店を畳んだ人がいる", [], step)
         factor_update.on_bankrupt(agent, float(acc["bankruptcy_grievance"]),
@@ -3327,6 +3406,11 @@ def _phase_daily(sim, step: int, sim_min: int) -> None:
             itr = economy_mod.daily_interest(agent.account, bcfg)
             if itr > 0.0:
                 agent.account += itr
+                # IF-E2(既定 OFF=従来どおり Bank.capital を減らさない=貨幣創出のまま):
+                # 利息の支払側を対称化する(§3-e の 1 行)。Bank は「最後の貸手=capital が
+                # 負でも貸せる」と既に宣言しているので理論的に整合する。
+                if sfc_mod.enabled(sim):
+                    _bank(sim).capital -= itr
                 sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                                      kind="interest_paid", x=agent.x, y=agent.y,
                                      payload={"amount": round(itr, 2),
@@ -3611,21 +3695,29 @@ def _apply_move_home(sim, agent, action, step, sim_min, p2) -> None:
         return
     old = agent.home_building
     dep = deposit                                      # 敷金の控除(口座→現金の順)
+    before_total = agent.money + float(getattr(agent, "account", 0.0) or 0.0)
     if accounts_on:
         take = min(agent.account, dep)
         agent.account -= take
         dep -= take
     agent.money = max(0.0, agent.money - dep)
+    mh_payee = None
+    if sfc_mod.enabled(sim):                           # IF-E2: 敷金の受け手=不在家主(RoW)
+        paid = before_total - (agent.money + float(getattr(agent, "account", 0.0) or 0.0))
+        if paid > 0.0:
+            mh_payee = sfc_mod.row_out(sim, "deposit_landlord", paid)
     levels = int(bld.get("levels", 1) or 1)
     agent.home_building = bld["id"]
     agent.home_node = bld["entrance"]
     agent.home_floor = 1 + int(rng.integers(max(1, levels)))
     if agent.home_floor > levels:
         agent.home_floor = max(1, levels)
+    mh_payload = {"from": old, "to": bld["id"], "deposit": round(deposit, 1)}
+    if mh_payee is not None:                           # IF-E2(既定 OFF=キーなし)
+        mh_payload["payee"] = mh_payee
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                          kind="move_home", x=agent.x, y=agent.y,
-                         payload={"from": old, "to": bld["id"],
-                                  "deposit": round(deposit, 1)}))
+                         payload=mh_payload))
     agent.remember("新しい住まいに引っ越した")
     _freedom_tally(sim, "exercised")
 
@@ -3812,12 +3904,16 @@ def _enforce_ventures(sim, officer_at, step: int, sim_min: int) -> None:
             factor_update.on_enforcement(owner, griev, step=step, sim_min=sim_min,
                                          logger=sim.logger)
             x, y = sim.city.node_xy(node)
+            ef_payload = {"rule_id": None, "officer": officer.id,
+                          "target": owner.id, "penalty": round(penalty, 1),
+                          "venture": v["name"]}
+            # IF-E2(既定 OFF=キーなし): 行政 OFF の世界では徴収主体が街に居ない → RoW。
+            if sfc_mod.enabled(sim) and penalty > 0:
+                ef_payload["payee"] = ("government" if gov_on else
+                                       sfc_mod.row_out(sim, "fine_no_authority", penalty))
             sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=officer.id,
                                  kind="enforcement", x=float(x), y=float(y),
-                                 payload={"rule_id": None, "officer": officer.id,
-                                          "target": owner.id,
-                                          "penalty": round(penalty, 1),
-                                          "venture": v["name"]}))
+                                 payload=ef_payload))
             tools.force_close_venture(sim, owner, step, sim_min, reason="unpermitted")
             owner.remember(f"無許可の出店を摘発され、店を畳んだ(罰金{round(penalty, 1)}円)")
 
@@ -3871,10 +3967,13 @@ def _phase_enforcement(sim, step: int, sim_min: int) -> None:
             sim.government.collect("ward", penalty)
         factor_update.on_enforcement(a, griev, step=step, sim_min=sim_min,
                                      logger=sim.logger)   # 執行を受けた不満(factors 経由)
+        ef2_payload = {"rule_id": rule_id, "officer": officer.id,
+                       "target": a.id, "penalty": round(penalty, 1)}
+        if sfc_mod.enabled(sim) and penalty > 0:           # IF-E2(既定 OFF=キーなし)
+            ef2_payload["payee"] = ("government" if gov_on else
+                                    sfc_mod.row_out(sim, "fine_no_authority", penalty))
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=officer.id,
-                             kind="enforcement", x=a.x, y=a.y,
-                             payload={"rule_id": rule_id, "officer": officer.id,
-                                      "target": a.id, "penalty": round(penalty, 1)}))
+                             kind="enforcement", x=a.x, y=a.y, payload=ef2_payload))
         # 再帰性(第9バッチ・既定 OFF): どのルールで執行されたかを計数し、被執行者の記憶にも
         # ルール名を残す(=知覚→不服→repeal 提案の材料)。OFF は従来の記憶文と完全同一。
         recur = getattr(sim, "recursion", None)
@@ -4163,13 +4262,17 @@ def _phase_career(sim, step: int, sim_min: int) -> None:
                 sev = wage_daily * float(cfg["severance_days"])
                 if sev > 0.0:
                     agent.money += sev
+                    sv_payload = {"amount": round(sev, 1),
+                                  "balance": round(agent.money, 1),
+                                  "to": "cash", "source": "severance"}
+                    # IF-E2(既定 OFF=キーなし): 退職金の出所は**解雇した元 org** の預金。
+                    sv_payer = sfc_mod.on_wage(sim, agent, sev, "severance",
+                                               from_org, step, sim_min)
+                    if sv_payer is not None:
+                        sv_payload["payer"] = sv_payer
                     sim.logger.log(Event(step=step, sim_min=sim_min,
                                          agent_id=agent.id, kind="wage",
-                                         x=agent.x, y=agent.y,
-                                         payload={"amount": round(sev, 1),
-                                                  "balance": round(agent.money, 1),
-                                                  "to": "cash",
-                                                  "source": "severance"}))
+                                         x=agent.x, y=agent.y, payload=sv_payload))
                 unfair = bool(float(cfg["unfair_ratio"]) > 0.0
                               and rng.random() < float(cfg["unfair_ratio"]))
                 g = griev * (float(cfg["unfair_grievance_mult"]) if unfair else 1.0)
@@ -4985,6 +5088,8 @@ def run_step(sim, step: int) -> None:
     # L2 業務の実体(work.service。既定OFF=-1でこの step の接客帰属を完全スキップ=バイト一致)。
     _work_idx = len(sim.logger.events) if _work_service_on(sim) else -1
     _ensure_orgs(sim)                              # 組織台帳の遅延初期化(既定OFF=no-op)
+    _sfc_arm(sim, step, sim_min)                   # IF-E2: org 預金の期首配賦(既定OFF=no-op・乱数ゼロ)
+    sfc_mod.day_roll(sim, step, sim_min)           # IF-E2: 日次境界に前日の域外収支を締める(既定OFF=no-op)
     _phase_org_ledger_roll(sim, step, sim_min)     # 会社観測データ層 B4: 日次境界に前日の org_output/ledger を締める(既定OFF=no-op)。
                                                    # 当日の産出/接客/在席より前に置く=当日分は新しい日へ積む(オフバイワン回避)
     for agent in sim.agents:

@@ -216,6 +216,35 @@ FEATURES: tuple[Feature, ...] = (
        "来街者が帰宅から戻るたび手持ちを補充(長期ランの恒久破綻対策)"),
     _f("economy.accounts.enabled", "strict", False, "none",
        "口座(銀行)概念。月給・家賃引落・カード/現金・ATM・立退き/破産サイクル"),
+    # ---- IF-E2 案B: org の会計主体化 + rest-of-world(設計 src/society/economy_sfc.py /
+    # docs/research/ifE2-org-accounting-research.md §4-3)----
+    # strict の根拠: 初期残高(配属者の日給合計 × month_days × σ)も受け手解決(台帳の静的索引)も
+    #   **完全決定論**で、乱数 stream を 1 本も引かない。LLM の自由文は 1 バイトも読まない。
+    # affects_k=False: generate() の呼び出しサイトを 1 つも足さず・減らさず、プロンプトの節も
+    #   1 つも増やさない(残高は観測層だけの概念)。
+    # fingerprint_risk=none: **プロンプトを 1 バイトも変えない**。org の残高・当座借越・域外依存度が
+    #   エージェントから観測できる経路は存在しない(記憶にも 1 行も入らない)。
+    #   ★「自社の資金繰りを経営者エージェントの判断に効かせる」のは将来の拡張であり、
+    #     やるときは affects_k / fingerprint_risk の再評価が要る。
+    _f("economy.org_accounting.enabled", "strict", False, "none",
+       "IF-E の実測(漏れ 71.8〜96.0% = 財布から出た金の受け取り手が世界に居ない)を閉じる。"
+       "org へ**スカラー預金 1 本**を新設し(Lengnick 2013 の M=wN・Caiani et al. 2016 の "
+       "σ×予想賃金支払で初期化)、賃金をそこから支払い(不足時は**自動当座借越**=負残高許容+"
+       "L1 org_overdraft。破綻処理は入れない)、消費を台帳の静的索引で解決した受け手 org へ"
+       "**実支払−消費税**として入金する。受け手が街に居ない金は rest-of-world(渋谷域外)へ"
+       "**チャネル別に**落とす(SNA 2008 §26.2/26.5/26.6 = 行動方程式なし・残高制約なしの明示部門)。"
+       "これで **Σ(全主体残高)+RoW 累積 = 一定**という閉じた不変量が立つ(ABCredit.jl 流の"
+       "スカラー総マネー保存を tests で常設)。既定 OFF は残高・state・L1・payload キーの"
+       "いずれも生えない(ゴールデン L1 バイト一致)"),
+    _f("economy.org_accounting.export_production", "strict", False, "none",
+       "域内のどの消費カテゴリからも 1 円も受け取れない org(台帳の POI 種別 office/education = "
+       "全 org の 36.5%・従業者の 51.5%)へ、既存 revenue_est(日給×revenue_margin)を"
+       "**RoW からの輸出代金**として入金する(式も発火点も 1 つも変えず相手方だけ void→RoW へ)。"
+       "地域会計で標準の扱い(観光サテライト勘定の逆向き)。false=輸出なし=当座借越へ沈む"),
+    _f("economy.org_accounting.sidecar", "strict", False, "none",
+       "部門別残高の日次サイドカー finance.parquet(org/bank/VC/行政/供託/家計/RoW)を書く。"
+       "analyze_accounting.py の検査①が org・銀行・行政・RoW でも成立するための観測点。"
+       "記録と動力学の分離(動力学は add_rows/flush/finalize しか呼ばない)"),
 
     # ---- tools / rules / recursion(LLM が文字列と rule JSON を書き込む層)----
     _f("tools.enabled", "journal", False, "possible",

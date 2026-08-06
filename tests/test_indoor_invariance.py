@@ -128,7 +128,8 @@ def test_postprocessing_does_not_change_run_output(tmp_path):
 # スコープ注記: 本検査は B3/B4 で新設した**私有バッファを持つ観測サイドカー**(indoor_tracks/org_ledger_sc)
 # に限定する。logger は共有 L1 ログであり、動力学が interstitial(S2)/work.service 用に len(logger.events)・
 # events[idx:] を読むのは意図的な既存設計(私有観測バッファの逆流ではない)ため対象外=正しく除外している。
-_SIDECARS = ("indoor_tracks", "org_ledger_sc")
+# IF-E2(第97バッチ)で finance_sc(部門別残高の日次サイドカー)を同じ規律の下に置く。
+_SIDECARS = ("indoor_tracks", "org_ledger_sc", "finance_sc")
 # 動力学が観測サイドカーへ許される操作(=書き込み配線の allowlist)。
 _ALLOWED_ATTRS = frozenset({"add_samples", "add_contacts", "add_rows",
                             "flush_segment", "finalize", "_resumed"})
