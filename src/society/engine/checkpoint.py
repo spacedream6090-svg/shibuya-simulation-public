@@ -28,6 +28,7 @@ import pickle
 from pathlib import Path
 
 from .. import ablate as _ablate_ckpt
+from .. import worldview as _wv_ckpt
 
 FORMAT = 1
 
@@ -329,9 +330,7 @@ def save(sim, step: int, path: str | Path) -> Path:
             # 日カウンタが無いと resume 直後の日境界が **first 扱い**になり、その日の worldview
             # スナップショット(世界1件 + 全員1件)がまるごと落ちる。窓は日を跨ぐ状態なので運ぶ。
             # 走査位置(_wv_pos)は**プロセス内 logger カウンタ由来**なので保存しない(load で 0
-            # = assets/gossip と同流儀)。★ただし worldview の走査は**日境界にしか走らない**ため、
-            # 直前の日境界〜checkpoint の区間の C2 応答は resume で失われる(毎 step 走査の
-            # gossip とは違う既知の残課題。ここでは埋められない=イベント本体の保存が要る)。
+            # = assets/gossip と同流儀)。
             "wv_day": getattr(sim, "_wv_day", -1),
             "wv_pioneer": list(getattr(sim, "_wv_pioneer", None) or ()),
             # 都市・環境ショック(H4): 日カウンタ + **継続中の災害/インフラ障害そのもの**
@@ -377,6 +376,43 @@ def save(sim, step: int, path: str | Path) -> Path:
             # resume 直後に precompute が再走し、全員ぶんの long_goal を二重記録する
             # (目標/趣味の値は決定論なので同じ。記録だけが二重になる)。
             "inner_life_init": bool(getattr(sim, "_inner_life_init", False)),
+            # ------------------------------------------------------------------
+            # 第98バッチ W4-A(resume 整合の完遂): 観測レンズの**暦日タリー**4 本。
+            # どれも echo(第70)/ norm(第74)/ regression(第91)とまったく同じ型 ——
+            # 「logger を増分走査して当日ぶんを積む」観測で、state を運ばないと mid-day
+            # resume の当該 L2 列が straight と食い違う(当日タリーが途中から数え直しに
+            # なる。silence.py の docstring が「resume の限界(正直註記)」として明記して
+            # いたもの)。watermark(_lens_processed / _silence_processed / _struct_processed
+            # / _dev_processed)は**プロセス内 logger カウンタ由来**なので保存しない
+            # (load で 0 に戻す = assets / gossip / echo と同流儀)。
+            # ★凍結 SPEC_FILES(lens/silence/structure/deviation)は 1 バイトも触らない —
+            #   状態は全て sim 側属性なので、保存も復元も本 module だけで完結する。
+            # 決定論: _silence_state["speakers"] は集合だが membership と len でしか使われず
+            # (silence.py 明記)、他は dict/int のみ = pickle の集合反復順非保存の影響なし。
+            # 既定 OFF では state 自体が生えない → None=挙動不変(load は .get で旧 ckpt 互換)。
+            "lens_state": getattr(sim, "_lens_state", None),       # 価値4軸 / 3M欲望の当日構成
+            "silence_state": getattr(sim, "_silence_state", None),  # 当日の発話者集合・熟慮/沈黙件数
+            "struct_state": getattr(sim, "_struct_state", None),   # 当日の edge 形成/断絶/風化 + 母数
+            "dev_state": getattr(sim, "_dev_state", None),         # 当日の住民別逸脱 + 職業 map
+            # ★正直な限界(保存では**解決しない**もの): silence の `undefined_action_total` /
+            #   `undefined_action_rate` は sim ではなく **logger のプロセス内カウンタ**
+            #   (logger.n_undefined_action_events ÷ LLM 総呼数)を読む設計で、llm_health 3 列
+            #   (llm_fallback_rate 等)と同じ「プロセス開始からの累積」族。族ごと watermark を
+            #   再設計しない限り一貫させられないため**あえて保存しない** → freedom.
+            #   undefined_register=true のランでは resume 後のこの 2 列は straight と食い違う
+            #   (0 から数え直す)。ON にするなら日境界での checkpoint を推奨。
+            # 世界観 C2/C6 の「直前の日境界 〜 checkpoint」区間(worldview の走査は日境界に
+            # しか走らないので、日カウンタ wv_day を戻すだけでは**この区間が丸ごと落ちる**)。
+            # 保存するのはイベント本体ではなく**有界な射影**(応答 3 つ組列 + 開拓行動数)。
+            # 生成は純粋な読み取り = straight ラン(分割 straight を含む)は完全に不変。
+            # 既定 OFF では None=挙動不変(load は .get で旧 checkpoint 互換)。
+            "wv_carry": _wv_ckpt.checkpoint_state(sim),
+            # 火種介入 spark の t=0 名簿イベントを**もう記録したか**(第88 mind_logged /
+            # scheduler の _workbind_reported と同型の「起動時 1 回」フラグ)。spark.apply は
+            # Simulation.__init__ から呼ばれるので resume した 2 つ目のプロセスでも走り、
+            # 同じ spark_roster を二重に記録していた(load 側でこのフラグを見て抑止する)。
+            # spark OFF では False=挙動不変(load は .get で旧 checkpoint 互換)。
+            "spark_reported": bool(getattr(sim, "_spark_reported", False)),
             # 第71バッチ: LLM 入出力ジャーナルの確定点(ファイル名 → {records, bytes})。
             # mark() が flush してから採るので、この時点のファイル末尾は必ず gzip メンバ境界
             # = 安全な切り詰め点。resume(load)がここまで巻き戻すことで、「checkpoint 後に
@@ -623,6 +659,41 @@ def load(sim, path: str | Path) -> int:
         sim._ads_campaigns = rt.get("ads_campaigns") or {}
     if rt.get("inner_life_init"):               # H6 起動後 1 回(long_goal の二重記録を防ぐ)
         sim._inner_life_init = True
+    # ---- 第98バッチ W4-A: 観測レンズの暦日タリー(旧 ckpt 互換=無ければ素通り=OFF は無風)----
+    # watermark は 4 本とも 0 に戻す(fresh logger=total 0 から再走査。echo/gossip と同流儀)。
+    lns = rt.get("lens_state")                  # 価値4軸 / 3M欲望の当日構成
+    if lns is not None:
+        sim._lens_state = lns
+    sim._lens_processed = 0
+    sls = rt.get("silence_state")               # 当日の発話者集合・熟慮/沈黙件数
+    if sls is not None:
+        sim._silence_state = sls
+    sim._silence_processed = 0
+    sts = rt.get("struct_state")                # 当日の edge 形成/断絶/風化 + 母数
+    if sts is not None:
+        sim._struct_state = sts
+    sim._struct_processed = 0
+    dvs = rt.get("dev_state")                   # 当日の住民別逸脱 + 職業 map
+    if dvs is not None:
+        sim._dev_state = dvs
+    sim._dev_processed = 0
+    # 世界観 C2/C6 の未走査区間(有界射影)。OFF / 旧 ckpt では no-op=従来挙動。
+    _wv_ckpt.restore_checkpoint(sim, rt.get("wv_carry"))
+    # ---- 第98バッチ W4-A: 火種介入 spark_roster の resume 二重記録を塞ぐ --------------
+    # spark.apply は **Simulation.__init__ から**呼ばれ、t=0 の名簿イベント spark_roster を
+    # 1 件記録する。resume した 2 つ目のプロセスでも __init__ は丸ごと走るので、同じイベントが
+    # もう一度バッファへ積まれ、結合後の L1 に 2 件並んでいた(実測)。scheduler 側の
+    # `workplace_bound` が `step != 0` ガード + `_workbind_reported` で防いでいるのと**同型**の
+    # ギャップだが、apply は step を見る術が無い(構築時=まだ step の概念が無い)ため、
+    # 「前のプロセスが既に記録済み」という事実を checkpoint に載せて**ここで**ガードする。
+    # 旧 checkpoint(キー無し)= False = 従来挙動。fresh ランは load を通らない=1 バイト不変。
+    # log() は spark_roster でカウンタを 1 つも進めない(fallback / undefined_action のみ加算)
+    # ので、バッファから外すこと自体に副作用は無い。
+    if rt.get("spark_reported"):
+        sim._spark_reported = True
+        if getattr(sim, "logger", None) is not None:
+            sim.logger.events = [e for e in sim.logger.events
+                                 if e.kind != "spark_roster"]
     if hasattr(sim, "_journal_rewind"):         # 第71: LLM ジャーナルを確定点まで巻き戻す
         sim._journal_rewind(rt.get("llm_journal"))
 

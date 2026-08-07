@@ -94,6 +94,10 @@ R1 ドクトリン(既定 OFF=1 バイトも動かさない)
   (低優先の削除+ずらし+plan_version++)であり、LLM 呼を足さない。第81 の認知イベントキューが
   ON のときだけ、内部発火(INTERNAL)として **plan_exception** を前倒し登録する
   (= 設計 §8 突入条件(3)の先行実装。engaged エピソード本体は第87)。
+- W4-F(計画遵守観測の強化)は **記録だけ**を足した。`plan_block_start` の `node`(実行時の
+  現在ノード)/ `plan_block_*` の `block`(台帳の添字)はどちらも **1 箇所も読まれない**
+  (`_bi` の戻り値で分岐する行はゼロ)。したがって ON ランでも行き先・乱数・LLM 呼数・
+  プロンプトは 1 バイトも変わらず、OFF ランはイベント自体が 0 件なので当然無風。
 - no-fingerprint: プロンプトは中立(機構語・実験条件語・因子名を 1 つも出さない)。本 module は
   性格特性も k も読まず、物理量(時刻・座標・訪問回数・営業時刻・所持金)だけを見る。
 
@@ -991,6 +995,20 @@ def _plan_of(agent, sim_min: int):
     return plan
 
 
+def _bi(plan: dict, b: dict) -> int:
+    """ブロックの添字(W4-F)。`plan["blocks"]` に無ければ -1。
+
+    ★**同一性**で採る: `list.index` は `==` 比較なので、同じ時刻・同じ場所の 2 件
+      (LLM は平気で書く)を取り違える。第93 IF-A の `apply_contingency` が既に
+      この採り方をしており、それを関数へ括り出しただけ = 新しい規則を足していない。
+
+    用途は**記録だけ**(この値を読んで分岐する箇所は 1 つも無い)。plan_block_* の
+    payload へ載せることで、事後解析(scripts/analyze_plan_execution.py)が
+    「どのイベントがどのブロックのものか」を台帳再生で推定せずに済む。
+    """
+    return next((i for i, x in enumerate(plan["blocks"]) if x is b), -1)
+
+
 def _sweep(sim, agent, plan: dict, cfg: dict, step: int, sim_min: int) -> None:
     """priority × flex の割り込み処理(**LLM を呼ばない**・決定論)。
 
@@ -1004,7 +1022,7 @@ def _sweep(sim, agent, plan: dict, cfg: dict, step: int, sim_min: int) -> None:
     now = int(sim_min) % 1440
     grace, day_end = int(cfg["grace_min"]), int(cfg["day_end_min"])
     threatened: list = []
-    for b in plan["blocks"]:
+    for i, b in enumerate(plan["blocks"]):
         if b["state"] != "todo" or now <= b["start"] + grace:
             continue
         if b["priority"] == "must":
@@ -1015,7 +1033,8 @@ def _sweep(sim, agent, plan: dict, cfg: dict, step: int, sim_min: int) -> None:
             _state(sim)["drop"] += 1
             _log(sim, agent, step, sim_min, "plan_block_drop",
                  {"act": b["act"], "place": b["place"], "start": b["start"],
-                  "priority": b["priority"], "flex": b["flex"], "reason": "grace"})
+                  "priority": b["priority"], "flex": b["flex"], "reason": "grace",
+                  "block": i})
             continue
         if b["flex"] == "slideable":
             dur = b["end"] - b["start"]
@@ -1027,20 +1046,22 @@ def _sweep(sim, agent, plan: dict, cfg: dict, step: int, sim_min: int) -> None:
                 _log(sim, agent, step, sim_min, "plan_block_drop",
                      {"act": b["act"], "place": b["place"], "start": b["start"],
                       "priority": b["priority"], "flex": b["flex"],
-                      "reason": "slide_cap"})
+                      "reason": "slide_cap", "block": i})
             else:
                 b["start"] = _round_to(now, cfg["round_min"])
                 b["end"] = b["start"] + dur
                 _state(sim)["slide"] += 1
                 _log(sim, agent, step, sim_min, "plan_slide",
                      {"act": b["act"], "place": b["place"], "start": b["start"],
-                      "slid": int(b["slid"]), "priority": b["priority"]})
+                      "slid": int(b["slid"]), "priority": b["priority"],
+                      "block": i})
         else:                                    # fixed で must でない = 機会を逃した
             b["state"] = "dropped"
             _state(sim)["drop"] += 1
             _log(sim, agent, step, sim_min, "plan_block_drop",
                  {"act": b["act"], "place": b["place"], "start": b["start"],
-                  "priority": b["priority"], "flex": b["flex"], "reason": "fixed_past"})
+                  "priority": b["priority"], "flex": b["flex"],
+                  "reason": "fixed_past", "block": i})
     if threatened:                               # ★must が脅かされたときだけ再計画が鳴る
         _replan(sim, agent, plan, cfg, step, sim_min, threatened)
 
@@ -1088,9 +1109,10 @@ def _replan(sim, agent, plan: dict, cfg: dict, step: int, sim_min: int,
             _state(sim)["drop"] += 1
             _log(sim, agent, step, sim_min, "plan_block_drop",
                  {"act": m["act"], "place": m["place"], "start": m["start"],
-                  "priority": m["priority"], "flex": m["flex"], "reason": "missed"})
+                  "priority": m["priority"], "flex": m["flex"], "reason": "missed",
+                  "block": _bi(plan, m)})
             continue
-        for b in plan["blocks"]:                 # ずらした先で邪魔になる could を空ける
+        for i, b in enumerate(plan["blocks"]):   # ずらした先で邪魔になる could を空ける
             if b is m or b["state"] != "todo" or b["priority"] != "could":
                 continue
             if b["start"] < m["end"] and m["start"] < b["end"]:
@@ -1100,7 +1122,7 @@ def _replan(sim, agent, plan: dict, cfg: dict, step: int, sim_min: int,
                 _log(sim, agent, step, sim_min, "plan_block_drop",
                      {"act": b["act"], "place": b["place"], "start": b["start"],
                       "priority": b["priority"], "flex": b["flex"],
-                      "reason": "replan"})
+                      "reason": "replan", "block": i})
     plan["version"] = int(plan["version"]) + 1
     _state(sim)["replan"] += 1
     _log(sim, agent, step, sim_min, "plan_replan",
@@ -1227,42 +1249,53 @@ COND_FN = {"rain": _cond_rain, "crowded": _cond_crowded, "closed": _cond_closed,
            "invited": _cond_invited}
 
 
-def _drop_block(sim, agent, b: dict, step: int, sim_min: int, reason: str) -> None:
-    """ブロックを削る(既存の drop 計上・イベントと同一形 = st['drop'] の保存則を守る)。"""
+def _drop_block(sim, agent, b: dict, step: int, sim_min: int, reason: str,
+                block: int = -1) -> None:
+    """ブロックを削る(既存の drop 計上・イベントと同一形 = st['drop'] の保存則を守る)。
+
+    `block`(W4-F)= `plan["blocks"]` の添字。**呼び元が既に持っている値をそのまま
+    受け取るだけ**で、ここで探し直さない(唯一の採り方は `_bi`)。既定 -1 は
+    「plan を持たない文脈から呼ばれた」= 第93 の `plan_cont_fire` が添字を採れなかった
+    ときと同じ値。src の実行経路では必ず `apply_contingency` 経由で真の添字が入る。
+    """
     b["state"] = "dropped"
     _state(sim)["drop"] += 1
     _log(sim, agent, step, sim_min, "plan_block_drop",
          {"act": b["act"], "place": b["place"], "start": b["start"],
-          "priority": b["priority"], "flex": b["flex"], "reason": reason})
+          "priority": b["priority"], "flex": b["flex"], "reason": reason,
+          "block": int(block)})
 
 
-def _then_skip(sim, agent, b: dict, cfg: dict, step: int, sim_min: int) -> bool:
-    _drop_block(sim, agent, b, step, sim_min, "cont_skip")
+def _then_skip(sim, agent, b: dict, cfg: dict, step: int, sim_min: int,
+               block: int = -1) -> bool:
+    _drop_block(sim, agent, b, step, sim_min, "cont_skip", block)
     return True
 
 
-def _then_postpone(sim, agent, b: dict, cfg: dict, step: int, sim_min: int) -> bool:
+def _then_postpone(sim, agent, b: dict, cfg: dict, step: int, sim_min: int,
+                   block: int = -1) -> bool:
     """postpone_min だけ後ろへずらす(既存 slide と同じ最小摂動の作法・継続は保つ)。"""
     dur = int(b["end"]) - int(b["start"])
     shift = int(cfg["postpone_min"])
     start = _round_to(int(b["start"]) + shift, cfg["round_min"])
     slid = int(b.get("slid", 0) or 0) + shift
     if slid > int(cfg["max_slide_min"]) or start + dur > int(cfg["day_end_min"]):
-        _drop_block(sim, agent, b, step, sim_min, "cont_postpone")
+        _drop_block(sim, agent, b, step, sim_min, "cont_postpone", block)
         return True
     b["start"], b["end"], b["slid"] = start, start + dur, slid
     _state(sim)["slide"] += 1
     _log(sim, agent, step, sim_min, "plan_slide",
          {"act": b["act"], "place": b["place"], "start": b["start"],
-          "slid": slid, "priority": b["priority"]})
+          "slid": slid, "priority": b["priority"], "block": int(block)})
     return True
 
 
-def _then_go_home(sim, agent, b: dict, cfg: dict, step: int, sim_min: int) -> bool:
+def _then_go_home(sim, agent, b: dict, cfg: dict, step: int, sim_min: int,
+                  block: int = -1) -> bool:
     """行き先を自宅へ差し替える。自宅が無ければ削る(捏造しない)。"""
     node = str(getattr(agent, "home_node", "") or "")
     if not node:
-        _drop_block(sim, agent, b, step, sim_min, "cont_no_place")
+        _drop_block(sim, agent, b, step, sim_min, "cont_no_place", block)
         return True
     if b["place"] == "home" and b.get("node") == node:
         return False                             # 既に自宅 = 空振り(世界は動かない)
@@ -1273,7 +1306,7 @@ def _then_go_home(sim, agent, b: dict, cfg: dict, step: int, sim_min: int) -> bo
 
 
 def _then_swap_indoor(sim, agent, b: dict, cfg: dict, step: int,
-                      sim_min: int) -> bool:
+                      sim_min: int, block: int = -1) -> bool:
     """屋外カテゴリを屋内へ差し替える。屋内ブロックなら空振り(applied=false)。"""
     place = str(b["place"])
     if place not in OUTDOOR_PLACES:
@@ -1282,7 +1315,7 @@ def _then_swap_indoor(sim, agent, b: dict, cfg: dict, step: int,
     node = resolve_place(sim, agent, sub, sim_min,
                          from_node=getattr(agent, "node", ""))
     if node is None:                             # 屋内の受け皿が無ければ自宅へ落とす
-        return _then_go_home(sim, agent, b, cfg, step, sim_min)
+        return _then_go_home(sim, agent, b, cfg, step, sim_min, block)
     b["place"], b["node"] = sub, node
     if b["act"] not in ACT_PLACE or ACT_PLACE[b["act"]] in OUTDOOR_PLACES:
         b["act"] = next((a for a, p in ACT_PLACE.items() if p == sub), b["act"])
@@ -1290,7 +1323,8 @@ def _then_swap_indoor(sim, agent, b: dict, cfg: dict, step: int,
     return True
 
 
-def _then_shorten(sim, agent, b: dict, cfg: dict, step: int, sim_min: int) -> bool:
+def _then_shorten(sim, agent, b: dict, cfg: dict, step: int, sim_min: int,
+                  block: int = -1) -> bool:
     """滞在を shorten_min だけ短くする(min_dur_min は下回らない)。"""
     lo = int(cfg["min_dur_min"])
     end = max(int(b["start"]) + lo, int(b["end"]) - int(cfg["shorten_min"]))
@@ -1320,8 +1354,10 @@ def apply_contingency(sim, agent, plan: dict, b: dict, cfg: dict,
             continue
         b["cont_done"] = True
         # 同値の別ブロックを拾わないよう **同一性**で位置を採る(list.index は == 比較)。
-        index = next((i for i, x in enumerate(plan["blocks"]) if x is b), -1)
-        applied = bool(act_fn(sim, agent, b, cfg, step, sim_min))
+        index = _bi(plan, b)
+        # W4-F: 対処が出す plan_block_drop / plan_slide にも同じ添字を載せる
+        # (= 同 step の 2 イベントが同じブロックを指していることが台帳再生を経ずに判る)。
+        applied = bool(act_fn(sim, agent, b, cfg, step, sim_min, index))
         _log(sim, agent, step, sim_min, "plan_cont_fire",
              {"cond": cond, "then": then, "block": index, "act": b["act"],
               "place": b["place"], "start": int(b["start"]), "applied": applied})
@@ -1370,13 +1406,21 @@ def plan_action(agent, sim, sim_min: int, step: int, rng, scfg=None):
                 return None
     from . import routine as _routine
     dest = b["node"]
+    # W4-F: 記録 2 欄。`block` = 台帳の添字、`node` = **この瞬間の現在ノード**(移動前)。
+    #   node は「行き先」ではない。同 step に route_start が出なければ個体はここに
+    #   留まったのだから、そのときに限りここがこのブロックの場所である
+    #   (= 事後解析の no_move_event が「既に目的地に居た」ぶん消える)。
+    #   どちらも読まれない=分岐に使わない=世界を 1 バイトも動かさない。
+    at_node = str(getattr(agent, "node", "") or "")
+    index = _bi(plan, b)
     if b["place"] == "street":                   # 戸外・特定しない = 行き先は習慣ポリシーへ委ねる
         b["state"] = "done"                      # (消化そのものは起きたので黙って消さず数える)
         _state(sim)["exec"] += 1
         _log(sim, agent, step, sim_min, "plan_block_start",
              {"act": b["act"], "place": b["place"], "aim": b["purpose"],
               "priority": b["priority"], "flex": b["flex"], "start": b["start"],
-              "slid": int(b["slid"]), "version": int(plan["version"])})
+              "slid": int(b["slid"]), "version": int(plan["version"]),
+              "node": at_node, "block": index})
         _clear_why(sim, agent)                   # 第94 IF-B: 再計画が実った=侵入は止まる
         return None
     if dest is None or not _open_now(sim, b, sim_min):
@@ -1388,14 +1432,16 @@ def plan_action(agent, sim, sim_min: int, step: int, rng, scfg=None):
         _state(sim)["drop"] += 1
         _log(sim, agent, step, sim_min, "plan_block_drop",
              {"act": b["act"], "place": b["place"], "start": b["start"],
-              "priority": b["priority"], "flex": b["flex"], "reason": "no_place"})
+              "priority": b["priority"], "flex": b["flex"], "reason": "no_place",
+              "block": index})
         return None
     b["state"] = "done"
     _state(sim)["exec"] += 1
     _log(sim, agent, step, sim_min, "plan_block_start",
          {"act": b["act"], "place": b["place"], "aim": b["purpose"],
           "priority": b["priority"], "flex": b["flex"], "start": b["start"],
-          "slid": int(b["slid"]), "version": int(plan["version"])})
+          "slid": int(b["slid"]), "version": int(plan["version"]),
+          "node": at_node, "block": index})
     # 第94 IF-B(Masicampo & Baumeister 2011): **代替ブロックが動き出した時点**で
     # 失敗理由を降格する(= 計画が立てば侵入思考は止まる)。既定 silent は完全 no-op。
     _clear_why(sim, agent)

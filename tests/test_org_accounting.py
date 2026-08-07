@@ -392,7 +392,9 @@ def test_row_channel_breakdown_is_published(tmp_path):
         assert ch in prov["row_channels"], ch
     flows = _kind(sim, "row_flow")
     assert flows, "L1 に日次の域外収支が出ていない"
-    assert {"day", "channels", "in_total", "out_total", "net"} <= set(flows[0].payload)
+    # 第99(IF-E2 残③): K5 も L1 の一級市民になった(それまで finance.parquet 専用だった)
+    assert {"day", "channels", "in_total", "out_total", "net",
+            "k5_total"} <= set(flows[0].payload)
     summary = json.loads((tmp_path / "sfc_row" / "summary.json").read_text(encoding="utf-8"))
     assert summary["org_accounting"]["row_net"] == prov["row_net"]
     assert "uncovered_kinds_declared" in summary["org_accounting"], "未接続の宣言が消えている"
@@ -707,6 +709,50 @@ def test_crime_run_classifies_every_theft_into_k5(tmp_path):
     # payload は 0.1 円丸め・会計は無限精度(1 件あたり最大 0.05 円の差)
     assert st["k5"]["theft"] == pytest.approx(logged, abs=0.05 * len(thefts) + 0.1)
     assert "theft" not in st["row"], "K5 が RoW チャネルに混ざっている"
+
+
+# ===========================================================================
+# ⑩ 第99 IF-E2 残③ — K5 の日次 L1 出力(`_emit` の 1 キー)
+#    それまで K5 は finance.parquet の k5_other 列にしか出ておらず、L1 だけを読む解析からは
+#    総マネー保存の第 3 項が見えなかった。粒度は in_total/out_total と同じ**累積**。
+# ===========================================================================
+def test_k5_is_published_in_the_daily_l1_row_flow(tmp_path):
+    """③ K5 累積が row_flow の 1 キーとして出る。値は finance.parquet の k5_other と同一。"""
+    sim = _run(tmp_path, "sfc_k5_l1", n_steps=288, n_agents=40,
+               **dict(ECON, **ON, **CRIME))
+    flows = _kind(sim, "row_flow")
+    assert flows, "L1 に日次の域外収支が出ていない"
+    seq = [e.payload["k5_total"] for e in flows]
+    assert all(isinstance(v, float) for v in seq)
+    # K5 は積むだけ(取り崩す経路が無い)= 単調非減少 = 差分で日次フローが採れる
+    assert seq == sorted(seq), f"K5 累積が減っている: {seq}"
+    assert seq[-1] > 0.0, "窃盗が起きているのに L1 の K5 が 0 のまま"
+    assert seq[-1] == pytest.approx(round(SFC.k5_total(sim), 1))
+    # ★同一の式であることの機械固定: サイドカー(6 桁丸め)を L1 の桁(1 桁)へ落とすと一致
+    col = pq.read_table(tmp_path / "sfc_k5_l1" / "finance.parquet") \
+            .column("k5_other").to_pylist()
+    assert len(col) == len(seq), "row_flow とサイドカー行が 1:1 で対応していない"
+    assert [round(float(v), 1) for v in col] == seq
+    # 総マネー保存の 3 項が **L1 と summary だけ**で閉じる(K5 が L1 に出た目的そのもの)
+    prov = SFC.provenance(sim)
+    assert prov["k5_total"] == pytest.approx(seq[-1])
+    assert sum(prov["k5_kinds"].values()) == pytest.approx(prov["k5_total"], abs=0.05)
+
+
+def test_k5_key_is_zero_when_nothing_non_transactional_happened(tmp_path):
+    """K5 の源(窃盗)が点火していないランでは 0.0 が出る(キーを欠測にしない)。"""
+    sim = _run(tmp_path, "sfc_k5_zero", n_steps=288, n_agents=25, **dict(ECON, **ON))
+    flows = _kind(sim, "row_flow")
+    assert flows
+    assert not _kind(sim, "crime"), "テスト前提が崩れた(窃盗が点火している)"
+    assert all(e.payload["k5_total"] == 0.0 for e in flows)
+
+
+def test_k5_l1_key_does_not_exist_when_org_accounting_is_off(tmp_path):
+    """OFF ゲート配下: row_flow 自体が出ない = 新キーも 1 つも生えない。"""
+    sim = _run(tmp_path, "sfc_k5_off", n_steps=288, n_agents=25, **dict(ECON, **CRIME))
+    assert not _kind(sim, "row_flow")
+    assert not any("k5_total" in (e.payload or {}) for e in sim.logger.events)
 
 
 def test_chance_event_is_classified_into_row_channels(tmp_path):

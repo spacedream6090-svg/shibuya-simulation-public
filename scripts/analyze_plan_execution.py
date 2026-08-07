@@ -57,25 +57,50 @@ agent の所持金・訪問履歴を要求し、ラン後の成果物からは�
     `plan_block_start` と同じ (agent_id, step) の `route_start` を採る。1 step 1 行為
     なので実務上ほぼ一意だが、**証拠は無い**(role 刻印が無いため、その移動が習慣
     ポリシー由来である可能性を排除できない)。出力の `node_src` で区別できる。
+(c) **留まった経路**(W4-F 以降のラン。移動イベントが 1 件も無い step のみ)
+    `plan_block_start.node`(実行時の現在ノード)を採る。`move_to` は経路が張れなければ
+    `route_start` を出さずに return するので、「同 step に移動イベントが無い」
+    ⇔「個体はそのノードから動かなかった」が成り立つ。よってこれは推測ではない。
 
-どちらの経路でも取れないときは **`unknown` と正直に出す**(当てにいかない):
+どの経路でも取れないときは **`unknown` と正直に出す**(当てにいかない):
   street_delegated … `place="street"` = 計画が行き先の特定を habit へ委譲した
-  no_move_event    … 同 step に移動イベントが無い(既に目的地に居た/経路が張れない)
+  no_move_event    … 同 step に移動イベントが無く、`node` も記録されていない旧ラン
   node_off_map     … 到達ノードが地図に無い(地図違い)
   home_unknown / work_unknown … agents.json から自宅/職場ノードが判らない
   category_absent_on_map      … その場所カテゴリの POI が地図に 1 件も無い
 
+W4-F(2026-08-08)で **src 側が 3 つの記録を足した**ため、下の限界 1・2 と未解決理由
+`no_move_event` は**新しいランでは消える**。旧ランは 1 行も変えずに読めるよう、
+本スクリプトは **新フィールドがあればそれを使い、無ければ従来経路へ自動で落ちる**:
+
+  `agents.json.work_node` / `part_time_node`
+      … `day_plan._work_node(agent)` の入力そのもの。あれば職場判定は実ノード
+        (`exact_node`)、無ければ従来の建物近似(`approx_building`)。
+  `plan_block_start.node`
+      … 実行を決めた瞬間の**現在ノード(移動前)**。行き先ではないので、同 step に
+        移動イベントが**無いときに限り**「個体はそこに留まった = そこがブロックの
+        場所」として採る(`node_src="block_node"`)。移動が起きたランでは使わない。
+  `plan_block_start` / `plan_block_drop` / `plan_slide` の `block`
+      … `plan_created.blocks[]` の添字。あれば台帳再生の照合を一切行わず添字で直接
+        帰属する(多義・不照合が構造的にゼロになる)。
+
 正直な限界(5 件)
 ------------------
-1. **`work` は近似**である。`agents.json` は `work_node` を持たず `work_building` しか
-   残らないので、職場ノード候補 = その建物の入口ノード ∪ その建物内 POI のノード、
-   とした(`approx_building`)。`work_building` が空の個体は `work_unknown`。
-2. **ブロックの同定は L1 の再生である**。`plan_block_start` は計画配列の添字を持たない
-   ため、`plan_created.blocks[]` から台帳を起こし、`plan_slide` / `plan_block_drop` /
-   `plan_cont_fire` / `plan_replan` を順に当てて `(act, place, aim, priority, flex,
-   start)` で照合する。多義・不照合は `matching.ambiguous` / `matching.unmatched` に
-   **数えて出す**(黙って捨てない)。`plan_cont_fire` だけはブロック添字を payload に
-   持つので**そちらを正典**とし、直前の drop/slide の帰属が食い違えば差し戻す。
+1. **`work` は旧ランでのみ近似**である。`agents.json` に `work_node` が無いランでは
+   職場ノード候補 = その建物の入口ノード ∪ その建物内 POI のノード、とした
+   (`approx_building`)。`work_building` も空の個体は `work_unknown`。
+   新ランでは `{work_node, part_time_node}` の実ノード集合で判定する(`exact_node`)。
+   ★ただし agents.json は**書き出した時点のスナップショット**であり、転職
+     (organizations)で run 中に職場が変わった個体は取りこぼしうる。だから受理集合は
+     本業とバイト先の**和**にしてある(`_work_node` は本業を優先するので和は上位集合
+     = 必要条件の検査という本スクリプトの立場と整合する)。
+2. **ブロックの同定は、添字が無いランでは L1 の再生である**。`plan_created.blocks[]`
+   から台帳を起こし、`plan_slide` / `plan_block_drop` / `plan_cont_fire` /
+   `plan_replan` を順に当てて `(act, place, aim, priority, flex, start)` で照合する。
+   多義・不照合は `matching.ambiguous` / `matching.unmatched` に**数えて出す**
+   (黙って捨てない)。`plan_cont_fire` は第93 から添字を持つので**そちらを正典**とし、
+   直前の drop/slide の帰属が食い違えば差し戻す。W4-F 以降のランは 3 種すべてが
+   添字を持つので、この再生経路は 1 度も走らない(`ledger.by_index` で確認できる)。
 3. **時間帯一致は「日中にずらされなかったこと」**として測る。実行判定
    (`day_plan.current_block`)は常に**現在の**窓の中でしか起きないので、「窓の外で
    実行された」は原理的に観測できない。朝の窓と実行時の窓が同一 = 遵守、とする
@@ -253,10 +278,12 @@ def load_map(path: str | None) -> dict | None:
 
 
 def load_agents(run_dir: str, mapidx: dict | None) -> dict:
-    """agents.json → {id: {home, work_building, work_nodes}}。
+    """agents.json → {id: {home, work_building, work_nodes, work_src}}。
 
-    ★`work_node` は agents.json に**残らない**(限界 1)。建物 id から候補ノード集合を
-      起こす近似であり、出力では `approx_building` と明記する。
+    ★W4-F 以降のランは `work_node` / `part_time_node`(= `day_plan._work_node` の入力
+      そのもの)を持つので、職場ノードは**実ノード**で判る(`work_src="exact_node"`)。
+      持たない旧ランだけ、建物 id から候補ノード集合を起こす近似へ落ちる
+      (`work_src="approx_building"`。限界 1)。
     """
     out: dict[int, dict] = {}
     path = os.path.join(run_dir, "agents.json")
@@ -271,9 +298,14 @@ def load_agents(run_dir: str, mapidx: dict | None) -> dict:
         if not isinstance(r, dict) or "id" not in r:
             continue
         wb = str(r.get("work_building") or "")
-        out[int(r["id"])] = {"home": str(r.get("home") or ""),
-                             "work_building": wb,
-                             "work_nodes": set(bnodes.get(wb, ())) if wb else set()}
+        exact = {n for n in (str(r.get("work_node") or ""),
+                             str(r.get("part_time_node") or "")) if n}
+        out[int(r["id"])] = {
+            "home": str(r.get("home") or ""),
+            "work_building": wb,
+            "work_nodes": exact if exact
+                          else (set(bnodes.get(wb, ())) if wb else set()),
+            "work_src": "exact_node" if exact else "approx_building"}
     return out
 
 
@@ -405,6 +437,29 @@ def _apply_slide(b: dict, p: dict) -> None:
     b["n_slide"] += 1
 
 
+def _by_index(rec: dict, p: dict, stats: dict, tag: str):
+    """payload の `block` 添字で直接帰属する(W4-F 以降のラン)。
+
+    返り値 = ブロック or None(添字が無い旧ラン = 台帳再生へ落ちる合図)。
+    キーはあるのに範囲外(壊れた/`-1`)なら **数えてから** None を返す
+    = 黙って当てにいかない(`plan_cont_fire` の cont_bad_index と同じ作法)。
+    """
+    v = p.get("block")
+    if v is None:
+        return None
+    try:
+        i = int(v)
+    except (TypeError, ValueError):
+        stats["block_index_bad"] += 1
+        return None
+    if not (0 <= i < len(rec["blocks"])):
+        stats["block_index_bad"] += 1
+        return None
+    stats["matched"][tag] += 1
+    stats["by_index"][tag] += 1
+    return rec["blocks"][i]
+
+
 def _pick_slide(rec: dict, p: dict, stats: dict):
     """`plan_slide` は **ずらした後の start** しか持たないので専用の照合を使う。
 
@@ -433,7 +488,8 @@ def _pick_slide(rec: dict, p: dict, stats: dict):
 def build_ledger(events: list[dict], cfg: dict) -> tuple[list, dict]:
     """`plan_created` を起点に (agent, day) ごとのブロック台帳を再生する。"""
     stats = {"matched": defaultdict(int), "ambiguous": defaultdict(int),
-             "unmatched": defaultdict(int), "orphan_events": 0,
+             "unmatched": defaultdict(int), "by_index": defaultdict(int),
+             "orphan_events": 0, "block_index_bad": 0,
              "cont_reattributed": 0, "cont_bad_index": 0, "replan_mismatch": 0,
              "n_repair": 0, "n_fallback": 0, "fallback_kinds": defaultdict(int)}
     days: dict = {}
@@ -464,7 +520,11 @@ def build_ledger(events: list[dict], cfg: dict) -> tuple[list, dict]:
                     "aim": str(p.get("aim") or ""),
                     "priority": str(p.get("priority") or ""),
                     "flex": str(p.get("flex") or ""), "start": int(p.get("start") or 0)}
-            b, exact = _pick(rec, want, stats, "start")
+            b = _by_index(rec, p, stats, "start")            # W4-F: 添字が正典
+            exact, src = True, "index"
+            if b is None:                                    # 旧ラン = 台帳再生へ
+                b, exact = _pick(rec, want, stats, "start")
+                src = "replay"
             if b is not None:
                 b["state"] = "done"
                 b["exec"] = {"step": e["step"], "sim_min": e["sim_min"],
@@ -473,7 +533,10 @@ def build_ledger(events: list[dict], cfg: dict) -> tuple[list, dict]:
                              "place": want["place"], "act": want["act"],
                              "aim": want["aim"],
                              "version": int(p.get("version") or 1),
-                             "exact_match": bool(exact),
+                             "exact_match": bool(exact), "attrib": src,
+                             # W4-F: 実行時の**現在ノード**(移動前)。移動イベントが
+                             # 1 件も無い step でだけ到達ノードとして採る。
+                             "node_at_start": str(p.get("node") or ""),
                              "node": "", "node_src": "", "node_planned": "",
                              "detour": None}
             rec["_pend"] = None
@@ -481,13 +544,17 @@ def build_ledger(events: list[dict], cfg: dict) -> tuple[list, dict]:
             want = {"act": str(p.get("act") or ""), "place": str(p.get("place") or ""),
                     "priority": str(p.get("priority") or ""),
                     "flex": str(p.get("flex") or ""), "start": int(p.get("start") or 0)}
-            b, _exact = _pick(rec, want, stats, "drop")
+            b = _by_index(rec, p, stats, "drop")
+            if b is None:
+                b, _exact = _pick(rec, want, stats, "drop")
             if b is not None:
                 rec["_pend"] = {"step": e["step"], "kind": kind, "b": b,
                                 "before": _snap(b), "payload": p, "event": e}
                 _apply_drop(b, e, p)
         elif kind == "plan_slide":
-            b = _pick_slide(rec, p, stats)
+            b = _by_index(rec, p, stats, "slide")
+            if b is None:
+                b = _pick_slide(rec, p, stats)
             if b is not None:
                 rec["_pend"] = {"step": e["step"], "kind": kind, "b": b,
                                 "before": _snap(b), "payload": p, "event": e}
@@ -499,7 +566,7 @@ def build_ledger(events: list[dict], cfg: dict) -> tuple[list, dict]:
     out = [days[k] for k in order]
     for rec in out:
         rec.pop("_pend", None)
-    for k in ("matched", "ambiguous", "unmatched", "fallback_kinds"):
+    for k in ("matched", "ambiguous", "unmatched", "by_index", "fallback_kinds"):
         stats[k] = {kk: int(vv) for kk, vv in sorted(stats[k].items())}
     return out, stats
 
@@ -580,7 +647,7 @@ def attach_nodes(days: list, events: list[dict]) -> dict:
     for e in events:
         if e["kind"] in MOVE_KINDS:
             moves[(e["agent_id"], e["step"])].append(e)
-    counts = {"prov": 0, "step_join": 0, "none": 0, "detour": 0}
+    counts = {"prov": 0, "step_join": 0, "block_node": 0, "none": 0, "detour": 0}
     n_role_plan = sum(1 for e in events if e["kind"] == "route_start"
                       and str(e["payload"].get("llm_role") or "") == "plan")
     for rec in days:
@@ -597,9 +664,19 @@ def attach_nodes(days: list, events: list[dict]) -> dict:
                     and str(x["payload"].get("llm_role") or "") == "plan"]
             pick, src = (prov[0], "prov") if prov else \
                         ((routes[0], "step_join") if routes else (None, "none"))
-            counts[src] += 1
             if pick is None:
+                # (c) 経路: 移動イベントが 1 件も無い = 個体は動かなかった。W4-F 以降の
+                #     ランはその「動かなかった場所」を plan_block_start.node に持つ。
+                stayed = str(ex.get("node_at_start") or "")
+                if stayed:
+                    counts["block_node"] += 1
+                    ex["node"] = stayed
+                    ex["node_src"] = "block_node"
+                    ex["node_planned"] = stayed
+                else:
+                    counts["none"] += 1
                 continue
+            counts[src] += 1
             ex["node"] = str(pick["payload"].get("dest") or "")
             ex["node_src"] = src
             ex["node_planned"] = ex["node"]
@@ -611,7 +688,8 @@ def attach_nodes(days: list, events: list[dict]) -> dict:
                 counts["detour"] += 1
     return {"by_source": counts, "n_route_start_role_plan": n_role_plan,
             "path": ("prov" if counts["prov"] else
-                     ("step_join" if counts["step_join"] else "none"))}
+                     ("step_join" if counts["step_join"] else
+                      ("block_node" if counts["block_node"] else "none")))}
 
 
 # --------------------------------------------------------------------------- #
@@ -630,10 +708,13 @@ def place_status(place: str, node: str, aid: int,
             return "unknown", "home_unknown"
         return ("match" if node == home else "mismatch"), ""
     if place == "work":
-        wn = (agents.get(aid) or {}).get("work_nodes") or set()
+        rec = agents.get(aid) or {}
+        wn = rec.get("work_nodes") or set()
         if not wn:
             return "unknown", "work_unknown"
-        return ("match" if node in wn else "mismatch"), "approx_building"
+        # detail = その判定が実ノード由来か建物近似か(W4-F 以降は exact_node)
+        return (("match" if node in wn else "mismatch"),
+                str(rec.get("work_src") or "approx_building"))
     if mapidx is None:
         return "unknown", "no_map"
     accept = _accept_cats(place)
@@ -763,6 +844,32 @@ def score(days: list, mapidx: dict | None, agents: dict) -> dict:
 # --------------------------------------------------------------------------- #
 # まとめ
 # --------------------------------------------------------------------------- #
+BLOCK_KINDS: tuple[str, ...] = ("plan_block_start", "plan_block_drop", "plan_slide")
+
+
+def field_support(events: list[dict], agents: dict) -> dict:
+    """W4-F の 3 記録がこのランに**在るか**(無ければ従来経路へ落ちている印)。
+
+    率ではなく生の件数で出す。「新フィールドがあるのに使われていない」「一部の
+    イベントだけ持っている」といった中途半端な状態を隠さないため。
+    """
+    n_bev = sum(1 for e in events if e["kind"] in BLOCK_KINDS)
+    n_bidx = sum(1 for e in events if e["kind"] in BLOCK_KINDS
+                 and e["payload"].get("block") is not None)
+    n_start = sum(1 for e in events if e["kind"] == "plan_block_start")
+    n_node = sum(1 for e in events if e["kind"] == "plan_block_start"
+                 and e["payload"].get("node"))
+    n_wexact = sum(1 for r in agents.values()
+                   if r.get("work_src") == "exact_node")
+    return {
+        "block_index": {"n": n_bidx, "of": n_bev},
+        "block_node": {"n": n_node, "of": n_start},
+        "work_node": {"n": n_wexact, "of": len(agents)},
+        "note": "W4-F(2026-08-08)以降のランだけが持つ記録。"
+                "0 なら旧ラン = 台帳再生 + 建物近似へ自動で落ちている(測定値は出る)",
+    }
+
+
 def summarize(run_dir: str, events: list[dict], cfg: dict,
               mapidx: dict | None, agents: dict) -> dict:
     cov = place_coverage(mapidx)
@@ -793,14 +900,16 @@ def summarize(run_dir: str, events: list[dict], cfg: dict,
         "day_plan": {"present": True, "n_plan_created": n_created,
                      "n_days": len(days),
                      "agents_json": bool(agents),
-                     "map": (mapidx or {}).get("path")},
+                     "map": (mapidx or {}).get("path"),
+                     "fields": field_support(events, agents)},
         "attribution": attrib,
         "ledger": {
             "matched": lstats["matched"], "ambiguous": lstats["ambiguous"],
-            "unmatched": lstats["unmatched"],
+            "unmatched": lstats["unmatched"], "by_index": lstats["by_index"],
             "ambiguous_rate": _rate(n_amb, n_mat),
             "unmatched_rate": _rate(n_unm, n_mat + n_unm),
             "orphan_events": lstats["orphan_events"],
+            "block_index_bad": lstats["block_index_bad"],
             "cont_reattributed": lstats["cont_reattributed"],
             "cont_bad_index": lstats["cont_bad_index"],
             "replan_mismatch": lstats["replan_mismatch"],
@@ -846,16 +955,26 @@ def render(res: dict) -> str:
         return "\n".join(L) + "\n"
     at, lg, c = res["attribution"], res["ledger"], res["compliance"]
     d, s = c["denominator"], c["stage"]
+    fl = dp.get("fields") or {}
+    n_idx = sum(lg.get("by_index", {}).values())
     L += ["## 1. 帰属経路", "",
           f"- 採用経路: **{at['path']}**"
           f"(PROV {at['by_source']['prov']} 件 / 同 step {at['by_source']['step_join']} 件"
+          f" / 留まった {at['by_source']['block_node']} 件"
           f" / 帰属不能 {at['by_source']['none']} 件)",
           f"- `llm_role=\"plan\"` の route_start: {at['n_route_start_role_plan']} 件"
           + ("(= observer.llm_link ON)" if at["n_route_start_role_plan"]
              else "(= observer.llm_link OFF → 同 step join へ自動フォールバック)"),
           f"- ブロック同定: 一致 {sum(lg['matched'].values())} /"
           f" 多義 {sum(lg['ambiguous'].values())}(率 {lg['ambiguous_rate']})/"
-          f" 不照合 {sum(lg['unmatched'].values())}(率 {lg['unmatched_rate']})", "",
+          f" 不照合 {sum(lg['unmatched'].values())}(率 {lg['unmatched_rate']})",
+          f"- うち **payload の block 添字で直接帰属 {n_idx} 件**"
+          f"(記録の有無: block 添字 {fl.get('block_index', {}).get('n', 0)}/"
+          f"{fl.get('block_index', {}).get('of', 0)} ・ "
+          f"現在ノード {fl.get('block_node', {}).get('n', 0)}/"
+          f"{fl.get('block_node', {}).get('of', 0)} ・ "
+          f"実職場ノードを持つ個体 {fl.get('work_node', {}).get('n', 0)}/"
+          f"{fl.get('work_node', {}).get('of', 0)})", "",
           "## 2. 計画遵守率(3 段のはしご)", "",
           f"- 計画 {d['plans']} 件 / ブロック {d['blocks_planned']} 個 "
           f"→ 実行 {d['blocks_executed']} / 自動削除 {d['blocks_dropped']} /"
@@ -879,12 +998,18 @@ def render(res: dict) -> str:
         L.append(f"| {k} | {r['planned']} | {r['executed']} | {r['dropped']} |"
                  f" {r['untouched']} | {r['time_ok']} | {r['act_ok']} |"
                  f" {r['place_decided']} | {r['place_ok']} | {r['unresolved']} |")
+    w_exact = int(fl.get("work_node", {}).get("n", 0)) > 0
     L += ["", "## 4. 自動削除の理由", "",
           json.dumps(c["by_drop_reason"], ensure_ascii=False) or "{}", "",
           "> 場所の判定は `resolve_place` の**必要条件**(到達ノードが",
           "> `pois_by_cat(place)` に属するか)であって、「同じ 1 ノードを選んだか」では",
-          "> ない。`work` は `work_building` からの近似(agents.json に work_node が",
-          "> 残らないため)。帰属できなかったものは当てにいかず `unknown` に置いてある。"]
+          "> ない。`work` は " + ("agents.json の **work_node / part_time_node による実"
+                                  "ノード判定**(W4-F。転職前のスナップショットである点は"
+                                  "残る)。"
+                                  if w_exact else
+                                  "`work_building` からの**近似**(この旧ランの "
+                                  "agents.json に work_node が無いため)。"),
+          "> 帰属できなかったものは当てにいかず `unknown` に置いてある。"]
     return "\n".join(L) + "\n"
 
 

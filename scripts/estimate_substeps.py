@@ -11,7 +11,12 @@ agent·サブステップ = 実際の演算量)を見積もる。
 1 step あたりのサブステップ数がどう決まるか(実装からの写し)
 -------------------------------------------------------------
   n_sub_max(zone) = min(max_sub_steps, max(1, round(step_seconds / dt_sub)))
-        既定は min(12000, 600/0.05) = 12000。
+        正準 Δt=10 / dt_sub=0.05 では min(12000, 600/0.05) = 12000。
+        ★第99: `max_sub_steps` を宣言していないゾーンでは上限が
+          `round(step_seconds/dt_sub)` から**導出**されるようになった
+          (`society.world.zones.derive_max_sub_steps`)ので、Δt を変えても
+          上限が binding せず、Δt=20 で積分が半分に打ち切られることは無くなった。
+          明示宣言した値はそのまま尊重される(= 上限を意図的に絞る使い方は健在)。
   実際に回る数 sub_done(zone, step) は **ゾーンが空になったら打ち切られる**:
     - step の頭で members も waiting も居なければ `_run_zone` は即 return(= 0)。
     - 誰か居る間は毎刻み回る。**入場待ち(waiting)だけでも回る**(信号赤で縁石に
@@ -279,13 +284,17 @@ def _shoelace_area(poly) -> float:
     return abs(a) * 0.5
 
 
-def load_zones(conf_path: Path) -> tuple[list[dict], list[str]]:
+def load_zones(conf_path: Path,
+               step_seconds: float = DEFAULT_DT_MIN * 60.0) -> tuple[list[dict], list[str]]:
     """conf の `physics.zones` を見積用の軽い dict 列にする。
 
     `zones_enabled: false`(既定)でも **宣言があれば見積もる**(「ON にしたらどうなるか」が
     本ツールの用途なので)。その場合は注記を返す。
     src の `world.zones.build_cfg` を第一候補にして既定値の単一源を保つが、壁/歩行可能面の
     データファイルが無い環境では落ちるので、そのときは ZONE_DEFAULTS だけで組み直す。
+
+    `step_seconds` は `max_sub_steps` **未指定**のゾーンで上限を Δt から導くための入力
+    (第99・`zones.derive_max_sub_steps`)。既定は正準 Δt=10 の 600s = 従来と同値。
     """
     notes: list[str] = []
     cfg = _load_yaml(conf_path)
@@ -300,7 +309,7 @@ def load_zones(conf_path: Path) -> tuple[list[dict], list[str]]:
     forced["zones_enabled"] = True
     try:
         from society.world import zones as _zones
-        built = _zones.build_cfg(forced, _ROOT)["zones"]
+        built = _zones.build_cfg(forced, _ROOT, step_seconds=step_seconds)["zones"]
         out = [{"id": z.id, "engine": z.engine, "dt_sub": z.dt_sub,
                 "max_sub_steps": int(z.max_sub_steps),
                 "area_m2": float(z.walkable_area_m2 or z.area_m2() or 0.0),
@@ -319,11 +328,14 @@ def load_zones(conf_path: Path) -> tuple[list[dict], list[str]]:
     for spec in specs:
         s = dict(spec)
         poly = [(float(p[0]), float(p[1])) for p in (s.get("polygon") or ())]
+        _dt_sub = float(s.get("dt_sub", d.get("dt_sub", 0.05)))
         out.append({
             "id": str(s.get("id", "?")),
             "engine": str(s.get("engine", d.get("engine", "sfm"))),
-            "dt_sub": float(s.get("dt_sub", d.get("dt_sub", 0.05))),
-            "max_sub_steps": int(s.get("max_sub_steps", d.get("max_sub_steps", 12000))),
+            "dt_sub": _dt_sub,
+            # 第99: 未指定なら Δt から導く(build_cfg 経路と同じ規則を写す)
+            "max_sub_steps": (int(s["max_sub_steps"]) if "max_sub_steps" in s
+                              else max(1, int(round(float(step_seconds) / _dt_sub)))),
             "area_m2": _shoelace_area(poly) if len(poly) >= 3 else 0.0,
             "polygon_area_m2": _shoelace_area(poly) if len(poly) >= 3 else 0.0,
             "has_signal": bool(s.get("signal")),
@@ -531,8 +543,10 @@ def measured_estimate(calib_dir: Path, zones: list, agents: int, days: int, *,
     ratio_n = (float(agents) / float(calib_agents)) if calib_agents > 0 else 1.0
     calib_days = max(1e-9, scan["n_steps"] / n_per_day)
     for zid, iv in sorted(scan["intervals"].items()):
+        # conf に宣言が無いゾーン id(較正ランが別 conf で回っている等)の後退値。
+        # max_sub_steps は第99の規則どおり Δt から導く(dt_sub は正準 0.05 を仮定)。
         z = zmap.get(zid) or {"id": zid, "engine": "sfm", "dt_sub": 0.05,
-                              "max_sub_steps": 12000}
+                              "max_sub_steps": max(1, int(round(step_seconds / 0.05)))}
         n_sub_max = n_sub_per_step(z["dt_sub"], z["max_sub_steps"], step_seconds)
         mm = measure_substeps(iv, scan["n_steps"], z["dt_sub"], n_sub_max, step_seconds)
         # 体数外挿: duty は (1−duty)^ratio 則、agent·サブステップは体数に比例。
@@ -773,14 +787,16 @@ def main(argv: list) -> int:
 
     conf_path = _resolve(args.conf)
     notes: list = []
+    # ★ Δt を**先に**決める(第99): `max_sub_steps` 未指定のゾーンは上限を
+    #   step_seconds/dt_sub から導くので、ゾーンを組む前に step_seconds が要る。
+    dt_min = dt_min_of(conf_path if conf_path.exists() else None, args.dt_min)
+    n_per_day = max(1, (24 * 60) // dt_min)
     if not conf_path.exists():
         notes.append(f"conf が見つからない: {conf_path}(ゾーン 0 件として扱う)")
         zones, znotes = [], []
     else:
-        zones, znotes = load_zones(conf_path)
+        zones, znotes = load_zones(conf_path, step_seconds=dt_min * 60.0)
     notes.extend(znotes)
-    dt_min = dt_min_of(conf_path if conf_path.exists() else None, args.dt_min)
-    n_per_day = max(1, (24 * 60) // dt_min)
 
     weights = diurnal_weights(n_per_day, args.active_hours, args.night_factor, dt_min)
     if args.profile_run:

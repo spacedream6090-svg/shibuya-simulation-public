@@ -7,7 +7,9 @@ ledger.enabled=false では本サイドカーは生成されず、L1・org_outpu
 
 セグメント化/finalize は observer/logger.py・indoor_tracks.py と同一流儀(checkpoint 連携で part 化→
 finalize で結合、resume の _resumed フラグで分割実行チャンクの canonical を先頭結合)。これにより
-resume==straight の org_ledger バイト一致を保つ。
+resume==straight の org_ledger バイト一致を保つ。★W4-E(第99バッチ)で結合の実装は
+`observer/finalize.py` の `FinalizeStreamMixin` **1 本**へ括り出し、conf
+`observer.finalize.streaming`(既定 false)が L1 と同じ 1 つの判断で本サイドカーにも効くようにした。
 
 スキーマ(会社 UI タスク B7 がこの契約で読む=厳守):
   org_ledger.parquet: (day, org_id, production, revenue_est, wage_paid, serve_count, attendance_min)
@@ -27,10 +29,12 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from .finalize import FinalizeStreamMixin
+
 _STEM = "org_ledger"
 
 
-class OrgLedger:
+class OrgLedger(FinalizeStreamMixin):
     """組織日次系列の追記バッファ + セグメント/finalize(indoor_tracks.IndoorTracks と対の設計)。"""
 
     def __init__(self, out_dir: Path):
@@ -82,30 +86,9 @@ class OrgLedger:
         self._seg += 1
 
     # ---- 出力(finalize)----
+    # 結合(既定の concat 経路 / streaming 経路)は FinalizeStreamMixin が唯一の実装。
+    # ここに自前の複製は置かない(W4-E)。
     def finalize(self) -> Path | None:
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        return self._finalize_stream(self._table(self.rows) if self.rows else None)
-
-    def _finalize_stream(self, table: pa.Table | None) -> Path | None:
-        """part 群 + 残りバッファを結合して canonical parquet を出す(logger._finalize_stream と同流儀)。
-
-        part が無い(=checkpoint 無効)なら buffer を直接書く(byte 級同一)。分割実行(resume で clean
-        finalize したチャンク)のときだけ既存 canonical を先頭に結合する(_resumed=False の fresh は不変)。"""
-        parts = sorted(self.out_dir.glob(f"{_STEM}.part-*.parquet"))
-        canonical = self.out_dir / f"{_STEM}.parquet"
-        if not parts:
-            if table is None:
-                return None
-            pq.write_table(table, canonical, compression="zstd")
-            return canonical
-        tables = []
-        if self._resumed and canonical.exists():
-            tables.append(pq.read_table(canonical))
-        tables += [pq.read_table(p) for p in parts]
-        if table is not None and table.num_rows > 0:
-            tables.append(table)
-        combined = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
-        pq.write_table(combined, canonical, compression="zstd")
-        for p in parts:
-            p.unlink()
-        return canonical
+        return self._finalize_stream(_STEM,
+                                     self._table(self.rows) if self.rows else None)

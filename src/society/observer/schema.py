@@ -341,13 +341,22 @@ register_event_kind("plan_repair",      "決定的ルールによる計画の修
 register_event_kind("plan_fallback",    "修復不能 → 前日の計画 or ペルソナ既定ルーチンへ後退"
                                         "{kind(prev_day|skeleton), n, n_schema_err, "
                                         "n_phys_err, model}")
+#      W4-F: plan_block_* の 3 種に **block**(= plan_created.blocks[] の添字)を載せた。
+#      添字は plan_cont_fire にしか無く、事後解析が台帳を再生して推定するほかなかった
+#      (同値ブロックが 2 件あると多義になる)。plan_block_start にはさらに **node**
+#      = 実行を決めたその瞬間の**現在ノード(移動前)**を載せる。行き先ではないので
+#      「到達先」として読んではならない。同 step に route_start が無いときに限り
+#      「個体はそこに留まった」= そのブロックの場所である、と読める。
+#      どちらも記録専用(シム側で読む箇所はゼロ = 世界を動かさない)。
 register_event_kind("plan_block_start", "計画ブロックの実行開始(ルールエンジンが無料で実行)"
-                                        "{act, place, aim, priority, flex, start, slid, version}")
+                                        "{act, place, aim, priority, flex, start, slid, version, "
+                                        "node(実行時の現在ノード=移動前), block(台帳の添字)}")
 register_event_kind("plan_block_drop",  "計画ブロックの自動削除(LLM を呼ばずルールが削る)"
                                         "{act, place, start, priority, flex, "
-                                        "reason(grace|slide_cap|fixed_past|replan|no_place)}")
+                                        "reason(grace|slide_cap|fixed_past|replan|no_place"
+                                        "|cont_skip|cont_postpone|cont_no_place), block}")
 register_event_kind("plan_slide",       "計画ブロックを後ろへずらした(最小摂動の retime)"
-                                        "{act, place, start, slid, priority}")
+                                        "{act, place, start, slid, priority, block}")
 register_event_kind("plan_replan",      "must が脅かされたので再計画した(plan_version が上がる)"
                                         "{version, n_must, freed, at}")
 # ---- contingency の消費(第93バッチ IF-A・planning.day_plan.use_contingency ON のみ・
@@ -436,7 +445,10 @@ register_event_kind("org_overdraft",   "org の預金が賃金支払で負に落
                                        "破綻処理は入れない){org, amount, balance, shortfall, reason}")
 register_event_kind("row_flow",        "その日の rest-of-world(渋谷域外)との資金収支。"
                                        "『街が域外にどれだけ依存しているか』= 案B 固有の新しい研究量"
-                                       "{day, channels{ch:{in,out}}, in_total, out_total, net, org_balance}")
+                                       "{day, channels{ch:{in,out}}, in_total, out_total, net, org_balance,"
+                                       " k5_total}"
+                                       "(k5_total = 取引でない資産変動 SNA §3.98 の累積。第99で追加 = "
+                                       "L1 単独で city+RoW+K5 の保存を閉じられるようにするため)")
 
 
 @dataclass

@@ -9,8 +9,13 @@ D16 セグメント化: checkpoint 連携で flush_segment() が溜まったロ�
 
 W2-6 finalize のメモリ有界化(第98バッチ 2026-08-07・conf `observer.finalize.streaming`・既定 OFF)
 ----------------------------------------------------------------------------------------------
+★実装は W4-E(第99バッチ 2026-08-08)で `observer/finalize.py` の `FinalizeStreamMixin` へ
+括り出した(サイドカー 5 本が同型の finalize を自前で持っていたため = 二重実装の解消)。
+本 class はそれを継承するだけで、経路も既定値も 1 バイトも変わらない。以下の説明は
+そのまま有効(詳細と横展開の設計は `observer/finalize.py` の docstring)。
+
 上の「結合」を素直に書くと `pq.read_table` した **全 part を `pa.concat_tables` で 1 枚に
-載せてから** 書くことになる(下の `_finalize_stream` の既定経路)。part を作る目的が
+載せてから** 書くことになる(`FinalizeStreamMixin._finalize_stream` の既定経路)。part を作る目的が
 「走行中の RAM を解放すること」なのに、**最後の 1 回だけ全部を載せ直す**ので、ランの
 ピークメモリは結局 L1 の総量で決まる。在場 25万 × 10 日の L1 は
 `docs/plans/proposal-dp-u3-observe-250k.md` §2-4 の実測外挿で **42.7 GB・40.6 億イベント**
@@ -40,7 +45,6 @@ ON にすると part を **1 つずつ開き row-group 単位で読み**、`pq.P
 from __future__ import annotations
 
 import json
-import os
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -48,20 +52,19 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from .finalize import (FINALIZE_BATCH_ROWS, FINALIZE_ROW_GROUP_ROWS,  # noqa: F401
+                       FinalizeStreamMixin)
 from .schema import EVENT_KINDS, Event
 
-#: streaming finalize の既定 row-group 行数(pyarrow の `write_table` 既定と同じ 2**20)。
-#: これがそのまま ON 時のピークメモリの単位になる(conf `observer.finalize.row_group_rows`)。
-FINALIZE_ROW_GROUP_ROWS = 1 << 20
-#: part を読むときの RecordBatch 行数(l1_stream.DEFAULT_BATCH_ROWS と同値)。
-FINALIZE_BATCH_ROWS = 131_072
+# FINALIZE_ROW_GROUP_ROWS / FINALIZE_BATCH_ROWS は observer/finalize.py が唯一の定義。
+# ここでの再輸出は既存の参照(tests・スクリプト)を壊さないためだけのもの。
 
 
 def _dumps(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, sort_keys=True)
 
 
-class ObserverLogger:
+class ObserverLogger(FinalizeStreamMixin):
     def __init__(self, out_dir: Path):
         self.out_dir = Path(out_dir)
         self.events: list[Event] = []          # L1
@@ -79,7 +82,8 @@ class ObserverLogger:
         # ---- W2-6: finalize のメモリ有界化(conf observer.finalize.streaming。既定 OFF)----
         # False = 従来の「全 part を concat_tables」経路(1 バイトも変えない)。
         # True  = part を 1 つずつ row-group 単位で読み ParquetWriter へ流す。
-        # 配線は engine/simulation.py の ObserverLogger 生成直後 1 箇所だけ。
+        # 実装は FinalizeStreamMixin(observer/finalize.py)。配線は
+        # engine/simulation.py の finalize.apply_cfg 1 箇所だけ(サイドカーと同じ関数)。
         self.streaming_finalize: bool = False
         self.finalize_row_group_rows: int = FINALIZE_ROW_GROUP_ROWS
         # ---- LLM 健全性 KPI(P0バッチ 2026-07-29)の O(1) 累積カウンタ ----
@@ -203,152 +207,20 @@ class ObserverLogger:
         self._seg += 1
 
     # ---- 出力(finalize)----
+    # 結合の実装は FinalizeStreamMixin(observer/finalize.py)に 1 本だけ置いてある。
+    # l1_events はバッファが空でも `_l1_table([])`(0 行の表)を渡すので canonical が必ず出る
+    # (他の 3 本は行が無ければ None = ファイルを作らない、という従来どおりの線引き)。
     def flush(self) -> dict[str, Path]:
         self.out_dir.mkdir(parents=True, exist_ok=True)
         paths: dict[str, Path] = {}
-        l1 = self._finalize_stream("l1_events", self._l1_table(self.events),
-                                   always=True)
+        l1 = self._finalize_stream("l1_events", self._l1_table(self.events))
         if l1 is not None:
             paths["l1"] = l1
         for stem, rows in [("l1b_llm", self.llm_calls),
                            ("l2_metrics", self.metrics),
                            ("l3_snapshots", self.snapshots)]:
             table = self._rows_table(rows) if rows else None
-            p = self._finalize_stream(stem, table, always=False)
+            p = self._finalize_stream(stem, table)
             if p is not None:
                 paths[stem] = p
         return paths
-
-    def _finalize_stream(self, stem: str, table: pa.Table | None,
-                         always: bool) -> Path | None:
-        """part 群 + 残りバッファを結合して canonical parquet を出す。
-
-        part が無い(=checkpoint 無効)場合は従来どおり buffer を直接書く(byte 級同一)。
-        """
-        parts = sorted(self.out_dir.glob(f"{stem}.part-*.parquet"))
-        canonical = self.out_dir / f"{stem}.parquet"
-        if not parts:
-            if table is None:
-                return None
-            pq.write_table(table, canonical, compression="zstd")
-            return canonical
-        if self.streaming_finalize:            # W2-6: 有界メモリ経路(既定 OFF=ここに入らない)
-            return self._finalize_streaming(stem, table, parts, canonical)
-        tables = []
-        # 分割実行(resume で clean に finalize したチャンク)のときだけ、前チャンクが書いた
-        # canonical を先頭に含める。straight ラン / crash-recovery(前 finalize 無し=canonical 不在)
-        # では発火しないため従来と完全同一(_resumed=False の fresh ランはこの分岐に一切入らない)。
-        if self._resumed and canonical.exists():
-            tables.append(pq.read_table(canonical))
-        tables += [pq.read_table(p) for p in parts]
-        if table is not None and table.num_rows > 0:
-            tables.append(table)
-        combined = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
-        pq.write_table(combined, canonical, compression="zstd")
-        for p in parts:
-            p.unlink()
-        return canonical
-
-    # ------------------------------------------------------------------ #
-    # W2-6: streaming finalize(observer.finalize.streaming=true のときだけ)
-    # ------------------------------------------------------------------ #
-    def _sources(self, parts: list[Path], canonical: Path) -> list[Path]:
-        """結合する parquet を読む順に並べる(既定経路の tables の組み立てと同じ順序)。
-
-        分割実行(resume で clean に finalize したチャンク)のときだけ前チャンクの
-        canonical を先頭に置く。**この規則は既定経路と 1 文字も違わない**(同じ条件式)。
-        """
-        src: list[Path] = []
-        if self._resumed and canonical.exists():
-            src.append(canonical)
-        return src + list(parts)
-
-    def _merged_schema(self, sources: list[Path],
-                       table: pa.Table | None) -> pa.Schema:
-        """全ソースの schema を footer だけから読んで統一する(**1 行も読まない**)。
-
-        part 間で列集合や型がずれうる(`_rows_table` は part ごとに「その part に現れた
-        キーの和集合」で表を作るので、ある列が part-0 に無い / part-0 では全 None =
-        null 型ということが起きる)。`promote_options="permissive"` は null → 具体型の
-        昇格と欠測列の補完を許す = **欠測を偽の値で埋めず null のまま揃える**。
-        """
-        schemas = []
-        for src in sources:
-            schemas.append(pq.read_schema(src))
-        if table is not None and table.num_rows > 0:
-            schemas.append(table.schema)
-        if len(schemas) == 1:
-            return schemas[0]
-        return pa.unify_schemas(schemas, promote_options="permissive")
-
-    @staticmethod
-    def _align(tbl: pa.Table, schema: pa.Schema) -> pa.Table:
-        """統一 schema へ揃える(欠測列は null で補い、型は cast する)。"""
-        if tbl.schema.equals(schema):
-            return tbl
-        cols = []
-        names = set(tbl.schema.names)
-        for field in schema:
-            if field.name in names:
-                col = tbl.column(field.name).cast(field.type)
-            else:                              # 欠測列は null で埋める(偽の値を作らない)
-                col = pa.chunked_array([pa.nulls(tbl.num_rows, field.type)],
-                                       type=field.type)
-            cols.append(col)
-        return pa.Table.from_arrays(cols, schema=schema)
-
-    def _finalize_streaming(self, stem: str, table: pa.Table | None,
-                            parts: list[Path], canonical: Path) -> Path:
-        """part を 1 つずつ row-group 単位で読み、ParquetWriter へ流して canonical を作る。
-
-        ピークメモリ = 「まだ書き出していない row-group 1 個ぶん」+「読み込み中の
-        RecordBatch 1 個ぶん」だけで、**part 数にも L1 総量にも依存しない**。
-        全部を 1 枚の Table に載せる操作(`read_table` / `concat_tables`)を
-        **この経路では 1 度も呼ばない**ことが有界性の構造的な根拠であり、
-        tests/test_finalize_streaming.py が AST で固定している。
-
-        出力は既定経路と **行の内容・行順・スキーマが同値**(バイト列は row-group の
-        切れ目が変わるので一致しない)。書き込み先は一時ファイルで、成功したときだけ
-        `os.replace` で canonical を差し替える(merge 中に落ちても canonical と part が
-        そのまま残る = 既定経路より安全)。
-        """
-        sources = self._sources(parts, canonical)
-        schema = self._merged_schema(sources, table)
-        tmp = self.out_dir / f"{stem}.parquet.tmp"
-        rg_rows = max(1, int(self.finalize_row_group_rows))
-        buf: list[pa.RecordBatch] = []
-        n_buf = 0
-
-        writer = pq.ParquetWriter(tmp, schema, compression="zstd")
-        try:
-            def _drain() -> None:
-                nonlocal buf, n_buf
-                if not buf:
-                    return
-                writer.write_table(pa.Table.from_batches(buf, schema=schema))
-                buf, n_buf = [], 0
-
-            for src in sources:
-                pf = pq.ParquetFile(src)
-                try:
-                    for batch in pf.iter_batches(batch_size=FINALIZE_BATCH_ROWS):
-                        if batch.num_rows == 0:
-                            continue
-                        aligned = self._align(pa.Table.from_batches([batch]), schema)
-                        buf.extend(aligned.to_batches())
-                        n_buf += aligned.num_rows
-                        if n_buf >= rg_rows:
-                            _drain()
-                finally:
-                    pf.close()
-            if table is not None and table.num_rows > 0:
-                aligned = self._align(table, schema)
-                buf.extend(aligned.to_batches())
-                n_buf += aligned.num_rows
-            _drain()
-        finally:
-            writer.close()
-        os.replace(tmp, canonical)             # 読み終えてから差し替える(Windows でも可)
-        for p in parts:
-            p.unlink()
-        return canonical

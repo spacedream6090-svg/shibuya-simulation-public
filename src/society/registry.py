@@ -712,7 +712,11 @@ FEATURES: tuple[Feature, ...] = (
        "依存しない。★観察ランでは ON を推奨する。"
        "出力は OFF と行の内容・行順・スキーマが完全同値(**バイト列は row-group の切れ目が"
        "変わるので不一致**)。part が 1 つも無いランは ON でも従来経路に落ちる=バイト一致。"
-       "副産物として一時ファイル + os.replace により merge 中のクラッシュに強い"),
+       "副産物として一時ファイル + os.replace により merge 中のクラッシュに強い。"
+       "★W4-E(第99バッチ)で対象は L1/L1b/L2/L3 に加え **サイドカー全部**"
+       "(indoor_tracks_samples / indoor_tracks_contacts / org_ledger / finance / channels /"
+       " cognition_g)になった。実装は observer/finalize.py の FinalizeStreamMixin 1 本で、"
+       "**この 1 キーの判断で全ファイルが同じモードになる**(サイドカー用の別キーは作らない)"),
     _f("observer.echo.enabled", "strict", False, "none",
        "L2 にエコー/自己反復 5列を足す(観測専用・常設)"),
     # 第91バッチ: 退行シグナル監視(設計 §3)。L1 を読むだけで世界も乱数も 1 バイト触らない=strict。

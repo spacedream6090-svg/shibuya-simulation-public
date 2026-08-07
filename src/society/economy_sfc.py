@@ -138,6 +138,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .observer.finalize import FinalizeStreamMixin
 from .observer.schema import Event
 
 SCHEMA = 1
@@ -808,7 +809,14 @@ def _emit(sim, st: dict, day: int, step: int, sim_min: int,
     ``row_step`` はサイドカー行に書く step(既定 = L1 の step)。日境界の行は
     ``day_roll`` = **step 先頭**で採られるので「その step の活動より前の残高」を意味し、
     窓 [s0, s1) の排他境界がそのまま成立する。最終行だけは全 step を走り終えた後に採るので
-    ``n_steps`` を書く(そうしないと最後の step のフローが窓から落ちる = オフバイワン)。"""
+    ``n_steps`` を書く(そうしないと最後の step のフローが窓から落ちる = オフバイワン)。
+
+    IF-E2 残③(第99): K5(取引でない資産変動。SNA 2008 §3.98)は今まで
+    ``finance.parquet`` の ``k5_other`` 列**にしか**出ていなかった = L1 だけを見る解析
+    (l1_stream / detect_regression / 外部の読み手)から K5 が見えず、総マネー保存
+    ``city + RoW + K5`` の第 3 項を L1 単独では閉じられなかった。ここで **1 キーだけ**
+    足す。粒度は ``in_total`` / ``out_total`` と同じ**累積**にする(内訳は provenance の
+    ``k5_kinds``・日次差分は連続する 2 行の引き算で採れる = 新しい指標を定義しない)。"""
     prev = st.get("row_prev") or {}
     delta = {}
     for ch, v in sorted(st["row"].items()):
@@ -823,7 +831,13 @@ def _emit(sim, st: dict, day: int, step: int, sim_min: int,
                                   "in_total": round(r_in, 1),
                                   "out_total": round(r_out, 1),
                                   "net": round(r_out - r_in, 1),
-                                  "org_balance": round(sum(st["org"].values()), 1)}))
+                                  "org_balance": round(sum(st["org"].values()), 1),
+                                  # 第99: K5 累積。`_finance_row` の `k5_other` 列と
+                                  # **同一の式**(丸め桁だけ L1 の他キーに合わせて 1 桁)。
+                                  # float() は空 dict の sum が int 0 になるのを防ぐ
+                                  # (L1 は JSON バイト比較の対象 = 型が揺れてはいけない)。
+                                  "k5_total": round(
+                                      float(sum((st.get("k5") or {}).values())), 1)}))
     st["row_prev"] = {k: dict(v) for k, v in st["row"].items()}
     sc = getattr(sim, "finance_sc", None)
     if sc is not None:
@@ -909,6 +923,9 @@ def provenance(sim) -> dict | None:
 #
 # ★記録と動力学の分離(indoor_tracks.py の設計原則③): 動力学は add_rows / flush_segment /
 #   finalize しか呼ばず、本クラスの内部バッファ(.rows)を読む向きは存在しない。
+# ★W4-E(第99バッチ): part 群 → canonical の結合は observer/finalize.py の
+#   FinalizeStreamMixin **1 本**が実装する(同型 finalize の二重実装をやめた)。conf
+#   `observer.finalize.streaming`(既定 false)が L1 と同じ 1 つの判断で本サイドカーにも効く。
 # --------------------------------------------------------------------------- #
 COLUMNS: tuple[str, ...] = (
     "day", "step", "org_balance", "org_count", "org_negative", "org_min",
@@ -920,7 +937,7 @@ COLUMNS: tuple[str, ...] = (
 )
 
 
-class FinanceLedger:
+class FinanceLedger(FinalizeStreamMixin):
     """部門別残高の日次サイドカー(``finance.parquet``)。検査①を org/bank/RoW/行政で成立させる。"""
 
     def __init__(self, out_dir):
@@ -975,28 +992,9 @@ class FinanceLedger:
             self.rows = []
         self._seg += 1
 
+    # 結合(既定の concat 経路 / streaming 経路)は FinalizeStreamMixin が唯一の実装。
+    # ここに自前の複製は置かない(W4-E)。
     def finalize(self):
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        return self._finalize_stream(self._table(self.rows) if self.rows else None)
-
-    def _finalize_stream(self, table):
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-        parts = sorted(self.out_dir.glob(f"{_STEM}.part-*.parquet"))
-        canonical = self.out_dir / f"{_STEM}.parquet"
-        if not parts:
-            if table is None:
-                return None
-            pq.write_table(table, canonical, compression="zstd")
-            return canonical
-        tables = []
-        if self._resumed and canonical.exists():
-            tables.append(pq.read_table(canonical))
-        tables += [pq.read_table(p) for p in parts]
-        if table is not None and table.num_rows > 0:
-            tables.append(table)
-        combined = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
-        pq.write_table(combined, canonical, compression="zstd")
-        for p in parts:
-            p.unlink()
-        return canonical
+        return self._finalize_stream(_STEM,
+                                     self._table(self.rows) if self.rows else None)

@@ -195,6 +195,30 @@ def test_build_cfg_rejects_bad_declarations():
         pass
 
 
+def test_max_sub_steps_tracks_dt_through_the_clock(tmp_path):
+    """第99(物理見積 残①): `max_sub_steps` 未指定のゾーンは上限を **Δt から導く**。
+
+    OBS-U2 §1.2 B5 / R7 は「12000 は 600s/0.05s の直書きで Δt に追随しない。Δt>10 では
+    physics.py:331 の min() が積分を黙って打ち切る」と指摘していた。Simulation は
+    `clock.step_seconds` を build_cfg へ渡すので、宣言が書いていなければ上限が追随する。
+    **Δt=10 では厳密に 12000 = 従来値**(= 既定ランは 1 ビットも変わらない)。
+    """
+    def cap(name, **ov):
+        sim = _sim(tmp_path, name, n=6, steps=1, zone_specs=[_zone()], **ov)
+        return int(sim.physcfg["zones"][0].max_sub_steps)
+
+    assert cap("cap_dt10") == 12000, "既定 Δt=10 で従来値 12000 から動いた"
+    assert cap("cap_dt20", **{"run.dt_min": 20}) == 24000     # 旧: 12000 で打ち切り
+    assert cap("cap_dt1", **{"run.dt_min": 1}) == 1200
+    # 明示宣言は Δt に関わらず尊重される(上限を意図的に絞る使い方 = resume テストの前提)
+    sim = _sim(tmp_path, "cap_explicit", n=6, steps=1,
+               zone_specs=[_zone(max_sub_steps=400)], **{"run.dt_min": 20})
+    assert int(sim.physcfg["zones"][0].max_sub_steps) == 400
+    # 導出は physics.py:331 の min() を binding させない = step 全長ぶん積める
+    z = sim.physcfg["zones"][0]
+    assert zones.derive_max_sub_steps(z.dt_sub, 1200.0) == 24000
+
+
 def test_overlapping_zones_are_rejected():
     """ゾーン非重複(P2 決定 条件6)。重複宣言はランを始めさせない。"""
     a = _zone("a")

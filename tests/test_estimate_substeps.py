@@ -43,12 +43,78 @@ def test_n_sub_per_step_matches_physics_formula():
     dt = float(ZONE_DEFAULTS["dt_sub"])
     cap = int(ZONE_DEFAULTS["max_sub_steps"])
     assert ES.n_sub_per_step(dt, cap, 600.0) == 12000          # 既定 = 600s / 0.05s
-    # 上限が binding するのは Δt > 10 分のとき(zones.py の警告コメントと同じ現象)
+    # ★純関数そのものは不変(physics.py:331 の写し)。**明示的に 12000 を渡せば**
+    #   Δt=20 で 24000 要るのに 12000 で止まる、という打ち切りは今も起きる。
+    #   第99 が変えたのは「未指定のときに 12000 が渡ってしまう」側であって、この式ではない。
     assert ES.n_sub_per_step(0.05, 12000, 1200.0) == 12000     # 24000 要るのに 12000 で止まる
     assert ES.n_sub_per_step(0.05, 12000, 60.0) == 1200        # Δt=1分 なら上限に届かない
     assert ES.n_sub_per_step(0.1, 12000, 600.0) == 6000
     assert ES.n_sub_per_step(0.05, 3, 600.0) == 3
     assert ES.n_sub_per_step(1000.0, 12000, 600.0) == 1        # 最低 1 刻み
+
+
+# --------------------------------------------------------------------------- #
+# 第99(物理見積 残①): max_sub_steps の Δt 追随
+#   旧仕様は「12000 の直書きが Δt に追随せず、Δt>10 で積分を黙って打ち切る」だった
+#   (OBS-U2 §1.2 B5 / R7)。上限を **step_seconds/dt_sub から導く**ことでこれを閉じる。
+#   上の固定テストは「現状仕様の文書化」だったので、導出化に合わせてここで追随更新する。
+# --------------------------------------------------------------------------- #
+def test_derived_cap_is_exactly_the_current_value_at_the_canonical_dt():
+    """Δt=10 / dt_sub=0.05(= 正準)では導出値が **厳密に 12000** = 現行完全同値。"""
+    from society.world.zones import ZONE_DEFAULTS, derive_max_sub_steps
+    dt = float(ZONE_DEFAULTS["dt_sub"])
+    assert derive_max_sub_steps(dt, 600.0) == int(ZONE_DEFAULTS["max_sub_steps"]) == 12000
+    # step_seconds を知らない呼び出しは正準値へ後退する(既存ツール経路がバイト不変)
+    assert derive_max_sub_steps(dt, None) == 12000
+
+
+def test_derived_cap_follows_dt_and_stops_truncating_the_integration():
+    """Δt を動かすと上限が追随し、**上限が binding しなくなる**(打ち切りが消える)。"""
+    from society.world.zones import derive_max_sub_steps
+    for step_s, want in ((60.0, 1200), (600.0, 12000), (1200.0, 24000), (3600.0, 72000)):
+        cap = derive_max_sub_steps(0.05, step_s)
+        assert cap == want
+        # 上限と「必要数」が一致 = min() が上限側で切らない = 積分が step 全長を進む
+        assert ES.n_sub_per_step(0.05, cap, step_s) == want
+    assert derive_max_sub_steps(1000.0, 600.0) == 1            # 最低 1 刻み
+
+
+def test_build_cfg_derives_the_cap_only_when_it_is_not_declared():
+    """未指定 → 導出 / 明示指定 → そのまま尊重(上限を意図的に絞る使い方は健在)。"""
+    from society.world import zones as Z
+    poly = [[0, 0], [30, 0], [30, 30], [0, 30]]
+    base = {"id": "z", "engine": "sfm", "dt_sub": 0.05, "polygon": poly}
+
+    def cap(spec, step_seconds):
+        cfg = Z.build_cfg({"zones_enabled": True, "zones": [spec]}, REPO_ROOT,
+                          step_seconds=step_seconds)
+        return int(cfg["zones"][0].max_sub_steps)
+
+    assert cap(base, 600.0) == 12000                            # Δt=10 = 現行完全同値
+    assert cap(base, 1200.0) == 24000                           # Δt=20 = 追随する
+    assert cap(base, 60.0) == 1200                              # Δt=1
+    assert cap(base, None) == 12000                             # Δt 不明 = 正準値
+    explicit = dict(base, max_sub_steps=400)                    # test_physics_zones の resume 用
+    for ss in (60.0, 600.0, 1200.0, None):
+        assert cap(explicit, ss) == 400, "明示宣言が導出に上書きされている"
+    # 「12000 と明示的に書いた」も尊重する(= _merge の既定埋めと区別できている)
+    assert cap(dict(base, max_sub_steps=12000), 1200.0) == 12000
+
+
+def test_load_zones_derives_the_cap_from_dt(tmp_path):
+    """見積ツール側(conf 直読み・build_cfg 経路とも)も同じ規則で導く。"""
+    p = tmp_path / "c.yaml"
+    p.write_text("physics:\n  zones_enabled: true\n  zones:\n"
+                 "    - id: zz\n      engine: sfm\n      dt_sub: 0.05\n"
+                 "      polygon: [[0,0],[10,0],[10,10],[0,10]]\n", encoding="utf-8")
+    assert ES.load_zones(p)[0][0]["max_sub_steps"] == 12000              # 既定 = 従来値
+    assert ES.load_zones(p, step_seconds=1200.0)[0][0]["max_sub_steps"] == 24000
+    q = tmp_path / "d.yaml"
+    q.write_text("physics:\n  zones_enabled: true\n  zones:\n"
+                 "    - id: zz\n      engine: sfm\n      dt_sub: 0.05\n"
+                 "      max_sub_steps: 400\n"
+                 "      polygon: [[0,0],[10,0],[10,10],[0,10]]\n", encoding="utf-8")
+    assert ES.load_zones(q, step_seconds=1200.0)[0][0]["max_sub_steps"] == 400
 
 
 def test_substeps_from_busy_is_ceiling_and_capped():

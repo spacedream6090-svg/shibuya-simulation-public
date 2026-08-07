@@ -158,6 +158,8 @@ def build(sim) -> dict:
             "seed_auto": bool(cfg.run.get("seed_auto", False)),
             "n_agents": int(cfg.run.n_agents),
             "n_steps": int(cfg.run.n_steps),
+            # 第101: Δt の第2の源(scripts/run_dt.py が config.yaml の次に読む)。
+            "dt_min": int(cfg.run.get("dt_min", 10)),
             "name": (str(cfg.run.name) if cfg.run.get("name") else None),
             "start_tod": str(cfg.run.get("start_tod", "07:00")),
             "start_date": (str(calendar.get("start_date"))

@@ -14,6 +14,10 @@
   (7) day_plan OFF ラン = 遵守率は **0.0 ではなく null**
   (8) 空ラン・欠損ランで落ちない
   (9) 語彙被覆(地図 × PLACE_CATS)= 台帳の「266 中 5」を置き換える測り方
+ (10) W4-F の 3 記録(agents.json.work_node / plan_block_start.node /
+      plan_block_*.block)がある新ランでは厳密判定になり、無い旧ランは 1 行も
+      変えずに従来経路へ落ちる。★どちらでも **測定値そのものは変わらない**
+      (強くなるのは帰属の証拠だけ)= (4) と同型の不変量
 """
 from __future__ import annotations
 
@@ -76,8 +80,13 @@ def _start_payload(b, start=None, slid=0):
             "slid": int(slid), "version": 1}
 
 
-def _scenario(with_role=True):
-    """1 体 1 日・5 ブロック。手計算の正解つき(下の test が固定する)。"""
+def _scenario(with_role=True, w4f=False):
+    """1 体 1 日・5 ブロック。手計算の正解つき(下の test が固定する)。
+
+    `w4f=True` は同じ筋書きを **W4-F 以降のランの形**(plan_block_* に block 添字、
+    plan_block_start に実行時の現在ノード)で出す。世界の出来事は 1 つも変えていない
+    ので、測定値は w4f=False と 1 桁も違ってはならない(下の test が固定する)。
+    """
     bs = _blocks()
     role = {"llm_role": "plan"} if with_role else {}
     cid = "c1"
@@ -105,6 +114,14 @@ def _scenario(with_role=True):
             {"act": "work", "place": "work", "start": 960, "priority": "must",
              "flex": "fixed", "reason": "missed"}),
     ]
+    if w4f:
+        block_of = {1: 0, 3: 1, 4: 1, 6: 2, 8: 3, 9: 4}     # seq → ブロック添字
+        at_node = {1: "nH", 4: "nF", 6: "nX", 8: "nH"}      # 実行時の現在ノード(移動前)
+        for e in ev:
+            if e["seq"] in block_of:
+                e["payload"]["block"] = block_of[e["seq"]]
+            if e["kind"] == "plan_block_start":
+                e["payload"]["node"] = at_node[e["seq"]]
     return ev
 
 
@@ -181,7 +198,9 @@ def test_prov_path_three_stage_rates_match_hand_computation():
     assert res["day_plan"]["present"] is True
     at = res["attribution"]
     assert at["path"] == "prov"
-    assert at["by_source"] == {"prov": 3, "step_join": 0, "none": 1, "detour": 0}
+    # block_node は W4-F の第 3 経路(この合成は旧ラン形なので 0 件)
+    assert at["by_source"] == {"prov": 3, "step_join": 0, "block_node": 0,
+                               "none": 1, "detour": 0}
     assert at["n_route_start_role_plan"] == 3
 
     d = res["compliance"]["denominator"]
@@ -239,7 +258,8 @@ def test_step_join_fallback_when_llm_link_is_off():
     assert off["attribution"]["path"] == "step_join"
     assert off["attribution"]["n_route_start_role_plan"] == 0
     assert off["attribution"]["by_source"] == {"prov": 0, "step_join": 3,
-                                               "none": 1, "detour": 0}
+                                               "block_node": 0, "none": 1,
+                                               "detour": 0}
     # ★経路が変わっても遵守率は 1 桁も動かない(帰属の証拠だけが違う)
     assert off["compliance"]["stage"] == on["compliance"]["stage"]
     assert off["compliance"]["by_place"] == on["compliance"]["by_place"]
@@ -547,3 +567,156 @@ def test_render_is_pure_text_and_mentions_both_paths():
     assert "帰属経路" in md and "prov" in md
     assert "3 段のはしご" in md
     assert "place 別の内訳" in md
+
+
+# =========================================================================== #
+# (10) W4-F: src 側が足した 3 記録(新ランは厳密・旧ランは従来経路のまま)
+#
+#   agents.json.work_node / part_time_node  … 職場判定が建物近似 → 実ノード
+#   plan_block_start.node                   … 「既に居た」ケースの no_move_event が消える
+#   plan_block_*.block                      … 台帳再生の多義が構造的に消える
+# =========================================================================== #
+def test_w4f_fields_do_not_move_the_measurement_only_the_evidence():
+    """★新フィールドを足しても遵守率は 1 桁も動かない(強くなるのは帰属の証拠だけ)。"""
+    old = _summarize(_scenario())
+    new = _summarize(_scenario(w4f=True))
+    assert new["compliance"]["stage"] == old["compliance"]["stage"]
+    assert new["compliance"]["by_place"] == old["compliance"]["by_place"]
+    assert new["compliance"]["denominator"] == old["compliance"]["denominator"]
+    # 変わるのは帰属の内訳(street ブロックが「留まった」経路で説明できるようになる)
+    assert old["attribution"]["by_source"]["none"] == 1
+    assert new["attribution"]["by_source"]["none"] == 0
+    assert new["attribution"]["by_source"]["block_node"] == 1
+
+
+def test_w4f_block_index_is_used_instead_of_replaying_the_ledger():
+    days, stats = APE.build_ledger(_scenario(w4f=True), DP.build_cfg(None))
+    assert stats["by_index"] == {"drop": 1, "slide": 1, "start": 4}
+    assert stats["ambiguous"] == {} and stats["unmatched"] == {}
+    assert stats["block_index_bad"] == 0
+    assert all(b["exec"]["attrib"] == "index"
+               for b in days[0]["blocks"] if b["exec"])
+    # 旧ランは従来どおり台帳再生(by_index は 1 件も立たない)
+    _d2, old = APE.build_ledger(_scenario(), DP.build_cfg(None))
+    assert old["by_index"] == {}
+    assert old["matched"] == {"drop": 1, "slide": 1, "start": 4}
+
+
+def test_w4f_block_index_removes_the_ambiguity_of_two_identical_blocks():
+    """同値ブロック 2 件 = 旧ランでは多義。添字があれば差し戻しすら要らない。"""
+    same = {"start": 600, "end": 660, "place": "food", "act": "meal",
+            "aim": "sustenance", "priority": "should", "flex": "slideable"}
+    ev = [_ev(0, 40, 400, 1, "plan_created",
+              {"n": 2, "src": "llm", "blocks": [dict(same), dict(same)]}, "c1"),
+          _ev(1, 60, 600, 1, "plan_block_drop",
+              {"act": "meal", "place": "food", "start": 600, "priority": "should",
+               "flex": "slideable", "reason": "cont_skip", "block": 1}),
+          _ev(2, 60, 600, 1, "plan_cont_fire",
+              {"cond": "closed", "then": "skip", "block": 1, "act": "meal",
+               "place": "food", "start": 600, "applied": True})]
+    days, stats = APE.build_ledger(ev, DP.build_cfg(None))
+    assert days[0]["blocks"][0]["state"] == "todo"
+    assert days[0]["blocks"][1]["state"] == "dropped"
+    assert stats["ambiguous"] == {}, "添字があるのに多義を数えている"
+    assert stats["cont_reattributed"] == 0, "誤帰属が起きていないのに差し戻した"
+    assert stats["by_index"] == {"drop": 1}
+
+
+def test_w4f_out_of_range_block_index_is_counted_and_falls_back_to_replay():
+    """壊れた添字は当てにいかず数え、従来の台帳再生へ落ちる(-1 も同じ扱い)。"""
+    bs = [{"start": 480, "end": 540, "place": "food", "act": "meal",
+           "aim": "sustenance", "priority": "should", "flex": "slideable"}]
+    ev = [_ev(0, 40, 400, 1, "plan_created", {"n": 1, "src": "llm", "blocks": bs},
+              "c1"),
+          _ev(1, 48, 480, 1, "plan_block_start",
+              {**_start_payload(bs[0]), "node": "nF", "block": 7})]
+    days, stats = APE.build_ledger(ev, DP.build_cfg(None))
+    assert stats["block_index_bad"] == 1
+    assert stats["by_index"] == {}
+    assert stats["matched"] == {"start": 1}                 # 再生で拾えている
+    assert days[0]["blocks"][0]["exec"]["attrib"] == "replay"
+
+
+def test_w4f_block_node_resolves_the_already_at_destination_case():
+    """★移動イベントが無い step は「留まった」= その現在ノードがブロックの場所。"""
+    bs = [{"start": 600, "end": 660, "place": "food", "act": "meal",
+           "aim": "sustenance", "priority": "should", "flex": "slideable"}]
+    created = _ev(0, 40, 400, 1, "plan_created",
+                  {"n": 1, "src": "llm", "blocks": bs}, "c1")
+    old = _summarize([created,
+                      _ev(1, 60, 600, 1, "plan_block_start", _start_payload(bs[0]))])
+    assert old["compliance"]["stage"]["place"]["by_reason"] == {"no_move_event": 1}
+    new = _summarize([created,
+                      _ev(1, 60, 600, 1, "plan_block_start",
+                          {**_start_payload(bs[0]), "node": "nF", "block": 0})])
+    s = new["compliance"]["stage"]
+    assert s["place"]["by_reason"] == {}, "no_move_event が残っている"
+    assert (s["place"]["n"], s["place"]["ok"]) == (1, 1)
+    assert new["attribution"]["by_source"]["block_node"] == 1
+    assert new["attribution"]["path"] == "block_node"
+
+
+def test_w4f_block_node_never_overrides_an_actual_move():
+    """node は移動前の出発地。移動が起きた step では 1 度も使われない。"""
+    bs = [{"start": 480, "end": 540, "place": "food", "act": "meal",
+           "aim": "sustenance", "priority": "should", "flex": "slideable"}]
+    ev = [_ev(0, 40, 400, 1, "plan_created", {"n": 1, "src": "llm", "blocks": bs},
+              "c1"),
+          # 出発地 nX(夜の店)から food の nF へ移動した
+          _ev(1, 48, 480, 1, "plan_block_start",
+              {**_start_payload(bs[0]), "node": "nX", "block": 0}),
+          _ev(2, 48, 480, 1, "route_start", {"dest": "nF", "llm_role": "plan"}, "c1")]
+    days, _stats = APE.build_ledger(ev, DP.build_cfg(None))
+    at = APE.attach_nodes(days, ev)
+    ex = days[0]["blocks"][0]["exec"]
+    assert (ex["node"], ex["node_src"]) == ("nF", "prov")
+    assert at["by_source"]["block_node"] == 0
+    assert _summarize(ev)["compliance"]["stage"]["place"]["ok"] == 1
+
+
+def test_w4f_work_node_makes_the_work_judgement_exact(tmp_path):
+    (tmp_path / "agents.json").write_text(json.dumps(
+        [{"id": 1, "home": "nH", "work_building": "bW",
+          "work_node": "nP", "part_time_node": "nS"}], ensure_ascii=False),
+        encoding="utf-8")
+    agents = APE.load_agents(str(tmp_path), _mapidx())
+    assert agents[1]["work_src"] == "exact_node"
+    assert agents[1]["work_nodes"] == {"nP", "nS"}          # 本業 ∪ バイト先
+    assert APE.place_status("work", "nP", 1, _mapidx(), agents) == \
+        ("match", "exact_node")
+    assert APE.place_status("work", "nS", 1, _mapidx(), agents)[0] == "match"
+    # 実ノードが判るランでは、同じ建物の別ノードはもう match しない(近似の卒業)
+    assert APE.place_status("work", "nW", 1, _mapidx(), agents)[0] == "mismatch"
+
+
+def test_w4f_work_node_absent_falls_back_to_the_building_approximation(tmp_path):
+    (tmp_path / "agents.json").write_text(json.dumps(
+        [{"id": 1, "home": "nH", "work_building": "bW"}], ensure_ascii=False),
+        encoding="utf-8")
+    agents = APE.load_agents(str(tmp_path), _mapidx())
+    assert agents[1]["work_src"] == "approx_building"
+    assert agents[1]["work_nodes"] == {"nW"}
+    assert APE.place_status("work", "nW", 1, _mapidx(), agents) == \
+        ("match", "approx_building")
+
+
+def test_w4f_field_support_reports_raw_counts_not_rates():
+    old = _summarize(_scenario())["day_plan"]["fields"]
+    assert old["block_index"] == {"n": 0, "of": 6}          # start4 + slide1 + drop1
+    assert old["block_node"] == {"n": 0, "of": 4}
+    assert old["work_node"] == {"n": 0, "of": 1}
+    new = _summarize(_scenario(w4f=True))["day_plan"]["fields"]
+    assert new["block_index"] == {"n": 6, "of": 6}
+    assert new["block_node"] == {"n": 4, "of": 4}
+    agents = {1: {"home": "nH", "work_nodes": {"nP"}, "work_src": "exact_node"}}
+    got = _summarize(_scenario(w4f=True), agents=agents)["day_plan"]["fields"]
+    assert got["work_node"] == {"n": 1, "of": 1}
+
+
+def test_w4f_render_states_which_evidence_it_used():
+    md_old = APE.render(_summarize(_scenario()))
+    assert "近似" in md_old and "留まった 0 件" in md_old
+    agents = {1: {"home": "nH", "work_nodes": {"nP"}, "work_src": "exact_node"}}
+    md_new = APE.render(_summarize(_scenario(w4f=True), agents=agents))
+    assert "実ノード判定" in md_new
+    assert "block 添字で直接帰属 6 件" in md_new

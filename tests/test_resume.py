@@ -14,9 +14,11 @@ from pathlib import Path
 
 import pyarrow.parquet as pq
 
+from society import worldview as _wv
 from society.config import load_config
 from society.engine import checkpoint, scheduler
 from society.engine.simulation import Simulation
+from society.observer.schema import Event
 
 
 def _cfg(name: str, n_steps: int, **ov):
@@ -154,6 +156,20 @@ _GUARD_ROUNDTRIP = {                       # sim 属性 → 往復させる値(�
     "_delivery_pending": [{"orderer": 1, "arrive": 42, "cat": "食事", "dispatched": False}],
     "_ads_period": 2,
     "_ads_campaigns": {"枠A": {"campaign": "新装開店", "cat": "食事"}},
+    # ---- 第98バッチ W4-A(観測レンズの暦日タリー + 火種介入の起動時1回フラグ)----
+    # どれも「logger を増分走査して当日ぶんを積む」観測の state(echo/norm/regression と同型)。
+    # watermark(_*_processed)は logger 由来なので**保存しない**=別途 0 復帰を固定する。
+    "_lens_state": {"day": 3, "value": {"utility": 2, "emotion": 1, "social": 0,
+                                        "epistemic": 4},
+                    "motive": {"earn": 5, "love": 0, "recognition": 2}},
+    "_silence_state": {"day": 3, "speakers": {1, 2, 5}, "n_deliberate": 7,
+                       "n_nothing": 2},
+    "_struct_state": {"day": 3, "formed": 2, "broken": 1, "decayed": 3, "active": 11},
+    "_dev_state": {"day": 3,
+                   "per": {1: {"disc_dev": 2, "disc_total": 3,
+                               "full_dev": 2, "full_total": 5}},
+                   "occ": {1: "研究員", 2: "会社員"}},
+    "_spark_reported": True,
 }
 
 
@@ -197,6 +213,10 @@ def test_checkpoint_roundtrips_every_day_guard(tmp_path):
     assert (dst._infra_active, dst._infra_kind, dst._infra_until_day) == (True, "停電", 22)
     assert dst.today_disaster_line == "今日は地震で交通が麻痺している。"
     assert dst.transit.suspended is True, "運休フラグが復元されていない(電車が勝手に復旧する)"
+    # 第98 W4-A: 観測レンズの watermark は 4 本とも 0 に戻る(fresh logger から再走査)。
+    for attr in ("_lens_processed", "_silence_processed", "_struct_processed",
+                 "_dev_processed"):
+        assert getattr(dst, attr, None) == 0, f"{attr} が 0 に戻っていない"
 
 
 def test_old_checkpoint_without_new_keys_still_loads(tmp_path):
@@ -218,7 +238,10 @@ def test_old_checkpoint_without_new_keys_still_loads(tmp_path):
                 "status_rank_mobility", "wv_day", "wv_pioneer", "disaster_state",
                 "council", "council_campaign", "b2b", "b2b_total", "delivery_pending",
                 "delivery_total", "service_total", "ads_period", "ads_campaigns",
-                "inner_life_init"]
+                "inner_life_init",
+                # 第98 W4-A
+                "lens_state", "silence_state", "struct_state", "dev_state",
+                "wv_carry", "spark_reported"]
     for k in new_keys:
         blob["runtime"].pop(k, None)
     with gzip.open(p, "wb") as f:
@@ -270,3 +293,263 @@ def test_resume_chance_day_no_double_windfall(tmp_path):
     assert n_chance > 0, "chance_event が 1 件も出ていない(テスト前提が崩れた=要再調整)"
     for stem in ("l1_events", "l2_metrics", "l3_snapshots"):
         assert _rows(straight, stem) == _rows(resumed, stem), f"{stem} 不一致(chance resume)"
+
+
+# ============================================================ 第98バッチ W4-A(resume 整合の完遂)
+# 小粒A の申し送り 3 件を塞いだことの機械固定。
+#   (1) spark_roster の resume 二重記録(起動時 1 回のイベントを 2 つ目のプロセスが出し直す)
+#   (2) 観測レンズ 4 本(lens / silence / structure / deviation)の暦日タリー未保存
+#   (3) worldview C2/C6 の「直前の日境界 〜 checkpoint」区間の取りこぼし
+def test_resume_spark_roster_recorded_once(tmp_path):
+    """spark ON の mid-day resume で spark_roster が **1 件のまま**(全層一致つき)。
+
+    spark.apply は Simulation.__init__ から呼ばれるので resume した 2 つ目のプロセスでも走り、
+    従来は同じ t=0 名簿イベントが L1 に 2 件並んでいた(scheduler の workplace_bound が
+    `step != 0` ガードで防いでいるのと同型のギャップ)。件数 1 だけでなく全層一致も固定する。
+    """
+    ov = {"spark.enabled": "true"}
+    straight = _run_straight(tmp_path, "spk_straight", 40, **ov)
+    resumed = _run_resume(tmp_path, "spk_resumed", 20, 40, **ov)
+    n_st = sum(1 for r in _rows(straight, "l1_events") if r["kind"] == "spark_roster")
+    n_rs = sum(1 for r in _rows(resumed, "l1_events") if r["kind"] == "spark_roster")
+    assert n_st == 1, "straight で spark_roster が 1 件でない(テスト前提が崩れた)"
+    assert n_rs == 1, f"resume で spark_roster が二重記録されている: {n_rs} 件"
+    for stem in ("l1_events", "l2_metrics", "l3_snapshots"):
+        assert _rows(straight, stem) == _rows(resumed, stem), f"{stem} 不一致(spark resume)"
+
+
+# 観測レンズ 4 本を 1 ランで同時に ON にする(どれも「logger 増分走査 + 暦日タリー」で同型)。
+_LENS_ON = {"lens.enabled": "true", "lens.deviation.enabled": "true",
+            "lens.structure.enabled": "true", "freedom.explicit_nothing": "true",
+            "relations.enabled": "true"}
+_LENS_COLS = ("value4_utility", "value4_social", "value4_epistemic", "value4_emotion",
+              "motive_earn", "motive_love", "motive_recognition",
+              "deviation_mean", "deviation_var", "deviation_top_share",
+              "deviation_fulltime_mean", "edges_formed", "edges_broken",
+              "edges_decayed", "edge_churn_rate",
+              "silent_agent_rate", "chosen_nothing_rate")
+
+
+def test_resume_observer_lens_day_tallies(tmp_path):
+    """観測レンズ 4 本 ON の mid-day resume==straight(第98 W4-A の本体)。
+
+    _lens_state / _silence_state / _struct_state / _dev_state は「当日(暦日)のタリー」で、
+    保存しないと mid-day resume が**当日分を途中から数え直す**(silence.py の docstring が
+    「resume の限界(正直註記)」として明記していたもの)。split=20→40 は日境界(step102)より
+    手前=完全に mid-day なので、当該 L2 列は保存が無ければ必ず食い違う。
+    """
+    straight = _run_straight(tmp_path, "lens_straight", 40, **_LENS_ON)
+    resumed = _run_resume(tmp_path, "lens_resumed", 20, 40, **_LENS_ON)
+    a = _rows(straight, "l2_metrics")
+    b = _rows(resumed, "l2_metrics")
+    for col in _LENS_COLS:                    # 空回り防止: 17 列すべてが実在すること
+        assert col in a[-1], f"L2 列 {col} が出ていない(テスト前提が崩れた=要再調整)"
+    # 当日タリー由来の列が実際に動いている(全部 0 なら一致しても意味がない)
+    assert any(a[-1][c] for c in ("value4_social", "value4_epistemic", "motive_earn",
+                                  "deviation_mean", "silent_agent_rate")), \
+        "レンズ列が全て 0(テスト前提が崩れた=要再調整)"
+    for stem in ("l1_events", "l2_metrics", "l3_snapshots"):
+        assert _rows(straight, stem) == _rows(resumed, stem), f"{stem} 不一致(lens resume)"
+
+
+# --------------------------------------------------------------- worldview C2/C6 の未走査区間
+# 日境界は start_tod=22:00 で step 12 / 156(既定 07:00 だと 102 / 246 でテストが長くなる)。
+# split=100 は day1 のど真ん中=「直前の日境界(12)〜100」の区間が resume で失われていた。
+_WV_ON = {"worldview.enabled": "true", "run.start_tod": "22:00"}
+
+
+def test_resume_worldview_scan_carry(tmp_path):
+    """worldview ON の mid-day resume==straight(C2 応答 / C6 開拓行動の取りこぼし解消)。
+
+    worldview の走査は**日境界にしか走らない**ので、日カウンタ _wv_day を戻すだけでは
+    「直前の日境界〜checkpoint」の区間がまるごと落ちる(_wv_pos は logger 由来で 0 に戻る)。
+    checkpoint が有界射影(応答 3 つ組列 + 開拓行動数)を運ぶことで塞いだ。
+    """
+    d = tmp_path / "wv_resumed"
+    every = {"observer.checkpoint_every": 100}
+    sim1 = Simulation(_cfg("wv_resumed", 100, **every, **_WV_ON), out_dir=d)
+    for step in range(100):
+        scheduler.run_step(sim1, step)
+    carry = _wv.checkpoint_state(sim1)
+    assert carry and (carry["pending"] or carry["pioneer"]), \
+        "未走査区間が空(テスト前提が崩れた=split/step 数の再調整が要る)"
+    checkpoint.save(sim1, 100, d / "checkpoint" / "ckpt-000100.pkl.gz")
+    sim1.logger.flush_segment()
+    sim2 = Simulation(_cfg("wv_resumed", 160, **every, **_WV_ON), out_dir=d)
+    sim2.run(resume_from=d)
+
+    straight = _run_straight(tmp_path, "wv_straight", 160, **_WV_ON)
+    for stem in ("l1_events", "l2_metrics", "l3_snapshots"):
+        assert _rows(straight, stem) == _rows(d, stem), f"{stem} 不一致(worldview resume)"
+    # 日境界(step156)の worldview 世界イベントが実在=検査が空回りしていない
+    world = [r for r in _rows(straight, "l1_events")
+             if r["kind"] == "worldview" and r["agent_id"] == -1]
+    assert world, "worldview の日次スナップショットが出ていない(テスト前提が崩れた)"
+
+
+def test_worldview_segmented_and_flushed_runs_match_plain(tmp_path):
+    """worldview ON でも「分割 straight == plain」が成立する(第98 W4-A で塞いだ**既存欠陥**)。
+
+    走査は日境界にしか走らないので、日の途中で flush_segment が入ると [_wv_pos, flush 点) の
+    イベントがバッファから消えて二度と読めなかった(module 冒頭が「退避された分は走査済み扱い」
+    と註記していたもの。実測: checkpoint_every=40 で plain と L1 が 3 行食い違っていた)。
+    flush の直前に未走査区間を carry へ吸い上げることで、checkpoint 由来の flush でも
+    flush_every_steps 由来の flush でも plain と一致する(= resume も同じ土俵に乗る)。
+    """
+    plain = _run_straight(tmp_path, "wvseg_plain", 160, **_WV_ON)
+    seg = _run_straight(tmp_path, "wvseg_ckpt", 160,
+                        **{"observer.checkpoint_every": 40}, **_WV_ON)
+    flushed = _run_straight(tmp_path, "wvseg_flush", 160,
+                            **{"observer.flush_every_steps": 25}, **_WV_ON)
+    world = [r for r in _rows(plain, "l1_events")
+             if r["kind"] == "worldview" and r["agent_id"] == -1]
+    assert world, "worldview の日次スナップショットが出ていない(テスト前提が崩れた)"
+    for stem in ("l1_events", "l2_metrics", "l3_snapshots"):
+        assert _rows(plain, stem) == _rows(seg, stem), f"{stem} 不一致(checkpoint 分割)"
+        assert _rows(plain, stem) == _rows(flushed, stem), f"{stem} 不一致(定期 flush)"
+
+
+def test_resume_worldview_across_many_flushes(tmp_path):
+    """flush が何度も挟まる現実的な設定(every=40)で 120→160 resume == plain。
+
+    resume 元プロセスが 40/80/120 で flush 済み = 走査位置より手前のイベントは**もう存在しない**
+    という、本選ラン(checkpoint_every>0 は必ず flush を伴う)そのものの条件で固定する。
+    """
+    plain = _run_straight(tmp_path, "wvmf_plain", 160, **_WV_ON)
+    d = tmp_path / "wvmf_resumed"
+    every = {"observer.checkpoint_every": 40}
+    sim1 = Simulation(_cfg("wvmf_resumed", 120, **every, **_WV_ON), out_dir=d)
+    sim1.run()                                    # 120 step 走り切って中断(3 回 flush 済み)
+    sim2 = Simulation(_cfg("wvmf_resumed", 160, **every, **_WV_ON), out_dir=d)
+    sim2.run(resume_from=d)
+    for stem in ("l1_events", "l2_metrics", "l3_snapshots"):
+        assert _rows(plain, stem) == _rows(d, stem), f"{stem} 不一致(flush 多段 resume)"
+
+
+def _wv_events(sim):
+    """C2 応答(event_attend=弱・venture_close=強)+ C6 開拓行動(venture_open)の合成列。"""
+    ids = [a.id for a in sim.agents[:3]]
+    return [
+        Event(step=1, sim_min=10, agent_id=-1, kind="event_attend", x=0.0, y=0.0,
+              payload={"host": ids[0]}),                     # 弱+ → ids[0]
+        Event(step=2, sim_min=20, agent_id=ids[1], kind="venture_close", x=0.0, y=0.0,
+              payload={}),                                    # 強- → ids[1]
+        Event(step=3, sim_min=30, agent_id=ids[2], kind="venture_open", x=0.0, y=0.0,
+              payload={}),                                    # 開拓行動(C6 の分子)
+        Event(step=4, sim_min=40, agent_id=-1, kind="event_attend", x=0.0, y=0.0,
+              payload={"host": ids[0]}),                     # 弱+ → ids[0](2 件目)
+    ]
+
+
+def _wv_prime(sim):
+    """日境界を「初日ではない」状態に整える(_on_day が snapshot 経路へ入るように)。"""
+    sim._wv_day = 0
+    sim._wv_pioneer = deque([0], maxlen=7)
+    sim._wv_pos = 0
+
+
+def _wv_fingerprint(sim):
+    return [round(getattr(a, "controllability", 0.5), 9) for a in sim.agents]
+
+
+def test_worldview_carry_equals_uninterrupted_scan(tmp_path):
+    """「4 件を一気に走査」==「2 件で checkpoint → 復元 → 残り 2 件」(C2/C6 とも同値)。
+
+    実ランを待たずに、未走査区間の射影が **順序・日次キャップ・開拓行動数まで含めて**
+    一気走査と同値であることを直接固定する(mock ランで応答が偶然 0 件でも空回りしない)。
+    """
+    cfgd = {"worldview.enabled": "true"}
+    straight = Simulation(_cfg("wvu_straight", 1, **cfgd), out_dir=tmp_path / "wvu_straight")
+    _wv_prime(straight)
+    for e in _wv_events(straight):
+        straight.logger.log(e)
+    _wv._on_day(straight, 1, 5, 1440, straight.worldviewcfg)
+
+    part1 = Simulation(_cfg("wvu_a", 1, **cfgd), out_dir=tmp_path / "wvu_a")
+    _wv_prime(part1)
+    evs = _wv_events(part1)
+    for e in evs[:2]:
+        part1.logger.log(e)
+    state = _wv.checkpoint_state(part1)
+    assert state["pending"] and state["pioneer"] == 0, "前半の射影が想定と違う"
+
+    part2 = Simulation(_cfg("wvu_b", 1, **cfgd), out_dir=tmp_path / "wvu_b")
+    _wv_prime(part2)
+    _wv.restore_checkpoint(part2, state)
+    for e in evs[2:]:
+        part2.logger.log(e)
+    _wv._on_day(part2, 1, 5, 1440, part2.worldviewcfg)
+
+    assert _wv_fingerprint(part2) == _wv_fingerprint(straight), \
+        "carry 経由の C2 が一気走査と食い違う"
+    assert list(part2._wv_pioneer) == list(straight._wv_pioneer), \
+        "carry 経由の C6 開拓行動数が一気走査と食い違う"
+
+    # 空回り防止: carry を捨てると必ず食い違う(= この検査は実際に何かを守っている)
+    naive = Simulation(_cfg("wvu_c", 1, **cfgd), out_dir=tmp_path / "wvu_c")
+    _wv_prime(naive)
+    for e in evs[2:]:
+        naive.logger.log(e)
+    _wv._on_day(naive, 1, 5, 1440, naive.worldviewcfg)
+    assert _wv_fingerprint(naive) != _wv_fingerprint(straight), \
+        "carry 無しでも一致してしまう(テストが空回りしている)"
+
+
+def test_worldview_daily_cap_survives_carry(tmp_path):
+    """日次キャップ(ctrl_daily_weak)が carry を跨いで**通算**で効く(有界化が同値な根拠)。
+
+    弱応答を上限+2 件ぶん流し、前半で checkpoint → 復元 → 後半、としても
+    一気走査と同じ controllability に落ちる(= 射影の cap 先取りが結果を変えない)。
+    """
+    cfgd = {"worldview.enabled": "true", "worldview.ctrl_daily_weak": "2"}
+
+    def _mk(sim):
+        host = sim.agents[0].id
+        return [Event(step=i, sim_min=10 * i, agent_id=-1, kind="event_attend",
+                      x=0.0, y=0.0, payload={"host": host}) for i in range(1, 5)]
+
+    straight = Simulation(_cfg("wvc_straight", 1, **cfgd), out_dir=tmp_path / "wvc_straight")
+    _wv_prime(straight)
+    for e in _mk(straight):
+        straight.logger.log(e)
+    _wv._on_day(straight, 1, 5, 1440, straight.worldviewcfg)
+
+    part1 = Simulation(_cfg("wvc_a", 1, **cfgd), out_dir=tmp_path / "wvc_a")
+    _wv_prime(part1)
+    evs = _mk(part1)
+    for e in evs[:3]:                          # 上限 2 を**超えて**から checkpoint する
+        part1.logger.log(e)
+    state = _wv.checkpoint_state(part1)
+    assert len(state["pending"]) == 2, f"射影が上限で切られていない: {state['pending']}"
+
+    part2 = Simulation(_cfg("wvc_b", 1, **cfgd), out_dir=tmp_path / "wvc_b")
+    _wv_prime(part2)
+    _wv.restore_checkpoint(part2, state)
+    for e in evs[3:]:
+        part2.logger.log(e)
+    _wv._on_day(part2, 1, 5, 1440, part2.worldviewcfg)
+    assert _wv_fingerprint(part2) == _wv_fingerprint(straight), \
+        "日次キャップが carry を跨いで通算になっていない"
+
+
+def test_worldview_checkpoint_state_is_pure_read(tmp_path):
+    """checkpoint_state は sim も logger も 1 バイトも書き換えない(straight ラン不変の根拠)。"""
+    sim = Simulation(_cfg("wvp", 1, **{"worldview.enabled": "true"}),
+                     out_dir=tmp_path / "wvp")
+    _wv_prime(sim)
+    for e in _wv_events(sim):
+        sim.logger.log(e)
+    before = (sim._wv_pos, len(sim.logger.events),
+              list(getattr(sim, "_wv_carry", []) or []),
+              int(getattr(sim, "_wv_pioneer_carry", 0)),
+              _wv_fingerprint(sim))
+    _wv.checkpoint_state(sim)
+    _wv.checkpoint_state(sim)                  # 2 回呼んでも同じ(冪等・副作用なし)
+    after = (sim._wv_pos, len(sim.logger.events),
+             list(getattr(sim, "_wv_carry", []) or []),
+             int(getattr(sim, "_wv_pioneer_carry", 0)),
+             _wv_fingerprint(sim))
+    assert before == after, "checkpoint_state が状態を書き換えている"
+    # OFF のランでは None(既定 OFF=挙動不変)
+    off = Simulation(_cfg("wvp_off", 1), out_dir=tmp_path / "wvp_off")
+    assert _wv.checkpoint_state(off) is None

@@ -278,7 +278,14 @@ def apply(sim) -> None:
     """spark treatment を起動時に適用する(顔なじみ→friend_graph→party の後の中立な1呼び出し)。
 
     既定 OFF=完全 no-op=バイト一致。ON なら trait-blind 選抜→(a)関係/(b)資本・在庫/(c)アンカーを適用し、
-    t=0 の名簿イベント spark_roster を1件記録する(イベント毎の spark タグは付けない=設計絶対条件#3)。"""
+    t=0 の名簿イベント spark_roster を1件記録する(イベント毎の spark タグは付けない=設計絶対条件#3)。
+
+    resume(第98バッチ W4-A): 本関数は Simulation.__init__ から呼ばれるので**再開した 2 つ目の
+    プロセスでも丸ごと走る**。関係/資本/アンカーの適用先(fresh な agents)は直後の
+    checkpoint.load が pickle 済み agents で丸ごと上書きするので無害だが、spark_roster だけは
+    logger バッファに残って L1 に 2 件並んでいた。ここで印(_spark_reported)を立て、
+    checkpoint が「もう記録済み」を運んで load 側で抑止する(scheduler の _workbind_reported
+    と同型のガード。fresh ランは 1 バイトも変わらない)。"""
     cfg = getattr(sim, "sparkcfg", None)
     if not cfg or not cfg["enabled"]:
         return
@@ -320,6 +327,7 @@ def apply(sim) -> None:
                 "n_stocked": int(n_stocked),
             },
         }))
+    sim._spark_reported = True     # 第98 W4-A: resume 二重記録の抑止印(checkpoint が運ぶ)
 
 
 # ---------------------------------------------------------------- 収束(自由行動の行き先)

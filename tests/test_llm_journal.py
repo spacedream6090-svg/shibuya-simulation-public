@@ -382,6 +382,7 @@ def test_manifest_written_with_required_fields(tmp_path):
     assert len(man["event_schema_sha256"]) == 64
     assert man["run"]["seed"] == 42 and man["run"]["n_agents"] == 6
     assert man["run"]["n_steps"] == 12
+    assert man["run"]["dt_min"] == 10   # 第101: Δt の第2の源(run_dt.py が読む)
     assert man["model"]["backend"] == "mock"
     assert man["model"]["cache_mode"] == "free" and man["model"]["journal"] is True
     assert man["started_at"] and man["started_at_epoch"] > 0

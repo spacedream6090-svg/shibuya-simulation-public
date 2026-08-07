@@ -29,6 +29,7 @@ from ..world.transit import Transit
 from ..world import presence as presence_mod
 from ..world import pool as pool_mod
 from ..world import floors as _floors_mod
+from .. import worldview as _wv_mod
 from . import checkpoint, scheduler
 
 
@@ -207,13 +208,16 @@ class Simulation:
         self.clock = Clock(start_min=_parse_start_tod(cfg.run.get("start_tod", "07:00")),
                            step_minutes=self.dt_min)
         self.logger = ObserverLogger(self.out_dir)
-        # W2-6: finalize のメモリ有界化(observer.finalize.streaming。既定 OFF=従来経路)。
-        # ON のときだけ属性を立てる = 既定ランは ObserverLogger の初期値のまま=バイト一致。
-        _fincfg = cfg.observer.get("finalize", None)
-        if _fincfg is not None and bool(_fincfg.get("streaming", False)):
-            self.logger.streaming_finalize = True
-            self.logger.finalize_row_group_rows = int(
-                _fincfg.get("row_group_rows", 1 << 20))
+        # W2-6 / W4-E: finalize のメモリ有界化(observer.finalize.streaming。既定 OFF=従来経路)。
+        # ON のときだけ属性を立てる = 既定ランは各クラスの初期値のまま=バイト一致
+        # (apply_cfg が OFF で early return する = 属性を 1 つも触らない)。
+        # ★同じ設定を **L1 とサイドカー全部**へ配る(新 conf キーは増やさない=1 つの判断で
+        #   全ファイルが同じモードになる)。サイドカーへの配布は __init__ 末尾でまとめて行う
+        #   (生成箇所が散っているため。配り漏れは tests/test_finalize_streaming_sidecars.py が
+        #   Simulation の属性を機械走査して検出する)。
+        from ..observer import finalize as _finalize_mod
+        self._finalize_cfg = _finalize_mod.cfg_of_config(cfg)
+        _finalize_mod.apply_cfg(self.logger, self._finalize_cfg)
         self.items = ItemStore()
         # ---- 場所の意味づけ最小版 D1(labeling.place_binding。既定 OFF=完全 no-op=バイト一致)----
         # ON 時だけ LabelSystem が束縛台帳を持つ(状態は LabelSystem 内に閉じるので checkpoint の
@@ -259,7 +263,10 @@ class Simulation:
         raw_phys = cfg.get("physics", None)
         raw_phys = (OmegaConf.to_container(raw_phys, resolve=True)
                     if OmegaConf.is_config(raw_phys) else raw_phys)
-        self.physcfg = _zones_mod.build_cfg(raw_phys, REPO_ROOT)
+        # step_seconds を渡すのは `max_sub_steps` 未指定のゾーンで上限を Δt から導くため
+        # (第99・OBS-U2 §1.2 B5 の是正)。Δt=10 かつ dt_sub=0.05 では 12000 = 従来値。
+        self.physcfg = _zones_mod.build_cfg(raw_phys, REPO_ROOT,
+                                            step_seconds=self.clock.step_seconds)
         self._indoor_meet_plan = {}                # (group,day)->(occurs,meet_min) 決定論キャッシュ(非pickle)
         self._indoor_encounters_step = []          # step 内一時状態(動力学→観測)。B3b が動力学として読む
         self._indoor_samples_step = []             # step 内一時状態(tracks 観測用)
@@ -787,6 +794,9 @@ class Simulation:
         if self.channelscfg["enabled"] or self.firecfg["enabled"]:
             self.cognition_calib = _calib_mod.load_calib(self.channelscfg["calib_file"])
             self.cognition_sigma = _calib_mod.load_sigma(self.channelscfg["sigma_file"])
+            # σ_c は Δt=10 で測った分散(OBS-U2 §2(d))。Δt が違うランで黙って使うと
+            # 発火率に系統バイアスが乗るので、**警告 1 回**だけ出す(値は補正しない)。
+            _calib_mod.check_sigma_dt(self)
         # g/θ の全軌跡サイドカー(§2.7「g_i(0) と g の全軌跡をログする」)。
         # 観測層なので動力学はこのバッファを読まない = ON でも L1/L2/L3 は変えない。
         if _plasticity_mod.enabled(self) and self.gcfg["log_every_steps"]:
@@ -1230,6 +1240,15 @@ class Simulation:
                                            interval=_shcfg["interval"],
                                            float_digits=_shcfg["float_digits"])
             if _shcfg["enabled"] else None)
+        # ---- W4-E: finalize のメモリ有界化をサイドカーへも配る(同一 conf キー)----
+        # サイドカーは生成条件がばらばら(indoor.tracks / work.ledger / economy.sidecar /
+        # cognition.channels / g_update)で __init__ の各所で作られるので、**全部そろった
+        # ここで 1 度だけ**配る。既定 OFF では apply_cfg が何も触らない = バイト一致。
+        # 配り漏れ(新サイドカー追加時)は tests が Simulation の属性を走査して検出する。
+        for _sc in (self.indoor_tracks, self.org_ledger_sc, self.finance_sc,
+                    self.channels_sc, self.cognition_g_sc):
+            if _sc is not None:
+                _finalize_mod.apply_cfg(_sc, self._finalize_cfg)
 
     # ------------------------------------------------------ LLM ジャーナル(第71)
     # ObserverLogger の flush_segment / checkpoint と同じ「checkpoint が真の境界」流儀で、
@@ -1689,6 +1708,7 @@ class Simulation:
                                 self.out_dir / "checkpoint"
                                 / f"ckpt-{step + 1:06d}.pkl.gz")
                 self._save_pool_sidecar(step + 1)  # pool ON 時のみ: ドーマント退避の対保存
+                _wv_mod.absorb_before_flush(self)  # 第98 W4-A: worldview 未走査区間の吸い上げ
                 self.logger.flush_segment()
                 if self.indoor_tracks is not None:  # B3: tracks サイドカーも対でセグメント化
                     self.indoor_tracks.flush_segment()
@@ -1703,6 +1723,9 @@ class Simulation:
                 did_flush = True
             if flush_every > 0 and not did_flush \
                     and (step + 1) % flush_every == 0:
+                # 第98 W4-A: 日境界にしか走らない worldview の未走査区間を、L1 バッファが
+                # 空になる前に carry へ吸い上げる(既定 flush_every_steps=0 では未到達)。
+                _wv_mod.absorb_before_flush(self)
                 self.logger.flush_segment()        # checkpoint と独立の定期 flush
                 for _j in self._journals:          # 第71: LLM ジャーナルも同時に確定させる
                     _j.flush()
@@ -1724,7 +1747,22 @@ class Simulation:
         __init__ の初期出力と finalize の再出力で共有(重複回避)。org 配属は run 中の遅延初期化
         (_ensure_orgs)で付くため、__init__ 時点では org_id が未付与=キー不在。会社観測データ層 B4
         (indoor_fields/ledger)ON のランのみ finalize が本レコードで agents.json を再出力し org_id/
-        org_role を載せる(B7 会社 UI の org 相関材料)。OFF は再出力しない=既存 agents.json とバイト一致。"""
+        org_role を載せる(B7 会社 UI の org 相関材料)。OFF は再出力しない=既存 agents.json とバイト一致。
+
+        W4-F: `work_node` / `part_time_node` は **day_plan 実効ランだけ**に足す 2 欄。
+        これは `day_plan.resolve_place("work")` が引く `_work_node(agent)`(本業 → バイト先)
+        の入力そのもので、事後解析(scripts/analyze_plan_execution.py)が職場ブロックの
+        到達判定を「建物内の全ノード」という近似ではなく実ノードで行えるようにする。
+        **無条件では足さない**: agents.json は day_plan OFF ランでも出る成果物であり、
+        既定ランのバイト不変が本バッチの絶対条件だから。IF-E2 の org_id/org_role が
+        「配属時のみキーを生やす」で既定バイトを守ったのと同じ流儀
+        (mind_model / ontology_group / input_res も同型の条件付きキー)。
+        ★スナップショットである点は org_id と同じ: 転職(organizations)で work_node は
+          run 中に変わりうるが、本レコードは書き出した時点の値しか持たない。"""
+        # day_plan が実効か(planning.enabled が前提)。cfg_of は遅延キャッシュを 1 つ
+        # 生やすだけで L1/L2/乱数のいずれにも出ない(day_plan.cfg_of の明文どおり)。
+        from ..cognition import day_plan as _day_plan
+        dp_on = _day_plan.enabled(self)
         return [{"id": a.id, "name": a.name, "age": a.age, "gender": a.gender,
                  "occupation": a.occupation, "visitor": a.visitor,
                  "commute": a.commute, "arrival_min": a.arrival_min,
@@ -1750,7 +1788,12 @@ class Simulation:
                     if getattr(a, "mind", None) else {}),
                  # 第50バッチ T6: 信用内訳レンズの org 相関用(org 配属時のみ=非配属ランはバイト同一)
                  **({"org_id": a.org_id, "org_role": getattr(a, "org_role", "")}
-                    if getattr(a, "org_id", None) else {})}
+                    if getattr(a, "org_id", None) else {}),
+                 # W4-F: 計画遵守観測の職場ノード突合(day_plan 実効ランのみ=OFF はバイト同一)。
+                 # day_plan._work_node と同じ 2 つの入力を、同じ優先順(本業 → バイト先)で残す。
+                 **({"work_node": a.work_node,
+                     "part_time_node": (a.part_time["node"] if a.part_time
+                                        else None)} if dp_on else {})}
                 for a in self.agents]
 
     def finalize(self) -> dict:

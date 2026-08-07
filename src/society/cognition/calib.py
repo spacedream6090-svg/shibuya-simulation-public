@@ -45,7 +45,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from pathlib import Path
+
+log = logging.getLogger("society.cognition.calib")
 
 SCHEMA = 1
 # 較正テーブルだけ別の schema 番号を持つ(σ_c 凍結ファイルとは独立に版が進むため)。
@@ -253,6 +256,77 @@ def load_sigma(path_str: str | None = None, *, required: bool = False) -> dict:
             "doc": doc}
 
 
+# --------------------------------------------------------------------------- #
+# σ_c の Δt 来歴照合(第99・OBS-U2 §2(d) の「照合機構が無い」への最小の答え)
+#
+# なぜ要るか(設計調査 docs/research/obs-u2-dt1min-design.md §2(d) の逐語):
+#   「観測チャンネルの一部は『**この step の件数**』というカウント量(channels.py の
+#     ext.heard / ext.signage)であり、data/calib/sigma_c.json は Δt=10 で測った母集団の
+#     分散。Δt=1 では 1 step あたりの件数が減るので σ_c が過大になり、
+#     S = Σ g|o−ô|/σ が系統的に小さくなる → **salience 発火が減る方向にバイアス**する。」
+#   そして「照合機構が無い。sigma_c.json の meta は n_agents/n_steps/seed のみで dt_min を
+#   持たず、cognition/calib.py に Δt 検査はゼロ」。
+#
+# 本バッチの範囲(意図的に狭い):
+#   - **data/calib/sigma_c.json は 1 バイトも触らない**(payload_sha256 で凍結されており、
+#     meta に dt_min を足すとハッシュが変わって既存ランの来歴と繋がらなくなる)。
+#     したがって「meta に無ければ正準 Δt=10 で測られた」と読む(実際そうである)。
+#   - **値も挙動も変えない**。σ をスケールし直す/発火を補正するのは較正のやり直し
+#     (scripts/measure_sigma.py の再実行)であって、読み手が勝手にやってよい変換ではない。
+#     ここでやるのは「黙って使わせない」ことだけ = 警告 1 回 + 来歴 3 キー。
+# --------------------------------------------------------------------------- #
+#: σ_c 凍結ファイルの meta が Δt を持たないとき、測定時 Δt とみなす値(= 正典の Δt)。
+SIGMA_CANONICAL_DT_MIN = 10
+
+
+def sigma_calib_dt_min(loaded: dict | None) -> int:
+    """σ_c を測ったときの Δt [分]。``meta.run.dt_min`` があればそれ、無ければ正準 10。
+
+    ``data/calib/theta_scale.json`` は既に ``meta.run.dt_min`` を書いている(助言的)。
+    σ_c ファイルも将来 measure_sigma.py が書けばそのまま拾われる = 前方互換。
+    """
+    meta = ((loaded or {}).get("doc") or {}).get("meta") or {}
+    raw = (meta.get("run") or {}).get("dt_min", None)
+    if raw is None:
+        return SIGMA_CANONICAL_DT_MIN
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return SIGMA_CANONICAL_DT_MIN
+    return v if v > 0 else SIGMA_CANONICAL_DT_MIN
+
+
+def sigma_dt_provenance(loaded: dict | None, run_dt_min: int) -> dict | None:
+    """{"calib_dt_min", "run_dt_min", "dt_match"}。σ が未読込なら None。"""
+    if not loaded or loaded.get("status") != "loaded" or not loaded.get("doc"):
+        return None
+    cal, run = sigma_calib_dt_min(loaded), int(run_dt_min)
+    return {"calib_dt_min": cal, "run_dt_min": run, "dt_match": cal == run}
+
+
+def check_sigma_dt(sim) -> None:
+    """run の Δt が σ_c の較正 Δt と違うとき **1 回だけ** WARNING を出す(weather と同流儀)。
+
+    Δt が一致する既定ラン(= Δt=10)では 1 バイトも出力しない = 完全に無風。
+    """
+    if getattr(sim, "_sigma_dt_warned", False):
+        return
+    prov = sigma_dt_provenance(getattr(sim, "cognition_sigma", None),
+                              int(getattr(sim, "dt_min", SIGMA_CANONICAL_DT_MIN)))
+    if prov is None or prov["dt_match"]:
+        return
+    sim._sigma_dt_warned = True
+    log.warning(
+        "[cognition] σ_c は Δt=%d 分で測った母集団の分散だが、この run は Δt=%d 分である。"
+        " チャンネルの一部は『この step の件数』というカウント量(ext.heard / ext.signage)"
+        "なので、Δt を変えると 1 step あたりの件数が変わり σ_c が系統的にずれる"
+        "(Δt を細かくすると σ_c 過大 → S=Σg|o−ô|/σ が小さくなり salience 発火が減る)。"
+        " 値は**補正していない**(凍結値をそのまま使う)。この Δt で結論を出すなら"
+        " scripts/measure_sigma.py を Δt=%d で回して測り直すこと。"
+        " 照合結果は run_manifest.json の cognition.sigma_c.dt_match に残る。",
+        prov["calib_dt_min"], prov["run_dt_min"], prov["run_dt_min"])
+
+
 def sigma_of(loaded: dict) -> dict[str, float]:
     """{channel_id: σ}。**usable=false(σ=0 等)のチャンネルは含めない**(=第81 は S から外す)。"""
     doc = (loaded or {}).get("doc")
@@ -325,5 +399,9 @@ def provenance(sim) -> dict | None:
             entry["n_usable"] = len(sigma_of(sigma))
             entry["spec_match"] = bool(
                 meta.get("channel_spec_sha256") == _channels.spec_sha256())
+            # 第99: Δt 来歴の照合(spec_match と同じ「凍結値がこの run に妥当か」の欄)。
+            # Δt=10 の既定ランでは dt_match=true = 既存 manifest と意味が変わらない。
+            entry.update(sigma_dt_provenance(
+                sigma, int(getattr(sim, "dt_min", SIGMA_CANONICAL_DT_MIN))) or {})
         out["sigma_c"] = entry
     return out

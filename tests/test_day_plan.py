@@ -905,3 +905,164 @@ def test_note_resolved_fires_on_clean_plan_not_on_fallback(tmp_path, monkeypatch
     assert calls == [a.id], "検証を通った計画で note_resolved が発火していない"
     DP.apply(sim, a, 200, 1440 + 8 * 60, "{壊れた", None)
     assert calls == [a.id], "フォールバックは解消ではないのに note_resolved が発火した"
+
+
+# --------------------------------------------------------------------------- #
+# (J) W4-F: 計画遵守観測の記録 3 点(2026-08-08)
+#
+# 足したのは **記録だけ**:
+#   - agents.json に work_node / part_time_node(**day_plan 実効ランのみ**)
+#   - plan_block_start の payload に node(実行時の現在ノード = 移動前)
+#   - plan_block_start / plan_block_drop / plan_slide の payload に block(台帳の添字)
+# 守るもの: OFF は agents.json ごとバイト不変 / ON でも世界は 1 バイトも動かない
+# (= 記録値を読んで分岐する行が無い)/ 既存 payload キーは 1 つも消えていない。
+# --------------------------------------------------------------------------- #
+_PRE_W4F_PAYLOAD_KEYS = {
+    "plan_block_start": {"act", "place", "aim", "priority", "flex", "start",
+                         "slid", "version"},
+    "plan_block_drop": {"act", "place", "start", "priority", "flex", "reason"},
+    "plan_slide": {"act", "place", "start", "slid", "priority"},
+}
+_W4F_ADDED_KEYS = {"plan_block_start": {"node", "block"},
+                   "plan_block_drop": {"block"},
+                   "plan_slide": {"block"}}
+
+
+def test_w4f_off_agents_json_is_byte_identical_to_pure_default(tmp_path):
+    """★絶対条件: day_plan OFF の agents.json は 1 バイトも変わらない。
+
+    IF-E2 の org_id/org_role と同じ流儀(条件付きキー)を採った根拠がこれ。
+    無条件に列を足すと、day_plan を使わない全ランの成果物が変わってしまう。
+    """
+    pure = _sim(tmp_path, "w4f_pure")
+    pure.run()
+    off = _sim(tmp_path, "w4f_off", **{"planning.day_plan.enabled": "false"})
+    off.run()
+    a_pure = (tmp_path / "w4f_pure" / "agents.json").read_bytes()
+    a_off = (tmp_path / "w4f_off" / "agents.json").read_bytes()
+    assert a_pure == a_off, "OFF の agents.json が純粋既定と食い違う"
+    assert b"work_node" not in a_pure and b"part_time_node" not in a_pure
+
+
+def test_w4f_keys_require_day_plan_to_be_effective(tmp_path):
+    """planning.enabled=false なら day_plan ON でも無効 = キーも生えない。"""
+    sim = _sim(tmp_path, "w4f_np", **{"planning.enabled": "false", **ON})
+    sim.run()
+    recs = json.loads((tmp_path / "w4f_np" / "agents.json").read_text("utf-8"))
+    assert recs and not any("work_node" in r for r in recs)
+
+
+def test_w4f_agents_json_carries_the_resolve_place_work_inputs(tmp_path):
+    """ON では 2 欄が載り、`resolve_place("work")` の入力と 1 対 1 で一致する。"""
+    sim = _sim(tmp_path, "w4f_on", **ON)
+    sim.run()
+    recs = json.loads((tmp_path / "w4f_on" / "agents.json").read_text("utf-8"))
+    assert recs and all("work_node" in r and "part_time_node" in r for r in recs)
+    by_id = {r["id"]: r for r in recs}
+    for a in sim.agents:
+        r = by_id[a.id]
+        assert r["work_node"] == a.work_node
+        assert r["part_time_node"] == (a.part_time["node"] if a.part_time else None)
+        # ★名簿の 2 欄から day_plan._work_node と同じ値が復元できる(近似ではない)
+        assert (r["work_node"] or r["part_time_node"] or "") == DP._work_node(a)
+    assert any(r["work_node"] for r in recs), "職場ノードを持つ個体が 1 体も居ない"
+
+
+def test_w4f_block_events_keep_every_old_key_and_add_exactly_the_new_ones(tmp_path):
+    """契約列挙: 旧キー集合は 1 つも欠けず、増えたのは block / node だけ。"""
+    sim = _sim(tmp_path, "w4f_keys", n_steps=288, **ON)
+    sim.run()
+    seen = {k: 0 for k in _PRE_W4F_PAYLOAD_KEYS}
+    for e in sim.logger.events:
+        if e.kind not in _PRE_W4F_PAYLOAD_KEYS:
+            continue
+        seen[e.kind] += 1
+        assert set(e.payload) == (_PRE_W4F_PAYLOAD_KEYS[e.kind]
+                                  | _W4F_ADDED_KEYS[e.kind]), (e.kind, e.payload)
+    assert seen["plan_block_start"] and seen["plan_block_drop"], seen
+
+
+def test_w4f_block_index_points_into_the_plan_of_that_agent_and_day(tmp_path):
+    """block は必ず **その個体・その日**の plan_created.blocks[] の範囲内を指す。"""
+    sim = _sim(tmp_path, "w4f_idx", n_steps=288, **ON)
+    sim.run()
+    n_by_plan = {(e.agent_id, e.sim_min // 1440): int(e.payload["n"])
+                 for e in _kind(sim, "plan_created")}
+    n_checked = 0
+    for kind in _W4F_ADDED_KEYS:
+        for e in _kind(sim, kind):
+            n = n_by_plan.get((e.agent_id, e.sim_min // 1440))
+            assert n is not None, f"計画の無い {kind}"
+            assert 0 <= int(e.payload["block"]) < n, (kind, e.payload)
+            n_checked += 1
+    assert n_checked > 0
+
+
+def test_w4f_block_index_is_taken_by_identity_not_by_equality(tmp_path):
+    """同値ブロックが 2 件あっても添字を取り違えない(`list.index` を使わない理由)。"""
+    sim, a = _agent_sim(tmp_path, "w4f_same")
+    same = _b(8 * 60, 9 * 60, "could", "droppable")
+    plan = _plan_on(sim, a, [dict(same), dict(same)])
+    assert DP._bi(plan, plan["blocks"][1]) == 1
+    DP._sweep(sim, a, plan, DP.cfg_of(sim), 100, 13 * 60)
+    drops = _kind(sim, "plan_block_drop")
+    assert [e.payload["block"] for e in drops] == [0, 1], \
+        "同値の 2 ブロックが同じ添字で記録された"
+
+
+def test_w4f_block_start_node_is_the_current_node_before_moving(tmp_path):
+    """`node` は **移動前の現在ノード**。行き先ではない(既に居るときだけ両者が一致)。"""
+    sim, a = _agent_sim(tmp_path, "w4f_node")
+    here = a.node
+    dest = next(n for n in sorted(sim.dests) if n != here)
+    # (1) 既に目的地に居る = 移動しない → 記録された node がそのままブロックの場所
+    _plan_on(sim, a, [_b(8 * 60, 9 * 60, "should", "slideable", node=here)])
+    assert DP.plan_action(a, sim, 8 * 60, 0,
+                          sim.hub.stream("decide", a.id, 0)) is None
+    ev = _kind(sim, "plan_block_start")[-1]
+    assert ev.payload["node"] == here and ev.payload["block"] == 0
+    # (2) 移動する場合は行き先ではなく出発地が入る
+    _plan_on(sim, a, [_b(10 * 60, 11 * 60, "should", "slideable", node=dest)])
+    out = DP.plan_action(a, sim, 10 * 60, 1, sim.hub.stream("decide", a.id, 1))
+    ev2 = _kind(sim, "plan_block_start")[-1]
+    assert out is not None and out["dest"] == dest
+    assert ev2.payload["node"] == here != dest
+
+
+def test_w4f_street_block_also_records_the_node(tmp_path):
+    """street(行き先を habit へ委譲)でも現在ノードは残る = 記録の穴を作らない。"""
+    sim, a = _agent_sim(tmp_path, "w4f_street")
+    _plan_on(sim, a, [_b(8 * 60, 9 * 60, "should", "slideable",
+                         place="street", act="walk", node=None)])
+    assert DP.plan_action(a, sim, 8 * 60, 0,
+                          sim.hub.stream("decide", a.id, 0)) is None
+    ev = _kind(sim, "plan_block_start")[-1]
+    assert ev.payload["place"] == "street" and ev.payload["node"] == a.node
+
+
+def test_w4f_recorded_values_never_drive_a_branch():
+    """★記録は世界を動かさない: 記録用の 2 値が分岐条件に一度も現れない(AST)。
+
+    `plan_action` の中でしか作られない `at_node`(現在ノード)と `index`(添字)が
+    if / while / 比較 / 論理演算のどこにも出てこないことを固定する。出てきた瞬間に
+    「記録のつもりが挙動を変えた」ことになるので、ここが落ちる。
+    """
+    import ast
+    from pathlib import Path
+    src = Path(DP.__file__).read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "plan_action")
+    guarded = {"at_node", "index"}
+    tests_: list = []
+    for node in ast.walk(fn):
+        if isinstance(node, (ast.If, ast.While, ast.IfExp)):
+            tests_.append(node.test)                 # ★条件式だけを見る(body は別)
+        elif isinstance(node, (ast.Compare, ast.BoolOp, ast.UnaryOp)):
+            tests_.append(node)
+    n_seen = 0
+    for t in tests_:
+        names = {x.id for x in ast.walk(t) if isinstance(x, ast.Name)}
+        n_seen += 1
+        assert not (names & guarded), \
+            f"W4-F の記録値が分岐に使われている: {sorted(names & guarded)}"
+    assert n_seen > 0, "plan_action の分岐を 1 つも拾えていない(検査が空回り)"

@@ -1786,7 +1786,12 @@ observer:
   # ON の出力は OFF と **行の内容・行順・スキーマが完全同値**だが、parquet の**バイト列は
   # 一致しない**(row-group の切れ目が変わるため)。part が 1 つも無いラン(checkpoint も
   # flush_every_steps も無効)は ON でも従来経路に落ちる=バイト一致。
-  # 実装と正直な限界は src/society/observer/logger.py の docstring を参照。
+  # ★W4-E(第99バッチ 2026-08-08): この 1 キーが **L1/L1b/L2/L3 とサイドカー全部**
+  #   (indoor_tracks_samples / indoor_tracks_contacts / org_ledger / finance / channels /
+  #   cognition_g)に同時に効く。同型の finalize を各サイドカーが自前で持っていたのを
+  #   src/society/observer/finalize.py の 1 本へ括り出した。**サイドカー用の別キーは作らない**
+  #   (1 つの判断で全ファイルが同じモードになるのが正)。
+  # 実装と正直な限界は src/society/observer/finalize.py の docstring を参照。
   finalize:
     streaming: false
     row_group_rows: 1048576     # 書き出す row-group の行数(= ON 時のピークメモリの単位。

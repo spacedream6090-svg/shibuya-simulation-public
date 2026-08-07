@@ -12,7 +12,10 @@ Parquet(`channels.parquet`)へ書き出すだけの層。第83バッチの θ �
 セグメント化/finalize は observer/logger.py・indoor_tracks.py と同一流儀
 (checkpoint 連携で part 化 → finalize で結合、resume の `_resumed` フラグで分割実行
 チャンクの canonical を先頭結合)。これにより resume==straight のバイト一致を保つ
-= **途中再開でサイドカーが二重記録しない**。
+= **途中再開でサイドカーが二重記録しない**。★W4-E(第99バッチ)で結合の実装は
+`observer/finalize.py` の `FinalizeStreamMixin` **1 本**へ括り出し、conf
+`observer.finalize.streaming`(既定 false)が L1 と同じ 1 つの判断で本サイドカー
+(`channels` / 派生の `cognition_g`)にも効くようにした。既定 OFF は従来経路のまま。
 
 列
 --
@@ -28,10 +31,12 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from .finalize import FinalizeStreamMixin
+
 STEM = "channels"
 
 
-class ChannelsSidecar:
+class ChannelsSidecar(FinalizeStreamMixin):
     """観測チャンネル行の追記バッファ + セグメント/finalize(IndoorTracks と対の設計)。
 
     ★ファイル名の幹はクラス属性 `STEM`(第82バッチで g/θ 軌跡サイドカーが同じ機構を
@@ -91,32 +96,13 @@ class ChannelsSidecar:
         self._seg += 1
 
     # ---- 出力(finalize)----
+    # 結合(既定の concat 経路 / streaming 経路)は FinalizeStreamMixin が唯一の実装。
+    # ここに自前の複製は置かない(W4-E)。stem はクラス属性 STEM なので派生
+    # (CognitionGSidecar)もそのまま同じ経路を通る。
     def finalize(self) -> Path | None:
-        """part 群 + 残りバッファを結合して canonical parquet を出す。
-
-        part が無い(=checkpoint 無効)なら buffer を直接書く(byte 級同一)。分割実行
-        (resume で clean finalize したチャンク)のときだけ既存 canonical を先頭に結合する。
-        """
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        table = self._table(self.rows) if self.rows else None
-        parts = sorted(self.out_dir.glob(f"{self.STEM}.part-*.parquet"))
-        canonical = self.out_dir / f"{self.STEM}.parquet"
-        if not parts:
-            if table is None:
-                return None
-            pq.write_table(table, canonical, compression="zstd")
-            return canonical
-        tables = []
-        if self._resumed and canonical.exists():
-            tables.append(pq.read_table(canonical))
-        tables += [pq.read_table(p) for p in parts]
-        if table is not None and table.num_rows > 0:
-            tables.append(table)
-        combined = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
-        pq.write_table(combined, canonical, compression="zstd")
-        for p in parts:
-            p.unlink()
-        return canonical
+        return self._finalize_stream(self.STEM,
+                                     self._table(self.rows) if self.rows else None)
 
 
 class CognitionGSidecar(ChannelsSidecar):

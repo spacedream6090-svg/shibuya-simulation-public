@@ -501,6 +501,83 @@ def test_frozen_sigma_file_matches_the_current_channel_spec():
 
 
 # --------------------------------------------------------------------------- #
+# (G2) 第99: σ_c の **Δt 来歴照合**(OBS-U2 §2(d)「照合機構が無い」への最小の答え)
+#   σ_c は Δt=10 で測ったカウント量の分散。Δt≠10 の run で黙って使うと salience 発火に
+#   系統バイアスが乗る。凍結ファイルは 1 バイトも触らず(payload_sha256 で凍結済み)、
+#   **読み手側で警告 1 回 + 来歴 3 キー**だけを足す。値・挙動は不変。
+# --------------------------------------------------------------------------- #
+class _FakeSim:
+    """calib の Δt 照合だけを見るための最小スタブ(Simulation を建てない)。"""
+
+    def __init__(self, sigma, dt_min):
+        self.cognition_sigma = sigma
+        self.dt_min = dt_min
+
+
+def test_frozen_sigma_is_read_as_the_canonical_dt():
+    """meta に dt_min が無い凍結ファイルは **正準 Δt=10 で測った**とみなす。"""
+    loaded = CALIB.load_sigma(None)
+    assert "dt_min" not in (loaded["doc"]["meta"].get("run") or {}), \
+        "凍結ファイルに dt_min が入った(= このテストの前提が変わった)"
+    assert CALIB.sigma_calib_dt_min(loaded) == CALIB.SIGMA_CANONICAL_DT_MIN == 10
+    # meta.run.dt_min があればそれを尊重する(theta_scale.json は既に書いている = 前方互換)
+    doc = json.loads(json.dumps(loaded["doc"]))
+    doc["meta"]["run"]["dt_min"] = 1
+    assert CALIB.sigma_calib_dt_min({"status": "loaded", "doc": doc}) == 1
+    for bad in ("x", None, 0, -3):
+        doc["meta"]["run"]["dt_min"] = bad
+        assert CALIB.sigma_calib_dt_min({"status": "loaded", "doc": doc}) == 10
+
+
+def test_sigma_dt_provenance_is_absent_without_a_sigma_file():
+    """σ ファイルが無いラン(= σ を測るパイロット自身)では照合キーが生えない。"""
+    absent = CALIB.load_sigma(str(REPO_ROOT / "data" / "calib" / "__nope__.json"))
+    assert absent["status"] == "absent"
+    assert CALIB.sigma_dt_provenance(absent, 10) is None
+    assert CALIB.sigma_dt_provenance(None, 10) is None
+
+
+def test_sigma_dt_mismatch_warns_exactly_once_and_changes_nothing(caplog):
+    """Δt 不一致で WARNING 1 回。**σ の値も usable 集合も 1 つも変わらない**。"""
+    loaded = CALIB.load_sigma(None)
+    before = dict(CALIB.sigma_of(loaded))
+
+    sim = _FakeSim(loaded, 1)
+    with caplog.at_level("WARNING", logger="society.cognition.calib"):
+        CALIB.check_sigma_dt(sim)
+        CALIB.check_sigma_dt(sim)                      # 2 回呼んでも 1 回だけ
+    hits = [r for r in caplog.records if r.name == "society.cognition.calib"]
+    assert len(hits) == 1, f"警告が {len(hits)} 回(1 回であるべき)"
+    msg = hits[0].getMessage()
+    assert "σ_c" in msg and "measure_sigma.py" in msg
+    assert "10" in msg and "1" in msg                  # 較正 Δt と run の Δt の両方を名指す
+    assert CALIB.sigma_of(loaded) == before, "警告が σ の値を書き換えている"
+
+
+def test_sigma_dt_match_is_silent_at_the_default_dt(caplog):
+    """既定 Δt=10 では 1 バイトも出さない(無風)。"""
+    loaded = CALIB.load_sigma(None)
+    with caplog.at_level("WARNING", logger="society.cognition.calib"):
+        CALIB.check_sigma_dt(_FakeSim(loaded, 10))
+    assert not [r for r in caplog.records if r.name == "society.cognition.calib"]
+    assert CALIB.sigma_dt_provenance(loaded, 10) == {
+        "calib_dt_min": 10, "run_dt_min": 10, "dt_match": True}
+    assert CALIB.sigma_dt_provenance(loaded, 1) == {
+        "calib_dt_min": 10, "run_dt_min": 1, "dt_match": False}
+
+
+def test_manifest_records_the_sigma_dt_check(tmp_path):
+    """来歴に載る(spec_match と同じ「凍結値がこの run に妥当か」の欄)。"""
+    _sim, out = _run(tmp_path, "sigdt", 6, 8, **_ON)
+    cog = json.loads((out / "run_manifest.json").read_text(encoding="utf-8"))["cognition"]
+    if cog["sigma_c"]["status"] != "loaded":
+        pytest.skip("σ_c 凍結ファイル未生成")
+    assert cog["sigma_c"]["calib_dt_min"] == 10
+    assert cog["sigma_c"]["run_dt_min"] == 10
+    assert cog["sigma_c"]["dt_match"] is True
+
+
+# --------------------------------------------------------------------------- #
 # (H) 宣言(検収基準 5)
 # --------------------------------------------------------------------------- #
 def test_feature_is_declared_in_the_registry():

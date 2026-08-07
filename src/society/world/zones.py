@@ -111,15 +111,15 @@ ZONE_DEFAULTS = {
     "engine": "sfm",              # "sfm" | "orca"(P2 決定: 既定 sfm・多方向交差流だけ orca)
     "dt_sub": 0.05,               # 物理サブステップ [s](P2 条件1: 0.02–0.05)
     "max_sub_steps": 12000,       # 1 世界 step で回すサブステップ上限(600s/0.05s = 12000)
-                                  # ★§1.2 B5 / R7(第94バッチ OBS-U2): これは **正準 Δt=10 の
-                                  #   step 長 600s** から導いた直書きであり、Δt に追随しない。
-                                  #   physics.py:331 は n_sub = min(max_sub_steps,
-                                  #   step_seconds/dt_sub) なので、Δt<10(1 分 = 1200 sub)では
-                                  #   上限に届かず無害だが、**Δt>10 では積分が黙って打ち切られる**
-                                  #   (Δt=20 で 24000 必要なのに 12000 で停止 = 半分の時間しか
-                                  #   進まない)。Δt 掃引を上方向にもやるなら、ここを
-                                  #   clock.step_seconds / dt_sub から導くよう直すこと。
-                                  #   OBS-U2(Δt=1)では踏まないので第94では据え置く。
+                                  # ★§1.2 B5 / R7(第94バッチ OBS-U2)で「Δt に追随しない
+                                  #   直書き」と指摘されていた値。**第99で導出化した**:
+                                  #   ゾーン宣言が `max_sub_steps` を書いていなければ
+                                  #   `derive_max_sub_steps(dt_sub, clock.step_seconds)`
+                                  #   = round(step_seconds / dt_sub) が使われる。
+                                  #   ここに残る 12000 は **step_seconds を渡せない呼び出し**
+                                  #   (conf 直読みのツール等)のためのフォールバック兼
+                                  #   「正準 Δt=10・dt_sub=0.05 での値」の宣言である。
+                                  #   Δt=10 かつ dt_sub=0.05 では導出値 = 12000 = 現行と厳密同値。
     "arrive_radius_m": 1.0,       # 出口ゲートへの到達判定半径 [m]
     "neighbor_cap": 12,           # 対人相互作用の近傍上限(SFM/ORCA 共通)
     "v_max_factor": 1.3,          # 最高速度 = 希望速度 × これ(Helbing2000)
@@ -371,11 +371,16 @@ def _merge(defaults: dict, raw) -> dict:
     return out
 
 
-def build_cfg(raw, repo_root: Path | None = None) -> dict:
+def build_cfg(raw, repo_root: Path | None = None,
+              step_seconds: float | None = None) -> dict:
     """conf の `physics` ブロック → 正準 dict。既定は **ゾーン 0 件**(= 完全 no-op)。
 
     Returns: {"zones_enabled": bool, "zones": tuple[Zone, …], "perception": {...}}
     ★ `zones_enabled=false` または `zones` が空なら `zones=()`(= 一切の新経路を通らない)。
+
+    `step_seconds`(= `clock.step_seconds`)は `max_sub_steps` **未指定**のゾーンで
+    上限を Δt から導くために使う(第99・`derive_max_sub_steps`)。省略すると正準
+    Δt=10 の値 12000 へ後退する = 既存の呼び出しはバイト単位で従来どおり。
     """
     raw = dict(raw or {})
     repo_root = repo_root or Path(".")
@@ -391,7 +396,7 @@ def build_cfg(raw, repo_root: Path | None = None) -> dict:
     zones: list[Zone] = []
     if enabled:
         for spec in (raw.get("zones", ()) or ()):
-            zones.append(_build_zone(dict(spec), repo_root))
+            zones.append(_build_zone(dict(spec), repo_root, step_seconds))
     _check_disjoint(zones)
     return {"zones_enabled": enabled, "zones": tuple(zones), "perception": perception,
             "sfm": sfm}
@@ -423,7 +428,27 @@ def _build_sfm(raw) -> dict:
     return out
 
 
-def _build_zone(spec: dict, repo_root: Path) -> Zone:
+def derive_max_sub_steps(dt_sub: float, step_seconds: float | None) -> int:
+    """`max_sub_steps` 未指定時の上限 = **1 世界 step ぶんちょうど**のサブステップ数。
+
+    第99(物理見積 残①・OBS-U2 §1.2 B5 / R7 の是正)。physics.py の
+    ``n_sub = min(max_sub_steps, max(1, round(step_seconds/dt_sub)))`` に対して、
+    上限側を同じ式から導けば **上限が binding しなくなる** = Δt を変えても積分が
+    黙って打ち切られない(Δt=20 分で 24000 必要なのに 12000 で止まる、が消える)。
+
+    - ``step_seconds=None``(= Δt を知らない呼び出し)では正準値 12000 へ後退する。
+    - **Δt=10 かつ dt_sub=0.05 では 600/0.05 = 12000 = 現行値と厳密に同じ**。
+    - dt_sub を正準の 0.05 より細かくした宣言(例 0.02)では導出値が 12000 を超える。
+      これは「1 step ぶんは必ず積む」という上限の契約を守った結果であり、旧実装が
+      その条件で黙って打ち切っていた方が誤り(同じ B5 の症状の別の顔)。明示的に
+      打ち切りたいときは宣言側に ``max_sub_steps`` を書けばそれが尊重される。
+    """
+    if step_seconds is None:
+        return int(ZONE_DEFAULTS["max_sub_steps"])
+    return max(1, int(round(float(step_seconds) / float(dt_sub))))
+
+
+def _build_zone(spec: dict, repo_root: Path, step_seconds: float | None = None) -> Zone:
     merged = _merge(ZONE_DEFAULTS, spec)
     zid = str(merged["id"]).strip()
     if not zid:
@@ -446,7 +471,11 @@ def _build_zone(spec: dict, repo_root: Path) -> Zone:
         polygon=poly,
         engine=engine,
         dt_sub=dt_sub,
-        max_sub_steps=int(merged["max_sub_steps"]),
+        # 明示宣言があればそれを尊重し、無ければ Δt から導く(第99)。
+        # ★ `merged` ではなく `spec` を見るのは、_merge が既定 12000 を必ず埋めてしまい
+        #   「書かれていない」と「12000 と書いた」が区別できなくなるため。
+        max_sub_steps=(int(spec["max_sub_steps"]) if "max_sub_steps" in spec
+                       else derive_max_sub_steps(dt_sub, step_seconds)),
         arrive_radius_m=float(merged["arrive_radius_m"]),
         neighbor_cap=int(merged["neighbor_cap"]),
         v_max_factor=float(merged["v_max_factor"]),

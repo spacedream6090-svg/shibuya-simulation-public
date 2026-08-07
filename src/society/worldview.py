@@ -28,7 +28,23 @@ R1 呼数不変: generate() を1本も足さない(発火者のプロンプト�
 no-fingerprint: 注入は自然文(mood_text 方式)。因子語・構成概念名は書かない。
 既定 OFF(enabled=false)= 状態・イベント・プロンプトとも既定と完全一致(バイト一致)。
 制約: C2 の応答走査は logger を絶対位置(total_n_events 基準)で増分走査する。
-  checkpoint の flush_segment で退避された分は走査済み扱い(標準ランは影響なし)。
+  ~~checkpoint の flush_segment で退避された分は走査済み扱い~~ → **第98バッチ W4-A で解消**:
+  flush の直前に absorb_before_flush() が未走査区間を carry へ吸い上げるので、分割 straight
+  (checkpoint_every / flush_every_steps)も plain と一致する。
+
+resume(第98バッチ W4-A で解消)
+--------------------------------
+走査位置 _wv_pos は**プロセス内 logger カウンタ由来**なので resume で 0 に戻る。走査は
+**日境界にしか走らない**ため、「直前の日境界 〜 checkpoint」区間のイベントは resume 後の
+新 logger に存在せず、そのままでは C2 応答も C6 開拓行動数もまるごと落ちていた(日カウンタ
+_wv_day を保存しても埋まらない=**イベント本体に相当する情報**が要る)。
+そこで checkpoint_state()/restore_checkpoint() が**未走査区間の射影**だけを運ぶ:
+  - C2: (対象 agent_id, 肯定か, 強い応答か) の三つ組列(_wv_carry)。日次上限(ctrl_daily_*)
+    を保存時に先取り適用するので **要素数は高々 n_agents×(strong+weak 上限)= 有界**。
+    上限超過分を捨てても消費時に必ず弾かれる=同値(応答の解決可否は agent_id ごとに一意)。
+  - C6: 未走査区間の開拓行動数(_wv_pioneer_carry。int 1 個)。
+checkpoint_state() は **1 バイトも sim を書き換えない純粋な読み取り**なので、straight ラン
+(checkpoint を挟む分割 straight を含む)の挙動は完全に不変。
 """
 from __future__ import annotations
 
@@ -135,11 +151,40 @@ def _ctrl_apply(agent, positive: bool, scale: float, cfg: dict) -> None:
     agent.controllability = min(_CTRL_CLIP[1], max(_CTRL_CLIP[0], c))
 
 
+def _response_of(e):
+    """イベント → (対象 agent_id, 肯定か, 強い応答か)。応答でなければ None(純関数・状態不変)。
+
+    _scan_responses(消費側)と checkpoint_state(保存側)が**同じ写像**を使うための単一の源。
+    対象 id は解決前の生値(payload 由来で None / 未知 id もありうる)を返し、解決は消費側が行う。"""
+    k = e.kind
+    if k == "proposal_passed":
+        return (e.agent_id, True, True)
+    if k == "vote_result":
+        return (e.agent_id, bool(e.payload.get("passed")), True)
+    if k == "venture_permit":
+        if str(e.payload.get("outcome")) == "denied":
+            return (e.agent_id, False, True)
+        return None
+    if k == "venture_close":
+        return (e.agent_id, False, True)
+    if k == "venture_sale":
+        return (e.agent_id, True, False)
+    if k == "flyer_view":
+        return (e.payload.get("author"), True, False)
+    if k == "event_attend":
+        return (e.payload.get("host"), True, False)
+    if k == "proposal_support":
+        return (e.payload.get("author"), True, False)
+    return None
+
+
 def _scan_responses(sim, cfg: dict) -> None:
     """前回位置から新しいイベントを1回ずつ走査し、C2 を世界の応答で更新する(R9)。
 
     絶対位置 = logger.total_n_events() 基準。flush_segment で退避された分は
-    走査済み扱い(標準ランでは退避は起きない)。
+    走査済み扱い(標準ランでは退避は起きない)。resume で運ばれた未走査分
+    (_wv_carry)は**時間順で先**なので、新 logger の走査より前に消費する
+    (日次キャップ quota も carry から順に食う=straight と完全同一)。
     """
     log = sim.logger
     flushed = getattr(log, "_n_flushed", 0)
@@ -153,7 +198,10 @@ def _scan_responses(sim, cfg: dict) -> None:
     quota: dict[tuple[int, bool], int] = {}
     cap = {True: cfg["ctrl_daily_strong"], False: cfg["ctrl_daily_weak"]}
 
-    def _apply(agent, positive: bool, strong: bool) -> None:
+    def _apply(aid, positive: bool, strong: bool) -> None:
+        agent = by_id.get(aid)
+        if agent is None:                  # 未知 id / payload 欠落 = 計上もキャップ消費もしない
+            return
         key = (agent.id, strong)
         used = quota.get(key, 0)
         if used >= cap[strong]:
@@ -161,41 +209,13 @@ def _scan_responses(sim, cfg: dict) -> None:
         quota[key] = used + 1
         _ctrl_apply(agent, positive, 1.0 if strong else ws, cfg)
 
+    for aid, positive, strong in (getattr(sim, "_wv_carry", None) or ()):
+        _apply(aid, positive, strong)      # resume で運ばれた「日境界〜checkpoint」区間
+    sim._wv_carry = []
     for e in events[start:]:
-        k = e.kind
-        if k == "proposal_passed":
-            a = by_id.get(e.agent_id)
-            if a is not None:
-                _apply(a, True, True)
-        elif k == "vote_result":
-            a = by_id.get(e.agent_id)
-            if a is not None:
-                _apply(a, bool(e.payload.get("passed")), True)
-        elif k == "venture_permit":
-            if str(e.payload.get("outcome")) == "denied":
-                a = by_id.get(e.agent_id)
-                if a is not None:
-                    _apply(a, False, True)
-        elif k == "venture_close":
-            a = by_id.get(e.agent_id)
-            if a is not None:
-                _apply(a, False, True)
-        elif k == "venture_sale":
-            a = by_id.get(e.agent_id)
-            if a is not None:
-                _apply(a, True, False)
-        elif k == "flyer_view":
-            a = by_id.get(e.payload.get("author"))
-            if a is not None:
-                _apply(a, True, False)
-        elif k == "event_attend":
-            a = by_id.get(e.payload.get("host"))
-            if a is not None:
-                _apply(a, True, False)
-        elif k == "proposal_support":
-            a = by_id.get(e.payload.get("author"))
-            if a is not None:
-                _apply(a, True, False)
+        r = _response_of(e)
+        if r is not None:
+            _apply(r[0], r[1], r[2])
     sim._wv_pos = flushed + len(events)
 
 
@@ -210,7 +230,9 @@ def _on_day(sim, day: int, step: int, sim_min: int, cfg: dict) -> None:
     log = sim.logger
     flushed = getattr(log, "_n_flushed", 0)
     start = max(0, getattr(sim, "_wv_pos", 0) - flushed)
-    pioneer = sum(1 for e in log.events[start:] if e.kind in _PIONEER_KINDS)
+    pioneer = (int(getattr(sim, "_wv_pioneer_carry", 0))     # resume で運ばれた未走査分
+               + sum(1 for e in log.events[start:] if e.kind in _PIONEER_KINDS))
+    sim._wv_pioneer_carry = 0
     _scan_responses(sim, cfg)                         # ここで _wv_pos が進む
     sim._wv_pioneer.append(pioneer)
     if first:
@@ -243,6 +265,80 @@ def _reset_err(sim) -> None:
         if getattr(a, "wv_expect", None) is not None:
             a._wv_err_sum = 0.0
             a._wv_err_n = 0
+
+
+# ------------------------------------------------------------------ checkpoint
+def checkpoint_state(sim) -> dict | None:
+    """未走査区間(直前の日境界 〜 いま)の C2 応答射影と C6 開拓行動数を返す(OFF は None)。
+
+    ★**純粋な読み取り**(sim も logger も 1 バイトも書き換えない)= straight ラン不変。
+    engine/checkpoint.py が save 時に1回呼ぶ(ablate.placebo_state と同じ口の切り方)。
+
+    有界性: 三つ組は (対象 id, strong) ごとに日次上限(ctrl_daily_strong/weak)まで**しか**
+    積まない。上限超過分は消費側の quota で必ず弾かれるので、捨てても結果は同値
+    (応答の解決可否 by_id.get(id) は id ごとに一意=同 id の要素は全て解決するか全て
+    しないかのどちらか。したがって「先頭 cap 件」が straight で実際に適用される要素と一致)。
+    """
+    cfg = getattr(sim, "worldviewcfg", None)
+    if not cfg or not cfg["enabled"]:
+        return None
+    log = getattr(sim, "logger", None)
+    if log is None:
+        return None
+    flushed = getattr(log, "_n_flushed", 0)
+    start = max(0, int(getattr(sim, "_wv_pos", 0)) - flushed)
+    tail = log.events[start:]
+    cap = {True: int(cfg["ctrl_daily_strong"]), False: int(cfg["ctrl_daily_weak"])}
+    quota: dict[tuple, int] = {}
+    pending: list = []
+
+    def _push(aid, positive: bool, strong: bool) -> None:
+        key = (aid, bool(strong))
+        used = quota.get(key, 0)
+        if used >= cap[bool(strong)]:
+            return
+        quota[key] = used + 1
+        pending.append((aid, bool(positive), bool(strong)))
+
+    for aid, positive, strong in (getattr(sim, "_wv_carry", None) or ()):
+        _push(aid, positive, strong)       # 前回 resume ぶんも取りこぼさない(時間順で先)
+    for e in tail:
+        r = _response_of(e)
+        if r is not None:
+            _push(r[0], r[1], r[2])
+    pioneer = (int(getattr(sim, "_wv_pioneer_carry", 0))
+               + sum(1 for e in tail if e.kind in _PIONEER_KINDS))
+    return {"pending": pending, "pioneer": pioneer}
+
+
+def absorb_before_flush(sim) -> None:
+    """L1 バッファが flush_segment で空になる**前**に、未走査区間を carry へ吸い上げる(OFF は no-op)。
+
+    走査は日境界にしか走らないので、日の途中で flush が入ると [_wv_pos, flush 点) のイベントが
+    バッファから消えて二度と読めない(本 module 冒頭が「退避された分は走査済み扱い」と註記して
+    いた**既存の欠落**。実測: worldview ON・checkpoint_every=40 の分割 straight は plain と
+    L1 が 3 行食い違っていた=第98 W4-A で確認)。checkpoint_state と同じ有界射影で先に吸って
+    おけば、日境界の走査が「carry + flush 後のイベント」で丸ごと 1 日分になり、分割 straight が
+    plain と一致し、resume も同じ土俵に乗る。
+    ★flush を 1 度も挟まないラン(checkpoint_every=0 かつ flush_every_steps=0 = 既定)では
+      本関数は 1 度も呼ばれない = 既定ランは 1 バイトも変わらない。
+    """
+    st = checkpoint_state(sim)
+    if st is None:                                    # worldview OFF
+        return
+    sim._wv_carry = list(st["pending"])
+    sim._wv_pioneer_carry = int(st["pioneer"])
+    log = sim.logger
+    sim._wv_pos = getattr(log, "_n_flushed", 0) + len(log.events)
+
+
+def restore_checkpoint(sim, state: dict | None) -> None:
+    """checkpoint_state() の返り値を sim へ戻す(None / 旧 checkpoint は no-op=従来挙動)。"""
+    if not state:
+        return
+    sim._wv_carry = [(aid, bool(p), bool(s))
+                     for aid, p, s in (state.get("pending") or ())]
+    sim._wv_pioneer_carry = int(state.get("pioneer", 0) or 0)
 
 
 # ------------------------------------------------------------------ プロンプト行

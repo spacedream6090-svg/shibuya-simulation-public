@@ -16,9 +16,9 @@ OBS-U2 の並行小ラン(`conf/smoke_dt1.yaml`・`run.dt_min=1`)は **Δt=10 �
 ----------------------------------------
 1. `<run_dir>/config.yaml` の `run.dt_min` … `society.config.save_config` が必ず書く
    スナップショット。第79バッチ以降のランはここに入っている(**正**)。
-2. `<run_dir>/run_manifest.json` の `run.dt_min` … 現行の manifest は `run` ブロックに
-   dt_min を持たない(`src/society/observer/manifest.py:155-166`)ので通常は空振りする。
-   将来 manifest 側に載ったときに自動で拾えるよう順序だけ用意してある(観測専用・読むだけ)。
+2. `<run_dir>/run_manifest.json` の `run.dt_min` … 第101(2026-08-08)から manifest の
+   `run` ブロックに載る(`src/society/observer/manifest.py`)。それ以前のランでは無いので
+   空振りして 3. へ落ちる(観測専用・読むだけ)。
 3. どちらにも無ければ **正準 Δt=10 と仮定し、その旨を stderr に 1 行出す**。
    第79バッチ以前のランは config.yaml に dt_min を持たない(実測 178 本中 173 本)ので
    この経路が普通に踏まれる。**黙って 144 を使わない**ことが本モジュールの存在理由。
