@@ -41,10 +41,12 @@ sys.path.insert(0, os.path.join(_ROOT, "src"))
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+import run_dt                                       # noqa: E402  (W2-3: Δt の単一の源)
 from society.observer import measure as m           # noqa: E402  (import のみ)
 
-MIN_PER_DAY = 1440
-STEPS_PER_DAY = 144
+MIN_PER_DAY = 1440                                  # 分/日は Δt 非依存(実時間)
+# W2-3: **ラン依存**(run.dt_min)。既定は正準 Δt=10 の 144 = 従来と 1 ビットも変わらない。
+STEPS_PER_DAY = run_dt.CANON_STEPS_PER_DAY
 _CONV_WINDOW_MIN = 3 * MIN_PER_DAY                    # 広告→来店の帰属窓(3日)= research §2.3
 _HUFF_BETA = 2.0                                     # Huff 距離減衰 b(research §1 KPI#4)
 
@@ -66,8 +68,9 @@ def _hour(sim_min: int) -> int:
     return (sim_min // 60) % 24
 
 
-def _day(step: int) -> int:
-    return step // STEPS_PER_DAY
+def _day(step: int, spd: int = STEPS_PER_DAY) -> int:
+    """step 基準の活動日(W2-3: `spd` の既定は正準 144 = 従来と完全同値)。"""
+    return step // int(spd)
 
 
 def _age_band(age) -> str:
@@ -167,7 +170,7 @@ def _bldg_label(bid: str, mp: dict) -> str:
 # --------------------------------------------------------------------------- #
 # 在館セッション(enter〜exit)の抽出。売上帰属・dwell・客単価・回遊の共通土台。
 # --------------------------------------------------------------------------- #
-def build_sessions(events: list[dict]):
+def build_sessions(events: list[dict], spd: int = STEPS_PER_DAY):
     """agent の建物在館セッション列を返す。
 
     各セッション: {agent, building, enter_min, exit_min, enter_step, day, hour,
@@ -198,7 +201,7 @@ def build_sessions(events: list[dict]):
             bid = p.get("building")
             open_sess[aid] = {
                 "agent": aid, "building": bid, "enter_min": e["sim_min"],
-                "exit_min": None, "enter_step": e["step"], "day": _day(e["step"]),
+                "exit_min": None, "enter_step": e["step"], "day": _day(e["step"], spd),
                 "hour": _hour(e["sim_min"]), "dwell_min": None,
                 "spend": 0.0, "spend_cat": Counter()}
         elif k == "exit_building":
@@ -560,12 +563,12 @@ def analyze_sales(events: list[dict], sessions: list[dict], agents: list[dict],
 # 観点4: トレンド・イベントROI
 # --------------------------------------------------------------------------- #
 def analyze_trends(events: list[dict], sessions: list[dict], mp: dict,
-                   n_days: int) -> dict:
+                   n_days: int, spd: int = STEPS_PER_DAY) -> dict:
     # 語の採用曲線(label_adopt / transmission の日次累積)
     adopt_day: Counter = Counter()
     trans_day: Counter = Counter()
     for e in events:
-        d = _day(e["step"])
+        d = _day(e["step"], spd)
         if e["kind"] == "label_adopt":
             adopt_day[d] += 1
         elif e["kind"] == "transmission":
@@ -588,7 +591,7 @@ def analyze_trends(events: list[dict], sessions: list[dict], mp: dict,
     casc_hist = dict(sorted(Counter(casc_sizes).items()))
 
     # イベント開催 → 会場周辺売上リフト(開催日 vs 非開催日・同時間帯)
-    event_lift = _event_lift(events, sessions)
+    event_lift = _event_lift(events, sessions, spd)
 
     return {
         "adopt_cumulative": adopt_cum, "transmission_cumulative": trans_cum,
@@ -599,7 +602,8 @@ def analyze_trends(events: list[dict], sessions: list[dict], mp: dict,
     }
 
 
-def _event_lift(events: list[dict], sessions: list[dict]) -> dict:
+def _event_lift(events: list[dict], sessions: list[dict],
+                spd: int = STEPS_PER_DAY) -> dict:
     """event_host / annual_event / crowd_surge の開催日を拾い、会場周辺(近接建物)の
     売上を開催日 vs 非開催日で比較(同時間帯窓)。リフトは正負両方を許す(§4 ハロウィン知見)。
 
@@ -610,7 +614,7 @@ def _event_lift(events: list[dict], sessions: list[dict]) -> dict:
     hosts = []
     for e in events:
         if e["kind"] in ("event_host", "annual_event"):
-            d = _day(e["step"])
+            d = _day(e["step"], spd)
             host_days.add(d)
             hosts.append({"kind": e["kind"], "day": d,
                           "title": e["payload"].get("title")
@@ -623,7 +627,7 @@ def _event_lift(events: list[dict], sessions: list[dict]) -> dict:
     spend_day: Counter = Counter()
     for e in events:
         if e["kind"] == "spend":
-            spend_day[_day(e["step"])] += float(e["payload"].get("amount") or 0)
+            spend_day[_day(e["step"], spd)] += float(e["payload"].get("amount") or 0)
     all_days = sorted(set(range(max(spend_day.keys(), default=0) + 1)))
     on = [spend_day.get(d, 0.0) for d in all_days if d in host_days]
     off = [spend_day.get(d, 0.0) for d in all_days if d not in host_days]
@@ -911,7 +915,9 @@ def report(run_dir: str, out_md: str | None = None) -> dict:
     run_name = os.path.basename(os.path.normpath(run_dir))
     n_agents = len(agents) or (max((e["agent_id"] for e in events), default=-1) + 1)
     n_steps = max((e["step"] for e in events), default=-1) + 1
-    n_days = -(-n_steps // STEPS_PER_DAY) if n_steps else 0
+    # W2-3: 「1 日」はこのランの run.dt_min で決まる(Δt=10 なら 144 = 従来と同値)。
+    spd = run_dt.steps_per_day(run_dir)
+    n_days = -(-n_steps // spd) if n_steps else 0
 
     # weekday マップ(build_panel と同じ流儀: 暦日 sim_min//1440 で first-wins)
     weekday_of: dict = {}
@@ -921,12 +927,12 @@ def report(run_dir: str, out_md: str | None = None) -> dict:
             if wd:
                 weekday_of.setdefault(e["sim_min"] // MIN_PER_DAY, wd)
 
-    sessions = build_sessions(events)
+    sessions = build_sessions(events, spd)
     foot = analyze_footfall(events, sessions, agents, mp, weekday_of)
     circ = analyze_circulation(sessions, mp)
     ads = analyze_ads(events, sessions, mp, agents)
     sales = analyze_sales(events, sessions, agents, mp, weekday_of)
-    trends = analyze_trends(events, sessions, mp, n_days)
+    trends = analyze_trends(events, sessions, mp, n_days, spd)
 
     md = render(run_name, len(events), n_agents, n_days, mp, foot, ads, sales,
                 trends, circ)

@@ -55,6 +55,8 @@ import pyarrow.parquet as pq
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "src"))
+if _HERE not in sys.path:                       # l1_stream(W2-2 の共有逐次読み)用
+    sys.path.insert(0, _HERE)
 
 # Windows コンソール(cp932)で日本語や記号を print しても落ちないように(ファイル出力は常に UTF-8)。
 for _s in (sys.stdout, sys.stderr):
@@ -63,7 +65,11 @@ for _s in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-STEPS_PER_DAY = 144                    # 本シミュ固定の 1 日あたりステップ数(analyze_flows_grid と共通)
+import run_dt                                   # noqa: E402  (W2-3: ランの Δt を読む単一の源)
+
+# W2-3: 1 日あたりステップ数は **ラン依存**(run.dt_min。Δt=10 で 144・Δt=1 で 1440)。
+# 定数は正準 Δt=10 の値として残し(既存の import 互換)、実際の換算は run dir から読む。
+STEPS_PER_DAY = run_dt.CANON_STEPS_PER_DAY
 
 # panel/ に「あることが期待される」派生表(無ければデータ不足として記録)。
 _EXPECTED_PANEL = ["panel.parquet", "heatmap_grid.parquet",
@@ -161,8 +167,12 @@ def _to_num(v):
     return None
 
 
-def _overview_rows(summary: dict) -> list[dict]:
-    """summary.json → ラン概要の代表値行(存在するキーだけ・決定論)。"""
+def _overview_rows(summary: dict, steps_per_day: int = STEPS_PER_DAY) -> list[dict]:
+    """summary.json → ラン概要の代表値行(存在するキーだけ・決定論)。
+
+    `steps_per_day` は W2-3 で追加した引数(既定 = 正準 Δt=10 の 144 = 従来と完全同値)。
+    呼び出し側(collect_kpi)は run dir の run.dt_min から実際の値を渡す。
+    """
     rows: list[dict] = []
     n_steps = summary.get("n_steps")
 
@@ -173,10 +183,10 @@ def _overview_rows(summary: dict) -> list[dict]:
             rows.append({"label": label, "num": n, "unit": unit})
 
     _add("エージェント数", "n_agents", "体")
-    if isinstance(n_steps, int):                  # 日数は n_steps // STEPS_PER_DAY の決定論的派生。
+    if isinstance(n_steps, int):                  # 日数は n_steps // steps_per_day の決定論的派生。
         # ラベルに数字を入れない(フォールバック本文へ表外数値が混入しガードを汚すのを避ける)。
         rows.append({"label": "シミュレーション日数(ステップ数から換算)",
-                     "num": n_steps // STEPS_PER_DAY, "unit": "日"})
+                     "num": n_steps // int(steps_per_day), "unit": "日"})
     _add("総ステップ数", "n_steps")
     _add("総イベント数", "n_events", "件")
     ek = summary.get("event_kinds")
@@ -200,7 +210,12 @@ def _top_event_rows(summary: dict, top: int = 5) -> list[dict]:
 
 
 def _read_parquet(path: str):
-    """parquet を列 dict + schema で返す(pyarrow・純 Python。pandas 非依存)。"""
+    """parquet を列 dict + schema で返す(pyarrow・純 Python。pandas 非依存)。
+
+    **小さい表専用の互換 API**。在場 25万 × 10 日の `panel/panel.parquet` は
+    体数 × 日数 = 250 万行になり、`to_pydict()` は数 GB の Python list を作る。
+    KPI 抽出の実経路は W2-2 で `_extract_*_stream`(row-group 逐次)に移した。
+    """
     tab = pq.read_table(path)
     return tab.to_pydict(), tab.schema
 
@@ -258,8 +273,113 @@ def _extract_generic(cols: dict, schema) -> list[dict]:
     return rows
 
 
+# --------------------------------------------------------------------------- #
+# W2-2(25万対応): 同じ代表値を row-group 逐次で作る抽出器
+#
+# 旧経路(`_read_parquet` → `_extract_*`)はピークメモリが **行数に比例**した。
+# 以下は同じ出力(行の並び・ラベル・数値)を、行数に比例しない状態で組む。
+#   - `_extract_generic_stream` … 状態は「数値列 6 本の 先頭値/末尾値/非 null 有無/
+#     合計/最大」だけ。**O(1)**。
+#   - `_extract_heatmap_grid_stream` … 状態はセル別在圏合計。**O(格子セル数)**
+#     (行数ではない。時間帯 bin を畳んだぶんだけ小さい)。
+# 旧 `_extract_*` は互換のため残す(テスト・小さい表からの呼び出し用)。
+# --------------------------------------------------------------------------- #
+def _iter_columns(path: str, columns=None):
+    import l1_stream as ls
+    return ls.iter_table_columns(path, columns)
+
+
+def _extract_generic_stream(path: str) -> list[dict]:
+    """`_extract_generic` と同一出力を逐次で。状態は列ごとのスカラのみ。"""
+    import l1_stream as ls
+    schema = ls.table_schema(path)
+    n = ls.table_rows(path) if schema.names else 0
+    ncols = _numeric_columns(schema)[:6]
+    rows: list[dict] = [{"label": "レコード数", "num": n, "unit": "行"}]
+    if not ncols:
+        return rows
+    _MAG = {"trips", "present_count", "pass_count", "n_transmissions",
+            "n_edges", "n_nodes"}
+    state = {c: {"first": None, "last": None, "seen": False, "any": False,
+                 "sum": 0, "max": None} for c in ncols}
+    for d in _iter_columns(path, ncols):
+        for c in ncols:
+            col = d.get(c)
+            if not col:
+                continue
+            s = state[c]
+            if not s["seen"]:
+                s["first"] = _to_num(col[0])       # 表全体の先頭行
+                s["seen"] = True
+            s["last"] = _to_num(col[-1])           # 最後に見た batch の末尾 = 表の末尾
+            for v in col:
+                if v is None:
+                    continue
+                s["any"] = True                    # 旧: vals = [v for v ... if v is not None]
+                if c in _MAG:
+                    x = _to_num(v)
+                    if x is None:
+                        continue
+                    s["sum"] += x
+                    s["max"] = x if s["max"] is None else max(s["max"], x)
+    for c in ncols:
+        s = state[c]
+        if not s["any"]:                           # 全 null の列は旧実装でも skip
+            continue
+        first, last = s["first"], s["last"]
+        if first is not None:
+            rows.append({"label": f"{c} 先頭値", "num": first, "unit": None})
+        if last is not None and last != first:
+            rows.append({"label": f"{c} 末尾値", "num": last, "unit": None})
+        if c in _MAG and s["max"] is not None:
+            rows.append({"label": f"{c} 合計", "num": s["sum"], "unit": None})
+            rows.append({"label": f"{c} 最大", "num": s["max"], "unit": None})
+    return rows
+
+
+def _extract_heatmap_grid_stream(path: str) -> list[dict]:
+    """`_extract_heatmap_grid` と同一出力を逐次で。状態はセル別在圏合計のみ。"""
+    import l1_stream as ls
+    names = set(ls.table_schema(path).names)
+    if not {"cell_x", "cell_y", "present_count"} <= names:
+        # 旧実装は列が無ければ KeyError で落ち、呼び出し側が「データ不足」に倒す。
+        # 同じ結末になるよう明示的に投げる(欠測を偽の値で埋めない)。
+        raise KeyError("heatmap_grid: cell_x/cell_y/present_count が無い")
+    want = [c for c in ("cell_x", "cell_y", "hour_bin", "pass_count",
+                        "present_count", "unique_agents") if c in names]
+    n = 0
+    pass_tot = 0
+    pres_tot = 0
+    uniq_max = 0
+    present_by_cell: dict = defaultdict(int)
+    for d in _iter_columns(path, want):
+        cx, cy = d["cell_x"], d["cell_y"]
+        pres = d["present_count"]
+        n += len(cx)
+        for v in d.get("pass_count", ()):
+            if v is not None:
+                pass_tot += int(v)
+        for v in pres:
+            if v is not None:
+                pres_tot += int(v)
+        for v in d.get("unique_agents", ()):
+            if v is not None and int(v) > uniq_max:
+                uniq_max = int(v)
+        for i in range(len(cx)):
+            present_by_cell[(cx[i], cy[i])] += int(pres[i] or 0)
+    top_present = max((v for v in present_by_cell.values()), default=0)
+    return [
+        {"label": "集計セル×時間帯レコード数", "num": n, "unit": "行"},
+        {"label": "通過(pass_count)総数", "num": pass_tot, "unit": "件"},
+        {"label": "在圏観測(present_count)総数", "num": pres_tot, "unit": "件"},
+        {"label": "最大同時 distinct 体数", "num": uniq_max, "unit": "体"},
+        {"label": "最混雑セルの在圏観測合計", "num": top_present, "unit": "件"},
+    ]
+
+
 # ファイル名 → 専用抽出器(未登録は generic)
 _PANEL_EXTRACTORS = {"heatmap_grid.parquet": _extract_heatmap_grid}
+_PANEL_EXTRACTORS_STREAM = {"heatmap_grid.parquet": _extract_heatmap_grid_stream}
 
 _PANEL_TITLES = {
     "panel.parquet": "エージェント日次パネル",
@@ -270,10 +390,11 @@ _PANEL_TITLES = {
 
 
 def _extract_panel_table(path: str) -> list[dict]:
-    cols, schema = _read_parquet(path)
+    """W2-2: 全読み(`_read_parquet`)ではなく row-group 逐次の抽出器を使う。
+    出力は旧経路とバイト同値(tests/test_l1_stream.py が固定)。"""
     fname = os.path.basename(path)
-    extractor = _PANEL_EXTRACTORS.get(fname, _extract_generic)
-    return extractor(cols, schema)
+    extractor = _PANEL_EXTRACTORS_STREAM.get(fname, _extract_generic_stream)
+    return extractor(path)
 
 
 def collect_kpi(run_dir: str, write: bool = True) -> dict:
@@ -294,7 +415,8 @@ def collect_kpi(run_dir: str, write: bool = True) -> dict:
             summary = json.loads(Path(spath).read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             summary = {}
-        ov = _overview_rows(summary)
+        # W2-3: 日数換算はランの Δt に従う(Δt=10 なら 144 = 従来と 1 ビットも変わらない)。
+        ov = _overview_rows(summary, run_dt.steps_per_day(run_dir))
         if ov:
             tables.append({"id": "overview", "title": "ラン概要",
                            "source": "summary.json", "rows": ov})
@@ -334,8 +456,7 @@ def collect_kpi(run_dir: str, write: bool = True) -> dict:
             continue
         ppath = os.path.join(panel_dir, fname)
         try:
-            cols, schema = _read_parquet(ppath)
-            rows = _extract_generic(cols, schema)
+            rows = _extract_generic_stream(ppath)     # W2-2: 全読みしない
         except Exception:
             continue
         tables.append({"id": fname.replace(".parquet", ""),

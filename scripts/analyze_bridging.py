@@ -28,7 +28,14 @@ from collections import defaultdict
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-STEPS_PER_DAY = 144
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:                    # 同ディレクトリの run_dt を import
+    sys.path.insert(0, _HERE)
+
+import run_dt                                # noqa: E402  (W2-3: ランの Δt の単一の源)
+
+# W2-3: **ラン依存**(run.dt_min)。既定は正準 Δt=10 の 144(= 従来と 1 ビットも変わらない)。
+STEPS_PER_DAY = run_dt.CANON_STEPS_PER_DAY
 
 
 def load_transmissions(run_dir: str) -> list[dict]:
@@ -58,7 +65,7 @@ def _stats(dists: list[float]) -> dict:
             "p90": round(p90, 1)}
 
 
-def summarize(trans: list[dict], far_m: float) -> dict:
+def summarize(trans: list[dict], far_m: float, spd: int = STEPS_PER_DAY) -> dict:
     by_ch: dict[str, list[dict]] = defaultdict(list)
     for t in trans:
         by_ch[str(t["channel"])].append(t)
@@ -76,7 +83,7 @@ def summarize(trans: list[dict], far_m: float) -> dict:
     for t in trans:
         if t["channel"] not in ("sns", "dm"):
             continue
-        d = daily.setdefault(t["step"] // STEPS_PER_DAY,
+        d = daily.setdefault(t["step"] // int(spd),
                              {"n": 0, "n_far": 0, "n_with_dist": 0})
         d["n"] += 1
         if t["dist_m"] is not None:
@@ -99,7 +106,7 @@ def main() -> None:
     args = ap.parse_args()
 
     trans = load_transmissions(args.run_dir)
-    result = summarize(trans, args.far_m)
+    result = summarize(trans, args.far_m, run_dt.steps_per_day(args.run_dir))
 
     out_dir = os.path.join(args.run_dir, "analysis")
     os.makedirs(out_dir, exist_ok=True)

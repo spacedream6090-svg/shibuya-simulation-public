@@ -35,7 +35,22 @@ try:
 except Exception:
     pass
 
-STEPS_PER_DAY = 144
+if _HERE not in sys.path:                # 同ディレクトリの run_dt を import
+    sys.path.insert(0, _HERE)
+
+import run_dt                            # noqa: E402  (W2-3: ランの Δt の単一の源)
+
+# W2-3: これから回すベンチランの 1 日 step 数は **プロファイル > 基底 conf の run.dt_min**
+# で決まる(Δt=10 なら 144 = 従来と 1 ビットも変わらない)。
+STEPS_PER_DAY = run_dt.CANON_STEPS_PER_DAY
+
+
+def bench_steps_per_day(profile=None) -> int:
+    """ベンチが回すランの 1 日あたり step 数(プロファイル → 基底 conf の順に見る)。"""
+    dt = run_dt.dt_min_from_yaml(profile)
+    if dt is None:
+        dt = run_dt.dt_min_of(os.path.join(_ROOT, "conf"))
+    return run_dt.steps_per_day(dt_min=dt)
 
 
 def _peak_working_set() -> int:
@@ -80,6 +95,7 @@ def _peak_working_set() -> int:
 def _single_run(profile: str, agents: int, steps: int, seed: int,
                 out_dir: Path) -> dict:
     """フレッシュな**子プロセス内**で 1 本回すための本体(ピーク working set=この run の峰)。"""
+    spd = bench_steps_per_day(profile)          # W2-3: このランの 1 日あたり step 数
     from society.config import load_config
     from society.engine.simulation import Simulation
     shutil.rmtree(out_dir, ignore_errors=True)
@@ -94,7 +110,7 @@ def _single_run(profile: str, agents: int, steps: int, seed: int,
     l1 = out_dir / "l1_events.parquet"
     l1_bytes = l1.stat().st_size if l1.exists() else 0
     total_bytes = sum(p.stat().st_size for p in out_dir.glob("*.parquet"))
-    return {"agents": agents, "steps": steps, "days": steps / STEPS_PER_DAY,
+    return {"agents": agents, "steps": steps, "days": steps / float(spd),
             "sec": dt, "events": summary["n_events"], "l1_bytes": l1_bytes,
             "all_parquet_bytes": total_bytes, "peak_ram_bytes": peak}
 
@@ -188,6 +204,7 @@ def main() -> None:
     bench_root = Path(_ROOT) / "runs" / "_bench_longrun"
     bench_root.mkdir(parents=True, exist_ok=True)
 
+    spd = bench_steps_per_day(profile)      # W2-3: このベンチが回すランの 1 日 step 数
     probe_days = [int(x) for x in args.probe_days.split(",") if x.strip()]
     print(f"[bench] profile={args.profile} agents={args.agents} "
           f"probes={probe_days}日 validate={args.validate_days}日 "
@@ -196,7 +213,7 @@ def main() -> None:
     # ---- 1) probe ラン(外挿の素)----
     probes = []
     for d in probe_days:
-        steps = d * STEPS_PER_DAY
+        steps = d * spd
         r = _run_once(profile, args.agents, steps, args.seed,
                       bench_root / f"probe_{d}d")
         probes.append(r)
@@ -208,7 +225,7 @@ def main() -> None:
             for k in ("sec", "events", "l1_bytes", "all_parquet_bytes", "peak_ram_bytes")}
 
     # ---- 2) 検証ラン(7日)実測 vs 外挿 ----
-    vsteps = args.validate_days * STEPS_PER_DAY
+    vsteps = args.validate_days * spd
     val = _run_once(profile, args.agents, vsteps, args.seed,
                     bench_root / f"validate_{args.validate_days}d")
     print(f"  validate {args.validate_days}日(実測): {_fmt_sec(val['sec'])} / "
@@ -230,7 +247,7 @@ def main() -> None:
     bytes_per_ev = val["l1_bytes"] / val["events"] if val["events"] else 0
     allbytes_per_ev = val["all_parquet_bytes"] / val["events"] if val["events"] else 0
 
-    tgt_steps = args.target_days * STEPS_PER_DAY
+    tgt_steps = args.target_days * spd
     tgt_agents = args.target_agents
     est_events = per_ev_agentday * tgt_agents * args.target_days
     est = {
@@ -241,7 +258,7 @@ def main() -> None:
         # ピーク RAM: checkpoint_every=1440(10日) で ~10日分のイベントが上限。全量保持の下限見積り。
         "peak_ram_full": (val["peak_ram_bytes"] / (va * vst)) * tgt_agents * tgt_steps,
     }
-    est["peak_ram_ckpt10d"] = (val["peak_ram_bytes"] / (va * vst)) * tgt_agents * (10 * STEPS_PER_DAY)
+    est["peak_ram_ckpt10d"] = (val["peak_ram_bytes"] / (va * vst)) * tgt_agents * (10 * spd)
 
     run30 = None
     if args.run_30d:
@@ -254,7 +271,7 @@ def main() -> None:
     # ---- 4) レポート出力 ----
     out_path = args.out if os.path.isabs(args.out) else os.path.join(_ROOT, args.out)
     _write_report(out_path, args, probes, fits, val, _err, est, run30,
-                  per_as_sec, per_ev_agentday, bytes_per_ev)
+                  per_as_sec, per_ev_agentday, bytes_per_ev, spd)
     print(f"[bench] -> {out_path}")
 
     if not args.keep:
@@ -262,7 +279,8 @@ def main() -> None:
 
 
 def _write_report(path, args, probes, fits, val, err_fn, est, run30,
-                  per_as_sec, per_ev_agentday, bytes_per_ev) -> None:
+                  per_as_sec, per_ev_agentday, bytes_per_ev,
+                  spd: int = STEPS_PER_DAY) -> None:
     import datetime
     L: list[str] = []
     L.append("# 長期日常ラン(30日級)の実行見積もり — 第57バッチ タスクC\n")
@@ -305,7 +323,7 @@ def _write_report(path, args, probes, fits, val, err_fn, est, run30,
              "長い日数ほど誤差が縮む。以下の 30日外挿は**検証ラン(最長=最安定)の per-agent-step 単価**を用いる。\n")
 
     L.append("## 4. 30日ランの見積り(人数 {}人・{}step)\n".format(
-        args.target_agents, args.target_days * STEPS_PER_DAY))
+        args.target_agents, args.target_days * spd))
     L.append(f"- 単価(検証ラン由来): {per_as_sec * 1000:.4f} ms/agent-step ・ "
              f"{per_ev_agentday:.1f} events/agent-day ・ {bytes_per_ev:.1f} B/event(L1)")
     L.append("")

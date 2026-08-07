@@ -48,7 +48,11 @@ if hasattr(sys.stdout, "reconfigure"):
 
 import panel_stats as ps                           # noqa: E402  (統計純関数の再利用)
 
-STEPS_PER_DAY = 144
+# W2-3(Δt 対応の棚卸し): この定数は **未使用**(死んだ定数)。
+# 本 module 内で step→日 の換算は行っていない(L2 の step 列をそのまま扱う)ため未使用。
+# 将来ここで日を切るときは 144 を書かず scripts/run_dt.steps_per_day(run_dir) を通すこと
+# (1 日の step 数は run.dt_min 依存: Δt=10 で 144・Δt=1 で 1440)。
+STEPS_PER_DAY = 144          # 正準 Δt=10 の値(未使用)
 
 # panel/run_day のうち指標として扱わない列(ID・メタ)。
 _PANEL_NONMETRIC = {"run", "day", "weekday", "warmup", "n_agents", "n_residents"}

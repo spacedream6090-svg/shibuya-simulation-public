@@ -39,9 +39,16 @@ if hasattr(sys.stdout, "reconfigure"):
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 RUNS_ROOT = os.path.join(_ROOT, "runs")
+if _HERE not in sys.path:                       # 同ディレクトリの run_dt を import
+    sys.path.insert(0, _HERE)
 
-STEPS_PER_DAY = 144
-WINDOW_STEPS = 24        # 4時間(=24×10分)
+import run_dt                                   # noqa: E402  (W2-3: ランの Δt の単一の源)
+
+# W2-3: どちらも **ラン依存**(run.dt_min)。ここの値は正準 Δt=10 の既定で、実際の値は
+# analyze() が run dir から読んで各段へ引数で配る(Δt=10 なら 144 / 24 = 従来と同値)。
+STEPS_PER_DAY = run_dt.CANON_STEPS_PER_DAY      # 144
+WINDOW_STEPS = 24        # 4時間(= 4×60/Δt step。Δt=10 で 24・Δt=1 で 240)
+WINDOW_HOURS = 4         # ↑の実時間(こちらが Δt 非依存の定義)
 MIN_ATTENTION_AGENTS = 3
 
 # テキストを持つイベント種と、その本文フィールド(schema.py 準拠)
@@ -568,6 +575,11 @@ def _classify_proper(cand: str, ctype: str, real_index: "NameIndex",
     return "fiction"
 
 
+def window_steps_of(run_dir: str) -> int:
+    """共伝播の観測窓 [step] = 実時間 WINDOW_HOURS 時間ぶん(Δt=10 で 24・Δt=1 で 240)。"""
+    return max(1, WINDOW_HOURS * run_dt.steps_per_hour(run_dir))
+
+
 def compute_grounding(records: list[dict], real_index: "NameIndex",
                       sim_index: "NameIndex | None" = None,
                       steps_per_day: int = STEPS_PER_DAY) -> dict:
@@ -719,8 +731,13 @@ def analyze(run_dir: str) -> dict:
     name_index = NameIndex(names)
     fiction = detect_fiction(records, name_index, coined_texts)
     norms = detect_norms(records)
-    attention = detect_attention(records, whitelist_tokens(names), coined_toks)
-    grounding = compute_grounding(records, name_index, sim_index)
+    # W2-3: 「1日」「4時間」は step 数ではなく実時間なので、このランの Δt で換算する
+    # (Δt=10 なら 144 / 24 = 従来と 1 ビットも変わらない)。
+    spd = run_dt.steps_per_day(run_dir)
+    win = window_steps_of(run_dir)
+    attention = detect_attention(records, whitelist_tokens(names), coined_toks,
+                                 window_steps=win)
+    grounding = compute_grounding(records, name_index, sim_index, steps_per_day=spd)
 
     return {
         "run": os.path.basename(os.path.normpath(run_dir)),
@@ -762,7 +779,8 @@ def _norm_label_counts(norms: list[dict]) -> list[tuple[str, int]]:
     return Counter(n["label"] for n in norms).most_common()
 
 
-def build_report(res: dict) -> str:
+def build_report(res: dict, window_steps: int = WINDOW_STEPS) -> str:
+    """W2-3: `window_steps` の既定は正準 Δt=10 の 24 = 従来と完全同値(本文の数字用)。"""
     L: list[str] = []
     L.append(f"# 創発の後付けテキスト検出レポート — {res['run']}\n")
     L.append("> 保守的なヒューリスティクス(形態素解析なし)。各命中は断定ではなく"
@@ -815,7 +833,7 @@ def build_report(res: dict) -> str:
 
     # --- attention ---
     L.append("## 3. 語の共伝播 (collective attention)")
-    L.append(f"窓 {WINDOW_STEPS}step(4時間)以内に {MIN_ATTENTION_AGENTS} 人以上の別"
+    L.append(f"窓 {window_steps}step({WINDOW_HOURS}時間)以内に {MIN_ATTENTION_AGENTS} 人以上の別"
              "エージェントが使った語(ストップワード・地名断片は除外)。\n")
     att = res["attention"]
     if not att:
@@ -935,7 +953,7 @@ def main() -> None:
         json.dump(res, fh, ensure_ascii=False, indent=2)
     md_path = os.path.join(run_dir, "emergence_report.md")
     with open(md_path, "w", encoding="utf-8") as fh:
-        fh.write(build_report(res))
+        fh.write(build_report(res, window_steps_of(run_dir)))
     # 接地率の日次系列を panel/ に書き出す(pyarrow 直書き)。
     panel_dir = os.path.join(run_dir, "panel")
     gp_path = write_grounding_parquet(res["run"], res["grounding"], panel_dir)

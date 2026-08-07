@@ -112,8 +112,10 @@ from society.observer import regression as RG          # noqa: E402
 from live_viewer import (                              # noqa: E402
     _open_shared, is_complete_parquet, list_parts,
 )
+# W2-3: 1 日 = 何 step かは **ラン依存**(run.dt_min)。144 直書きをやめて run dir から読む。
+import run_dt                                          # noqa: E402
 
-STEPS_PER_DAY = 144
+STEPS_PER_DAY = run_dt.CANON_STEPS_PER_DAY   # 正準 Δt=10 の値(144)。ラン依存値は下の関数で。
 
 
 # --------------------------------------------------------------------------- #
@@ -242,7 +244,8 @@ def run_window_steps(run_dir: Path) -> int:
                         in_reg = False
         except Exception:                       # noqa: BLE001
             pass
-    return STEPS_PER_DAY
+    # W2-3: 「見つからねば 1 日」の 1 日は Δt 依存(Δt=10 で 144・Δt=1 で 1440)。
+    return run_dt.steps_per_day(run_dir)
 
 
 def downsample(steps, vals, stride: int, warmup: int = 0,
@@ -369,39 +372,35 @@ def act_counts_from_l1(run_dir: Path, window_steps: int,
 
     L2 の最終行と同じ窓を、L1 から**独立に**再計算する経路(= 列の独立検算にもなる)。
     payload 列は 1 バイトも読まない(kind と agent_id と step だけ)。
+
+    W2-2(在場 25万 × 10 日 = 40.6 億件)の 3 段の減速解除。**出力は完全に同一**:
+      1. パス 1(最終 step)は `l1_stream.max_step` = **row-group 統計のみ**で決まる。
+         旧実装は step 列 40.6 億値を Python list 化していた(O(全行) の時間 +
+         batch ごとに数十 MB の一時 list)。統計が無い row-group だけは従来どおり走査する。
+      2. パス 2 は `step_min=floor` を渡して **row-group を丸ごと枝刈り**する。
+         L1 は step 非減少で追記されるので、末尾 1 日分の窓なら読む row-group は
+         ラン全体の 1/10 以下になる(= I/O と復号がそのぶん消える)。
+      3. `kinds=RG._ACT_INDEX` で **act 種以外を Arrow レベルで落としてから** Python に
+         渡す。旧実装は全行を zip で回して `_ACT_INDEX.get` で捨てていた。
+    メモリは従来どおり **O(体数 × act 種数)**(生イベント列は 1 行も溜めない)。
     """
-    paths = _l1_paths(run_dir)
-    if not paths:
+    import l1_stream as ls
+    if not _l1_paths(run_dir):
         return {}, -1, 0
-    max_step = -1
-    for path in paths:                          # パス 1: 最終 step を確定(step 列だけ)
-        with _open_shared(path) as f:
-            pf = pq.ParquetFile(f)
-            for batch in pf.iter_batches(batch_size=batch_rows, columns=["step"]):
-                col = batch.column(0).to_pylist()
-                if col:
-                    m = max(col)
-                    if m > max_step:
-                        max_step = int(m)
+    max_step = ls.max_step(run_dir)             # パス 1: row-group 統計だけで確定
     if max_step < 0:
         return {}, -1, 0
     floor = max_step - int(window_steps) + 1
     acts: dict = {}
-    for path in paths:                          # パス 2: 窓内の act だけ畳む
-        with _open_shared(path) as f:
-            pf = pq.ParquetFile(f)
-            for batch in pf.iter_batches(
-                    batch_size=batch_rows,
-                    columns=["step", "agent_id", "kind"]):
-                d = batch.to_pydict()
-                for s, aid, kind in zip(d["step"], d["agent_id"], d["kind"]):
-                    if s < floor:
-                        continue
-                    idx = RG._ACT_INDEX.get(kind)
-                    if idx is None or aid is None or int(aid) < 0:
-                        continue
-                    row = acts.setdefault(int(aid), {})
-                    row[idx] = row.get(idx, 0) + 1
+    for d in ls.iter_columns(run_dir, ["step", "agent_id", "kind"],
+                             kinds=RG._ACT_INDEX.keys(), step_min=floor,
+                             batch_rows=batch_rows):   # パス 2: 窓内の act だけ
+        for aid, kind in zip(d["agent_id"], d["kind"]):
+            idx = RG._ACT_INDEX.get(kind)
+            if idx is None or aid is None or int(aid) < 0:
+                continue
+            row = acts.setdefault(int(aid), {})
+            row[idx] = row.get(idx, 0) + 1
     return acts, max_step, max(1, max_step - floor + 1)
 
 

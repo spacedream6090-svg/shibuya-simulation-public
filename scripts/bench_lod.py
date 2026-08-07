@@ -43,6 +43,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
+if str(REPO_ROOT / "scripts") not in sys.path:   # 同ディレクトリの run_dt を import
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+
+import run_dt                                    # noqa: E402  (W2-3: Δt の単一の源)
 
 for _s in (sys.stdout, sys.stderr):
     try:
@@ -413,7 +417,9 @@ def main() -> None:
     ap.add_argument("--worker", default=None,
                     help="(内部)子プロセス実行: 指定 spec JSON の 1 構成を走らせ結果を書く")
     ap.add_argument("--agents", type=int, default=1000)
-    ap.add_argument("--steps", type=int, default=144)
+    # W2-3: 既定は「1 シミュ日」= 基底 conf の run.dt_min 依存(Δt=10 で 144)。
+    ap.add_argument("--steps", type=int, default=None,
+                    help="1 構成の step 数(既定=1 シミュ日ぶん。Δt=10 で 144)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--configs", nargs="*", default=None,
                     help="対象構成名(既定=全マトリクス)。例: --configs cap300 full dens0.30")
@@ -423,6 +429,8 @@ def main() -> None:
     ap.add_argument("--no-rss", action="store_true",
                     help="子プロセス/RSS を使わず in-process で走らせる(軽量・RSS なし)")
     args = ap.parse_args()
+    if args.steps is None:
+        args.steps = run_dt.steps_per_day(REPO_ROOT / "conf")
 
     if args.worker:
         _worker_main(args.worker)

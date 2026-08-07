@@ -33,7 +33,11 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 RUNS_ROOT = os.path.join(_ROOT, "runs")
 
-STEPS_PER_DAY = 144
+# W2-3(Δt 対応の棚卸し): この定数は **未使用**(死んだ定数)。
+# 本 module 内で step→日 の換算は行っていない(step をそのまま表示する)ため未使用。
+# 将来ここで日を切るときは 144 を書かず scripts/run_dt.steps_per_day(run_dir) を通すこと
+# (1 日の step 数は run.dt_min 依存: Δt=10 で 144・Δt=1 で 1440)。
+STEPS_PER_DAY = 144          # 正準 Δt=10 の値(未使用)
 
 # 1人あたりの「活動量」を構成する行動イベント種(世界に働きかける社会的行為。agent_id>=0 のもの)。
 _ACTIVITY_KINDS = (

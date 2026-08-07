@@ -71,7 +71,10 @@ from diagnose_stationarity import (                       # noqa: E402
     _r, paired_dz, paired_signflip_tvd,
 )
 
-STEPS_PER_DAY = 144            # 1 step = 10 sim 分(observe.py / analyze_communities と同値)
+import run_dt                                          # noqa: E402  (W2-3: Δt の単一の源)
+
+# W2-3: **ラン依存**(run.dt_min)。既定は正準 Δt=10 の 144(= 従来と 1 ビットも変わらない)。
+STEPS_PER_DAY = run_dt.CANON_STEPS_PER_DAY
 MAX_PAIR_AGENTS = 200          # 個体間 TVD の全ペア計算に使う個体数の上限(等間隔サブサンプル)
 MAX_KINDS = 96                 # 特徴次元の上限(超過分は "_other" へ集約。凍結側と同じ流儀)
 MIN_DAYS = 2                   # 個体内比較に必要な最小在籍日数
@@ -232,7 +235,11 @@ def _load_events(run_dir: str) -> list[dict]:
 
 
 def analyze(run_dir: str, *, cap: int = MAX_PAIR_AGENTS, mc: int = 2000,
-            seed: int = RNG_SEED, steps_per_day: int = STEPS_PER_DAY) -> dict:
+            seed: int = RNG_SEED, steps_per_day: int | None = None) -> dict:
+    """W2-3: `steps_per_day=None`(既定)はこのランの run.dt_min から導く
+    (Δt=10 なら 144 = 従来の既定と同値)。明示指定があればそちらを尊重する。"""
+    if steps_per_day is None:
+        steps_per_day = run_dt.steps_per_day(run_dir)
     events = _load_events(run_dir)
     prof = build_profiles(events, steps_per_day=steps_per_day)
     if not prof["agents"]:

@@ -25,7 +25,14 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-STEPS_PER_DAY = 144  # 1step=10分(リポジトリ共通の暦)
+_HERE = str(Path(__file__).resolve().parent)
+if _HERE not in sys.path:                    # 同ディレクトリの run_dt を import
+    sys.path.insert(0, _HERE)
+
+import run_dt                                # noqa: E402  (W2-3: ランの Δt の単一の源)
+
+# W2-3: **ラン依存**(run.dt_min)。既定は正準 Δt=10 の 144(= 従来と 1 ビットも変わらない)。
+STEPS_PER_DAY = run_dt.CANON_STEPS_PER_DAY
 
 LEVELS = ("narrow", "mid", "wide")
 
@@ -55,6 +62,8 @@ def entropy(counts: Counter) -> float:
 
 # --------------------------------------------------------------------- 集計
 def collect(run_dir: Path) -> tuple[dict[int, dict], dict[int, str]]:
+    # W2-3: 「1 日」はこのランの run.dt_min で決まる(Δt=10 なら 144 = 従来と同値)。
+    spd = run_dt.steps_per_day(run_dir)
     agents = json.loads((run_dir / "agents.json").read_text(encoding="utf-8"))
     level_of = {a["id"]: a.get("input_res") for a in agents}
     if not any(level_of.values()):
@@ -100,7 +109,7 @@ def collect(run_dir: Path) -> tuple[dict[int, dict], dict[int, str]]:
                 name = ""
             if name:
                 m["places"][name] += 1
-                m["place_days"][int(step) // STEPS_PER_DAY].add(name)
+                m["place_days"][int(step) // spd].add(name)
         elif kind == "sns_read":
             m["n_sns_read"] += 1
         elif kind == "news_read":

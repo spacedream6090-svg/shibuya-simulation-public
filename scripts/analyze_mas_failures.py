@@ -48,8 +48,13 @@ sys.path.insert(0, _HERE)
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-STEPS_PER_DAY = 144
-RESPONSE_WINDOW_STEPS = 6        # 「聞いたのに応じない」の猶予(6 step = 60 sim 分)
+import run_dt                      # noqa: E402  (W2-3: ランの Δt の単一の源)
+
+# W2-3: どちらも **ラン依存**(run.dt_min)。ここの値は正準 Δt=10 の既定で、実際の値は
+# analyze() が run dir から読む(Δt=10 なら 144 / 6 = 従来と 1 ビットも変わらない)。
+STEPS_PER_DAY = run_dt.CANON_STEPS_PER_DAY
+RESPONSE_WINDOW_MIN = 60         # 「聞いたのに応じない」の猶予 [分](こちらが Δt 非依存の定義)
+RESPONSE_WINDOW_STEPS = 6        # ↑を step にしたもの(Δt=10 で 6・Δt=1 で 60)
 TURN_CAP = 12                    # 第 87 engaged のターン上限(FM-1.5 の代理閾値)
 PREMATURE_DAYS = 3               # 発足から N 日以内に誰も加わらなければ「早すぎる終了」候補
 NGRAM_N = 2                      # 文字 2-gram(語彙リテラルを置かない)
@@ -159,7 +164,8 @@ def fm13_step_repetition(events: list[dict]) -> dict:
             "n_agents_with_repeat": len(reps_by_agent)}
 
 
-def fm15_termination_unaware(events: list[dict], turn_cap: int = TURN_CAP) -> dict:
+def fm15_termination_unaware(events: list[dict], turn_cap: int = TURN_CAP,
+                             spd: int = STEPS_PER_DAY) -> dict:
     """FM-1.5 Unaware of termination conditions —(**代理**)同日・同一ペアの往復が上限に達した件数。
 
     根拠は第 87 バッチ `engaged` のターン上限 12(CAMEL の無限 goodbye ループが由来)。
@@ -171,7 +177,7 @@ def fm15_termination_unaware(events: list[dict], turn_cap: int = TURN_CAP) -> di
         if e["kind"] != "speak":
             continue
         aid = e["agent"]
-        day = e["step"] // STEPS_PER_DAY
+        day = e["step"] // int(spd)
         for h in (e["payload"] or {}).get("hearers", []) or []:
             if isinstance(h, int) and h >= 0 and h != aid:
                 key = (day, min(aid, h), max(aid, h))
@@ -217,7 +223,8 @@ def fm25_ignored_input(events: list[dict], window: int = RESPONSE_WINDOW_STEPS) 
 
 
 def fm26_reasoning_action_mismatch(events: list[dict],
-                                   min_vocab_overlap: float = 0.05) -> dict:
+                                   min_vocab_overlap: float = 0.05,
+                                   spd: int = STEPS_PER_DAY) -> dict:
     """FM-2.6 Reasoning-action mismatch — 朝の `day_plan` の place にその日到達しなかった割合。
 
     ★**本シムでの "仕様" は自分で言い出した目的**(冒頭の読み替え)。
@@ -240,7 +247,7 @@ def fm26_reasoning_action_mismatch(events: list[dict],
     n_items = n_blank = 0
     for e in events:
         k, aid, p = e["kind"], e["agent"], (e["payload"] or {})
-        day = e["step"] // STEPS_PER_DAY
+        day = e["step"] // int(spd)
         if k == "day_plan":
             for item in p.get("plan", []) or []:
                 if not isinstance(item, dict):
@@ -346,7 +353,8 @@ def fm23_task_derailment(events: list[dict], n: int = NGRAM_N) -> dict:
 
 
 def fm31_premature_termination(events: list[dict],
-                               premature_days: int = PREMATURE_DAYS) -> dict:
+                               premature_days: int = PREMATURE_DAYS,
+                               spd: int = STEPS_PER_DAY) -> dict:
     """FM-3.1 Premature termination — 目的未達で終わった集団/事業の件数。
 
     (a) `group_found` してから premature_days 日以内に **誰も加わらなかった**集団
@@ -367,7 +375,7 @@ def fm31_premature_termination(events: list[dict],
             v_open.setdefault(aid, e["step"])
         elif k == "venture_close":
             v_close.append((aid, e["step"]))
-    cutoff = premature_days * STEPS_PER_DAY
+    cutoff = premature_days * int(spd)
     lonely = sorted(g for g, st in found.items()
                     if not any(s - st <= cutoff for s in joins.get(g, [])))
     early_close = sorted(a for (a, st) in v_close
@@ -409,8 +417,19 @@ def _load_events(run_dir: str) -> list[dict]:
     return out
 
 
-def analyze(run_dir: str, *, window: int = RESPONSE_WINDOW_STEPS,
+def response_window_steps(run_dir: str) -> int:
+    """「聞いたのに応じない」の猶予 [step] = 実時間 RESPONSE_WINDOW_MIN 分ぶん。"""
+    return max(1, RESPONSE_WINDOW_MIN // run_dt.min_per_step(run_dir))
+
+
+def analyze(run_dir: str, *, window: int | None = None,
             turn_cap: int = TURN_CAP, premature_days: int = PREMATURE_DAYS) -> dict:
+    """W2-3: `window=None`(既定)はこのランの Δt から実時間 60 分ぶんの step 数を導く
+    (Δt=10 なら 6 = 従来の既定と同値)。明示指定があればそちらを尊重する。"""
+    # 1 日の step 数もランの Δt に従う(Δt=10 なら 144 = 従来と同値)。
+    spd = run_dt.steps_per_day(run_dir)
+    if window is None:
+        window = max(1, RESPONSE_WINDOW_MIN // run_dt.min_per_step(run_dir))
     events = _load_events(run_dir)
     res: dict = {
         "run": os.path.basename(os.path.normpath(run_dir)),
@@ -432,15 +451,15 @@ def analyze(run_dir: str, *, window: int = RESPONSE_WINDOW_STEPS,
         "FM-1.3": {"name": "Step repetition", "fc": "FC1",
                    **fm13_step_repetition(events)},
         "FM-1.5": {"name": "Unaware of termination conditions", "fc": "FC1",
-                   **fm15_termination_unaware(events, turn_cap)},
+                   **fm15_termination_unaware(events, turn_cap, spd)},
         "FM-2.3": {"name": "Task derailment", "fc": "FC2",
                    **fm23_task_derailment(events)},
         "FM-2.5": {"name": "Ignored other agent's input", "fc": "FC2",
                    **fm25_ignored_input(events, window)},
         "FM-2.6": {"name": "Reasoning-action mismatch", "fc": "FC2",
-                   **fm26_reasoning_action_mismatch(events)},
+                   **fm26_reasoning_action_mismatch(events, spd=spd)},
         "FM-3.1": {"name": "Premature termination", "fc": "FC3",
-                   **fm31_premature_termination(events, premature_days)},
+                   **fm31_premature_termination(events, premature_days, spd)},
     }
     res["not_implemented"] = {fm: {"name": nm, "reason": why}
                               for fm, (nm, why) in sorted(NOT_IMPLEMENTED.items())}
@@ -531,7 +550,8 @@ def render(res: dict) -> str:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="S-10 MAST 失敗様式(読み取り専用)")
     ap.add_argument("run", help="ランディレクトリ")
-    ap.add_argument("--window", type=int, default=RESPONSE_WINDOW_STEPS)
+    ap.add_argument("--window", type=int, default=None,
+                    help=f"「応じない」の猶予 [step](既定=実時間 {RESPONSE_WINDOW_MIN} 分ぶん)")
     ap.add_argument("--turn-cap", type=int, default=TURN_CAP)
     ap.add_argument("--premature-days", type=int, default=PREMATURE_DAYS)
     ap.add_argument("--out", default=None, help="出力先(既定 <run>/analysis)")

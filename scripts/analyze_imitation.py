@@ -49,10 +49,15 @@ except Exception:
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "src"))
+if _HERE not in sys.path:                # 同ディレクトリの run_dt を import
+    sys.path.insert(0, _HERE)
 
+import run_dt                            # noqa: E402  (W2-3: ランの Δt の単一の源)
 from society.observer import measure as m  # noqa: E402
 
-STEPS_PER_DAY = 144
+# W2-3: **ラン依存**(run.dt_min)。既定は正準 Δt=10 の 144。日の第一手段は sim_min//1440
+# なので Δt 非依存で、この定数は sim_min 欠損時の後退経路にだけ効く。
+STEPS_PER_DAY = run_dt.CANON_STEPS_PER_DAY
 WINDOW = 7          # 初実行の判定窓 W(過去 W 日 X 未実行なら「初実行」)
 LAG = 3             # 曝露窓 T(初実行の直前 T 日以内の接触を候補にする)
 MIN_DOERS = 2       # この人数未満しか実行していない行動は解析しない(模倣が定義できない)
@@ -74,10 +79,10 @@ BEHAVIOR_FIELDS: dict[str, str | None] = {
 SPEND_EXCLUDE = {"taxi", "bus", "fixed_cost", "medical", "lodging"}
 
 
-def _day_of(e: dict) -> int:
+def _day_of(e: dict, spd: int = STEPS_PER_DAY) -> int:
     sm = e.get("sim_min")
     if sm is None:
-        return int(e["step"]) // STEPS_PER_DAY
+        return int(e["step"]) // int(spd)
     return int(sm) // 1440
 
 
@@ -99,7 +104,7 @@ def behavior_label(kind: str, payload: dict) -> str | None:
 # --------------------------------------------------------------------------- #
 # 接触(同席・会話)グラフ(日次・対称)
 # --------------------------------------------------------------------------- #
-def build_contacts(events: list[dict]) -> dict[int, dict[int, set]]:
+def build_contacts(events: list[dict], spd: int = STEPS_PER_DAY) -> dict[int, dict[int, set]]:
     """contacts[a][day] = その日 a が接触した相手集合(対称)。"""
     contacts: dict[int, dict[int, set]] = defaultdict(lambda: defaultdict(set))
 
@@ -109,7 +114,7 @@ def build_contacts(events: list[dict]) -> dict[int, dict[int, set]]:
             contacts[b][d].add(a)
 
     for e in events:
-        k, aid, p, d = e["kind"], e["agent_id"], e["payload"], _day_of(e)
+        k, aid, p, d = e["kind"], e["agent_id"], e["payload"], _day_of(e, spd)
         if not isinstance(aid, int) or aid < 0:
             continue
         if k == "speak":
@@ -143,7 +148,9 @@ def analyze(run_dir: str, window: int = WINDOW, lag: int = LAG,
     name_of = {int(a["id"]): a.get("name", f"a{a['id']}") for a in agents if "id" in a}
     roster = sorted(name_of) or sorted({e["agent_id"] for e in events if e["agent_id"] >= 0})
     run_name = os.path.basename(os.path.normpath(run_dir))
-    max_day = max((_day_of(e) for e in events), default=-1)
+    # W2-3: sim_min 欠損時の後退経路で使う 1 日あたり step 数(Δt=10 なら 144 = 従来と同値)。
+    spd = run_dt.steps_per_day(run_dir)
+    max_day = max((_day_of(e, spd) for e in events), default=-1)
 
     # 行動 X の実行日 exec[X][agent] = set(days) / first_exec[X][agent] = 最小日
     exec_days: dict[str, dict[int, set]] = defaultdict(lambda: defaultdict(set))
@@ -153,10 +160,10 @@ def analyze(run_dir: str, window: int = WINDOW, lag: int = LAG,
             continue
         x = behavior_label(e["kind"], e["payload"])
         if x is not None:
-            exec_days[x][aid].add(_day_of(e))
+            exec_days[x][aid].add(_day_of(e, spd))
     first_exec = {x: {a: min(ds) for a, ds in by.items()} for x, by in exec_days.items()}
 
-    contacts = build_contacts(events)
+    contacts = build_contacts(events, spd)
 
     # 解析対象の行動 = 実行者が min_doers 人以上(模倣が定義できる)
     behaviors = sorted(x for x, by in exec_days.items() if len(by) >= min_doers)
@@ -253,7 +260,7 @@ def analyze(run_dir: str, window: int = WINDOW, lag: int = LAG,
         "n_agents": len(roster),
         "n_days": max_day + 1,
         "params": {"window_W": window, "lag_T": lag, "min_doers": min_doers,
-                   "steps_per_day": STEPS_PER_DAY,
+                   "steps_per_day": spd,
                    "contact_channels": "speak/hear/dm + joint_activity + event_attend(host) "
                                        "+ group_join(founder) + chance_event(encounter)",
                    "behaviors_fields": {k: v for k, v in BEHAVIOR_FIELDS.items()}},

@@ -43,6 +43,10 @@ import matplotlib.pyplot as plt  # noqa: E402
 from omegaconf import OmegaConf  # noqa: E402
 
 from society.observer import measure as m  # noqa: E402
+# W2-2(25万対応): 特徴量・集団時系列は **全件 list ではなく run_dir を受ける逐次版** を使う。
+# stream は measure と出力バイト同一(tests/test_streaming_analyze.py が固定)で、
+# 在場 25万 × 10 日(40.6 億件)でも RAM はエンティティ数で有界になる。
+from society.observer import stream as st  # noqa: E402
 
 # 連続 k 軸(対照 sham は除外)上での条件並び優先
 PALETTE = ["#0072B2", "#E69F00", "#009E73", "#D55E00", "#CC79A7",
@@ -558,14 +562,15 @@ def analyze_sweep(pattern, out=None, allow_tier_mismatch: bool = False):
     runs = []
     for d in dirs:
         cond = _read_cond(d)
-        events = m.load_events(d)
+        # W2-2: L1 は 1 行も list 化しない(旧: m.load_events(d) の全件 RAM 展開)。
+        # n_agents は agents.json が無いときだけ agent_id 列を 1 パス走査して決める
+        # (旧 max((e["agent_id"] for e in events), default=-1)+1 と同値)。
         agents = m.load_agents(d)
         l2 = m.load_l2(d)
         traits, tnames, _src = m.load_traits(d, agents)
-        n_agents = len(agents) or (max((e["agent_id"] for e in events),
-                                       default=-1) + 1)
-        feats = m.agent_features(events, agents, traits)
-        collective = m.collective_series(events, l2, n_agents)
+        n_agents = len(agents) or (st.max_agent_id(d) + 1)
+        feats = st.agent_features(d, agents, traits)
+        collective = st.collective_series(d, l2, n_agents)
         r2 = m.r2_traits(feats, tnames)
         ews_adopt = m.ews(collective["adoption_frac"])
         ews_entropy = m.ews(collective["vocab_entropy"])

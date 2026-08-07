@@ -36,8 +36,13 @@ if hasattr(sys.stdout, "reconfigure"):
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 RUNS_ROOT = os.path.join(_ROOT, "runs")
+if _HERE not in sys.path:                # 同ディレクトリの run_dt を import
+    sys.path.insert(0, _HERE)
 
-STEPS_PER_DAY = 144
+import run_dt                            # noqa: E402  (W2-3: ランの Δt の単一の源)
+
+# W2-3: **ラン依存**(run.dt_min)。既定は正準 Δt=10 の 144 = 従来と 1 ビットも変わらない。
+STEPS_PER_DAY = run_dt.CANON_STEPS_PER_DAY
 
 
 # --------------------------------------------------------------------------- #
@@ -122,7 +127,7 @@ def _attr_id(spec: dict, agent_id: int, payload: dict):
 # --------------------------------------------------------------------------- #
 # ローダ(scripts/analyze_founders.py と同じ house style: pyarrow 列射影 + batch 逐次)
 # --------------------------------------------------------------------------- #
-def load_events(run_dir: str) -> list[dict]:
+def load_events(run_dir: str, dt_min: int = run_dt.CANON_DT_MIN) -> list[dict]:
     """l1_events.parquet を読み、{step, sim_min, agent, kind, payload(dict)} 列で返す。"""
     import pyarrow.parquet as pq
 
@@ -145,8 +150,9 @@ def load_events(run_dir: str) -> list[dict]:
                 payload = {}
             out.append({
                 "step": int(d["step"][i]),
+                # W2-3: sim_min 欠損時の復元は step × Δt(既定 10 = 従来と完全同値)。
                 "sim_min": (int(smin[i]) if smin is not None and smin[i] is not None
-                            else int(d["step"][i]) * 10),
+                            else int(d["step"][i]) * int(dt_min)),
                 "agent": int(d["agent_id"][i]),
                 "kind": d["kind"][i],
                 "payload": payload,
@@ -173,18 +179,20 @@ def load_agents(run_dir: str) -> dict[int, dict]:
 # --------------------------------------------------------------------------- #
 # 帰属の中核(監査 audit と 運/実力分解 analyze_luck が共有する 1 箇所)
 # --------------------------------------------------------------------------- #
-def _active_residents_by_day(events: list[dict], residents: set[int] | None):
+def _active_residents_by_day(events: list[dict], residents: set[int] | None,
+                             spd: int = STEPS_PER_DAY):
     """day -> その日 街に居た住民集合(= agent_id>=0 のイベントを持つ・residents 指定時は住民のみ)。"""
     active: dict[int, set] = defaultdict(set)
     for e in events:
         aid = e["agent"]
         if aid >= 0 and (residents is None or aid in residents):
-            active[e["step"] // STEPS_PER_DAY].add(aid)
+            active[e["step"] // int(spd)].add(aid)
     return active
 
 
 def attribute_chances(events: list[dict],
-                      agents: dict[int, dict] | None = None) -> dict:
+                      agents: dict[int, dict] | None = None,
+                      spd: int = STEPS_PER_DAY) -> dict:
     """揺らぎ由来イベントを住民へ帰属した中核結果を返す(監査・運分解の共通土台)。
 
     LUCK_KINDS の意味づけ(scope / attr_field / phase)を適用する **唯一の場所**。
@@ -201,7 +209,7 @@ def attribute_chances(events: list[dict],
     """
     agents = agents or {}
     residents = {aid for aid, m in agents.items() if not m.get("visitor")} or None
-    active_by_day = _active_residents_by_day(events, residents)
+    active_by_day = _active_residents_by_day(events, residents, spd)
 
     per_ad: dict[tuple, Counter] = defaultdict(Counter)
     by_kind: Counter = Counter()
@@ -213,7 +221,7 @@ def attribute_chances(events: list[dict],
         if spec is None or not _phase_ok(spec, e["payload"]):
             continue
         by_kind[e["kind"]] += 1
-        day = e["step"] // STEPS_PER_DAY
+        day = e["step"] // int(spd)
         if spec["scope"] == "world":
             world_by_day[day][e["kind"]] += 1
         else:
@@ -246,7 +254,8 @@ def attribute_chances(events: list[dict],
 # --------------------------------------------------------------------------- #
 # 監査本体
 # --------------------------------------------------------------------------- #
-def audit(events: list[dict], agents: dict[int, dict] | None = None) -> dict:
+def audit(events: list[dict], agents: dict[int, dict] | None = None,
+          spd: int = STEPS_PER_DAY) -> dict:
     """揺らぎ由来イベントの per-agent-day 件数分布と全イベント比率を返す。"""
     agents = agents or {}
     residents = {aid for aid, m in agents.items() if not m.get("visitor")}
@@ -254,7 +263,7 @@ def audit(events: list[dict], agents: dict[int, dict] | None = None) -> dict:
     total_events = len(events)
     total_agent_events = sum(1 for e in events if e["agent"] >= 0)   # 比率の分母
 
-    attr = attribute_chances(events, agents)
+    attr = attribute_chances(events, agents, spd)
     per_ad = attr["per_ad"]
     by_kind = attr["by_kind"]
     by_category = attr["by_category"]
@@ -266,7 +275,7 @@ def audit(events: list[dict], agents: dict[int, dict] | None = None) -> dict:
     counts = [sum(cc.values()) for cc in per_ad.values()]
     # 揺らぎに 1 件も遭遇しなかった (resident, day) も母集団に含める(0 を数える)。
     if agents:
-        all_days = sorted({e["step"] // STEPS_PER_DAY for e in events})
+        all_days = sorted({e["step"] // int(spd) for e in events})
         zero_cells = 0
         seen = set(per_ad)
         for aid in residents:
@@ -379,9 +388,11 @@ def render_text(run_name: str, res: dict) -> str:
 def analyze(run_dir: str, out_dir: str) -> dict:
     """ラン1本を監査し、audit/uncertainty.json と uncertainty.txt を書く。"""
     run_name = os.path.basename(os.path.normpath(run_dir))
-    events = load_events(run_dir)
+    # W2-3: 「1 日」「sim_min 復元」はこのランの run.dt_min で決まる(Δt=10 なら従来と同値)。
+    spd = run_dt.steps_per_day(run_dir)
+    events = load_events(run_dir, run_dt.min_per_step(run_dir))
     agents = load_agents(run_dir)
-    res = audit(events, agents)
+    res = audit(events, agents, spd)
     res["run"] = run_name
 
     os.makedirs(out_dir, exist_ok=True)

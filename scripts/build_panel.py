@@ -32,17 +32,23 @@ from collections import Counter, defaultdict
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "src"))
+if _HERE not in sys.path:                          # 同ディレクトリの run_dt を import
+    sys.path.insert(0, _HERE)
 
 # Windows コンソール(cp932)対策。ファイル出力は常に UTF-8。
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+import run_dt                                       # noqa: E402  (W2-3: ランの Δt の単一の源)
 from society.observer import measure as m           # noqa: E402  (import のみ)
 from society.observer.schema import EVENT_KINDS      # noqa: E402  (正準 kind 一覧)
 
-MIN_PER_DAY = 1440
-MIN_PER_STEP = 10
-STEPS_PER_DAY = 144
+# W2-3: MIN_PER_STEP / STEPS_PER_DAY は **ラン依存**(run.dt_min)。ここに残す値は
+# 正準 Δt=10 の既定であり、実際の値は build() が run dir から読んで各段へ引数で配る
+# (Δt=10 では既定と同値なので既存ランの出力は 1 ビットも変わらない)。
+MIN_PER_DAY = 1440                                  # 分/日は Δt 非依存(実時間)
+MIN_PER_STEP = run_dt.CANON_DT_MIN                  # 10
+STEPS_PER_DAY = run_dt.CANON_STEPS_PER_DAY          # 144
 
 # spend の cat は既知8種に固定し、未知は "other" へ寄せる(tidy: 列を固定して安定化)。
 _SPEND_CATS = ["food", "shop", "nightlife", "taxi", "bus", "lodging",
@@ -54,11 +60,13 @@ def _cat(c) -> str:
     return c if c in _SPEND_CATS else "other"
 
 
-def _day(step: int) -> int:
-    """step 基準の「活動日」(step // 144)。sim は 07:00 起点なので step 基準だと
-    07:00〜翌07:00 が1日=夜間睡眠が同一日に収まり、n_days=n_steps/144 と一致する
-    (calibrate_report の _daily_series が s//144 で日を切るのと同じ流儀)。"""
-    return step // STEPS_PER_DAY
+def _day(step: int, spd: int = STEPS_PER_DAY) -> int:
+    """step 基準の「活動日」(step // steps_per_day)。sim は 07:00 起点なので step 基準だと
+    07:00〜翌07:00 が1日=夜間睡眠が同一日に収まり、n_days=n_steps/steps_per_day と一致する
+    (calibrate_report の _daily_series が同じ流儀で日を切る)。
+
+    W2-3: `spd` は既定が正準 144(Δt=10)で従来と完全同値。Δt=1 のランでは 1440 が入る。"""
+    return step // int(spd)
 
 
 def _gini(values) -> float | None:
@@ -119,7 +127,11 @@ def validate_stage0(events: list[dict], n_steps: int) -> dict:
 # --------------------------------------------------------------------------- #
 def build_agent_day(events: list[dict], agents: list[dict], n_days: int,
                     warmup_days: int, run_name: str,
-                    weekday_of: dict[int, str]) -> dict[str, list]:
+                    weekday_of: dict[int, str],
+                    spd: int = STEPS_PER_DAY,
+                    mps: int = MIN_PER_STEP) -> dict[str, list]:
+    """W2-3: `spd`(1日の step 数)/ `mps`(1 step の分数)は既定が正準 Δt=10 の値
+    (144 / 10)なので、渡さなければ従来と 1 ビットも変わらない。"""
     ordered = sorted(events, key=lambda e: e["step"])
     meta_by_id = {int(a["id"]): a for a in agents if "id" in a}
     ids = sorted(meta_by_id) if meta_by_id else sorted(
@@ -157,12 +169,12 @@ def build_agent_day(events: list[dict], agents: list[dict], n_days: int,
         k, aid, p = e["kind"], e["agent_id"], e["payload"]
         if aid is None or aid < 0:
             continue
-        d = _day(e["step"])
+        d = _day(e["step"], spd)
         key = (aid, d)
         if k == "wake_up":
             ss = p.get("slept_steps")
             if ss:
-                sleep_h[key] += float(ss) * MIN_PER_STEP / 60.0
+                sleep_h[key] += float(ss) * mps / 60.0
         elif k == "wage":
             wage_inc[key] += float(p.get("amount") or 0)
         elif k == "spend":
@@ -192,7 +204,7 @@ def build_agent_day(events: list[dict], agents: list[dict], n_days: int,
             ent = open_enter.pop((aid, bid), None)
             if ent is not None and workplace.get(aid) == bid:
                 dwell = max(0, e["sim_min"] - ent)         # 滞在分は sim_min 差で算定
-                work_h[(aid, _day(e["step"]))] += dwell / 60.0
+                work_h[(aid, _day(e["step"], spd))] += dwell / 60.0
         elif k == "arrive":
             nid = p.get("node")
             if nid is not None:
@@ -314,7 +326,9 @@ def _run_day_schema():
 
 def build_run_day(events: list[dict], agents: list[dict], l2: dict | None,
                   agent_day: dict[str, list], n_days: int, warmup_days: int,
-                  run_name: str, weekday_of: dict[int, str]) -> dict[str, list]:
+                  run_name: str, weekday_of: dict[int, str],
+                  spd: int = STEPS_PER_DAY) -> dict[str, list]:
+    """W2-3: `spd` の既定は正準 144(Δt=10)= 従来と完全同値。"""
     n_agents = len(agents) or len({e["agent_id"] for e in events
                                    if e["agent_id"] >= 0})
     n_res = sum(1 for a in agents if not a.get("visitor")) or n_agents
@@ -332,7 +346,7 @@ def build_run_day(events: list[dict], agents: list[dict], l2: dict | None,
     items_by_day: dict = defaultdict(set)                  # その日までの distinct item
     for e in events:
         k, p = e["kind"], e["payload"]
-        d = _day(e["step"])
+        d = _day(e["step"], spd)
         if k == "spend":
             amt = float(p.get("amount") or 0)
             spend_day[d] += amt
@@ -377,7 +391,7 @@ def build_run_day(events: list[dict], agents: list[dict], l2: dict | None,
         sg = l2.get("status_gini")
         mg = l2.get("mean_grievance")
         for i, s in enumerate(steps):
-            d = int(s) // STEPS_PER_DAY
+            d = int(s) // int(spd)
             if sg is not None and sg[i] is not None:
                 l2_last[d]["status_gini"] = sg[i]
             if mg is not None and mg[i] is not None:
@@ -441,26 +455,36 @@ _ACT_CATS = ["sleep", "home", "work", "food", "shop", "leisure", "move", "other"
 # enter_building.activity(L1 で観測される在館目的)→ 活動カテゴリの決定論写像。
 _ACT_OF_BUILDING = {"working": "work", "eating": "food", "shopping": "shop"}
 
-# 1つの区間の最大長(step)。未閉じの enter 等が暴走しないための安全弁(24h=144step)。
+# 1つの区間の最大長(step)。未閉じの enter 等が暴走しないための安全弁(24h=1日ぶんの step)。
+# ★W2-3: 「24h ぶんの step 数」なので Δt 依存(Δt=1 では 1440)。既定は正準 144。
 _ACT_MAX_SPAN = STEPS_PER_DAY
 
 
-def _hour_of_step(step: int) -> int:
-    """絶対 step → 時刻(0-23)。sim_min = 420 + step*10(step0=07:00)。"""
-    return ((420 + step * MIN_PER_STEP) % MIN_PER_DAY) // 60
+def _hour_of_step(step: int, mps: int = MIN_PER_STEP) -> int:
+    """絶対 step → 時刻(0-23)。sim_min = 420 + step*mps(step0=07:00・既定 mps=10)。
+
+    ★420 は start_tod="07:00" の直書きで、これは Δt ではなく開始時刻の問題(W2-3 の
+    対象外)。`mps` だけを Δt 対応させる(既定 10 = 従来と完全同値)。"""
+    return ((420 + step * int(mps)) % MIN_PER_DAY) // 60
 
 
-def reconstruct_activity(events: list[dict], agents: list[dict]) -> dict:
+def reconstruct_activity(events: list[dict], agents: list[dict],
+                         spd: int = STEPS_PER_DAY,
+                         mps: int = MIN_PER_STEP) -> dict:
     """L1 を1パスで走査し、各エージェントの活動状態を絶対 step 単位で復元する。
 
     返り値(下流=時間バジェット表・tempogram・calibrate の生活時間配分で共用):
-      adc          : {(agent_id, day, category): n_steps}  在圏 step 数(day=step//144)
+      adc          : {(agent_id, day, category): n_steps}  在圏 step 数(day=step//spd)
       active_days  : {agent_id: set(day)}                   1 step 以上復元できた日
       tempo        : {(hour, category): n_steps}            時刻×カテゴリの在圏 step 数
       holiday_by_day: {day: bool}                            weather.holiday 由来(無ければ空)
       cats         : _ACT_CATS
     決定論: イベントは load_events の行順(step 昇順)で処理し、集計は step の自然順。
+
+    W2-3: `spd`(1日の step 数)/ `mps`(1 step の分数)は既定が正準 Δt=10 の値なので、
+    渡さなければ従来と 1 ビットも変わらない。区間の安全弁 `_ACT_MAX_SPAN` も spd に従う。
     """
+    max_span = int(spd)                       # 24h ぶんの step 数(Δt 依存の安全弁)
     # 自宅/宿泊先の建物(在館カテゴリの home 判定に使う。空文字は None 扱い)
     home_b: dict[int, str] = {}
     for a in agents or []:
@@ -494,11 +518,11 @@ def reconstruct_activity(events: list[dict], agents: list[dict]) -> dict:
         elif k == "media_use":
             n = int(p.get("steps") or 0)
             if n > 0:
-                media[aid].append((s, min(n, _ACT_MAX_SPAN)))
+                media[aid].append((s, min(n, max_span)))
         elif k == "sleep_start":
             us = p.get("until_step")
             if isinstance(us, int) and us > s:
-                sleeps[aid].append((s, min(us, s + _ACT_MAX_SPAN)))
+                sleeps[aid].append((s, min(us, s + max_span)))
         elif k == "lodging_checkin":
             b = p.get("building")
             if b:
@@ -514,7 +538,7 @@ def reconstruct_activity(events: list[dict], agents: list[dict]) -> dict:
                 s0, act = st
                 cat = _dwell_cat(act, b, home_b.get(aid), lodging.get(aid))
                 if s > s0:
-                    dwells[aid].append((s0, min(s, s0 + _ACT_MAX_SPAN), cat))
+                    dwells[aid].append((s0, min(s, s0 + max_span), cat))
 
     # 未閉じの在館(exit 未観測)は「入館 step の1 step だけ」在圏とみなす(過剰計上回避)
     for (aid, b), (s0, act) in open_b.items():
@@ -540,9 +564,9 @@ def reconstruct_activity(events: list[dict], agents: list[dict]) -> dict:
             for s in range(s0, s1):
                 state[s] = "sleep"
         for s, cat in state.items():
-            d = s // STEPS_PER_DAY
+            d = s // int(spd)
             adc[(aid, d, cat)] += 1
-            tempo[(_hour_of_step(s), cat)] += 1
+            tempo[(_hour_of_step(s, mps), cat)] += 1
             active_days[aid].add(d)
 
     return {"adc": dict(adc), "active_days": {a: s for a, s in active_days.items()},
@@ -576,9 +600,12 @@ def _time_budget_schema():
     ])
 
 
-def build_time_budget(recon: dict, run_name: str) -> dict[str, list]:
+def build_time_budget(recon: dict, run_name: str,
+                      mps: int = MIN_PER_STEP) -> dict[str, list]:
     """(agent, category) 別の総分・活動日数・分/日。分/日 = 総分 / 本人の活動日数。
-    本人の1日あたり総在圏分は 144step×10=1440 を超えない(step 単位復元のため)。"""
+    本人の1日あたり総在圏分は steps_per_day×mps=1440 を超えない(step 単位復元のため)。
+
+    W2-3: `mps`(1 step の分数)の既定は正準 10 = 従来と完全同値。"""
     per_ac: dict[tuple, int] = defaultdict(int)     # (aid,cat)->step 数
     for (aid, _d, cat), n in recon["adc"].items():
         per_ac[(aid, cat)] += n
@@ -586,7 +613,7 @@ def build_time_budget(recon: dict, run_name: str) -> dict[str, list]:
     cols: dict[str, list] = {c: [] for c in _TIME_BUDGET_COLS}
     for (aid, cat) in sorted(per_ac):
         nd = len(active.get(aid, ()))
-        mins = per_ac[(aid, cat)] * MIN_PER_STEP
+        mins = per_ac[(aid, cat)] * int(mps)
         cols["run"].append(run_name)
         cols["agent_id"].append(int(aid))
         cols["category"].append(cat)
@@ -667,8 +694,12 @@ def build(run_dir: str, warmup_days: int = 7, out_dir: str | None = None) -> dic
         summary = json.load(open(spath, encoding="utf-8"))
     n_steps = int(summary.get("n_steps") or
                   (max((e["step"] for e in events), default=-1) + 1))
-    max_day = max((_day(e["step"]) for e in events), default=-1)
-    n_days = max(max_day + 1, -(-n_steps // STEPS_PER_DAY))  # ceil(n_steps/144)
+    # W2-3: 1日の step 数・1 step の分数は **このランの run.dt_min** から決める
+    # (Δt=10 なら 144 / 10 = 従来と 1 ビットも変わらない。読めなければ stderr に告知)。
+    spd = run_dt.steps_per_day(run_dir)
+    mps = run_dt.min_per_step(run_dir)
+    max_day = max((_day(e["step"], spd) for e in events), default=-1)
+    n_days = max(max_day + 1, -(-n_steps // spd))            # ceil(n_steps/spd)
     run_name = os.path.basename(os.path.normpath(run_dir))
     weekday_of = _weekday_map(events)
 
@@ -677,17 +708,17 @@ def build(run_dir: str, warmup_days: int = 7, out_dir: str | None = None) -> dic
         json.dump(validation, fh, ensure_ascii=False, indent=1)
 
     agent_day = build_agent_day(events, agents, n_days, warmup_days, run_name,
-                                weekday_of)
+                                weekday_of, spd, mps)
     run_day = build_run_day(events, agents, l2, agent_day, n_days, warmup_days,
-                            run_name, weekday_of)
+                            run_name, weekday_of, spd)
     _write_parquet(os.path.join(out_dir, "agent_day.parquet"),
                    _agent_day_schema(), agent_day)
     _write_parquet(os.path.join(out_dir, "run_day.parquet"),
                    _run_day_schema(), run_day)
 
     # ④行動統計(第31バッチ W3): 活動時間バジェット + tempogram(新規 parquet・追加のみ)
-    recon = reconstruct_activity(events, agents)
-    time_budget = build_time_budget(recon, run_name)
+    recon = reconstruct_activity(events, agents, spd, mps)
+    time_budget = build_time_budget(recon, run_name, mps)
     tempogram = build_tempogram(recon, run_name)
     _write_parquet(os.path.join(out_dir, "time_budget.parquet"),
                    _time_budget_schema(), time_budget)

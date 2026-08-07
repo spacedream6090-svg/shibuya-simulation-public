@@ -62,7 +62,9 @@ import networkx as nx                                   # noqa: E402
 import analyze_communities as ac                        # noqa: E402  (凍結外・再利用)
 from analyze_founders import betweenness_bfs            # noqa: E402  (再実装しない)
 
-STEPS_PER_DAY = ac.STEPS_PER_DAY
+import run_dt                                         # noqa: E402  (W2-3: Δt の単一の源)
+
+STEPS_PER_DAY = ac.STEPS_PER_DAY                        # 正準 Δt=10 の 144(実値は run 依存)
 GA_Z_THRESHOLD = 2.5        # Guimerà–Amaral 原典(代謝網で較正)。★参考値専用
 GA_P_THRESHOLD = 0.62       # 同上。★主判定には用いない
 GRC_MAX_NODES = 1500        # これを超えたら GRC を打ち切る(O(N(N+E)))
@@ -269,7 +271,8 @@ def analyze(run_dir: str, *, window_days: int = 7,
         return res
     res["status"] = "OK"
 
-    window_steps = max(int(window_days) * STEPS_PER_DAY, 1)
+    # W2-3: 窓幅は「日数 × このランの 1 日あたり step 数」(Δt=10 で 144 = 従来と同値)。
+    window_steps = max(int(window_days) * run_dt.steps_per_day(run_dir), 1)
     max_step = max(e["step"] for e in events)
     buckets: dict[int, list] = defaultdict(list)
     for e in events:

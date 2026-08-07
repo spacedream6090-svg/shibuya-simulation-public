@@ -48,13 +48,18 @@ except Exception:
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "src"))
+if _HERE not in sys.path:                # 同ディレクトリの run_dt を import
+    sys.path.insert(0, _HERE)
 
+import run_dt                            # noqa: E402  (W2-3: ランの Δt の単一の源)
 from society.observer import measure as m  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # 既定パラメータ(決定論のためスクリプト定数。CLI で上書き可)
 # --------------------------------------------------------------------------- #
-STEPS_PER_DAY = 144          # 1 step = 10 sim 分 → 1440/10 = 144
+# W2-3: **ラン依存**(run.dt_min)。既定は正準 Δt=10 の 144。日の第一手段は sim_min//1440
+# なので Δt 非依存で、この定数は sim_min 欠損時の後退経路と L3 の日バケツにだけ効く。
+STEPS_PER_DAY = run_dt.CANON_STEPS_PER_DAY
 TOP_K = 10                   # 中心性/順位の上位K(レースチャート・turnover)
 MIN_DAYS = 3                 # 「構造固着」とみなす連続日数の下限 N
 CENT_CHURN_LOW = 0.10        # 中心性 turnover がこの値以下 = 上位が入れ替わらない = 固着
@@ -81,19 +86,23 @@ def kendall_tau(a, b):
 # --------------------------------------------------------------------------- #
 # 日次バケツ + 補助
 # --------------------------------------------------------------------------- #
-def _day_of(e: dict) -> int:
-    """イベントの暦日。sim_min//1440(欠損時は step//STEPS_PER_DAY へ後退)。"""
+def _day_of(e: dict, spd: int = STEPS_PER_DAY) -> int:
+    """イベントの暦日。sim_min//1440(欠損時は step//spd へ後退)。
+
+    W2-3: 第一手段は sim_min 基準なので **Δt に一切依存しない**(この形が処方箋の正典)。
+    `spd` の既定は正準 144 で、後退経路でも Δt=10 なら従来と完全同値。"""
     sm = e.get("sim_min")
     if sm is None:
-        return int(e["step"]) // STEPS_PER_DAY
+        return int(e["step"]) // int(spd)
     return int(sm) // 1440
 
 
-def bucket_by_day(events: list[dict]) -> tuple[dict[int, list], list[int]]:
+def bucket_by_day(events: list[dict],
+                  spd: int = STEPS_PER_DAY) -> tuple[dict[int, list], list[int]]:
     """events を暦日へ振り分け、連続する日レンジ [0..max] を返す(空日は空リスト=時系列を連続に)。"""
     by_day: dict[int, list] = defaultdict(list)
     for e in events:
-        by_day[_day_of(e)].append(e)
+        by_day[_day_of(e, spd)].append(e)
     if not by_day:
         return {}, []
     days = list(range(0, max(by_day) + 1))
@@ -168,7 +177,8 @@ def reconstruct_churn(by_day: dict[int, list], days: list[int]) -> dict:
 # --------------------------------------------------------------------------- #
 # 2. 順位固着(Kendall τ + レースチャート素材)
 # --------------------------------------------------------------------------- #
-def _status_by_day(run_dir: str, days: list[int]) -> dict[int, dict] | None:
+def _status_by_day(run_dir: str, days: list[int],
+                   spd: int = STEPS_PER_DAY) -> dict[int, dict] | None:
     """L3 スナップから各日の末尾スナップの status を読む(hierarchy ON 時のみ。無ければ None)。"""
     import pyarrow.parquet as pq
 
@@ -182,7 +192,7 @@ def _status_by_day(run_dir: str, days: list[int]) -> dict[int, dict] | None:
     last_by_day: dict[int, dict] = {}
     found = False
     for r in rows:
-        d = int(r["step"]) // STEPS_PER_DAY
+        d = int(r["step"]) // int(spd)
         prev = last_by_day.get(d)
         if prev is None or int(r["step"]) >= prev[0]:
             last_by_day[d] = (int(r["step"]), r)
@@ -218,9 +228,9 @@ def _reputation_by_day(by_day: dict[int, list], days: list[int]) -> dict[int, di
 
 
 def rank_stability(run_dir: str, by_day: dict[int, list], days: list[int],
-                   top_k: int) -> dict:
+                   top_k: int, spd: int = STEPS_PER_DAY) -> dict:
     """地位(L3 status 優先)or 評判(L1)ランキングの前日比・前週比 Kendall τ + 上位K人の順位推移。"""
-    vals_by_day = _status_by_day(run_dir, days)
+    vals_by_day = _status_by_day(run_dir, days, spd)
     source = "status"
     if not vals_by_day:
         vals_by_day = _reputation_by_day(by_day, days)
@@ -396,11 +406,13 @@ def analyze(run_dir: str, top_k: int = TOP_K, min_days: int = MIN_DAYS,
     agents = m.load_agents(run_dir)
     n_agents = len(agents) or (max((e["agent_id"] for e in events
                                     if e["agent_id"] >= 0), default=-1) + 1)
-    by_day, days = bucket_by_day(events)
+    # W2-3: 「1 日」はこのランの run.dt_min で決まる(Δt=10 なら 144 = 従来と同値)。
+    spd = run_dt.steps_per_day(run_dir)
+    by_day, days = bucket_by_day(events, spd)
     run_name = os.path.basename(os.path.normpath(run_dir))
 
     churn = reconstruct_churn(by_day, days)
-    rank = rank_stability(run_dir, by_day, days, top_k)
+    rank = rank_stability(run_dir, by_day, days, top_k, spd)
     cent = centrality_churn(by_day, days, top_k)
     comm = community_change(by_day, days, n_agents)
     stag = detect_stagnation(days, churn, rank, cent, min_days,
@@ -413,7 +425,7 @@ def analyze(run_dir: str, top_k: int = TOP_K, min_days: int = MIN_DAYS,
         "days": days,
         "params": {"top_k": top_k, "min_days": min_days,
                    "centrality_churn_low": cent_low, "edge_churn_low": edge_low,
-                   "tau_high": tau_high, "steps_per_day": STEPS_PER_DAY,
+                   "tau_high": tau_high, "steps_per_day": spd,
                    "detector": "measure.communities (deterministic LPA on speak/dm graph)",
                    "tau": "measure._kendall_tau (tau-b, numpy, exact small-N)"},
         "churn": churn,

@@ -29,12 +29,18 @@ from collections import Counter, defaultdict
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "src"))
+if _HERE not in sys.path:                       # 同ディレクトリの run_dt を import
+    sys.path.insert(0, _HERE)
 
 from society.observer import measure as m  # noqa: E402
 
 # 1 step = 10 sim 分。sim_min は 07:00(=420)起点の絶対分(step0→420)。
-MIN_PER_STEP = 10
-MIN_PER_DAY = 1440
+import run_dt                                 # noqa: E402  (W2-3: ランの Δt の単一の源)
+
+# W2-3: MIN_PER_STEP は **ラン依存**(run.dt_min)。ここの値は正準 Δt=10 の既定で、
+# 実際の値は observe() が run dir から読んで observe_visits へ渡す(Δt=10 なら同値)。
+MIN_PER_STEP = run_dt.CANON_DT_MIN          # 10
+MIN_PER_DAY = 1440                          # 分/日は Δt 非依存(実時間。_day は sim_min 基準)
 
 # 建物 kind → 大まかなカテゴリ(POI が無い建物のフォールバック)
 _KIND_TO_CAT = {
@@ -151,8 +157,11 @@ def _day(sim_min: int) -> int:
 # --------------------------------------------------------------------------- #
 # 訪問観測
 # --------------------------------------------------------------------------- #
-def observe_visits(events: list[dict], mp: dict) -> dict:
-    """POI/建物/ノード別の訪問・滞在・ユニーク訪問者、カテゴリ集客、行動圏。"""
+def observe_visits(events: list[dict], mp: dict,
+                   mps: int = MIN_PER_STEP) -> dict:
+    """POI/建物/ノード別の訪問・滞在・ユニーク訪問者、カテゴリ集客、行動圏。
+
+    W2-3: `mps`(1 step の分数)は滞在 step → 分の換算だけに使う。既定は正準 10。"""
     # ---- 建物訪問(enter_building)+ 滞在時間(enter→exit ペアリング)----
     bld_visits: dict[str, int] = Counter()
     bld_visitors: dict[str, set] = defaultdict(set)
@@ -231,7 +240,7 @@ def observe_visits(events: list[dict], mp: dict) -> dict:
         if not steps:
             return {"n_completed": 0, "mean_stay_min": None, "median_stay_min": None,
                     "max_stay_min": None}
-        mins = sorted(s * MIN_PER_STEP for s in steps)
+        mins = sorted(s * int(mps) for s in steps)
         n = len(mins)
         med = mins[n // 2] if n % 2 else (mins[n // 2 - 1] + mins[n // 2]) / 2
         return {"n_completed": n,
@@ -649,7 +658,7 @@ def observe(run_dir: str, out_dir: str | None = None) -> str:
     n_agents = len(agents) or (max((e["agent_id"] for e in events), default=-1) + 1)
     mp = load_map(run_dir)
 
-    visits = observe_visits(events, mp)
+    visits = observe_visits(events, mp, run_dt.min_per_step(run_dir))
     interests = observe_interests(events, agents)
 
     run_name = os.path.basename(os.path.normpath(run_dir))

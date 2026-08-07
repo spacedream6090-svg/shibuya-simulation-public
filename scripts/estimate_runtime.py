@@ -47,9 +47,15 @@ import numpy as np
 import pyarrow.parquet as pq
 
 _ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT / "scripts") not in sys.path:   # 同ディレクトリの run_dt を import
+    sys.path.insert(0, str(_ROOT / "scripts"))
+
+import run_dt                                # noqa: E402  (W2-3: ランの Δt の単一の源)
 
 # ── 実測ベースの既定定数(較正ラン無し時 / アンカー) ──────────────────────
 # 1 日 = 144 ステップ(10 分刻み・24h)。全較正ランが n_steps=432(3日)。
+# ★W2-3: これは **正準 Δt=10 の値**。較正ランの日別集計は各ランの run.dt_min から導く
+#   (steps_per_day=None のとき)。予測対象ランの 1 日 step 数は --steps-per-day で指定する。
 DEFAULT_STEPS_PER_DAY = 144
 DEFAULT_SEC_PER_CALL = 3.1   # qwen3:4b 実測の 1 呼あたり秒
 DEFAULT_OVERHEAD = 0.15      # スケジューラ/IO 等のオーバーヘッド率
@@ -134,12 +140,17 @@ FLEET_PRESETS = {
 
 
 # ── 較正データ読み取り ────────────────────────────────────────────────────
-def read_daily_calls(run_dir: Path, steps_per_day: int = DEFAULT_STEPS_PER_DAY) -> list[int]:
+def read_daily_calls(run_dir: Path, steps_per_day: int | None = None) -> list[int]:
     """l1b_llm.parquet の step 列を日別の実 LLM 呼数系列に集計する。
 
     cached 列があれば cache hit(True)を除外して実呼数のみ数える。
     戻り値は [day1, day2, ...](間の欠日は 0 で埋める)。
+
+    W2-3: `steps_per_day=None`(既定)は **その較正ラン自身の run.dt_min** から導く
+    (Δt=10 なら 144 = 従来の既定と同値)。明示指定があればそちらを尊重する。
     """
+    if steps_per_day is None:
+        steps_per_day = run_dt.steps_per_day(run_dir)
     path = run_dir / "l1b_llm.parquet"
     if not path.exists():
         raise FileNotFoundError(f"l1b_llm.parquet が見つからない: {path}")
@@ -289,7 +300,7 @@ class Calibration:
     points: list = field(default_factory=list)  # [(N, day1), ...]
 
 
-def build_calibration(calib_dirs: list[Path], *, steps_per_day: int = DEFAULT_STEPS_PER_DAY,
+def build_calibration(calib_dirs: list[Path], *, steps_per_day: int | None = None,
                       alpha_override: float | None = None,
                       g_override: float | None = None) -> Calibration:
     """較正ラン群(0本以上)から Calibration を組む。"""
@@ -579,8 +590,9 @@ def main(argv: list[str]) -> int:
                     help="非LLM(Python step)コスト: none/lean(mock 0.00183)/full(実測 0.060 秒/agent-step)")
     ap.add_argument("--nonllm-sec-per-agent-step", type=float, default=None,
                     help="非LLM秒/agent-step を明示(--nonllm-profile より優先)")
-    ap.add_argument("--steps-per-day", type=int, default=DEFAULT_STEPS_PER_DAY,
-                    help=f"1 日のステップ数(既定 {DEFAULT_STEPS_PER_DAY})")
+    ap.add_argument("--steps-per-day", type=int, default=None,
+                    help=f"1 日のステップ数(既定 {DEFAULT_STEPS_PER_DAY}=Δt 10 分。"
+                         "較正ランの日別集計は各ランの run.dt_min から自動で導く)")
     ap.add_argument("--start", type=str, default=None,
                     help='完走予定の開始時刻 "HH:MM"(既定=現在時刻を使わず ETA 非表示)')
     args = ap.parse_args(argv)
@@ -626,7 +638,9 @@ def main(argv: list[str]) -> int:
 
     rep = build_report(args.agents, args.days, calib,
                        sec_per_call=sec_per_call, overhead=args.overhead,
-                       start=start, steps_per_day=args.steps_per_day,
+                       start=start,
+                       steps_per_day=(args.steps_per_day
+                                      if args.steps_per_day else DEFAULT_STEPS_PER_DAY),
                        cap_per_step=cap, lod_call_mult=lod_mult,
                        nonllm_sec_per_agent_step=nonllm, fleet=fleet)
     print(render_report(rep))

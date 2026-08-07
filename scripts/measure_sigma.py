@@ -76,6 +76,10 @@ import pyarrow.parquet as pq
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
+if str(REPO_ROOT / "scripts") not in sys.path:          # 同ディレクトリの run_dt を import
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+
+import run_dt                                           # noqa: E402  (W2-3: Δt の単一の源)
 
 from society.cognition import calib as CALIB          # noqa: E402
 from society.cognition import channels as CH          # noqa: E402
@@ -85,7 +89,17 @@ from society.engine.simulation import Simulation      # noqa: E402
 SCHEMA = CALIB.SCHEMA
 DEFAULT_OUT = REPO_ROOT / CALIB.SIGMA_DEFAULT_REL
 DEFAULT_RUN_DIR = REPO_ROOT / "runs" / "_sigma_pilot"
-STEPS_PER_DAY = 144                                    # Δt=10 分(正準)
+# W2-3: 1 日の step 数は **これから回すパイロットの Δt** に従う(正準 Δt=10 で 144)。
+# パイロットの Δt は「--set run.dt_min=N」> 基底 conf/config.yaml の run.dt_min の順で決まる。
+STEPS_PER_DAY = run_dt.CANON_STEPS_PER_DAY             # 144(Δt=10 分=正準)
+
+
+def pilot_steps_per_day(extra: list[str] | None = None) -> int:
+    """パイロットの 1 日あたり step 数。--set の run.dt_min → 基底 conf の順に見る。"""
+    dt = run_dt.dt_min_from_dotlist(extra)
+    if dt is None:
+        dt = run_dt.dt_min_of(REPO_ROOT / "conf")       # conf/config.yaml の run.dt_min
+    return run_dt.steps_per_day(dt_min=dt)
 
 
 # --------------------------------------------------------------------------- #
@@ -268,7 +282,8 @@ def main(argv=None) -> int:
     ap.add_argument("--print-only", action="store_true", help="書き出さずに要約だけ表示")
     args = ap.parse_args(argv)
 
-    steps = int(args.steps) if args.steps > 0 else int(round(args.days * STEPS_PER_DAY))
+    steps = (int(args.steps) if args.steps > 0
+             else int(round(args.days * pilot_steps_per_day(args.extra))))
     if args.from_parquet is not None:
         path = Path(args.from_parquet)
         run_cfg = {"source": "existing_parquet", "path": CALIB.rel_path(path)}

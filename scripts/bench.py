@@ -53,6 +53,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
+if str(REPO_ROOT / "scripts") not in sys.path:      # 同ディレクトリの run_dt を import
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 # Windows コンソール(cp932)で日本語パスや記号を print しても落ちないように
 for _s in (sys.stdout, sys.stderr):
@@ -61,6 +63,7 @@ for _s in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
+import run_dt                                       # noqa: E402  (W2-3: Δt の単一の源)
 from society.config import load_config              # noqa: E402
 from society.engine.simulation import Simulation    # noqa: E402
 
@@ -87,6 +90,9 @@ def bench_one(n_agents: int, steps: int, seed: int, out_root: Path,
     if servers:
         overrides.append(f"model.servers={json.dumps(list(servers))}")
     cfg = load_config(overrides=overrides)
+    # W2-3: このベンチランの 1 日あたり step 数(Δt=10 なら 144 = 従来と同値)。
+    spd = run_dt.steps_per_day(dt_min=run_dt.valid_dt_min(
+        (cfg.get("run") or {}).get("dt_min")) or run_dt.CANON_DT_MIN)
     sim = Simulation(cfg)
 
     tracemalloc.start()
@@ -108,7 +114,7 @@ def bench_one(n_agents: int, steps: int, seed: int, out_root: Path,
                               if steps and n_agents else None),
         "llm_calls": llm_calls,
         "llm_per_step": round(llm_calls / steps, 2) if steps else None,
-        "llm_per_agent_day": _per_agent_day(llm_calls, n_agents, steps),
+        "llm_per_agent_day": _per_agent_day(llm_calls, n_agents, steps, spd),
         "peak_mem_mb": round(peak / (1024 * 1024), 2),
         # P0バッチ 2026-07-29: summary.json の新キー(プロセス実メモリ/シム側 wall)。
         # peak_mem_mb(tracemalloc=Python ヒープ)と違い pyarrow の C++ バッファを含む。
@@ -116,13 +122,17 @@ def bench_one(n_agents: int, steps: int, seed: int, out_root: Path,
         "summary_elapsed_s": summary.get("elapsed_sec"),
         "n_events": n_events,
         "events_per_step": round(n_events / steps, 1) if steps else None,
-        "events_per_agent_day": _per_agent_day(n_events, n_agents, steps),
+        "events_per_agent_day": _per_agent_day(n_events, n_agents, steps, spd),
         "source": "fresh",
     }
 
 
-def _per_agent_day(total: int, n_agents: int, steps: int, steps_per_day: int = 144):
-    """総数 → 1エージェント1シミュ日あたり(144 step=1日)。分母 0 なら None。"""
+def _per_agent_day(total: int, n_agents: int, steps: int,
+                   steps_per_day: int = run_dt.CANON_STEPS_PER_DAY):
+    """総数 → 1エージェント1シミュ日あたり(steps_per_day step=1日)。分母 0 なら None。
+
+    W2-3: `steps_per_day` の既定は正準 Δt=10 の 144 = 従来と完全同値。呼び出し側は
+    そのランの run.dt_min から導いた値を渡す。"""
     denom = n_agents * (steps / float(steps_per_day))
     return round(total / denom, 2) if denom > 0 else None
 
@@ -156,13 +166,15 @@ def rows_from_existing_runs(run_dirs: list[Path]) -> list[dict]:
                                   if wall and steps and n_agents else None),
             "llm_calls": llm_calls,
             "llm_per_step": round(llm_calls / steps, 2) if steps else None,
-            "llm_per_agent_day": _per_agent_day(llm_calls, n_agents, steps),
+            "llm_per_agent_day": _per_agent_day(llm_calls, n_agents, steps,
+                                               run_dt.steps_per_day(d)),
             "peak_mem_mb": None,
             "peak_rss_mb": s.get("peak_rss_mb"),
             "summary_elapsed_s": wall,
             "n_events": n_events,
             "events_per_step": round(n_events / steps, 1) if steps else None,
-            "events_per_agent_day": _per_agent_day(n_events, n_agents, steps),
+            "events_per_agent_day": _per_agent_day(n_events, n_agents, steps,
+                                                  run_dt.steps_per_day(d)),
             "source": f"existing:{d.name}",
         })
     return out

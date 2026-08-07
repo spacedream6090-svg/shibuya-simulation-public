@@ -45,7 +45,11 @@ sys.path.insert(0, os.path.join(_ROOT, "src"))  # society.observer.measure(研�
 import audit_uncertainty as au                  # noqa: E402  共有: LUCK_KINDS / attribute_chances
 from society.observer import measure            # noqa: E402  研究資産: load_traits(OLS 流儀)
 
-STEPS_PER_DAY = 144
+import run_dt                                   # noqa: E402  (W2-3: Δt の単一の源)
+
+# W2-3: **ラン依存**(run.dt_min)。既定は正準 Δt=10 の 144。本 module 内で日を切る箇所は
+# 無く(日の集計は audit_uncertainty 側)、この定数は互換のために残している。
+STEPS_PER_DAY = run_dt.CANON_STEPS_PER_DAY
 
 # 実力側 trait の許可リスト(traits.json には money/wage/visitor/part_time も入るため、
 # 成果への漏れ=リークを避けて安定な人格/傾性因子のみ採用する)。
@@ -226,7 +230,8 @@ def _pearson(a: list[float], b: list[float]) -> float:
 # 分解本体
 # --------------------------------------------------------------------------- #
 def decompose(events: list[dict], agents: dict[int, dict],
-              traits_by_id: dict[int, dict]) -> dict:
+              traits_by_id: dict[int, dict],
+              spd: int = STEPS_PER_DAY) -> dict:
     """成果ごとの 実力/運 分散分解 + 住民別散布データ + 共線・小標本の診断を返す。"""
     residents = {aid for aid, m in agents.items() if not m.get("visitor")}
     if not residents:                                       # visitor 情報が無い旧ラン等
@@ -234,7 +239,7 @@ def decompose(events: list[dict], agents: dict[int, dict],
 
     outcomes = agent_outcomes(events, residents)
     sfeat, scols, sinfo = skill_features(agents, traits_by_id, residents)
-    attr = au.attribute_chances(events, agents)
+    attr = au.attribute_chances(events, agents, spd)
     per_agent = attr["per_agent"]                           # {agent: Counter(category->count)}
 
     # 統合行(実力側特徴が揃った住民のみ)。運側 = 偶発曝露の総件数。
@@ -323,10 +328,12 @@ def _limitations(n: int, scols: list[str], max_collin: float) -> list[str]:
 def analyze(run_dir: str, out_dir: str) -> dict:
     """ラン1本を分解し、luck/decomposition.json を書く。"""
     run_name = os.path.basename(os.path.normpath(run_dir))
-    events = au.load_events(run_dir)
+    # W2-3: 「1 日」「sim_min 復元」はこのランの run.dt_min で決まる(Δt=10 なら従来と同値)。
+    spd = run_dt.steps_per_day(run_dir)
+    events = au.load_events(run_dir, run_dt.min_per_step(run_dir))
     agents = au.load_agents(run_dir)
     traits_by_id, trait_names, tsource = measure.load_traits(run_dir)
-    res = decompose(events, agents, traits_by_id)
+    res = decompose(events, agents, traits_by_id, spd)
     res["run"] = run_name
     res["traits_source"] = tsource
     res["traits_available"] = trait_names

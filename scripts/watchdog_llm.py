@@ -40,6 +40,8 @@ from collections import Counter
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT / "scripts") not in sys.path:   # l1_stream(W2-2 の共有逐次読み)用
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 for _s in (sys.stdout, sys.stderr):              # Windows コンソール(cp932)対策
     try:
@@ -54,22 +56,39 @@ def _read_table(path: Path, columns=None):
 
 
 def _l1b_stats(run_dir: Path) -> dict:
-    """l1b_llm.parquet から呼数・キャッシュ率・purpose 内訳。無ければ空。"""
+    """l1b_llm.parquet から呼数・キャッシュ率・purpose 内訳。無ければ空。
+
+    W2-2(25万対応): 旧実装は `read_table().to_pylist()` で全行を dict 化していた。
+    在場 25万 × 10 日の推定呼数は **7.38×10⁶**(提案書 §2-2 構成 B)で、1 行 dict が
+    数百バイトなら数 GB になる。ここは 2 列(purpose/cached)を row-group 逐次で読み、
+    メモリを **O(distinct purpose)** に落とす。出力(llm_calls / cache_hits /
+    by_purpose)は旧実装と同値: 行数は footer メタ、purpose 欠測は "?"、
+    cached は truthy 判定という規約をそのまま保つ。
+    """
     path = run_dir / "l1b_llm.parquet"
     if not path.exists():
         return {"llm_calls": None, "cache_hits": None, "by_purpose": {}}
-    tbl = _read_table(path).to_pylist()
+    import l1_stream as ls
+    n_rows = ls.table_rows(path)
+    names = set(ls.table_schema(path).names)
     by_purpose: Counter = Counter()
     cached_by_purpose: Counter = Counter()
     cache_hits = 0
-    for r in tbl:
-        purpose = str(r.get("purpose") or "?")
-        by_purpose[purpose] += 1
-        if r.get("cached"):
-            cache_hits += 1
-            cached_by_purpose[purpose] += 1
+    if not ({"purpose", "cached"} & names):       # 列が 1 つも無い旧 schema
+        by_purpose["?"] = n_rows
+    else:
+        for d in ls.iter_table_columns(path, ["purpose", "cached"]):
+            n = len(next(iter(d.values())))
+            purposes = d.get("purpose")
+            cacheds = d.get("cached")
+            for i in range(n):
+                purpose = str((purposes[i] if purposes is not None else None) or "?")
+                by_purpose[purpose] += 1
+                if cacheds is not None and cacheds[i]:
+                    cache_hits += 1
+                    cached_by_purpose[purpose] += 1
     return {
-        "llm_calls": len(tbl),
+        "llm_calls": n_rows,
         "cache_hits": cache_hits,
         "by_purpose": {p: {"calls": n,
                            "cache_hit_rate": round(cached_by_purpose[p] / n, 4)}
@@ -80,7 +99,13 @@ def _l1b_stats(run_dir: Path) -> dict:
 
 def _l1_fallbacks(run_dir: Path) -> int | None:
     """L1 の kind='fallback' 件数。summary.json の event_kinds があればそれを使う
-    (巨大な L1 を読まずに済む)。無ければ parquet の kind 列だけを読む。"""
+    (巨大な L1 を読まずに済む)。無ければ parquet の kind 列だけを読む。
+
+    W2-2(25万対応): 旧実装の `read_table(columns=["kind"]).to_pylist()` は
+    **40.6 億個の Python 文字列**を作る(在場 25万 × 10 日。提案書 §2-4)。
+    `l1_stream.kind_counts` は Arrow の `value_counts` で数えるので Python 文字列を
+    1 個も作らず、メモリは O(distinct kind)。走行中ランの part 群にも透過に効く。
+    """
     summ = run_dir / "summary.json"
     if summ.exists():
         try:
@@ -90,11 +115,10 @@ def _l1_fallbacks(run_dir: Path) -> int | None:
                 return int(kinds.get("fallback", 0))
         except (json.JSONDecodeError, ValueError, OSError):
             pass
-    path = run_dir / "l1_events.parquet"
-    if not path.exists():
+    import l1_stream as ls
+    if not ls.l1_paths(run_dir):
         return None
-    kinds = _read_table(path, columns=["kind"]).column("kind").to_pylist()
-    return sum(1 for k in kinds if k == "fallback")
+    return int(ls.kind_counts(run_dir).get("fallback", 0))
 
 
 def _deadline_exceeded(run_dir: Path) -> int | None:

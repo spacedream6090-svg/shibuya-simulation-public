@@ -96,7 +96,19 @@ def _load_tracks_bin():
     spec.loader.exec_module(mod)
     return mod
 
+def _load_run_dt():
+    """scripts/run_dt.py を場所非依存で読み込む(_load_tracks_bin と同じ流儀。
+    本ファイルは scripts/ を sys.path に載せない設計なのでそれを守る)。"""
+    spec = importlib.util.spec_from_file_location(
+        "run_dt", Path(__file__).resolve().parent / "run_dt.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 FLOOR_HEIGHT = 3.5
+# W2-3: **ラン依存**(run.dt_min)。既定は正準 Δt=10 = 従来と 1 ビットも変わらない。
+# 実際の値は export_run() が run dir から読んで build_scene / 再構成へ引数で配る。
 STEP_MINUTES = 10
 DEFAULT_START_MIN = 7 * 60  # make_viewer と同じ既定(7:00)
 
@@ -755,7 +767,8 @@ def _close_ring(fp: list) -> list:
     return ring
 
 
-def build_scene(city: dict, buildings: list) -> dict:
+def build_scene(city: dict, buildings: list,
+                step_minutes: int = STEP_MINUTES) -> dict:
     blds_out = []
     for b in buildings:
         levels = int(b.get("levels", 2) or 2)
@@ -807,7 +820,7 @@ def build_scene(city: dict, buildings: list) -> dict:
             "axes": "X=east,Y=north,Z=up",
             "origin_latlon": meta.get("origin_latlon"),
             "bbox": meta.get("bbox"),
-            "step_minutes": STEP_MINUTES,
+            "step_minutes": int(step_minutes),
             "floor_height": FLOOR_HEIGHT,
             "attribution": meta.get("attribution", ""),
             "source": meta.get("name", ""),
@@ -1022,7 +1035,8 @@ def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
                        step_stride: int = 1, rich_tracks: bool = False,
                        n_steps_override: int | None = None,
                        step_min_override: dict | None = None,
-                       agent_ids_override: list | None = None) -> dict:
+                       agent_ids_override: list | None = None,
+                       step_minutes: int = STEP_MINUTES) -> dict:
     """viz/make_viewer.py build_data の位置再構成を移植・整理。
     positions[step][i] = [x, y, w]  (w: 0=路上 -1=範囲外 -2=睡眠 1000+bIdx*100+floor=屋内)
     moves[step][i] = [mode, pts] または None,  traffic[step] = {n, segs}
@@ -1070,14 +1084,16 @@ def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
     groups = ((s, by_step[s]) for s in sorted(by_step))
     return _reconstruct_core(groups, n_steps, agent_ids_seed, step_min,
                              buildings, agents_meta, sample_agents=sample_agents,
-                             step_stride=step_stride, rich_tracks=rich_tracks)
+                             step_stride=step_stride, rich_tracks=rich_tracks,
+                             step_minutes=step_minutes)
 
 
 def reconstruct_tracks_streaming(parquet_path: Path, buildings: list, agents_meta: list,
                                  sample_agents: int | None = None,
                                  step_stride: int = 1, rich_tracks: bool = False,
                                  columns: tuple = TRACK_COLUMNS,
-                                 kinds: tuple = TRACK_KINDS) -> dict:
+                                 kinds: tuple = TRACK_KINDS,
+                                 step_minutes: int = STEP_MINUTES) -> dict:
     """L1 parquet から**イベント列を全保持せずに** tracks を組む(--low-mem の主経路)。
 
     pass1 = `scan_track_meta`(3 列だけ走査)/ pass2 = `iter_track_events`(row group 逐次)。
@@ -1094,19 +1110,21 @@ def reconstruct_tracks_streaming(parquet_path: Path, buildings: list, agents_met
         events, ov = load_track_events(parquet_path, columns, kinds)
         return reconstruct_tracks(events, buildings, agents_meta,
                                   sample_agents=sample_agents, step_stride=step_stride,
-                                  rich_tracks=rich_tracks, **ov)
+                                  rich_tracks=rich_tracks, step_minutes=step_minutes, **ov)
     groups = _group_by_step(iter_track_events(parquet_path, columns, kinds))
     return _reconstruct_core(groups, int(meta["n_steps_override"]),
                              list(meta["agent_ids_override"]),
                              {int(k): int(v) for k, v in meta["step_min_override"].items()},
                              buildings, agents_meta, sample_agents=sample_agents,
-                             step_stride=step_stride, rich_tracks=rich_tracks)
+                             step_stride=step_stride, rich_tracks=rich_tracks,
+                             step_minutes=step_minutes)
 
 
 def _reconstruct_core(step_groups, n_steps: int, agent_ids_seed: list,
                       step_min: dict, buildings: list, agents_meta: list,
                       sample_agents: int | None = None,
-                      step_stride: int = 1, rich_tracks: bool = False) -> dict:
+                      step_stride: int = 1, rich_tracks: bool = False,
+                      step_minutes: int = STEP_MINUTES) -> dict:
     """位置再構成の本体。`step_groups` は `(step, その step のイベント list)` を
     **step 昇順**で出す iterable(list でも generator でもよい)。
 
@@ -1248,7 +1266,7 @@ def _reconstruct_core(step_groups, n_steps: int, agent_ids_seed: list,
 
     start_min = step_min.get(0, DEFAULT_START_MIN)
     emitted = list(range(0, n_steps, stride))
-    sim_min = [step_min.get(s, start_min + s * STEP_MINUTES) for s in emitted]
+    sim_min = [step_min.get(s, start_min + s * int(step_minutes)) for s in emitted]
 
     agents_slim = [{
         "id": a["id"], "name": a.get("name", f"agent{a['id']}"),
@@ -1259,7 +1277,7 @@ def _reconstruct_core(step_groups, n_steps: int, agent_ids_seed: list,
         "has_bicycle": bool(a.get("has_bicycle", False)),
     } for a in agents_meta]
 
-    meta = {"nSteps": len(positions), "step_minutes": STEP_MINUTES,
+    meta = {"nSteps": len(positions), "step_minutes": int(step_minutes),
             "start_min": start_min, "floor_height": FLOOR_HEIGHT}
     if stride > 1:                                  # 追加専用: 全量時は出さない=現行と同一
         meta["step_stride"] = stride
@@ -1391,7 +1409,9 @@ def export_run(run_dir: Path, map_path: Path | None = None,
     am_path = run_dir / "agents.json"
     agents_meta = json.loads(am_path.read_text(encoding="utf-8")) if am_path.exists() else []
 
-    scene = build_scene(city, buildings)
+    # W2-3: 1 step の分数は **このランの run.dt_min**(Δt=10 なら 10 = 従来と同値)。
+    step_minutes = _load_run_dt().min_per_step(run_dir)
+    scene = build_scene(city, buildings, step_minutes)
     plateau = _load_plateau(plateau_dir) if plateau_dir is not None else None
     if plateau:
         for b in scene["buildings"]:
@@ -1418,11 +1438,13 @@ def export_run(run_dir: Path, map_path: Path | None = None,
     if low_mem:
         tracks = reconstruct_tracks_streaming(
             l1_path, buildings, agents_meta, sample_agents=sample_agents,
-            step_stride=step_stride, rich_tracks=rich_tracks)
+            step_stride=step_stride, rich_tracks=rich_tracks,
+            step_minutes=step_minutes)
     else:
         tracks = reconstruct_tracks(events, buildings, agents_meta,
                                     sample_agents=sample_agents,
-                                    step_stride=step_stride, rich_tracks=rich_tracks)
+                                    step_stride=step_stride, rich_tracks=rich_tracks,
+                                    step_minutes=step_minutes)
         events = None                      # 以降は tracks しか要らない(早めに解放)
     glb = build_glb(scene["buildings"], plateau)
 

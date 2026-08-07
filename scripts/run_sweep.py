@@ -27,6 +27,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
+if str(REPO_ROOT / "scripts") not in sys.path:   # 同ディレクトリの run_dt を import
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+
+import run_dt                                    # noqa: E402  (W2-3: Δt の単一の源)
 
 from society.config import load_config  # noqa: E402
 from society.engine.simulation import Simulation  # noqa: E402
@@ -69,13 +73,18 @@ def main() -> None:
                     help="1つなら従来名、複数なら FSS(名前に N トークン)")
     ap.add_argument("--alphas", nargs="*", type=float, default=[],
                     help="degraded の擬似連続点(k の中間軸)。例: 0.25 0.5 0.75")
-    ap.add_argument("--steps", type=int, default=144)
+    # W2-3: 既定は「1 シミュ日」= run.dt_min 依存(Δt=10 で 144・Δt=1 で 1440)。
+    ap.add_argument("--steps", type=int, default=None,
+                    help="1 ラン の step 数(既定=1 シミュ日ぶん。Δt=10 で 144)")
     ap.add_argument("--prefix", default="pilot")
     ap.add_argument("--no-auto-data", action="store_true",
                     help="data/personas_<N>.json 等の自動注入を無効化")
     ap.add_argument("--extra", nargs="*", default=[])
     args = ap.parse_args()
 
+    if args.steps is None:
+        dt = run_dt.dt_min_from_dotlist(args.extra) or run_dt.dt_min_of(REPO_ROOT / "conf")
+        args.steps = run_dt.steps_per_day(dt_min=dt)
     conditions = _build_conditions(args.modes, args.alphas)
     multi_n = len(args.agents) > 1
     total = len(args.agents) * len(conditions) * len(args.seeds)

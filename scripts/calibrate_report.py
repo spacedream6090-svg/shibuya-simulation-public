@@ -46,9 +46,13 @@ from model_battery import metrics as bm        # noqa: E402  (cv / quantile の�
 from model_battery import reference as bref    # noqa: E402  (現実バンドの来歴強制ローダ)
 from society.observer.measure import stream_events  # noqa: E402
 
-MIN_PER_DAY = 1440
-MIN_PER_STEP = 10
-STEPS_PER_DAY = 144
+import run_dt                                # noqa: E402  (W2-3: ランの Δt の単一の源)
+
+# W2-3: MIN_PER_STEP / STEPS_PER_DAY は **ラン依存**(run.dt_min)。ここの値は正準 Δt=10 の
+# 既定で、実際の値は analyze() が run dir から読んで各段へ引数で配る(Δt=10 なら同値)。
+MIN_PER_DAY = 1440                          # 分/日は Δt 非依存(実時間)
+MIN_PER_STEP = run_dt.CANON_DT_MIN          # 10
+STEPS_PER_DAY = run_dt.CANON_STEPS_PER_DAY  # 144
 
 # 現実側の分散バンド(来歴つき)。読み込み失敗は「バンド無し」へ後退する(レポートは出る)。
 REF_DIR = os.path.join(_ROOT, "data", "battery", "reference")
@@ -225,15 +229,17 @@ _ACT_REF_BAND = {   # category -> (lo_min, hi_min, 出典・注記)
 }
 
 
-def activity_summary(recon: dict) -> dict:
+def activity_summary(recon: dict, mps: int = MIN_PER_STEP) -> dict:
     """reconstruct_activity の出力から、カテゴリ別 分/日(全体/平日/休日)と
-    平日vs休日の分布一致(KS/EMD)を計算する。"""
+    平日vs休日の分布一致(KS/EMD)を計算する。
+
+    W2-3: `mps`(1 step の分数)の既定は正準 10 = 従来と完全同値。"""
     adc = recon["adc"]
     hol = recon["holiday_by_day"]
     cats = recon["cats"]
     by_ad: dict[tuple, dict] = defaultdict(lambda: defaultdict(float))
     for (aid, d, c), n in adc.items():
-        by_ad[(aid, d)][c] += n * MIN_PER_STEP
+        by_ad[(aid, d)][c] += n * int(mps)
     all_ad = sorted(by_ad)
     wk = [ad for ad in all_ad if hol.get(ad[1]) is False]
     hd = [ad for ad in all_ad if hol.get(ad[1]) is True]
@@ -353,7 +359,7 @@ def load_reference_bands() -> dict:
 
 
 def variance_summary(recon: dict | None, speak_by_ad: dict, contact_by_ad: dict,
-                     agent_days: set) -> dict:
+                     agent_days: set, mps: int = MIN_PER_STEP) -> dict:
     """agent×day 単位の 3 系統(行動時間・発話数・接触人数)の個体間分散。
 
     行動時間は build_panel.reconstruct_activity の adc(=(aid, day, cat) → step 数)を
@@ -368,7 +374,7 @@ def variance_summary(recon: dict | None, speak_by_ad: dict, contact_by_ad: dict,
         adc = recon["adc"]
         by_ad: dict[tuple, dict] = defaultdict(lambda: defaultdict(float))
         for (aid, d, c), n in adc.items():
-            by_ad[(aid, d)][c] += n * MIN_PER_STEP
+            by_ad[(aid, d)][c] += n * int(mps)
         # ★ L1 に実際にイベントが記録された agent×day に限る。活動復元は睡眠区間を
         #   最終 step の先まで延ばすことがあり(sleep_start の until_step)、その端数日を
         #   1 日として数えると分母が狂う。ここで揃えると発話・接触の行と n も一致する。
@@ -407,7 +413,11 @@ def analyze(run_dir: str) -> dict:
     summary = json.load(open(os.path.join(run_dir, "summary.json"), encoding="utf-8"))
     kinds: dict[str, int] = summary.get("event_kinds", {})
     n_steps = int(summary.get("n_steps", 0))
-    n_days = max(1.0, n_steps / 144.0)
+    # W2-3: 1日の step 数・1 step の分数は **このランの run.dt_min** から決める
+    # (Δt=10 なら 144 / 10 = 従来と 1 ビットも変わらない)。
+    spd = run_dt.steps_per_day(run_dir)
+    mps = run_dt.min_per_step(run_dir)
+    n_days = max(1.0, n_steps / float(spd))
 
     residents = [a for a in agents if not a.get("visitor")]
     # 組織雇用(解雇・転職の母数): 在勤先 or パートを持つ住民
@@ -440,7 +450,7 @@ def analyze(run_dir: str) -> dict:
     joint_invites = 0
     joint_accepts = 0
     # ---- S-03 個体間分散(第92バッチ): agent×day の台帳 ----
-    #   日の切り方は build_panel と同じ step//144(07:00 起点で夜間睡眠が同一日に収まる)。
+    #   日の切り方は build_panel と同じ step//steps_per_day(07:00 起点で夜間睡眠が同一日に収まる)。
     #   ★メモリ: agent×day のキー数に比例する(接触は集合を持つ)。25 万体×10 日級では
     #     bp.reconstruct_activity の adc((aid, day, cat))が既に同規模なので支配項ではない。
     agent_days: set[tuple] = set()
@@ -452,7 +462,7 @@ def analyze(run_dir: str) -> dict:
         p = e["payload"]
         aid = e["agent_id"]
         sm = e["sim_min"]
-        d_ad = e["step"] // STEPS_PER_DAY
+        d_ad = e["step"] // spd
         if aid is not None and aid >= 0:
             agent_days.add((aid, d_ad))
         if k == "speak":
@@ -468,7 +478,7 @@ def analyze(run_dir: str) -> dict:
             if aid in res_ids:
                 ss = p.get("slept_steps")
                 if ss:
-                    sleep_h.append(float(ss) * 10.0 / 60.0)
+                    sleep_h.append(float(ss) * float(mps) / 60.0)
                 wake_hours.append(hod(sm))
         elif k == "sleep_start":
             if aid in res_ids:
@@ -524,24 +534,24 @@ def analyze(run_dir: str) -> dict:
     m: dict = {}
 
     def _daily_series(col: str) -> list[float]:
-        """列を日ごとに合計(step列基準・1日=144step)。"""
+        """列を日ごとに合計(step列基準・1日=spd step)。"""
         vals = l2.get(col)
         if not vals:
             return []
         acc: dict[int, float] = defaultdict(float)
         for s, v in zip(steps, vals):
-            acc[s // 144] += float(v or 0)
+            acc[s // spd] += float(v or 0)
         return [acc[d] for d in sorted(acc)]
 
-    # 労働時間: 日ごとの Σ(n_working)×10分 ÷ その日の最大同時就業者数(実働者の近似)。
+    # 労働時間: 日ごとの Σ(n_working)×Δt分 ÷ その日の最大同時就業者数(実働者の近似)。
     # 名簿上の被雇用者数だと来街者の店員などを取りこぼすため、実測ピークを分母にする。
     work_daily = _daily_series("n_working")
     peak_daily: dict[int, float] = defaultdict(float)
     for s, v in zip(steps, l2.get("n_working", [])):
-        d = s // 144
+        d = s // spd
         peak_daily[d] = max(peak_daily[d], float(v or 0))
     peaks = [peak_daily[d] for d in sorted(peak_daily)]
-    work_h_days = [w * 10.0 / 60.0 / p for w, p in zip(work_daily, peaks) if p >= 5]
+    work_h_days = [w * float(mps) / 60.0 / p for w, p in zip(work_daily, peaks) if p >= 5]
     workdays = [w for w in work_h_days if w >= 3.0]
     m["work_h"] = st.mean(workdays) if workdays else None
     m["workday_share"] = len(work_h_days) / len(work_daily) if work_daily else None
@@ -630,13 +640,13 @@ def analyze(run_dir: str) -> dict:
     # ---- ④生活時間配分(第31バッチ W3): build_panel の活動復元を再利用 ----
     recon = None
     try:
-        recon = bp.reconstruct_activity(stream_events(run_dir), agents)
-        m["_activity"] = activity_summary(recon)
+        recon = bp.reconstruct_activity(stream_events(run_dir), agents, spd, mps)
+        m["_activity"] = activity_summary(recon, mps)
     except Exception:
         m["_activity"] = None
 
     # ---- ⑤個体間分散(第92バッチ SV-U1 B3 = S-03)----
-    m["_variance"] = variance_summary(recon, speak_by_ad, contact_by_ad, agent_days)
+    m["_variance"] = variance_summary(recon, speak_by_ad, contact_by_ad, agent_days, mps)
 
     # 既存 L2 の集中度列は**読むだけ**(観測系 aggregate.py は凍結対象なので触らない)。
     # 無い列(そのランで lens が OFF)は None のまま=「―」で出す。

@@ -55,6 +55,11 @@ import os
 import statistics as st
 import sys
 from collections import defaultdict
+from pathlib import Path
+
+_SCRIPTS = str(Path(__file__).resolve().parent)
+if _SCRIPTS not in sys.path:                     # l1_stream(W2-2 の共有逐次読み)用
+    sys.path.insert(0, _SCRIPTS)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -71,27 +76,108 @@ DK_PEAK_SPREADER = 1.0 - math.log(2.0)          # ≈ 0.30685
 # --------------------------------------------------------------------------- #
 # 読み込み(読み取り専用)
 # --------------------------------------------------------------------------- #
+WANT_KINDS = ("rumor_born", "rumor_stifle", "transmission", "speak", "hear", "dm")
+
+
 def load_events(run_dir: str) -> list[dict]:
-    """l1_events.parquet から本解析に要る種だけを dict 化して返す。"""
-    import pyarrow.parquet as pq
-    path = os.path.join(run_dir, "l1_events.parquet")
-    if not os.path.isfile(path):
+    """l1_events.parquet から本解析に要る種だけを dict 化して返す(**小ラン専用**)。
+
+    W2-2: 旧実装は `read_table().to_pylist()` で L1 を丸ごと Python 化していた。
+    ここは `l1_stream.iter_events(kinds=...)` の逐次読みに置き換えてあり、
+    **返り値・行順は 1 バイトも変わらない**(不要な種の dict を作らなくなっただけ)。
+
+    ただし `speak`/`hear`/`dm` は L1 の大半を占めるので、**戻り値の list 自体が
+    在場 25万 × 10 日では依然として数十 GB になる**。本選規模では `collect()` を使う
+    こと(`main()` はそちらを呼ぶ)。この関数は既存テスト・小ランの互換のために残す。
+    """
+    import l1_stream as ls
+    if not ls.l1_paths(run_dir):
         raise SystemExit(f"[rumors] l1_events.parquet が無い: {run_dir}")
-    want = {"rumor_born", "rumor_stifle", "transmission", "speak", "hear", "dm"}
-    out: list[dict] = []
-    for e in pq.read_table(path).to_pylist():
-        if e["kind"] not in want:
-            continue
-        p = e["payload"]
-        p = json.loads(p) if isinstance(p, str) else (p or {})
-        out.append({"step": int(e["step"]), "agent_id": int(e["agent_id"]),
-                    "kind": e["kind"], "payload": p})
+    out: list[dict] = [
+        {"step": e["step"], "agent_id": e["agent_id"], "kind": e["kind"],
+         "payload": e["payload"]}
+        for e in ls.iter_events(run_dir,
+                                columns=["step", "agent_id", "kind", "payload"],
+                                kinds=WANT_KINDS)
+    ]
     out.sort(key=lambda r: (r["step"], r["kind"], r["agent_id"]))
     return out
 
 
 def is_rumor(item_id) -> bool:
     return isinstance(item_id, str) and item_id.startswith(RUMOR_PREFIX)
+
+
+# --------------------------------------------------------------------------- #
+# W2-2: チャンク集約(在場 25万対応)
+# --------------------------------------------------------------------------- #
+def _new_bundle() -> dict:
+    return {"events": [], "population_seen": set(),
+            "n_all_transmissions": 0, "n_rumor_transmissions": 0}
+
+
+def _feed(b: dict, step: int, aid: int, kind: str, p: dict) -> None:
+    """1 イベントを集約に畳む。**木に効く行だけ** `events` に残す。
+
+    - 母集団は集合(順序非依存・上限 = 体数)。
+    - `transmission` の件数は 2 本のカウンタ(全件 / 噂ぶん)。
+    - `speak`/`hear`/`dm` と **噂でない** `transmission` は母集団と件数にしか効かない
+      (`build_cascades` はこれらを必ず読み飛ばす)ので、ここで捨てる。これが
+      「40.6 億件 → 噂カスケードの実サイズ」に落ちる唯一の理由。
+    """
+    if aid >= 0:
+        b["population_seen"].add(aid)
+    for key in ("from", "to", "speaker"):
+        v = p.get(key)
+        if isinstance(v, int) and v >= 0:
+            b["population_seen"].add(v)
+    for key in ("hearers", "knowers"):
+        for v in (p.get(key) or []):
+            if isinstance(v, int) and v >= 0:
+                b["population_seen"].add(v)
+    if kind == "transmission":
+        b["n_all_transmissions"] += 1
+        if not is_rumor(p.get("item_id")):
+            return
+        b["n_rumor_transmissions"] += 1
+    elif kind not in ("rumor_born", "rumor_stifle"):
+        return
+    b["events"].append({"step": step, "agent_id": aid, "kind": kind, "payload": p})
+
+
+def collect(run_dir: str) -> dict:
+    """L1 を **1 パスの逐次読み**で畳み、噂解析に要る集約だけを返す。
+
+    ピークメモリは **O(噂カスケードに効く行数 + 体数)**。L1 の総行数には比例しない。
+    `summarize()` に直接渡せる(`summarize(load_events(rd), None)` と同じ結果を返す
+    ことを `tests/test_l1_stream.py` がバイト同値で固定している)。
+
+    残る比例項(正直な注記):
+      - `events` は「噂の誕生・stifle・**噂の**伝播」の行数に比例する。噂が街全体に
+        広がった場合はこれ自体が大きくなりうる(= O(1) にはならない)。
+      - `population_seen` は distinct agent_id に比例(在場 25万なら 25万要素の set)。
+    """
+    import l1_stream as ls
+    if not ls.l1_paths(run_dir):
+        raise SystemExit(f"[rumors] l1_events.parquet が無い: {run_dir}")
+    b = _new_bundle()
+    for e in ls.iter_events(run_dir,
+                            columns=["step", "agent_id", "kind", "payload"],
+                            kinds=WANT_KINDS):
+        _feed(b, e["step"], e["agent_id"], e["kind"], e["payload"])
+    # 旧 load_events と同じ全体ソート。対象は「木に効く行」だけに縮んでいるが、
+    # 安定ソートなので生存行どうしの相対順序は全件ソートしたときと同一になる。
+    b["events"].sort(key=lambda r: (r["step"], r["kind"], r["agent_id"]))
+    return b
+
+
+def _bundle_from_events(events: list[dict]) -> dict:
+    """既存の list[dict] 経路(テスト・小ラン)から同じ集約を作る互換シム。"""
+    b = _new_bundle()
+    for e in events:
+        _feed(b, e["step"], e["agent_id"], e["kind"], e["payload"])
+    b["events"].sort(key=lambda r: (r["step"], r["kind"], r["agent_id"]))
+    return b
 
 
 # --------------------------------------------------------------------------- #
@@ -260,14 +346,24 @@ def _agg(xs: list[int]) -> dict:
             "median": round(st.median(xs), 4), "max": max(xs)}
 
 
-def summarize(events: list[dict], population: int | None) -> dict:
+def summarize(source, population: int | None) -> dict:
+    """`collect()` の集約(dict)でも、旧来の events list でも同じ結果を返す。
+
+    W2-2 で入口を 2 系統にした。dict を渡す経路は L1 の総行数に比例するメモリを
+    持たない(`collect` を参照)。list を渡す旧経路は既存テストとの互換のため維持。
+    """
+    bundle = source if isinstance(source, dict) else _bundle_from_events(source)
+    events = bundle["events"]
     cascades = build_cascades(events)
     metrics = [cascade_metrics(c) for c in
                sorted(cascades.values(), key=lambda c: c["item_id"])]
-    n_pop, pop_src = population_of(events, population)
-    n_rumor_tr = sum(1 for e in events if e["kind"] == "transmission"
-                     and is_rumor(e["payload"].get("item_id")))
-    n_all_tr = sum(1 for e in events if e["kind"] == "transmission")
+    if population and population > 0:
+        n_pop, pop_src = int(population), "explicit(--population)"
+    else:
+        n_pop = len(bundle["population_seen"])
+        pop_src = "distinct agent_id in L1(近似)"
+    n_rumor_tr = bundle["n_rumor_transmissions"]
+    n_all_tr = bundle["n_all_transmissions"]
     by_src: dict[str, int] = defaultdict(int)
     for m in metrics:
         by_src[m["src_kind"]] += 1
@@ -329,8 +425,8 @@ def main() -> int:
     ap.add_argument("--out", default=None, help="出力先(既定: <run_dir>/analysis)")
     args = ap.parse_args()
 
-    events = load_events(args.run_dir)
-    res = summarize(events, args.population)
+    # W2-2: 全件 list ではなくチャンク集約(在場 25万 × 10 日でも RAM が総行数に比例しない)
+    res = summarize(collect(args.run_dir), args.population)
     out_dir = args.out or os.path.join(args.run_dir, "analysis")
     os.makedirs(out_dir, exist_ok=True)
     jpath = os.path.join(out_dir, "rumors.json")

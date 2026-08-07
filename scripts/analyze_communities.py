@@ -54,6 +54,8 @@ except Exception:
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "src"))
+if _HERE not in sys.path:                    # 同ディレクトリの run_dt を import
+    sys.path.insert(0, _HERE)
 
 import networkx as nx  # noqa: E402
 from society.observer import measure as m  # noqa: E402
@@ -61,7 +63,11 @@ from society.observer import measure as m  # noqa: E402
 # --------------------------------------------------------------------------- #
 # 定数(研究 §2・§4 の推奨。決定論のため config ではなくスクリプト定数に固定)
 # --------------------------------------------------------------------------- #
-STEPS_PER_DAY = 144          # 1 step = 10 sim 分 → 1440/10 = 144(observe.py と同じ)
+import run_dt                 # noqa: E402  (W2-3: ランの Δt の単一の源)
+
+# W2-3: **ラン依存**(run.dt_min)。ここの値は正準 Δt=10 の既定で、実際の値は
+# analyze() が run dir から読む(Δt=10 なら 144 = 従来と 1 ビットも変わらない)。
+STEPS_PER_DAY = run_dt.CANON_STEPS_PER_DAY   # 144
 SEED = 0                     # louvain の乱数シード(決定論の4点セット其の二)
 GAMMA = 1.0                  # louvain resolution(既定1)
 TAU = 0.30                   # 窓間 Jaccard マッチング閾値(研究 §2.1)
@@ -700,7 +706,8 @@ def analyze(run_dir: str, window_days: int = 7,
     orgs = org_labels(agents)
     run_name = os.path.basename(os.path.normpath(run_dir))
 
-    window_steps = max(int(window_days) * STEPS_PER_DAY, 1)
+    # W2-3: 窓幅は「日数 × このランの 1 日あたり step 数」(Δt=10 で 144 = 従来と同値)。
+    window_steps = max(int(window_days) * run_dt.steps_per_day(run_dir), 1)
     max_step = max((e["step"] for e in events), default=0)
 
     # 窓ごとにイベントを振り分け(step 昇順は保たない=窓内順序は元の行順で十分)

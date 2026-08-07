@@ -47,8 +47,14 @@ if hasattr(sys.stdout, "reconfigure"):
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 RUNS_ROOT = os.path.join(_ROOT, "runs")
+if _HERE not in sys.path:                 # 同ディレクトリの run_dt を import
+    sys.path.insert(0, _HERE)
 
-STEPS_PER_DAY = 144
+import run_dt                             # noqa: E402  (W2-3: ランの Δt の単一の源)
+
+# W2-3: **ラン依存**(run.dt_min)。ここの値は正準 Δt=10 の既定で、実際の値は analyze() が
+# run dir から読んで各段へ引数で配る(Δt=10 なら 144 = 従来と 1 ビットも変わらない)。
+STEPS_PER_DAY = run_dt.CANON_STEPS_PER_DAY
 
 # ---- 検出の既定パラメータ(すべて CLI で上書き可) ----
 DEF_PRE_DAYS = 2          # 形成前履歴の窓(前 N 日)
@@ -63,7 +69,7 @@ DEF_MAX_CORE = 12         # 組織候補: これを超えるコアは「群集�
 # --------------------------------------------------------------------------- #
 # ローダ(detect_emergence.py と同じ流儀。numpy を引き込まない最小実装)
 # --------------------------------------------------------------------------- #
-def load_events(run_dir: str) -> list[dict]:
+def load_events(run_dir: str, dt_min: int = run_dt.CANON_DT_MIN) -> list[dict]:
     """l1_events.parquet を列射影 + RecordBatch 逐次で読み、payload を dict 展開して返す。
 
     返り値の各要素: {step, sim_min, agent, kind, payload(dict)}。"""
@@ -91,7 +97,9 @@ def load_events(run_dir: str) -> list[dict]:
                 payload = {}
             out.append({
                 "step": int(step[i]),
-                "sim_min": int(smin[i]) if smin is not None and smin[i] is not None else int(step[i]) * 10,
+                # W2-3: sim_min 欠損時の復元は step × Δt(既定 10 = 従来と完全同値)。
+                "sim_min": (int(smin[i]) if smin is not None and smin[i] is not None
+                            else int(step[i]) * int(dt_min)),
                 "agent": int(agent[i]),
                 "kind": kind[i],
                 "payload": payload,
@@ -508,7 +516,8 @@ def _empty_daily() -> dict:
             "relacts": 0, "speak": 0, "dm_out": 0, "listen": 0}
 
 
-def build_daily_index(events: list[dict]) -> tuple[dict, dict]:
+def build_daily_index(events: list[dict],
+                      spd: int = STEPS_PER_DAY) -> tuple[dict, dict]:
     """全イベントを1パスで (agent, day) 集計。返り値 (G, heard_by_day)。
 
     G[agent] = {
@@ -534,7 +543,7 @@ def build_daily_index(events: list[dict]) -> tuple[dict, dict]:
         if aid is None or aid < 0:
             continue
         k = e["kind"]
-        day = e["step"] // STEPS_PER_DAY
+        day = e["step"] // int(spd)
         p = e["payload"]
         if k == "wage":
             g = slot(aid); g["daily"][day]["income"] += _f(p.get("amount"))
@@ -621,14 +630,15 @@ PANEL_COLS = [
 
 def build_panel_rows(run_name: str, founders: dict[int, dict], controls: dict[int, int],
                      agents: dict[int, dict], traits: dict[int, dict],
-                     G: dict, heard_by_day: dict, *, pre_days: int) -> list[dict]:
+                     G: dict, heard_by_day: dict, *, pre_days: int,
+                     spd: int = STEPS_PER_DAY) -> list[dict]:
     """ファウンダー + 対照の日次パネル行を生成(founder=0/1)。窓 = [ref_day-pre_days, ref_day]。"""
     rows: list[dict] = []
 
     def emit(aid: int, is_founder: int, ftype: str, matched_to: int, ref_step: int):
         if ref_step is None:
             return
-        ref_day = ref_step // STEPS_PER_DAY
+        ref_day = ref_step // int(spd)
         a = agents.get(aid, {})
         tr = traits.get(aid, {})
         g = G.get(aid)
@@ -720,7 +730,8 @@ def detect_org_candidates(events: list[dict], agents: dict[int, dict],
                           building_names: dict[str, str], *,
                           min_days: int = DEF_COPRESENCE_DAYS,
                           min_core: int = DEF_MIN_CORE,
-                          max_core: int = DEF_MAX_CORE) -> dict:
+                          max_core: int = DEF_MAX_CORE,
+                          spd: int = STEPS_PER_DAY) -> dict:
     """同一建物 × 反復共在クラスタを列挙。既存台帳(勤務先/自宅建物)は known として除外。
 
     共在 = 同じ建物に同じ日に enter_building した集合。連続 min_days 日以上、その共在の
@@ -735,7 +746,7 @@ def detect_org_candidates(events: list[dict], agents: dict[int, dict],
         b = e["payload"].get("building")
         if aid is None or aid < 0 or not b:
             continue
-        bd[b][e["step"] // STEPS_PER_DAY].add(aid)
+        bd[b][e["step"] // int(spd)].add(aid)
 
     clusters: list[dict] = []
     seen_keys: set[tuple] = set()
@@ -819,7 +830,10 @@ def analyze(run_dir: str, out_dir: str, *, pre_days: int = DEF_PRE_DAYS,
             min_core: int = DEF_MIN_CORE, max_core: int = DEF_MAX_CORE) -> dict:
     """ラン1本を解析し、panel/founders.parquet と panel/org_candidates.json を書く。"""
     run_name = os.path.basename(os.path.normpath(run_dir))
-    events = load_events(run_dir)
+    # W2-3: 「1 日」はこのランの run.dt_min で決まる(Δt=10 なら 144 = 従来と同値)。
+    spd = run_dt.steps_per_day(run_dir)
+    dt_min = run_dt.min_per_step(run_dir)
+    events = load_events(run_dir, dt_min)
     agents = load_agents(run_dir)
     traits = load_traits(run_dir)
     building_names = load_building_names(run_dir)
@@ -832,12 +846,12 @@ def analyze(run_dir: str, out_dir: str, *, pre_days: int = DEF_PRE_DAYS,
     founders = merge_founders(venture, political, hub)
 
     controls = match_controls(founders, agents, per_founder=controls_per_founder)
-    G, heard_by_day = build_daily_index(events)
+    G, heard_by_day = build_daily_index(events, spd)
     rows = build_panel_rows(run_name, founders, controls, agents, traits, G, heard_by_day,
-                            pre_days=pre_days)
+                            pre_days=pre_days, spd=spd)
     orgs = detect_org_candidates(events, agents, building_names,
                                  min_days=copresence_days, min_core=min_core,
-                                 max_core=max_core)
+                                 max_core=max_core, spd=spd)
 
     os.makedirs(out_dir, exist_ok=True)
     panel_path = write_panel_parquet(rows, out_dir)
@@ -850,7 +864,7 @@ def analyze(run_dir: str, out_dir: str, *, pre_days: int = DEF_PRE_DAYS,
     founders_json = {}
     for aid, r in founders.items():
         founders_json[aid] = {"types": sorted(r["types"]), "ref_step": r["ref_step"],
-                              "ref_day": (r["ref_step"] // STEPS_PER_DAY
+                              "ref_day": (r["ref_step"] // spd
                                           if r["ref_step"] is not None else None),
                               "detail": r["detail"]}
     fdet_path = os.path.join(out_dir, "founders_detail.json")

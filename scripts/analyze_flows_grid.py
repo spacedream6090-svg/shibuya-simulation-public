@@ -51,7 +51,15 @@ _ROOT = os.path.dirname(_HERE)
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-STEPS_PER_DAY = 144
+if _HERE not in sys.path:                       # 同ディレクトリの run_dt を import
+    sys.path.insert(0, _HERE)
+
+import run_dt                                   # noqa: E402  (W2-3: ランの Δt の単一の源)
+
+# W2-3: STEPS_PER_DAY は **ラン依存**(run.dt_min)。ここの値は正準 Δt=10 の既定で、
+# 実際の値は analyze() が run dir から読んで aggregate() へ渡す(Δt=10 なら同値)。
+# hour_bin は sim_min 基準なので Δt 非依存(MIN_PER_DAY は実時間の分/日)。
+STEPS_PER_DAY = run_dt.CANON_STEPS_PER_DAY      # 144
 MIN_PER_DAY = 1440
 
 # --------------------------------------------------------------------------- #
@@ -199,10 +207,14 @@ def _seg_points(e: dict) -> list[tuple[float, float]]:
 
 
 def aggregate(events, cell_m: float, time_bin_h: int,
-              centroids: dict[str, tuple[float, float]] | None = None) -> dict:
+              centroids: dict[str, tuple[float, float]] | None = None,
+              spd: int = STEPS_PER_DAY) -> dict:
     """イベント列を (cell_x, cell_y, hour_bin) へ集計。純関数(events は iterable の dict)。
     返り値: pass/present(dict key->count)・uniq(key->set)・days(set)・surges(list)・
-            n_present_events / n_pass_events(診断用)。"""
+            n_present_events / n_pass_events(診断用)。
+
+    W2-3: `spd`(1日の step 数)は day の切り方だけに効く。既定は正準 144(Δt=10)。
+    hour_bin は sim_min 基準なので Δt に依存しない。"""
     centroids = centroids or {}
     pass_c: dict = defaultdict(int)
     present_c: dict = defaultdict(int)
@@ -213,7 +225,7 @@ def aggregate(events, cell_m: float, time_bin_h: int,
     n_present_ev = 0
     for e in events:
         kind = e["kind"]
-        days.add(int(e["step"]) // STEPS_PER_DAY)
+        days.add(int(e["step"]) // int(spd))
         hb = hour_bin_of(e["sim_min"], time_bin_h)
         aid = e["agent_id"]
         if kind == "move_segment":
@@ -252,7 +264,7 @@ def aggregate(events, cell_m: float, time_bin_h: int,
                 "node": e["payload"].get("node"),
                 "level": e["payload"].get("level"),
                 "event": e["payload"].get("event"),
-                "day": int(e["step"]) // STEPS_PER_DAY,
+                "day": int(e["step"]) // int(spd),
             })
     return {"pass": pass_c, "present": present_c, "uniq": uniq, "days": days,
             "surges": surges, "n_pass_ev": n_pass_ev, "n_present_ev": n_present_ev}
@@ -608,7 +620,8 @@ def analyze(run_dir: str, cell_m: float = 25.0, time_bin_h: int = 1,
     run_name = os.path.basename(os.path.normpath(run_dir))
 
     centroids = load_building_centroids(run_dir)
-    agg = aggregate(_iter_events(run_dir), cell_m, time_bin_h, centroids)
+    agg = aggregate(_iter_events(run_dir), cell_m, time_bin_h, centroids,
+                    run_dt.steps_per_day(run_dir))
     n_days = (max(agg["days"]) + 1) if agg["days"] else 0
     cols = grid_rows(agg)
 

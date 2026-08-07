@@ -49,8 +49,17 @@ _ROOT = os.path.dirname(_HERE)
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-STEPS_PER_DAY = 144           # 1日=144step(1step=10分)
-STEPS_PER_HOUR = 6            # 6step=60分 → hour_bin 幅
+if _HERE not in sys.path:     # 同ディレクトリの run_dt を import
+    sys.path.insert(0, _HERE)
+
+import run_dt                  # noqa: E402  (W2-3: ランの Δt の単一の源)
+
+# W2-3: どちらも **ラン依存**(run.dt_min)。ここの値は正準 Δt=10 の既定で、実際の値は
+# analyze() が run dir から読んで各段へ引数で配る(Δt=10 なら 144 / 6 = 従来と同値)。
+# ★hour_bin は step 基準(step0=開始時刻)なので、sim_min 基準に変えると Δt=10 でも
+#   ビンがずれる。流儀は変えずに Δt だけ吸収する。
+STEPS_PER_DAY = run_dt.CANON_STEPS_PER_DAY    # 1日の step 数(Δt=10 で 144)
+STEPS_PER_HOUR = run_dt.CANON_STEPS_PER_HOUR  # hour_bin 幅(Δt=10 で 6)
 
 # 目的カテゴリ(固定順)。優先順位でもある(work が最も定義的・other は最弱)。
 _PURPOSES = ["work", "food", "shop", "leisure", "home", "other"]
@@ -86,9 +95,12 @@ _DAYPLAN_PURPOSE = {
 }
 
 
-def hour_bin_of_step(step: int) -> int:
-    """1日=144step・1step=10分 → hour_bin = (step % 144) // 6(0..23 の時刻帯)。"""
-    return (int(step) % STEPS_PER_DAY) // STEPS_PER_HOUR
+def hour_bin_of_step(step: int, spd: int = STEPS_PER_DAY,
+                     sph: int = STEPS_PER_HOUR) -> int:
+    """hour_bin = (step % steps_per_day) // steps_per_hour(0..23 の時刻帯)。
+
+    W2-3: 既定は正準 Δt=10 の (144, 6) で従来と完全同値。Δt=1 では (1440, 60)。"""
+    return (int(step) % int(spd)) // int(sph)
 
 
 def district_zone(x, y, district_m: float) -> str:
@@ -228,7 +240,8 @@ def load_building_kinds(run_dir: str) -> dict[str, str]:
 # トリップ抽出(純関数=テスト対象)
 # --------------------------------------------------------------------------- #
 def extract_trips(events, district_m: float,
-                  building_kinds: dict[str, str] | None = None) -> dict:
+                  building_kinds: dict[str, str] | None = None,
+                  spd: int = STEPS_PER_DAY, sph: int = STEPS_PER_HOUR) -> dict:
     """OD 関連イベント列(flat iterable)を agent ごとに束ね、トリップ列へ変換する純関数。
 
     返り値 dict:
@@ -325,9 +338,9 @@ def extract_trips(events, district_m: float,
                     purpose = "home"
             trips.append({
                 "origin": origin_zone, "dest": dest_zone,
-                "hour_bin": hour_bin_of_step(start_step),
+                "hour_bin": hour_bin_of_step(start_step, spd, sph),
                 "purpose": purpose,
-                "day": int(start_step) // STEPS_PER_DAY,
+                "day": int(start_step) // int(spd),
             })
     return {"trips": trips, "gateway_xy": gateway_xy,
             "n_route_start": n_route_start, "n_arrive": n_arrive,
@@ -479,10 +492,11 @@ def render_report(run_name: str, cols: dict[str, list], info: dict,
 # 可視化(自己完結 HTML・外部 CDN 非依存・地区重心間フロー線・時間帯切替・上位N)
 # --------------------------------------------------------------------------- #
 def build_html(run_name: str, cols: dict[str, list], gateway_xy: dict,
-               district_m: float, n_days: int, top_per_hour: int = 300) -> str:
+               district_m: float, n_days: int, top_per_hour: int = 300,
+               n_bins: int = STEPS_PER_DAY // STEPS_PER_HOUR) -> str:
     """フロー map の単体 HTML を返す。サイズ抑制のため各時間帯 top_per_hour 本まで埋め込む
     (全量は parquet 側)。ゾーン重心・フロー(o,d,hour,trips)を JSON で内包する。"""
-    n_bins = STEPS_PER_DAY // STEPS_PER_HOUR       # 24
+    n_bins = int(n_bins)                           # 24(= 1日の時間帯数。Δt 非依存)
     # (o,d,hour) で集計(目的は map では合算・目的構成はレポート側)
     agg: dict[tuple, int] = defaultdict(int)
     for i in range(len(cols["origin"])):
@@ -672,7 +686,11 @@ def analyze(run_dir: str, district_m: float = 100.0,
     run_name = os.path.basename(os.path.normpath(run_dir))
 
     building_kinds = load_building_kinds(run_dir)
-    info = extract_trips(_iter_events(run_dir, _OD_KINDS), district_m, building_kinds)
+    # W2-3: 「1日」「1時間」の step 数はこのランの run.dt_min で決まる(Δt=10 なら従来と同値)。
+    spd = run_dt.steps_per_day(run_dir)
+    sph = run_dt.steps_per_hour(run_dir)
+    info = extract_trips(_iter_events(run_dir, _OD_KINDS), district_m, building_kinds,
+                         spd, sph)
     trips = info["trips"]
     n_days = (max(t["day"] for t in trips) + 1) if trips else 0
     cols = od_rows(trips, n_days)

@@ -21,7 +21,49 @@ Caiani et al. 本文が「大規模で複雑な AB モデルで実装中の漏�
 読み取り専用
 ------------
 本スクリプトは runs/<name>/ を読むだけで、シム本体(src/society)を一切呼ばない・変更しない。
-乱数を引かず LLM も呼ばない(R1 適合が自明)。依存は 標準ライブラリ + pyarrow のみ(pandas 禁止)。
+乱数を引かず LLM も呼ばない(R1 適合が自明)。依存は 標準ライブラリ + pyarrow +
+**同ディレクトリの `l1_stream.py`**(W2-2 で新設した共有ストリーミング読み)のみ(pandas 禁止)。
+
+メモリの上限(W2-6 ②。在場 25万 × 10 日への対応。第98バッチ 2026-08-07)
+-------------------------------------------------------------------------
+在場 25万 × 10 日のランは L1 が 42.7 GB・40.6 億イベント、L3 が 10 日 ×(1日12枚)=
+120 枚 × 25万体 のスナップショット(`proposal-dp-u3-observe-250k.md` §2-4)。
+**全読みしている箇所を潰した**。何が有界になり、何が残るかを正直に書く。
+
+  有界化したもの(行数・体数に**比例しなくなった**)
+    - `l3_snapshots` … 旧: `read_table` で全 step の state 文字列を載せ、さらに
+      `stock_by_step = {step: {agent_id: 残高}}` を **全 step ぶん**保持していた
+      (120 枚 × 25万体 = 3,000 万エントリ)。新: `SnapshotStocks` が 1 枚ずつ
+      json.loads し、検査①(`conserve_household`)は**隣り合う 2 枚だけ**を保持して
+      窓を進む。ピーク = **スナップショット 2 枚 = O(在場人数)**。
+      (2 枚必要なのは検査式そのものの要請: 窓の d_common が「両方の枚に居る個体」の
+       差の総和で、集合演算に個体別の値が要る。1 枚にはできない。)
+    - 未分類の金の経路の検知 … 旧: 該当イベントを list に貯めてから数えていた。
+      新: `MoneyKindTally` が走査中に畳む。**O(イベント種類数)**(実測 100 前後)。
+    - `org_ledger` / `finance` … 旧: `read_table().to_pylist()` で全列全行。
+      新: **列射影 + チャンク読み**(`l1_stream.iter_table_columns`)。ledger は
+      検査が使う 4 列だけ(`LEDGER_COLUMNS`)。行数自体は O(org 数 × 日数) で残るが、
+      これは 25万体でも 11,010 社 × 10 日 = 11 万行で、L1/L3 とは桁が違う。
+    - L1 の読み出し列 … `x` / `y` を**読むのをやめた**(会計の検査は 1 度も使わない。
+      serve↔spend の突合が座標を使えないことは `match_serve_to_spend` の docstring 参照)。
+      40.6 億行 × float32 2 本 = 約 32 GB の復号が丸ごと消える。
+    - part 群への対応 … canonical が無い(走行中・クラッシュ)ランでも
+      `l1_stream.l1_paths` 経由で完結 part を読む。
+
+  残るもの(**O(金額を運ぶイベント数)**。25万体でも消せない理由つき)
+    - `run["events"]` … 金額を運ぶ L1 イベントだけ(全 L1 の一部)を dict で保持する。
+      **1 パス化できない**のは `resolve_tax_sources` が tax の相手方を「同 step・同 agent の
+      spend / wage との突合」で決めており、その結果を **payload dict の同一性 `id(payload)`**
+      で `flows_for` へ渡す設計だから(= 突合の前にフローを確定できない)。ここを直すには
+      `flows_for` の呼び出し規約を変える必要があり、それは検査式の意味の変更に触れる。
+    - `moves_by_step` / `flows` … 上の events から作る派生列。行列・漏れ内訳・部門別
+      検査はすべて**集約**なので原理的には畳めるが、`conserve_sector` /
+      `conserve_government` / `classifier_consistency` が `list[Flow]` を受ける公開関数
+      として既にテストで固定されているため、本バッチでは畳まない(二重実装を作らない)。
+    - `serve` / spend の突合表 … `match_serve_to_spend` が全 spend の索引を要求する。
+    ★運用上の含意: 25万体ランでこのスクリプトを回す前に、必要なら
+      `--rel-tol` だけでなく**日を絞ったサブセット**で回すこと。L3 と ledger と未分類検知は
+      有界になったので、残るのは「金額イベント数に比例する分」だけである。
 
 部門(6+1)
 ----------
@@ -107,10 +149,26 @@ void は「相手方が存在しない金」の**検出器**である(装置は�
   2. **受け手の特定率**。台帳の静的索引 `(building, floor, POI種別)` → `(node, POI種別)` で
      解決し、決まらない消費は RoW へ落とす。小ラン(台帳 42 社)では 15/299 件しか org へ
      着地しない。研究文書 §3-c の全数測定では 11,010 社台帳で floor 鍵の一意率 56.8%。
-  3. **接続できていない金の経路が 4 つ残る**(`economy_sfc.UNCOVERED_KINDS`):
-     `rule_bonus`(rules.py)・`crime`(diversity.py)・`chance_event`(chance.py)は
-     IF-E2 の変更範囲外のファイルで残高を動かす。`b2b_trade` は帳簿 dict のみで残高を
-     動かさない。これらが点火するランでは不変量の外側に残る(summary へ件数を出す)。
+  3. ~~接続できていない金の経路が 4 つ残る~~ → **第98バッチ IF-E2 UNCOVERED で閉じた**(下記)。
+
+IF-E2 UNCOVERED(第98バッチ 2026-08-07)= 残り 4 種の接続
+--------------------------------------------------------
+`economy_sfc.UNCOVERED_KINDS` が**空になった**。ON のときだけ・動力学は 1 つも変えずに分類を足す:
+
+  - `rule_bonus`  区(ward)予算からの歳出(payload `payer="government"`)。区の残高は負に振れうる。
+  - `crime`(窃盗)**取引ではない**(SNA 2008 §3.98 逐語: "If thefts, or acts of violence
+    (including war), involve significant redistributions, or destructions, of assets, it is
+    necessary to take them into account. As explained below, **they are treated as other flows,
+    not as transactions**.")。よって RoW(= 街の外の取引相手)ではなく、SNA 2008 第12章
+    *The other changes in assets accounts*(K.5 = other changes in volume n.e.c.)に相当する
+    新部門 `other_volume` へ落とす(payload `payee="k5:theft"`)。**加害者へは入金しない**
+    (= 世界がまだ記録していない受け取り側を、この勘定が持っている)。
+  - `chance_event` RoW の外生チャネル `chance_windfall` / `chance_loss`。
+  - `b2b_trade`   org 預金間の**実移転**。買い手の小売 POI を台帳で特定できなければ
+    `b2b_buyer_unknown`(RoW → 街)から払う(`unknown_payee` の裏返し)。
+
+これで総マネー保存は **Σ(全主体残高) + RoW 累積 + K5 累積 = 一定** に拡張された
+(`economy_sfc.total_money`)。`void` 部門は**残す**(値をゼロにするだけ)。
 
 正直な限界(出力にも印字する)
 ------------------------------
@@ -133,6 +191,15 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT / "scripts") not in sys.path:      # `python scripts/...` 以外の経路から import
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+
+# W2-2 の共有ストリーミング読み(列射影・チャンク・part 群の透過連結・Windows の
+# FILE_SHARE_DELETE)。ここを自前で書き直すと車輪の再発明になるので必ず借りる。
+import run_dt                                        # noqa: E402  (W2-3: Δt の単一の源)
+from l1_stream import iter_table_columns, l1_paths   # noqa: E402
+
 # --------------------------------------------------------------------------- #
 # 部門
 # --------------------------------------------------------------------------- #
@@ -142,13 +209,21 @@ VENTURE = "venture"
 BANK = "bank"
 GOVERNMENT = "government"
 EXTERNAL = "external"
+#: 第98バッチ IF-E2 UNCOVERED: **取引ではない**資産変動の勘定(SNA 2008 第12章
+#: *The other changes in assets accounts* / K.5 = other changes in volume n.e.c.)。
+#: §3.98「窃盗・暴力による資産の再分配や破壊は **other flows であって transactions ではない**」に従い、
+#: 窃盗を EXTERNAL(=街の外に居る取引相手)へ落とさずここへ分類する。混ぜると「窃盗は輸入だった」
+#: という嘘になる。残高は economy_sfc の K5 アキュムレータ(finance.parquet の k5_other)で観測できる。
+OTHER = "other_volume"
 VOID = "void"
 
-SECTORS: tuple[str, ...] = (HOUSEHOLD, ORG, VENTURE, BANK, GOVERNMENT, EXTERNAL, VOID)
+SECTORS: tuple[str, ...] = (HOUSEHOLD, ORG, VENTURE, BANK, GOVERNMENT, EXTERNAL,
+                            OTHER, VOID)
 
 SECTOR_JA = {
     HOUSEHOLD: "家計", ORG: "企業(org)", VENTURE: "個人事業", BANK: "銀行",
-    GOVERNMENT: "行政", EXTERNAL: "街外", VOID: "未接続(漏れ)",
+    GOVERNMENT: "行政", EXTERNAL: "街外", OTHER: "非取引(SNA K.5)",
+    VOID: "未接続(漏れ)",
 }
 
 #: 残高が観測できない理由(正直開示用)。
@@ -157,6 +232,7 @@ UNOBSERVABLE_REASON = {
     VENTURE: "屋台は sales_total(累計売上)だけを持ち残高を持たない=通過部門",
     BANK: "Bank.capital / VCFund は L1・L3 のどこにも出力されない",
     EXTERNAL: "街の外=定義上の無限の源/シンク(残高の概念を置いていない)",
+    OTHER: "非取引の資産変動(SNA K.5)= finance.parquet が無いと観測できない",
     VOID: "相手方が存在しない=残高の器そのものが無い(これが漏れの定義)",
 }
 
@@ -234,15 +310,19 @@ def party_sector(token) -> str | None:
     """IF-E2 案B の payload トークン(payer / payee)→ 部門。無ければ None(= 従来の写像へ)。
 
     ON のランでは spend / wage / rent / venture_open / move_home / enforcement /
-    bankruptcy / deposit / candidacy / reward の payload に相手方が 1 語で載る:
-      "row:<channel>" = rest-of-world(渋谷域外)の窓口 / "venture" = 屋台 /
-      "government" = 行政 / "escrow" = 行政の預り金 / それ以外 = 台帳の org_id。
+    bankruptcy / deposit / candidacy / reward / rule_bonus / crime / chance_event /
+    b2b_trade の payload に相手方が 1 語で載る:
+      "row:<channel>" = rest-of-world(渋谷域外)の窓口 / "k5:<kind>" = 非取引の資産変動
+      (SNA K.5。第98バッチ)/ "venture" = 屋台 / "government" = 行政 /
+      "escrow" = 行政の預り金 / それ以外 = 台帳の org_id。
     OFF のランでは 1 つも載らないので本関数は常に None を返す(= 従来の分類のまま)。"""
     t = str(token or "")
     if not t:
         return None
     if t.startswith("row:"):
         return EXTERNAL
+    if t.startswith("k5:"):
+        return OTHER
     if t == "venture":
         return VENTURE
     if t in ("government", "escrow"):
@@ -367,22 +447,35 @@ def flows_for(kind: str, payload: dict, ctx: dict) -> list[Flow]:
                             HOUSEHOLD, amt, "reward"))
     elif kind == "rule_bonus":
         amt = _f(p, "amount")
-        if amt:                                     # 区が「発行」するが行政予算は減らない
-            out.append(Flow(VOID, HOUSEHOLD, amt, "rule_bonus:unfunded"))
+        if amt:
+            # OFF: 区が「発行」するだけで行政予算は減らない(無からの創出)。
+            # IF-E2 UNCOVERED(第98): payer=government = 区(ward)予算からの実際の歳出。
+            src = party_sector(p.get("payer"))
+            out.append(Flow(src or VOID, HOUSEHOLD, amt,
+                            "rule_bonus:ward_expense" if src else "rule_bonus:unfunded"))
     elif kind == "civic_service":
         amt = _f(p, "amount")
         if amt:
             out.append(Flow(GOVERNMENT, HOUSEHOLD, amt, "civic_benefit"))
     elif kind == "chance_event":
+        # IF-E2 UNCOVERED(第98): ON では RoW のチャネル(chance_windfall / chance_loss)が
+        # payload に載る。OFF でも「設計上の外生」= EXTERNAL 扱いは従来どおり(分類は不変)。
         amt, t = _f(p, "amount"), str(p.get("type") or "")
         if amt and t == "windfall":
-            out.append(Flow(EXTERNAL, HOUSEHOLD, amt, "chance:windfall"))
+            out.append(Flow(party_sector(p.get("payer")) or EXTERNAL,
+                            HOUSEHOLD, amt, "chance:windfall"))
         elif amt and t == "loss":
-            out.append(Flow(HOUSEHOLD, EXTERNAL, amt, "chance:loss"))
+            out.append(Flow(HOUSEHOLD, party_sector(p.get("payee")) or EXTERNAL,
+                            amt, "chance:loss"))
     elif kind == "crime":
         amt = _f(p, "amount")
         if amt and str(p.get("kind") or "") == "theft":
-            out.append(Flow(HOUSEHOLD, VOID, amt, "theft:destroyed"))   # 加害者は受け取らない
+            # OFF: 加害者は受け取らない = 相手方が世界に無い(漏れ)。
+            # IF-E2 UNCOVERED(第98): payee="k5:theft" = **取引ではない**資産変動(SNA §3.98)
+            # として K5 勘定へ。RoW(街の外の取引相手)へは落とさない。
+            dst = party_sector(p.get("payee"))
+            out.append(Flow(HOUSEHOLD, dst or VOID, amt,
+                            "theft:other_volume" if dst else "theft:destroyed"))
     elif kind == "bankruptcy":
         seized = _f(p, "seized")
         if seized:
@@ -405,7 +498,11 @@ def flows_for(kind: str, payload: dict, ctx: dict) -> list[Flow]:
     elif kind == "b2b_trade":
         amt = _f(p, "amount")
         if amt:
-            out.append(Flow(ORG, ORG, amt, "b2b_trade"))           # 部門内(卸→小売)=行/列で相殺
+            # OFF: 帳簿 dict のみ = 部門内(卸→小売)の名目フロー(行/列で相殺)。
+            # IF-E2 UNCOVERED(第98): ON では org 預金間の**実移転**になり、買い手を台帳で
+            # 特定できなかった仕入れは RoW(域外資本の店)が払う = EXTERNAL → ORG。
+            out.append(Flow(party_sector(p.get("payer")) or ORG,
+                            party_sector(p.get("payee")) or ORG, amt, "b2b_trade"))
     elif kind == "production":
         # IF-E2 案B: 域内に客が居ない org(全 org の 36.5%・従業者の 51.5%)の**輸出代金**。
         # 地域会計では観光サテライト勘定(非居住者の域内消費=輸出)の逆向き適用にあたる。
@@ -513,32 +610,62 @@ def leak_family(tag: str) -> str:
     return str(tag).split(":", 1)[0]
 
 
-def unclassified_money_kinds(events: list[dict]) -> dict[str, dict]:
+class MoneyKindTally:
+    """未分類の金の経路を **走査中に畳む**累積器(W2-6 ②のメモリ有界化)。
+
+    旧実装は該当イベントを `list[dict]` に貯めてから数えていたので、40.6 億行の L1 では
+    「未分類の経路が 1 種でも大量に出た瞬間に落ちる」形だった。判定式は 1 ミリも変えずに
+    **保持量を O(イベント種類数)**(実測 distinct kind は 100 前後)へ落とす。
+
+    `unclassified_money_kinds()` と**同じ規則**で数えること(規則の源はここ 1 箇所)。"""
+
+    __slots__ = ("_acc",)
+
+    def __init__(self) -> None:
+        self._acc: dict[str, dict] = {}
+
+    @staticmethod
+    def hits(payload) -> list[str]:
+        """payload が持つ「金らしい非ゼロ数値キー」(判定規則の単一の源)。"""
+        if not isinstance(payload, dict):
+            return []
+        return sorted(k for k, v in payload.items()
+                      if k in MONEY_KEYS and isinstance(v, (int, float))
+                      and not isinstance(v, bool) and float(v) != 0.0)
+
+    def add(self, kind, payload) -> None:
+        if kind in MONEY_KINDS or kind in DERIVED_MONEY_KINDS:
+            return
+        hits = self.hits(payload)
+        if not hits:
+            return
+        rec = self._acc.setdefault(str(kind), {"n": 0, "keys": set()})
+        rec["n"] += 1
+        rec["keys"].update(hits)
+
+    def result(self) -> dict[str, dict]:
+        return {k: {"n": v["n"], "keys": sorted(v["keys"])}
+                for k, v in sorted(self._acc.items())}
+
+    def __len__(self) -> int:
+        return len(self._acc)
+
+
+def unclassified_money_kinds(events) -> dict[str, dict]:
     """**金の経路の追加を検知する装置**。
 
     payload に金らしい数値キーを持つのに MONEY_KINDS にも DERIVED_MONEY_KINDS にも
     入っていないイベント種を洗い出す。新しい送金経路が実装されると必ずここに現れるので、
     テストで「空である」ことを固定すれば、会計検査の網羅性が構造的に守られる。
 
-    events は L1 の全イベント(kind, payload)。戻り値 {kind: {"n":件数, "keys":[鍵語]}}。"""
-    known = MONEY_KINDS | DERIVED_MONEY_KINDS
-    out: dict[str, dict] = {}
+    events は L1 の全イベント(kind, payload)の列、または `load_run` が返す
+    `MoneyKindTally`(走査中に畳んだ同じ集計)。戻り値 {kind: {"n":件数, "keys":[鍵語]}}。"""
+    if hasattr(events, "result"):            # MoneyKindTally = 既に畳んである
+        return events.result()
+    tally = MoneyKindTally()
     for e in events:
-        kind = e.get("kind")
-        if kind in known:
-            continue
-        p = e.get("payload") or {}
-        if not isinstance(p, dict):
-            continue
-        hits = sorted(k for k, v in p.items()
-                      if k in MONEY_KEYS and isinstance(v, (int, float))
-                      and not isinstance(v, bool) and float(v) != 0.0)
-        if not hits:
-            continue
-        rec = out.setdefault(kind, {"n": 0, "keys": set()})
-        rec["n"] += 1
-        rec["keys"].update(hits)
-    return {k: {"n": v["n"], "keys": sorted(v["keys"])} for k, v in sorted(out.items())}
+        tally.add(e.get("kind"), e.get("payload") or {})
+    return tally.result()
 
 
 # --------------------------------------------------------------------------- #
@@ -589,22 +716,49 @@ def leak_breakdown(flows: list[Flow]) -> dict[str, dict[str, float]]:
 # --------------------------------------------------------------------------- #
 # 4. 検査① — 貨幣ストックの保存
 # --------------------------------------------------------------------------- #
-def conserve_household(stock_by_step: dict[int, dict[int, float]],
+def _iter_stock(stock):
+    """ストックを **step 昇順の (step, {agent_id: 残高}) ペア列**として供給する。
+
+    受け付ける形は 2 つ。どちらでも**同じ窓・同じ順序**になる:
+      - `{step: {agent_id: 残高}}` … 従来の辞書(合成テストと過去の呼び出し規約)。
+      - `(step, {agent_id: 残高})` を yield する反復可能物 … `SnapshotStocks`
+        (L3 を 1 枚ずつ読む W2-6 のストリーム)。
+
+    ★ストリーム側は「L3 が step 非減少で追記される」という記録側の不変条件に乗っている
+      (`ObserverLogger.log_snapshot` は step ループから 1 回ずつ呼ばれ、part は index 昇順で
+      結合される)。破れていれば `SnapshotStocks` が例外を投げる = **黙って間違えない**。"""
+    if isinstance(stock, dict):
+        for s in sorted(stock):
+            yield s, stock[s]
+        return
+    yield from stock
+
+
+def conserve_household(stock_by_step,
                        moves_by_step: dict[int, list[Move]],
                        rel_tol: float) -> dict:
     """家計の検査①: L3 スナップショット間で Δ(money+account) = Σ move.total か。
 
-    stock_by_step: {step: {agent_id: money+account}}(L3 由来)
+    stock_by_step: `{step: {agent_id: money+account}}` または `SnapshotStocks`(L3 由来)
     moves_by_step: {step: [Move, ...]}(L1 由来。**その step の処理で動いた分**)
 
     L1 の step s のイベントは step s のスナップショット(step 末に取る)に**反映済み**なので、
-    窓 (s0, s1] の流量は step が s0 < step <= s1 のイベント。"""
-    steps = sorted(stock_by_step)
+    窓 (s0, s1] の流量は step が s0 < step <= s1 のイベント。
+
+    ★W2-6 ②(25万体対応): **隣り合う 2 枚のスナップショットしか保持しない**。
+      全 step を同時に持つと 120 枚 × 25万体 = 3,000 万エントリになる。2 枚が下限なのは
+      検査式そのものの要請で、d_common が「両方の枚に居る個体」の差の総和だから
+      (集合演算に個体別の値が要る)。判定式は 1 ミリも変えていない。"""
     windows = []
     tot_abs_flow = 0.0
     tot_resid = 0.0
-    for s0, s1 in zip(steps, steps[1:]):
-        a0, a1 = stock_by_step[s0], stock_by_step[s1]
+    prev: tuple | None = None
+    for s1, a1 in _iter_stock(stock_by_step):
+        if prev is None:
+            prev = (s1, a1)
+            continue
+        s0, a0 = prev
+        prev = (s1, a1)                    # 直前の 1 枚だけを引き継ぐ(2 枚を超えて持たない)
         common = a0.keys() & a1.keys()
         d_common = sum(a1[i] - a0[i] for i in common)
         rot_in = sum(a1[i] for i in a1.keys() - a0.keys())     # 途中参加(pool)
@@ -701,10 +855,12 @@ def conserve_government(budget_rows: list[dict], flows: list[Flow],
 #:   org        企業の預金(スカラー 1 本の総和)
 #:   bank       Bank.capital + VCFund.balance(どちらも金融部門)
 #:   external   RoW が**正味で吸収した**額 = row_out − row_in(街の外に残高は無い = SNA §26.6)
+#:   other_volume  非取引の資産変動(SNA K.5)の累積 = k5_other(第98バッチ)
 FINANCE_BALANCE = {
     ORG:        lambda r: _f(r, "org_balance"),
     BANK:       lambda r: _f(r, "bank_capital") + _f(r, "vc_balance"),
     EXTERNAL:   lambda r: _f(r, "row_out") - _f(r, "row_in"),
+    OTHER:      lambda r: _f(r, "k5_other"),
     GOVERNMENT: lambda r: _f(r, "gov_balance") + _f(r, "escrow"),
     HOUSEHOLD:  lambda r: _f(r, "household_balance"),
 }
@@ -924,72 +1080,141 @@ def _read_config(run_dir: Path) -> dict:
     return out
 
 
-def load_run(run_dir: Path) -> dict:
-    """ラン1本を読み、検査に必要な素材だけをメモリに載せる(payload の JSON パースは対象種のみ)。"""
-    import pyarrow.parquet as pq
+#: L1 から**実際に読む列**。会計の検査は座標を 1 度も使わない(serve↔spend の突合が
+#: 座標を使えないことは match_serve_to_spend の docstring 参照)ので x / y は読まない。
+#: 40.6 億行 × float32 2 本 = 約 32 GB の復号がこれだけで消える(W2-6 ②)。
+L1_SCAN_COLUMNS: tuple[str, ...] = ("step", "agent_id", "kind", "payload")
 
+#: org_ledger から読む列(検査が実際に使う 4 つだけ)。
+#: revenue_gap は org_id / revenue_est / wage_paid を、analyze の擬似フローは day を使う。
+#: **ここを増やすときは使う側と一緒に増やすこと**(射影は「使っていない列を読まない」宣言)。
+LEDGER_COLUMNS: tuple[str, ...] = ("day", "org_id", "revenue_est", "wage_paid")
+
+#: parquet を dict 行へ実体化するときのチャンク行数(l1_stream の既定と同じ)。
+SCAN_BATCH_ROWS = 131_072
+
+
+class SnapshotStocks:
+    """L3 スナップショットを **1 枚ずつ** `(step, {agent_id: money+account})` で供給する。
+
+    W2-6 ②(25万体対応)。旧実装は `read_table` で全 step の state 文字列を載せ、さらに
+    `{step: {agent_id: 残高}}` を全 step ぶん保持していた(120 枚 × 25万体 = 3,000 万
+    エントリ + 全 state の JSON 文字列)。本クラスは **1 枚ぶんの JSON と 1 枚ぶんの
+    残高辞書**しか作らない。ピークを決めるのは呼び出し側(`conserve_household` が
+    隣り合う 2 枚を保持する)。
+
+    - canonical が無いラン(走行中 / クラッシュ)でも完結 part を index 昇順で読む
+      (`l1_stream.l1_paths`)。
+    - `step` は **非減少**でなければならない(記録側の不変条件)。破れていたら
+      黙って間違った窓を作らずに `ValueError` を投げる。
+    - JSON が壊れている枚は**飛ばす**(旧実装と同じ。欠測を偽の値で埋めない)。
+    - 真偽値は「読める枚が 1 枚でもあるか」を実際に 1 枚読んで判定する
+      (行数だけで判定すると全枚が壊れているランを observable と誤申告するため)。
+    """
+
+    __slots__ = ("paths",)
+
+    def __init__(self, paths) -> None:
+        self.paths = [Path(p) for p in paths]
+
+    def __iter__(self):
+        prev = None
+        for path in self.paths:
+            for d in iter_table_columns(path, ["step", "state"], batch_rows=1):
+                st, raw = int(d["step"][0]), d["state"][0]
+                try:
+                    agents = json.loads(raw).get("agents", []) if raw else []
+                except (TypeError, ValueError):
+                    continue
+                if prev is not None and st < prev:
+                    raise ValueError(
+                        f"l3_snapshots の step が減少した({prev} → {st})。"
+                        "記録は追記専用で step 非減少のはずで、破れていると検査①の窓が"
+                        "無意味になる(黙って間違えないためここで止める)。")
+                prev = st
+                yield st, {int(a["id"]): float(a.get("money", 0.0))
+                           + float(a.get("account", 0.0) or 0.0)
+                           for a in agents}
+
+    def __bool__(self) -> bool:
+        for _ in self:
+            return True
+        return False
+
+
+def _read_rows(paths, columns=None) -> list[dict]:
+    """parquet 群を **列射影 + チャンク**で読み、行 dict のリストにする。
+
+    `read_table().to_pylist()` の置き換え。実体化した list そのものは行数に比例して
+    残る(呼び出し側が全行を要る表にだけ使うこと)が、**読み込み中に表 1 枚を丸ごと
+    Arrow で持つピーク**が消える。列射影で「使わない列は 1 バイトも読まない」。"""
+    out: list[dict] = []
+    for path in paths:
+        for d in iter_table_columns(path, columns, batch_rows=SCAN_BATCH_ROWS):
+            keys = list(d)
+            for vals in zip(*(d[k] for k in keys)):
+                out.append(dict(zip(keys, vals)))
+    return out
+
+
+def load_run(run_dir: Path) -> dict:
+    """ラン1本を読み、検査に必要な素材だけをメモリに載せる(payload の JSON パースは対象種のみ)。
+
+    W2-6 ②(25万体対応)で全読みを潰した。何が有界になり何が残るかは module docstring の
+    「メモリの上限」節を参照(要約: L3 と未分類検知は有界・L1 の金額イベントは残る)。"""
     run_dir = Path(run_dir)
     cfg = _read_config(run_dir)
 
     events: list[dict] = []
     serve_rows: list[dict] = []
     budget_rows: list[dict] = []
-    other_money: list[dict] = []       # 未分類の金の経路の検知用(安価な部分文字列で事前ふるい)
+    # 未分類の金の経路の検知は**走査中に畳む**(list に貯めない)。安価な部分文字列で事前ふるい。
+    other_money = MoneyKindTally()
     needles = tuple(f'"{k}"' for k in MONEY_KEYS)
     want = SCAN_KINDS | {"serve", "public_budget"}
-    pf = pq.ParquetFile(run_dir / "l1_events.parquet")
-    for batch in pf.iter_batches(batch_size=200_000,
-                                 columns=["step", "agent_id", "kind", "x", "y", "payload"]):
-        d = batch.to_pydict()
-        for st, aid, kind, x, y, pl in zip(d["step"], d["agent_id"], d["kind"],
-                                           d["x"], d["y"], d["payload"]):
-            if kind not in want:
-                if kind not in DERIVED_MONEY_KINDS and pl and any(n in pl for n in needles):
-                    try:
-                        other_money.append({"kind": kind, "payload": json.loads(pl)})
-                    except (TypeError, ValueError):
-                        pass
-                continue
-            try:
-                p = json.loads(pl) if pl else {}
-            except (TypeError, ValueError):
-                p = {}
-            rec = {"step": int(st), "agent_id": int(aid), "kind": kind, "payload": p,
-                   "x": float(x or 0.0), "y": float(y or 0.0)}
-            if kind == "serve":
-                serve_rows.append(rec)
-            elif kind == "public_budget":
-                budget_rows.append({"step": int(st), **p})
-            else:
-                events.append(rec)
+    l1_files = l1_paths(run_dir)
+    if not l1_files:
+        raise FileNotFoundError(
+            f"L1 が見つからない: {run_dir / 'l1_events.parquet'}"
+            "(canonical も完結 part も無い)")
+    for path in l1_files:
+        for d in iter_table_columns(path, L1_SCAN_COLUMNS, batch_rows=SCAN_BATCH_ROWS):
+            for st, aid, kind, pl in zip(d["step"], d["agent_id"], d["kind"],
+                                         d["payload"]):
+                if kind not in want:
+                    if kind not in DERIVED_MONEY_KINDS and pl and any(n in pl for n in needles):
+                        try:
+                            other_money.add(kind, json.loads(pl))
+                        except (TypeError, ValueError):
+                            pass
+                    continue
+                try:
+                    p = json.loads(pl) if pl else {}
+                except (TypeError, ValueError):
+                    p = {}
+                rec = {"step": int(st), "agent_id": int(aid), "kind": kind, "payload": p}
+                if kind == "serve":
+                    serve_rows.append(rec)
+                elif kind == "public_budget":
+                    budget_rows.append({"step": int(st), **p})
+                else:
+                    events.append(rec)
 
-    stock_by_step: dict[int, dict[int, float]] = {}
-    snap_path = run_dir / "l3_snapshots.parquet"
-    if snap_path.exists():
-        t = pq.read_table(snap_path)
-        for st, state in zip(t.column("step").to_pylist(), t.column("state").to_pylist()):
-            try:
-                agents = json.loads(state).get("agents", [])
-            except (TypeError, ValueError):
-                continue
-            stock_by_step[int(st)] = {
-                int(a["id"]): float(a.get("money", 0.0)) + float(a.get("account", 0.0) or 0.0)
-                for a in agents}
+    snap_paths = l1_paths(run_dir, "l3_snapshots")
+    stock = SnapshotStocks(snap_paths) if snap_paths else {}
 
-    ledger_rows: list[dict] = []
-    led_path = run_dir / "org_ledger.parquet"
-    if led_path.exists():
-        ledger_rows = pq.read_table(led_path).to_pylist()
+    # org_ledger: 行数は O(org 数 × 日数)= 25万体でも 11 万行(L1/L3 とは桁が違う)。
+    # 列射影で「検査が使う 4 列だけ」に絞る。
+    ledger_rows = _read_rows(l1_paths(run_dir, "org_ledger"), LEDGER_COLUMNS)
 
     # IF-E2 案B: 部門別残高の日次サイドカー(org / 銀行 / VC / 行政 / 供託 / 家計 / RoW)。
     # これがあると検査①が org・銀行・行政・RoW でも成立する(= 案B の受入条件)。
-    fin_rows: list[dict] = []
-    fin_path = run_dir / "finance.parquet"
-    if fin_path.exists():
-        fin_rows = pq.read_table(fin_path).to_pylist()
+    # **1 日 1 行**なので列射影はしない(レポートが期首/期末の全列を印字するため、
+    # 絞ると出力が減ってしまう。行数が小さいので絞る必要も無い)。
+    fin_rows = _read_rows(l1_paths(run_dir, "finance"))
 
     return {"cfg": cfg, "events": events, "serve": serve_rows,
-            "budget": budget_rows, "stock": stock_by_step, "ledger": ledger_rows,
+            "budget": budget_rows, "stock": stock, "ledger": ledger_rows,
             "finance": fin_rows, "other_money": other_money, "run_dir": str(run_dir)}
 
 
@@ -1048,6 +1273,8 @@ def analyze(run: dict, rel_tol: float = 1e-6) -> dict:
            "tax_src": resolve_tax_sources(events),
            "tax_src_default": VOID}
 
+    # W2-3: 日境界の step 数は **このランの run.dt_min** で決まる(Δt=10 なら 144 = 従来と同値)。
+    spd = run_dt.steps_per_day(run.get("run_dir"))
     flows: list[Flow] = []
     flows_by_day: dict[int, list[Flow]] = defaultdict(list)
     moves_by_step: dict[int, list[Move]] = defaultdict(list)
@@ -1058,7 +1285,7 @@ def analyze(run: dict, rel_tol: float = 1e-6) -> dict:
         for fl in flows_for(kind, p, ctx):
             fl.step, fl.kind = st, kind
             flows.append(fl)
-            flows_by_day[st // 144].append(fl)
+            flows_by_day[st // spd].append(fl)
         if kind in HOUSEHOLD_KINDS:
             moves_by_step[st].extend(move_for(kind, e["agent_id"], p, cfg["accounts_on"]))
 
@@ -1071,11 +1298,11 @@ def analyze(run: dict, rel_tol: float = 1e-6) -> dict:
         day = int(r.get("day", 0) or 0)
         est, wage = _f(r, "revenue_est"), _f(r, "wage_paid")
         if est:
-            fl = Flow(VOID, ORG, est, "org:revenue_est_unfunded", day * 144, "org_ledger")
+            fl = Flow(VOID, ORG, est, "org:revenue_est_unfunded", day * spd, "org_ledger")
             flows.append(fl)
             flows_by_day[day].append(fl)
         if wage:
-            fl = Flow(ORG, VOID, wage, "org:wage_paid_unfunded", day * 144, "org_ledger")
+            fl = Flow(ORG, VOID, wage, "org:wage_paid_unfunded", day * spd, "org_ledger")
             flows.append(fl)
             flows_by_day[day].append(fl)
 
@@ -1107,14 +1334,14 @@ def analyze(run: dict, rel_tol: float = 1e-6) -> dict:
     else:
         checks[GOVERNMENT] = {"sector": GOVERNMENT, "observable": False,
                               "reason": "public_budget イベントが 0 件(government OFF)"}
-    for s in (ORG, VENTURE, BANK, EXTERNAL, VOID):
+    for s in (ORG, VENTURE, BANK, EXTERNAL, OTHER, VOID):
         checks[s] = {"sector": s, "observable": False, "reason": UNOBSERVABLE_REASON[s]}
     # IF-E2 案B: finance.parquet があれば org / 銀行 / RoW の残高が観測できる = 検査①が成立する。
     # 行政は public_budget 由来の既存検査(内部整合 + 外部整合)を主にし、供託(escrow)を
     # 含む finance 由来の判定を external_finance として**併記**する(既存の判定を壊さない)。
     fin = run.get("finance") or []
     if len(fin) >= 2:
-        for s in (ORG, BANK, EXTERNAL):
+        for s in (ORG, BANK, EXTERNAL, OTHER):
             checks[s] = conserve_sector(fin, flows, s, rel_tol)
         gv_fin = conserve_sector(fin, flows, GOVERNMENT, rel_tol)
         if checks[GOVERNMENT].get("observable"):
@@ -1122,7 +1349,10 @@ def analyze(run: dict, rel_tol: float = 1e-6) -> dict:
         else:
             checks[GOVERNMENT] = gv_fin
 
-    spend_rows = [{"step": e["step"], "agent_id": e["agent_id"], "x": e["x"], "y": e["y"],
+    # 突合鍵は (step, agent_id, cat) と (step, cat) だけ。**座標は使えない**ので持たない
+    # (match_serve_to_spend の docstring: serve フェーズは _phase_jitter の後に走るため
+    #  serve の (x, y) は spend 時点の座標と一致しない)。W2-6 ②で L1 からも読むのをやめた。
+    spend_rows = [{"step": e["step"], "agent_id": e["agent_id"],
                    "cat": str(e["payload"].get("cat") or ""), "amount": _f(e["payload"], "amount")}
                   for e in events if e["kind"] == "spend"]
     gap = revenue_gap(run["ledger"], run["serve"], spend_rows)
@@ -1317,7 +1547,8 @@ def render_markdown(rep: dict) -> str:
                            ("行政 預り金(供託)", "escrow"),
                            ("家計(現金+口座)", "household_balance"),
                            ("RoW 累計流入(街へ)", "row_in"),
-                           ("RoW 累計流出(街から)", "row_out")):
+                           ("RoW 累計流出(街から)", "row_out"),
+                           ("非取引の資産変動(SNA K.5)", "k5_other")):
             a, b = _f(op, key), _f(cl, key)
             L.append(f"| {label} | {_num(a)} | {_num(b)} | {_num(b - a)} |")
         L.append("")

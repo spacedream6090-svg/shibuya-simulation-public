@@ -75,11 +75,13 @@ from omegaconf import OmegaConf  # noqa: E402
 from society.observer import measure as m  # noqa: E402
 
 import analyze_structure as _ast  # noqa: E402  (タスクB指標の単一の源を再利用)
+import run_dt                    # noqa: E402  (W2-3: ランの Δt の単一の源)
 
 # --------------------------------------------------------------------------- #
 # 定数(決定論のためスクリプト定数。CLI で上書き可)
 # --------------------------------------------------------------------------- #
-STEP_MIN = 10                    # 1 step = 10 sim 分
+# W2-3: **ラン依存**(run.dt_min)。既定は正準 Δt=10 = 従来と 1 ビットも変わらない。
+STEP_MIN = run_dt.CANON_DT_MIN   # 1 step の sim 分
 SKIP_DAYS = 1                    # per-run スカラーから除くウォームアップ日数(day0 は
                                  # friend_graph 注入等の初期化バーストが churn を汚すため)
 MC_ITER = 10000                  # sign-flip モンテカルロ回数(n>EXHAUST_MAX のとき)
@@ -151,7 +153,8 @@ def _mean_skip(series: list, skip_days: int):
     return round(float(sum(vals)) / len(vals), 6) if vals else None
 
 
-def _l2_kpi_daily(run_dir: str, start_min: int, n_days: int) -> dict[str, list]:
+def _l2_kpi_daily(run_dir: str, start_min: int, n_days: int,
+                  step_min: int = STEP_MIN) -> dict[str, list]:
     """L2 の joint_* 4列を「暦日の最終行」で日次化(当日タリーの終値=in-sim 定義と一致)。
     列が無い(endo OFF / joint OFF)ランは空 dict。"""
     l2 = m.load_l2(run_dir)
@@ -162,7 +165,7 @@ def _l2_kpi_daily(run_dir: str, start_min: int, n_days: int) -> dict[str, list]:
         return {}
     last_idx: dict[int, int] = {}
     for i, s in enumerate(l2["step"]):
-        d = (start_min + int(s) * STEP_MIN) // 1440
+        d = (start_min + int(s) * int(step_min)) // 1440
         prev = last_idx.get(d)
         if prev is None or int(s) >= int(l2["step"][prev]):
             last_idx[d] = i
@@ -180,9 +183,11 @@ def run_metrics(run_dir: str, skip_days: int = SKIP_DAYS,
     agents = m.load_agents(run_dir)
     n_agents = len(agents) or (max((e["agent_id"] for e in events
                                     if e["agent_id"] >= 0), default=-1) + 1)
-    by_day, days = _ast.bucket_by_day(events)
+    # W2-3: 「1 日」はこのランの run.dt_min で決まる(Δt=10 なら 144 = 従来と同値)。
+    spd = run_dt.steps_per_day(run_dir)
+    by_day, days = _ast.bucket_by_day(events, spd)
     churn = _ast.reconstruct_churn(by_day, days)
-    rank = _ast.rank_stability(run_dir, by_day, days, top_k)
+    rank = _ast.rank_stability(run_dir, by_day, days, top_k, spd)
     cent = _ast.centrality_churn(by_day, days, top_k)
     comm = _ast.community_change(by_day, days, n_agents)
     stag = _ast.detect_stagnation(days, churn, rank, cent, _ast.MIN_DAYS,
@@ -593,7 +598,8 @@ def analyze(pattern, out=None, skip_days: int = SKIP_DAYS, mc: int = MC_ITER,
         cell = read_cell(d)
         rm = run_metrics(d, skip_days=skip_days)
         n_days_max = max(n_days_max, rm["n_days"])
-        kpi_daily = _l2_kpi_daily(d, cell["start_min"], rm["n_days"])
+        kpi_daily = _l2_kpi_daily(d, cell["start_min"], rm["n_days"],
+                                  run_dt.min_per_step(d))
         kpi_scalars = {c: _mean_skip(v, skip_days)
                        for c, v in kpi_daily.items()}
         name = os.path.basename(os.path.normpath(d))

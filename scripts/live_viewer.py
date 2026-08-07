@@ -89,7 +89,15 @@ for _s in (sys.stdout, sys.stderr):              # Windows コンソール(cp932
     except Exception:
         pass
 
-STEP_MINUTES = 10                # 1 step = 10 分(society.engine.clock と同一)
+_HERE_DIR = str(Path(__file__).resolve().parent)
+if _HERE_DIR not in sys.path:    # 同ディレクトリの run_dt を import
+    sys.path.insert(0, _HERE_DIR)
+
+import run_dt                    # noqa: E402  (W2-3: ランの Δt の単一の源)
+
+# W2-3: **ラン依存**(run.dt_min)。既定は正準 Δt=10(society.engine.clock と同一)で、
+# 実際の値は read_run_config が run dir から読み ChaseState が self.step_minutes に持つ。
+STEP_MINUTES = run_dt.CANON_DT_MIN
 DEFAULT_START_MIN = 7 * 60       # sim_min 列も config も無いときの最終退避(make_viewer と同値)
 PARQUET_MAGIC = b"PAR1"
 DEFAULT_INTERVAL = 45.0
@@ -298,6 +306,9 @@ def read_run_config(run_dir: Path) -> dict:
         "n_steps": int(run.get("n_steps") or 0) or None,
         "n_agents": int(run.get("n_agents") or 0) or None,
         "start_min": _parse_tod(run.get("start_tod")),
+        # W2-3: 1 step の分数(Δt=10 なら 10 = 従来と 1 ビットも変わらない)。
+        # run dir に無ければ run_dt が正準 10 を仮定し stderr に告知する(黙って仮定しない)。
+        "dt_min": run_dt.dt_min_of(run_dir),
         "checkpoint_every": int(obs.get("checkpoint_every") or 0),
         "flush_every_steps": int(obs.get("flush_every_steps") or 0),
         "config_fallback": fallback,
@@ -357,6 +368,7 @@ class ChaseState:
         self.series: dict[str, list] = {}
         self.last_step: int | None = None
         self.start_min: int | None = self.cfg["start_min"]
+        self.step_minutes: int = int(self.cfg["dt_min"])   # W2-3: このランの Δt [分]
         self.parts_read = 0
         self.rows_read = 0
         self.last_part_mtime: float | None = None
@@ -458,7 +470,7 @@ class ChaseState:
             sm = tbl.column("sim_min")[0].as_py()
             st = tbl.column("step")[0].as_py()
             if sm is not None and st is not None:
-                self.start_min = int(sm) - int(st) * STEP_MINUTES
+                self.start_min = int(sm) - int(st) * self.step_minutes
 
         # --- 位置(payload は読まない) ---
         mask = pc.and_(pc.is_in(kind_col, value_set=_pa_array(list(POS_KINDS))),
@@ -626,7 +638,7 @@ class ChaseState:
     # ---------------------------------------------------------------- 出力データ
     def _sim_min(self, step: int) -> int:
         base = self.start_min if self.start_min is not None else DEFAULT_START_MIN
-        return int(base) + int(step) * STEP_MINUTES
+        return int(base) + int(step) * self.step_minutes
 
     def _dot_ids(self) -> list[int]:
         ids = sorted(self.pos)
