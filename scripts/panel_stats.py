@@ -92,10 +92,20 @@ def _parse_cond_seed(run_name: str, cfg_seed):
 
 
 def _r2_yext(run_dir: str):
-    """measure を再利用して R²(traits→Y_external)を返す(算出不能なら None)。"""
+    """measure を再利用して R²(traits→Y_external)を返す(算出不能なら None)。
+
+    W4-D: L1 の読みは `l1_stream.iter_events(kinds=AGENT_FEATURES_KINDS)`。
+    `agent_features`(凍結)が読む kind 以外はこの関数の出力に一切効かない。
+    ただし **名簿が空のときは絞らない**: `agent_features` は名簿が無いと
+    「L1 に現れた agent_id」を行にするので、絞ると行集合が変わる(judge と同じ罠)。
+    """
+    import l1_stream as ls
     try:
-        events = m.load_events(run_dir)
         agents = m.load_agents(run_dir)
+        if not ls.l1_paths(run_dir):
+            raise FileNotFoundError(os.path.join(run_dir, "l1_events.parquet"))
+        events = list(ls.iter_events(
+            run_dir, kinds=(ls.AGENT_FEATURES_KINDS if agents else None)))
         traits, names, _src = m.load_traits(run_dir, agents)
         feats = m.agent_features(events, agents, traits)
         res = m.r2_traits(feats, names)

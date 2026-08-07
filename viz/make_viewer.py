@@ -9,9 +9,17 @@
                    語彙 / 関係グラフ改良版 / 分析[論文風グラフ] / 施設 / 住民 / シナリオ)
 背景タイル: © OpenStreetMap contributors(オンライン時のみ。オフラインでは無地)
 検索エンジンはシミュ内データベース(D13 再現性+架空世界の閉性のため実 API 不使用)。
+
+Δt(1 step の分数)について — W4-C:
+  壁時計・日境界・グラフの時間軸はすべて run.dt_min に依存する。本ファイルは
+  `scripts/run_dt.py`(解析側 Δt の単一の源)を importlib で借り、**ランを読む入口**
+  (`build_data` / `build_rollup_data` / `main`)だけがランの Δt を解決して下位と HTML
+  テンプレートへ配る。モジュール定数 `STEP_MINUTES` / `ROLLUP_STEPS_PER_DAY` は正準値
+  (10 / 144)のまま据え置き=既定 Δt=10 のランでは出力が 1 バイトも変わらない。
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import math
 import sys
@@ -23,8 +31,46 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-STEP_MINUTES = 10           # 1 step = 10 分(sim クロック Clock と同一)
+_RUN_DT = None
+
+
+def _load_run_dt():
+    """scripts/run_dt.py(解析側 Δt の単一の源)を場所非依存で読み込む。
+
+    viz/ は **scripts/ を sys.path に載せない**(viz/make_viewer3d.py の
+    `_load_export3d` と同じ流儀)。1 プロセスで何度も引くのでモジュールは束ねて持つ
+    (run_dt 側の「同じランに同じ警告を 1 回だけ」も 1 インスタンスで効く)。
+    """
+    global _RUN_DT
+    if _RUN_DT is None:
+        spec = importlib.util.spec_from_file_location(
+            "run_dt", REPO_ROOT / "scripts" / "run_dt.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _RUN_DT = mod
+    return _RUN_DT
+
+
+# W2-3 / W4-C: **ラン依存**(run.dt_min)。モジュール定数は正準 Δt=10 のまま据え置き、
+# 実際の値は「ランを読む入口」(build_data / build_rollup_data / main)が run dir から
+# 解決して下位へ配る。既定 Δt=10 のランでは配られる値も 10 なので **1 ビットも変わらない**。
+STEP_MINUTES = 10           # 1 step = 10 分(sim クロック Clock と同一・正準値)
 DEFAULT_START_MIN = 7 * 60  # 既定開始 07:00(sim_min 列が無いランのフォールバック=従来値)
+
+
+def _steps_per_day(step_minutes: int = STEP_MINUTES) -> int:
+    """1 日の step 数(Δt=10 で 144)。run_dt.steps_per_day と同定義の局所版。"""
+    return max(1, int(round(1440 / float(step_minutes))))
+
+
+def _steps_per_hour(step_minutes: int = STEP_MINUTES) -> int:
+    """1 時間の step 数(Δt=10 で 6)。run_dt.steps_per_hour と同定義の局所版。"""
+    return max(1, int(round(60 / float(step_minutes))))
+
+
+def _run_step_minutes(run_dir: Path) -> int:
+    """このランの Δt [分]。config.yaml → run_manifest.json → 正準 10(stderr へ告知)。"""
+    return int(_load_run_dt().min_per_step(run_dir))
 
 # 語彙の伝播(transmission)を1語あたりこの辺数で上限。超過は決定論規則で間引き、
 # out["caps"] に (kept/total) を記録=silent cap 禁止(画面にも「表示は上位N」と出す)。
@@ -52,15 +98,16 @@ def _parse_start_tod(v) -> int:
         return DEFAULT_START_MIN
 
 
-def _derive_start_min(events: list) -> int | None:
+def _derive_start_min(events: list, step_minutes: int = STEP_MINUTES) -> int | None:
     """events の sim_min 列から壁時計の原点(day0 step0 の分 of day)を復元する。
-    sim_min = start_min + step*STEP_MINUTES の不変量から、任意のイベント 1 件で復元できる
+    sim_min = start_min + step*step_minutes の不変量から、任意のイベント 1 件で復元できる
     (全イベントで同値)。sim_min 列が無い/空なら None(呼び出し側が既定 07:00 へ退避)。
-    既定 07:00 開始のランは step0 の sim_min=420 → 420 を返し従来 startMin とバイト同一。"""
+    既定 07:00 開始のランは step0 の sim_min=420 → 420 を返し従来 startMin とバイト同一。
+    step_minutes は run.dt_min(既定=正準 10。渡さなければ従来と完全同値)。"""
     for e in events:
         sm = e.get("sim_min")
         if sm is not None:
-            return int(sm) - int(e["step"]) * STEP_MINUTES
+            return int(sm) - int(e["step"]) * int(step_minutes)
     return None
 
 
@@ -318,14 +365,17 @@ def _load_floor_specs_for_viewer(cfg) -> list:
 
 
 def _build_indoor_tracks(samples_path: Path, idx: dict, bld_idx: dict,
-                         n_steps: int) -> tuple[str, list | None]:
+                         n_steps: int,
+                         steps_per_day: int = _steps_per_day()) -> tuple[str, list | None]:
     """indoor_tracks_samples.parquet → (agent, building, floor) 別の歩行軌跡ポリライン。
 
     7日超のランは埋め込まず note だけ返す(HTML 肥大ガード)。総点数が上限超なら決定論間引き
-    (stride 抽出)して note に明記(silent cap 禁止)。t_s=サブステップ秒(step0 起点の秒)。"""
-    if n_steps > _INDOOR_MOVES_MAX_DAYS * 144:
+    (stride 抽出)して note に明記(silent cap 禁止)。t_s=サブステップ秒(step0 起点の秒)。
+    ガードは「日数」で切るので step 数ではなく steps_per_day(=1440/Δt)で割る
+    (既定=正準 144 → 従来の直書き 144 と完全同値)。"""
+    if n_steps > _INDOOR_MOVES_MAX_DAYS * steps_per_day:
         return (f"屋内軌跡ポリラインは7日以下のランのみ埋込(このランは {n_steps} step="
-                f"約{n_steps // 144}日)=非表示", None)
+                f"約{n_steps // steps_per_day}日)=非表示", None)
     rows = pq.read_table(samples_path).to_pylist()
     groups: dict[tuple, list] = {}
     for r in rows:
@@ -353,8 +403,12 @@ def _build_indoor_tracks(samples_path: Path, idx: dict, bld_idx: dict,
 
 
 def build_indoor_data(events: list, idx: dict, bld_idx: dict, run_dir: Path,
-                      n_steps: int, cfg: dict, include_moves: bool) -> dict | None:
-    """屋内ミクロ埋め込み(indoor ON のランのみ非 None)。無い旧ランは None=out 不変=バイト同一。"""
+                      n_steps: int, cfg: dict, include_moves: bool,
+                      step_minutes: int = STEP_MINUTES) -> dict | None:
+    """屋内ミクロ埋め込み(indoor ON のランのみ非 None)。無い旧ランは None=out 不変=バイト同一。
+
+    step_minutes は run.dt_min(contacts の秒→step 換算と軌跡ガードの日数換算に効く。
+    既定=正準 10 なので渡さなければ従来と完全同値)。"""
     space_moves: list = []
     has_sm = False
     for e in events:
@@ -384,12 +438,13 @@ def build_indoor_data(events: list, idx: dict, bld_idx: dict, run_dir: Path,
             ia, ib = idx.get(r["id_a"]), idx.get(r["id_b"])
             if bi is None or ia is None or ib is None:
                 continue
-            contacts.append([int(r["t_s"] // (STEP_MINUTES * 60)),
+            contacts.append([int(r["t_s"] // (int(step_minutes) * 60)),
                             1000 + bi * 100 + int(r["floor"]), ia, ib])
         if contacts:
             data["contacts"] = contacts
     if include_moves and samples_path.exists():
-        note, tracks = _build_indoor_tracks(samples_path, idx, bld_idx, n_steps)
+        note, tracks = _build_indoor_tracks(samples_path, idx, bld_idx, n_steps,
+                                            _steps_per_day(step_minutes))
         if tracks:
             data["tracks"] = tracks
         if note:
@@ -405,12 +460,14 @@ ORG_LIST_CAP = 300          # D.orgs.list に載せる会社の上限(従業員�
 ORG_EMP_CAP = 200           # 1社の従業員名簿の上限(超過は n_emp に真値・名簿は先頭 cap)
 
 
-def _ev_day(e: dict) -> int:
-    """イベントの day(org_ledger の day=sim_min//1440 と同義。sim_min 無い旧ランは step//144)。"""
+def _ev_day(e: dict, steps_per_day: int = _steps_per_day()) -> int:
+    """イベントの day(org_ledger の day=sim_min//1440 と同義。sim_min 無い旧ランは step//spd)。
+
+    spd=1440/Δt(既定=正準 144)。sim_min 列がある限り Δt に依存しない(run_dt.day_of と同思想)。"""
     sm = e.get("sim_min")
     if sm is not None and sm >= 0:
         return int(sm) // 1440
-    return int(e["step"]) // (1440 // STEP_MINUTES)
+    return int(e["step"]) // int(steps_per_day)
 
 
 def _load_org_book(cfg: dict) -> dict:
@@ -435,7 +492,7 @@ def _load_org_book(cfg: dict) -> dict:
 
 
 def build_org_data(events: list, agents_meta: list, cfg: dict,
-                   run_dir: Path) -> dict | None:
+                   run_dir: Path, step_minutes: int = STEP_MINUTES) -> dict | None:
     """会社エンティティの埋め込み(org 系データがある時だけ非 None)。
 
     トリガ(いずれか): ①agents.json に org_id ②serve イベントに org_id ③org_ledger.parquet。
@@ -455,12 +512,13 @@ def build_org_data(events: list, agents_meta: list, cfg: dict,
     prod_by: dict = defaultdict(int)           # (org_id, day) → production 件数
     serve_by: dict = defaultdict(int)          # (org_id, day) → serve 件数
     org_ids: set = set(agent_org.values())
+    spd = _steps_per_day(step_minutes)
     for e in events:
         kind = e["kind"]
         if kind not in ("production", "serve"):
             continue
         p = json.loads(e["payload"]) if e["payload"] else {}
-        day = _ev_day(e)
+        day = _ev_day(e, spd)
         if kind == "production":
             oid = p.get("org")
             if oid is not None:
@@ -628,7 +686,15 @@ def load_occupancy(run_dir: Path, buildings: list, n_steps: int,
 
 def build_data(run_dir: Path, include_traffic: bool = True,
                start_min: int | None = None,
-               include_moves: bool = False) -> dict:
+               include_moves: bool = False,
+               step_minutes: int | None = None) -> dict:
+    # W4-C: **ランを読む入口**。1 step の分数はこのランの run.dt_min(config.yaml →
+    # run_manifest.json → 正準 10 を仮定して stderr へ 1 行告知)。Δt=10 のランでは 10 =
+    # 従来の直書きと同値なので出力は 1 バイトも変わらない。明示指定は試験用の上書き口。
+    if step_minutes is None:
+        step_minutes = _run_step_minutes(run_dir)
+    step_minutes = int(step_minutes)
+    steps_per_day = _steps_per_day(step_minutes)
     events = pq.read_table(run_dir / "l1_events.parquet").to_pylist()
     n_steps = max(e["step"] for e in events) + 1
 
@@ -636,7 +702,7 @@ def build_data(run_dir: Path, include_traffic: bool = True,
     # 明示 start_min(CLI --start-tod)が最優先 → 無ければ events の sim_min 列から復元
     # → それも無ければ既定 07:00。既定 07:00 のランは 420 に戻り従来出力とバイト同一。
     if start_min is None:
-        start_min = _derive_start_min(events)
+        start_min = _derive_start_min(events, step_minutes)
     if start_min is None:
         start_min = DEFAULT_START_MIN
 
@@ -814,7 +880,7 @@ def build_data(run_dir: Path, include_traffic: bool = True,
             feed.append({"s": e["step"], "a": e["agent_id"], "k": "enter",
                          "t": "電車で帰ってきた" if p.get("via") == "train" else "戻ってきた"})
         elif kind == "joint_invite":
-            d = (start_min + int(e["step"]) * STEP_MINUTES) // 1440
+            d = (start_min + int(e["step"]) * step_minutes) // 1440
             rec = endo_days.setdefault(d, {"inv": 0, "acc": 0, "basis": {}})
             rec["inv"] += 1
             if p.get("accepted"):
@@ -936,7 +1002,8 @@ def build_data(run_dir: Path, include_traffic: bool = True,
     # 無ければ out は不変=既存ランのビューア再生成でバイト同一(communities/mode_legend と同型)。
     lens_map = load_lens_map(run_dir)
     if lens_map is not None:
-        out["lens"] = build_lens_data(events, agents_meta, lens_map, start_min)
+        out["lens"] = build_lens_data(events, agents_meta, lens_map, start_min,
+                                      step_minutes)
     # 信用内訳(T6): L3 に status がある(hierarchy ON)時だけ埋め込む。無ければ非表示=不変。
     trust = build_trust_data(events, run_dir, agents_meta)
     if trust is not None:
@@ -945,7 +1012,8 @@ def build_data(run_dir: Path, include_traffic: bool = True,
     # 無ければ out は不変=既存ランのビューア再生成でバイト同一(lens/trust と同型の後方互換)。
     dev_map = load_deviation_map(run_dir)
     if dev_map is not None:
-        out["deviation"] = build_deviation_data(events, agents_meta, dev_map, start_min)
+        out["deviation"] = build_deviation_data(events, agents_meta, dev_map, start_min,
+                                                step_minutes)
     # 社会構造の内生変動(第56バッチ タスクB): structure.json(scripts/analyze_structure.py の事後出力)が
     # 「有る時だけ」そのまま埋め込む。事後層が L1+L3 から計算済み(churn 時系列・順位 τ・中心性 turnover・
     # コミュニティ変化・固着区間)を読むだけ=build_data は再計算しない。無ければ out 不変=後方互換。
@@ -956,7 +1024,8 @@ def build_data(run_dir: Path, include_traffic: bool = True,
     # 日次系列・順位 τ・上位/下位ドリルダウンを事後計算。L3 が無ければ None=足さない=後方互換(lens/trust と同型)。
     assets_map = load_assets_map(run_dir)
     if assets_map is not None:
-        adata = build_assets_data(run_dir, agents_meta, start_min, assets_map)
+        adata = build_assets_data(run_dir, agents_meta, start_min, assets_map,
+                                  step_minutes)
         if adata is not None:
             out["assets"] = adata
     # 承諾内生化(第62バッチ): joint_invite イベント(endogenous_accept ON のランのみ)が「有る時
@@ -968,7 +1037,7 @@ def build_data(run_dir: Path, include_traffic: bool = True,
             vals = metrics.get(key) or []
             picks = []
             for d in range(nd):
-                j = min((d + 1) * (1440 // STEP_MINUTES) - 1, len(vals) - 1)
+                j = min((d + 1) * steps_per_day - 1, len(vals) - 1)
                 picks.append(round(float(vals[j]), 6) if 0 <= j < len(vals) else None)
             return picks
         bases = sorted({b for rec in endo_days.values() for b in rec["basis"]})
@@ -984,12 +1053,13 @@ def build_data(run_dir: Path, include_traffic: bool = True,
             "fulfill": _day_last("joint_fulfill_rate"),
         }
     # 屋内ミクロ(B5): space_move / indoor_tracks が有るランだけ埋め込む。無ければ out 不変=バイト同一。
-    ind = build_indoor_data(events, idx, bld_idx, run_dir, n_steps, cfg, include_moves)
+    ind = build_indoor_data(events, idx, bld_idx, run_dir, n_steps, cfg, include_moves,
+                            step_minutes)
     if ind is not None:
         out.update(ind)
     # 会社エンティティ(B7): org 系データ(agents.json org_id / serve.org_id / org_ledger.parquet)が
     # 有る時「だけ」会社の名簿・日次系列を埋め込む。無ければ out 不変=バイト同一(indoor/lens と同型)。
-    orgs = build_org_data(events, agents_meta, cfg, run_dir)
+    orgs = build_org_data(events, agents_meta, cfg, run_dir, step_minutes)
     if orgs is not None:
         out["orgs"] = orgs
     # 在館観測列(B8): occupancy.parquet(scripts/build_occupancy.py の事後出力)が有る時「だけ」
@@ -1066,7 +1136,7 @@ def _lens_axis(kind: str, payload: dict, kind_map: dict):
 
 
 def build_lens_data(events: list, agents_meta: list, lens_map: dict,
-                    start_min: int) -> dict:
+                    start_min: int, step_minutes: int = STEP_MINUTES) -> dict:
     """L1 を価値4軸/3M欲望で事後分類する。全体日別構成 + 住民別プロファイル + 3M 軸間遷移。
 
     L2 が持つのは全体スカラーのみ(人数>時間の方針)。住民別・遷移はここで L1 から算出=シム実行コスト0。"""
@@ -1086,7 +1156,7 @@ def build_lens_data(events: list, agents_meta: list, lens_map: dict,
     def _day(e):
         sm = e.get("sim_min")
         if sm is None:
-            sm = start_min + int(e["step"]) * STEP_MINUTES
+            sm = start_min + int(e["step"]) * int(step_minutes)
         return int(sm) // 1440
 
     for e in events:
@@ -1176,10 +1246,11 @@ def load_assets_map(run_dir: Path) -> dict | None:
         return None
 
 
-def _wealth_by_day(run_dir: Path, start_min: int) -> tuple[list[int], dict[int, dict]]:
+def _wealth_by_day(run_dir: Path, start_min: int,
+                   step_minutes: int = STEP_MINUTES) -> tuple[list[int], dict[int, dict]]:
     """L3 スナップから各暦日の末尾スナップの wealth=money+account を復元。(days, {day:{id:wealth}})。
 
-    day = (start_min + step*STEP_MINUTES)//1440(L2/deviation の暦日定義と同一)。L3 が無ければ ([], {})。"""
+    day = (start_min + step*step_minutes)//1440(L2/deviation の暦日定義と同一)。L3 が無ければ ([], {})。"""
     l3 = run_dir / "l3_snapshots.parquet"
     if not l3.exists():
         return [], {}
@@ -1189,7 +1260,7 @@ def _wealth_by_day(run_dir: Path, start_min: int) -> tuple[list[int], dict[int, 
         return [], {}
     last_by_day: dict[int, tuple[int, dict]] = {}     # day -> (step, row)
     for r in rows:
-        d = (start_min + int(r["step"]) * STEP_MINUTES) // 1440
+        d = (start_min + int(r["step"]) * int(step_minutes)) // 1440
         prev = last_by_day.get(d)
         if prev is None or int(r["step"]) >= prev[0]:
             last_by_day[d] = (int(r["step"]), r)
@@ -1267,13 +1338,14 @@ def _assets_tau(cur: dict, prev: dict | None):
 
 
 def build_assets_data(run_dir: Path, agents_meta: list, start_min: int,
-                      assets_map: dict) -> dict | None:
+                      assets_map: dict,
+                      step_minutes: int = STEP_MINUTES) -> dict | None:
     """L3 スナップの wealth=money+account から資産分布を事後計算(assets_map が有る時のみ呼ぶ)。
 
     日次の Gini/上位集中/中央値/平均/前日比 τ 系列 + 最終日の分布ヒスト + 上位/下位ドリルダウン。
     L3 が無い(スナップ無効)ランでは None=タブ非表示(全体スカラーは 📈 分析タブに残る)。"""
     top_pct = float(assets_map.get("top_pct", 0.1))
-    days, wbd = _wealth_by_day(run_dir, start_min)
+    days, wbd = _wealth_by_day(run_dir, start_min, step_minutes)
     if not days or not wbd:
         return None
     name_of = {a["id"]: a.get("name", f"a{a['id']}") for a in agents_meta}
@@ -1340,10 +1412,11 @@ def build_assets_data(run_dir: Path, agents_meta: list, start_min: int,
 # --daily-rollup は positions を一切読まず、L2 metrics を日次集計 + structure.json(事後層)を束ねた
 # 軽量な rollup.html だけを追加生成する(既存 viewer/dashboard の生成経路には一切触れない=バイト一致)。
 # ROLLUP_STEPS_PER_DAY: 1日=144step(= STEP_MINUTES 10分 × 144 = 1440分)。analyze_structure と同一。
+# W4-C: これは**正準値**。実際の日長は build_rollup_data が run.dt_min から解決して配る。
 ROLLUP_STEPS_PER_DAY = 1440 // STEP_MINUTES        # =144
 
 
-def _rollup_start_min(run_dir: Path) -> int:
+def _rollup_start_min(run_dir: Path, step_minutes: int = STEP_MINUTES) -> int:
     """L1 の先頭 row group から sim_min 原点を安価に復元(全 L1 は読まない)。無ければ既定 07:00。"""
     path = run_dir / "l1_events.parquet"
     if not path.exists():
@@ -1357,21 +1430,25 @@ def _rollup_start_min(run_dir: Path) -> int:
         st0 = t.column("step")[0].as_py()
         if sm0 is None:
             return DEFAULT_START_MIN
-        return int(sm0) - int(st0) * STEP_MINUTES
+        return int(sm0) - int(st0) * int(step_minutes)
     except Exception:
         return DEFAULT_START_MIN
 
 
-def build_rollup_data(run_dir: Path) -> dict:
+def build_rollup_data(run_dir: Path, step_minutes: int | None = None) -> dict:
     """L2 metrics を日次平均へ集計 + structure.json を束ねた軽量ロールアップ dict を返す。
 
     日境界は analyze_structure と同定義(sim_min//1440)。L2 は sim_min 列を持たないため、L1 先頭から
-    復元した start_min で day=(start_min+step*10)//1440 を算出して構造指標と日インデックスを揃える。
-    L2 が無いラン=metrics 空(structure だけ表示)。どちらも無ければ空の骨格(画面に案内を出す)。"""
-    start_min = _rollup_start_min(run_dir)
+    復元した start_min で day=(start_min+step*Δt)//1440 を算出して構造指標と日インデックスを揃える。
+    L2 が無いラン=metrics 空(structure だけ表示)。どちらも無ければ空の骨格(画面に案内を出す)。
+    W4-C: Δt は run.dt_min(**ランを読む入口**)。Δt=10 のランでは 10=従来と完全同値。"""
+    if step_minutes is None:
+        step_minutes = _run_step_minutes(run_dir)
+    step_minutes = int(step_minutes)
+    start_min = _rollup_start_min(run_dir, step_minutes)
 
     def _day(step: int) -> int:
-        return (start_min + int(step) * STEP_MINUTES) // 1440
+        return (start_min + int(step) * step_minutes) // 1440
 
     # L2 を日次平均へ(全数値列を対象=lens ON の列も含め robust。step 列は集計対象外)
     daily: dict[str, list] = {}
@@ -1416,14 +1493,14 @@ def build_rollup_data(run_dir: Path) -> dict:
             pass
 
     return {"runName": run_dir.name, "startMin": start_min,
-            "stepsPerDay": ROLLUP_STEPS_PER_DAY, "days": days,
+            "stepsPerDay": _steps_per_day(step_minutes), "days": days,
             "metricKeys": metric_keys, "metrics": daily,
             "structure": structure, "nAgents": n_agents, "nSteps": n_steps,
             "hasL2": bool(metric_keys)}
 
 
 def build_deviation_data(events: list, agents_meta: list, dev_map: dict,
-                         start_min: int) -> dict:
+                         start_min: int, step_minutes: int = STEP_MINUTES) -> dict:
     """L1 を「ペルソナ期待 vs 実際の行動」で事後分類する。分布ヒスト + 日別推移 + 最逸脱者ドリルダウン。
 
     observer/deviation.classify と同一規則を _lens_axis(=resolve_axis の鏡)で再現。裁量(義務除外)を主・
@@ -1446,7 +1523,7 @@ def build_deviation_data(events: list, agents_meta: list, dev_map: dict,
     def _day(e):
         sm = e.get("sim_min")
         if sm is None:
-            sm = start_min + int(e["step"]) * STEP_MINUTES
+            sm = start_min + int(e["step"]) * int(step_minutes)
         return int(sm) // 1440
 
     for e in events:
@@ -1669,7 +1746,7 @@ _BASE_CSS = r"""
 """
 
 _TIME_JS = r"""
-function tstr(s){ const mm=Math.floor(D.startMin+s*10); const d=Math.floor(mm/1440);
+function tstr(s){ const mm=Math.floor(D.startMin+s*__STEP_MIN__); const d=Math.floor(mm/1440);
   return `Day${d} ${String(Math.floor(mm/60)%24).padStart(2,'0')}:${String(mm%60).padStart(2,'0')}`; }
 const hue = i => (i*137.508)%360;
 const iOf = Object.fromEntries(D.ids.map((a,i)=>[a,i]));
@@ -1731,7 +1808,7 @@ const _NIGHT = {
 const _lerp=(a,b,k)=>a+(b-a)*k;
 const _mix=(a,b,k)=>[_lerp(a[0],b[0],k),_lerp(a[1],b[1],k),_lerp(a[2],b[2],k),_lerp(a[3]??1,b[3]??1,k)];
 const _css=c=>`rgba(${Math.round(c[0])},${Math.round(c[1])},${Math.round(c[2])},${(c[3]??1).toFixed(3)})`;
-function nightAmt(t){ const m=((D.startMin+t*10)%1440+1440)%1440, h=m/60;
+function nightAmt(t){ const m=((D.startMin+t*__STEP_MIN__)%1440+1440)%1440, h=m/60;
   if(h>=6&&h<17) return 0; if(h>=19||h<4) return 1;
   if(h>=17&&h<19) return (h-17)/2; return 1-(h-4)/2; }
 let _lastK=-1, _TH=null;
@@ -2482,7 +2559,7 @@ function colorOf(i, s0){
   return `hsl(${hue(i)} 70% 60%)`;
 }
 
-function trainsActive(t){ const m=Math.floor((D.startMin+t*10))%1440;
+function trainsActive(t){ const m=Math.floor((D.startMin+t*__STEP_MIN__))%1440;
   return D.transit.filter(w=> w.b<1440? (m>=w.a&&m<=w.b):(m>=w.a||m<=w.b-1440)).length; }
 const trainPaths = D.rails.filter(r=>r.k==='rail' && pathLen(r.g)>250).slice(0,10);
 
@@ -2638,7 +2715,7 @@ function draw(){
       ctx.strokeStyle='rgba(0,0,0,.5)'; ctx.lineWidth=0.8*devicePixelRatio;
       ctx.beginPath(); ctx.arc(x,y,2.6*devicePixelRatio,0,7); ctx.fill(); ctx.stroke(); } }
   // ---- 電車: 連結済み運行路線を走らせる(through=渋谷を跨いで通過 / terminus=渋谷端で折返し)----
-  const nowM=((D.startMin+t*10)%1440+1440)%1440;
+  const nowM=((D.startMin+t*__STEP_MIN__)%1440+1440)%1440;
   let nAct=0;
   if(RAILLINES.length){ for(const rl of RAILLINES) if(_railActive(rl,nowM)) nAct++; }
   else nAct=trainsActive(t);
@@ -2735,8 +2812,8 @@ __INDOOR_HOOK__  if(focusId!==null){ const i=iOf[focusId]; const p=pos[i];
   document.getElementById('nOut').textContent=nOut;
   document.getElementById('nSleep').textContent=nSl;
   document.getElementById('nCar').textContent=tr.n;
-  document.getElementById('day').textContent=Math.floor((D.startMin+t*10)/1440);
-  const mm=Math.floor(D.startMin+t*10)%1440;
+  document.getElementById('day').textContent=Math.floor((D.startMin+t*__STEP_MIN__)/1440);
+  const mm=Math.floor(D.startMin+t*__STEP_MIN__)%1440;
   const hhmm=String(Math.floor(mm/60)).padStart(2,'0')+':'+String(mm%60).padStart(2,'0');
   document.getElementById('clock').textContent=hhmm;
   document.getElementById('stepLabel').textContent=`· ${s0}/${D.nSteps-1}`;
@@ -2840,7 +2917,7 @@ function renderValue(s0){
    <div class="chartBox"><h3>③ 住民別の価値プロファイル(上位)</h3>
      <div class="sub">各住民のイベントを4軸で構成比表示(帯の長さ=総数)。誰がどの価値に厚いか</div>
      <div id="lvProf"></div></div>`;
-  const X=d=>d*144;
+  const X=d=>d*__STEPS_PER_DAY__;
   lineChart(document.getElementById('lvc1'),
     L.axes.map(ax=>({label:VAX_LABEL[ax]||ax,color:VAX_COLOR[ax]||'#999',
       data:days.map((d,i)=>[X(d), tot[i]? L.series[ax][i]/tot[i]:0])})), {pct:true, ymax:1});
@@ -2868,7 +2945,7 @@ function renderMotive(s0){
      <div class="sub">ある欲望の直後に来る欲望。線の太さ=遷移回数(円弧=同じ欲望が続く自己ループ)。関係タブの canvas 流儀を再利用</div>
      <canvas id="lmNet" style="height:300px"></canvas>
      <div id="lmList" style="font-size:12px;color:var(--dim);margin-top:6px"></div></div>`;
-  const X=d=>d*144;
+  const X=d=>d*__STEPS_PER_DAY__;
   lineChart(document.getElementById('lmc1'),
     M.motives.map(mt=>({label:MOT_LABEL[mt]||mt,color:MOT_COLOR[mt]||'#999',
       data:days.map((d,i)=>[X(d), M.series[mt][i]])})), {});
@@ -2974,7 +3051,7 @@ function renderDeviation(s0){
    <div class="chartBox"><h3>③ 最も逸脱した住民(ペルソナ属性 vs 実際の行動構成)</h3>
      <div class="sub">裁量逸脱率の高い順。帯=実際の裁量行動のカテゴリ構成(赤枠=期待外=逸脱)。閾値 ${(V.top_threshold*100).toFixed(0)}% 以上が「上位逸脱者」</div>
      ${rows}</div>`;
-  const X=d=>d*144;
+  const X=d=>d*__STEPS_PER_DAY__;
   lineChart(document.getElementById('dvc1'), [
     {label:'裁量逸脱率',color:'#e8a33d', data:days.map((d,i)=>[X(d), V.disc_series[i]])},
     {label:'全時間逸脱率',color:'#60a5fa', data:days.map((d,i)=>[X(d), V.full_series[i]])},
@@ -3000,7 +3077,7 @@ function _stBands(container, intervals, nDays, color, label){
 function renderStructure(s0){
   const V=D.structure, days=V.days||[], nD=days.length;
   const ch=V.churn||{}, rk=V.rank||{}, ce=V.centrality||{}, co=V.community||{}, st=V.stagnation||{};
-  const X=d=>d*144;
+  const X=d=>d*__STEPS_PER_DAY__;
   const pack=(arr)=> days.map((d,i)=>[X(d), arr&&arr[i]!=null?arr[i]:null]).filter(p=>p[1]!=null);
   const lg = st.longest;
   const hero = lg
@@ -3062,7 +3139,7 @@ function _yen(v){ if(v==null) return '—'; const a=Math.abs(v);
   if(a>=1e8) return (v/1e8).toFixed(2)+'億'; if(a>=1e4) return (v/1e4).toFixed(1)+'万'; return Math.round(v).toLocaleString(); }
 function renderAssets(s0){
   const V=D.assets, days=V.days||[];
-  const X=d=>d*144;
+  const X=d=>d*__STEPS_PER_DAY__;
   const pack=(arr)=> days.map((d,i)=>[X(d), arr&&arr[i]!=null?arr[i]:null]).filter(p=>p[1]!=null);
   const gLast=(()=>{ for(let i=V.gini.length-1;i>=0;i--) if(V.gini[i]!=null) return V.gini[i]; return 0; })();
   const tLast=(()=>{ for(let i=V.top10.length-1;i>=0;i--) if(V.top10[i]!=null) return V.top10[i]; return 0; })();
@@ -3130,7 +3207,7 @@ const ENDO_BAS_COLOR={conflict:'#f87171', appointment:'#6ee7b7', plan_with:'#34d
   solo_plan:'#fbbf24', dialog_cue:'#60a5fa', fallback:'#94a3b8'};
 function renderEndo(s0){
   const V=D.endo, days=V.days||[];
-  const X=d=>d*144;
+  const X=d=>d*__STEPS_PER_DAY__;
   const pack=(arr)=> days.map((d,i)=>[X(d), arr&&arr[i]!=null?arr[i]:null]).filter(p=>p[1]!=null);
   const totInv=(V.invites||[]).reduce((s,x)=>s+(x||0),0);
   const totAcc=(V.accepts||[]).reduce((s,x)=>s+(x||0),0);
@@ -3194,7 +3271,7 @@ let orgSel=null, orgQuery='', orgSort='emp', orgPersonSel=null;
 function _orgUpto(arr, day){ if(!arr) return 0; let t=0;
   for(let i=0;i<D.orgs.days.length;i++){ if(D.orgs.days[i]<=day) t+=arr[i]||0; } return t; }
 function _orgRows(s0){
-  const O=D.orgs, day=Math.floor((D.startMin+s0*10)/1440);
+  const O=D.orgs, day=Math.floor((D.startMin+s0*__STEP_MIN__)/1440);
   let rows=O.list.map(o=>{ const ser=O.series[o.id]||{};
     return {o, prod:_orgUpto(ser.production, day), serve:_orgUpto(ser.serve, day)}; });
   const q=orgQuery.trim();
@@ -3254,7 +3331,7 @@ function renderOrgCard(s0){
     <div class="chartBox"><h3>${hasLedger?'③':'②'} 従業員名簿(クリックで個人情報)</h3>
       <div class="sub">agents.json の org_id で束ねた従業員。クリックすると氏名・職種・語彙・直近発話を表示</div>
       <div class="roster">${roster||'<div class="ev">従業員データがありません</div>'}</div></div>`;
-  const pts=arr=>O.days.map((d,i)=>[d*144, arr?arr[i]||0:0]);
+  const pts=arr=>O.days.map((d,i)=>[d*__STEPS_PER_DAY__, arr?arr[i]||0:0]);
   lineChart(document.getElementById('orgc1'), [
     {label:'産出',color:'#60a5fa', data:pts(ser.production)},
     {label:'接客',color:'#f472b6', data:pts(ser.serve)}], {});
@@ -3290,7 +3367,7 @@ function _occDrawHeat(cv, bld){
     g.fillStyle=ink; g.font=`${10*devicePixelRatio}px system-ui`; g.textAlign='right';
     g.fillText(f+'F', mL-4*devicePixelRatio, mT+ri*rowH+rowH*0.6); });
   g.fillStyle=dim; g.textAlign='center';
-  for(let s=0;s<N;s+=Math.max(18,Math.round(N/8/18)*18)){ const mm=D.startMin+s*10;
+  for(let s=0;s<N;s+=Math.max(__STEPS_PER_3H__,Math.round(N/8/__STEPS_PER_3H__)*__STEPS_PER_3H__)){ const mm=D.startMin+s*__STEP_MIN__;
     g.fillText(`${Math.floor(mm/60)%24}時`, mL+s*colW, H-mB+15*devicePixelRatio); }
   // 現在時刻カーソル
   g.strokeStyle='rgba(255,209,102,.8)'; g.setLineDash([4,4]);
@@ -3621,11 +3698,11 @@ function lineChart(cv2, series, opts){
   for(let k=0;k<=4;k++){ const v=ymax*k/4; g.beginPath(); g.moveTo(mL,Y(v)); g.lineTo(W-mR,Y(v)); g.stroke();
     g.fillText(opts.pct? (v*100).toFixed(0)+'%' : (Math.round(v*100)/100), mL-5*devicePixelRatio, Y(v)+3*devicePixelRatio); }
   g.textAlign='center';
-  const stepsPerDay=144;
-  for(let s=0;s<=x1;s+=Math.max(18,Math.round(x1/8/18)*18)){
+  const stepsPerDay=__STEPS_PER_DAY__;
+  for(let s=0;s<=x1;s+=Math.max(__STEPS_PER_3H__,Math.round(x1/8/__STEPS_PER_3H__)*__STEPS_PER_3H__)){
     g.beginPath(); g.moveTo(X(s),H-mB); g.lineTo(X(s),H-mB+4*devicePixelRatio);
     g.strokeStyle=_tick; g.stroke();
-    const mm=D.startMin+s*10; g.fillText(`${Math.floor(mm/60)%24}時`, X(s), H-mB+15*devicePixelRatio); }
+    const mm=D.startMin+s*__STEP_MIN__; g.fillText(`${Math.floor(mm/60)%24}時`, X(s), H-mB+15*devicePixelRatio); }
   for(const s of series){
     g.strokeStyle=s.color; g.lineWidth=1.8*devicePixelRatio; g.beginPath(); let st=false;
     for(const p of s.data){ if(p[0]>x1) break;
@@ -3904,8 +3981,8 @@ function drawVCurve(c, v, s0){
   g.beginPath(); g.moveTo(X(Math.min(s0,x1)),mT); g.lineTo(X(Math.min(s0,x1)),H-mB); g.stroke(); g.setLineDash([]);
   // x 軸時刻
   g.fillStyle=dim; g.textAlign='center';
-  for(let s=x0; s<=x1; s+=Math.max(6,Math.round((x1-x0)/6/6)*6||6)){
-    const mm=D.startMin+s*10; g.fillText(`${Math.floor(mm/60)%24}時`, X(s), H-mB+15*devicePixelRatio); }
+  for(let s=x0; s<=x1; s+=Math.max(__STEPS_PER_HOUR__,Math.round((x1-x0)/6/__STEPS_PER_HOUR__)*__STEPS_PER_HOUR__||__STEPS_PER_HOUR__)){
+    const mm=D.startMin+s*__STEP_MIN__; g.fillText(`${Math.floor(mm/60)%24}時`, X(s), H-mB+15*devicePixelRatio); }
 }
 
 // ② 伝播ネットワーク: 発案者中心・採用者を採用時刻順に外へ・エッジ=最初の聴取辺(チャネル色)。
@@ -4063,7 +4140,7 @@ code{background:color-mix(in srgb,var(--ink) 8%,transparent);padding:1px 5px;bor
 </style></head><body>
 <h1>__RUN__ <span class="pill">日次ロールアップ</span></h1>
 <div class="meta" id="meta"></div>
-<div class="banner">📊 これは <b>日次ロールアップ表示</b>です。1日(144step=1,440分)ごとに L2 指標を平均集計し、
+<div class="banner">📊 これは <b>日次ロールアップ表示</b>です。1日(__STEPS_PER_DAY__step=1,440分)ごとに L2 指標を平均集計し、
 社会構造の事後分析(structure.json)を束ねた軽量ページ。<b>地図・位置アニメ・個票は含みません</b>
 (長期ラン=30日級で viewer.html が数百MBになり開けない問題の回避用)。全量の閲覧は
 <code>python viz/make_viewer.py runs/__RUN__ --no-traffic</code> を使ってください。</div>
@@ -4189,6 +4266,34 @@ if(D.hasL2){
 """
 
 
+# ============================================================ Δt トークン(W4-C)
+# JS 側の時間換算は「1 step = 何分か」に依存する(壁時計・日境界・軸目盛)。テンプレートには
+# 数値を直書きせず下の 4 トークンを置き、**ランを読む入口(main)だけ**が run.dt_min から
+# 解決した値を流し込む。正準 Δt=10 では 10 / 6 / 18 / 144 = 従来の直書きと同じ文字列に
+# なるので、**旧ランの viewer.html / dashboard.html はバイト同一**(tests が固定)。
+#   __STEP_MIN__      1 step の分数            (Δt=10 → "10")
+#   __STEPS_PER_HOUR__ 1 時間の step 数         (Δt=10 → "6"、1時間刻み目盛)
+#   __STEPS_PER_3H__  3 時間の step 数          (Δt=10 → "18"、3時間刻み目盛)
+#   __STEPS_PER_DAY__ 1 日の step 数            (Δt=10 → "144"、日→step 軸変換)
+DT_TOKENS = ("__STEP_MIN__", "__STEPS_PER_HOUR__", "__STEPS_PER_3H__", "__STEPS_PER_DAY__")
+
+
+def dt_token_values(step_minutes: int = STEP_MINUTES) -> dict:
+    """Δt[分] → トークン置換表。Δt=10 では ("10","6","18","144") = 従来の直書き値。"""
+    sph = _steps_per_hour(step_minutes)
+    return {"__STEP_MIN__": str(int(step_minutes)),
+            "__STEPS_PER_HOUR__": str(sph),
+            "__STEPS_PER_3H__": str(sph * 3),
+            "__STEPS_PER_DAY__": str(_steps_per_day(step_minutes))}
+
+
+def fill_dt_tokens(html: str, step_minutes: int = STEP_MINUTES) -> str:
+    """HTML 中の Δt トークンを実値へ。Δt=10 なら **恒等**(バイト同一の根拠)。"""
+    for tok, val in dt_token_values(step_minutes).items():
+        html = html.replace(tok, val)
+    return html
+
+
 def main() -> None:
     argv = sys.argv[1:]
     # --start-tod "HH:MM" を明示指定した時だけ壁時計原点を上書き(既定=run から復元)。
@@ -4204,12 +4309,15 @@ def main() -> None:
     run_dir = Path(args[0]) if args else REPO_ROOT / "runs" / "day80"
     if not run_dir.is_absolute():
         run_dir = REPO_ROOT / run_dir
+    # W4-C: このランの Δt(run.dt_min)。**ランを読む入口はここ 1 箇所**で、以降は
+    # build_data / build_rollup_data / HTML トークンへ配るだけ。Δt=10 では従来と同値。
+    step_minutes = _run_step_minutes(run_dir)
     # 第57バッチ タスクC: --daily-rollup は positions を読まない軽量ページ rollup.html「だけ」を
     # 追加生成して早期 return する(既存 viewer.html/dashboard.html の生成経路には一切入らない=
     # 既定=--daily-rollup 未指定時の出力は完全に従来どおり・バイト同一)。長期ラン(30日級)向け。
     if "--daily-rollup" in flags:
-        rollup = build_rollup_data(run_dir)
-        html = (ROLLUP_HTML
+        rollup = build_rollup_data(run_dir, step_minutes)
+        html = (fill_dt_tokens(ROLLUP_HTML, step_minutes)
                 .replace("__RUN__", rollup["runName"])
                 .replace("__DATA__", json.dumps(rollup, ensure_ascii=False)))
         out = run_dir / "rollup.html"
@@ -4224,7 +4332,7 @@ def main() -> None:
     # 屋内セマンティックズーム(B5): --indoor-moves で歩行軌跡ポリラインも埋め込む(7日以下・サイズガード)。
     include_moves = "--indoor-moves" in flags
     data = build_data(run_dir, include_traffic=include_traffic, start_min=start_min,
-                      include_moves=include_moves)
+                      include_moves=include_moves, step_minutes=step_minutes)
     payload = json.dumps(data, ensure_ascii=False)
     # 第18バッチ①: communities.json が有る時だけ色分け「コミュニティ」を追加。
     # 無ければ3トークンとも空文字へ→ MAP_HTML はバイト同一(後方互換の合格条件)。
@@ -4311,7 +4419,11 @@ def main() -> None:
                 .replace("__FLOOR_JS__", _FLOOR_JS)
                 .replace("__INDOOR_JS__", indoor_js)
                 .replace("__INDOOR_HOOK__", indoor_hook)
-                .replace("__INDOOR_CLICK__", indoor_click)
+                .replace("__INDOOR_CLICK__", indoor_click))
+        # Δt トークンは **注入 JS を全て置いた後・データを流し込む前**に埋める
+        # (注入フラグメント側のトークンも拾い、payload 由来の文字列は触らない)。
+        html = fill_dt_tokens(html, step_minutes)
+        html = (html
                 .replace("__RUN__", data["runName"])
                 .replace("__DATA__", payload))
         out = run_dir / name

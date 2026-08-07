@@ -179,13 +179,16 @@ def _l2_kpi_daily(run_dir: str, start_min: int, n_days: int,
 def run_metrics(run_dir: str, skip_days: int = SKIP_DAYS,
                 top_k: int = _ast.TOP_K) -> dict:
     """1 ラン分: タスクB日次系列 + per-run スカラー + フェーズ1 KPI(存在時)。"""
-    events = m.load_events(run_dir)
+    # W4-D: タスク B の指標は **analyze_structure の関数そのもの**なので、
+    # 読む kind もそちらの `WANT_KINDS` に従う(ここで写経すると二重定義になる)。
+    # 全 kind 依存の 2 量(母数・日軸)も analyze_structure.analyze と同じ列走査へ。
+    import l1_stream as ls
+    events = _ast.load_events(run_dir)
     agents = m.load_agents(run_dir)
-    n_agents = len(agents) or (max((e["agent_id"] for e in events
-                                    if e["agent_id"] >= 0), default=-1) + 1)
+    n_agents = len(agents) or (ls.max_agent_id(run_dir) + 1)
     # W2-3: 「1 日」はこのランの run.dt_min で決まる(Δt=10 なら 144 = 従来と同値)。
     spd = run_dt.steps_per_day(run_dir)
-    by_day, days = _ast.bucket_by_day(events, spd)
+    by_day, days = _ast.bucket_by_day(events, spd, ls.max_day(run_dir, spd))
     churn = _ast.reconstruct_churn(by_day, days)
     rank = _ast.rank_stability(run_dir, by_day, days, top_k, spd)
     cent = _ast.centrality_churn(by_day, days, top_k)

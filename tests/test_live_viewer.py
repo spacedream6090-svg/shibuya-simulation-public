@@ -711,3 +711,144 @@ def test_cli_once_on_finished_run(tmp_path):
 
 def test_cli_missing_run_dir_returns_2(tmp_path):
     assert LV.main([str(tmp_path / "nope"), "--once", "--quiet"]) == 2
+
+
+# ============================================================ F. part 読みの有界化(W4-C)
+# W2-2 残件#2: 1 part を `ParquetFile.read()` で丸ごと Arrow 表にしていたため、常駐が
+# **part の行数に比例**していた(在場 25万の本線では checkpoint 1 回分の part が数千万行)。
+# `iter_batches` + 列射影へ移した。ここで固定するのは 2 点:
+#   (a) 出力が変わらない —— batch 境界をどこに置いても、また HEAD 実装と比べても同値。
+#   (b) 構造的にピークが batch 単位 —— `ParquetFile.read` を**一度も呼ばない**(実行時に検知)。
+_STABLE_KEYS = ("pos", "ids", "trail", "counts", "stat", "series", "chase", "lag")
+
+
+def _stable(d: dict) -> dict:
+    """壁時計依存(wrote_at/wrote_epoch/gen/lag.seconds/lag.text)を除いた比較用ビュー。
+
+    lag の seconds/text は「最後の part の mtime から今まで」= 実行のたびに動くので外す。
+    parts_read / rows_read / src は読み方が変われば動くので**残す**(有界化の検収対象)。"""
+    out = {k: d[k] for k in _STABLE_KEYS if k in d}
+    if "lag" in out:
+        out["lag"] = {k: v for k, v in out["lag"].items()
+                      if k not in ("seconds", "text")}
+    out["ticker"] = [(t["s"], t["k"], t["a"], t["d"], t["t"], t["x"]) for t in d["ticker"]]
+    return out
+
+
+def _busy_run(tmp_path: Path, name: str, n_parts: int = 3, per: int = 8) -> Path:
+    run_dir = _make_run(tmp_path, name, n_steps=n_parts * per, checkpoint_every=per)
+    rows = _busy_rows(n_parts * per)
+    for k in range(n_parts):
+        _write_l1_part(run_dir, k, [r for r in rows if per * k <= r["step"] < per * (k + 1)])
+        _write_l2_part(run_dir, k, [{"step": s, "n_moving": float(s % 3),
+                                     "distinct_vocab_in_use": float(s)}
+                                    for s in range(per * k, per * (k + 1))])
+    return run_dir
+
+
+@pytest.mark.parametrize("batch_rows", [1, 2, 3, 7, 64, 131_072])
+def test_batch_size_does_not_change_results(tmp_path, monkeypatch, batch_rows):
+    """batch 境界をどこに置いても結果は同一(= 有界化が意味論を変えていない)。
+
+    part 内の step 境界・見せ場・start_min 復元がすべて batch をまたぐ大きさで回す。
+    """
+    ref_dir = _busy_run(tmp_path, f"ref{batch_rows}")
+    ref = _stable(LV.ChaseState(ref_dir).poll())        # 既定 BATCH_ROWS
+    monkeypatch.setattr(LV, "BATCH_ROWS", batch_rows)
+    got_dir = _busy_run(tmp_path, f"got{batch_rows}")
+    assert _stable(LV.ChaseState(got_dir).poll()) == ref
+
+
+def test_batch_size_does_not_change_incremental_results(tmp_path, monkeypatch):
+    """増分追いかけ(part ごとの poll)でも batch 境界に依らない。"""
+    def _chase(run_dir: Path) -> list:
+        st = LV.ChaseState(run_dir)
+        return [_stable(st.poll()) for _ in range(3)]
+
+    ref = _chase(_busy_run(tmp_path, "iref"))
+    monkeypatch.setattr(LV, "BATCH_ROWS", 3)
+    assert _chase(_busy_run(tmp_path, "igot")) == ref
+
+
+def test_never_materializes_a_whole_part(tmp_path, monkeypatch):
+    """`ParquetFile.read()` を **1 度も呼ばない**(呼べば例外=構造的根拠のランタイム検査)。
+
+    これが「ピークが part 全体でなく batch 単位」の根拠。列射影だけでは part の行数に
+    比例した Arrow 表が残るので、read を封じてなお通ることを条件にする。
+    """
+    def _boom(self, *a, **kw):                          # noqa: ANN001
+        raise AssertionError("ParquetFile.read() = part 全体の実体化(有界化が壊れている)")
+
+    monkeypatch.setattr(pq.ParquetFile, "read", _boom)
+    run_dir = _busy_run(tmp_path, "noread")
+    d = LV.ChaseState(run_dir).poll()
+    assert d["chase"]["step"] == 23 and d["lag"]["parts_read"] == 3
+    assert d["series"], "L2 系列も read() 無しで読めている"
+    (run_dir / "summary.json").write_text("{}", encoding="utf-8")
+    pq.write_table(pa.table({"step": list(range(24)),
+                             "n_moving": [float(s % 3) for s in range(24)]}),
+                   run_dir / "l2_metrics.parquet")
+    assert LV.ChaseState(run_dir).poll()["finished"] is True   # canonical 経路も read 無し
+
+
+def test_source_has_no_whole_table_read():
+    """静的にも `ParquetFile.read(` / `read_table(` が残っていない(コメント/文字列を除く)。"""
+    import ast
+    src = (REPO_ROOT / "scripts" / "live_viewer.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    bad = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr in ("read", "read_table", "read_row_group", "read_pandas"):
+                owner = node.func.value
+                name = getattr(owner, "id", None) or getattr(owner, "attr", None)
+                if name in ("pf", "pq"):
+                    bad.append(f"L{node.lineno}: {name}.{node.func.attr}(")
+    assert not bad, "part 全体を実体化する呼び出しが残っている: " + ", ".join(bad)
+    assert "iter_batches" in src
+
+
+def test_max_step_helper_matches_full_scan(tmp_path):
+    """`_max_step_of` は「step 列の最大」と厳密同値(統計あり/なしの両方)。"""
+    import pyarrow.compute as pc
+    rows = _busy_rows(24)
+    for stats in (True, False):
+        path = tmp_path / f"m{int(stats)}.parquet"
+        cols = {k: [r[k] for r in rows] for k in L1_SCHEMA.names}
+        pq.write_table(pa.table(cols, schema=L1_SCHEMA), path,
+                       write_statistics=stats, row_group_size=7)
+        with LV._open_shared(path) as fh:
+            pf = pq.ParquetFile(fh)
+            assert LV._max_step_of(pf, pc) == 23
+    # 全 null の step 列 = 判断材料が無い → None(偽の値を作らない)
+    path = tmp_path / "null.parquet"
+    pq.write_table(pa.table({"step": pa.array([None, None], pa.int32())}), path)
+    with LV._open_shared(path) as fh:
+        assert LV._max_step_of(pq.ParquetFile(fh), pc) is None
+
+
+@pytest.mark.xdist_group("live_viewer_head")
+def test_matches_head_implementation(tmp_path):
+    """HEAD 実装(part を丸読みしていた版)と画面データが完全一致(移行の受入条件)。"""
+    try:
+        src = subprocess.check_output(["git", "show", "HEAD:scripts/live_viewer.py"],
+                                      cwd=REPO_ROOT, stderr=subprocess.DEVNULL)
+    except Exception:                                    # noqa: BLE001
+        pytest.skip("git 不在(HEAD 版を取れない)")
+    head_py = tmp_path / "live_viewer_head.py"
+    head_py.write_bytes(src)
+    # `_load` は REPO_ROOT / rel で解決する。絶対パスを渡せば pathlib がそのまま採る。
+    HEADLV = _load("live_viewer_head", str(head_py))
+    head_dir = _busy_run(tmp_path, "hd")
+    cur_dir = _busy_run(tmp_path, "cu")
+    assert _stable(LV.ChaseState(cur_dir).poll()) == \
+        _stable(HEADLV.ChaseState(head_dir).poll())
+    # 終了後(L2 canonical から末尾を補完する経路)も一致
+    for d in (head_dir, cur_dir):
+        (d / "summary.json").write_text("{}", encoding="utf-8")
+        pq.write_table(pa.table({"step": list(range(30)),
+                                 "n_moving": [float(s % 3) for s in range(30)],
+                                 "distinct_vocab_in_use": [float(s) for s in range(30)]}),
+                       d / "l2_metrics.parquet")
+    assert _stable(LV.ChaseState(cur_dir).poll()) == \
+        _stable(HEADLV.ChaseState(head_dir).poll())

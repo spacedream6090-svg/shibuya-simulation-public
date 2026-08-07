@@ -127,18 +127,26 @@ def _attr_id(spec: dict, agent_id: int, payload: dict):
 # --------------------------------------------------------------------------- #
 # ローダ(scripts/analyze_founders.py と同じ house style: pyarrow 列射影 + batch 逐次)
 # --------------------------------------------------------------------------- #
-def load_events(run_dir: str, dt_min: int = run_dt.CANON_DT_MIN) -> list[dict]:
-    """l1_events.parquet を読み、{step, sim_min, agent, kind, payload(dict)} 列で返す。"""
-    import pyarrow.parquet as pq
+def load_events(run_dir: str, dt_min: int = run_dt.CANON_DT_MIN,
+                kinds=None) -> list[dict]:
+    """l1_events.parquet を読み、{step, sim_min, agent, kind, payload(dict)} 列で返す。
 
-    path = os.path.join(run_dir, "l1_events.parquet")
+    W4-D: 読みは `l1_stream.iter_columns`(Arrow レベルの kind 絞り込み)へ。
+    `kinds=None`(既定)は **LUCK_KINDS の 11 種だけ**を読む。`attribute()` が
+    `LUCK_KINDS.get(kind)` で他種を必ず読み飛ばすので、絞っても出力は変わらない
+    (`analyze_luck` のように追加の種が要る呼び出し側は `kinds=` で足す)。
+    `kinds=()` を渡すと **全 kind**(旧挙動)。返り値・行順・キー順は不変。
+
+    残る比例項: 返り値は依然 list なので、**LUCK_KINDS の行数**にはメモリが比例する
+    (絞り読みで消えたのは「読み飛ばす行の dict 生成」のほう)。
+    """
+    import l1_stream as ls
+    if not ls.l1_paths(run_dir):
+        raise FileNotFoundError(os.path.join(run_dir, "l1_events.parquet"))
     want = ["step", "sim_min", "agent_id", "kind", "payload"]
-    available = set(pq.read_schema(path).names)
-    cols = [c for c in want if c in available]
-    pf = pq.ParquetFile(path)
+    sel = LUCK_KINDS.keys() if kinds is None else (kinds or None)
     out: list[dict] = []
-    for batch in pf.iter_batches(columns=cols):
-        d = batch.to_pydict()
+    for d in ls.iter_columns(run_dir, want, kinds=sel):
         n = len(d["step"])
         smin = d.get("sim_min")
         pays = d["payload"]
@@ -190,9 +198,65 @@ def _active_residents_by_day(events: list[dict], residents: set[int] | None,
     return active
 
 
+def scan_presence(run_dir: str, spd: int = STEPS_PER_DAY) -> dict:
+    """**全 kind** の (step, agent_id) 2 列だけを 1 パス走査した「在街」の素材を返す。
+
+    W4-D: 本監査には **LUCK_KINDS 以外の kind にも依存する量が 4 つ**ある。
+    絞り読みに切り替えるとき、これらを絞った list から作り直すと**値が変わる**:
+
+      - `n_events`       … 全イベント件数(`len(events)`)
+      - `n_agent_events` … `agent_id >= 0` の件数(揺らぎ比率の**分母**)
+      - `days`           … 出現する日の集合。`audit()` の `all_days` は
+                           `{e["step"] // spd for e in events}` = **世界イベント
+                           (agent_id=-1)しか無い日も含む**ので、在街日と別に持つ。
+      - `active_by_day`  … 「その日 街に居た人」= **どの kind でもいいから**イベントを
+                           1 件でも出した人。world ショックの曝露対象そのもの。
+
+    定義が「全 kind」である以上ここを絞ることはできない。できるのは
+    **payload を 1 バイトも復号しない**ことで、実際そうしている(2 列しか読まない)。
+
+    残る比例項(正直な注記): `active_by_day` は day × distinct agent に比例する
+    (在場 25万 × 10 日なら 250 万要素の集合群)。これは指標の定義そのものなので畳めない。
+    返す `active_by_day` は **residents で絞る前**(呼び出し側が交差を取る)。
+    """
+    import l1_stream as ls
+    n_events = 0
+    n_agent_events = 0
+    days: set[int] = set()
+    active: dict[int, set] = defaultdict(set)
+    for d in ls.iter_columns(run_dir, ["step", "agent_id"]):
+        steps, aids = d["step"], d["agent_id"]
+        n_events += len(steps)
+        for i, aid in enumerate(aids):
+            day = int(steps[i]) // int(spd)
+            days.add(day)
+            if aid is not None and aid >= 0:
+                n_agent_events += 1
+                active[day].add(int(aid))
+    return {"n_events": n_events, "n_agent_events": n_agent_events,
+            "days": sorted(days), "active_by_day": dict(active)}
+
+
+def _active_filtered(active_all: dict, residents: set[int] | None) -> dict:
+    """`scan_presence` の全員版 active_by_day を residents で絞る(空集合の日は落とす)。
+
+    `_active_residents_by_day` が「residents に該当する人だけを add する」ので、
+    絞った結果が空になる日は **キー自体が生えない**。ここもそれに合わせる。
+    """
+    if residents is None:
+        return {d: set(s) for d, s in active_all.items()}
+    out = {}
+    for d, s in active_all.items():
+        hit = s & residents
+        if hit:
+            out[d] = hit
+    return out
+
+
 def attribute_chances(events: list[dict],
                       agents: dict[int, dict] | None = None,
-                      spd: int = STEPS_PER_DAY) -> dict:
+                      spd: int = STEPS_PER_DAY,
+                      active_by_day: dict | None = None) -> dict:
     """揺らぎ由来イベントを住民へ帰属した中核結果を返す(監査・運分解の共通土台)。
 
     LUCK_KINDS の意味づけ(scope / attr_field / phase)を適用する **唯一の場所**。
@@ -209,7 +273,11 @@ def attribute_chances(events: list[dict],
     """
     agents = agents or {}
     residents = {aid for aid, m in agents.items() if not m.get("visitor")} or None
-    active_by_day = _active_residents_by_day(events, residents, spd)
+    # W4-D: `active_by_day` は **全 kind** から作る量(下の docstring 参照)。
+    # `events` が kind 絞り読みなら呼び出し側が `scan_presence` 由来の表を渡す。
+    # 渡されなければ従来どおり events から作る(逐語温存 = 既存テストの経路)。
+    if active_by_day is None:
+        active_by_day = _active_residents_by_day(events, residents, spd)
 
     per_ad: dict[tuple, Counter] = defaultdict(Counter)
     by_kind: Counter = Counter()
@@ -255,15 +323,29 @@ def attribute_chances(events: list[dict],
 # 監査本体
 # --------------------------------------------------------------------------- #
 def audit(events: list[dict], agents: dict[int, dict] | None = None,
-          spd: int = STEPS_PER_DAY) -> dict:
-    """揺らぎ由来イベントの per-agent-day 件数分布と全イベント比率を返す。"""
+          spd: int = STEPS_PER_DAY, presence: dict | None = None) -> dict:
+    """揺らぎ由来イベントの per-agent-day 件数分布と全イベント比率を返す。
+
+    W4-D: `presence` に `scan_presence(run_dir, spd)` の結果を渡すと、**全 kind に
+    依存する 4 量**(総件数・agent 件数・日集合・在街表)をそちらから取る。
+    渡さなければ従来どおり `events` から作る(= 全件 list を渡す既存経路と逐語同一)。
+    """
     agents = agents or {}
     residents = {aid for aid, m in agents.items() if not m.get("visitor")}
 
-    total_events = len(events)
-    total_agent_events = sum(1 for e in events if e["agent"] >= 0)   # 比率の分母
+    if presence is None:
+        total_events = len(events)
+        total_agent_events = sum(1 for e in events if e["agent"] >= 0)  # 比率の分母
+        all_days = sorted({e["step"] // int(spd) for e in events})
+        active_pre = None
+    else:
+        total_events = int(presence["n_events"])
+        total_agent_events = int(presence["n_agent_events"])
+        all_days = list(presence["days"])
+        active_pre = _active_filtered(presence["active_by_day"],
+                                      residents or None)
 
-    attr = attribute_chances(events, agents, spd)
+    attr = attribute_chances(events, agents, spd, active_pre)
     per_ad = attr["per_ad"]
     by_kind = attr["by_kind"]
     by_category = attr["by_category"]
@@ -275,7 +357,6 @@ def audit(events: list[dict], agents: dict[int, dict] | None = None,
     counts = [sum(cc.values()) for cc in per_ad.values()]
     # 揺らぎに 1 件も遭遇しなかった (resident, day) も母集団に含める(0 を数える)。
     if agents:
-        all_days = sorted({e["step"] // int(spd) for e in events})
         zero_cells = 0
         seen = set(per_ad)
         for aid in residents:
@@ -390,9 +471,13 @@ def analyze(run_dir: str, out_dir: str) -> dict:
     run_name = os.path.basename(os.path.normpath(run_dir))
     # W2-3: 「1 日」「sim_min 復元」はこのランの run.dt_min で決まる(Δt=10 なら従来と同値)。
     spd = run_dt.steps_per_day(run_dir)
+    # W4-D: L1 は 2 回読む。①LUCK_KINDS だけを payload 付きで(dict 化はここだけ)
+    # ②(step, agent_id) 2 列を全 kind ぶん(在街・分母・日軸。payload は復号しない)。
+    # 「全件を dict にしてから捨てる」経路が消えるので、②を足しても総コストは下がる。
     events = load_events(run_dir, run_dt.min_per_step(run_dir))
+    presence = scan_presence(run_dir, spd)
     agents = load_agents(run_dir)
-    res = audit(events, agents, spd)
+    res = audit(events, agents, spd, presence)
     res["run"] = run_name
 
     os.makedirs(out_dir, exist_ok=True)

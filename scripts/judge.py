@@ -47,6 +47,8 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
+if str(REPO_ROOT / "scripts") not in sys.path:   # l1_stream(共有の逐次読み)用
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 # Windows コンソール(cp932)で κ や日本語を print しても落ちないように
 for _s in (sys.stdout, sys.stderr):
@@ -89,6 +91,26 @@ _MARKER_WEIGHT: dict[str, float] = {
 # --------------------------------------------------------------------------- #
 # ドシエ構築
 # --------------------------------------------------------------------------- #
+def _load_events(run_dir: str, agents: list[dict] | None) -> list[dict]:
+    """L1 を「ドシエに載る kind + 主指標が読む kind」だけ読む(W4-D)。
+
+    読む集合 = `_ACTION_LABELS`(`_event_text` が None を返さない唯一の集合)
+             ∪ `measure.agent_features` が読む kind(= 主指標 Y_external の入力。
+               凍結側の表は写経せず `l1_stream` を参照する)。
+
+    ★ **`agents` が空のときは絞らない**。`agent_features` は名簿が無いと
+    「L1 に現れた agent_id」を行にするので、絞ると行集合そのものが変わる
+    (= Y_external の対象者が減る)。名簿がある通常経路だけ絞り読みにする。
+    """
+    import l1_stream as ls
+    if not ls.l1_paths(run_dir):        # m.load_events と同じく「無ければ落とす」
+        raise FileNotFoundError(os.path.join(run_dir, "l1_events.parquet"))
+    kinds = None
+    if agents:
+        kinds = frozenset(_ACTION_LABELS) | ls.AGENT_FEATURES_KINDS
+    return list(ls.iter_events(run_dir, kinds=kinds))
+
+
 def _event_text(kind: str, p: dict) -> str | None:
     """外向き行動イベント 1 件を短い日本語行に。対象外 kind は None。"""
     label = _ACTION_LABELS.get(kind)
@@ -306,8 +328,8 @@ def _spearman(x, y):
 def judge_run(run_dir: str, backend: str = "mock", model: str = "qwen3:4b",
               judges: int = 3, max_chars: int = 2000) -> dict:
     """1 run に judge を適用し analysis/judge.json + judge_report.md を書く。返り値=judge.json。"""
-    events = m.load_events(run_dir)
     agents = m.load_agents(run_dir)
+    events = _load_events(run_dir, agents)
     dossiers = build_dossiers(events, agents, max_chars=max_chars)
 
     # 主指標(客観量)= 校正の基準。traits は渡さない(R9)。

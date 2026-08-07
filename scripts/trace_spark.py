@@ -32,6 +32,8 @@ if hasattr(sys.stdout, "reconfigure"):
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 RUNS_ROOT = os.path.join(_ROOT, "runs")
+if _HERE not in sys.path:                # l1_stream(共有の逐次読み)用
+    sys.path.insert(0, _HERE)
 
 # W2-3(Δt 対応の棚卸し): この定数は **未使用**(死んだ定数)。
 # 本 module 内で step→日 の換算は行っていない(step をそのまま表示する)ため未使用。
@@ -50,18 +52,27 @@ _ACTIVITY_KINDS = (
 # --------------------------------------------------------------------------- #
 # ローダ(analyze_founders.py と同じ流儀。numpy を引き込まない最小実装)
 # --------------------------------------------------------------------------- #
-def load_events(run_dir: str) -> list[dict]:
-    """l1_events.parquet を列射影 + RecordBatch 逐次で読み、payload を dict 展開して返す。"""
-    import pyarrow.parquet as pq
+# W4-D: 本トレーサが実際に読む kind。`load_events` はこれだけを Python 化する。
+#   活動量(_ACTIVITY_KINDS)/ 名簿(spark_roster)/ 伝播 / 関係 / 組織の 5 用途ぶん。
+# ここに無い kind は全ての集計関数が `if e["kind"] != ...: continue` で必ず読み飛ばす
+# ので、絞っても出力は 1 バイトも変わらない(唯一の全 kind 依存は `trace()` の
+# residents フォールバックで、そちらは agent_id 列の走査に置き換えてある)。
+WANT_KINDS = frozenset(_ACTIVITY_KINDS) | {
+    "spark_roster", "transmission", "relation_tier", "group_found", "group_join"}
 
-    path = os.path.join(run_dir, "l1_events.parquet")
+
+def load_events(run_dir: str, kinds=WANT_KINDS) -> list[dict]:
+    """l1_events.parquet を列射影 + kind 絞り込み + 逐次読みし、payload を dict 展開して返す。
+
+    W4-D: `l1_stream.iter_columns` 経由(Arrow レベルで kind を落としてから実体化)。
+    `kinds=None` を渡すと全 kind(旧挙動)。返り値・行順・キー順は不変。
+    """
+    import l1_stream as ls
+    if not ls.l1_paths(run_dir):
+        raise FileNotFoundError(os.path.join(run_dir, "l1_events.parquet"))
     want = ["step", "sim_min", "agent_id", "kind", "payload"]
-    available = set(pq.read_schema(path).names)
-    cols = [c for c in want if c in available]
-    pf = pq.ParquetFile(path)
     out: list[dict] = []
-    for batch in pf.iter_batches(columns=cols):
-        d = batch.to_pydict()
+    for d in ls.iter_columns(run_dir, want, kinds=kinds):
         n = len(d["step"])
         step, agent, kind, pays = d["step"], d["agent_id"], d["kind"], d["payload"]
         for i in range(n):
@@ -256,8 +267,11 @@ def trace(run_dir: str, out_dir: str) -> dict:
 
     residents = [aid for aid, a in agents.items() if not a.get("visitor")]
     if not residents:                                    # agents.json に visitor 列が無い等の後退
-        residents = sorted({e["agent"] for e in events if e["agent"] is not None
-                            and e["agent"] >= 0})
+        # W4-D: ここは **全 kind** に現れる agent の集合(= 街に出た全員)。
+        # events は WANT_KINDS 絞り読みなので、そこから作ると人が落ちる。
+        # agent_id 列だけの走査に置き換える(値は全件走査と同一)。
+        import l1_stream as ls
+        residents = sorted(ls.distinct_agent_ids(run_dir))
 
     if roster is None:
         result = {"run": run_name, "spark_enabled": False, "n_sparked": 0,

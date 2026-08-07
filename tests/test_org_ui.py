@@ -206,12 +206,28 @@ def test_old_run_build_data_no_org_keys(tmp_path):
             json.dumps(head_data, ensure_ascii=False)
 
 
+def _canon_dt(tpl: str) -> str:
+    """Δt トークン(W4-C)を正準 Δt=10 の値へ畳んだテンプレート文字列。
+
+    W4-C で JS の時間換算の直書き(1 step=10 分 / 1 日=144 step / 目盛 6・18 step)を
+    `__STEP_MIN__` ほかのトークンへ置き換えた。**正準 Δt=10 では同じ文字列に戻る**ので、
+    ここで畳んでから比較すれば「Δt トークン化以外の改変は 1 文字も無い」を従来どおり検知できる
+    (トークンが入る前の HEAD にも、入った後の HEAD にも、同じ判定が効く)。"""
+    for tok, val in mv.dt_token_values(10).items():
+        tpl = tpl.replace(tok, val)
+    return tpl
+
+
 def test_templates_unmodified_vs_head():
-    """DASH_HTML/MAP_HTML の文字列を一切改変していない(既存 viewer 系テストが無修正緑の担保)。"""
+    """DASH_HTML/MAP_HTML を(Δt トークン化を除いて)一切改変していない。
+
+    出力そのもののバイト同一は test_old_run_html_byte_identical_end_to_end が別途固定する。"""
     if HEAD is None:
         pytest.skip("git 不在")
-    assert mv.DASH_HTML == HEAD.DASH_HTML, "DASH_HTML を改変している(テンプレ無改変が崩れる)"
-    assert mv.MAP_HTML == HEAD.MAP_HTML, "MAP_HTML を改変している(テンプレ無改変が崩れる)"
+    assert _canon_dt(mv.DASH_HTML) == _canon_dt(HEAD.DASH_HTML), \
+        "DASH_HTML を改変している(テンプレ無改変が崩れる)"
+    assert _canon_dt(mv.MAP_HTML) == _canon_dt(HEAD.MAP_HTML), \
+        "MAP_HTML を改変している(テンプレ無改変が崩れる)"
 
 
 # ============================================================ 2. org データ生成

@@ -86,6 +86,28 @@ def kendall_tau(a, b):
 # --------------------------------------------------------------------------- #
 # 日次バケツ + 補助
 # --------------------------------------------------------------------------- #
+# W4-D: 本解析が読む kind。
+#   ① edge churn      = relation_tier / relation_break
+#   ② 順位固着(評判)= reputation_update(L3 status が無いランの後退経路)
+#   ③ 中心性・コミュニティ = speak / dm(`measure._conversation_adj` / `communities`)
+# ここに無い kind は ①②の if/elif も凍結側の会話グラフも必ず読み飛ばす。
+# **全 kind 依存は 2 つだけ**で、どちらも列走査に置き換えてある:
+#   n_agents(母数) → `l1_stream.max_agent_id` / 日軸の右端 → `l1_stream.max_day`。
+WANT_KINDS = frozenset({"relation_tier", "relation_break", "reputation_update",
+                        "speak", "dm"})
+
+
+def load_events(run_dir: str) -> list[dict]:
+    """L1 を `WANT_KINDS` だけ読み、`measure.load_events` と同一形の dict 列で返す。
+
+    残る比例項: 関係イベントと会話イベントの行数(日次窓を全期間ぶん組むので畳めない)。
+    """
+    import l1_stream as ls
+    if not ls.l1_paths(run_dir):        # m.load_events と同じく「無ければ落とす」
+        raise FileNotFoundError(os.path.join(run_dir, "l1_events.parquet"))
+    return list(ls.iter_events(run_dir, kinds=WANT_KINDS))
+
+
 def _day_of(e: dict, spd: int = STEPS_PER_DAY) -> int:
     """イベントの暦日。sim_min//1440(欠損時は step//spd へ後退)。
 
@@ -97,15 +119,26 @@ def _day_of(e: dict, spd: int = STEPS_PER_DAY) -> int:
     return int(sm) // 1440
 
 
-def bucket_by_day(events: list[dict],
-                  spd: int = STEPS_PER_DAY) -> tuple[dict[int, list], list[int]]:
-    """events を暦日へ振り分け、連続する日レンジ [0..max] を返す(空日は空リスト=時系列を連続に)。"""
+def bucket_by_day(events: list[dict], spd: int = STEPS_PER_DAY,
+                  max_day: int | None = None) -> tuple[dict[int, list], list[int]]:
+    """events を暦日へ振り分け、連続する日レンジ [0..max] を返す(空日は空リスト=時系列を連続に)。
+
+    W4-D: `max_day` を渡すと日レンジの右端を **そちら**で決める。events を kind 絞り
+    読みにすると「最後の関係イベントの日」までしか日軸が伸びず、系列の長さが変わって
+    しまう。日軸は「どの kind でもいいから最後にイベントがあった日」なので、
+    呼び出し側が `l1_stream.max_day(run_dir, spd)`(全 kind の 2 列走査)を渡す。
+    None なら従来どおり events から決める(= 全件 list を渡す既存経路と逐語同一)。
+    """
     by_day: dict[int, list] = defaultdict(list)
     for e in events:
         by_day[_day_of(e, spd)].append(e)
-    if not by_day:
+    if max_day is None:
+        if not by_day:
+            return {}, []
+        max_day = max(by_day)
+    elif max_day < 0:
         return {}, []
-    days = list(range(0, max(by_day) + 1))
+    days = list(range(0, int(max_day) + 1))
     return by_day, days
 
 
@@ -402,13 +435,14 @@ def analyze(run_dir: str, top_k: int = TOP_K, min_days: int = MIN_DAYS,
             cent_low: float = CENT_CHURN_LOW, edge_low: float = EDGE_CHURN_LOW,
             tau_high: float = TAU_HIGH) -> dict:
     """1 ラン分の構造変化解析を実行し、structure.json 相当の dict を返す。"""
-    events = m.load_events(run_dir)
+    import l1_stream as ls
+    events = load_events(run_dir)
     agents = m.load_agents(run_dir)
-    n_agents = len(agents) or (max((e["agent_id"] for e in events
-                                    if e["agent_id"] >= 0), default=-1) + 1)
+    # 全 kind 依存の 2 量(母数と日軸)は列走査から取る(WANT_KINDS の解説を参照)。
+    n_agents = len(agents) or (ls.max_agent_id(run_dir) + 1)
     # W2-3: 「1 日」はこのランの run.dt_min で決まる(Δt=10 なら 144 = 従来と同値)。
     spd = run_dt.steps_per_day(run_dir)
-    by_day, days = bucket_by_day(events, spd)
+    by_day, days = bucket_by_day(events, spd, ls.max_day(run_dir, spd))
     run_name = os.path.basename(os.path.normpath(run_dir))
 
     churn = reconstruct_churn(by_day, days)

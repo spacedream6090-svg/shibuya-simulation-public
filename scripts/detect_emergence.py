@@ -60,18 +60,22 @@ _TEXT_KINDS = ("speak", "sns_post", "dm", "reflect")
 # ローダ(build_panel.py / measure.load_events と同じ流儀。ここでは自前で最小実装し
 # numpy 等を引き込まない。返り値は {step, agent, kind, payload(dict)})
 # --------------------------------------------------------------------------- #
-def load_events(run_dir: str) -> list[dict]:
-    """l1_events.parquet を列射影 + RecordBatch 逐次で読み、payload を dict 展開して返す。"""
-    import pyarrow.parquet as pq
+def load_events(run_dir: str, kinds=None) -> list[dict]:
+    """l1_events.parquet を列射影 + kind 絞り込み + 逐次読みし、payload を dict 展開して返す。
 
-    path = os.path.join(run_dir, "l1_events.parquet")
+    W4-D: 読みは `l1_stream.iter_columns`(Arrow レベルで kind を落としてから実体化)。
+    既定の kind 集合は `WANT_KINDS`(下記)。`kinds=()` で全 kind(旧挙動)。
+    返り値・行順・キー順は不変。
+
+    残る比例項: 返り値は list なので **テキストを持つ行数**にメモリが比例する
+    (テキスト検出は全期間の本文を突き合わせるので、そこは畳めない)。"""
+    import l1_stream as ls
+    if not ls.l1_paths(run_dir):
+        raise FileNotFoundError(os.path.join(run_dir, "l1_events.parquet"))
     want = ["step", "sim_min", "agent_id", "kind", "payload"]
-    available = set(pq.read_schema(path).names)
-    cols = [c for c in want if c in available]
-    pf = pq.ParquetFile(path)
+    sel = WANT_KINDS if kinds is None else (kinds or None)
     out: list[dict] = []
-    for batch in pf.iter_batches(columns=cols):
-        d = batch.to_pydict()
+    for d in ls.iter_columns(run_dir, want, kinds=sel):
         n = len(d["step"])
         step, agent_id, kind, pays = d["step"], d["agent_id"], d["kind"], d["payload"]
         for i in range(n):
@@ -255,6 +259,16 @@ _SIM_NAME_KINDS = {
     "group_found": "name", "group_join": "name",           # コミュニティ名
     "institution": "name", "institution_rule": "name",     # 制度・status function 名
 }
+
+# W4-D: 本検出器が実際に読む kind は 3 用途ぶんだけ。
+#   ① テキスト本文 = _TEXT_KINDS(speak/sns_post/dm/reflect)
+#   ② 造語台帳     = label_coin / vocab_coin(collect_coined)
+#   ③ 創発名台帳   = _SIM_NAME_KINDS(店名・コミュニティ名・制度名。②を含む)
+# 3 つの collector はいずれも「対象外 kind は continue」なので、絞っても出力は不変。
+# 本 module に全 kind 依存の量は無い(件数はどれも自分の kind の行数)。
+# ①③ は上の定数を **写経せず合成する**(片方だけ増える事故を防ぐ)。
+WANT_KINDS = (frozenset(_TEXT_KINDS) | {"label_coin", "vocab_coin"}
+              | frozenset(_SIM_NAME_KINDS))
 
 
 def collect_sim_names(events: list[dict]) -> list[dict]:
@@ -545,7 +559,11 @@ def detect_attention(records: list[dict], exclude_tokens: set[str] | None = None
                     "provenance": "coined" if term in coined_tokens else "organic",
                 })
                 break                                # 1語1件
-    out.sort(key=lambda x: (-x["n_agents"], -x["occurrences"], x["first_step"]))
+    # term を最終タイブレークに置く(W4-D 検収で発見: これが無いと同値行の並びが
+    # set 反復順=PYTHONHASHSEED 依存になり、同一ランで 297 件中 51 件の順序が
+    # 走行ごとに変わっていた。決定論バグの修正であり「正しい旧出力」は存在しない)。
+    out.sort(key=lambda x: (-x["n_agents"], -x["occurrences"], x["first_step"],
+                            x["term"]))
     return out
 
 

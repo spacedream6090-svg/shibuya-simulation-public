@@ -40,13 +40,27 @@ parquet は `PAR1 …データ… フッタ フッタ長(int32,LE) PAR1` の順�
 
 L1 の読み方(10日ラン=1 part 数百万行でも重くならないための実装上の判断)
 -----------------------------------------------------------------------
-- **payload 列を読まない**。位置の状態遷移(屋内/屋外/就寝)は kind だけで決まるので、
-  L1 で最も重い payload 列は「ティッカーに出す見せ場イベント(全体の数%)」に限って読む。
+- **payload を Python 化するのは見せ場イベントだけ**。位置の状態遷移(屋内/屋外/就寝)は
+  kind だけで決まるので、L1 で最も重い payload 列は「ティッカーに出す見せ場イベント
+  (全体の数%)」に限って dict にする。
 - 位置は `viz/make_viewer.py::build_data` と**同じイベント意味論**(move_segment/arrive/
   speak/reflect で x,y 更新、enter/exit_building で屋内/路上、exit/enter_area、sleep/wake)。
   ただし w は make_viewer の `1000+bIdx*100+floor` を使わず 4 値の状態コードへ畳む
   (0=路上 1=屋内 -1=範囲外 -2=就寝)。ライブ画面は点を打つだけでフロアビューを持たない=
   建物 index も階も要らず、payload を読まないで済むという上の判断とセットの帰結。
+- **part は batch 単位でしか実体化しない**(W4-C。W2-2 の残件)。以前は 1 part を
+  `ParquetFile.read()` で丸ごと Arrow 表にしていたので、常駐が **part の行数に比例**した。
+  在場 25万の本線では checkpoint 1 回分の part が数千万行になり得る(`docs/plans/
+  proposal-dp-u3-observe-250k.md` §2-4 の外挿)。いまは `iter_batches` + 列射影で
+  常駐 = **O(BATCH_ROWS × 列数)**。読み取り結果(= 画面に出る数字)は 1 バイトも変えていない
+  (`tests/test_live_viewer.py` の増分==一括・参照実装一致・統合テストがそのまま固定する)。
+  ★`scripts/l1_stream.py` は同じ流儀の汎用版だが、**あちらが本ファイルの `_open_shared` /
+  `is_complete_parquet` / `list_parts` を import する**側なので、ここから import すると
+  循環になる。依存の向きを保つため pyarrow を直接使う(規約は l1_stream の docstring に明記)。
+- 途中で例外が出た場合の意味論: `_open_shared` で**開けた**ハンドルは相手が unlink しても
+  有効(削除保留)なので、`_safe` が拾う `FileNotFoundError` は**開く瞬間**に限られる
+  = そこまでに状態は 1 バイトも動いていない。壊れた part を途中まで読んだ場合だけ前半が
+  反映されるが、`poll` は読んだ part を必ず飛ばす(`next_l1` を進める)ので二重計上はない。
 
 画面の更新方式(判断の理由は本ファイル末尾 `_HTML` の注記と報告を参照)
 --------------------------------------------------------------------
@@ -102,6 +116,10 @@ DEFAULT_START_MIN = 7 * 60       # sim_min 列も config も無いときの最�
 PARQUET_MAGIC = b"PAR1"
 DEFAULT_INTERVAL = 45.0
 DEFAULT_OUT_SUBDIR = "_live"
+# W4-C: part を読むときの 1 batch の行数(= 常駐の上限を決める唯一のつまみ)。
+# `scripts/l1_stream.DEFAULT_BATCH_ROWS` と同値にして「読む粒度」をリポジトリ内で揃える
+# (import はしない = 依存の向きを保つ。理由はモジュール docstring)。
+BATCH_ROWS = 131_072
 
 # 位置の状態コード(make_viewer の w を畳んだもの)
 W_ROAD, W_INDOOR, W_OUTSIDE, W_SLEEP = 0, 1, -1, -2
@@ -231,6 +249,49 @@ def is_complete_parquet(path: Path) -> bool:
         return False
     footer_len = int.from_bytes(tail[:4], "little")
     return 0 < footer_len <= size - 12
+
+
+def _max_step_of(pf, pc) -> int | None:
+    """part の最大 step。**row-group 統計だけで決まるなら 1 行も読まない**。
+
+    `pc.max(表全体の step 列)` と同値であることが「part 全体を実体化しない」ための鍵。
+    統計を持たない row-group がある場合だけ、その row-group の `step` 列を batch で走査する
+    (= 欠測を偽の値で埋めない)。流儀は `scripts/l1_stream.max_step` と同じ
+    (あちらは本ファイルを import する側なので、依存の向きを保つためここに写す)。
+    """
+    md = pf.metadata
+    try:
+        names = [md.schema.column(i).name for i in range(md.num_columns)]
+        j = names.index("step")
+    except (ValueError, AttributeError):
+        j = None
+    mx: int | None = None
+    need: list[int] = []
+    for rg in range(md.num_row_groups):
+        stats = None
+        if j is not None:
+            try:
+                stats = md.row_group(rg).column(j).statistics
+            except (IndexError, AttributeError):
+                stats = None
+        if stats is None or not stats.has_min_max:
+            need.append(rg)
+            continue
+        try:
+            v = int(stats.max)
+        except (TypeError, ValueError):
+            need.append(rg)
+            continue
+        mx = v if mx is None else max(mx, v)
+    if need:
+        for batch in pf.iter_batches(columns=["step"], row_groups=need,
+                                     batch_size=BATCH_ROWS):
+            if batch.num_rows == 0:
+                continue
+            v = pc.max(batch.column(0)).as_py()
+            if v is not None:
+                mx = int(v) if mx is None else max(mx, int(v))
+    return mx
 
 
 # ====================================================================== 小道具
@@ -437,101 +498,93 @@ class ChaseState:
 
     # ---------------------------------------------------------------- L1 取り込み
     def _ingest_l1(self, path: Path) -> None:
+        """完結 part 1 本を **batch 単位**で畳み込む(part 全体は 1 度も実体化しない)。
+
+        以前の実装は `ParquetFile.read()` を 2 回(位置用の 6 列 + 見せ場用の payload 込み
+        5 列)呼び、どちらも **part の全行**を Arrow 表にしていた。25万本線では 1 part が
+        数千万行になり得るのでここが常駐の支配項になる。いまは
+          pass1 … `step` の row-group 統計(統計が無い row-group だけ step 列を走査)で
+                  `max_step` を出す。**行はほぼ読まない**。
+          pass2 … 位置と見せ場に要る列だけを `iter_batches` で流し、batch ごとに
+                  filter → 必要な行だけ Python 化する。
+        の 2 パスで、常駐は O(BATCH_ROWS × 列数)。
+
+        **出力は 1 バイトも変えない**ための不変量(順序と境界の扱い):
+          - 行の順序は `read()` と同じ**ファイル順**。`iter_batches` は row-group 順・
+            row-group 内は格納順で返す。
+          - `prev_step`(残像を積む step 境界)は **part をまたがず batch をまたぐ**
+            = 以前の「part 1 本を 1 ループで回す」と同じ切れ目になる。
+          - `start_min` は part の**先頭行**から復元する(= 最初の batch の先頭行)。
+          - `rows_read` は part の全行数、`max_step` は part の全行の最大 step。
+        """
         import pyarrow.compute as pc
         import pyarrow.parquet as pq
 
+        pos_set = _pa_array(list(POS_KINDS))
+        hi_set = _pa_array(sorted(HIGHLIGHT_KINDS))
+
         def _read(p: Path):
-            """1 ハンドルで schema と 2 つの列集合を読む(開き直さない=レース窓を最小化)。"""
+            """1 ハンドルで開いて畳み込む(開き直さない=レース窓を最小化)。
+
+            戻り値は (状態を動かしたか, 必須列があったか, max_step)。開けた後の走査中に
+            相手がファイルを消しても `_open_shared` のハンドルは有効なので、`_safe` が
+            拾う `FileNotFoundError` は**開く瞬間**に限られる(モジュール docstring)。
+            """
             with _open_shared(p) as fh:
                 pf = pq.ParquetFile(fh)
                 have = set(pf.schema_arrow.names)
                 if not {"step", "agent_id", "kind", "x", "y"} <= have:
-                    return have, None, None
-                base = [c for c in ("step", "sim_min", "agent_id", "kind", "x", "y")
-                        if c in have]
-                hi_cols = [c for c in ("step", "sim_min", "agent_id", "kind", "payload")
-                           if c in have]
-                return have, pf.read(columns=base), pf.read(columns=hi_cols)
+                    return False, False, None
+                if pf.metadata.num_rows == 0:
+                    return False, True, None
+                cols = [c for c in ("step", "sim_min", "agent_id", "kind", "x", "y",
+                                    "payload") if c in have]
+                max_step = _max_step_of(pf, pc)
+                if max_step is None:                  # step が全て null(実運用では起きない)
+                    return False, True, None
+                trail_from = max_step - self.trail_steps + 1
+                prev_step = None
+                names: dict | None = None
+                first = True
+                for batch in pf.iter_batches(columns=cols, batch_size=BATCH_ROWS):
+                    if batch.num_rows == 0:
+                        continue
+                    self.rows_read += batch.num_rows
+                    kind_col = batch.column("kind")
+                    # --- 壁時計の原点(make_viewer._derive_start_min と同じ不変量) ---
+                    if first:
+                        first = False
+                        if self.start_min is None and "sim_min" in have:
+                            sm = batch.column("sim_min")[0].as_py()
+                            st = batch.column("step")[0].as_py()
+                            if sm is not None and st is not None:
+                                self.start_min = int(sm) - int(st) * self.step_minutes
+                    # --- 位置(payload は Python 化しない) ---
+                    mask = pc.and_(pc.is_in(kind_col, value_set=pos_set),
+                                   pc.greater_equal(batch.column("agent_id"), 0))
+                    pos_b = batch.filter(mask)
+                    if pos_b.num_rows:
+                        prev_step = self._apply_positions(pos_b, prev_step, trail_from)
+                    # --- 見せ場イベント(ここだけ payload を dict にする) ---
+                    hi_mask = pc.is_in(kind_col, value_set=hi_set)
+                    if (pc.sum(pc.cast(hi_mask, "int64")).as_py() or 0) > 0:
+                        if names is None:
+                            names = self._names_map()
+                        self._apply_highlights(batch.filter(hi_mask), names)
+                    del batch, pos_b                  # batch は次の反復まで持ち越さない
+                if prev_step is not None and prev_step >= trail_from:
+                    self._push_trail(prev_step)
+                return True, True, max_step
 
         got = self._safe(path, _read, "l1")
         if got is None:
             return
-        have, tbl, hi_all = got
-        if tbl is None:
+        applied, has_cols, max_step = got
+        if not has_cols:
             self.warnings.append(f"{path.name}: L1 の必須列が無い(読み飛ばす)")
             return
-        if tbl.num_rows == 0:
+        if not applied:                               # 空 part = 何も進めない(従来と同じ)
             return
-        self.rows_read += tbl.num_rows
-        kind_col = tbl.column("kind")
-
-        # --- 壁時計の原点(make_viewer._derive_start_min と同じ不変量) ---
-        if self.start_min is None and "sim_min" in have:
-            sm = tbl.column("sim_min")[0].as_py()
-            st = tbl.column("step")[0].as_py()
-            if sm is not None and st is not None:
-                self.start_min = int(sm) - int(st) * self.step_minutes
-
-        # --- 位置(payload は読まない) ---
-        mask = pc.and_(pc.is_in(kind_col, value_set=_pa_array(list(POS_KINDS))),
-                       pc.greater_equal(tbl.column("agent_id"), 0))
-        pos_tbl = tbl.filter(mask)
-        max_step = int(pc.max(tbl.column("step")).as_py())
-        trail_from = max_step - self.trail_steps + 1
-        if pos_tbl.num_rows:
-            steps = pos_tbl.column("step").to_pylist()
-            aids = pos_tbl.column("agent_id").to_pylist()
-            xs = pos_tbl.column("x").to_pylist()
-            ys = pos_tbl.column("y").to_pylist()
-            kinds = pos_tbl.column("kind").to_pylist()
-            prev_step = None
-            for st, aid, k, x, y in zip(steps, aids, kinds, xs, ys):
-                if prev_step is not None and st != prev_step and prev_step >= trail_from:
-                    self._push_trail(prev_step)
-                prev_step = st
-                cur = self.pos.get(aid)
-                if cur is None:
-                    cur = [0.0, 0.0, W_ROAD]
-                    self.pos[aid] = cur
-                op = POS_KINDS[k]
-                if op == "xy":
-                    cur[0], cur[1] = round(float(x), 1), round(float(y), 1)
-                elif op == "in":
-                    cur[0], cur[1], cur[2] = round(float(x), 1), round(float(y), 1), W_INDOOR
-                elif op == "out":
-                    cur[0], cur[1], cur[2] = round(float(x), 1), round(float(y), 1), W_ROAD
-                elif op == "back":
-                    cur[0], cur[1], cur[2] = round(float(x), 1), round(float(y), 1), W_ROAD
-                elif op == "gone":
-                    cur[2] = W_OUTSIDE
-                elif op == "sleep":
-                    cur[2] = W_SLEEP
-                elif op == "wake":
-                    if cur[2] == W_SLEEP:
-                        cur[2] = W_ROAD
-            if prev_step is not None and prev_step >= trail_from:
-                self._push_trail(prev_step)
-
-        # --- 見せ場イベント(ここだけ payload を読む) ---
-        hi_mask = pc.is_in(kind_col, value_set=_pa_array(sorted(HIGHLIGHT_KINDS)))
-        if (pc.sum(pc.cast(hi_mask, "int64")).as_py() or 0) > 0:
-            hi = hi_all.filter(hi_mask)
-            names = self._names_map()
-            for r in hi.to_pylist():
-                kind = r["kind"]
-                self.counts[kind] += 1
-                aid = int(r["agent_id"])
-                sm = r.get("sim_min")
-                sm = int(sm) if sm is not None else self._sim_min(int(r["step"]))
-                self.ticker.append({
-                    "s": int(r["step"]),
-                    "d": sm // 1440,
-                    "t": _fmt_tod(sm),
-                    "a": ("世界" if aid < 0 else names.get(aid, f"agent{aid}")),
-                    "k": kind,
-                    "x": _payload_text(r.get("payload")),
-                })
-
         self.last_step = max_step if self.last_step is None else max(self.last_step, max_step)
         self.parts_read += 1
         try:
@@ -540,6 +593,61 @@ class ChaseState:
         except OSError:
             pass
 
+    def _apply_positions(self, pos_b, prev_step, trail_from: int):
+        """位置イベントの batch 1 個を状態機械に流す。戻り値は次の batch へ引き継ぐ `prev_step`。
+
+        分岐は `viz/make_viewer.py::build_data` と同じ意味論(w だけ 4 値へ畳む)。
+        step が変わった瞬間に「**直前の** step」の残像を積むので、`prev_step` を batch を
+        またいで持ち越すことが「1 part を 1 ループで回していた頃」との同値条件になる。
+        """
+        steps = pos_b.column("step").to_pylist()
+        aids = pos_b.column("agent_id").to_pylist()
+        xs = pos_b.column("x").to_pylist()
+        ys = pos_b.column("y").to_pylist()
+        kinds = pos_b.column("kind").to_pylist()
+        for st, aid, k, x, y in zip(steps, aids, kinds, xs, ys):
+            if prev_step is not None and st != prev_step and prev_step >= trail_from:
+                self._push_trail(prev_step)
+            prev_step = st
+            cur = self.pos.get(aid)
+            if cur is None:
+                cur = [0.0, 0.0, W_ROAD]
+                self.pos[aid] = cur
+            op = POS_KINDS[k]
+            if op == "xy":
+                cur[0], cur[1] = round(float(x), 1), round(float(y), 1)
+            elif op == "in":
+                cur[0], cur[1], cur[2] = round(float(x), 1), round(float(y), 1), W_INDOOR
+            elif op == "out":
+                cur[0], cur[1], cur[2] = round(float(x), 1), round(float(y), 1), W_ROAD
+            elif op == "back":
+                cur[0], cur[1], cur[2] = round(float(x), 1), round(float(y), 1), W_ROAD
+            elif op == "gone":
+                cur[2] = W_OUTSIDE
+            elif op == "sleep":
+                cur[2] = W_SLEEP
+            elif op == "wake":
+                if cur[2] == W_SLEEP:
+                    cur[2] = W_ROAD
+        return prev_step
+
+    def _apply_highlights(self, hi_b, names: dict) -> None:
+        """見せ場イベントの batch 1 個をティッカー(上限つき deque)と件数へ流す。"""
+        for r in hi_b.to_pylist():
+            kind = r["kind"]
+            self.counts[kind] += 1
+            aid = int(r["agent_id"])
+            sm = r.get("sim_min")
+            sm = int(sm) if sm is not None else self._sim_min(int(r["step"]))
+            self.ticker.append({
+                "s": int(r["step"]),
+                "d": sm // 1440,
+                "t": _fmt_tod(sm),
+                "a": ("世界" if aid < 0 else names.get(aid, f"agent{aid}")),
+                "k": kind,
+                "x": _payload_text(r.get("payload")),
+            })
+
     def _push_trail(self, step: int) -> None:
         if self.trail and self.trail[-1][0] == step:
             return
@@ -547,6 +655,12 @@ class ChaseState:
 
     # ---------------------------------------------------------------- L2 取り込み
     def _ingest_l2(self, path: Path) -> None:
+        """L2 part を batch 単位で系列へ足す(L1 と同じ読み方に揃える)。
+
+        L2 は 1 step 1 行なので part が巨大になることはない(そこが L1 との違い)。
+        それでも `read()` を使わないのは、**part を丸ごと Python 化する経路をこのファイルから
+        無くす**ため(構造として「part 全体は実体化しない」を機械検査できる形にする)。
+        """
         import pyarrow.parquet as pq
 
         def _read(p: Path):
@@ -556,27 +670,27 @@ class ChaseState:
                 cols = ["step"] + [k for k, _, _ in SERIES_PREF
                                    if k in head and k != "step"]
                 if "step" not in head or len(cols) <= 1:
-                    return None, None
-                return cols, pf.read(columns=cols)
+                    return False
+                last: dict | None = None
+                for batch in pf.iter_batches(columns=cols, batch_size=BATCH_ROWS):
+                    if batch.num_rows == 0:
+                        continue
+                    rows = batch.to_pylist()
+                    for r in rows:
+                        st = r.get("step")
+                        if st is None:
+                            continue
+                        for k in cols[1:]:
+                            v = r.get(k)
+                            if v is None:
+                                continue
+                            self.series.setdefault(k, []).append([int(st), float(v)])
+                    last = rows[-1]
+                if last is not None:
+                    self._l2_last = {k: last.get(k) for k in cols}
+                return True
 
-        got = self._safe(path, _read, "l2")
-        if got is None:
-            return
-        cols, tbl = got
-        if tbl is None:
-            return
-        rows = tbl.to_pylist()
-        for r in rows:
-            st = r.get("step")
-            if st is None:
-                continue
-            for k in cols[1:]:
-                v = r.get(k)
-                if v is None:
-                    continue
-                self.series.setdefault(k, []).append([int(st), float(v)])
-        if rows:
-            self._l2_last = {k: rows[-1].get(k) for k in cols}
+        self._safe(path, _read, "l2")
 
     # ---------------------------------------------------------------- poll
     def poll(self) -> dict:
@@ -604,6 +718,10 @@ class ChaseState:
         if not path.exists():
             return
         try:
+            # 既読の末尾 step は**足し始める前に**1 回だけ確定させる(batch をまたいでも
+            # 判定が動かない=二重計上しない。従来の一括版と同じ基準)。
+            seen = {k: (v[-1][0] if v else -1) for k, v in self.series.items()}
+            last: dict | None = None
             with _open_shared(path) as fh:        # canonical も同じ非侵襲な開き方で統一
                 pf = pq.ParquetFile(fh)
                 head = pf.schema_arrow.names
@@ -611,25 +729,27 @@ class ChaseState:
                                    if k in head and k != "step"]
                 if len(cols) <= 1:
                     return
-                tbl = pf.read(columns=cols)
-            if tbl.num_rows == 0:
+                # L2 canonical は小さい(1 step 1 行)ので、追いかけ中に読めなかった末尾ぶんだけ
+                # 系列に足して完結させる。**L1 canonical は読まない**(10日ランで巨大 =
+                # 監視プロセスが食い潰す)。ここも batch 単位=常駐は行数に比例しない。
+                for batch in pf.iter_batches(columns=cols, batch_size=BATCH_ROWS):
+                    if batch.num_rows == 0:
+                        continue
+                    rows = batch.to_pylist()
+                    for r in rows:
+                        st = r.get("step")
+                        if st is None:
+                            continue
+                        for k in cols[1:]:
+                            v = r.get(k)
+                            if v is None or int(st) <= seen.get(k, -1):
+                                continue
+                            self.series.setdefault(k, []).append([int(st), float(v)])
+                    last = rows[-1]
+            if last is None:                          # 0 行 = 何も確定させない(従来と同じ)
                 return
-            last = tbl.slice(tbl.num_rows - 1, 1).to_pylist()[0]
             self._l2_last = last
             self.final_step = int(last.get("step") or 0)
-            # L2 canonical は小さい(1 step 1 行)ので、追いかけ中に読めなかった末尾ぶんだけ
-            # 系列に足して完結させる。既読 step より後だけを足すので二重計上しない。
-            # **L1 canonical は読まない**(10日ランで巨大 = 監視プロセスが食い潰す)。
-            seen = {k: (v[-1][0] if v else -1) for k, v in self.series.items()}
-            for r in tbl.to_pylist():
-                st = r.get("step")
-                if st is None:
-                    continue
-                for k in cols[1:]:
-                    v = r.get(k)
-                    if v is None or int(st) <= seen.get(k, -1):
-                        continue
-                    self.series.setdefault(k, []).append([int(st), float(v)])
             if self.last_step is None:
                 self.last_step = self.final_step
         except Exception as exc:                      # 読めなくても画面は出す

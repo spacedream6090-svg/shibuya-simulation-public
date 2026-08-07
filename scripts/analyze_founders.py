@@ -69,20 +69,41 @@ DEF_MAX_CORE = 12         # 組織候補: これを超えるコアは「群集�
 # --------------------------------------------------------------------------- #
 # ローダ(detect_emergence.py と同じ流儀。numpy を引き込まない最小実装)
 # --------------------------------------------------------------------------- #
-def load_events(run_dir: str, dt_min: int = run_dt.CANON_DT_MIN) -> list[dict]:
-    """l1_events.parquet を列射影 + RecordBatch 逐次で読み、payload を dict 展開して返す。
+# W4-D: 本解析が実際に読む kind(5 つの検出器の if/elif を全数列挙したもの)。
+#   起業型 = _VENTURE_KINDS / 政治型 = candidacy・proposal / ハブ型 = relation_tier
+#   + 発受信 3 種 / 日次指標 = 金銭 4 種・opinion_shift・state_update
+#   / 組織候補 = enter_building。
+# ここに無い kind は全ての検出器が必ず読み飛ばすので、絞っても出力は変わらない。
+# 本 module に **全 kind 依存の量は無い**(n_agents は agents.json 由来・
+# 日軸は各検出器が自分の kind の step から作る)ことを確認済み。
+WANT_KINDS = frozenset({
+    "venture_open", "venture_permit", "venture_fulltime",   # 起業型
+    "candidacy", "proposal",                                # 政治型
+    "relation_tier",                                        # 関係グラフ / 日次
+    "speak", "dm", "hear",                                  # 発受信の非対称
+    "wage", "spend", "withdraw", "tax",                     # 家計の日次
+    "opinion_shift", "state_update",                        # 内面の日次
+    "enter_building",                                       # 反復共在(組織候補)
+})
 
-    返り値の各要素: {step, sim_min, agent, kind, payload(dict)}。"""
-    import pyarrow.parquet as pq
 
-    path = os.path.join(run_dir, "l1_events.parquet")
+def load_events(run_dir: str, dt_min: int = run_dt.CANON_DT_MIN,
+                kinds=WANT_KINDS) -> list[dict]:
+    """l1_events.parquet を列射影 + kind 絞り込み + 逐次読みし、payload を dict 展開して返す。
+
+    返り値の各要素: {step, sim_min, agent, kind, payload(dict)}。
+
+    W4-D: 読みは `l1_stream.iter_columns` へ(Arrow レベルで kind を落としてから
+    Python 化する)。`kinds=None` を渡すと全 kind(旧挙動)。返り値・行順・キー順は不変。
+
+    残る比例項: 返り値は list なので **WANT_KINDS の行数**にはメモリが比例する
+    (この解析は「形成前後の窓」を全期間から引くので、対象行は畳めない)。"""
+    import l1_stream as ls
+    if not ls.l1_paths(run_dir):
+        raise FileNotFoundError(os.path.join(run_dir, "l1_events.parquet"))
     want = ["step", "sim_min", "agent_id", "kind", "payload"]
-    available = set(pq.read_schema(path).names)
-    cols = [c for c in want if c in available]
-    pf = pq.ParquetFile(path)
     out: list[dict] = []
-    for batch in pf.iter_batches(columns=cols):
-        d = batch.to_pydict()
+    for d in ls.iter_columns(run_dir, want, kinds=kinds):
         n = len(d["step"])
         step = d["step"]
         smin = d.get("sim_min")

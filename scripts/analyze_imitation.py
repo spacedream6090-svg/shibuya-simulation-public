@@ -79,6 +79,29 @@ BEHAVIOR_FIELDS: dict[str, str | None] = {
 SPEND_EXCLUDE = {"taxi", "bus", "fixed_cost", "medical", "lodging"}
 
 
+# 接触(同席・会話)を作る kind。build_contacts の if/elif の全数。
+_CONTACT_KINDS = frozenset({"speak", "hear", "dm", "joint_activity",
+                            "event_attend", "group_join", "chance_event"})
+
+# W4-D: 本解析が読む kind = 行動語彙(BEHAVIOR_FIELDS)+ 接触(_CONTACT_KINDS)。
+# `behavior_label` は `kind not in BEHAVIOR_FIELDS` で必ず None を返し、
+# `build_contacts` も if/elif で他種を必ず読み飛ばすので、絞っても出力は不変。
+# 全 kind 依存は 2 つ(roster のフォールバック・max_day)で、どちらも列走査へ。
+# 定義の源は上の 2 表なので **写経せず合成する**。
+WANT_KINDS = frozenset(BEHAVIOR_FIELDS) | _CONTACT_KINDS
+
+
+def _load_events(run_dir: str) -> list[dict]:
+    """L1 を `WANT_KINDS` だけ読み、`measure.load_events` と同一形の dict 列で返す。
+
+    残る比例項: 行動イベントと接触イベントの行数(初実行判定が全期間の日次集合を
+    要求するので、行そのものは畳めない)。"""
+    import l1_stream as ls
+    if not ls.l1_paths(run_dir):        # m.load_events と同じく「無ければ落とす」
+        raise FileNotFoundError(os.path.join(run_dir, "l1_events.parquet"))
+    return list(ls.iter_events(run_dir, kinds=WANT_KINDS))
+
+
 def _day_of(e: dict, spd: int = STEPS_PER_DAY) -> int:
     sm = e.get("sim_min")
     if sm is None:
@@ -143,14 +166,17 @@ def build_contacts(events: list[dict], spd: int = STEPS_PER_DAY) -> dict[int, di
 # --------------------------------------------------------------------------- #
 def analyze(run_dir: str, window: int = WINDOW, lag: int = LAG,
             min_doers: int = MIN_DOERS, top_k: int = 20) -> dict:
-    events = m.load_events(run_dir)
+    import l1_stream as ls
+    events = _load_events(run_dir)
     agents = m.load_agents(run_dir)
     name_of = {int(a["id"]): a.get("name", f"a{a['id']}") for a in agents if "id" in a}
-    roster = sorted(name_of) or sorted({e["agent_id"] for e in events if e["agent_id"] >= 0})
+    # roster / max_day は **全 kind** から決まる(街に出た全員・最後にイベントがあった日)。
+    # 絞った events から作ると人と日が落ちるので、専用の列走査に置き換える。
+    roster = sorted(name_of) or sorted(ls.distinct_agent_ids(run_dir))
     run_name = os.path.basename(os.path.normpath(run_dir))
     # W2-3: sim_min 欠損時の後退経路で使う 1 日あたり step 数(Δt=10 なら 144 = 従来と同値)。
     spd = run_dt.steps_per_day(run_dir)
-    max_day = max((_day_of(e, spd) for e in events), default=-1)
+    max_day = ls.max_day(run_dir, spd)
 
     # 行動 X の実行日 exec[X][agent] = set(days) / first_exec[X][agent] = 最小日
     exec_days: dict[str, dict[int, set]] = defaultdict(lambda: defaultdict(set))

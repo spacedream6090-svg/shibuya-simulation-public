@@ -64,6 +64,8 @@ except Exception:                   # 一部環境(パイプ等)では reconfigu
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "src"))
+if _HERE not in sys.path:                # l1_stream(W2-2 の共有逐次読み)用
+    sys.path.insert(0, _HERE)
 
 from society.observer import measure as m  # noqa: E402
 
@@ -90,6 +92,34 @@ _GOV_LABEL = {"nation": "国", "ward": "区", "metro": "都"}
 
 def _day(sim_min: int) -> int:
     return sim_min // MIN_PER_DAY
+
+
+# W4-D: 本観測が読む kind(2 つの観測器の if/elif を全数列挙したもの)。
+#   observe_money     = wage / spend / venture_sale / rent / tax / civic_service /
+#                       reward / rule_bonus / withdraw / deposit
+#   observe_attention = hear / dm / sns_read / sns_like / sns_reshare /
+#                       event_attend / flyer_view
+# どちらの `seen` Counter も **全 kind を数えるが読み出しは自分の種だけ**
+# (money: by_event_kind は kind_amt のキー = 上の 10 種 / 明示 10 行も同じ。
+#  attention: seen[k] は if/elif の中でしか加算されない)なので、絞っても不変。
+# 全 kind 依存は「注意グラフの末尾窓を決める max_day」と「summary の総件数」の 2 つ。
+WANT_KINDS = frozenset({
+    "wage", "spend", "venture_sale", "rent", "tax", "civic_service",
+    "reward", "rule_bonus", "withdraw", "deposit",
+    "hear", "dm", "sns_read", "sns_like", "sns_reshare",
+    "event_attend", "flyer_view",
+})
+
+
+def load_events(run_dir: str) -> list[dict]:
+    """L1 を `WANT_KINDS` だけ読み、`measure.load_events` と同一形の dict 列で返す。
+
+    残る比例項: 金流イベントと注意イベントの行数(どちらも全期間の集計)。
+    """
+    import l1_stream as ls
+    if not ls.l1_paths(run_dir):        # m.load_events と同じく「無ければ落とす」
+        raise FileNotFoundError(os.path.join(run_dir, "l1_events.parquet"))
+    return list(ls.iter_events(run_dir, kinds=WANT_KINDS))
 
 
 # --------------------------------------------------------------------------- #
@@ -355,13 +385,19 @@ _MEDIA_LABEL = "メディア/公式"
 
 
 def observe_attention(events: list[dict], name_of: dict,
-                      window_days: int | None = None) -> dict:
+                      window_days: int | None = None,
+                      max_day: int | None = None) -> dict:
     """有向グラフ(注意を向ける人→向けられる人)。重み=回数。
 
     window_days>0 なら「ラン末尾の N 日」だけに限定する(直近の注意を見る)。
+
+    W4-D: `max_day`(末尾窓の右端)は **全 kind** の最終日で決まる。events を kind
+    絞り読みにすると窓がずれるので、呼び出し側が `l1_stream.max_day` の値を渡す。
+    None なら従来どおり events から決める(= 全件 list を渡す既存経路と逐語同一)。
     """
     ordered = sorted(events, key=lambda ev: ev["step"])
-    max_day = max((_day(e["sim_min"]) for e in ordered), default=0)
+    if max_day is None:
+        max_day = max((_day(e["sim_min"]) for e in ordered), default=0)
     lo_day = (max_day - window_days + 1) if window_days else None
 
     # (attender, target) -> 回数 / チャネル内訳
@@ -672,18 +708,25 @@ def observe(run_dir: str, out_dir: str | None = None,
     out_dir = out_dir or os.path.join(run_dir, "observe_flows")
     os.makedirs(out_dir, exist_ok=True)
 
-    events = m.load_events(run_dir)
+    import l1_stream as ls
+    events = load_events(run_dir)
     agents = m.load_agents(run_dir)
     name_of = {int(a["id"]): a.get("name") for a in (agents or []) if "id" in a}
 
+    # 全 kind 依存の 2 量。max_day は `_day` と同じ規則(sim_min のみ・step 後退なし)。
+    n_events = ls.row_count(run_dir)
+    max_day = max(ls.max_day(run_dir, 1, min_per_day=MIN_PER_DAY,
+                             step_fallback=False), 0)  # 旧: default=0
+
     money = observe_money(events, name_of)
-    attention = observe_attention(events, name_of, window_days=window_days)
+    attention = observe_attention(events, name_of, window_days=window_days,
+                                  max_day=max_day)
 
     run_name = os.path.basename(os.path.normpath(run_dir))
     _dump(os.path.join(out_dir, "money_flows.json"), money)
     _dump(os.path.join(out_dir, "attention.json"), attention)
     write_links_csv(money, os.path.join(out_dir, "money_flows_links.csv"))
-    write_money_md(money, run_name, len(events),
+    write_money_md(money, run_name, n_events,
                    os.path.join(out_dir, "flows_summary.md"))
     write_attention_md(attention, run_name,
                        os.path.join(out_dir, "attention_summary.md"))

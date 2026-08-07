@@ -42,6 +42,35 @@ import run_dt                                 # noqa: E402  (W2-3: ランの Δt
 MIN_PER_STEP = run_dt.CANON_DT_MIN          # 10
 MIN_PER_DAY = 1440                          # 分/日は Δt 非依存(実時間。_day は sim_min 基準)
 
+# W4-D: 本観測が読む kind(2 つの観測器の if/elif を全数列挙したもの)。
+#   observe_visits    = arrive / enter_building / exit_building
+#   observe_interests = drive_request / affect_update / label_adopt / vocab_use /
+#                       search / sns_like / sns_reshare / spend / emotion_label /
+#                       long_goal / media_use / day_plan
+# `observe_interests` は `seen_kinds` に全 kind を数えるが、**読み出すのは上の 7 種
+# だけ**(`seen_kinds.get("affect_update"/"emotion_label"/"long_goal"/"search"/
+# "label_adopt"/"spend"/"media_use")`)なので、絞っても出力は 1 バイトも変わらない。
+# 全 kind 依存は n_agents と summary.md の総件数の 2 つで、どちらも列走査/フッタへ。
+WANT_KINDS = frozenset({
+    "arrive", "enter_building", "exit_building",
+    "drive_request", "affect_update", "label_adopt", "vocab_use", "search",
+    "sns_like", "sns_reshare", "spend", "emotion_label", "long_goal",
+    "media_use", "day_plan",
+})
+
+
+def load_events(run_dir: str) -> list[dict]:
+    """L1 を `WANT_KINDS` だけ読み、`measure.load_events` と同一形の dict 列で返す。
+
+    残る比例項: 訪問イベント(arrive/enter/exit)の行数。滞在時間は enter→exit の
+    ペアリングで測るので、両端を全期間ぶん保持する必要がある(畳めない)。
+    """
+    import l1_stream as ls
+    if not ls.l1_paths(run_dir):        # m.load_events と同じく「無ければ落とす」
+        raise FileNotFoundError(os.path.join(run_dir, "l1_events.parquet"))
+    return list(ls.iter_events(run_dir, kinds=WANT_KINDS))
+
+
 # 建物 kind → 大まかなカテゴリ(POI が無い建物のフォールバック)
 _KIND_TO_CAT = {
     "retail": "shop", "office": "office", "hotel": "hotel", "station": "station",
@@ -653,9 +682,12 @@ def observe(run_dir: str, out_dir: str | None = None) -> str:
     out_dir = out_dir or os.path.join(run_dir, "observe")
     os.makedirs(out_dir, exist_ok=True)
 
-    events = m.load_events(run_dir)
+    import l1_stream as ls
+    events = load_events(run_dir)
     agents = m.load_agents(run_dir)
-    n_agents = len(agents) or (max((e["agent_id"] for e in events), default=-1) + 1)
+    # 全 kind 依存の 2 量(母数・総件数)はフッタ/列走査から取る。
+    n_agents = len(agents) or (ls.max_agent_id(run_dir, nonneg=False) + 1)
+    n_events = ls.row_count(run_dir)
     mp = load_map(run_dir)
 
     visits = observe_visits(events, mp, run_dt.min_per_step(run_dir))
@@ -665,7 +697,7 @@ def observe(run_dir: str, out_dir: str | None = None) -> str:
     _dump(os.path.join(out_dir, "visits.json"), visits)
     _dump(os.path.join(out_dir, "interests.json"), interests)
     write_poi_csv(visits, os.path.join(out_dir, "poi_ranking.csv"))
-    write_summary_md(visits, interests, run_name, len(events), n_agents,
+    write_summary_md(visits, interests, run_name, n_events, n_agents,
                      os.path.join(out_dir, "summary.md"))
     return out_dir
 

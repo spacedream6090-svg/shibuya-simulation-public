@@ -67,6 +67,16 @@ _TRAIT_BLOCKLIST = {"money", "wage", "visitor", "part_time", "account", "balance
 # 収入源: kind -> payload の金額キー(本人 agent_id へ帰属)。
 _INCOME_SRC = {"wage": "amount", "venture_sale": "amount", "deliver": "fare"}
 
+# W4-D: 本解析が payload まで読む kind = 成果側(agent_outcomes)+ 運側(LUCK_KINDS)。
+# `analyze()` はこれを `au.load_events(kinds=...)` に渡す。ここに無い kind は
+# `agent_outcomes` の if/elif も `attribute_chances` の `LUCK_KINDS.get` も必ず
+# 読み飛ばすので、絞っても 1 バイトも出力が変わらない。
+# **例外は「その日 街に居た人」表だけ**で、そちらは全 kind の 2 列走査
+# (`au.scan_presence`)から別途作る。
+_OUTCOME_KINDS = frozenset(_INCOME_SRC) | {
+    "speak", "hear", "dm", "relation_tier", "reputation_update", "sns_like"}
+WANT_KINDS = _OUTCOME_KINDS | frozenset(au.LUCK_KINDS)
+
 
 def agent_outcomes(events: list[dict], residents: set[int]) -> dict[int, dict]:
     """住民ごとの成果 {income, relations, reputation} を L1 から集計する。
@@ -231,15 +241,21 @@ def _pearson(a: list[float], b: list[float]) -> float:
 # --------------------------------------------------------------------------- #
 def decompose(events: list[dict], agents: dict[int, dict],
               traits_by_id: dict[int, dict],
-              spd: int = STEPS_PER_DAY) -> dict:
-    """成果ごとの 実力/運 分散分解 + 住民別散布データ + 共線・小標本の診断を返す。"""
+              spd: int = STEPS_PER_DAY,
+              active_by_day: dict | None = None) -> dict:
+    """成果ごとの 実力/運 分散分解 + 住民別散布データ + 共線・小標本の診断を返す。
+
+    W4-D: `active_by_day` は `au.attribute_chances` の「その日 街に居た人」表。
+    **全 kind 依存**の量なので、`events` を kind 絞り読みにした呼び出し側は
+    `au.scan_presence` 由来の表をここから渡す。None なら従来どおり events から作る。
+    """
     residents = {aid for aid, m in agents.items() if not m.get("visitor")}
     if not residents:                                       # visitor 情報が無い旧ラン等
         residents = {aid for aid in traits_by_id if aid >= 0}
 
     outcomes = agent_outcomes(events, residents)
     sfeat, scols, sinfo = skill_features(agents, traits_by_id, residents)
-    attr = au.attribute_chances(events, agents, spd)
+    attr = au.attribute_chances(events, agents, spd, active_by_day)
     per_agent = attr["per_agent"]                           # {agent: Counter(category->count)}
 
     # 統合行(実力側特徴が揃った住民のみ)。運側 = 偶発曝露の総件数。
@@ -330,10 +346,18 @@ def analyze(run_dir: str, out_dir: str) -> dict:
     run_name = os.path.basename(os.path.normpath(run_dir))
     # W2-3: 「1 日」「sim_min 復元」はこのランの run.dt_min で決まる(Δt=10 なら従来と同値)。
     spd = run_dt.steps_per_day(run_dir)
-    events = au.load_events(run_dir, run_dt.min_per_step(run_dir))
+    # W4-D: L1 は 2 回読む。①本解析が読む kind(= 成果 9 種 + LUCK_KINDS)だけを
+    # payload 付きで ②(step, agent_id) 2 列を全 kind ぶん(在街表・分母・日軸)。
+    events = au.load_events(run_dir, run_dt.min_per_step(run_dir), kinds=WANT_KINDS)
+    presence = au.scan_presence(run_dir, spd)
     agents = au.load_agents(run_dir)
     traits_by_id, trait_names, tsource = measure.load_traits(run_dir)
-    res = decompose(events, agents, traits_by_id, spd)
+    # 在街表を絞る住民集合は **attribute_chances と同じ定義**でなければならない
+    # (decompose 側の traits フォールバックは outcomes 用の別物。混ぜると値が変わる)。
+    attr_residents = {aid for aid, mm in agents.items()
+                      if not mm.get("visitor")} or None
+    res = decompose(events, agents, traits_by_id, spd,
+                    au._active_filtered(presence["active_by_day"], attr_residents))
     res["run"] = run_name
     res["traits_source"] = tsource
     res["traits_available"] = trait_names

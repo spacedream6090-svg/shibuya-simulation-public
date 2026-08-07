@@ -86,6 +86,8 @@ import sys
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "src"))
+if _HERE not in sys.path:                  # l1_stream(W2-2 の共有逐次読み)用
+    sys.path.insert(0, _HERE)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -315,13 +317,34 @@ def render(res: dict) -> str:
     return "\n".join(L) + "\n"
 
 
+def _want_kinds() -> frozenset:
+    """本解析が読む kind = 凍結 2 関数の入力 + 噂の 3 種。
+
+    W4-D: `compare()` は自分では kind を数えるだけで、実質の計算は
+    `measure.agent_features` と `measure.echo_novelty`(どちらも凍結)がする。
+    したがって絞ってよい集合は **凍結関数が読む kind の和** + 自前で数える
+    transmission / rumor_born / rumor_stifle。凍結側の集合は写経せず
+    `l1_stream` の表を参照する(measure.py の AST と機械照合されている)。
+    """
+    import l1_stream as ls
+    return (ls.AGENT_FEATURES_KINDS | ls.ECHO_NOVELTY_KINDS
+            | {"transmission", "rumor_born", "rumor_stifle"})
+
+
 def analyze(run_dir: str) -> dict:
     """ラン 1 本を解析して結果 dict を返す(読み取り専用)。"""
+    import l1_stream as ls
     path = os.path.join(run_dir, "l1_events.parquet")
     if not os.path.isfile(path):
         raise SystemExit(f"[rumor-contamination] l1_events.parquet が無い: {run_dir}")
-    events = m.load_events(run_dir)
-    res = compare(events, m.load_agents(run_dir))
+    # W4-D: 全件 dict 展開 → kind 絞り読み。名簿の合成だけは **全 kind** に現れる
+    # agent_id が要る(噂でしか出てこない個体を落とさないための仕掛けなので、
+    # 絞った list から作ると仕掛けそのものが壊れる)ので agent_id 列を別に走査する。
+    events = list(ls.iter_events(run_dir, kinds=_want_kinds()))
+    agents_meta = m.load_agents(run_dir)
+    if not agents_meta:
+        agents_meta = [{"id": aid} for aid in sorted(ls.distinct_agent_ids(run_dir))]
+    res = compare(events, agents_meta)
     res["run_dir"] = os.path.abspath(run_dir)
     l2 = _l2_final(run_dir)
     if l2:

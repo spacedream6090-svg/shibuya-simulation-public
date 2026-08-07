@@ -168,6 +168,33 @@ def test_attention_provenance_and_exclusion():
     assert "渋谷" not in terms                         # ホワイトリスト断片は除外
 
 
+def test_attention_tie_order_is_deterministic():
+    """W4-D 検収で発見した決定論バグの回帰(2026-08-08 修正)。
+
+    (n_agents, occurrences, first_step) が同値の語は、修正前は occ dict の挿入順
+    (= set(_tokenize) 反復順 = PYTHONHASHSEED 依存)で並び、同一ランを2回通すだけで
+    順序が変わっていた(実測 297 件中 51 件)。term を最終タイブレークに置いたので、
+    入力レコードの並びを逆にしても出力は同一・同値語は term 昇順で並ぶ。"""
+    def _both(term_a, term_b):
+        recs = []
+        for term in (term_a, term_b):
+            recs += [_rec(0, 1, f"{term}が気になる"),
+                     _rec(5, 2, f"{term}いいね"),
+                     _rec(10, 3, f"{term}最高")]
+        return recs
+
+    fwd = de.detect_attention(_both("パルソニア", "ガルベリン"),
+                              window_steps=24, min_agents=3)
+    rev = de.detect_attention(_both("ガルベリン", "パルソニア"),
+                              window_steps=24, min_agents=3)
+    assert fwd == rev, "入力順(=dict挿入順)が出力順に漏れている"
+    tied = [a["term"] for a in fwd
+            if (a["n_agents"], a["occurrences"], a["first_step"]) ==
+               (fwd[0]["n_agents"], fwd[0]["occurrences"], fwd[0]["first_step"])]
+    assert tied == sorted(tied), "同値語が term 昇順になっていない"
+    assert {"パルソニア", "ガルベリン"} <= {a["term"] for a in fwd}
+
+
 # --------------------------------------------------------------------------- #
 # 5. extract_text_records の reflect 条件(written_back のみ)
 # --------------------------------------------------------------------------- #

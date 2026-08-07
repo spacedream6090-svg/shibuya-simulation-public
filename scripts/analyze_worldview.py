@@ -37,6 +37,8 @@ from collections import Counter, defaultdict
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "src"))
+if _HERE not in sys.path:                           # l1_stream(共有の逐次読み)用
+    sys.path.insert(0, _HERE)
 
 # Windows コンソール(cp932)対策。ファイル出力は常に UTF-8。
 if hasattr(sys.stdout, "reconfigure"):
@@ -50,6 +52,21 @@ MIN_PER_DAY = 1440
 # C6/可制御性の分岐で「開拓的行動」とみなす kind(worldview.py の _PIONEER_KINDS と一致)。
 # いずれも agent_id = 行為者。
 _PIONEER_KINDS = ("venture_open", "proposal", "event_host", "group_found")
+
+# W4-D: 本解析が読む kind(5 用途の抽出条件を全数列挙したもの)。
+#   ① 世界観パネル = worldview
+#   ② 開拓的行動   = _PIONEER_KINDS + free_action
+#   ③ 共有事象     = weather / disaster / proposal_passed / ad_campaign
+#   ④ 発話 valence = speak / sns_post
+#   ⑤ 信念テキスト = reflect
+# ここに無い kind はどの抽出も `!=` / `not in` で必ず読み飛ばすので、絞っても不変。
+# 唯一の全 kind 依存は n_agents のフォールバックで、そちらは agent_id 列走査へ。
+# ② は上の定数を **写経せず合成する**。
+WANT_KINDS = frozenset(_PIONEER_KINDS) | {
+    "worldview", "free_action",
+    "weather", "disaster", "proposal_passed", "ad_campaign",
+    "speak", "sns_post", "reflect",
+}
 # 悪天(共有事象)とみなす天気(weather の cond は 晴/曇/雨/雪 の4値)。
 _BAD_WEATHER = {"雨", "雪"}
 # belief 世界観クラスタの類似閾値(文字3-gram コサイン。>= で同クラスタ)。
@@ -89,6 +106,18 @@ def _day_of(sim_min: int) -> int:
 # --------------------------------------------------------------------------- #
 # worldview イベントの分解
 # --------------------------------------------------------------------------- #
+def load_events(run_dir: str) -> list[dict]:
+    """L1 を `WANT_KINDS` だけ読み、`measure.load_events` と同一形の dict 列で返す。
+
+    残る比例項: 世界観行(agent × 日)と発話テキストの行数。どちらも
+    「全期間の系列」「共有事象の前後 24h」を測る定義なので畳めない。
+    """
+    import l1_stream as ls
+    if not ls.l1_paths(run_dir):        # m.load_events と同じく「無ければ落とす」
+        raise FileNotFoundError(os.path.join(run_dir, "l1_events.parquet"))
+    return list(ls.iter_events(run_dir, kinds=WANT_KINDS))
+
+
 def split_worldview(events: list[dict]) -> tuple[list[dict], list[dict]]:
     """L1 から worldview イベントを (agent 行, 街 行) に分ける。day = sim_min//1440。"""
     agent_rows: list[dict] = []
@@ -681,16 +710,22 @@ def analyze(run_dir: str, out_md: str | None = None,
             events: list[dict] | None = None,
             agents: list[dict] | None = None) -> dict:
     """単一ランの世界解釈分析。events/agents をメモリで渡せば L1 を読まない。"""
+    import l1_stream as ls
     run_name = os.path.basename(os.path.normpath(run_dir))
+    from_memory = events is not None            # events を渡された経路は逐語温存
     if events is None:
-        events = m.load_events(run_dir)
+        events = load_events(run_dir)
     if agents is None:
         agents = m.load_agents(run_dir)
     out_md = out_md or os.path.join(run_dir, "worldview_report.md")
 
     agent_rows, city_rows = split_worldview(events)
     off_run = not agent_rows and not city_rows
-    n_agents = len(agents) or (max((e["agent_id"] for e in events), default=-1) + 1)
+    # n_agents は **全 kind** に現れる agent_id の最大値から決まる。events を渡された
+    # ときはそれが唯一の情報源なので従来式のまま、L1 から読んだときは列走査へ。
+    n_agents = len(agents) or (
+        (max((e["agent_id"] for e in events), default=-1) + 1) if from_memory
+        else (ls.max_agent_id(run_dir, nonneg=False) + 1))
 
     if off_run:
         md = write_report(out_md, run_name, True, 0, {}, {}, {}, {}, {}, n_agents, 0)

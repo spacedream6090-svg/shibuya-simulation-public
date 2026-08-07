@@ -96,6 +96,42 @@ except ImportError:                                     # src を import でき�
 DEFAULT_BATCH_ROWS = 131_072
 L1_STEM = "l1_events"
 
+# --------------------------------------------------------------------------- #
+# W4-D: **凍結側(observer/measure.py)の関数が読む kind 集合**
+#
+# 解析スクリプトの多くは自分の集計に加えて `measure.agent_features` /
+# `measure.item_cascades` に同じ events を渡す。絞り読みに切り替えるとき、
+# 「自分が読む kind」だけで絞ると**凍結関数の入力が痩せて出力が変わる**。
+# measure.py は 1 バイトも触れないので、ここに *読み取って写した* 表を置く。
+# 定義の単一の源はあくまで measure.py 側で、この写しが古びていないことは
+# `tests/test_l1_stream_migration.py` が **measure.py の AST から機械抽出して**
+# 突き合わせる(人手の同期に頼らない)。
+# --------------------------------------------------------------------------- #
+AGENT_FEATURES_KINDS = frozenset({
+    # _item_creators
+    "vocab_coin", "label_coin",
+    # _tool_features
+    "event_host", "event_attend", "flyer_view", "group_found", "group_join",
+    "proposal", "proposal_support", "venture_open", "venture_sale",
+    # agent_features 本体
+    "institution", "institution_rule", "arrive", "sns_post", "transmission",
+    "label_adopt", "speak", "hear", "dm", "reflect", "llm_deliberate",
+    "drive_request", "opinion_shift", "sns_like", "sns_reshare",
+})
+
+ITEM_CASCADES_KINDS = frozenset({
+    "transmission",            # item_cascades 本体
+    "vocab_coin", "label_coin",  # _item_creators
+})
+
+ECHO_NOVELTY_KINDS = frozenset({
+    "speak", "sns_post", "dm",   # _UTTERANCE_KINDS
+    "transmission", "label_adopt",
+})
+
+# `measure.communities` / `_conversation_adj`(会話グラフ)が読む kind。
+COMMUNITIES_KINDS = frozenset({"speak", "dm"})
+
 
 # --------------------------------------------------------------------------- #
 # パス解決(canonical 優先・無ければ完結 part 群)
@@ -200,6 +236,111 @@ def max_step(run_dir, stem: str = L1_STEM) -> int:
                     if v is not None and int(v) > mx:
                         mx = int(v)
     return int(mx)
+
+
+def max_agent_id(run_dir, *, nonneg: bool = True, stem: str = L1_STEM) -> int:
+    """L1 に現れる最大 agent_id。**agent_id 列 1 本しか読まない**(メモリ O(batch))。
+
+    W4-D: 解析側に散在する
+    `n_agents = len(agents) or (max(e["agent_id"] for e in events if ...) + 1)`
+    という**全 kind 依存**のフォールバックを、kind 絞り込みと両立させるための部品。
+    絞り読みに切り替えた解析でこの式をそのまま残すと、絞られた kind にしか出ない
+    エージェントが数から落ちて**出力が変わる**。ここだけ全 kind を 1 列で見る。
+
+    `nonneg=True`(既定)は `agent_id >= 0` の行だけを見る(= 世界イベント -1 を除く
+    呼び出し側の書き方に合わせる)。該当が無ければ **-1**(= 元の式の `default=-1`)。
+    """
+    mx = -1
+    for path in l1_paths(run_dir, stem):
+        with _open_shared(path) as fh:
+            pf = pq.ParquetFile(fh)
+            if "agent_id" not in pf.schema_arrow.names:
+                continue
+            for batch in pf.iter_batches(columns=["agent_id"],
+                                         batch_size=DEFAULT_BATCH_ROWS):
+                col = batch.column(0)
+                if nonneg:
+                    col = col.filter(pc.fill_null(
+                        pc.greater_equal(col, pa.scalar(0, col.type)), False))
+                if len(col) == 0:
+                    continue
+                v = pc.max(col).as_py()
+                if v is not None and int(v) > mx:
+                    mx = int(v)
+    return int(mx)
+
+
+def max_day(run_dir, spd: int, *, min_per_day: int = 1440,
+            step_fallback: bool = True, stem: str = L1_STEM) -> int:
+    """L1 全体の最終**暦日**。`sim_min // min_per_day`(欠損行だけ `step // spd`)。
+
+    `step_fallback=False` は **sim_min だけ**で決める(`observe_flows._day` のように
+    step への後退を持たない呼び出し側に合わせる。sim_min 列が無ければ -1)。
+
+    W4-D: 解析側の `_day_of(e, spd)`(analyze_structure ほか)と**同じ規則**を
+    Arrow 上で評価する。日軸 `days = range(0, max_day + 1)` は「どの kind でもいい
+    から最後にイベントがあった日」で決まるので、kind 絞り読みに切り替えると
+    **系列の長さが変わりうる**。ここだけ 2 列(step, sim_min)を全 kind ぶん見る。
+
+    Python オブジェクトは 1 個も作らない(pyarrow の compute だけで畳む)。空なら -1。
+    """
+    mx = -1
+    for path in l1_paths(run_dir, stem):
+        with _open_shared(path) as fh:
+            pf = pq.ParquetFile(fh)
+            names = set(pf.schema_arrow.names)
+            cols = [c for c in ("step", "sim_min") if c in names]
+            if not step_fallback:
+                cols = [c for c in cols if c == "sim_min"]
+            if not cols:
+                continue
+            for batch in pf.iter_batches(columns=cols,
+                                         batch_size=DEFAULT_BATCH_ROWS):
+                if "sim_min" in cols:
+                    sm = pc.cast(batch.column("sim_min"), pa.int64())
+                    day = pc.divide(sm, pa.scalar(int(min_per_day), pa.int64()))
+                    if "step" in cols:
+                        step = pc.cast(batch.column("step"), pa.int64())
+                        day = pc.if_else(
+                            pc.is_null(sm),
+                            pc.divide(step, pa.scalar(int(spd), pa.int64())), day)
+                else:
+                    step = pc.cast(batch.column("step"), pa.int64())
+                    day = pc.divide(step, pa.scalar(int(spd), pa.int64()))
+                v = pc.max(day).as_py()
+                if v is not None and int(v) > mx:
+                    mx = int(v)
+    return int(mx)
+
+
+def distinct_agent_ids(run_dir, *, nonneg: bool = True,
+                       stem: str = L1_STEM) -> set:
+    """L1 に現れる distinct な agent_id の集合。**agent_id 列 1 本しか読まない**。
+
+    `max_agent_id` と同じ理由(全 kind 依存のフォールバック式を絞り読みと両立させる)
+    の部品。集合そのものは **distinct agent 数に比例して残る**(在場 25万なら 25万要素)
+    — これは指標の定義がそう要求しているのであって、畳めない。畳めたのは
+    「そのために全 kind の payload を dict 化していた」ぶんである。
+    """
+    out: set = set()
+    for path in l1_paths(run_dir, stem):
+        with _open_shared(path) as fh:
+            pf = pq.ParquetFile(fh)
+            if "agent_id" not in pf.schema_arrow.names:
+                continue
+            for batch in pf.iter_batches(columns=["agent_id"],
+                                         batch_size=DEFAULT_BATCH_ROWS):
+                col = batch.column(0)
+                if nonneg:
+                    col = col.filter(pc.fill_null(
+                        pc.greater_equal(col, pa.scalar(0, col.type)), False))
+                if len(col) == 0:
+                    continue
+                for st in pc.value_counts(col):
+                    v = st["values"].as_py()
+                    if v is not None:
+                        out.add(int(v))
+    return out
 
 
 def kind_counts(run_dir, stem: str = L1_STEM) -> Counter:
@@ -414,7 +555,10 @@ def table_rows(path) -> int:
 
 __all__ = [
     "DEFAULT_BATCH_ROWS", "L1_COLUMNS", "L1_INT_COLUMNS", "L1_STEM",
-    "l1_paths", "row_count", "max_step", "kind_counts",
+    "AGENT_FEATURES_KINDS", "ITEM_CASCADES_KINDS", "ECHO_NOVELTY_KINDS",
+    "COMMUNITIES_KINDS",
+    "l1_paths", "row_count", "max_step", "max_day", "max_agent_id",
+    "distinct_agent_ids", "kind_counts",
     "iter_record_batches", "iter_columns", "iter_events",
     "iter_table_columns", "table_schema", "table_rows",
 ]

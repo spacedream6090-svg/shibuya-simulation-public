@@ -86,6 +86,41 @@ DIR_W = {"face": 1.0, "dm": 2.0, "sns_like": 0.5, "sns_reshare": 1.0, "event": 1
 
 
 # --------------------------------------------------------------------------- #
+# W4-D: 本解析が読む kind(4 用途 + 凍結関数 1 本)
+#   ① 窓グラフ   = speak / hear / dm / sns_like / sns_reshare / event_attend / event_host
+#   ② 滞在エリア = arrive / enter_building
+#   ③ 成果帰属   = event_host / event_attend / group_found / venture_open /
+#                  venture_sale / proposal / proposal_support / institution_rule
+#   ④ 造語の窓帰属 = vocab_coin / label_coin
+#   ⑤ `measure.item_cascades`(凍結)= transmission + 造語 2 種
+# ここに無い kind は ①〜④ の if/elif も凍結側も必ず読み飛ばすので、絞っても出力は不変。
+# 全 kind 依存は 2 つ(n_agents の母数・窓数を決める最終 step)で、どちらも
+# `l1_stream` の列走査/フッタ読みに置き換えてある。
+# --------------------------------------------------------------------------- #
+def _want_kinds() -> frozenset:
+    import l1_stream as ls
+    return frozenset({
+        "speak", "hear", "dm", "sns_like", "sns_reshare",           # ①
+        "event_attend", "event_host",
+        "arrive", "enter_building",                                  # ②
+        "group_found", "venture_open", "venture_sale",               # ③
+        "proposal", "proposal_support", "institution_rule",
+        "vocab_coin", "label_coin",                                  # ④
+    }) | ls.ITEM_CASCADES_KINDS                                      # ⑤
+
+
+def load_events(run_dir: str) -> list[dict]:
+    """L1 を `_want_kinds()` だけ読み、`measure.load_events` と同一形の dict 列で返す。
+
+    残る比例項: 会話・成果イベントの行数(窓ごとにグラフを組み直すので全期間ぶん要る)。
+    """
+    import l1_stream as ls
+    if not ls.l1_paths(run_dir):        # m.load_events と同じく「無ければ落とす」
+        raise FileNotFoundError(os.path.join(run_dir, "l1_events.parquet"))
+    return list(ls.iter_events(run_dir, kinds=_want_kinds()))
+
+
+# --------------------------------------------------------------------------- #
 # 補助(決定論の丸め・Jaccard)
 # --------------------------------------------------------------------------- #
 def _r(x: float, nd: int = 6) -> float:
@@ -699,16 +734,17 @@ def analyze(run_dir: str, window_days: int = 7,
     global TAU, GAMMA
     TAU, GAMMA = tau, gamma
 
-    events = m.load_events(run_dir)
+    import l1_stream as ls
+    events = load_events(run_dir)
     agents = m.load_agents(run_dir)
-    n_agents = len(agents) or (max((e["agent_id"] for e in events
-                                    if e["agent_id"] >= 0), default=-1) + 1)
+    # 全 kind 依存の 2 量(母数・窓数を決める最終 step)は列走査/フッタから取る。
+    n_agents = len(agents) or (ls.max_agent_id(run_dir) + 1)
     orgs = org_labels(agents)
     run_name = os.path.basename(os.path.normpath(run_dir))
 
     # W2-3: 窓幅は「日数 × このランの 1 日あたり step 数」(Δt=10 で 144 = 従来と同値)。
     window_steps = max(int(window_days) * run_dt.steps_per_day(run_dir), 1)
-    max_step = max((e["step"] for e in events), default=0)
+    max_step = max(ls.max_step(run_dir), 0)   # 旧: max(events の step, default=0)
 
     # 窓ごとにイベントを振り分け(step 昇順は保たない=窓内順序は元の行順で十分)
     win_events: list[list[dict]] = []

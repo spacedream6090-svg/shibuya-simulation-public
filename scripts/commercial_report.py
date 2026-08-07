@@ -37,6 +37,8 @@ from collections import Counter, defaultdict
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "src"))
+if _HERE not in sys.path:                # l1_stream(W2-2 の共有逐次読み)用
+    sys.path.insert(0, _HERE)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -49,6 +51,32 @@ MIN_PER_DAY = 1440                                  # 分/日は Δt 非依存(�
 STEPS_PER_DAY = run_dt.CANON_STEPS_PER_DAY
 _CONV_WINDOW_MIN = 3 * MIN_PER_DAY                    # 広告→来店の帰属窓(3日)= research §2.3
 _HUFF_BETA = 2.0                                     # Huff 距離減衰 b(research §1 KPI#4)
+
+# W4-D: 本レポートが読む kind(6 観点の抽出条件を全数列挙したもの)。
+#   来店/滞在 = enter_building / exit_building   回遊 = move_segment
+#   売上       = spend                            広告 = ad_exposure / price_change
+#   語の普及   = label_adopt / transmission / sns_reshare
+#   催事       = event_host / annual_event        暦   = weather(曜日マップ)
+# ここに無い kind はどの抽出も必ず読み飛ばすので、絞っても出力は不変。
+# 全 kind 依存は 3 つ(n_agents・n_steps・総件数)で、いずれも列走査/フッタへ。
+WANT_KINDS = frozenset({
+    "enter_building", "exit_building", "move_segment", "spend",
+    "ad_exposure", "price_change",
+    "label_adopt", "transmission", "sns_reshare",
+    "event_host", "annual_event", "weather",
+})
+
+
+def load_events(run_dir: str) -> list[dict]:
+    """L1 を `WANT_KINDS` だけ読み、`measure.load_events` と同一形の dict 列で返す。
+
+    残る比例項: 来店・回遊・消費イベントの行数(セッション化が enter→exit の
+    ペアリングなので、両端を全期間ぶん保持する必要がある)。
+    """
+    import l1_stream as ls
+    if not ls.l1_paths(run_dir):        # m.load_events と同じく「無ければ落とす」
+        raise FileNotFoundError(os.path.join(run_dir, "l1_events.parquet"))
+    return list(ls.iter_events(run_dir, kinds=WANT_KINDS))
 
 _SPEND_CATS = ["food", "shop", "nightlife", "taxi", "bus", "lodging",
                "medical", "fixed_cost", "other"]
@@ -909,12 +937,15 @@ def _dump_parquets(out_panel: str, foot, sales, trends) -> None:
 
 # --------------------------------------------------------------------------- #
 def report(run_dir: str, out_md: str | None = None) -> dict:
-    events = m.load_events(run_dir)
+    import l1_stream as ls
+    events = load_events(run_dir)
     agents = m.load_agents(run_dir)
     mp = load_map(run_dir)
     run_name = os.path.basename(os.path.normpath(run_dir))
-    n_agents = len(agents) or (max((e["agent_id"] for e in events), default=-1) + 1)
-    n_steps = max((e["step"] for e in events), default=-1) + 1
+    # 全 kind 依存の 3 量(母数・ラン長・総件数)は列走査/フッタから取る。
+    n_agents = len(agents) or (ls.max_agent_id(run_dir, nonneg=False) + 1)
+    n_steps = ls.max_step(run_dir) + 1
+    n_events = ls.row_count(run_dir)
     # W2-3: 「1 日」はこのランの run.dt_min で決まる(Δt=10 なら 144 = 従来と同値)。
     spd = run_dt.steps_per_day(run_dir)
     n_days = -(-n_steps // spd) if n_steps else 0
@@ -934,7 +965,7 @@ def report(run_dir: str, out_md: str | None = None) -> dict:
     sales = analyze_sales(events, sessions, agents, mp, weekday_of)
     trends = analyze_trends(events, sessions, mp, n_days, spd)
 
-    md = render(run_name, len(events), n_agents, n_days, mp, foot, ads, sales,
+    md = render(run_name, n_events, n_agents, n_days, mp, foot, ads, sales,
                 trends, circ)
     out_md = out_md or os.path.join(run_dir, "commercial_report.md")
     with open(out_md, "w", encoding="utf-8") as fh:

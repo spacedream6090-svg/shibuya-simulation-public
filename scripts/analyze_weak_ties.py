@@ -50,6 +50,8 @@ except Exception:
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "src"))
+if _HERE not in sys.path:                # l1_stream(W2-2 の共有逐次読み)用
+    sys.path.insert(0, _HERE)
 
 from society.observer import measure as m  # noqa: E402
 
@@ -169,11 +171,35 @@ def attribute_adoptions(events: list[dict]) -> list[tuple]:
 # --------------------------------------------------------------------------- #
 # メイン解析
 # --------------------------------------------------------------------------- #
+# W4-D: 本解析が読む kind。
+#   接触グラフ = speak / dm(`measure.communities` の入力チャネルと同一)
+#   採用の帰属 = transmission / label_adopt
+# ここに無い kind は `build_weighted_graph` / `attribute_adoptions` /
+# `measure._conversation_adj` のいずれもが必ず読み飛ばすので、絞っても出力は不変。
+# 唯一の全 kind 依存は n_agents のフォールバックで、そちらは agent_id 列走査へ。
+WANT_KINDS = frozenset({"speak", "dm", "transmission", "label_adopt"})
+
+
+def _load_events(run_dir: str) -> list[dict]:
+    """L1 を `WANT_KINDS` だけ読み、`measure.load_events` と同一形の dict 列で返す。
+
+    W4-D: `m.load_events` の全件 RAM 展開をやめ、`l1_stream.iter_events` の
+    Arrow レベル kind 絞り込みへ。残る比例項は「speak/dm/transmission/label_adopt の
+    行数」で、これは接触グラフと採用系譜の定義そのもの(畳めない)。
+    """
+    import l1_stream as ls
+    if not ls.l1_paths(run_dir):        # m.load_events と同じく「無ければ落とす」
+        raise FileNotFoundError(os.path.join(run_dir, "l1_events.parquet"))
+    return list(ls.iter_events(run_dir, kinds=WANT_KINDS))
+
+
 def analyze(run_dir: str, min_strength: int = MIN_STRENGTH, top_k: int = 15) -> dict:
-    events = m.load_events(run_dir)
+    import l1_stream as ls
+    events = _load_events(run_dir)
     agents = m.load_agents(run_dir)
-    n_agents = len(agents) or (max((e["agent_id"] for e in events
-                                    if e["agent_id"] >= 0), default=-1) + 1)
+    # n_agents は **全 kind** に現れる agent_id の最大値から決まる(会話に一度も
+    # 出てこない個体も母数に入る)。絞った events から取ると数が減るので列走査へ。
+    n_agents = len(agents) or (ls.max_agent_id(run_dir) + 1)
     name_of = {int(a["id"]): a.get("name", f"a{a['id']}") for a in agents if "id" in a}
     run_name = os.path.basename(os.path.normpath(run_dir))
 

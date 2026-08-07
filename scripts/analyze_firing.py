@@ -80,6 +80,8 @@ import pyarrow.parquet as pq
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
+if str(REPO_ROOT / "scripts") not in sys.path:      # l1_stream(共有の逐次読み)用
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from society.cognition import channels as CH          # noqa: E402
 from society.cognition import fire as FIRE            # noqa: E402
@@ -257,29 +259,41 @@ WANTED = frozenset(COG_KINDS) | frozenset(CAUSE_KINDS) | {"watch_spec"}
 
 
 def load_events(run_dir: Path) -> dict:
-    path = Path(run_dir) / "l1_events.parquet"
-    if not path.exists():
-        raise SystemExit(f"L1 が無い: {path}")
-    table = pq.read_table(path, columns=["step", "sim_min", "agent_id", "kind",
-                                         "x", "y", "payload"])
-    cols = {name: table.column(name).to_pylist() for name in table.column_names}
+    """L1 から `WANTED` の 3 種族(cog / 原因 / watch_spec)だけを読み出す。
+
+    W4-D: 旧実装は `pq.read_table(...).to_pylist()` で **7 列 × 全行**を Python の
+    list にしてから `if kind not in WANTED: continue` で捨てていた。捨てる行の
+    Python オブジェクト生成費が全体の支配項だったので、`l1_stream.iter_columns`
+    の **Arrow レベル kind 絞り込み**に置き換える。
+
+    O(1) 化するもの / 残るもの(正直な注記):
+      - 捨てる行のオブジェクト生成 … **消える**(pyarrow の filter が先に効く)。
+      - `cog` / `causes` / `watch` の蓄積 … **残る**。この解析は「発火 1 件ごとに
+        直前 step の原因候補を引く」ものなので、対象行そのものは全期間ぶん要る。
+      - 生 payload の JSON 復号は `WANTED` の行にしか起きない。
+
+    返り値・行順・`cog` のソートキーは 1 バイトも変えていない(payload の
+    `json.loads` も**旧実装の逐語**=壊れた JSON は従来どおり例外になる)。"""
+    import l1_stream as ls
+    if not ls.l1_paths(run_dir):
+        raise SystemExit(f"L1 が無い: {Path(run_dir) / 'l1_events.parquet'}")
     cog: list[dict] = []
     causes: dict[tuple[int, str], list[dict]] = {}
     watch: list[dict] = []
-    for i, kind in enumerate(cols["kind"]):
-        if kind not in WANTED:
-            continue
-        blob = cols["payload"][i]
-        rec = json.loads(blob) if blob else {}
-        row = {"step": int(cols["step"][i]), "sim_min": int(cols["sim_min"][i]),
-               "agent_id": int(cols["agent_id"][i]), "kind": kind,
-               "x": float(cols["x"][i]), "y": float(cols["y"][i]), "p": rec}
-        if kind in COG_KINDS:
-            cog.append(row)
-        elif kind == "watch_spec":
-            watch.append(row)
-        else:
-            causes.setdefault((row["step"], kind), []).append(row)
+    for cols in ls.iter_columns(run_dir, ["step", "sim_min", "agent_id", "kind",
+                                          "x", "y", "payload"], kinds=WANTED):
+        for i, kind in enumerate(cols["kind"]):
+            blob = cols["payload"][i]
+            rec = json.loads(blob) if blob else {}
+            row = {"step": int(cols["step"][i]), "sim_min": int(cols["sim_min"][i]),
+                   "agent_id": int(cols["agent_id"][i]), "kind": kind,
+                   "x": float(cols["x"][i]), "y": float(cols["y"][i]), "p": rec}
+            if kind in COG_KINDS:
+                cog.append(row)
+            elif kind == "watch_spec":
+                watch.append(row)
+            else:
+                causes.setdefault((row["step"], kind), []).append(row)
     cog.sort(key=lambda r: (r["sim_min"], r["agent_id"], r["kind"]))
     return {"cog": cog, "causes": causes, "watch": watch}
 

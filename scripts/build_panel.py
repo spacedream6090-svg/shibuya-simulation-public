@@ -87,29 +87,45 @@ def _gini(values) -> float | None:
 # --------------------------------------------------------------------------- #
 # stage0: 検証
 # --------------------------------------------------------------------------- #
-def validate_stage0(events: list[dict], n_steps: int) -> dict:
-    """schema 照合・step 欠落・重複を検査した検証サマリを返す。"""
-    kinds = Counter(e["kind"] for e in events)
+# W4-D: stage1〜4(パネル本体)が **kind を見て**読む種。全 kind 依存の 3 量
+# (stage0 検証・資産追跡・roster フォールバック)は絞れないので、`scan_all_kinds`
+# が別途 **絞らずに** 1 パス回す(下の docstring 参照)。
+#   agent×日 = wake_up / wage / spend / speak / hear / sns_post / sns_like /
+#              sns_reshare / move_segment / enter_building / exit_building / arrive
+#   run×日   = spend / wage / speak / sns_post / crime / enter_building /
+#              label_adopt / transmission
+#   活動再構成 = move_segment / ride / media_use / sleep_start / lodging_checkin /
+#              enter_building / exit_building / weather
+#   曜日マップ = weather
+WANT_KINDS = frozenset({
+    "wake_up", "wage", "spend", "speak", "hear", "sns_post",
+    "sns_like", "sns_reshare", "move_segment", "enter_building",
+    "exit_building", "arrive", "crime", "label_adopt", "transmission",
+    "weather", "ride", "media_use", "sleep_start", "lodging_checkin",
+})
+
+
+def load_events(run_dir: str) -> list[dict]:
+    """L1 を `WANT_KINDS` だけ読み、`measure.load_events` と同一形の dict 列で返す。
+
+    残る比例項: パネルは「agent × 日」の全セルを埋めるので、対象 kind の行は
+    全期間ぶん要る(move_segment/enter_building が支配項)。
+    """
+    import l1_stream as ls
+    if not ls.l1_paths(run_dir):        # m.load_events と同じく「無ければ落とす」
+        raise FileNotFoundError(os.path.join(run_dir, "l1_events.parquet"))
+    return list(ls.iter_events(run_dir, kinds=WANT_KINDS))
+
+
+def _stage0_result(n_events: int, kinds: Counter, steps_present: set,
+                   dup: int, n_steps: int) -> dict:
+    """stage0 の 4 素材 → 検証サマリ。**判定式の単一の源**(2 経路が共有する)。"""
     registered = set(EVENT_KINDS)
     unknown = sorted(k for k in kinds if k not in registered)
-
-    steps_present = {e["step"] for e in events}
     expected = set(range(int(n_steps))) if n_steps else set()
     missing = sorted(expected - steps_present) if expected else []
-
-    # 完全重複(同一 step・sim_min・agent・kind・payload)。決定論 sim では 0 が期待値。
-    seen: set = set()
-    dup = 0
-    for e in events:
-        key = (e["step"], e["sim_min"], e["agent_id"], e["kind"],
-               json.dumps(e["payload"], ensure_ascii=False, sort_keys=True))
-        if key in seen:
-            dup += 1
-        else:
-            seen.add(key)
-
     return {
-        "n_events": len(events),
+        "n_events": n_events,
         "n_kinds": len(kinds),
         "unknown_kinds": unknown,             # schema 未登録の kind(あれば要注意)
         "n_unknown_kind_events": sum(kinds[k] for k in unknown),
@@ -122,6 +138,109 @@ def validate_stage0(events: list[dict], n_steps: int) -> dict:
     }
 
 
+def _dup_key(e: dict):
+    """完全重複の判定キー(同一 step・sim_min・agent・kind・payload)。"""
+    return (e["step"], e["sim_min"], e["agent_id"], e["kind"],
+            json.dumps(e["payload"], ensure_ascii=False, sort_keys=True))
+
+
+def validate_stage0(events: list[dict], n_steps: int) -> dict:
+    """schema 照合・step 欠落・重複を検査した検証サマリを返す。"""
+    kinds = Counter(e["kind"] for e in events)
+    steps_present = {e["step"] for e in events}
+
+    # 完全重複(同一 step・sim_min・agent・kind・payload)。決定論 sim では 0 が期待値。
+    seen: set = set()
+    dup = 0
+    for e in events:
+        key = _dup_key(e)
+        if key in seen:
+            dup += 1
+        else:
+            seen.add(key)
+
+    return _stage0_result(len(events), kinds, steps_present, dup, n_steps)
+
+
+def scan_all_kinds(run_dir: str, n_steps: int, agents: list[dict] | None = None,
+                   spd: int = STEPS_PER_DAY) -> dict:
+    """**全 kind に依存する 3 つの量**を L1 の 1 パス逐次読みでまとめて作る。
+
+    W4-D: 本 module には kind で絞れない量が 3 つある。絞れないものを絞ったふりは
+    せず、代わりに **「全件を Python の list に積む」のをやめる**(row-group 逐次)。
+
+      ① stage0 検証(`validate_stage0` と同じ dict)
+         未知 kind の検出・step 欠落・完全重複は、どれも「全イベント」が定義。
+
+      ② 資産追跡 `wealth_day`
+         `build_agent_day` は **kind を見ずに** `payload` に `balance` / `account`
+         があれば最新値として拾う(wage/spend/withdraw/rent/venture_sale/
+         rule_bonus/deposit/loan_* …)。どの kind が金額キーを持つかは payload の
+         中身次第で**静的に決まらない**ので、ここは全 kind を見るしかない。
+         ★これは実ラン突合(runs/calib_base_30d)で `agent_day.wealth_end` の差として
+         実際に出た。kind 絞りだけを入れて済ませていたら静かに値が変わっていた。
+
+      ③ `ids_seen`(agents.json が無いランの roster フォールバック)
+
+    O(1) 化するもの / 残るもの(正直な注記):
+      - `events` の list … **消える**(1 行ずつ畳んで捨てる)。
+      - `kinds` Counter … O(distinct kind) / `steps_present` … O(step 数)。
+      - `wealth_day` … O(agent × 日)。指標の定義そのもの。
+      - `seen`(重複判定の集合)… **残る**。distinct イベント数に比例する
+        (在場 25万 × 10 日なら 40.6 億要素)。「完全重複が 1 件でもあるか」の定義
+        そのもので、ハッシュに置き換えれば衝突で値がズレうるため畳まない。
+        本選規模で stage0 を回すなら **ここが律速**であることを先に知っておくこと。
+
+    行順の前提: L1 は step 非減少で追記される(`l1_stream` の同名の前提)。
+    `build_agent_day` の `sorted(events, key=step)` は安定ソートなので、その前提の
+    下では逐次読みの順序と完全に一致する。
+    """
+    import l1_stream as ls
+    meta_by_id = {int(a["id"]): a for a in (agents or []) if "id" in a}
+    ids = sorted(meta_by_id)
+    last_cash = {aid: float(meta_by_id.get(aid, {}).get("money") or 0.0)
+                 for aid in ids}
+    last_acct = {aid: 0.0 for aid in ids}
+    wealth_day: dict = defaultdict(dict)
+    ids_seen: set = set()
+
+    kinds: Counter = Counter()
+    steps_present: set = set()
+    seen: set = set()
+    n_events = 0
+    dup = 0
+    for e in ls.iter_events(run_dir):
+        n_events += 1
+        kinds[e["kind"]] += 1
+        steps_present.add(e["step"])
+        key = _dup_key(e)
+        if key in seen:
+            dup += 1
+        else:
+            seen.add(key)
+        # ---- ②③(build_agent_day の該当ブロックの逐語)----
+        aid = e["agent_id"]
+        if aid is None or aid < 0:
+            continue
+        ids_seen.add(aid)
+        p = e["payload"]
+        if "balance" in p and isinstance(p.get("balance"), (int, float)):
+            last_cash[aid] = float(p["balance"])
+        if "account" in p and isinstance(p.get("account"), (int, float)):
+            last_acct[aid] = float(p["account"])
+        if aid in last_cash:
+            wealth_day[aid][_day(e["step"], spd)] = (
+                last_cash[aid] + last_acct.get(aid, 0.0))
+    return {"validation": _stage0_result(n_events, kinds, steps_present, dup,
+                                         n_steps),
+            "wealth_day": dict(wealth_day), "ids_seen": ids_seen}
+
+
+def validate_stage0_stream(run_dir: str, n_steps: int) -> dict:
+    """`validate_stage0` と**同じ dict** を、events の全件 list を作らずに返す。"""
+    return scan_all_kinds(run_dir, n_steps)["validation"]
+
+
 # --------------------------------------------------------------------------- #
 # stage1(a): agent × 日 パネル
 # --------------------------------------------------------------------------- #
@@ -129,13 +248,19 @@ def build_agent_day(events: list[dict], agents: list[dict], n_days: int,
                     warmup_days: int, run_name: str,
                     weekday_of: dict[int, str],
                     spd: int = STEPS_PER_DAY,
-                    mps: int = MIN_PER_STEP) -> dict[str, list]:
+                    mps: int = MIN_PER_STEP,
+                    scan: dict | None = None) -> dict[str, list]:
     """W2-3: `spd`(1日の step 数)/ `mps`(1 step の分数)は既定が正準 Δt=10 の値
-    (144 / 10)なので、渡さなければ従来と 1 ビットも変わらない。"""
+    (144 / 10)なので、渡さなければ従来と 1 ビットも変わらない。
+
+    W4-D: `scan` に `scan_all_kinds(...)` の結果を渡すと、**全 kind 依存の 2 量**
+    (資産追跡 `wealth_day` と roster フォールバック)をそちらから取る。渡さなければ
+    従来どおり `events` から作る(= 全件 list を渡す既存経路と逐語同一)。"""
     ordered = sorted(events, key=lambda e: e["step"])
     meta_by_id = {int(a["id"]): a for a in agents if "id" in a}
     ids = sorted(meta_by_id) if meta_by_id else sorted(
-        {e["agent_id"] for e in events if e["agent_id"] >= 0})
+        scan["ids_seen"] if scan is not None
+        else {e["agent_id"] for e in events if e["agent_id"] >= 0})
 
     # (aid, day) をキーにした集計器
     sleep_h: dict = defaultdict(float)
@@ -160,10 +285,15 @@ def build_agent_day(events: list[dict], agents: list[dict], n_days: int,
     open_enter: dict = {}                                   # (aid,bid)->enter sim_min
 
     # 資産(現金 balance + 口座 account)の最新値を追跡し日末をスナップ。
+    # ★ここは **kind を見ない**(payload に金額キーがあるかだけで決まる)ので、
+    #   events が kind 絞り読みだと値が変わる。`scan` があればそちらを使う。
     last_cash = {aid: float(meta_by_id.get(aid, {}).get("money") or 0.0)
                  for aid in ids}
     last_acct = {aid: 0.0 for aid in ids}
     wealth_day: dict = defaultdict(dict)                    # aid -> day -> wealth
+    track_wealth = scan is None
+    if not track_wealth:
+        wealth_day = scan["wealth_day"]
 
     for e in ordered:
         k, aid, p = e["kind"], e["agent_id"], e["payload"]
@@ -211,12 +341,13 @@ def build_agent_day(events: list[dict], agents: list[dict], n_days: int,
                 poi_set[key].add(("n", nid))
 
         # 資産追跡: balance(現金)/account(口座)を持つイベントで最新値を更新
-        if "balance" in p and isinstance(p.get("balance"), (int, float)):
-            last_cash[aid] = float(p["balance"])
-        if "account" in p and isinstance(p.get("account"), (int, float)):
-            last_acct[aid] = float(p["account"])
-        if aid in last_cash:
-            wealth_day[aid][d] = last_cash[aid] + last_acct.get(aid, 0.0)
+        if track_wealth:
+            if "balance" in p and isinstance(p.get("balance"), (int, float)):
+                last_cash[aid] = float(p["balance"])
+            if "account" in p and isinstance(p.get("account"), (int, float)):
+                last_acct[aid] = float(p["account"])
+            if aid in last_cash:
+                wealth_day[aid][d] = last_cash[aid] + last_acct.get(aid, 0.0)
 
     # 期末資産の日次充填(イベントが無い日は前日から carry-forward)
     wealth_end: dict = {}
@@ -685,30 +816,36 @@ def build(run_dir: str, warmup_days: int = 7, out_dir: str | None = None) -> dic
     out_dir = out_dir or os.path.join(run_dir, "panel")
     os.makedirs(out_dir, exist_ok=True)
 
-    events = m.load_events(run_dir)
+    import l1_stream as ls
+    events = load_events(run_dir)
     agents = m.load_agents(run_dir)
     l2 = m.load_l2(run_dir)
     summary = {}
     spath = os.path.join(run_dir, "summary.json")
     if os.path.exists(spath):
         summary = json.load(open(spath, encoding="utf-8"))
-    n_steps = int(summary.get("n_steps") or
-                  (max((e["step"] for e in events), default=-1) + 1))
+    # 全 kind 依存の 2 量(ラン長・最終日)は footer/row-group 統計から取る
+    # (max(step)//spd == max(step//spd)。空なら -1 // spd = -1 で従来の default と一致)。
+    l1_max_step = ls.max_step(run_dir)
+    n_steps = int(summary.get("n_steps") or (l1_max_step + 1))
     # W2-3: 1日の step 数・1 step の分数は **このランの run.dt_min** から決める
     # (Δt=10 なら 144 / 10 = 従来と 1 ビットも変わらない。読めなければ stderr に告知)。
     spd = run_dt.steps_per_day(run_dir)
     mps = run_dt.min_per_step(run_dir)
-    max_day = max((_day(e["step"], spd) for e in events), default=-1)
+    max_day = _day(l1_max_step, spd) if l1_max_step >= 0 else -1
     n_days = max(max_day + 1, -(-n_steps // spd))            # ceil(n_steps/spd)
     run_name = os.path.basename(os.path.normpath(run_dir))
     weekday_of = _weekday_map(events)
 
-    validation = validate_stage0(events, n_steps)
+    # 全 kind 依存の 3 量(stage0 検証・資産追跡・roster フォールバック)は
+    # **絞らないまま 1 パス逐次で**まとめて作る(全件 list を作らないぶんが利く)。
+    scan = scan_all_kinds(run_dir, n_steps, agents, spd)
+    validation = scan["validation"]
     with open(os.path.join(out_dir, "validation.json"), "w", encoding="utf-8") as fh:
         json.dump(validation, fh, ensure_ascii=False, indent=1)
 
     agent_day = build_agent_day(events, agents, n_days, warmup_days, run_name,
-                                weekday_of, spd, mps)
+                                weekday_of, spd, mps, scan)
     run_day = build_run_day(events, agents, l2, agent_day, n_days, warmup_days,
                             run_name, weekday_of, spd)
     _write_parquet(os.path.join(out_dir, "agent_day.parquet"),
