@@ -5176,7 +5176,25 @@ def run_step(sim, step: int) -> None:
     # ON では推論結果の **world への適用順を agent_id 昇順に正準化**する(到着順=推論の
     # 完了順が世界に漏れない。T1 完了順序不変性テストがこれを固定する)。
     actions = fire_mod.barrier(sim, actions)
+    # 噂の誕生 IF-C 残③(第98 W2-5): **源イベントと同じ step のうちに**噂を成立させる。
+    #   第95 の初版は誕生走査が step 末(rumors_mod.phase)の 1 回だけで、伝播口
+    #   rumors_mod.on_talk は _apply の中(speak/dm)で呼ばれる = 誕生は必ず会話より後
+    #   → その step に起きた出来事は**次 step の会話**にしか乗らなかった(1 step の遅れ)。
+    #   適用の各回の**直前**に走査を挟むと、
+    #     ・enforcement(_apply より前のフェーズが出す)は最初の 1 回で、
+    #     ・host_event / venture_open(先に適用された個体の行為)はその直後の回で
+    #   誕生し、後から適用される個体の会話に同 step で乗る。取りこぼし(最後の個体の行為・
+    #   _apply より後のフェーズ)は従来どおり step 末の rumors_mod.phase が拾う。
+    # ★_apply の**外**に置く理由: 誕生は「世界の出来事」であって会話の一部ではない。
+    #   _apply の内側は来歴スコープ(provlink の set_prov/clear_prov)なので、そこで
+    #   L1 を出すと rumor_born に**別人の発話を決めた llm_call_id** が刻まれてしまう
+    #   (observer.llm_link ON のとき)。外に置けば構造的に起きない。
+    # ★二重誕生は起きない: 走査は L1 の watermark 1 本(rumors._new_events)に閉じている。
+    # ★OFF は bool 1 個を見るだけで 1 度も呼ばない = ゴールデン L1 バイト一致。
+    _rumors_on = rumors_mod.enabled(sim)
     for agent, action in actions:
+        if _rumors_on:
+            rumors_mod.birth_scan(sim, step, sim_min)
         _apply(sim, agent, action, step, sim_min)
     # 屋内エンジン配線(B3): building/floor が確定した _apply 後に、在館者の区画割当・フロア内
     # markov 遷移・階間到着の実軌跡差替・会議・遭遇を回す(既定 OFF=sim.indoor None=即 return=バイト一致)。
@@ -5190,9 +5208,10 @@ def run_step(sim, step: int) -> None:
                                                    # infoenv(誤情報)確定後・collect(L2)前=当日の負イベントを同 step でスキャン
     _phase_beliefs(sim, step, sim_min)             # 真偽台帳: fact 抽出→直接目撃→伝聞→現場確認(既定OFF=no-op。第73バッチ B)。
                                                    # _apply 後=この step の発話・世界イベントを同 step で取り込む / collect(L2)前
-    rumors_mod.phase(sim, step, sim_min)           # 情報オブジェクト IF-C: 構造化イベント→噂 Item の誕生+忘却掃引
-                                                   # (既定OFF=no-op。第95バッチ)。_apply 後=この step の行為イベントを
-                                                   # 同 step で拾う(伝播は次 step 以降の会話に乗る=1 step の遅れ)/ collect(L2)前
+    rumors_mod.phase(sim, step, sim_min)           # 情報オブジェクト IF-C: 取りこぼしの誕生+忘却掃引(既定OFF=no-op。第95バッチ)。
+                                                   # 誕生の本体は _apply ループ内の birth_scan へ移した(第98 W2-5=1 step 遅れの解消)。
+                                                   # ここが拾うのは「最後に適用された個体の行為」と「_apply より後のフェーズ」だけ
+                                                   # (この step にはもう語り手が居ない=遅れを生まない)/ collect(L2)前
     traces_mod.phase(sim, step, sim_min)           # 痕跡 IF-D: 場所への集約(aggregation)+日境界の蒸発(evaporation)
                                                    # (既定OFF=no-op。第96バッチ)。**演算はこの 2 つだけ**=拡散なし
                                                    # (Parunak の propagation factor 0)。rumors の後=同じ L1 を別の

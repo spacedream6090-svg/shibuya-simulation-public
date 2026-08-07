@@ -226,6 +226,14 @@ PLACE_ALIAS: dict[str, str] = {
     "museum": "attraction", "theater": "hall", "theatre": "hall",
     "movie": "cinema", "store": "shop", "clinic": "service",
 }
+# 計画語彙 → 地図カテゴリの**追加照会先**(resolve_place だけが読む)。地図側の実カテゴリ名が
+# 計画語彙と食い違う「実測で確認された分」だけを置く(推測で足さない)。
+# 実測(2026-08-07 W2-4・本線地図 wide_v7): education は 1 件しかなく school が 68 件
+# = 学業ブロックが事実上解決不能だった。LLM 語の正規化(PLACE_ALIAS: school→education)
+# とは向きが別の表であることに注意。fallback の無いカテゴリの解決は従来と完全同値。
+MAP_FALLBACK_CATS: dict[str, tuple[str, ...]] = {
+    "education": ("school",),
+}
 # 実行時 activity タグ(routine._PLAN_ACTIVITY と同一。到着時の課金経路に載せるため)。
 ACT_ACTIVITY: dict[str, str] = {"meal": "eating", "shop": "shopping"}
 
@@ -550,7 +558,11 @@ def resolve_place(sim, agent, place: str, sim_min: int, from_node=None):
     from .. import commerce as _commerce
     from . import routine as _routine
     origin = from_node or getattr(agent, "node", "")
-    pool = [p for p in sim.city.pois_by_cat(place)
+    pool_src = list(sim.city.pois_by_cat(place))
+    for _cat in MAP_FALLBACK_CATS.get(place, ()):   # 地図語彙の食い違い分の追加照会(上表)
+        _have = {p["node"] for p in pool_src}
+        pool_src += [p for p in sim.city.pois_by_cat(_cat) if p["node"] not in _have]
+    pool = [p for p in pool_src
             if p["node"] != origin
             and float(getattr(agent, "money", 0.0)) >= _routine._poi_price(sim, p)]
     pool = _commerce.filter_open(sim, pool, sim_min)

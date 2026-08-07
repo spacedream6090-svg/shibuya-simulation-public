@@ -87,11 +87,19 @@ R1 ドクトリン
 
 正直な限界(4 件)
 ------------------
-- **1 step の遅れ**: 噂の誕生は step 末の L1 走査で起きるので、その step の会話には乗らない
-  (最短で次 step から広まる)。既定 Δt=10 分では「10 分以内に人づてで広まる」を捨てている。
-- **目撃者は step 末の位置で決める**: 出来事の**発生時**ではなく **step 末**の同席者を初期
-  knower にする(``hearers_of`` = 既存の「同席者」規約と同じ知覚半径)。Δt 内の出入りは
-  捉えない。
+- **残る遅れは 2 つだけ**(第98 W2-5 で「1 step の遅れ」は解消した):
+  誕生走査 :func:`birth_scan` は step 末だけでなく **``_apply`` の各回の直前**にも走るので、
+  源イベントより**後に適用される個体**の会話には**同じ step のうちに**噂が乗る
+  (既定 Δt=10 分の「10 分以内に人づてで広まる」が表現できるようになった)。
+  残っているのは (i) **行為者自身**はその step の行動枠を出来事そのものに使い切っている
+  ので語れない(= 物理的に正しい遅れ)、(ii) 発話文面を決める ``_decide`` は ``_apply``
+  より前に終わっているので「噂を知ったこと」がプロンプトに映るのは次 step から
+  (噂は本文に注入しない設計判断 (2) なので**伝播そのもの**には影響しない)。
+- **目撃者は「出来事の直後の走査」時点の位置で決める**: 出来事の**発生時**そのものでは
+  なく、その直後に走る誕生走査の時点の同席者を初期 knower にする
+  (``hearers_of`` = 既存の「同席者」規約と同じ知覚半径。空間索引は ``_phase_move`` 後に
+  1 回だけ張られた 1 枚)。第98 以前の「step 末の位置」よりは近いが、Δt 内の出入りは
+  やはり捉えない。
 - **プール退場で噂を失う**: ``world/pool.py`` の ``dehydrate`` は静的属性と明示列挙した
   可変状態しか運ばないため、``_rumors``(動的属性)は退場時に落ちる = 街を出て戻った者は
   噂を忘れて帰ってくる。``cognition/day_plan.py`` が同じ制約を明記しているのと同型で、
@@ -295,7 +303,11 @@ def _learn(sim, st: dict, agent, item_id: str, src_kind: str, step: int) -> bool
 
 
 # --------------------------------------------------------------------------- #
-# 1. 噂の誕生(step 末に L1 を走査。決定論・乱数ゼロ・LLM ゼロ)
+# 1. 噂の誕生(新規 L1 の走査。決定論・乱数ゼロ・LLM ゼロ)
+#
+# ★第98 W2-5(IF-C 残③「1 step の遅れ」の解消): 走査は step 末だけでなく
+#   **``_apply`` の各回の直前**にも走る(scheduler.run_step)。詳細は birth_scan の
+#   docstring と module docstring「正直な限界」の 1 件目。
 # --------------------------------------------------------------------------- #
 def _new_events(sim) -> list:
     """前回処理済み総数(watermark)以降の新規 L1(``gossip._scan_seeds`` と同型)。
@@ -399,26 +411,78 @@ def _forget_day(sim, cfg: dict, st: dict, sim_min: int, step: int) -> None:
         st["forgotten"] += len(stale)
 
 
+def _step_budget(sim, cfg: dict, step: int) -> int:
+    """この step に**あと何件**噂を生めるか(``max_per_step`` = **step あたり**の上限)。
+
+    第98 で誕生走査が 1 step に何度も走るようになったので、上限を「1 回の走査あたり」で
+    数えると実質的に上限が消えてしまう。IF-C 初版の意味(= 暴走の安全弁)をそのまま
+    保つために、予算は step をキーにして持ち回る。
+
+    ★プロセス内カウンタなので **checkpoint に保存しない**(``_rumor_watermark`` と
+      同流儀)。resume は必ず step 境界から始まるので、その step の最初の走査で
+      straight と同じ満額から張り直される = resume==straight を壊さない。
+    """
+    b = getattr(sim, "_rumor_budget", None)
+    if b is None or int(b[0]) != int(step):
+        b = (int(step), int(cfg["max_per_step"]))
+        sim._rumor_budget = b
+    return int(b[1])
+
+
+def birth_scan(sim, step: int, sim_min: int) -> int:
+    """新規 L1 → 噂 Item の誕生走査。**同じ step に何度呼んでも安全**(誕生数を返す)。
+
+    ★第98 W2-5(IF-C 残③): この関数は ``scheduler.run_step`` の **``_apply`` ループの
+      各回の直前**と、step 末の :func:`phase` から呼ばれる。IF-C 初版は step 末の 1 回
+      だけだったので、伝播口 :func:`on_talk` が呼ばれる ``_apply`` は**必ず誕生より前**
+      = その step に起きた出来事は次 step の会話にしか乗らなかった(1 step の遅れ)。
+
+    二重誕生が起きない理由は **watermark 1 本**に閉じている: :func:`_new_events` は
+    ``logger`` の総件数を読んで**その場で** ``sim._rumor_watermark`` を進めるので、
+    同じ L1 イベントが 2 回窓に入ることが構造的に無い(``_birth`` 側に重複判定は不要)。
+    自分が出す ``rumor_born`` / ``transmission`` は次の走査で窓に入るが、
+    ``SRC_SPECS`` に無い種なので源にならない(再帰しない)。
+
+    並びの決定論: 窓は L1 の**追記順**そのもの、初期 knower は agent_id 昇順
+    (:func:`_initial_knowers`)、走査点は ``_apply`` ループの順(第81 barrier ON なら
+    agent_id 昇順に正準化済み)。乱数は 1 本も引かない。
+    """
+    if not enabled(sim):
+        return 0
+    cfg = cfg_of(sim)
+    st = _state(sim)
+    # ★ sources が空でも必ず drain する(watermark を進める = IF-C 初版と同じ順序)。
+    events = _new_events(sim)
+    sources = cfg["sources"]
+    if not sources:
+        return 0
+    budget = _step_budget(sim, cfg, step)
+    n = 0
+    for e in events:
+        if budget <= 0:
+            break
+        if e.kind in sources and _birth(sim, cfg, st, e, step, sim_min):
+            budget -= 1
+            n += 1
+    sim._rumor_budget = (int(step), int(budget))
+    return n
+
+
 def phase(sim, step: int, sim_min: int) -> None:
-    """step 末の単一作用点: 噂の誕生 + 忘却掃引。**既定 OFF は即 return**。
+    """step 末の作用点: **取りこぼしの誕生** + 忘却掃引。**既定 OFF は即 return**。
+
+    誕生の本体は :func:`birth_scan` に移った(第98 W2-5)。ここに残っているのは
+    「``_apply`` ループの**最後**に適用された個体が出した源イベント」と
+    「``_apply`` より後のフェーズが出した源イベント」の受け皿 + 日境界の忘却掃引で、
+    どちらもこの step にはもう語り手が居ないので遅れを生まない。
 
     ★世界状態(所持金・位置・関係・drive・opinion)は 1 つも動かさない。
       触るのは「誰が何を知っているか」だけ。
     """
     if not enabled(sim):
         return
-    cfg = cfg_of(sim)
-    st = _state(sim)
-    sources = cfg["sources"]
-    events = _new_events(sim)
-    if sources:
-        budget = int(cfg["max_per_step"])
-        for e in events:
-            if budget <= 0:
-                break
-            if e.kind in sources and _birth(sim, cfg, st, e, step, sim_min):
-                budget -= 1
-    _forget_day(sim, cfg, st, sim_min, step)
+    birth_scan(sim, step, sim_min)
+    _forget_day(sim, cfg_of(sim), _state(sim), sim_min, step)
 
 
 # --------------------------------------------------------------------------- #

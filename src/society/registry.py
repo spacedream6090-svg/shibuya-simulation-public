@@ -688,6 +688,31 @@ FEATURES: tuple[Feature, ...] = (
        "DAG はシム側に持たせない(捕集と組み立ての分離)= 観測がシムを変えない"),
     _f("observer.llm_health.enabled", "strict", False, "none",
        "L2 に LLM 健全性 KPI 3列を足す(観測専用・累積カウンタ)"),
+    # 第98バッチ W2-6: finalize のメモリ有界化(設計 src/society/observer/logger.py)。
+    # ★repro_tier=strict の根拠(**バイト列が変わる機能なので特に正直に書く**):
+    #   本トグルが変えるのは「既に確定した記録を **どの物理レイアウトで書き出すか**」だけで、
+    #   世界の因果には 1 バイトも触れない。乱数 stream を 1 本も引かず、LLM を 1 本も呼ばず、
+    #   プロンプトを 1 バイトも変えず、**シムは書いた parquet を二度と読まない**。
+    #   ON/OFF で L1/L2/L3 の **行の内容・行順・スキーマは完全同値**であり、変わるのは
+    #   parquet の row-group の切れ目に由来するファイルのバイト列だけである。
+    #   registry の 3 等級は「世界の因果を事後に再構成できるか」の分類(journal=LLM の自由文を
+    #   消費する / none=実時刻・外部プロセス・非決定並列)であって、**記録ファイルの
+    #   バイト同一性の分類ではない**。したがって journal / none のどちらにも該当せず strict。
+    #   ただし「同一 seed の 2 ランで parquet を sha256 比較する」型の検査は ON/OFF を
+    #   跨いで成立しない(行比較なら成立する)。この 1 点だけは正直に申告しておく。
+    # affects_k=False: generate() の呼び出し点を 1 つも足さない/減らさない(finalize だけの層)。
+    # fingerprint_risk=none: プロンプトを 1 バイトも変えない。エージェントから観測する経路は無い。
+    _f("observer.finalize.streaming", "strict", False, "none",
+       "finalize(part → canonical の結合)を **全 part 同時載せ**から**逐次書き**へ替える。"
+       "既定 OFF は全 part を read_table して concat_tables するため、part 化で走行中の RAM を"
+       "解放しても**ランのピークメモリが L1 の総量で決まる**(在場 25万 × 10 日 = 42.7 GB・"
+       "40.6 億イベントの外挿 = 解析以前に『ランの書き終わり』で落ちる。W2-2 の発見)。"
+       "ON は part を 1 つずつ row-group 単位で読み ParquetWriter へ流すので、ピークは"
+       "row-group 1 個ぶん(observer.finalize.row_group_rows)だけで part 数にも L1 総量にも"
+       "依存しない。★観察ランでは ON を推奨する。"
+       "出力は OFF と行の内容・行順・スキーマが完全同値(**バイト列は row-group の切れ目が"
+       "変わるので不一致**)。part が 1 つも無いランは ON でも従来経路に落ちる=バイト一致。"
+       "副産物として一時ファイル + os.replace により merge 中のクラッシュに強い"),
     _f("observer.echo.enabled", "strict", False, "none",
        "L2 にエコー/自己反復 5列を足す(観測専用・常設)"),
     # 第91バッチ: 退行シグナル監視(設計 §3)。L1 を読むだけで世界も乱数も 1 バイト触らない=strict。

@@ -504,6 +504,48 @@ def test_resolve_place_is_deterministic_habit_then_distance(tmp_path):
         "訪問履歴(習慣)が行き先解決に効いていない"
 
 
+def test_resolve_place_education_falls_back_to_school_cat(tmp_path):
+    """★第98是正: 本線地図では education 1 件 vs school 68 件(W2-4 実測)で学業ブロックが
+    事実上解決不能だった。MAP_FALLBACK_CATS の追加照会で school 側の POI が候補に入る。"""
+    sim, a = _agent_sim(tmp_path, "resolve_fb")
+    real = sim.city.pois_by_cat
+    food = list(real("food"))
+    assert food, "テスト前提が崩れた(food POI が無い)"
+    asked: list[str] = []
+
+    def fake(cat):
+        asked.append(cat)
+        if cat == "education":
+            return []                       # 地図側の education はほぼ空(実測の縮図)
+        if cat == "school":
+            return food                     # school 側には実在する(中身は既存 POI を流用)
+        return real(cat)
+
+    sim.city.pois_by_cat = fake
+    got = DP.resolve_place(sim, a, "education", 12 * 60, from_node=a.node)
+    assert got is not None, "fallback 照会が効いていない(学業ブロックが解決不能のまま)"
+    assert asked[:2] == ["education", "school"]      # 自カテゴリ→fallback の順で照会
+    assert got in {p["node"] for p in food}
+
+
+def test_resolve_place_without_fallback_queries_only_its_own_cat(tmp_path):
+    """fallback の無いカテゴリは従来と完全同値=照会は自カテゴリ 1 回のみ。"""
+    sim, a = _agent_sim(tmp_path, "resolve_nofb")
+    real = sim.city.pois_by_cat
+    asked: list[str] = []
+
+    def fake(cat):
+        asked.append(cat)
+        return real(cat)
+
+    sim.city.pois_by_cat = fake
+    before = DP.resolve_place(sim, a, "food", 12 * 60, from_node=a.node)
+    assert asked == ["food"]                         # 余計な照会ゼロ
+    assert "food" not in DP.MAP_FALLBACK_CATS        # 前提: fallback 表は education のみ
+    assert set(DP.MAP_FALLBACK_CATS) == {"education"}
+    assert before is not None
+
+
 def test_resolve_place_specials(tmp_path):
     sim, a = _agent_sim(tmp_path, "resolve_sp")
     assert DP.resolve_place(sim, a, "home", 0) == a.home_node

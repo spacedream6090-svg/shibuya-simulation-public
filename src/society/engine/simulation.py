@@ -207,6 +207,13 @@ class Simulation:
         self.clock = Clock(start_min=_parse_start_tod(cfg.run.get("start_tod", "07:00")),
                            step_minutes=self.dt_min)
         self.logger = ObserverLogger(self.out_dir)
+        # W2-6: finalize のメモリ有界化(observer.finalize.streaming。既定 OFF=従来経路)。
+        # ON のときだけ属性を立てる = 既定ランは ObserverLogger の初期値のまま=バイト一致。
+        _fincfg = cfg.observer.get("finalize", None)
+        if _fincfg is not None and bool(_fincfg.get("streaming", False)):
+            self.logger.streaming_finalize = True
+            self.logger.finalize_row_group_rows = int(
+                _fincfg.get("row_group_rows", 1 << 20))
         self.items = ItemStore()
         # ---- 場所の意味づけ最小版 D1(labeling.place_binding。既定 OFF=完全 no-op=バイト一致)----
         # ON 時だけ LabelSystem が束縛台帳を持つ(状態は LabelSystem 内に閉じるので checkpoint の

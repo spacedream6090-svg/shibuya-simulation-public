@@ -1775,6 +1775,22 @@ observer:
   flush_every_steps: 0          # B2(スケール): この step ごとに L1 ログを part 化して RAM を解放
                                 # (checkpoint とは独立。0=無効で従来と完全同一)。大規模ランの OOM 回避用。
                                 # checkpoint_every と同一 step では二重 flush しない。finalize で part を結合。
+  # ---- finalize のメモリ有界化(W2-6 第98バッチ 2026-08-07・**既定 OFF**)----
+  # 上の part 化は「走行中の RAM」を解放するが、finalize の結合は **全 part を read_table して
+  # concat_tables** するので、ランのピークメモリは結局 L1 の総量で決まる。在場 25万 × 10 日の
+  # L1 は 42.7 GB・40.6 億イベント(proposal-dp-u3-observe-250k.md §2-4 の実測外挿)であり、
+  # **解析以前に「ランの書き終わり」で落ちる**。ON にすると part を 1 つずつ row-group 単位で
+  # 読み ParquetWriter へ流すので、ピークは row-group 1 個ぶん(下の row_group_rows)だけになり
+  # part 数にも L1 総量にも依存しない。
+  # ★観察ラン(25万体)では ON にすること。既定 OFF は現行経路と 1 バイトも変わらない。
+  # ON の出力は OFF と **行の内容・行順・スキーマが完全同値**だが、parquet の**バイト列は
+  # 一致しない**(row-group の切れ目が変わるため)。part が 1 つも無いラン(checkpoint も
+  # flush_every_steps も無効)は ON でも従来経路に落ちる=バイト一致。
+  # 実装と正直な限界は src/society/observer/logger.py の docstring を参照。
+  finalize:
+    streaming: false
+    row_group_rows: 1048576     # 書き出す row-group の行数(= ON 時のピークメモリの単位。
+                                # pyarrow の write_table 既定と同じ 2**20)。streaming=false では未使用。
   # ---- 第71バッチ 2026-07-31: ラン来歴 run_manifest.json(既定 ON=新規別ファイル)----
   # ラン開始時に runs/<name>/run_manifest.json を書く: git SHA/branch/dirty・resolved config の
   # 正準 JSON sha256・run_seed・モデル ID・cache_mode・**真偽値スイッチ全状態**(機械採取)・

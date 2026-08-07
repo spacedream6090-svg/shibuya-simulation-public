@@ -741,3 +741,214 @@ def test_resume_matches_straight(tmp_path):
     jb = json.loads((d / "summary.json").read_text(encoding="utf-8"))
     assert ja["rumors"] == jb["rumors"], \
         "累積タリー/reach が resume で straight と食い違う(中央管理の漏れ)"
+
+
+# --------------------------------------------------------------------------- #
+# (J) 第98 W2-5: 誕生の「1 step 遅れ」の解消(IF-C 残③)
+#
+# 第95 の初版は誕生走査が step 末(rumors.phase)の 1 回だけで、伝播口 on_talk は
+# _apply の中で呼ばれる = 誕生は必ず会話より後 → その step に起きた出来事は
+# **次 step の会話**にしか乗らなかった。第98 は誕生走査(rumors.birth_scan)を
+# _apply の各回の直前にも挟む。
+# --------------------------------------------------------------------------- #
+def _sched_tree():
+    return ast.parse(Path(scheduler.__file__).read_text(encoding="utf-8"))
+
+
+def _fn(tree, name):
+    return next(n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == name)
+
+
+def _calls_attr(node, attr) -> bool:
+    return any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+               and c.func.attr == attr for c in ast.walk(node))
+
+
+def test_birth_scan_runs_before_each_apply_in_the_step():
+    """``run_step`` の適用ループが **_apply の前に** ``birth_scan`` を呼ぶ(構造固定)。
+
+    これが遅れ解消の本体。順序が入れ替わる/呼び出しが消えると、その step の出来事は
+    再び次 step の会話にしか乗らなくなる。
+    """
+    loops = [n for n in ast.walk(_fn(_sched_tree(), "run_step"))
+             if isinstance(n, ast.For)
+             and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                     and c.func.id == "_apply" for c in ast.walk(n))]
+    assert len(loops) == 1, f"_apply を回すループが {len(loops)} 個(構造が変わった)"
+    body = loops[0].body
+
+    def _pos(pred) -> int:
+        for i, stmt in enumerate(body):
+            if any(isinstance(c, ast.Call) and pred(c) for c in ast.walk(stmt)):
+                return i
+        return -1
+
+    i_scan = _pos(lambda c: isinstance(c.func, ast.Attribute)
+                  and c.func.attr == "birth_scan")
+    i_apply = _pos(lambda c: isinstance(c.func, ast.Name) and c.func.id == "_apply")
+    assert i_scan >= 0, "適用ループが birth_scan を呼んでいない(1 step 遅れに逆戻り)"
+    assert i_scan < i_apply, "birth_scan が _apply より後にある(誕生が会話に間に合わない)"
+
+
+def test_birth_scan_stays_outside_the_provenance_scope(tmp_path):
+    """誕生は ``_apply``(来歴スコープ)の**外**で起きる = 他人の思考 ID が刻まれない。
+
+    ``_apply`` は ``observer.llm_link`` ON のとき ``logger.set_prov`` で
+    「行為者自身が出す L1」に ``llm_call_id`` を刻む。誕生走査をその内側に置くと、
+    たまたま同じ個体が源イベントの当事者だったとき ``rumor_born`` に
+    **別の行為(発話)を決めた思考の ID** が付いてしまう(捏造された来歴の辺)。
+    """
+    tree = _sched_tree()
+    for name in ("_apply", "_apply_action"):
+        assert not _calls_attr(_fn(tree, name), "birth_scan"), \
+            f"{name}(来歴スコープの内側)から birth_scan を呼んでいる"
+    sim = _sim(tmp_path, "rm_prov", n_steps=144, n_agents=15, **ON,
+               **{"observer.llm_link": "true"})
+    sim.llm = _FixedLLM(_HOST_AND_TALK)
+    sim.run()
+    born = _kind(sim, "rumor_born")
+    assert born, "テストが空振り(噂が 1 件も生まれていない)"
+    assert [e for e in _kind(sim, "speak") if e.llm_call_id], \
+        "テストが空振り(llm_link が 1 件も刻まれていない)"
+    for e in born:
+        assert e.llm_call_id is None, f"rumor_born に llm_call_id が刻まれた: {e.llm_call_id}"
+        assert "llm_role" not in (e.payload or {}), "rumor_born に llm_role が刻まれた"
+
+
+def test_a_rumor_born_this_step_rides_a_conversation_in_the_same_step(tmp_path):
+    """★遅れ解消の意味そのもの: 誕生 step == 伝播 step が成立する。
+
+    初版では ``phase`` が step 末だったので、この順序(誕生 → 同 step の会話)は
+    engine 上で原理的に作れなかった。
+    """
+    sim = _sim(tmp_path, "rm_same_step", n_steps=2, **ON)
+    host, teller, outsider = sim.agents[0], sim.agents[1], sim.agents[2]
+    outsider.loc, outsider.building = "outside", ""  # 誕生時は同席していない = ignorant
+    _colocate(teller, host)                          # 目撃者(初期 knower になる)
+    _host(sim, host, step=0, sim_min=0)              # 源イベント(step 0)
+    assert RM.birth_scan(sim, 0, 0) == 1             # _apply の各回の直前に走る走査
+    ev = _kind(sim, "rumor_born")[-1]
+    iid = ev.payload["item_id"]
+    assert ev.step == 0, "誕生 step が源イベント step と違う"
+    assert RM.knows(teller, iid), "同席の目撃者が初期 knower になっていない"
+    assert not RM.knows(outsider, iid)
+    _colocate(outsider, teller)                      # 話が聞こえる位置へ
+    assert RM.on_talk(sim, teller, [outsider], "face", 0, 0) == 1, \
+        "同じ step のうちに噂が伝わらない(1 step 遅れが残っている)"
+    tr = [e for e in _kind(sim, "transmission") if e.payload["item_id"] == iid]
+    assert tr and tr[-1].step == 0, "伝播 step が誕生 step と同じでない"
+    assert _mem(outsider, RM.KIND) == [sim.items.items[iid].text]
+
+
+def test_births_are_interleaved_into_the_apply_loop(tmp_path):
+    """L1 の**並び**で遅れ解消を固定する: 同 step の ``speak`` より前に出る誕生がある。
+
+    ``speak`` は ``_apply`` の中でしか記録されない(scheduler の唯一の記録点)。
+    初版は誕生が ``_apply`` ループを**全部終えた後**だったので、
+    「同 step の speak より前の rumor_born」は 1 件も存在し得なかった。
+    """
+    sim = _sim(tmp_path, "rm_interleave", n_steps=216, n_agents=18, **ON)
+    sim.llm = _FixedLLM(_HOST_AND_TALK)
+    sim.run()
+    by_step: dict[int, list[tuple[int, str]]] = {}
+    for i, e in enumerate(sim.logger.events):
+        by_step.setdefault(e.step, []).append((i, e.kind))
+    n = 0
+    for rows in by_step.values():
+        b = [i for i, k in rows if k == "rumor_born"]
+        s = [i for i, k in rows if k == "speak"]
+        if b and s and min(b) < max(s):
+            n += 1
+    assert n > 0, "同 step の speak より前に出た rumor_born が 1 件も無い(遅れが残っている)"
+
+
+def test_birth_step_equals_the_source_event_step(tmp_path):
+    """すべての ``rumor_born`` が**源イベントと同じ step・同じ当事者**で立つ。"""
+    sim = _sim(tmp_path, "rm_same_src_step", n_steps=216, n_agents=18, **ON)
+    sim.llm = _FixedLLM(_HOST_AND_TALK)
+    sim.run()
+    seen: set[tuple[int, str, int]] = set()
+    born = 0
+    for e in sim.logger.events:
+        if e.kind in RM.SRC_SPECS:
+            seen.add((int(e.step), str(e.kind), int(e.agent_id)))
+        elif e.kind == "rumor_born":
+            born += 1
+            key = (int(e.step), str(e.payload["src_kind"]), int(e.agent_id))
+            assert key in seen, f"誕生が源イベントと同じ step に立っていない: {key}"
+    assert born, "テストが空振り"
+
+
+def test_birth_scan_is_idempotent_within_a_step(tmp_path):
+    """同じ step に何度走査しても**二重誕生しない**(watermark 1 本の帰結)。"""
+    sim = _sim(tmp_path, "rm_idem", n_steps=1, **ON)
+    a, w = sim.agents[0], sim.agents[1]
+    _colocate(w, a)
+    n0 = len(sim.logger.events)
+    _host(sim, a)
+    assert RM.birth_scan(sim, 0, 0) == 1
+    for _ in range(5):                              # 追加の走査では 1 件も増えない
+        assert RM.birth_scan(sim, 0, 0) == 0
+    RM.phase(sim, 0, 0)                             # step 末の受け皿も二重に生まない
+    born = [e for e in sim.logger.events[n0:] if e.kind == "rumor_born"]
+    assert len(born) == 1, f"同じ源イベントから {len(born)} 件生まれた(二重誕生)"
+    assert len(getattr(a, RM.RUMOR_KEY)) == 1 and len(getattr(w, RM.RUMOR_KEY)) == 1
+    assert sim._rumor_state["born"] == 1
+    assert sim._rumor_state["items"][born[0].payload["item_id"]]["reach"] == 2
+
+
+def test_max_per_step_is_a_budget_per_step_not_per_scan(tmp_path):
+    """``max_per_step`` は「1 step あたり」の上限(走査回数が増えても緩まない)。"""
+    sim = _sim(tmp_path, "rm_cap_step", n_steps=2, **ON,
+               **{"information.rumors.max_per_step": 2})
+    a = sim.agents[0]
+    n0 = len(sim.logger.events)
+    for i in range(5):
+        _host(sim, a, title=f"集まり{i}")
+        RM.birth_scan(sim, 0, 0)                    # 走査を 5 回に分けても
+    RM.phase(sim, 0, 0)
+    born0 = [e for e in sim.logger.events[n0:] if e.kind == "rumor_born"]
+    assert len(born0) == 2, f"step 予算が走査ごとに復活している({len(born0)} 件)"
+    n1 = len(sim.logger.events)
+    _host(sim, a, step=1, sim_min=10, title="翌step")
+    RM.birth_scan(sim, 1, 10)                       # 次 step では満額に戻る
+    born1 = [e for e in sim.logger.events[n1:] if e.kind == "rumor_born"]
+    assert len(born1) == 1, "step が変わっても予算が戻っていない"
+
+
+def test_resume_across_a_birth_matches_straight(tmp_path):
+    """★分割点が**誕生を跨ぐ** resume でも straight とバイト一致(第98 の追加分)。
+
+    第98 で入った 2 つのプロセス内カウンタ(誕生走査の watermark ``_rumor_watermark`` と
+    step 予算 ``_rumor_budget``)は **checkpoint に保存しない**。resume が必ず step
+    境界から始まるので、resumed 側の最初の走査で straight と同じ満額・同じ窓から
+    張り直される — それを「誕生を跨いだ分割」で機械固定する
+    (既存の ``test_resume_matches_straight`` は分割点の前で誕生が終わっていた)。
+    """
+    ov = {**ON, "run.start_tod": "00:00", "run.natural_start": "true"}
+    split, total = 72, 144
+    straight_dir = tmp_path / "rm_bstraight"
+    straight = Simulation(_cfg("rm_bstraight", total, 20, **ov), out_dir=straight_dir)
+    straight.run()
+    steps = [e.step for e in _kind(straight, "rumor_born")]
+    assert steps and min(steps) < split <= max(steps), \
+        f"分割点 {split} が誕生を跨いでいない(誕生 step = {sorted(set(steps))})"
+
+    d = tmp_path / "rm_bresumed"
+    sim1 = Simulation(_cfg("rm_bresumed", split, 20, **ov,
+                           **{"observer.checkpoint_every": split}), out_dir=d)
+    for step in range(split):
+        scheduler.run_step(sim1, step)
+    checkpoint.save(sim1, split, d / "checkpoint" / f"ckpt-{split:06d}.pkl.gz")
+    sim1.logger.flush_segment()
+    sim2 = Simulation(_cfg("rm_bresumed", total, 20, **ov,
+                           **{"observer.checkpoint_every": split}), out_dir=d)
+    sim2.run(resume_from=d)
+    for stem in ("l1_events", "l2_metrics", "l3_snapshots"):
+        sa = pq.read_table(straight_dir / f"{stem}.parquet").to_pylist()
+        sb = pq.read_table(d / f"{stem}.parquet").to_pylist()
+        assert sa == sb, f"{stem} 不一致(誕生を跨ぐ resume)"
+    ja = json.loads((straight_dir / "summary.json").read_text(encoding="utf-8"))
+    jb = json.loads((d / "summary.json").read_text(encoding="utf-8"))
+    assert ja["rumors"] == jb["rumors"]
