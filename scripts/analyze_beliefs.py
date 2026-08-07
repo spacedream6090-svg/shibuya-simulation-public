@@ -50,11 +50,17 @@ except Exception:                                        # noqa: BLE001
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "src"))
+if _HERE not in sys.path:                # 同ディレクトリの l1_stream を import
+    sys.path.insert(0, _HERE)
 
+import l1_stream as ls                                    # noqa: E402  (W2-2)
 from society import registry as R                         # noqa: E402
-from society.observer import measure as m                 # noqa: E402
 
 LEDGER_NAME = "beliefs_ledger.json"
+# W2-2: L1 から読む種。`belief_events` が絞る集合と**同一**でなければならない
+# (observer/schema.py が登録する belief_* はこの 3 種で全部)。ここで Arrow レベルに
+# 絞ることで、解析が使わない種の Python dict を 1 個も作らずに済む。
+BELIEF_KINDS = ("belief_update", "belief_transmit", "belief_verify")
 NOTE = ("観測記録であって因果の証明ではない(訂正の伝播効率は接触前後の関連)。"
         "真値は [0,1] の1次元スカラー(ミニマル版)。検証行動は誘導していないので"
         "検証数 0 のランはありうる。")
@@ -74,6 +80,26 @@ def load_ledger(run_dir: str) -> dict:
 def belief_events(events: list[dict]) -> list[dict]:
     """belief_* の 3 種だけを step→(元の並び)で取り出す(L1 の並びは既に決定論)。"""
     return [e for e in events if str(e.get("kind", "")).startswith("belief_")]
+
+
+def load_belief_events(run_dir: str) -> list[dict]:
+    """L1 から belief_* だけを**逐次読み**で取り出す(W2-2)。
+
+    旧実装は `measure.load_events(run_dir)` で L1 を全件 RAM 展開してから
+    `belief_events` で絞っていた。在場 25万 × 10 日の L1 は 40.6 億件なので
+    (`docs/plans/proposal-dp-u3-observe-250k.md` §2-4)、解析が使うのが数万件でも
+    40.6 億個の Python dict を作って捨てることになり、確実に破綻する。
+
+    **返り値は 1 バイトも変わらない**: `l1_stream.iter_events` の要素は
+    `load_events` の要素とキー順まで同一で、`kinds=` は「その条件で filter した
+    部分列」を順序を保って返すことが `tests/test_l1_stream.py` で固定されている。
+    さらに絞り込みの結果へ `belief_events` を**もう一度**掛けているので、
+    絞る集合は旧実装の述語そのものが最終決定する(二重掛けは冪等)。
+    """
+    if not ls.l1_paths(run_dir):
+        # 欠測を偽の値で埋めない(旧実装も L1 が無ければ例外で止まっていた)。
+        raise SystemExit(f"[beliefs] l1_events.parquet が無い: {run_dir}")
+    return belief_events(list(ls.iter_events(run_dir, kinds=BELIEF_KINDS)))
 
 
 # --------------------------------------------------------------------------- #
@@ -257,8 +283,7 @@ def analyze(run_dir: str, *, bin_steps: int = 24, top_k: int = 15) -> dict:
     ledger = load_ledger(run_dir)
     facts = {f["id"]: f for f in ledger.get("facts", [])}
     truth = {fid: float(f["value"]) for fid, f in facts.items()}
-    events = m.load_events(run_dir)
-    bevents = belief_events(events)
+    bevents = load_belief_events(run_dir)
 
     tr = trace(bevents, truth, bin_steps)
     ver = verification(bevents, tr["final"])

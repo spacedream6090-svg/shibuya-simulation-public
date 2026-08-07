@@ -56,10 +56,14 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
+_HERE = str(Path(__file__).resolve().parent)
+if _HERE not in sys.path:                # 同ディレクトリの run_dt を import
+    sys.path.insert(0, _HERE)
 
 import numpy as np                                          # noqa: E402
 from omegaconf import OmegaConf                             # noqa: E402
 
+import run_dt                                               # noqa: E402  (W2-3)
 from society import registry as R                           # noqa: E402
 from society.observer import measure as m                   # noqa: E402
 from society.observer import norms as N                     # noqa: E402
@@ -67,7 +71,11 @@ from society.observer import stream as S                    # noqa: E402
 
 MC_ITER = 10000          # analyze_endo_treatment.py と同値(MC の反復数)
 EXHAUST_MAX = 200000     # 全列挙する組合せ数の上限(超えたら MC へ)
-STEPS_PER_DAY = 144
+# W2-3: **ラン依存**(run.dt_min)。この定数は正準 Δt=10 の 144 で、下位関数の既定引数
+# としてだけ残る(= 渡さなければ従来と完全同値)。実際の値は入口 `analyze_run` が
+# `run_dt.steps_per_day(run_dir)` で解決して配る。「参入初日」は暦ではなく
+# **初出 step から 1 日ぶんの step** なので、Δt が変われば step 数も変わる。
+STEPS_PER_DAY = run_dt.CANON_STEPS_PER_DAY
 
 # 参入初日の行動分布を比較する既定のイベント種(存在するものだけ使う)。
 FIRST_DAY_KINDS = ("speak", "sns_post", "dm", "hear", "stay", "route_start",
@@ -179,11 +187,14 @@ def _read_initial_frame(run_dir: str):
 
 
 def first_day_features(run_dir: str, first_step: dict, words: list,
-                       t_norm: int | None) -> tuple[list[dict], int]:
+                       t_norm: int | None,
+                       spd: int = STEPS_PER_DAY) -> tuple[list[dict], int]:
     """個体ごとの **参入初日**(初出 step から 1 日)の行動特徴を 1 パスで集める。
 
     返り値は (レコード列, ランの最終 step)。ランの終端に掛かって初日が丸ごと観測でき
     なかった個体には `full_day=False` を立てる(絶対件数の比較は歪むため)。
+
+    W2-3: `spd` = 1 日の step 数。既定は正準 144 なので **渡さなければ従来と完全同値**。
     """
     counts: dict[int, dict] = {}
     utt: dict[int, list] = {}
@@ -196,7 +207,7 @@ def first_day_features(run_dir: str, first_step: dict, words: list,
         if not isinstance(aid, int) or aid < 0:
             continue
         f0 = first_step.get(aid)
-        if f0 is None or s < f0 or s >= f0 + STEPS_PER_DAY:
+        if f0 is None or s < f0 or s >= f0 + spd:
             continue
         row = counts.setdefault(aid, {"agent": aid, "first_step": f0,
                                       "n_events": 0, "kinds": {}})
@@ -212,12 +223,12 @@ def first_day_features(run_dir: str, first_step: dict, words: list,
         texts = utt.get(aid, [])
         n_utt = len(texts)
         hit = sum(1 for t in texts if any(w in t for w in words)) if words else 0
-        observed = min(last_step + 1, row["first_step"] + STEPS_PER_DAY) \
+        observed = min(last_step + 1, row["first_step"] + spd) \
             - row["first_step"]
         rec = {
             "agent": aid, "first_step": row["first_step"],
-            "first_day": row["first_step"] // STEPS_PER_DAY,
-            "observed_steps": observed, "full_day": observed >= STEPS_PER_DAY,
+            "first_day": row["first_step"] // spd,
+            "observed_steps": observed, "full_day": observed >= spd,
             "n_events": row["n_events"], "n_utterances": n_utt,
             "norm_word_use_rate": (round(hit / n_utt, 6) if n_utt else None),
             "norm_word_use_any": (1.0 if hit else 0.0) if n_utt else None,
@@ -241,7 +252,10 @@ def analyze_run(run_dir: str, min_stage: int, min_agents: int,
     t_norm = cands[0]["established_step"] if cands else None
     words = [c["word"] for c in cands]
     first = S.first_presence(run_dir)
-    feats, last_step = first_day_features(run_dir, first, words, t_norm)
+    # W2-3: 「参入初日 = 初出 step から 1 日」の 1 日はこのランの run.dt_min で決まる
+    # (Δt=10 なら 144 = 従来と同値・Δt=1 なら 1440)。
+    feats, last_step = first_day_features(run_dir, first, words, t_norm,
+                                          run_dt.steps_per_day(run_dir))
     n_truncated = sum(1 for r in feats if not r["full_day"])
     if require_full_day:
         feats = [r for r in feats if r["full_day"]]
@@ -445,7 +459,12 @@ def main() -> None:
         "params": {"norm_stage": args.norm_stage,
                    "norm_threshold": args.norm_threshold,
                    "mc": args.mc, "seed": args.seed,
-                   "steps_per_day": STEPS_PER_DAY},
+                   # W2-3: 直書き 144 ではなく**ラン由来**(Δt=10 なら 144 = 従来と同値)。
+                   # 複数ランを束ねるときは先頭ランの Δt を出す(スカラー 1 個という
+                   # 出力の形を変えないため)。Δt が混在するラン群の比較はそもそも
+                   # 「1 日」の意味が揃わないので、ラン別の窓は各 analyze_run が
+                   # 自分の Δt で正しく取っている。
+                   "steps_per_day": run_dt.steps_per_day(dirs[0])},
         "runs": runs,
         "downward": downward_causation(runs, n_mc=args.mc, rng_seed=args.seed),
     }

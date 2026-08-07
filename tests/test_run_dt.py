@@ -561,18 +561,35 @@ def test_export_3d_loads_run_dt_without_touching_sys_path():
         "export_3d が sys.path を触り始めている(設計逸脱)"
 
 
-def test_frozen_spec_files_untouched_by_this_batch():
-    """凍結 SPEC_FILES(解析側 4 本)は W2-3 では **1 バイトも触っていない**。
+def test_frozen_spec_files_touched_only_where_the_user_approved():
+    """凍結 SPEC_FILES(解析側 4 本)のうち **Δt 対応が入ってよいのは 2 本だけ**。
 
-    触った瞬間 run_manifest の metrics_spec_hash が変わる = 事後の指標いじりと区別できない。
-    Δt 直書きが残っているのは既知(報告済み)で、解除はユーザー判断(8/15)。
+    W2-3 の時点では 4 本とも 1 バイトも触っていなかった(Δt 直書きは既知の残件として
+    報告済み)。**2026-08-07 にユーザーが 3 本まとめての修正を明示承認**したため
+    (8/15 の事前登録凍結の前に metrics_spec_hash を 1 回だけ動かして確定し直す)、
+    W3-1 で `analyze_norms.py` / `analyze_specialization.py` に run_dt 経由の
+    Δt 解決が入った。残る 2 本は引き続き **Δt 対応を入れない**:
+
+      - `analyze_beliefs.py`   … W3-1 の変更は I/O(L1 の逐次読み)だけで、
+                                  時間換算の配管には触れていない
+      - `diagnose_stationarity.py` … 事前登録 U-10 の本体。触る理由が無い(実測で安全)
+
+    触った瞬間 run_manifest の metrics_spec_hash が変わる = 事後の指標いじりと
+    区別できないので、**どのファイルが動いてよいか**をここで機械固定する。
     """
     from society.observer import metrics_spec
     frozen = [f for f in metrics_spec.SPEC_FILES if f.startswith("scripts/")]
     assert frozen, "凍結リストに解析側ファイルが無い(前提が変わった)"
+    migrated = {"scripts/analyze_norms.py", "scripts/analyze_specialization.py"}
+    assert migrated <= set(frozen), "承認された 2 本が凍結リストから消えている"
     for rel in frozen:
         src = (_ROOT / rel).read_text(encoding="utf-8")
-        assert "run_dt" not in src, f"凍結ファイル {rel} に W2-3 の変更が入っている"
+        if rel in migrated:
+            assert "import run_dt" in src, \
+                f"承認済みの {rel} が run_dt を経由していない(144 直書きへの逆戻り)"
+        else:
+            assert "run_dt" not in src, \
+                f"未承認の凍結ファイル {rel} に Δt 対応が入っている"
 
 
 def test_run_dt_cli_reports_provenance(tmp_path):

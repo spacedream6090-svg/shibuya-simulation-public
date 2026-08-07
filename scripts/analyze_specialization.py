@@ -73,7 +73,11 @@ except Exception:                                        # noqa: BLE001
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
+_HERE = str(Path(__file__).resolve().parent)
+if _HERE not in sys.path:                # 同ディレクトリの run_dt を import
+    sys.path.insert(0, _HERE)
 
+import run_dt                                             # noqa: E402  (W2-3)
 from society import registry as R                         # noqa: E402
 from society.observer import measure as m                 # noqa: E402
 from society.observer import metrics_spec as MS           # noqa: E402
@@ -81,7 +85,10 @@ from society.observer import state_hash as SH             # noqa: E402
 
 # 発話とみなすイベント種(observer/echo.py・norms.py と同一定義)
 UTTERANCE_KINDS = ("speak", "sns_post", "dm")
-STEPS_PER_DAY = 144
+# W2-3: **ラン依存**(run.dt_min)。正準 Δt=10 の 144。③ の日ビン幅の既定は
+# `--bin-steps` 未指定なら `main()` が `run_dt.steps_per_day()` で解決する
+# (Δt=10 では 144 に解決される = 従来と完全同値)。
+STEPS_PER_DAY = run_dt.CANON_STEPS_PER_DAY
 
 # トークン化から落とす文字(空白・句読点・括弧・記号)。**語彙リテラルは 1 語も置かない**。
 _DROP = set(" \t\n　、。「」『』()()[]【】,.!?！?…・:;:;\"'‘’“”-—~〜/\\")
@@ -572,8 +579,9 @@ def main() -> int:
                     help="②で役割を採用する最小トークン数(既定 100)")
     ap.add_argument("--min-count", type=int, default=5, help="③の最小出現数(既定 5)")
     ap.add_argument("--min-users", type=int, default=2, help="③の最小話者数(既定 2)")
-    ap.add_argument("--bin-steps", type=int, default=STEPS_PER_DAY,
-                    help=f"③の日ビン幅 step(既定 {STEPS_PER_DAY}=1日)")
+    ap.add_argument("--bin-steps", type=int, default=None,
+                    help="③の日ビン幅 step(既定=ランの run.dt_min から 1 日ぶん。"
+                         f"Δt=10 なら {STEPS_PER_DAY})")
     ap.add_argument("--out", default=None, help="出力先ディレクトリ(既定: 先頭ラン)")
     ap.add_argument("--allow-tier-mismatch", action="store_true",
                     help="再現性等級が異なるラン同士の比較を明示的に許可する")
@@ -584,6 +592,11 @@ def main() -> int:
     if not treat_dirs:
         raise SystemExit(f"treatment のランが見つからない: {args.run_dirs}")
     R.guard_or_die(treat_dirs + ctrl_dirs, allow_mismatch=args.allow_tier_mismatch)
+    # W2-3: 日ビン幅を**ラン由来**にする(Δt=10 なら 144 に解決 = 従来と完全同値)。
+    # treatment と control を**同じビン幅**で測らないと ③ の差分が比較にならないので、
+    # 先頭 treatment ランの Δt を 1 回だけ解決して両条件へ配る(実数は params に載る)。
+    if args.bin_steps is None:
+        args.bin_steps = run_dt.steps_per_day(treat_dirs[0])
 
     treat = condition(treat_dirs, args, "treatment(通常ラン)")
     ctrl = (condition(ctrl_dirs, args, "control(ablate.propagation_off)")
