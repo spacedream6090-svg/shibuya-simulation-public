@@ -655,3 +655,370 @@ def test_zone_gate_interpolation_respects_step_stride(tmp_path):
     assert tracks["positions"][2][i0] == [40.0, 20.0, 0]    # step4 = 中点(補間)
     assert tracks["positions"][3][i0] == [80.0, 40.0, 0]    # step6 = 退場
     assert tracks["meta"]["zone_interp"]["frames"] == 1
+
+
+# ==================================================== 小粒E: tracks 再構成のストリーミング化
+# 検収条件 = **出力バイト同一**。リファクタ前(2026-08-06 時点)の reconstruct_tracks 本体を
+# ここへ**逐語で**並置し、新しい 3 経路
+#   (a) reconstruct_tracks(events)            … list 経路(既存 API)
+#   (b) reconstruct_tracks(load_track_events) … --low-mem 第1段(間引き済み list)
+#   (c) reconstruct_tracks_streaming(path)    … --low-mem 第2段(イベント列を持たない)
+# の JSON バイト列がすべて旧実装と一致することを固定する。
+# ★このコピーはテスト内でのみ参照する(本体からは import されない)。
+from collections import defaultdict          # noqa: E402  (旧実装の逐語コピーが使う)
+
+encode_indoor_w = E3D.encode_indoor_w
+DEFAULT_START_MIN = E3D.DEFAULT_START_MIN
+STEP_MINUTES = E3D.STEP_MINUTES
+FLOOR_HEIGHT = E3D.FLOOR_HEIGHT
+
+
+def _legacy_reconstruct_tracks(events: list, buildings: list, agents_meta: list,
+                               sample_agents: int | None = None,
+                               step_stride: int = 1, rich_tracks: bool = False,
+                               n_steps_override: int | None = None,
+                               step_min_override: dict | None = None,
+                               agent_ids_override: list | None = None) -> dict:
+    """リファクタ前の scripts/export_3d.py::reconstruct_tracks 本体(逐語)。"""
+    n_steps = (max((e["step"] for e in events), default=-1) + 1
+               if n_steps_override is None else int(n_steps_override))
+    bld_idx = {b["id"]: i for i, b in enumerate(buildings)}
+    bld_levels = [max(1, int(b.get("levels", 2) or 2)) for b in buildings]
+    w_stats: dict = {}                 # B-1: floor クランプ / 未知建物の件数(黙って落とさない)
+
+    agent_ids = (sorted({e["agent_id"] for e in events if e["agent_id"] >= 0})
+                 if agent_ids_override is None else list(agent_ids_override))
+    if agents_meta:
+        idx = {a["id"]: i for i, a in enumerate(agents_meta)}
+        agent_ids = [a["id"] for a in agents_meta]
+    else:
+        idx = {aid: i for i, aid in enumerate(agent_ids)}
+        agents_meta = [{"id": a, "name": f"agent{a}", "occupation": "?",
+                        "visitor": False} for a in agent_ids]
+    # LOD: 先頭 N エージェントに間引く(idx/agent_ids/agents_meta を一貫して縮小)
+    if sample_agents and sample_agents > 0 and sample_agents < len(agents_meta):
+        agents_meta = agents_meta[:sample_agents]
+        agent_ids = [a["id"] for a in agents_meta]
+        idx = {a["id"]: i for i, a in enumerate(agents_meta)}
+    stride = max(1, int(step_stride or 1))
+
+    by_step: dict[int, list[dict]] = defaultdict(list)
+    step_min: dict[int, int] = ({} if step_min_override is None
+                                else {int(k): int(v) for k, v in step_min_override.items()})
+    for e in events:
+        by_step[e["step"]].append(e)
+        if step_min_override is not None:
+            continue
+        sm = e.get("sim_min")
+        if sm is not None:
+            step_min.setdefault(e["step"], int(sm))
+
+    mode_code = {"walk": 0, "bicycle": 1, "car": 2}
+    # --rich-tracks 用: taxi 乗車(ride イベント, payload mode=="taxi")の (agent_id, step) 集合。
+    # 対応付け: ride と同一 agent×step の move_segment(mode=car)がタクシー乗車区間。
+    # 実データ runs/demo_event_200a3d では ride 79件すべてが同一 step の move_segment 終点と
+    # (x,y)一致し、うち mode=car は 33件(残り46件は sim が walk で記録=car ではないため非対象)。
+    # 既定 OFF では空集合=振替なし=現行と完全同一。
+    taxi_steps: set = set()
+    if rich_tracks:
+        for e in events:
+            if e["kind"] == "ride":
+                pr = json.loads(e["payload"]) if e.get("payload") else {}
+                if pr.get("mode") == "taxi":
+                    taxi_steps.add((e["agent_id"], e["step"]))
+    positions, moves, traffic = [], [], []
+    cur = [[0.0, 0.0, 0] for _ in agent_ids]
+    # 竹-4 持ち越し①: ゾーン所有中(zone_gate enter → exit)の位置の穴。
+    #   zone_open[i] = (enter step, (x, y)) / zone_fills = 埋める区間
+    zone_open: dict[int, tuple[int, tuple[float, float]]] = {}
+    zone_fills: list[tuple[int, int, tuple[float, float], int, tuple[float, float]]] = []
+    for step in range(n_steps):
+        mv = [None] * len(agent_ids)
+        tr_step = {"n": 0, "segs": []}
+        for e in by_step.get(step, []):
+            p = json.loads(e["payload"]) if e.get("payload") else {}
+            kind = e["kind"]
+            if kind == "traffic_flow":
+                segs = [[[round(float(a), 1), round(float(b), 1)] for a, b in seg]
+                        for seg in p.get("segs", [])]
+                tr_step = {"n": p.get("n", 0), "segs": segs}
+                continue
+            if e["agent_id"] not in idx:
+                continue
+            i = idx[e["agent_id"]]
+            if kind in ("move_segment", "arrive", "speak", "reflect"):
+                cur[i][0], cur[i][1] = round(float(e["x"]), 1), round(float(e["y"]), 1)
+            if kind == "move_segment" and p.get("pts"):
+                pts = [[round(float(a), 1), round(float(b), 1)] for a, b in p["pts"]]
+                code = mode_code.get(p.get("mode", "walk"), 0)
+                # rich_tracks: 同一 agent×step に taxi ride がある car 区間(2)→タクシー(3)。
+                # 既定は taxi_steps 空・rich_tracks False なので code 不変=現行と同一。
+                if rich_tracks and code == 2 and (e["agent_id"], step) in taxi_steps:
+                    code = 3
+                mv[i] = [code, pts]
+            elif kind == "enter_building":
+                cur[i] = [round(float(e["x"]), 1), round(float(e["y"]), 1),
+                          encode_indoor_w(bld_idx, bld_levels,
+                                          p.get("building"), p.get("floor", 1), w_stats)]
+            elif kind == "floor_move":
+                cur[i][2] = encode_indoor_w(bld_idx, bld_levels,
+                                            p.get("building"), p.get("floor", 1), w_stats)
+            elif kind == "exit_building":
+                cur[i] = [round(float(e["x"]), 1), round(float(e["y"]), 1), 0]
+            elif kind == "exit_area":
+                # rich_tracks: 退出手段が電車(payload via=="train")なら -3(電車で圏外)。
+                # exit_area payload は via("train"/"walk")を権威情報として持つ(city nodes に
+                # 駅種別はほぼ無く=3499中1件、近傍判定より確実)。既定 OFF=従来どおり -1。
+                cur[i][2] = -3 if (rich_tracks and p.get("via") == "train") else -1
+            elif kind == "enter_area":
+                cur[i] = [round(float(e["x"]), 1), round(float(e["y"]), 1), 0]
+            elif kind == "sleep_start":
+                cur[i][2] = -2
+            elif kind == "wake_up":
+                cur[i][2] = 0 if cur[i][2] == -2 else cur[i][2]
+            elif kind == "zone_gate":
+                # 物理ゾーンの流入/流出。所有中は move_segment が出ないので、この 2 点で
+                # 区間を挟んで**直線補間**する(後段の post-pass。w=0=路上扱い)。
+                # 順序: physics.phase() は _phase_move の**直前**なので、同 step の
+                # move_segment は zone_gate より後に来る = 退場した step の最終位置は
+                # move_segment 側が正しく上書きする。
+                xy = (round(float(e["x"]), 1), round(float(e["y"]), 1))
+                cur[i] = [xy[0], xy[1], 0]
+                if p.get("dir") == "enter":
+                    zone_open[i] = (step, xy)
+                else:                                  # "exit"(reason は問わない)
+                    opened = zone_open.pop(i, None)
+                    if opened is not None and step - opened[0] >= 2:
+                        zone_fills.append((i, opened[0], opened[1], step, xy))
+        if step % stride == 0:                     # LOD: K step ごとに1フレームだけ出力
+            positions.append([list(p) for p in cur])
+            moves.append(mv)
+            traffic.append(tr_step)
+
+    # ---- 竹-4 持ち越し①: ゾーン所有中の位置を enter→exit の直線で埋める(post-pass)----
+    # なぜ post-pass か: 埋める先(exit の位置)は未来の行なので、前向き 1 パスでは書けない。
+    # ★正直な限界: これは**実軌跡ではなく直線近似**である。物理(SFM/ORCA)は dt_sub=0.05s で
+    #   局所回避しながら曲がって歩くが、その軌跡は L1 に一切残っていない(記録すると 1 個体
+    #   1 step あたり最大 12000 点)。実軌跡の記録は将来課題。ここで埋めるのは
+    #   「ゾーンに入った人が入口で固まって見え、出口で瞬間移動する」表示上の欠落だけである。
+    n_interp_frames = 0
+    for i, s0, (x0, y0), s1, (x1, y1) in zone_fills:
+        span = s1 - s0
+        for s in range(s0 + 1, s1):
+            if s % stride:
+                continue                       # 出力されないフレームは埋めない
+            f = s // stride
+            if f >= len(positions):
+                continue
+            t = (s - s0) / span
+            positions[f][i] = [round(x0 + (x1 - x0) * t, 1),
+                               round(y0 + (y1 - y0) * t, 1), 0]
+            n_interp_frames += 1
+
+    start_min = step_min.get(0, DEFAULT_START_MIN)
+    emitted = list(range(0, n_steps, stride))
+    sim_min = [step_min.get(s, start_min + s * STEP_MINUTES) for s in emitted]
+
+    agents_slim = [{
+        "id": a["id"], "name": a.get("name", f"agent{a['id']}"),
+        "visitor": bool(a.get("visitor", False)),
+        "occupation": a.get("occupation", "?"),
+        "age": a.get("age", 0), "gender": a.get("gender", "?"),
+        "has_car": bool(a.get("has_car", False)),
+        "has_bicycle": bool(a.get("has_bicycle", False)),
+    } for a in agents_meta]
+
+    meta = {"nSteps": len(positions), "step_minutes": STEP_MINUTES,
+            "start_min": start_min, "floor_height": FLOOR_HEIGHT}
+    if stride > 1:                                  # 追加専用: 全量時は出さない=現行と同一
+        meta["step_stride"] = stride
+    if rich_tracks:                                 # 追加専用: 既定 OFF=現行と同一
+        meta["mode_legend"] = {"0": "徒歩", "1": "自転車", "2": "車", "3": "タクシー"}
+        meta["away_train"] = -3
+    # 竹-4 持ち越し①: 補間の実績(追加専用キー。ゾーン 0 件のランでは出さない=既存出力と同一)
+    if zone_fills or zone_open:
+        meta["zone_interp"] = {"method": "linear", "segments": len(zone_fills),
+                               "frames": n_interp_frames,
+                               "unclosed": len(zone_open)}
+        print(f"  [tracks] ゾーン所有中の位置を直線補間: 区間 {len(zone_fills)} 本 /"
+              f" フレーム {n_interp_frames} 点"
+              + (f" / 未閉 {len(zone_open)} 件(ラン終端で所有中)" if zone_open else "")
+              + " ※実軌跡ではなく enter→exit の直線近似")
+    if w_stats.get("clamped") or w_stats.get("unknown"):     # silent cap 禁止
+        top = sorted(w_stats.get("unknown_names", {}).items(),
+                     key=lambda kv: (-kv[1], str(kv[0])))[:3]
+        print(f"  [tracks] 屋内 w の是正: floor クランプ {w_stats.get('clamped', 0)}件"
+              f" / 未知建物 {w_stats.get('unknown', 0)}件は路上(w=0)へ退避"
+              + (f"  上位={top}" if top else ""))
+    return {
+        "meta": meta,
+        "agents": agents_slim,
+        "ids": agent_ids,
+        "positions": positions,
+        "moves": moves,
+        "traffic": traffic,
+        "sim_min": sim_min,
+    }
+
+
+def _tracks_blob(tracks) -> str:
+    return json.dumps(tracks, ensure_ascii=False, separators=(",", ":"))
+
+
+def _stream_events():
+    """ride(タクシー)+ zone_gate + traffic_flow を含む、全分岐を踏むイベント列。"""
+    rows = _mock_events()
+
+    def add(step, aid, kind, x, y, payload):
+        rows.append({"step": step, "sim_min": 7 * 60 + step * 10, "agent_id": aid,
+                     "kind": kind, "x": float(x), "y": float(y),
+                     "payload": json.dumps(payload, ensure_ascii=False),
+                     "rng_stream": "", "llm_call_id": ""})
+
+    # agent1: 同一 step の ride(taxi)+ car の move_segment = --rich-tracks の振替対象
+    add(7, 1, "ride", 30, 20, {"mode": "taxi"})
+    add(7, 1, "move_segment", 30, 20, {"mode": "car", "pts": [[20, 10], [30, 20]]})
+    # agent5: 物理ゾーンの通過(zone_gate enter → exit。間の位置は直線補間される)
+    add(9, 5, "zone_gate", 0, 0, {"zone": "z1", "gate": "g0", "dir": "enter"})
+    add(14, 5, "zone_gate", 80, 40, {"zone": "z1", "gate": "g1", "dir": "exit",
+                                     "reason": "gate"})
+    # agent6: 電車で圏外(--rich-tracks の w=-3)
+    add(11, 6, "exit_area", -100, -100, {"gateway": "n1", "via": "train"})
+    # 対象外 kind(tracks に一切影響しないことの担保)
+    add(12, 7, "hear", 1, 1, {"speaker": 3})
+    add(13, 8, "spend", 1, 1, {"amount": 100})
+    rows.sort(key=lambda r: r["step"])          # L1 と同じ step 非減少
+    return rows
+
+
+def _write_stream_run(tmp_path, rows, name="e_stream", row_group_size=None):
+    run_dir = tmp_path / name
+    run_dir.mkdir()
+    map_path = tmp_path / f"{name}_map.json"
+    map_path.write_text(json.dumps(_synthetic_map(), ensure_ascii=False), encoding="utf-8")
+    (run_dir / "config.yaml").write_text(
+        f"world:\n  map: {map_path.as_posix()}\n", encoding="utf-8")
+    agents = [{"id": i, "name": f"住民{i}", "age": 20 + i, "gender": "男" if i % 2 else "女",
+               "occupation": "会社員", "visitor": (i % 3 == 0),
+               "has_bicycle": False, "has_car": (i == 1)} for i in range(10)]
+    (run_dir / "agents.json").write_text(json.dumps(agents, ensure_ascii=False),
+                                         encoding="utf-8")
+    cols = {k: [r[k] for r in rows] for k in rows[0]}
+    schema = pa.schema([
+        ("step", pa.int32()), ("sim_min", pa.int32()), ("agent_id", pa.int32()),
+        ("kind", pa.string()), ("x", pa.float32()), ("y", pa.float32()),
+        ("payload", pa.string()), ("rng_stream", pa.string()), ("llm_call_id", pa.string())])
+    kw = {"row_group_size": row_group_size} if row_group_size else {}
+    pq.write_table(pa.table(cols, schema=schema), run_dir / "l1_events.parquet", **kw)
+    return run_dir, map_path
+
+
+@pytest.mark.parametrize("kw", [
+    {},
+    {"rich_tracks": True},
+    {"step_stride": 3},
+    {"sample_agents": 4},
+    {"sample_agents": 4, "step_stride": 2, "rich_tracks": True},
+])
+def test_streaming_reconstruct_is_byte_identical_to_legacy(tmp_path, kw):
+    """旧実装 vs (a) list 経路 / (b) --low-mem 第1段 / (c) streaming がすべてバイト同一。"""
+    rows = _stream_events()
+    # row group を 7 行刻みに割る = ストリーミングが必ず複数 chunk をまたぐ
+    run_dir, map_path = _write_stream_run(tmp_path, rows, row_group_size=7)
+    city = json.loads(map_path.read_text(encoding="utf-8"))
+    buildings = city["buildings"]
+    agents_meta = json.loads((run_dir / "agents.json").read_text(encoding="utf-8"))
+    l1 = run_dir / "l1_events.parquet"
+
+    all_events = pq.read_table(l1).to_pylist()
+    legacy = _tracks_blob(_legacy_reconstruct_tracks(all_events, buildings, agents_meta, **kw))
+    a = _tracks_blob(E3D.reconstruct_tracks(all_events, buildings, agents_meta, **kw))
+    thin, ov = E3D.load_track_events(l1)
+    b = _tracks_blob(E3D.reconstruct_tracks(thin, buildings, agents_meta, **ov, **kw))
+    c = _tracks_blob(E3D.reconstruct_tracks_streaming(l1, buildings, agents_meta, **kw))
+    assert a == legacy, "list 経路が旧実装と食い違う"
+    assert b == legacy, "--low-mem 第1段(間引き list)が旧実装と食い違う"
+    assert c == legacy, "streaming 経路が旧実装と食い違う"
+
+
+def test_streaming_never_materializes_all_events(tmp_path):
+    """streaming 経路は「全イベントの list」を 1 度も作らない(chunk 単位で回る)。"""
+    rows = _stream_events()
+    run_dir, _ = _write_stream_run(tmp_path, rows, row_group_size=5)
+    l1 = run_dir / "l1_events.parquet"
+    chunks = list(E3D.iter_track_events(l1))
+    assert len(chunks) >= 2, "row group が 1 つしかなく chunk 分割を検証できていない"
+    # chunk を連結すると load_track_events の list と**同じ順・同じ内容**
+    flat = [e for ch in chunks for e in ch]
+    thin, _ = E3D.load_track_events(l1)
+    assert flat == thin
+    # step 単位のバケツは step 昇順で、各バケツは 1 step だけを含む
+    groups = list(E3D._group_by_step(iter(chunks)))
+    assert [g[0] for g in groups] == sorted({e["step"] for e in thin})
+    for step, evs in groups:
+        assert all(e["step"] == step for e in evs)
+
+
+def test_scan_track_meta_matches_load_track_events(tmp_path):
+    """pass1(列だけ走査)の override 3 点は全読み版と完全一致し、step 昇順を検出する。"""
+    rows = _stream_events()
+    run_dir, _ = _write_stream_run(tmp_path, rows, row_group_size=6)
+    l1 = run_dir / "l1_events.parquet"
+    _thin, ov = E3D.load_track_events(l1)
+    meta = E3D.scan_track_meta(l1)
+    assert meta.pop("step_sorted") is True
+    assert meta == ov
+
+
+def test_streaming_falls_back_when_l1_is_not_step_sorted(tmp_path, capsys):
+    """step 非減少でない L1 では退避経路に落ち、結果は全保持経路と同一のまま。"""
+    rows = _stream_events()
+    rows = rows[12:] + rows[:12]                 # わざと step 順を壊す
+    run_dir, map_path = _write_stream_run(tmp_path, rows, name="e_unsorted", row_group_size=6)
+    city = json.loads(map_path.read_text(encoding="utf-8"))
+    buildings = city["buildings"]
+    agents_meta = json.loads((run_dir / "agents.json").read_text(encoding="utf-8"))
+    l1 = run_dir / "l1_events.parquet"
+    assert E3D.scan_track_meta(l1)["step_sorted"] is False
+    thin, ov = E3D.load_track_events(l1)
+    want = _tracks_blob(E3D.reconstruct_tracks(thin, buildings, agents_meta, **ov))
+    got = _tracks_blob(E3D.reconstruct_tracks_streaming(l1, buildings, agents_meta))
+    assert got == want
+    assert "退避" in capsys.readouterr().out
+
+
+def test_export_run_low_mem_outputs_are_byte_identical(tmp_path):
+    """export_run の --low-mem あり/なしで生成物が 1 バイトも変わらない。"""
+    rows = _stream_events()
+    a_dir, map_path = _write_stream_run(tmp_path, rows, name="e_full", row_group_size=7)
+    b_dir, _ = _write_stream_run(tmp_path, rows, name="e_low", row_group_size=7)
+    ra = E3D.export_run(a_dir, map_path)
+    rb = E3D.export_run(b_dir, map_path, low_mem=True)
+    for key in ("scene", "tracks", "glb"):
+        assert ra[key].read_bytes() == rb[key].read_bytes(), key
+
+
+def test_dump_json_stream_is_byte_identical_to_dumps(tmp_path):
+    """逐次書き出しは json.dumps + write_text と 1 バイトも変わらない。"""
+    obj = {"meta": {"nSteps": 3, "start_min": 420, "floor_height": 3.5},
+           "日本語キー": ["渋谷", "スクランブル", None, True, False],
+           "floats": [0.1, -0.0, 1e-7, 1234567.891, 1 / 3],
+           "ints": [0, -1, 2 ** 62],
+           "nested": [[[1, 2], [3, 4]], {"a": {"b": {"c": []}}}],
+           "empty": [{}, [], "", 0],
+           # 非 str キー(dumps はキーを文字列化する)= 手で開かず dumps へ落ちる経路
+           "intkeys": {1: "a", 2: "b"},
+           "escapes": "tab\t nl\n quote\" backslash\\ ctrl\x01"}
+    for ensure_ascii in (False, True):
+        want = json.dumps(obj, ensure_ascii=ensure_ascii, separators=(",", ":"))
+        p = tmp_path / f"a_{int(ensure_ascii)}.json"
+        q = tmp_path / f"b_{int(ensure_ascii)}.json"
+        p.write_text(want, encoding="utf-8")
+        E3D.dump_json_stream(q, obj, ensure_ascii=ensure_ascii, separators=(",", ":"))
+        assert q.read_bytes() == p.read_bytes()
+        # チャンク境界を跨いでも同じ(1 文字ずつ書き出しても連結は同じ)
+        r = tmp_path / f"c_{int(ensure_ascii)}.json"
+        E3D.dump_json_stream(r, obj, ensure_ascii=ensure_ascii,
+                             separators=(",", ":"), chunk_chars=1)
+        assert r.read_bytes() == p.read_bytes()
+

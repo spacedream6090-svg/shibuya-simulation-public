@@ -13,6 +13,20 @@
                       1万体×1日(16.2M イベント・L1 167MiB)の実測で
                       プロセスピーク RSS 13.3GB → 2.0GB・所要 84.8s → 12.8s。
                       10日ランのように L1 が GB 級のときに使う。既定 OFF=従来経路そのまま。
+                      ★第2段(小粒E): --low-mem は **イベント列自体を保持しない**
+                      (reconstruct_tracks_streaming)。従来の --low-mem は「間引いた
+                      イベント dict の全期間ぶん」を list で持っていた(10日ラン規模で
+                      GB 級 = 台帳 PENDING §4)。いまは
+                        pass1 = 列だけ走査して n_steps / step→sim_min / agent_id 集合を取り
+                        pass2 = row group ごとに読んで **step 単位のバケツ 1 つ**だけ持つ
+                      = イベント側は O(全期間) → O(row group + 1 step)。出力はバイト同一。
+                      L1 が step 昇順でない場合は自動で従来の全保持経路へ退避する。
+                      加えて tracks.json も **逐次書き出し**(dump_json_stream)になる
+                      = dumps の戻り値(GB 級の 1 本の str)を作らない。バイト列は同一。
+                      実測(wv_mock_30d・L1 22.6MB・tracks.json 82.8MB・実ピーク RSS):
+                        既定     2235.6MB / 12.7s → 1985.5MB / 12.8s
+                        --low-mem 1895.7MB /  9.5s → 1634.7MB /  8.9s
+                      (tracks.json の SHA-256 は 4 通りすべて一致)
   --plateau         : PLATEAU 実形状(plateau_extract/match_plateau の成果物)で、照合済み建物を
                       実測メッシュに置換する(glb ハイブリッド+scene.json height 上書き+
                       viewer3d 用 plateau_web.json)。既定 OFF=従来出力とバイト同一。
@@ -823,6 +837,49 @@ TRACK_KINDS = ("arrive", "enter_area", "enter_building", "exit_area", "exit_buil
                "zone_gate")
 
 
+def _new_meta_acc() -> dict:
+    """「間引きで落とした行にしか無い情報」の集計器(row group 単位で畳む)。"""
+    return {"max_step": -1, "step_min": {}, "agent_ids": set(),
+            "sorted": True, "last_step": None}
+
+
+def _feed_meta(tbl, acc: dict) -> None:
+    """1 row group ぶんの列を numpy のまま畳む(Python オブジェクト化しない)。
+
+    ここで採る 3 つは全件 to_pylist() 版と**同値**であることが --low-mem の
+    バイト同一性の根拠:
+      max_step   … `max(e["step"])`
+      step_min   … step ごとの「ファイル順で最初の非 null sim_min」(setdefault と同義)
+      agent_ids  … `{e["agent_id"] for e in events if e["agent_id"] >= 0}`
+    併せて **step 非減少か**も見る(ストリーミング再構成の前提。破れていたら退避する)。
+    """
+    st = tbl.column("step").to_numpy(zero_copy_only=False)
+    acc["max_step"] = max(acc["max_step"], int(st.max()))
+    if acc["sorted"]:
+        if acc["last_step"] is not None and int(st[0]) < acc["last_step"]:
+            acc["sorted"] = False
+        elif len(st) > 1 and not bool(np.all(st[1:] >= st[:-1])):
+            acc["sorted"] = False
+    acc["last_step"] = int(st[-1])
+    # step ごとの「最初の非 null sim_min」= 全件版 step_min.setdefault(...) と同一
+    sm = tbl.column("sim_min").to_numpy(zero_copy_only=False)
+    ok = ~np.isnan(sm) if sm.dtype.kind == "f" else np.ones(len(sm), dtype=bool)
+    if ok.any():
+        st_ok, sm_ok = st[ok], sm[ok]
+        uniq, first = np.unique(st_ok, return_index=True)   # return_index は最初の出現
+        step_min = acc["step_min"]
+        for s, j in zip(uniq.tolist(), first.tolist()):
+            step_min.setdefault(int(s), int(sm_ok[j]))
+    aid = np.unique(tbl.column("agent_id").to_numpy(zero_copy_only=False))
+    acc["agent_ids"].update(int(a) for a in aid.tolist() if a >= 0)
+
+
+def _meta_overrides(acc: dict) -> dict:
+    return {"n_steps_override": acc["max_step"] + 1,
+            "step_min_override": acc["step_min"],
+            "agent_ids_override": sorted(acc["agent_ids"])}
+
+
 def load_track_events(parquet_path: Path,
                       columns: tuple = TRACK_COLUMNS,
                       kinds: tuple = TRACK_KINDS) -> tuple[list, dict]:
@@ -837,6 +894,10 @@ def load_track_events(parquet_path: Path,
     (c) があるので **戻り値で reconstruct_tracks を呼ぶと全件 to_pylist() と tracks.json が
     バイト同一**になる。順序も row group 順 = ファイル順で保存される。
 
+    ★注意(小粒E): 本関数は **絞ったイベントを全期間ぶん list で持つ**。10日ラン規模では
+    これ自体が GB 級になるので、`reconstruct_tracks_streaming` が主経路になった
+    (本関数は「L1 が step 昇順でない」ときの退避経路と、既存呼び出しの後方互換用)。
+
     戻り値: (events, overrides)。overrides は reconstruct_tracks の *_override 引数へそのまま渡す。
     """
     import pyarrow as pa
@@ -846,30 +907,82 @@ def load_track_events(parquet_path: Path,
     pf = pq.ParquetFile(parquet_path)
     value_set = pa.array(sorted(set(kinds)), type=pa.string())
     events: list = []
-    max_step = -1
-    step_min: dict[int, int] = {}
-    agent_ids: set = set()
+    acc = _new_meta_acc()
     for i in range(pf.metadata.num_row_groups):
         tbl = pf.read_row_group(i, columns=list(columns))
         if tbl.num_rows == 0:
             continue
-        st = tbl.column("step").to_numpy(zero_copy_only=False)
-        max_step = max(max_step, int(st.max()))
-        # step ごとの「最初の非 null sim_min」= 全件版 step_min.setdefault(...) と同一
-        sm = tbl.column("sim_min").to_numpy(zero_copy_only=False)
-        ok = ~np.isnan(sm) if sm.dtype.kind == "f" else np.ones(len(sm), dtype=bool)
-        if ok.any():
-            st_ok, sm_ok = st[ok], sm[ok]
-            uniq, first = np.unique(st_ok, return_index=True)   # return_index は最初の出現
-            for s, j in zip(uniq.tolist(), first.tolist()):
-                step_min.setdefault(int(s), int(sm_ok[j]))
-        aid = np.unique(tbl.column("agent_id").to_numpy(zero_copy_only=False))
-        agent_ids.update(int(a) for a in aid.tolist() if a >= 0)
+        _feed_meta(tbl, acc)
         events.extend(tbl.filter(pc.is_in(tbl.column("kind"), value_set=value_set)).to_pylist())
         del tbl
-    return events, {"n_steps_override": max_step + 1,
-                    "step_min_override": step_min,
-                    "agent_ids_override": sorted(agent_ids)}
+    return events, _meta_overrides(acc)
+
+
+def scan_track_meta(parquet_path: Path, columns: tuple = TRACK_COLUMNS) -> dict:
+    """pass1: 列だけを走査して override 3 点 + `step_sorted` を返す(イベントを作らない)。
+
+    メモリは O(row group + n_steps + n_agents)。`step` / `sim_min` / `agent_id` の
+    3 列しか読まないので、pass2(本読み)より圧倒的に軽い。
+    """
+    import pyarrow.parquet as pq
+
+    pf = pq.ParquetFile(parquet_path)
+    want = tuple(c for c in ("step", "sim_min", "agent_id") if c in columns)
+    acc = _new_meta_acc()
+    for i in range(pf.metadata.num_row_groups):
+        tbl = pf.read_row_group(i, columns=list(want))
+        if tbl.num_rows == 0:
+            continue
+        _feed_meta(tbl, acc)
+        del tbl
+    out = _meta_overrides(acc)
+    out["step_sorted"] = bool(acc["sorted"])
+    return out
+
+
+def iter_track_events(parquet_path: Path,
+                      columns: tuple = TRACK_COLUMNS,
+                      kinds: tuple = TRACK_KINDS):
+    """pass2: row group ごとに「tracks が読む 7 列 × 対象 kind」だけを dict 化して yield。
+
+    yield 単位は **row group**(list[dict])。呼び出し側が使い終えれば GC される
+    = 常駐は 1 row group ぶんだけ。行の順序は row group 順 = ファイル順で、
+    `load_track_events` が返す list を同じ順に切っただけのもの(= 出力バイト同一の根拠)。
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    pf = pq.ParquetFile(parquet_path)
+    value_set = pa.array(sorted(set(kinds)), type=pa.string())
+    for i in range(pf.metadata.num_row_groups):
+        tbl = pf.read_row_group(i, columns=list(columns))
+        if tbl.num_rows == 0:
+            continue
+        chunk = tbl.filter(pc.is_in(tbl.column("kind"), value_set=value_set)).to_pylist()
+        del tbl
+        if chunk:
+            yield chunk
+
+
+def _group_by_step(chunks):
+    """イベント chunk 列 → `(step, その step のイベント list)` を step 昇順で yield。
+
+    L1 は step 非減少で追記される(`src/society/observer/stream.py` の前提と同じ)。
+    連続する同 step をひとまとめにするだけなので、常駐は **1 step ぶん**。
+    """
+    cur = None
+    buf: list = []
+    for chunk in chunks:
+        for e in chunk:
+            s = e["step"]
+            if s != cur:
+                if buf:
+                    yield cur, buf
+                cur, buf = s, []
+            buf.append(e)
+    if buf:
+        yield cur, buf
 
 
 # ------------------------------------------------------------------ tracks.json
@@ -933,15 +1046,79 @@ def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
     w=0(路上)として埋める。実績は meta["zone_interp"](= {method, segments, frames,
     unclosed})に残す。★これは実軌跡ではない: 物理の dt_sub 刻みの実軌跡は L1 に記録されて
     いない(将来課題)。zone_gate が 1 件も無いラン(= 物理 OFF の既存ラン)では
-    この経路を一度も通らず、出力は従来とバイト同一。"""
+    この経路を一度も通らず、出力は従来とバイト同一。
+
+    ★小粒E(2026-08-07): 本関数は「events を全部 RAM に持つ」API のまま据え置き、
+    再構成の本体を `_reconstruct_core`(step 単位のバケツしか持たない)へ切り出した。
+    ここでの by_step 構築と `_reconstruct_core` の pending 送りは同じ列を作るので、
+    出力は 1 バイトも変わらない(tests/test_export3d.py が新旧突合で固定)。
+    L1 から直に流す経路は `reconstruct_tracks_streaming`。"""
     n_steps = (max((e["step"] for e in events), default=-1) + 1
                if n_steps_override is None else int(n_steps_override))
+    agent_ids_seed = (sorted({e["agent_id"] for e in events if e["agent_id"] >= 0})
+                      if agent_ids_override is None else list(agent_ids_override))
+    step_min: dict[int, int] = ({} if step_min_override is None
+                                else {int(k): int(v) for k, v in step_min_override.items()})
+    by_step: dict[int, list[dict]] = defaultdict(list)
+    for e in events:
+        by_step[e["step"]].append(e)
+        if step_min_override is not None:
+            continue
+        sm = e.get("sim_min")
+        if sm is not None:
+            step_min.setdefault(e["step"], int(sm))
+    groups = ((s, by_step[s]) for s in sorted(by_step))
+    return _reconstruct_core(groups, n_steps, agent_ids_seed, step_min,
+                             buildings, agents_meta, sample_agents=sample_agents,
+                             step_stride=step_stride, rich_tracks=rich_tracks)
+
+
+def reconstruct_tracks_streaming(parquet_path: Path, buildings: list, agents_meta: list,
+                                 sample_agents: int | None = None,
+                                 step_stride: int = 1, rich_tracks: bool = False,
+                                 columns: tuple = TRACK_COLUMNS,
+                                 kinds: tuple = TRACK_KINDS) -> dict:
+    """L1 parquet から**イベント列を全保持せずに** tracks を組む(--low-mem の主経路)。
+
+    pass1 = `scan_track_meta`(3 列だけ走査)/ pass2 = `iter_track_events`(row group 逐次)。
+    `reconstruct_tracks(load_track_events(...))` と **出力バイト同一**で、
+    イベント側の常駐が O(全期間) → O(row group + 1 step) になる。
+
+    L1 が step 昇順でないとき(通常あり得ない。logger は step 非減少で追記する)は、
+    step 単位のバケツ化が成立しないので **黙って結果を変えず**従来の全保持経路へ退避する。
+    """
+    meta = scan_track_meta(parquet_path, columns=columns)
+    if not meta.pop("step_sorted"):
+        print("  [tracks] L1 が step 昇順でない → ストリーミング再構成を退避"
+              "(従来の全保持経路で同一結果を作る)")
+        events, ov = load_track_events(parquet_path, columns, kinds)
+        return reconstruct_tracks(events, buildings, agents_meta,
+                                  sample_agents=sample_agents, step_stride=step_stride,
+                                  rich_tracks=rich_tracks, **ov)
+    groups = _group_by_step(iter_track_events(parquet_path, columns, kinds))
+    return _reconstruct_core(groups, int(meta["n_steps_override"]),
+                             list(meta["agent_ids_override"]),
+                             {int(k): int(v) for k, v in meta["step_min_override"].items()},
+                             buildings, agents_meta, sample_agents=sample_agents,
+                             step_stride=step_stride, rich_tracks=rich_tracks)
+
+
+def _reconstruct_core(step_groups, n_steps: int, agent_ids_seed: list,
+                      step_min: dict, buildings: list, agents_meta: list,
+                      sample_agents: int | None = None,
+                      step_stride: int = 1, rich_tracks: bool = False) -> dict:
+    """位置再構成の本体。`step_groups` は `(step, その step のイベント list)` を
+    **step 昇順**で出す iterable(list でも generator でもよい)。
+
+    常駐するのは「いま処理している step のイベント」だけ = イベント側は O(1 step)。
+    残る O(n_steps × n_agents) は **出力そのもの**(positions/moves)なので、これ以上は
+    tracks.json の構造を変えないと減らない(tracks.bin 側の分割出力が別の答え)。
+    """
     bld_idx = {b["id"]: i for i, b in enumerate(buildings)}
     bld_levels = [max(1, int(b.get("levels", 2) or 2)) for b in buildings]
     w_stats: dict = {}                 # B-1: floor クランプ / 未知建物の件数(黙って落とさない)
 
-    agent_ids = (sorted({e["agent_id"] for e in events if e["agent_id"] >= 0})
-                 if agent_ids_override is None else list(agent_ids_override))
+    agent_ids = list(agent_ids_seed)
     if agents_meta:
         idx = {a["id"]: i for i, a in enumerate(agents_meta)}
         agent_ids = [a["id"] for a in agents_meta]
@@ -956,30 +1133,9 @@ def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
         idx = {a["id"]: i for i, a in enumerate(agents_meta)}
     stride = max(1, int(step_stride or 1))
 
-    by_step: dict[int, list[dict]] = defaultdict(list)
-    step_min: dict[int, int] = ({} if step_min_override is None
-                                else {int(k): int(v) for k, v in step_min_override.items()})
-    for e in events:
-        by_step[e["step"]].append(e)
-        if step_min_override is not None:
-            continue
-        sm = e.get("sim_min")
-        if sm is not None:
-            step_min.setdefault(e["step"], int(sm))
-
     mode_code = {"walk": 0, "bicycle": 1, "car": 2}
-    # --rich-tracks 用: taxi 乗車(ride イベント, payload mode=="taxi")の (agent_id, step) 集合。
-    # 対応付け: ride と同一 agent×step の move_segment(mode=car)がタクシー乗車区間。
-    # 実データ runs/demo_event_200a3d では ride 79件すべてが同一 step の move_segment 終点と
-    # (x,y)一致し、うち mode=car は 33件(残り46件は sim が walk で記録=car ではないため非対象)。
-    # 既定 OFF では空集合=振替なし=現行と完全同一。
-    taxi_steps: set = set()
-    if rich_tracks:
-        for e in events:
-            if e["kind"] == "ride":
-                pr = json.loads(e["payload"]) if e.get("payload") else {}
-                if pr.get("mode") == "taxi":
-                    taxi_steps.add((e["agent_id"], e["step"]))
+    groups = iter(step_groups)
+    pending = next(groups, None)
     positions, moves, traffic = [], [], []
     cur = [[0.0, 0.0, 0] for _ in agent_ids]
     # 竹-4 持ち越し①: ゾーン所有中(zone_gate enter → exit)の位置の穴。
@@ -989,7 +1145,28 @@ def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
     for step in range(n_steps):
         mv = [None] * len(agent_ids)
         tr_step = {"n": 0, "segs": []}
-        for e in by_step.get(step, []):
+        # この step のイベントだけを取り出す(step 昇順の前提。過去の step は捨てる)。
+        while pending is not None and pending[0] < step:
+            pending = next(groups, None)
+        if pending is not None and pending[0] == step:
+            evs = pending[1]
+            pending = next(groups, None)
+        else:
+            evs = ()
+        # --rich-tracks 用: taxi 乗車(ride イベント, payload mode=="taxi")の (agent_id, step) 集合。
+        # 対応付け: ride と同一 agent×step の move_segment(mode=car)がタクシー乗車区間。
+        # 実データ runs/demo_event_200a3d では ride 79件すべてが同一 step の move_segment 終点と
+        # (x,y)一致し、うち mode=car は 33件(残り46件は sim が walk で記録=car ではないため非対象)。
+        # 既定 OFF では空集合=振替なし=現行と完全同一。
+        # ★参照は必ず「同一 step」なので、全期間ぶんを溜める必要はない(= step 内で完結)。
+        taxi_steps: set = set()
+        if rich_tracks:
+            for e in evs:
+                if e["kind"] == "ride":
+                    pr = json.loads(e["payload"]) if e.get("payload") else {}
+                    if pr.get("mode") == "taxi":
+                        taxi_steps.add((e["agent_id"], e["step"]))
+        for e in evs:
             p = json.loads(e["payload"]) if e.get("payload") else {}
             kind = e["kind"]
             if kind == "traffic_flow":
@@ -1115,6 +1292,74 @@ def reconstruct_tracks(events: list, buildings: list, agents_meta: list,
     }
 
 
+# ------------------------------------------------------------------ 逐次 JSON 書き出し
+def dump_json_stream(path: Path, obj, *, ensure_ascii: bool = True,
+                     separators: tuple = (",", ":"), chunk_chars: int = 1 << 20) -> None:
+    """`json.dumps(obj, ...)` と **同一バイト列** をファイルへ逐次書き出す。
+
+    なぜ: `Path.write_text(json.dumps(tracks, ...))` は「完成した JSON 文字列そのもの」を
+    一度 RAM に作る。tracks.json は 1万体×1日で 65.8MB、10日ラン規模では数百 MB〜GB 級
+    になるので、**tracks dict とは別に**同じだけのピークを積む。iterencode は同じ
+    エンコーダで断片を出すだけなので、連結すれば dumps と 1 バイトも変わらない
+    (tests/test_export3d.py が両者のバイト一致を固定する)。
+    open() の引数は `Path.write_text(..., encoding="utf-8")` と同一(newline 変換も同条件)。
+
+    どう書くか: 上位 `depth` 段だけ手で開いて(`{`/`[`/`,`/`:`)、**葉は `dumps` の
+    C エンコーダに一発で投げる**。`json.JSONEncoder.iterencode` は C 経路を通らないので
+    素朴に使うと遅い(実測 tracks.json 82.8MB で +5.5s)。tracks は
+    `{"positions": [フレーム, …], …}` の形なので depth=2 で「1 フレームずつ C エンコード」
+    になり、速度は dumps とほぼ同じままピークだけ落ちる。
+    セパレータに空白が無いので `dumps(d) == "{" + ",".join(dumps(k)+":"+dumps(v)) + "}"`
+    が厳密に成り立つ(= バイト同一の根拠)。非 str キーの dict は手で開かず丸ごと
+    `dumps` へ落とす(キーの文字列化規則を再実装しない)。
+
+    ★使いどころ: **--low-mem のときだけ**。既定経路は従来どおり dumps 一発。
+    """
+    enc = json.JSONEncoder(ensure_ascii=ensure_ascii, separators=separators)
+    buf: list = []
+    size = 0
+    with open(path, "w", encoding="utf-8") as f:
+        for piece in _iter_json_chunks(obj, enc, separators, 2):
+            buf.append(piece)
+            size += len(piece)
+            if size >= chunk_chars:
+                f.write("".join(buf))
+                buf.clear()
+                size = 0
+        if buf:
+            f.write("".join(buf))
+
+
+def _iter_json_chunks(obj, enc, separators: tuple, depth: int):
+    """`json.dumps(obj)` と同一の文字列を、上位 depth 段だけ分割して yield する。"""
+    item_sep, key_sep = separators
+    if depth <= 0 or not obj or not isinstance(obj, (dict, list)):
+        yield enc.encode(obj)                     # 葉 = C エンコーダ一発
+        return
+    if isinstance(obj, dict):
+        if not all(type(k) is str for k in obj):  # 非 str キーは dumps に任せる
+            yield enc.encode(obj)
+            return
+        yield "{"
+        first = True
+        for k, v in obj.items():
+            if not first:
+                yield item_sep
+            first = False
+            yield enc.encode(k) + key_sep
+            yield from _iter_json_chunks(v, enc, separators, depth - 1)
+        yield "}"
+        return
+    yield "["
+    first = True
+    for v in obj:
+        if not first:
+            yield item_sep
+        first = False
+        yield from _iter_json_chunks(v, enc, separators, depth - 1)
+    yield "]"
+
+
 # ------------------------------------------------------------------ top-level
 def export_run(run_dir: Path, map_path: Path | None = None,
                sample_agents: int | None = None, step_stride: int = 1,
@@ -1132,12 +1377,12 @@ def export_run(run_dir: Path, map_path: Path | None = None,
         # tracks.json は書いたままなので埋め込み版 viewer3d.html は自己完結を保つ。
         tracks_binary = True
     run_dir = Path(run_dir)
-    if low_mem:                       # 追加専用: 出力バイトは既定経路と同一(load_track_events)
-        events, track_ov = load_track_events(run_dir / "l1_events.parquet")
+    l1_path = run_dir / "l1_events.parquet"
+    if low_mem:            # 追加専用: 出力バイトは既定経路と同一(reconstruct_tracks_streaming)
+        events = None      # ★イベント列は 1 度も丸ごと作らない(常駐 = row group + 1 step)
     else:
         import pyarrow.parquet as pq
-        events = pq.read_table(run_dir / "l1_events.parquet").to_pylist()
-        track_ov = {}
+        events = pq.read_table(l1_path).to_pylist()
 
     mp = _resolve_map_path(run_dir, map_path)
     city = json.loads(mp.read_text(encoding="utf-8"))
@@ -1170,10 +1415,15 @@ def export_run(run_dir: Path, map_path: Path | None = None,
             gz = [_sample_terrain_gz(terrain, p[0], p[1]) for p in fp]
             b["gz"] = round(min(gz), 1) if gz else _sample_terrain_gz(
                 terrain, b["cx"], b["cy"])                            # 追加専用キー
-    tracks = reconstruct_tracks(events, buildings, agents_meta,
-                                sample_agents=sample_agents,
-                                step_stride=step_stride, rich_tracks=rich_tracks,
-                                **track_ov)
+    if low_mem:
+        tracks = reconstruct_tracks_streaming(
+            l1_path, buildings, agents_meta, sample_agents=sample_agents,
+            step_stride=step_stride, rich_tracks=rich_tracks)
+    else:
+        tracks = reconstruct_tracks(events, buildings, agents_meta,
+                                    sample_agents=sample_agents,
+                                    step_stride=step_stride, rich_tracks=rich_tracks)
+        events = None                      # 以降は tracks しか要らない(早めに解放)
     glb = build_glb(scene["buildings"], plateau)
 
     out_dir = run_dir / "scene3d"
@@ -1184,8 +1434,17 @@ def export_run(run_dir: Path, map_path: Path | None = None,
     scene_p.write_text(json.dumps(scene, ensure_ascii=False, separators=(",", ":")),
                        encoding="utf-8")
     if write_tracks_json:
-        tracks_p.write_text(json.dumps(tracks, ensure_ascii=False, separators=(",", ":")),
-                            encoding="utf-8")
+        if low_mem:
+            # --low-mem = メモリが律速のモード。dumps の戻り値(10日ランで GB 級の 1 本の
+            # str)を作らずに書く。★バイト列は dumps と同一(tests が固定)。
+            # 既定経路で使わない理由: 実測で **既定経路のピークは JSON 文字列で決まらない**
+            # (wv_mock_30d 実測: 既定は逐次書きにしても 1985.5MB → 1985.7MB で不変。
+            #  ピークは to_pylist() のイベント dict が握っている)。効くのは --low-mem の
+            # ときだけ(1895.7MB → 1634.7MB)なので、作用のある側にだけ入れる。
+            dump_json_stream(tracks_p, tracks, ensure_ascii=False, separators=(",", ":"))
+        else:
+            tracks_p.write_text(json.dumps(tracks, ensure_ascii=False,
+                                           separators=(",", ":")), encoding="utf-8")
     glb_p.write_bytes(glb)
     res = {"scene": scene_p, "glb": glb_p,
            "n_buildings": len(scene["buildings"]), "n_steps": tracks["meta"]["nSteps"]}

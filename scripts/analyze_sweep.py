@@ -12,6 +12,8 @@
   - EWS var_tau / ac1_tau(adoption_frac 系列, measure.ews。三角測量の3本目)
   - fires 合計(R1 監査: 条件間で計算量交絡が無いか)/ compute 合計
   - seed_divergence(同一 (N,k) 内の seed ペア間 adoption_frac 系列の平均 L2 距離)
+  - llm_health 3 列(llm_calls_total / llm_cache_hit_rate / llm_fallback_rate の**ラン最終値**。
+    observer.llm_health.enabled=false のランは列が無いので n/a 表示=そのランを落とさない)
   - k*(N) 推定雛形: R^2(k) 最大勾配点 / seed_divergence 最大増分点 / EWS τ 最大点の
     3候補 → fss.json + fig_fss.png(k* vs 1/N。N<3 水準なら外挿せず「insufficient」)
 
@@ -63,6 +65,22 @@ _EXTRA_L2_SERIES = ("speech_diversity", "deviation_mean",
                     "echo_max", "self_similarity_mean", "echo_utterance_rate",
                     "transmission_novel", "transmission_novel_rate",
                     "active_relations_mean", "dormant_total", "rekindle_total")
+
+# ---- LLM 健全性 KPI(observer.llm_health.enabled=false のランでは **列が存在しない**)---- #
+# 源は observer/aggregate.py の 3 列。**いずれもラン開始からの累積**(per-step 差分ではない)
+# ので、系列としてではなく「**ランの最終行の値**」= ラン全体の要約として横断表に載せる。
+#   llm_calls_total     … 累積呼数 → 最終値 = ラン総呼数(fires/compute と同族の計算量監査量。
+#                          セル内では **合計**する)
+#   llm_cache_hit_rate  … 累積 hits/累積 calls → 最終値が既に**ラン全体の率**(レート化不要。
+#                          セル内では seed 階層ブートストラップの平均+95%CI)
+#   llm_fallback_rate   … 同上(発話・熟考のパース失敗率の**下限**)
+# ★resume の限界: 3 列とも**プロセス開始**からの累積(observer/silence.py:25 が同じ性質を明記)。
+#   途中 resume したランでは最終値が resume 後の区間だけを表すので、`llm_calls_total` は
+#   過小に出る(率 2 列は resume 後区間の率になる)。横断表は「1 プロセスで完走したラン」を前提。
+# ★条件間の絶対比較に使わない: aggregate.py の但し書きどおり `llm_fallback_rate` の分母は
+#   総呼数(plan/reflect/recall/null 込み)なので、purpose 構成が動くと同じ失敗率でも値が動く。
+#   本表は **同一構成内での急増検知**の材料であって k 依存性の主張には使えない(図も出さない)。
+_LLM_HEALTH_COLS = ("llm_calls_total", "llm_cache_hit_rate", "llm_fallback_rate")
 
 plt.rcParams.update({
     "figure.facecolor": "white", "axes.facecolor": "white",
@@ -124,6 +142,28 @@ def _nan_none(v):
         return None if v is None or math.isnan(float(v)) else float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _last_valid(series):
+    """系列の**最後の有効値**(末尾の None/nan は飛ばす)。全欠測・列なしなら None。
+
+    llm_health の 3 列は累積量なので「最終行の値 = ラン全体の要約」。列が存在しないラン
+    (observer.llm_health.enabled=false)では `collective` にキー自体が無く None を返す
+    = 欠測として落ちずに N/A 表示される。
+    """
+    if not series:
+        return None
+    for v in reversed(series):
+        fv = _nan_none(v)
+        if fv is not None:
+            return fv
+    return None
+
+
+def _sum_present(rs, key):
+    """列を持つランだけを合計する。**1 本も持たなければ None**(0 で埋めない)。"""
+    vals = [r[key] for r in rs if r.get(key) is not None]
+    return float(sum(vals)) if vals else None
 
 
 def _bootstrap_ci(values, b=2000):
@@ -428,6 +468,35 @@ def _write_report(path, N_levels, table, fss):
                 f"{c['compute_total']} | {_num(c['seed_divergence'])} |")
         lines.append("")
 
+    lines.append("## LLM health (observer.llm_health, cumulative columns)\n")
+    lines.append("Run-final values of the three cumulative L2 columns. Runs with "
+                 "`observer.llm_health.enabled=false` have **no such columns** and "
+                 "show n/a (they are not dropped from any other row). "
+                 "`llm_calls` is summed over the runs of the cell; the two rates "
+                 "are already run-level ratios, so they get the seed-hierarchical "
+                 "bootstrap mean [95%CI].\n")
+    lines.append("| N | k | runs w/ llm_health | llm_calls (sum) | "
+                 "cache_hit_rate | fallback_rate |")
+    lines.append("|---|---|---|---|---|---|")
+    for N in N_levels:
+        cells = table[N]
+        for lab in _order_labels(cells):
+            c = cells[lab]
+            lines.append(
+                f"| {N} | {lab} | {c['llm_health_runs']}/{c['n_runs']} | "
+                f"{_num(c['llm_calls_total'], '{:.0f}')} | "
+                f"{_ci_str(c['llm_cache_hit_rate'])} | "
+                f"{_ci_str(c['llm_fallback_rate'])} |")
+    lines.append("")
+    lines.append("> Two honest limits carried over from `observer/aggregate.py` and "
+                 "`observer/silence.py`: (1) all three are cumulative **from process "
+                 "start**, so a resumed run reports only its post-resume segment "
+                 "(llm_calls under-counts); (2) `fallback_rate` counts only "
+                 "utterance/deliberation parse failures over **all** LLM calls, so it "
+                 "is a LOWER BOUND and its denominator moves with purpose mix -- use "
+                 "it to detect a spike within one configuration, NOT to compare k "
+                 "levels. No figure is drawn for it on purpose.\n")
+
     lines.append("## Triangulation of k* (three legs)\n")
     lines.append("Legs: (1) R^2(Y~traits) FALLS toward free (traits stop "
                  "explaining who changes the world), (2) seed_divergence RISES "
@@ -508,8 +577,12 @@ def analyze_sweep(pattern, out=None, allow_tier_mismatch: bool = False):
                 e = m.ews([v if v is not None else 0.0 for v in vals])
                 ews_extra[col] = {"var_tau": _nan_none(e["var_tau"]),
                                   "ac1_tau": _nan_none(e["ac1_tau"])}
+        # LLM 健全性 3 列(累積列 → 最終行の値。列が無いラン=llm_health OFF では None)
+        llm_health = {col: _last_valid(collective.get(col))
+                      for col in _LLM_HEALTH_COLS}
         runs.append({
-            "dir": d, **cond,
+            "dir": d, **cond, **llm_health,
+            "has_llm_health": any(v is not None for v in llm_health.values()),
             "r2_ext": r2["external"]["r2"], "r2_int": r2["internal"]["r2"],
             "fires": sum(f["n_fires_received"] for f in feats),
             "compute": sum(f["compute"] for f in feats),
@@ -542,6 +615,11 @@ def analyze_sweep(pattern, out=None, allow_tier_mismatch: bool = False):
             "fires_total": int(sum(r["fires"] for r in rs)),
             "compute_total": int(sum(r["compute"] for r in rs)),
             "seed_divergence": _seed_divergence(rs),
+            # LLM 健全性(llm_health OFF のランしか無いセルは総数 None / CI mean None = n/a)
+            "llm_calls_total": _sum_present(rs, "llm_calls_total"),
+            "llm_cache_hit_rate": _agg_metric(rs, "llm_cache_hit_rate"),
+            "llm_fallback_rate": _agg_metric(rs, "llm_fallback_rate"),
+            "llm_health_runs": int(sum(1 for r in rs if r["has_llm_health"])),
         }
 
     # k*(N) 推定 + FSS
@@ -570,7 +648,9 @@ def analyze_sweep(pattern, out=None, allow_tier_mismatch: bool = False):
                                                "is_control", "seed", "r2_ext",
                                                "r2_int", "ews_adopt_var",
                                                "ews_adopt_ac1", "fires",
-                                               "compute")}
+                                               "compute", "llm_calls_total",
+                                               "llm_cache_hit_rate",
+                                               "llm_fallback_rate")}
                             for r in runs]},
                   fh, ensure_ascii=False, indent=1)
     with open(os.path.join(out, "seed_divergence.json"), "w",
