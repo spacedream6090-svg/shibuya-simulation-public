@@ -29,6 +29,7 @@ R1(バイト一致): 新 stream は "chance" 1本のみ・追加 LLM 呼ゼロ=�
 """
 from __future__ import annotations
 
+from . import economy_sfc as sfc_mod
 from .observer.schema import Event
 
 # カタログのイベント種別(重み付き抽選の固定順=決定論)。money 系=windfall/loss、関係系=encounter。
@@ -113,7 +114,13 @@ def _apply_money(sim, agent, ecfg: dict, sign: int, rng, step: int, sim_min: int
 
     金額は同 stream の uniform 抽選。windfall は money+、loss は money−(0 未満にしない=手持ちの範囲での
     現金流出)。記録する amount は **実際の増減の絶対値**(loss が床で頭打ちなら実損=payload と収支が一致)。
-    経済会計は既存の severance/home_refill(現金への外生入金)と同じ流儀で money を直接動かす。"""
+    経済会計は既存の severance/home_refill(現金への外生入金)と同じ流儀で money を直接動かす。
+
+    IF-E2 UNCOVERED(第98バッチ・``economy.org_accounting``。既定 OFF=完全 no-op=payload バイト一致):
+    拾得・還付・当選小口も財布の紛失も**街の外との資金移動**なので rest-of-world のチャネル
+    (``chance_windfall`` / ``chance_loss``)へ分類する。抽選も金額もタイミングも 1 つも変えず、
+    payload に相手方(windfall=``payer`` / loss=``payee``)が 1 語増えるだけ。会計へ渡すのは
+    **丸める前の実変化量**(payload の 0.1 円丸めに引きずられない)。"""
     lo = float(ecfg["money_lo"])
     hi = float(ecfg["money_hi"])
     if hi < lo:
@@ -128,14 +135,21 @@ def _apply_money(sim, agent, ecfg: dict, sign: int, rng, step: int, sim_min: int
     else:
         agent.money = max(0.0, old - draw)
         kind, note = "loss", "お金を失った"
-    amount = round(abs(agent.money - old), 1)
+    delta = abs(float(agent.money) - old)    # 丸める前の実変化量(会計はこちらを使う)
+    # ★早期 return の**前**に会計する: 丸めで 0.0 になる微小変化(loss が手持ちの端数で
+    #   頭打ち)でも残高は動いているので、RoW への分類を取りこぼさない(L1 の粒度は 0.1 円の
+    #   まま=記録の挙動は不変)。既定 OFF は None=完全 no-op。
+    token = sfc_mod.on_chance(sim, kind, delta)
+    amount = round(delta, 1)
     if amount <= 0.0:                        # 実質変化なし(loss で手持ち 0)=記録しない
         return
     agent.remember(note)
+    payload = {"type": kind, "amount": amount, "balance": round(agent.money, 1)}
+    if token is not None:
+        payload["payer" if kind == "windfall" else "payee"] = token
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                          kind="chance_event", x=agent.x, y=agent.y,
-                         payload={"type": kind, "amount": amount,
-                                  "balance": round(agent.money, 1)}))
+                         payload=payload))
 
 
 def _apply_encounter(sim, agent, ecfg: dict, pools: dict, rng, step: int,

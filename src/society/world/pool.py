@@ -150,6 +150,11 @@ class DormantStore:
 _EP_CAP = 30        # 退避する統合エピソードの上限(persona-pool §3.3: 非前景の episodes を小さく)
 _REL_CAP = 20       # 退避する関係台帳の上限(接触回数の多い上位)
 
+# 噂の知識を持つ動的属性名。**`society.rumors.RUMOR_KEY` と同一でなければならない**が、
+# world/ 層から society 直下の機構 module を import すると依存の向きが逆流する(world は
+# 下層)ため、ここでは文字列で持ち、一致は tests/test_pool_rotation.py が機械固定する。
+_RUMOR_KEY = "_rumors"
+
 # 実効値(conf: pool.relations_cap / pool.episodes_cap)。既定は上の素値=挙動不変。
 # ★なぜ引数ではなくモジュール状態か: dehydrate の呼び出し口は
 #   `_phase_pool_rotation`(engine/scheduler.py)の 1 行だけで、そこは sim も cfg も
@@ -189,7 +194,7 @@ def dehydrate(agent, *, ep_cap: int | None = None, rel_cap: int | None = None) -
     mem = agent.mem
     rels = sorted(mem.relations.items(),
                   key=lambda kv: (-int(kv[1].get("count", 0)), kv[0]))[:rel_cap]
-    return {
+    state = {
         "beliefs": list(agent.beliefs),
         "day_summaries": list(mem.day_summaries),
         "episodes": [(int(e.step), e.text, e.kind, float(e.importance))
@@ -204,6 +209,29 @@ def dehydrate(agent, *, ep_cap: int | None = None, rel_cap: int | None = None) -
         "self_model": getattr(agent, "self_model", None),
         "theta_drift": float(getattr(agent, "theta_drift", 0.0)),
     }
+    # --- 第98バッチ 小粒A: 台帳の残課題 2 件(IF-C 残② / 竹-4 残③)を塞ぐ ---------------
+    # ★**属性が在って非空のときだけ**キーを足す。rumors / physics OFF のランでは退避 dict が
+    #   現行と 1 バイトも変わらない(tests/test_pool_rotation.py が dict 等値で機械固定)。
+    # ★正規化して入れる(プリミティブ / dict のみ)= JSON 安全 + 往復同値。
+    rumors = getattr(agent, _RUMOR_KEY, None)     # IF-C 残②: 街を出ると噂を忘れる(reach 過小)
+    if rumors:
+        # 挿入順 = 知った順(rumors.py の決定論反復順そのもの)を dict の順序で保つ。
+        state["rumors"] = {
+            str(iid): {"role": str(r["role"]), "redundant": int(r.get("redundant", 0)),
+                       "step": int(r.get("step", 0)), "src": str(r.get("src", ""))}
+            for iid, r in rumors.items()}
+    body = getattr(agent, "_phys_body", None)     # 竹-4 残③: 直近の群集体感(Perception.body 3 欄)
+    if body:
+        state["phys_body"] = {"blocked": float(body["blocked"]),
+                              "contact": float(body["contact"]),
+                              "local_density": float(body["local_density"])}
+    # ★**ゾーン所有(_phys_zone と _FIELDS の走行レコード)は意図的に運ばない**。あれは
+    #   「いま歩いている経路 agent.route の途中」という**その旅に固有の**状態で、再来街時は
+    #   build_pool_agent が別の node / route で個体を組み直すため、復元すると physics._run_zone が
+    #   存在しない経路の続きを積分しようとする(= 破損)。ゾーン側に占有者名簿は無く
+    #   (所有は agent._phys_zone の単一値のみ)、退場した個体は走査対象から外れるだけなので、
+    #   運ばないことによる取り残しも発生しない。持続するのは体感(_phys_body)だけ。
+    return state
 
 
 def hydrate(agent, state: dict) -> None:
@@ -222,3 +250,16 @@ def hydrate(agent, state: dict) -> None:
     agent.status = float(state.get("status", 0.0))
     agent.self_model = state.get("self_model", None)
     agent.theta_drift = float(state.get("theta_drift", 0.0))
+    # 第98バッチ 小粒A: 噂の知識と群集体感を戻す。**キー欠落を許容**する(旧 退避辞書 /
+    # rumors・physics OFF のラン)= その場合は属性を 1 つも生やさない = 現行と完全同一。
+    rumors = state.get("rumors")
+    if rumors:
+        setattr(agent, _RUMOR_KEY, {
+            str(iid): {"role": str(r["role"]), "redundant": int(r.get("redundant", 0)),
+                       "step": int(r.get("step", 0)), "src": str(r.get("src", ""))}
+            for iid, r in rumors.items()})
+    body = state.get("phys_body")
+    if body:
+        agent._phys_body = {"blocked": float(body["blocked"]),
+                            "contact": float(body["contact"]),
+                            "local_density": float(body["local_density"])}

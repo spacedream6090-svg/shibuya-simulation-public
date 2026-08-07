@@ -63,6 +63,7 @@ from .. import economy as economy_mod
 from ..government import Government, build_government_cfg
 from .. import organizations, schedule, weather
 from ..world import calendar
+from ..world import floors as floors_mod
 from ..world import indoor as indoor_mod
 from ..world import indoor_flow as indoor_flow_mod
 from ..world import presence as presence_mod
@@ -2866,7 +2867,7 @@ def _apply_action(sim, agent, action: dict, step: int, sim_min: int) -> None:
                 and sim.city.has_building(agent.home_building)):
             bld = sim.city.building(agent.home_building)
             agent.building = bld["id"]
-            agent.floor = agent.home_floor
+            agent.floor = floors_mod.clamp(sim, bld, agent.home_floor)
             agent.x, agent.y = bld["centroid"]
             sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                                  kind="enter_building", x=agent.x, y=agent.y,
@@ -2928,9 +2929,12 @@ def _apply_action(sim, agent, action: dict, step: int, sim_min: int) -> None:
         rng = sim.hub.stream("floor", agent.id, step)
         agent.building = bld["id"]
         if action.get("floor"):
-            agent.floor = int(action["floor"])
+            # 3D-U0(world.floor_clamp・既定 OFF=そのまま): 職場/バイト先の階は POI 由来で
+            # 建物の実階数を超えうる(実データ 20 件)。ON のときだけ表示側と同一規則で丸める。
+            agent.floor = floors_mod.clamp(sim, bld, int(action["floor"]))
         else:
-            agent.floor = int(rng.integers(1, int(bld["levels"]) + 1))
+            agent.floor = floors_mod.clamp(
+                sim, bld, int(rng.integers(1, int(bld["levels"]) + 1)))
         agent.stay_until = step + int(action.get("stay_steps", 3))
         activity = action.get("activity")
         if not activity:                           # 建物の中身(POI)から推定
@@ -2980,7 +2984,7 @@ def _apply_action(sim, agent, action: dict, step: int, sim_min: int) -> None:
         return
 
     if kind == "floor_move" and agent.building:
-        agent.floor = int(action["floor"])
+        agent.floor = floors_mod.clamp(sim, agent.building, int(action["floor"]))
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                              kind="floor_move", x=agent.x, y=agent.y,
                              payload={"building": agent.building,
@@ -4638,6 +4642,8 @@ def _phase_pool_rotation(sim, step: int, sim_min: int) -> None:
     """日境界で presence を引き直し、退場者をドーマント化・入場者を実体化する(pool ON 時のみ)。
 
     - presence は stream("presence", pid, day) の純関数(k/trait 非依存・resume 不変)。
+      cap の充足規則は pool.tier_quota.enabled で切替(既定 OFF=層優先 break=現行と完全一致。
+      ON=層別クォータ=DP-U3 案A。どちらも乱数の引き方は同じ=追加乱数ゼロ)。
     - 退場者(present→absent): dehydrate してスリム状態を DormantStore へ退避し sim.agents から除去。
     - 入場者(absent→present): P5 record から build_pool_agent で実体化。退避済み状態があれば hydrate
       (再来街=同一実体の記憶・信念・所持金・関係が続く)。agent.id はペルソナ id で安定。
@@ -4653,7 +4659,8 @@ def _phase_pool_rotation(sim, step: int, sim_min: int) -> None:
     sim._pool_day = day
     weekday = sim._pool_weekday(day)
     new_ids = set(presence_mod.present_for_day(
-        pool.presence_records(), day, sim._pool_present_cap, sim.hub, weekday))
+        pool.presence_records(), day, sim._pool_present_cap, sim.hub, weekday,
+        getattr(sim, "_pool_tier_quota", False)))
     cur = {getattr(a, "pool_pid", None): a for a in sim.agents}
     cur.pop(None, None)
     old_ids = set(cur)

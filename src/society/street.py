@@ -182,8 +182,12 @@ def phase(sim, step: int, sim_min: int) -> None:
     if slots is None:
         slots = resolve_slots(sim.city, cfg)
         sim._ads_slots = slots
-        sim._ads_period = -1
-        sim._ads_campaigns = {}
+        # 第98バッチ 小粒A: 枠(slots)は city からの決定論導出なので毎ラン組み直すが、
+        # **キャンペーン期の進行は日を跨ぐ状態**で checkpoint が運ぶ。ここで無条件に -1 へ
+        # 潰すと resume 直後に同じ期を引き直して ad_campaign を二重記録するので、既存値が
+        # あれば残す(fresh ランでは属性が生えていない → -1 / {} = 従来と完全同一)。
+        sim._ads_period = getattr(sim, "_ads_period", -1)
+        sim._ads_campaigns = getattr(sim, "_ads_campaigns", None) or {}
     if not slots:
         return
     day = sim_min // 1440

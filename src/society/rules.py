@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import math
 
+from . import economy_sfc as sfc_mod
 from .observer.schema import Event
 from .world.clock import STEPS_PER_DAY
 
@@ -322,6 +323,11 @@ def apply_bonus(rulebook: RuleBook | None, sim, agent, behavior: str,
     """behavior に該当する bonus ルールをすべて agent へ支給(区=発行、累計を記録)。
 
     rules 無効/該当ルール無しなら副作用ゼロ(ログも金額も動かさない=OFF 不変)。
+
+    IF-E2 UNCOVERED(第98バッチ・``economy.org_accounting``。既定 OFF=完全 no-op=payload
+    バイト一致): 「区が発行する」建て付けの bonus に**財源**を与える = 区(ward)予算からの
+    移転として記帳する(``economy_sfc.on_rule_bonus``)。支給額もタイミングも 1 つも変えず、
+    payload に支払側を示す ``payer`` キーが 1 つ増えるだけ。
     """
     if rulebook is None or not rulebook.cfg["enabled"]:
         return 0.0
@@ -333,9 +339,13 @@ def apply_bonus(rulebook: RuleBook | None, sim, agent, behavior: str,
         agent.money += amt
         r["spent"] += amt
         paid += amt
+        payload = {"rule_id": r["id"], "behavior": behavior,
+                   "amount": round(amt, 1),
+                   "balance": round(agent.money, 1)}
+        payer = sfc_mod.on_rule_bonus(sim, amt)      # IF-E2(既定 OFF=None=キーなし)
+        if payer is not None:
+            payload["payer"] = payer
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                              kind="rule_bonus", x=agent.x, y=agent.y,
-                             payload={"rule_id": r["id"], "behavior": behavior,
-                                      "amount": round(amt, 1),
-                                      "balance": round(agent.money, 1)}))
+                             payload=payload))
     return paid

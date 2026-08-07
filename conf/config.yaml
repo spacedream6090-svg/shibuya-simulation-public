@@ -320,6 +320,21 @@ world:
     path: data/building_heights_shibuya.json   # OSM 建物 id → 実高さ [m](210KB・data/plateau は gitignore だがこの派生表は追跡する)
     fallback_m_per_level: 3.5   # 未照合の建物の推定高さ = levels x この値(export_3d の FLOOR_HEIGHT と同値)
 
+  # ---- 建物実階数への floor クランプ 3D-U0(2026-08-07。既定 OFF=現行挙動と完全同一)----
+  # 問題: POI データ(data/shibuya_osm.json)には建物の階数 levels を超える floor が 20 件、
+  #   地下(負の floor)が 31 件ある。職場・バイト先の階はこの POI 値から来るため、agent.floor に
+  #   建物階数を超える値がそのまま入り L1 の enter_building payload に残る(3D ビューワーでは
+  #   2 階建てに floor=42 → +138m 浮遊。実測: 描画フレームの 5.4% が屋根超えだった)。
+  # ON 時: 屋内位置の階を [1, max(1, min(levels, 99))] へ丸める。規則は**表示側と完全に同一**
+  #   (scripts/export_3d.py::encode_indoor_w。0/負値=地下 POI 由来 → 1F、levels 超え → levels、
+  #    上限 99 は w=1000+bIdx*100+floor の 2 桁枠)。地下階は sim も w も表現できないので導入しない。
+  # クランプするのは**位置 agent.floor だけ**(work_floor/home_floor/part_time floor は名簿・台帳
+  #   の値であって位置ではないので触らない)。決定論=乱数を 1 つも引かない純関数。
+  # ★ON は L1 が変わる(floor 値・同一階の co-location 経由でプロンプト loc とその後の展開も)。
+  #   観察ランで ON にする想定。OFF が保つ不変条件: 代入値をそのまま返す=L1 バイト一致。
+  floor_clamp:
+    enabled: false              # ★観察ランで ON。false=完全 no-op(バイト一致)
+
   # ---- 環境改変条件 world.mod A1 第67バッチ(2026-07-29。既定 OFF=現行挙動と完全同一)----
   # 「現実の渋谷幾何が原点、改変条件はその周りの反実仮想」を条件パラメータ化する層
   # (実装 src/society/world/worldmod.py。scenario.shock_closure の一般化=時間軸を持たず
@@ -996,6 +1011,17 @@ pool:
                              #     **再会する前に台帳から落ちやすい**(第75バッチ実測の持ち越し)。
                              #     忘却/再会を観察するランではここを広げる(例 60)。
   episodes_cap: 30           # 退避する統合エピソードの件数(直近から)。同上の理由で広げられる口。
+  # ---- 層別クォータ(DP-U3 案A・既定 OFF=現行の層優先 break と 1 バイト一致)----
+  # 正典: docs/plans/proposal-dp-u3-observe-250k.md §1.2「案 A の中身」。
+  # 層優先は「優先順に埋めて途中 break」なので、上位層が present_cap を食い切ると下位層が
+  # 構造的に全滅する(第91 実測: cap 25万 の平日は workday_shift が埋め切り cadence /
+  # stochastic が 0 人 = 来街者ゼロの街)。true にすると cap を層ごとのクォータへ分配する:
+  #   quota[t] = round(present_cap × 当日資格者[t] / Σ 当日資格者)  ← 構成比を保存
+  # 端数は整数演算の最大剰余法(同値は層の固定順)で合計 = cap に正規化。溢れた層だけ従来と
+  # 同じ当日ランキング(presence_rank stream)で切る。**追加する乱数はゼロ**。
+  # ★ON では resident も比率で切られる(「上位層は毎日不変」は ON では成り立たない)。
+  tier_quota:
+    enabled: false
 
 # ---- LLM一括発行(P2-S6b・既定OFF=バイト一致)----
 # 個体間で独立なLLMフェーズ(朝計画。夜内省は次段)を「build id順→未命中のみ並行発行→

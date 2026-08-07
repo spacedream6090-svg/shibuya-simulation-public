@@ -81,15 +81,47 @@ R1 ドクトリン
 「多義 node は RoW 帰属で正直開示」というディレクティブの**核心部分は完全に守る**
 (解決できなかった消費は ``unknown_payee`` チャネルで RoW へ落ち、段別の解決件数を公表する)。
 
-正直な限界(4 件・出力にも残す)
---------------------------------
-- **カバーしていない金の経路がある**(``UNCOVERED_KINDS``)。``rule_bonus``(rules.py)・
-  ``crime``(diversity.py)・``chance_event``(chance.py)は本バッチの変更範囲外のファイルで
-  残高を動かすので、**ON でもそれらが点火するランでは不変量が破れる**。
-  一覧と理由は ``summary.org_accounting.uncovered_kinds_declared`` に必ず刻む(ゼロと偽らない)。
-  実際に発火したかの検出は**解析側**が担う — 相手方の無い金は
-  ``scripts/analyze_accounting.py`` の ``leak_families`` に void フローとして必ず現れる
-  (「装置は残したまま値をゼロにする」= 検査の網羅性を将来にわたって守る唯一の方法)。
+第98バッチ IF-E2 UNCOVERED — 残り 4 種の接続(``UNCOVERED_KINDS`` が空になった)
+------------------------------------------------------------------------------
+IF-E2 案B の時点では ``rule_bonus`` / ``crime`` / ``chance_event`` / ``b2b_trade`` の 4 種が
+「変更範囲外のファイルが残高を動かす」ため不変量の外側に残っていた(**それらが点火するランでは
+ON でも不変量が破れる**と正直に宣言していた)。本バッチでその 4 本を閉じる。**いずれも ON のときだけ・
+金額もタイミングも既存の動力学を 1 つも変えない(分類の追加だけ)**:
+
+- ``rule_bonus``(rules.py)= **行政歳出**。制度DSL の bonus は「区が発行する」建て付けなので、
+  区(ward)予算からの移転として記帳する。**区の残高が負に振れるのは許容**(``debit_org`` の
+  自動当座借越と同じ思想 = 払えないことを隠さずに記録する)。
+  ★``Government.expense`` ではなく残高を直に動かす。理由は ``on_rule_bonus`` の docstring。
+- ``crime``(diversity.py の窃盗)= **非取引**。SNA 2008 §3.98(逐語):
+  *"If thefts, or acts of violence (including war), involve significant redistributions, or
+  destructions, of assets, it is necessary to take them into account. As explained below,
+  **they are treated as other flows, not as transactions**."* §3.96 が「相互合意という取引の特徴を
+  満たす違法行為は合法行為と同じに扱う」と定める裏返しで、**窃盗は相互合意が無いので取引ではない**。
+  したがって RoW(=取引の相手方)へ落としてはならず、**「その他の資産変動勘定」**(SNA 2008
+  第12章 *The other changes in assets accounts*・K.5 = other changes in volume n.e.c.)に相当する
+  専用バケツ ``K5``(``K5_KINDS``)へ分類する。総マネー保存は
+  **Σ(全主体残高) + RoW 累積 + K5 累積 = 一定**へ拡張される。
+  ★**加害者が受け取る動力学変更はしない**(現行実装は被害者から減るだけで加害者は受け取らない)。
+    SNA では窃盗は「被害者の資産 −・加害者の資産 +」の再分配なので、本バケツが持っているのは
+    **世界がまだ記録していない受け取り側**である。加害者へ入金するかは**将来の判断**として
+    ここに宣言しておく(やると加害者の消費余力が増える = 挙動変化を伴うので独立トグルが要る)。
+- ``chance_event``(chance.py の臨時収入 / 紛失)= **外生 = RoW**。拾得・還付・当選小口も財布の
+  紛失も街の外との資金移動なので、``chance_windfall``(RoW → 街)/ ``chance_loss``(街 → RoW)の
+  2 チャネルへ分類する(向きが両属のチャネルは作らない = ``CHANNELS_IN``/``OUT`` の規約)。
+- ``b2b_trade``(b2b.py の卸→小売)= **org 預金間の実移転**。従来は帳簿 dict(``sim._b2b``)だけが
+  動き残高は 1 円も動かなかった。ON では買い手 org の預金 → 売り手 org の預金へ実際に移す
+  (= 案B の「範囲内の取引は個人と企業・組織を観察できるようにする」の完成)。買い手の小売 POI は
+  ``(node, POI種別)`` の台帳索引で解決し、決まらなければ**域外資本の店**とみなして
+  ``b2b_buyer_unknown``(RoW → 街)から支払う(``unknown_payee`` の裏返し・正直開示)。
+  **b2b の動力学(在庫・仕入れ成否・トリップ)は 1 バイトも変えない**。
+
+``UNCOVERED_KINDS`` は**空 dict のまま残す**(``summary`` の ``uncovered_kinds_declared`` も同様)。
+「装置は残したまま値をゼロにする」= 新しい金の経路が実装された瞬間に
+``tests/test_org_accounting.py`` の網羅テスト(``COVERED_KINDS ∪ UNCOVERED_KINDS ⊇
+analyze_accounting.MONEY_KINDS``)が落ちる = 会計検査の網羅性を将来にわたって守る唯一の方法。
+
+正直な限界(出力にも残す)
+--------------------------
 - **消費税の按分**。内税(価格に含まれる)なので受け手 org には ``実支払 − 消費税`` が入る。
   一方 ``venture``(屋台)は既存実装が売上**全額**を店主へ渡すため、消費税ぶんが世界に
   無いところから出る。この穴は ``tax_gap`` チャネルとして RoW が埋める(**改名して隠さない**)。
@@ -127,6 +159,9 @@ CHANNELS_IN: tuple[str, ...] = (
     "tax_gap",             # 屋台売上の内税を売り手が留保しない既存挙動の穴埋め(正直開示)
     "clamp_gap",           # 名目 > 実支払(残高床クリップ)の差額(正直開示)
     "shock",               # 外生ショック(D9 の reward 等。ablation 装置であることを明記)
+    "chance_windfall",     # 偶発の臨時収入(拾得・還付・当選小口)= 外生(chance.py)
+    "b2b_buyer_unknown",   # 買い手の小売 POI を台帳で特定できなかった仕入れ = 域外資本の店
+    "subsidy_no_authority",  # 行政が未構築の世界での rule_bonus(支給主体が街に居ない)
 )
 #: 街 → RoW(域外への支払・帰属不能)
 CHANNELS_OUT: tuple[str, ...] = (
@@ -139,8 +174,16 @@ CHANNELS_OUT: tuple[str, ...] = (
     "profit_remit",        # 利益送金(将来の拡張。現状は常に 0)
     "fine_no_authority",   # government OFF 時の罰金(徴収主体が街に居ない)
     "seizure",             # 破産の資産圧縮(債権者が街に居ない)
+    "chance_loss",         # 偶発の紛失・急な出費 = 外生の流出(chance.py)
 )
 CHANNELS: tuple[str, ...] = CHANNELS_IN + CHANNELS_OUT
+
+#: **その他の資産変動**(SNA 2008 第12章 *The other changes in assets accounts* / K.5 =
+#: other changes in volume n.e.c.)へ落とす非取引の種。RoW(= 取引の相手方)とは**別勘定**。
+#: §3.98 が「窃盗は取引ではなく other flows」と定めるので、ここに来るものは**取引ではない**。
+K5_KINDS: tuple[str, ...] = (
+    "theft",               # 窃盗: 被害者から減るが加害者は受け取らない(受け取り側が未記録)
+)
 
 #: 本 module が残高に**接続した** L1 の金額運搬種(analyze_accounting.MONEY_KINDS の部分集合)。
 COVERED_KINDS: frozenset[str] = frozenset({
@@ -148,15 +191,18 @@ COVERED_KINDS: frozenset[str] = frozenset({
     "venture_sale", "venture_open", "deposit", "candidacy", "reward",
     "civic_service", "bankruptcy", "vc_investment", "enforcement", "tax", "move_home",
     "production",   # ON のときだけ payload に revenue(RoW → org の輸出代金)が載る
+    # ---- 第98バッチ IF-E2 UNCOVERED(module docstring の該当節を参照)----
+    "rule_bonus",    # 区(ward)予算からの移転
+    "crime",         # 窃盗 = 非取引 → K5(その他の資産変動)
+    "chance_event",  # 臨時収入/紛失 = 外生 → RoW の chance_windfall / chance_loss
+    "b2b_trade",     # 卸→小売 = org 預金間の実移転(買い手不明なら RoW から)
 })
 #: **接続できていない**金額運搬種と、その理由(ゼロと偽らない)。IF-E の監視装置と対で持つ。
-#: いずれも本バッチの変更範囲外のファイルで残高を動かすため、ON でも不変量の外側に残る。
-UNCOVERED_KINDS: dict[str, str] = {
-    "rule_bonus": "rules.py が財源なしで支給する(変更範囲外。行政歳出化は将来)",
-    "crime": "diversity.py の窃盗は被害者から減るだけで加害者が受け取らない(変更範囲外)",
-    "chance_event": "chance.py の臨時収入/紛失は外生(変更範囲外。RoW 化は将来)",
-    "b2b_trade": "b2b.py は帳簿 dict のみで残高を動かさない(不変量には現れない)",
-}
+#: ★第98バッチで**空になった**。辞書と ``summary.org_accounting.uncovered_kinds_declared`` は
+#: 空のまま**残す**(装置は残したまま値をゼロにする)。新しい金の経路が
+#: ``analyze_accounting.MONEY_KINDS`` へ足された瞬間に網羅テストが落ち、ここか
+#: ``COVERED_KINDS`` への追加を強制する = 会計検査の網羅性が構造的に守られる。
+UNCOVERED_KINDS: dict[str, str] = {}
 
 # --------------------------------------------------------------------------- #
 # 消費カテゴリ → 台帳の POI 種別(受け手解決の鍵の一部)/ 直行 RoW チャネル
@@ -253,6 +299,9 @@ def _state(sim) -> dict:
             "org": {},                  # org_id -> 預金残高(スカラー 1 本)
             "row": {},                  # channel -> {"in": …, "out": …}(累積)
             "row_prev": {},             # 前日の累積(日次差分 = row_flow イベント)
+            "k5": {},                   # 非取引の資産変動(SNA K.5)。kind -> 累積額(第98)
+            "bonus_out": 0.0,           # 区予算から出した制度DSL bonus の累計(第98)
+            "b2b_transfer": 0.0,        # org 預金間で実移転した b2b 仕入れの累計(第98)
             "escrow": 0.0,              # 行政の預り金(議案供託・立候補供託)
             "wage_out": 0.0,            # org が払った賃金の累計
             "revenue_in": 0.0,          # org が受け取った売上の累計
@@ -289,6 +338,34 @@ def row_out(sim, channel: str, amount: float) -> str:
     if amt:
         _row(_state(sim), channel)["out"] += amt
     return f"row:{channel}"
+
+
+# --------------------------------------------------------------------------- #
+# K5 = その他の資産変動(SNA 2008 第12章。**取引ではない**フローの受け皿)
+#
+#   RoW と分けるのが要点: RoW は「取引の相手方が街の外に居る」ことを表す部門で、
+#   K5 は「そもそも取引ではない(相互合意が無い)」ことを表す**勘定**である(SNA §3.96/§3.98)。
+#   混ぜると「窃盗は輸入だった」という嘘になる。
+# --------------------------------------------------------------------------- #
+def _k5(st: dict) -> dict:
+    # 旧 checkpoint(第97バッチ)からの resume でもキーが生える(setdefault = 互換の作法)
+    return st.setdefault("k5", {})
+
+
+def k5_out(sim, kind: str, amount: float) -> str:
+    """街の残高から**取引でない**理由で消えた額を K5 へ分類する。戻り値 = payload のトークン。"""
+    amt = float(amount)
+    if amt:
+        k = _k5(_state(sim))
+        k[str(kind)] = k.get(str(kind), 0.0) + amt
+    return f"k5:{kind}"
+
+
+def k5_total(sim) -> float:
+    st = state_of(sim)
+    if st is None:
+        return 0.0
+    return sum((st.get("k5") or {}).values())
 
 
 # --------------------------------------------------------------------------- #
@@ -442,6 +519,19 @@ def resolve_payee(sim, agent, cat: str) -> tuple[str | None, str]:
     return None, "row"
 
 
+def resolve_payee_at_node(sim, node: str, cat: str) -> str | None:
+    """**場所だけ**から受け手 org を解決する(b2b の買い手 = 小売 POI。客の個体が居ない経路)。
+
+    b2b の仕入れは ``(node, cat)`` の小売 POI が買い手で、``agent.building`` / ``floor`` が
+    存在しない(客ではなく店が買う)。したがって使える鍵は ``(node, POI種別)`` だけ =
+    ``resolve_payee`` の縮退経路と同じ精度(研究文書 §3-c の実測で一意率 4.5%)。
+    決まらなければ None(= 呼び出し側が RoW = 域外資本の店として扱う)。"""
+    poi = CAT_TO_POI.get(str(cat) or "")
+    if poi is None:
+        return None
+    return _book_index(sim)["node"].get((str(node), poi))
+
+
 # --------------------------------------------------------------------------- #
 # 記帳の口(scheduler / tools はこの 4 つしか呼ばない)
 # --------------------------------------------------------------------------- #
@@ -556,6 +646,91 @@ def escrow_out(sim, amount: float, *, to_government: bool = False) -> str | None
 
 
 # --------------------------------------------------------------------------- #
+# 第98バッチ IF-E2 UNCOVERED — 残り 4 種の記帳口(いずれも既定 OFF で即 return)
+#
+# 共通規約: **金額もタイミングも既存の動力学を 1 つも変えない**。呼び出し元は支給/被害/仕入れを
+#   従来どおり済ませてから、その額を本節の関数へ渡して**分類だけ**を足す(payload に 1 語増える)。
+# --------------------------------------------------------------------------- #
+def on_rule_bonus(sim, amount: float) -> str | None:
+    """制度DSL の bonus 支給を**区(ward)の歳出**として記帳する(``rules.apply_bonus`` の唯一の口)。
+
+    ★``Government.expense`` を使わない理由: あちらは議会の予算承認フック(``exec_ratio``)で
+      区の歳出額に執行率を掛ける。本関数が呼ばれる時点で **agent は既に満額を受け取っている**ので、
+      執行率で目減りさせると差額が無から生まれて不変量が破れる。``exec_ratio`` は「これから出す
+      歳出」を絞る装置であって、**事後の記帳**に掛けるものではない(掛けたい場合は支給額そのものを
+      絞るべきで、それは rules.py 側の設計変更 = 本バッチの範囲外)。
+
+    区の残高が負に振れるのは許容する(``debit_org`` の自動当座借越と同じ思想 = 払えないことを
+    隠さずに記録する。行政の破綻処理は世界に無い)。行政がまだ実体化していない世界
+    (ON では ``scheduler._sfc_arm`` が step 先頭で必ず作る)では支給主体が街に居ないので RoW。"""
+    if not enabled(sim):
+        return None
+    amt = float(amount)
+    if amt <= 0.0:
+        return None
+    gov = getattr(sim, "government", None)
+    if gov is None:
+        return row_in(sim, "subsidy_no_authority", amt)
+    gov.balance["ward"] -= amt
+    gov.day_exp["ward"] += amt              # public_budget の内部整合(残高=前+歳入−歳出)を保つ
+    _state(sim)["bonus_out"] += amt
+    return "government"
+
+
+def on_theft(sim, amount: float) -> str | None:
+    """窃盗で被害者から減った額を **K5(その他の資産変動)** へ分類する(``diversity.tick_crime``)。
+
+    SNA 2008 §3.98 のとおり窃盗は**取引ではない**ので、RoW(取引の相手方)へ落としてはならない。
+    ``amount`` は**丸める前の実減少額**(床クリップ後)を渡すこと(payload の丸め値ではない)。
+    ★加害者へ入金する動力学変更は**しない**(module docstring の「将来の判断」宣言)。"""
+    if not enabled(sim):
+        return None
+    return k5_out(sim, "theft", float(amount))     # 0 でもトークンは返す(row_* と同じ流儀)
+
+
+def on_chance(sim, kind: str, amount: float) -> str | None:
+    """偶発の臨時収入 / 紛失を RoW の外生チャネルへ分類する(``chance._apply_money``)。
+
+    ``kind`` は "windfall"(RoW → 街)/ "loss"(街 → RoW)。``amount`` は**丸める前の実変化量**
+    (loss が手持ちで頭打ちになった場合は実損)。戻り値は windfall なら payload の ``payer``、
+    loss なら ``payee`` に載せるトークン。"""
+    if not enabled(sim):
+        return None
+    amt = float(amount)
+    if str(kind) == "windfall":
+        return row_in(sim, "chance_windfall", amt)
+    return row_out(sim, "chance_loss", amt)
+
+
+def on_b2b_trade(sim, node: str, cat: str, seller_org, amount: float,
+                 step: int, sim_min: int) -> tuple[str, str] | None:
+    """卸→小売の仕入れを **org 預金間の実移転**にする(``b2b.fulfill`` の唯一の口)。
+
+    戻り値 ``(payer, payee)`` = payload に載せる買い手 / 売り手のトークン(OFF は None)。
+    買い手は小売 POI ``(node, cat)`` を台帳索引で解決する。決まらなければ**域外資本の店**と
+    みなして ``b2b_buyer_unknown``(RoW → 街)から払う(``unknown_payee`` の裏返し)。
+    買い手と売り手が同一 org に解決したときは**残高を動かさない**(自己取引 = 純額ゼロ。
+    動かすと当座借越の L1 が偽って立つ)。**b2b の在庫・仕入れ成否・トリップには一切触れない**。"""
+    if not enabled(sim):
+        return None
+    amt = float(amount)
+    seller = str(seller_org)
+    if amt <= 0.0 or not _is_org(sim, seller):
+        return None
+    buyer = resolve_payee_at_node(sim, node, cat)
+    if buyer == seller:                                # 自己取引(純額ゼロ)
+        return seller, seller
+    if buyer is None:
+        payer = row_in(sim, "b2b_buyer_unknown", amt)  # 域外資本の店が払う(正直開示)
+    else:
+        debit_org(sim, buyer, amt, step, sim_min, reason="b2b")
+        payer = buyer
+    credit_org(sim, seller, amt)
+    _state(sim)["b2b_transfer"] += amt
+    return payer, seller
+
+
+# --------------------------------------------------------------------------- #
 # 不変量(§4-1 (b): Σ(全主体残高) + RoW 累積 = 一定。ABCredit.jl 流のスカラー総マネー保存)
 # --------------------------------------------------------------------------- #
 def city_total(sim) -> float:
@@ -588,9 +763,12 @@ def row_net(sim) -> float:
 
 
 def total_money(sim) -> float:
-    """**閉じた不変量**: 街の全残高 + RoW 累積。これが一定であることをテストで固定する
-    (ABCredit.jl ``test/stock_flow_consistency.jl`` の ``isapprox(init, tot, atol)`` と同型)。"""
-    return city_total(sim) + row_net(sim)
+    """**閉じた不変量**: 街の全残高 + RoW 累積 + K5 累積。一定であることをテストで固定する
+    (ABCredit.jl ``test/stock_flow_consistency.jl`` の ``isapprox(init, tot, atol)`` と同型)。
+
+    第98バッチで **K5(取引でない資産変動。SNA 2008 第12章)** の項が増えた。RoW と足し合わせて
+    1 本にしないのは、「街の外の取引相手」と「そもそも取引でないもの」を混ぜないため(§3.98)。"""
+    return city_total(sim) + row_net(sim) + k5_total(sim)
 
 
 # --------------------------------------------------------------------------- #
@@ -619,7 +797,8 @@ def _finance_row(sim, st: dict, day: int, step: int) -> tuple:
             round(hh, 6), round(r_in, 6), round(r_out, 6),
             json.dumps({k: {"in": round(v["in"], 3), "out": round(v["out"], 3)}
                         for k, v in sorted(st["row"].items())},
-                       ensure_ascii=False, sort_keys=True))
+                       ensure_ascii=False, sort_keys=True),
+            round(sum((st.get("k5") or {}).values()), 6))
 
 
 def _emit(sim, st: dict, day: int, step: int, sim_min: int,
@@ -710,12 +889,17 @@ def provenance(sim) -> dict | None:
         "row_net": round(r_out - r_in, 1),
         "row_channels": {k: {"in": round(v["in"], 1), "out": round(v["out"], 1)}
                          for k, v in sorted(st["row"].items())},
+        # 第98バッチ: 取引でない資産変動(SNA K.5)と、新たに接続した 3 経路の累計。
+        "k5_total": round(k5_total(sim), 1),
+        "k5_kinds": {k: round(v, 1) for k, v in sorted((st.get("k5") or {}).items())},
+        "bonus_out_total": round(float(st.get("bonus_out", 0.0)), 1),
+        "b2b_transfer_total": round(float(st.get("b2b_transfer", 0.0)), 1),
         "escrow": round(float(st["escrow"]), 1),
         "city_total": round(city_total(sim), 1),
         "total_money": round(total_money(sim), 1),
-        # ★ゼロと偽らない: 接続できていない金の経路(変更範囲外のファイルが残高を動かす)を
-        #   ラン結果に必ず刻む。**実際に発火したかの検出は解析側**が行う
-        #   (scripts/analyze_accounting.py の leak_families に void フローとして必ず現れる)。
+        # ★接続できていない金の経路の宣言。第98バッチで**空になった**が、キーは後方互換と
+        #   監視装置として残す(装置は残したまま値をゼロにする)。新しい金の経路が生えたら
+        #   ここか COVERED_KINDS への追加が強制され、解析側の leak_families にも現れる。
         "uncovered_kinds_declared": dict(sorted(UNCOVERED_KINDS.items())),
     }
 
@@ -730,6 +914,9 @@ COLUMNS: tuple[str, ...] = (
     "day", "step", "org_balance", "org_count", "org_negative", "org_min",
     "bank_capital", "vc_balance", "gov_balance", "escrow", "household_balance",
     "row_in", "row_out", "row_channels",
+    # 第98バッチ: K5(取引でない資産変動。窃盗の未記録な受け取り側)の累計。
+    # 末尾に足す(既存 14 列は順序含め不変 = 会社UI/解析の契約を壊さない)。
+    "k5_other",
 )
 
 
@@ -764,6 +951,7 @@ class FinanceLedger:
             "row_in":            pa.array([r[11] for r in rows], pa.float64()),
             "row_out":           pa.array([r[12] for r in rows], pa.float64()),
             "row_channels":      pa.array([r[13] for r in rows], pa.string()),
+            "k5_other":          pa.array([r[14] for r in rows], pa.float64()),
         })
 
     def _next_seg(self) -> int:

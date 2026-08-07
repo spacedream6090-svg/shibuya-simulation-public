@@ -34,6 +34,12 @@
 #     したがって横煙は「**平日 1 日ぶんのスループット/OOM 試験**」として読むこと。
 #     人口構成まで現実に寄せたいなら presence の層優先か pool の総件数を触る判断が要る
 #     (= ユーザー判断。第91 では触っていない)。
+#     ★2026-08-07 追記: DP-U3 案A の**層別クォータが実装された**(conf `pool.tier_quota.enabled`・
+#       既定 false = 上の層優先のまま)。true にすると cap を当日資格者の比率で層へ配るので、
+#       平日 25万 でも来街者が約 3.9万人入る(提案書 §1.2)。このプロファイル自体は既定のまま
+#       据え置く(横煙の比較可能性を第91 の実測と保つため)。ONで回すなら実行時に
+#         python scripts/run.py --profile conf/smoke_wide.yaml pool.tier_quota.enabled=true
+#       と渡す(= 同じプロファイルで層優先版と 2 本並べられる)。
 #
 # (c) ★**プールを開くだけで名簿 N に比例するメモリが常駐する**。PoolStore._build_index は
 #     total(=100万)件ぶんの PresenceRec / offsets / index を常駐させ、737MB を 1 パス

@@ -31,10 +31,12 @@ sys.path.insert(0, str(_ROOT / "src"))
 
 import analyze_accounting as aa                      # noqa: E402
 
+from society import b2b as B2BMOD                    # noqa: E402
 from society import economy_sfc as SFC               # noqa: E402
 from society.config import load_config               # noqa: E402
 from society.engine import checkpoint, scheduler     # noqa: E402
 from society.engine.simulation import Simulation     # noqa: E402
+from society.rules import apply_bonus                # noqa: E402
 
 GOLDEN = _ROOT / "tests" / "data" / "golden_baseline_l1.json"
 
@@ -60,6 +62,15 @@ ACCOUNTS = dict(ECON, **{
     "economy.accounts.enabled": "true", "economy.accounts.payday_dom": 1,
     "economy.bank.enabled": "true", "economy.bank.deposit_rate": 3.65,
 })
+
+# ---- 第98バッチ IF-E2 UNCOVERED: 残り 4 種の点火セット ----
+#: 窃盗(diversity.tick_crime)。既定ランでは 1 件も起きないので明示的に点火する。
+CRIME = {"society_diversity.enabled": "true", "society_diversity.crime_prob": 0.05}
+#: 偶発の臨時収入 / 紛失(chance.tick_day)。encounter は金を動かさないので weight=0 で外す。
+CHANCE = {"chance.enabled": "true", "chance.daily_rate": 1.0,
+          "chance.events.encounter.weight": 0}
+#: B2B 卸→小売(b2b.fulfill)。在庫(goods)ON が前提。
+B2B = {"commerce.inventory.enabled": "true", "commerce.inventory.b2b.enabled": "true"}
 
 
 # --------------------------------------------------------------------------- #
@@ -385,6 +396,9 @@ def test_row_channel_breakdown_is_published(tmp_path):
     summary = json.loads((tmp_path / "sfc_row" / "summary.json").read_text(encoding="utf-8"))
     assert summary["org_accounting"]["row_net"] == prov["row_net"]
     assert "uncovered_kinds_declared" in summary["org_accounting"], "未接続の宣言が消えている"
+    # 第98バッチ IF-E2 UNCOVERED: 4 種を接続したので**空**。ただしキーは監視装置として残す
+    #(「装置は残したまま値をゼロにする」)。
+    assert summary["org_accounting"]["uncovered_kinds_declared"] == {}
 
 
 def test_finance_sidecar_has_the_declared_schema(tmp_path):
@@ -603,3 +617,242 @@ def test_off_and_on_differ_only_where_declared(tmp_path):
             if k in ("balance", "account", "cash"):
                 continue                    # 残高そのものは ON でも変わらない想定だが
             assert (x.payload or {})[k] == (y.payload or {})[k], f"{y.kind}.{k} が変わった"
+
+
+# ===========================================================================
+# ⑨ 第98バッチ IF-E2 UNCOVERED — 残り 4 種の接続
+#    (rule_bonus = 区の歳出 / crime = 非取引 K5 / chance_event = RoW / b2b = org 預金間の実移転)
+# ===========================================================================
+def test_uncovered_kinds_is_empty_and_every_money_kind_is_covered():
+    """★受入の核: 接続できていない金の経路が **0 本**になった(辞書自体は装置として残す)。"""
+    assert SFC.UNCOVERED_KINDS == {}, "宣言だけ残して実装が戻っている"
+    assert set(aa.MONEY_KINDS) <= set(SFC.COVERED_KINDS)
+    for k in ("rule_bonus", "crime", "chance_event", "b2b_trade"):
+        assert k in SFC.COVERED_KINDS, k
+    # K5 は RoW と**別勘定**(SNA 2008 §3.98: 窃盗は取引ではない)。名前空間も分ける。
+    assert "theft" in SFC.K5_KINDS
+    assert not (set(SFC.K5_KINDS) & set(SFC.CHANNELS))
+
+
+def test_rule_bonus_is_funded_by_the_ward_budget_only_when_on(tmp_path):
+    """① rule_bonus = 区(ward)予算からの移転。支給額もタイミングも 1 円も変えない。"""
+    kw = dict(ECON, **{"rules.enabled": "true"})
+    for name, ov, funded in (("sfc_bonus_off", kw, False),
+                             ("sfc_bonus_on", dict(kw, **ON), True)):
+        sim = _sim(tmp_path, name, n_steps=1, n_agents=15, **ov)
+        sim.run()                       # step 先頭の _sfc_arm が行政/銀行/VC を実体化する
+        gov = sim.government
+        rec = sim.rulebook.enact({"type": "bonus", "behavior": "park", "amount": 500},
+                                 name="公園", proposer=0, step=0, day=0)
+        agent = sim.agents[0]
+        before_money, before_ward = agent.money, gov.balance["ward"]
+        before_total = SFC.total_money(sim) if funded else 0.0
+        paid = apply_bonus(sim.rulebook, sim, agent, "park", 0, 0)
+        ev = _kind(sim, "rule_bonus")[-1]
+        # 動力学(支給額・累計・payload の金額)は ON/OFF で完全に同じ
+        assert paid == 500.0 and agent.money == before_money + 500.0
+        assert rec["spent"] == 500.0 and ev.payload["amount"] == 500.0
+        if not funded:
+            assert "payer" not in ev.payload
+            assert gov.balance["ward"] == before_ward, "OFF なのに区予算が減った"
+            assert getattr(sim, "_sfc_state", None) is None
+            continue
+        assert ev.payload["payer"] == "government"
+        assert gov.balance["ward"] == pytest.approx(before_ward - 500.0)
+        assert SFC.total_money(sim) == pytest.approx(before_total)
+        assert SFC.state_of(sim)["bonus_out"] == pytest.approx(500.0)
+        # ★議会の予算否決(exec_ratio)を掛けてはいけない: 支給は既に満額で済んでいるので、
+        #   執行率で目減りさせると差額が無から生まれる(on_rule_bonus の docstring)。
+        gov.exec_ratio = 0.5
+        again = SFC.total_money(sim)
+        apply_bonus(sim.rulebook, sim, agent, "park", 0, 0)
+        assert gov.balance["ward"] == pytest.approx(before_ward - 1000.0)
+        assert SFC.total_money(sim) == pytest.approx(again)
+
+
+def test_theft_is_an_other_change_in_volume_not_a_transaction(tmp_path):
+    """② 窃盗 = **取引ではない**(SNA 2008 §3.98)ので RoW ではなく K5 勘定へ。
+
+    加害者へは 1 円も入らない(= K5 が持っているのは「世界がまだ記録していない受け取り側」)。"""
+    sim = _sim(tmp_path, "sfc_k5", n_steps=1, n_agents=15, **dict(ECON, **ON))
+    sim.run()
+    victim = sim.agents[0]
+    victim.money = 5000.0
+    base, row0 = SFC.total_money(sim), SFC.row_net(sim)
+    cash0 = sum(a.money for a in sim.agents)
+    orgs0 = dict(SFC.state_of(sim)["org"])
+
+    victim.money -= 3000.0                      # diversity.py 側の実減額(動力学)
+    token = SFC.on_theft(sim, 3000.0)           # 会計側の分類だけ
+
+    assert token == "k5:theft"
+    assert SFC.k5_total(sim) == pytest.approx(3000.0)
+    assert SFC.state_of(sim)["k5"] == {"theft": pytest.approx(3000.0)}
+    assert SFC.total_money(sim) == pytest.approx(base), "K5 込みの総マネーが動いた"
+    assert SFC.row_net(sim) == pytest.approx(row0), "窃盗を RoW(取引の相手方)へ落としている"
+    assert sum(a.money for a in sim.agents) == pytest.approx(cash0 - 3000.0)
+    assert SFC.state_of(sim)["org"] == orgs0, "加害者側(org)へ入金してしまっている"
+
+
+def test_crime_run_classifies_every_theft_into_k5(tmp_path):
+    """②(実ラン): 窃盗が実際に点火し、全件が K5 へ分類され、累計が payload と一致する。"""
+    sim = _run(tmp_path, "sfc_crime", n_steps=288, n_agents=40,
+               **dict(ECON, **ON, **CRIME))
+    thefts = [e for e in _kind(sim, "crime")
+              if e.payload.get("kind") == "theft" and e.payload.get("amount", 0.0) > 0.0]
+    assert thefts, "窃盗が 1 件も起きていない(点火条件が弱い)"
+    assert all(e.payload.get("payee") == "k5:theft" for e in thefts)
+    st = SFC.state_of(sim)
+    logged = sum(float(e.payload["amount"]) for e in thefts)
+    # payload は 0.1 円丸め・会計は無限精度(1 件あたり最大 0.05 円の差)
+    assert st["k5"]["theft"] == pytest.approx(logged, abs=0.05 * len(thefts) + 0.1)
+    assert "theft" not in st["row"], "K5 が RoW チャネルに混ざっている"
+
+
+def test_chance_event_is_classified_into_row_channels(tmp_path):
+    """③ 偶発の臨時収入 / 紛失 = 外生 = RoW の 2 チャネル(向きが両属のチャネルは作らない)。"""
+    sim = _run(tmp_path, "sfc_chance", n_steps=288, n_agents=25,
+               **dict(ECON, **ON, **CHANCE))
+    ev = _kind(sim, "chance_event")
+    wf = [e for e in ev if e.payload["type"] == "windfall"]
+    ls = [e for e in ev if e.payload["type"] == "loss"]
+    assert wf and ls, "臨時収入/紛失が点火していない"
+    assert all(e.payload["payer"] == "row:chance_windfall" for e in wf)
+    assert all(e.payload["payee"] == "row:chance_loss" for e in ls)
+    row = SFC.state_of(sim)["row"]
+    assert row["chance_windfall"]["in"] > 0.0 and row["chance_loss"]["out"] > 0.0
+    assert row["chance_windfall"]["out"] == 0.0 and row["chance_loss"]["in"] == 0.0
+    assert "chance_windfall" in SFC.CHANNELS_IN and "chance_loss" in SFC.CHANNELS_OUT
+
+
+def _b2b_sim(tmp_path, name, **ov):
+    sim = _sim(tmp_path, name, n_steps=1, n_agents=15, **ov)
+    sim.run()
+    return sim
+
+
+def test_b2b_moves_org_deposits_only_when_on(tmp_path):
+    """④ b2b = 帳簿だけ → **org 預金間の実移転**。b2b 自身の動力学(在庫・成否)は不変。"""
+    kw = dict(ECON, **B2B)
+    off = _b2b_sim(tmp_path, "sfc_b2b_off", **kw)
+    on = _b2b_sim(tmp_path, "sfc_b2b_on", **dict(kw, **ON))
+    assert B2BMOD.enabled(on) and B2BMOD.enabled(off), "b2b が点火していない"
+
+    node = next((n for (n, poi) in sorted(SFC._book_index(on)["node"]) if poi == "shop"),
+                None)
+    if node is None:
+        pytest.skip("台帳に (node, shop) の一意鍵が無い")
+    seller = B2BMOD.wholesale_for(on, node, "shop")
+    if seller is None:
+        pytest.skip("卸 org が居ない台帳")
+    for sim in (off, on):                       # 在庫を同じだけ積む(仕入れ成立の条件)
+        B2BMOD._state(sim)["stock"][str(seller["id"])] = 100
+
+    bal0 = dict(SFC.state_of(on)["org"])
+    row0, total0 = SFC.row_net(on), SFC.total_money(on)
+    assert B2BMOD.fulfill(on, node, "shop", 2, 0, 0) is True
+    assert B2BMOD.fulfill(off, node, "shop", 2, 0, 0) is True
+
+    p_on = [e for e in on.logger.events if e.kind == "b2b_trade"][-1].payload
+    p_off = [e for e in off.logger.events if e.kind == "b2b_trade"][-1].payload
+    amt, payer, payee = float(p_on["amount"]), p_on["payer"], p_on["payee"]
+    bal1 = SFC.state_of(on)["org"]
+
+    assert payee == str(seller["id"])
+    assert SFC.total_money(on) == pytest.approx(total0), "b2b 移転で総マネーが動いた"
+    if payer == payee:                          # 自己取引=純額ゼロ(残高を動かさない)
+        assert bal1 == bal0
+    elif payer.startswith("row:"):              # 買い手の小売 POI を特定できない=域外資本の店
+        assert payer == "row:b2b_buyer_unknown"
+        assert bal1[payee] == pytest.approx(bal0.get(payee, 0.0) + amt)
+        assert SFC.row_net(on) == pytest.approx(row0 - amt)
+    else:
+        assert bal1[payer] == pytest.approx(bal0.get(payer, 0.0) - amt)
+        assert bal1[payee] == pytest.approx(bal0.get(payee, 0.0) + amt)
+
+    # OFF = 現行どおり(相手方キーなし・state 不発生)。b2b の帳簿/在庫は ON/OFF で完全一致
+    assert "payer" not in p_off and "payee" not in p_off
+    assert getattr(off, "_sfc_state", None) is None
+    assert {k: v for k, v in p_on.items() if k not in ("payer", "payee")} == p_off
+    assert off._b2b == on._b2b, "org 会計 ON で b2b の在庫/帳簿が動いた(動力学不変の違反)"
+
+
+def test_uncovered_sites_change_nothing_but_the_relationship_keys(tmp_path):
+    """★動力学不変の機械固定: 4 種を点火した ON/OFF で L1 の差分が相手方キーだけに閉じる。"""
+    kw = dict(ECON, **CRIME, **CHANCE)
+    off = _run(tmp_path, "sfc_unc_off", n_steps=144, n_agents=25, **kw)
+    on = _run(tmp_path, "sfc_unc_on", n_steps=144, n_agents=25, **dict(kw, **ON))
+    new_kinds = {"org_overdraft", "row_flow"}
+    a = list(off.logger.events)
+    b = [e for e in on.logger.events if e.kind not in new_kinds]
+    assert len(a) == len(b), "新 2 種以外のイベント数が変わった(発火が動いた)"
+    allowed = {"payer", "payee", "paid", "revenue"}
+    fired: set[str] = set()
+    for x, y in zip(a, b):
+        assert (x.step, x.agent_id, x.kind) == (y.step, y.agent_id, y.kind)
+        extra = set(y.payload or {}) - set(x.payload or {})
+        assert extra <= allowed, f"{y.kind}: 宣言外のキーが増えた {sorted(extra)}"
+        if y.kind in ("crime", "chance_event"):
+            fired.add(y.kind)
+        for k in set(x.payload or {}):
+            if k in ("balance", "account", "cash"):
+                continue
+            assert (x.payload or {})[k] == (y.payload or {})[k], f"{y.kind}.{k} が変わった"
+    assert fired == {"crime", "chance_event"}, f"点火していない種がある: {fired}"
+
+
+def test_analyze_maps_the_four_kinds_to_known_sectors_not_void():
+    """解析側の追随: トークンが有れば void に落ちない / 無ければ従来どおり(OFF ラン互換)。"""
+    # OFF(トークン無し)= 第95バッチまでの分類のまま
+    assert aa.flows_for("rule_bonus", {"amount": 100.0}, {})[0].src == aa.VOID
+    assert aa.flows_for("crime", {"kind": "theft", "amount": 100.0}, {})[0].dst == aa.VOID
+    assert aa.flows_for("b2b_trade", {"amount": 600.0}, {})[0].src == aa.ORG
+    # ON(トークンあり)= 既知の部門へ
+    f = aa.flows_for("rule_bonus", {"amount": 100.0, "payer": "government"}, {})[0]
+    assert (f.src, f.dst) == (aa.GOVERNMENT, aa.HOUSEHOLD)
+    f = aa.flows_for("crime", {"kind": "theft", "amount": 100.0,
+                               "payee": "k5:theft"}, {})[0]
+    assert (f.src, f.dst) == (aa.HOUSEHOLD, aa.OTHER), "窃盗を RoW へ落としている"
+    assert aa.party_sector("k5:theft") == aa.OTHER != aa.EXTERNAL
+    f = aa.flows_for("chance_event", {"type": "windfall", "amount": 50.0,
+                                      "payer": "row:chance_windfall"}, {})[0]
+    assert (f.src, f.dst) == (aa.EXTERNAL, aa.HOUSEHOLD)
+    f = aa.flows_for("chance_event", {"type": "loss", "amount": 50.0,
+                                      "payee": "row:chance_loss"}, {})[0]
+    assert (f.src, f.dst) == (aa.HOUSEHOLD, aa.EXTERNAL)
+    f = aa.flows_for("b2b_trade", {"amount": 600.0, "payee": "co_x",
+                                   "payer": "row:b2b_buyer_unknown"}, {})[0]
+    assert (f.src, f.dst) == (aa.EXTERNAL, aa.ORG)
+    # 新部門は SECTORS の一級市民(行列・検査表・不可観測理由のすべてに載る)
+    assert aa.OTHER in aa.SECTORS and aa.SECTOR_JA[aa.OTHER]
+    assert aa.OTHER in aa.UNOBSERVABLE_REASON and aa.OTHER in aa.FINANCE_BALANCE
+    assert aa.leak_family("theft:other_volume") == "theft"
+
+
+@pytest.fixture(scope="module")
+def acct_uncovered(tmp_path_factory):
+    """4 種のうち**ランで点火できる 2 種**(窃盗・偶発事)を足した mock 小ランの解析。"""
+    out = tmp_path_factory.mktemp("sfc_unc")
+    dot = ["run.seed=20260807", "run.n_agents=40", "run.n_steps=288",
+           "run.name=sfc_unc", "model.backend=mock", "observer.snapshot_every=12"]
+    dot += [f"{k}={v}" for k, v in dict(ACCOUNTS, **ON, **CRIME, **CHANCE).items()]
+    d = out / "sfc_unc"
+    Simulation(load_config(dot), out_dir=d).run()
+    return aa.analyze(aa.load_run(d), rel_tol=1e-4)
+
+
+def test_measured_uncovered_kinds_leave_no_void_flow(acct_uncovered):
+    """★受入(実測): 窃盗・偶発事が点火しても漏れ 0・検査①が K5 部門を含めて全部門 PASS。"""
+    rep = acct_uncovered
+    assert rep["event_counts"].get("crime", 0) > 0, "窃盗が点火していない(検査が空虚)"
+    assert rep["event_counts"].get("chance_event", 0) > 0
+    assert rep["leak_families"] == [], f"漏れの族が残っている: {rep['leak_families']}"
+    assert rep["totals"]["leak_share"] < 0.01
+    for sec in (aa.HOUSEHOLD, aa.ORG, aa.BANK, aa.EXTERNAL, aa.OTHER):
+        c = rep["checks"][sec]
+        assert c.get("observable"), f"{sec} の残高が観測できない: {c.get('reason')}"
+        assert c["pass"], f"{sec} の貨幣ストック保存が破れた: {c}"
+    assert rep["checks"][aa.OTHER]["close_balance"] > 0.0, "K5 が積まれていない"
+    assert rep["classifier_consistency"]["pass"]
+    assert rep["unclassified_money_kinds"] == {}
+    assert "k5_other" in rep["finance"]["close"], "サイドカーに K5 列が無い"

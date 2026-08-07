@@ -64,6 +64,7 @@ import copy
 import json
 import logging
 import os
+import sys
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -142,6 +143,10 @@ FEATURES: tuple[Feature, ...] = (
        "標高 z 列をイベント payload へ付ける(表示・観測専用)"),
     _f("world.heights.enabled", "strict", False, "none",
        "建物へ実高さ属性を付与(PLATEAU 実測表。現状は属性付与のみ)"),
+    _f("world.floor_clamp.enabled", "strict", False, "none",
+       "屋内位置の階を建物の実階数へ丸める(3D-U0)。規則は表示側 export_3d.encode_indoor_w と"
+       "同一 = [1, max(1, min(levels, 99))]。POI 由来の階数超え floor が L1 に通るのを止める。"
+       "ON は L1 が変わる(floor 値と、同一階 co-location 経由でプロンプト loc も)"),
     _f("world.mod.enabled", "strict", False, "possible",
        "環境改変条件(エッジ封鎖・速度係数・営業時間)をワールド構築時に一度だけ適用"),
     _f("world.traffic.enabled", "strict", False, "none",
@@ -442,6 +447,15 @@ FEATURES: tuple[Feature, ...] = (
        "入力解像度 LOD(知覚・記憶・フィードの注入件数を水準別に振る)"),
     _f("pool.enabled", "strict", True, "none",
        "ペルソナプールの日次ローテーション(在場者の決定論選択=当日の思考対象人数が変わる)"),
+    _f("pool.tier_quota.enabled", "strict", True, "none",
+       "presence の層別クォータ(DP-U3 案A)。present_cap の充足を『優先順に埋めて途中 break』"
+       "から『quota[t] = round(cap × 当日資格者[t] / Σ 当日資格者)』へ替え、溢れた層だけ従来と"
+       "同じ当日ランキングで切る。端数は整数演算の最大剰余法(同値は層の固定順)= **追加する"
+       "乱数はゼロ**・k 非依存・trait 非依存・resume 不変。"
+       "★affects_k=true: 当日 present な個体の集合そのものが変わる(= 誰が LLM を呼ぶかが変わる)"
+       "ため pool.enabled と同じ扱いにする。pool.enabled が OFF なら 1 バイトも効かない子トグル"
+       "だが、ON 時は在場の層構成を作り替えるので独立に宣言する。"
+       "既定 OFF では quota 経路を 1 度も通らない=現行の層優先と選抜集合が完全一致"),
     _f("engine.batch_llm.enabled", "journal", False, "none",
        "LLM 一括発行(未命中のみ並行発行→id 順 apply)。LLM 発行経路そのものを差し替える"),
     _f("cognition.policy_cache.enabled", "journal", True, "none",
@@ -1206,7 +1220,18 @@ def check_runs(run_dirs, allow_mismatch: bool = False) -> dict:
             "unknown": [s["name"] for s in unknown]}
 
 
-def guard_or_die(run_dirs, allow_mismatch: bool = False, echo=print) -> dict:
+def _safe_echo(msg: str) -> None:
+    """print の cp932 安全版。Windows の非TTY stdout(cp932)では警告文の ⚠/✖ が
+    UnicodeEncodeError になり**解析スクリプトごと落ちる**(小粒C検収で実測)。
+    本文は変えず、表示できない文字だけ置換して必ず出力する。"""
+    try:
+        print(msg)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+        print(msg.encode(enc, errors="replace").decode(enc, errors="replace"))
+
+
+def guard_or_die(run_dirs, allow_mismatch: bool = False, echo=_safe_echo) -> dict:
     """check_runs を実行し、拒否条件なら SystemExit で止める(解析スクリプト用の口)。
 
     - 同一モード・同一等級集合 … **無言**(何も出力しない)

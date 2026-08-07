@@ -331,6 +331,20 @@ def test_guard_treats_missing_manifest_as_unknown(tmp_path):
     assert any("不明" in m for m in said)         # 警告のみ(過去ラン互換を壊さない)
 
 
+def test_default_echo_survives_cp932_stdout(monkeypatch):
+    """第98小粒: Windows 非TTY stdout(cp932)では警告文の ⚠/✖ が UnicodeEncodeError
+    になり解析スクリプトごと落ちる実バグ(小粒C検収で発見)の回帰。
+    既定 echo(_safe_echo)は本文を変えず、表示不能文字だけ置換して必ず生き残る。"""
+    import io
+    import sys
+    buf = io.TextIOWrapper(io.BytesIO(), encoding="cp932")
+    monkeypatch.setattr(sys, "stdout", buf)
+    R._safe_echo("⚠ ✖ cp932 に無い記号を含む警告")   # 落ちないことが本体
+    buf.flush()
+    raw = buf.buffer.getvalue().decode("cp932")
+    assert "警告" in raw and "?" in raw               # 本文は残り記号だけ置換される
+
+
 def test_real_run_signature_is_readable(tmp_path):
     _sim, out = _run(tmp_path, "m_sig", n_steps=12, n_agents=8,
                      **{"run.mode": "observe"})

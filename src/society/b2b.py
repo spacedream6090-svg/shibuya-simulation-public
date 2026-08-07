@@ -29,6 +29,7 @@ R1 呼数不変: generate() を1本も足さない。既定 OFF(commerce.invento
 """
 from __future__ import annotations
 
+from . import economy_sfc as sfc_mod
 from .observer.schema import Event
 
 # 小売カテゴリ → 卸が供給する output_kind(素材/製品)。実データ実査(organizations_shibuya.json):
@@ -147,7 +148,14 @@ def fulfill(sim, node: str, cat: str, qty: int, step: int, sim_min: int) -> bool
     戻り値=仕入れ成立か。卸不在(外生 depot 扱い)なら True(従来の外生補充=b2b_trade を出さない)。卸在庫が
     qty 未満なら False(=補充失敗=在庫回復なし=goods 側で欠品が波及)。成立時は org 間で金+物を移転:
     卸 在庫 −qty・売上 +amount / 小売 仕入費 +amount(会計保存=買い側支出=売り側売上)。b2b_trade を1件記録。
-    RNG は一切引かない=決定論。amount = qty × 卸値(cat 別)。"""
+    RNG は一切引かない=決定論。amount = qty × 卸値(cat 別)。
+
+    IF-E2 UNCOVERED(第98バッチ・``economy.org_accounting``。既定 OFF=完全 no-op=payload バイト一致):
+    従来この帳簿 dict は**どの主体の残高とも接続していなかった**(金は 1 円も動かない)。ON では
+    ``economy_sfc.on_b2b_trade`` が **買い手 org の預金 → 売り手 org の預金**へ実際に移す
+    (買い手の小売 POI を台帳で特定できなければ域外資本の店とみなし RoW が払う)。
+    **在庫・仕入れ成否(戻り値)・トリップ・帳簿 dict は 1 バイトも変わらない**=b2b の動力学は不変で、
+    payload に ``payer`` / ``payee`` が増えるだけ。"""
     if qty <= 0:
         return True
     org = wholesale_for(sim, node, cat)
@@ -169,9 +177,12 @@ def fulfill(sim, node: str, cat: str, qty: int, step: int, sim_min: int) -> bool
     b["trades"] += 1
     sim._b2b_total = b["trades"]
     org_node = (org.get("workplace_poi") or {}).get("node")
+    payload = {"from_org": oid, "to_poi": node, "cat": str(cat),
+               "qty": int(qty), "amount": round(amount, 1),
+               "from_node": org_node}
+    parties = sfc_mod.on_b2b_trade(sim, node, cat, oid, amount, step, sim_min)
+    if parties is not None:                           # IF-E2(既定 OFF=None=キーなし)
+        payload["payer"], payload["payee"] = parties
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
-                         kind="b2b_trade", x=0.0, y=0.0,
-                         payload={"from_org": oid, "to_poi": node, "cat": str(cat),
-                                  "qty": int(qty), "amount": round(amount, 1),
-                                  "from_node": org_node}))
+                         kind="b2b_trade", x=0.0, y=0.0, payload=payload))
     return True

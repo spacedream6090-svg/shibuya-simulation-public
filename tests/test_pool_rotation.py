@@ -390,3 +390,379 @@ def test_m3_dunbar_dormant_ties_survive_rotation_only_when_widened(small_pool, t
               traits={}, states={}, mem=MemoryStore())
     pool_mod.hydrate(b, {"relations": wide["relations"]})
     assert dunbar_mod.dormant_ids(b) == wide["weak"]
+
+
+# ============================================================ DP-U3 案A: 層別クォータ
+# 正典: docs/plans/proposal-dp-u3-observe-250k.md §1.2「案 A の中身」/ §5.1 R-1。
+# 第91 の破綻: 層優先は「優先順に埋めて途中 break」なので、上位層(workday_shift)が cap を
+# 食い切ると来街層(cadence / stochastic)が **構造的に全滅**する(cap 25万・平日で 0 人)。
+# conf `pool.tier_quota.enabled`(既定 false)で cap を層別クォータへ分配する。追加乱数ゼロ。
+def _legacy_present(recs, day: int, cap: int, hub, weekday: int) -> list[str]:
+    """DP-U3 以前の `present_for_day` 本体(層優先 break)の**逐語コピー**。
+
+    既定 OFF が現行と 1 バイトも変わらないことを、この参照実装との突合で固定する。
+    """
+    tiers = [[] for _ in range(presence_mod._N_TIERS)]
+    for rec in recs:
+        if presence_mod._eligible(rec, day, weekday, hub):
+            tiers[presence_mod._TIER.get(rec.key, presence_mod._N_TIERS - 1)].append(rec.pid)
+    present: list[str] = []
+    for tier in range(presence_mod._N_TIERS):
+        ids = tiers[tier]
+        if not ids:
+            continue
+        room = cap - len(present)
+        if room <= 0:
+            break
+        if len(ids) <= room:
+            present.extend(ids)
+        else:
+            ranked = sorted(
+                ids,
+                key=lambda pid: (float(hub.stream("presence_rank", pid, int(day)).random()), pid))
+            present.extend(ranked[:room])
+            break
+    present.sort()
+    return present
+
+
+def _tier_recs(resident=0, duty=0, work=0, cadence=0, stochastic=0):
+    """5 層すべてを含む合成名簿(当日資格は平日なら全員 True = 比率が読みやすい)。"""
+    recs = []
+    for i in range(resident):
+        recs.append(PresenceRec(pid=f"RES_{i:06d}", key="resident"))
+    for i in range(duty):
+        recs.append(PresenceRec(pid=f"DUT_{i:06d}", key="duty", duty_days="all"))
+    for i in range(work):
+        recs.append(PresenceRec(pid=f"WRK_{i:06d}", key="workday_shift", work_days="mon-fri"))
+    for i in range(cadence):
+        recs.append(PresenceRec(pid=f"CAD_{i:06d}", key="cadence", cadence="school_day"))
+    for i in range(stochastic):
+        recs.append(PresenceRec(pid=f"STO_{i:06d}", key="stochastic", visit_rate=1.0))
+    return recs
+
+
+def _by_tier(pids) -> dict:
+    return Counter(p.split("_", 1)[0] for p in pids)
+
+
+# 第91 の実測構成(名簿 100万・平日資格者)を 1/1000 に縮めた再現ケース。
+# 提案書 §1.1 の表: resident 30,034 / duty 986 / workday 253,702 / cadence 27,357 / stoch 24,883。
+_B91 = dict(resident=30, duty=1, work=254, cadence=27, stochastic=25)   # 計 337 人(= 33.7万)
+_B91_CAP = 250                                                          # = 在場 25万
+
+
+# ---------------------------------------------------------------- ① OFF = 現行完全一致
+@pytest.mark.parametrize("cap", [10, 25, 100, 250, 337, 1000])
+@pytest.mark.parametrize("weekday", [1, 6])
+def test_quota_off_matches_legacy_exactly(cap, weekday):
+    """既定 OFF は DP-U3 以前の層優先 break と**選抜集合も順序も**完全一致(全 cap 帯)。"""
+    recs = _tier_recs(**_B91)
+    for day in range(3):
+        hub_a, hub_b = RngHub(42), RngHub(42)
+        assert present_for_day(recs, day, cap, hub_a, weekday) == \
+            _legacy_present(recs, day, cap, hub_b, weekday)
+
+
+def test_quota_off_matches_legacy_on_real_pool(small_pool):
+    """実 P5 プール(小)でも既定 OFF は逐語コピーの参照実装と一致する。"""
+    recs = pool_mod.PoolStore(small_pool).presence_records()
+    for cap in (50, 300, 100000):
+        assert present_for_day(recs, 0, cap, RngHub(42), 0) == \
+            _legacy_present(recs, 0, cap, RngHub(42), 0)
+    # 明示 False も既定(引数省略)と同一
+    assert present_for_day(recs, 1, 300, RngHub(42), 1, False) == \
+        present_for_day(recs, 1, 300, RngHub(42), 1)
+
+
+def test_quota_off_default_is_false_in_conf():
+    cfg = load_config([])
+    assert cfg.pool.tier_quota.enabled is False
+    on = load_config(["pool.tier_quota.enabled=true"])
+    assert on.pool.tier_quota.enabled is True
+
+
+def test_quota_toggle_is_declared_in_registry():
+    """新トグルは機能レジストリに宣言済み(未宣言検出 CI ゲートに落ちない)。"""
+    from society import registry as R
+    ids = {f.id for f in R.FEATURES}
+    assert "pool.tier_quota.enabled" in ids
+    assert R.undeclared_toggles(load_config()) == []
+
+
+# ---------------------------------------------------------------- ② ON = 構成比保存(第91 の解消)
+def test_quota_on_keeps_visitors_that_legacy_wipes_out():
+    """★第91 破綻ケース: OFF では来街層が 0 人、ON では quota どおり残る(構成比保存)。"""
+    recs = _tier_recs(**_B91)
+    off = _by_tier(present_for_day(recs, 0, _B91_CAP, RngHub(42), 1))
+    on = _by_tier(present_for_day(recs, 0, _B91_CAP, RngHub(42), 1, True))
+
+    # OFF: resident 30 + duty 1 で残 219 を workday(254)が埋め切り break = 来街者ゼロ
+    assert off["CAD"] == 0 and off["STO"] == 0
+    assert off["WRK"] == 219 and off["RES"] == 30 and off["DUT"] == 1
+
+    # ON: 提案書 §1.2 の割当(resident 22,282 / duty 731 / workday 188,228 /
+    #     cadence 20,297 / stochastic 18,461)を 1/1000 に縮めた値と一致する
+    assert on == Counter({"WRK": 188, "RES": 22, "CAD": 20, "STO": 19, "DUT": 1})
+    assert sum(on.values()) == _B91_CAP
+    assert on["CAD"] + on["STO"] == 39          # 来街者が 3.9万人ぶん入る(現行 = 0 人)
+
+    # 構成比が資格者比率に保存されている(最大剰余法の丸め以内 = 1 人)
+    total = sum(_B91.values())
+    for tag, n_elig in (("RES", 30), ("DUT", 1), ("WRK", 254), ("CAD", 27), ("STO", 25)):
+        assert abs(on[tag] - _B91_CAP * n_elig / total) <= 1.0
+
+
+def test_quota_on_overflow_tiers_use_the_existing_daily_ranking():
+    """溢れた層の切り方は**既存の当日ランキングそのまま**(新しい順序を発明していない)。"""
+    recs = _tier_recs(**_B91)
+    hub = RngHub(42)
+    got = set(present_for_day(recs, 0, _B91_CAP, hub, 1, True))
+    quota = presence_mod.quota_by_ratio([30, 1, 254, 27, 25], _B91_CAP)
+    for tag, prefix, tier in (("RES", "RES_", 0), ("WRK", "WRK_", 2),
+                              ("CAD", "CAD_", 3), ("STO", "STO_", 4)):
+        ids = [r.pid for r in recs if r.pid.startswith(prefix)]
+        expect = presence_mod._ranked(ids, 0, hub)[:quota[tier]]
+        assert {p for p in got if p.startswith(prefix)} == set(expect), tag
+
+
+def test_quota_on_weekend_falls_back_to_eligible_total():
+    """週末は workday_shift が失格 → クォータは残層に配られるが**総数は資格者数が上限**。
+
+    (提案書 §1.2 の正直な注記: 週末の人口崩れは名簿の較正問題でクォータでは直らない)
+    """
+    recs = _tier_recs(**_B91)
+    on = _by_tier(present_for_day(recs, 0, _B91_CAP, RngHub(42), 6, True))
+    assert on["WRK"] == 0
+    assert sum(on.values()) == 30 + 1 + 25         # cadence(school_day)も週末は失格
+    assert on["STO"] == 25                          # 資格者は全員入る(捏造しない)
+
+
+# ---------------------------------------------------------------- ③ quota 合計 = cap
+@pytest.mark.parametrize("cap", [0, 1, 2, 5, 37, 100, 249, 250, 336, 337, 338, 10**6])
+def test_quota_sums_to_cap_or_eligible_total(cap):
+    """端数正規化: Σ quota = min(cap, Σ 資格者)。各層は資格者数を超えない。"""
+    sizes = [30, 1, 254, 27, 25]
+    q = presence_mod.quota_by_ratio(sizes, cap)
+    assert sum(q) == min(cap, sum(sizes))
+    assert all(0 <= q[t] <= sizes[t] for t in range(len(sizes)))
+
+
+@pytest.mark.parametrize("sizes", [
+    [0, 0, 0, 0, 0],                 # 全層で資格者ゼロ
+    [7, 0, 0, 0, 0],                 # 1 層だけ
+    [1, 1, 1, 1, 1],                 # 完全同数(タイブレークが全部効く)
+    [3, 3, 3, 0, 1],
+    [999999, 1, 1, 1, 1],            # 極端な偏り
+    [30034, 986, 253702, 27357, 24883],   # 提案書 §1.1 の実測(平日)
+])
+@pytest.mark.parametrize("cap", [0, 1, 3, 4, 5, 999, 250000, 10**7])
+def test_quota_invariants_over_many_shapes(sizes, cap):
+    q = presence_mod.quota_by_ratio(sizes, cap)
+    assert sum(q) == min(cap, sum(sizes)), (sizes, cap, q)
+    assert all(0 <= q[t] <= sizes[t] for t in range(len(sizes))), (sizes, cap, q)
+
+
+def test_quota_real_scale_matches_the_proposal_table():
+    """提案書 §1.2 の割当(cap 25万・平日実測比)を実装が再現する(端数処理の差は ±1 人)。
+
+    提案書の手計算は素の round(合計 249,999 = 1 人足りない)。実装は最大剰余法なので
+    合計が厳密に cap になり、その 3 人ぶんが上位剰余の層(resident/duty/cadence)へ入る。
+    """
+    q = presence_mod.quota_by_ratio([30034, 986, 253702, 27357, 24883], 250000)
+    assert sum(q) == 250000
+    assert q == [22283, 732, 188227, 20297, 18461]
+    for got, doc in zip(q, [22282, 731, 188228, 20297, 18461]):     # 提案書 §1.2 の表
+        assert abs(got - doc) <= 1
+    assert q[3] + q[4] == 38758                        # 来街者(現行 = 0 人)= 約 3.9 万人
+
+
+def test_quota_tie_break_is_the_fixed_tier_order():
+    """剰余が同値なら層の固定順(resident>duty>workday>cadence>stochastic)で決める。"""
+    # 5 層同数 × cap=7 → base=1 ずつ・余り 2 を上位 2 層へ
+    assert presence_mod.quota_by_ratio([10, 10, 10, 10, 10], 7) == [2, 2, 1, 1, 1]
+    assert presence_mod.quota_by_ratio([10, 10, 10, 10, 10], 6) == [2, 1, 1, 1, 1]
+
+
+# ---------------------------------------------------------------- ④ 決定論
+def test_quota_on_is_deterministic():
+    """同入力 2 走で同一選抜(乱数追加ゼロ・整数演算の端数処理)。"""
+    recs = _tier_recs(**_B91)
+    a = present_for_day(recs, 5, _B91_CAP, RngHub(42), 3, True)
+    b = present_for_day(recs, 5, _B91_CAP, RngHub(42), 3, True)
+    assert a == b and a == sorted(a)
+    # quota 側も純関数(同入力同出力)
+    assert presence_mod.quota_by_ratio([30, 1, 254, 27, 25], 250) == \
+        presence_mod.quota_by_ratio([30, 1, 254, 27, 25], 250)
+    # ON は日ごとに顔ぶれが動く(ローテーションは失われていない)
+    d0 = set(present_for_day(recs, 0, _B91_CAP, RngHub(42), 1, True))
+    d1 = set(present_for_day(recs, 1, _B91_CAP, RngHub(42), 1, True))
+    assert d0 != d1
+
+
+def test_quota_on_adds_no_new_random_draws():
+    """ON でも引く stream は既存の presence 系のみ(新種の乱数キーを増やしていない)。"""
+    seen: list[str] = []
+
+    class _Spy(RngHub):
+        def stream(self, *key):
+            seen.append(str(key[0]))
+            return super().stream(*key)
+
+    present_for_day(_tier_recs(**_B91), 0, _B91_CAP, _Spy(42), 1, True)
+    assert set(seen) <= {"presence", "presence_rank", "presence_cadence", "presence_revisit"}
+
+
+# ---------------------------------------------------------------- ⑤ 資格者 < quota の再配分
+def test_quota_short_tier_takes_all_and_rest_is_redistributed():
+    """資格者数が取り分に満たない層は**全員だけ**入り、余りは残層へ回る(枠を捨てない)。"""
+    # cap > Σ 資格者: 全層まるごと(存在しない人を捏造しない)
+    assert presence_mod.quota_by_ratio([10, 2, 3, 0, 5], 100) == [10, 2, 3, 0, 5]
+    # 資格者ゼロの層には 1 人も配らず、その枠は資格者のいる層へ回る
+    q = presence_mod.quota_by_ratio([5, 0, 0, 0, 95], 50)
+    assert q[1] == q[2] == q[3] == 0 and sum(q) == 50
+    # 小さすぎて比例配分では 0 になる層も、cap が資格者総数を超えれば全員入る
+    q2 = presence_mod.quota_by_ratio([1, 1, 100000, 1, 1], 100004)
+    assert q2 == [1, 1, 100000, 1, 1]
+
+
+def test_quota_short_tier_end_to_end():
+    """名簿側から見た再配分: 取り分に届かない小さな層は**全員 present**・切られるのは過多の層だけ。"""
+    recs = _tier_recs(resident=3, duty=2, work=40, cadence=1, stochastic=4)   # 計 50
+    got = _by_tier(present_for_day(recs, 0, 45, RngHub(42), 1, True))
+    assert got["RES"] == 3 and got["DUT"] == 2 and got["CAD"] == 1            # 全員入る
+    assert got["WRK"] == 36 and got["STO"] == 3                               # 過多の層だけ切られる
+    assert sum(got.values()) == 45                                            # 枠の取りこぼしゼロ
+
+
+# ---------------------------------------------------------------- ON 統合(mock・実プール小)
+_KEYS = ("resident", "duty", "workday_shift", "cadence", "stochastic")
+
+
+def test_quota_on_wiring_and_composition(small_pool, tmp_path):
+    """conf → Simulation → presence の配線と、実プールでの構成比保存(day0=月曜)。
+
+    cap は「上位 3 層(resident+duty+workday_shift)の当日資格者数ちょうど」に取る。
+    層優先ではここで cap 到達 → break = **来街層が 1 人も入らない**(第91 の破綻の縮小再現)。
+    """
+    ps = pool_mod.PoolStore(small_pool)
+    recs = ps.presence_records()
+    key_of = {r.pid: r.key for r in recs}
+    elig = Counter(r.key for r in recs if presence_mod._eligible(r, 0, 0, RngHub(42)))
+    sizes = [elig.get(k, 0) for k in _KEYS]
+    cap = sizes[0] + sizes[1] + sizes[2]
+    assert sizes[2] > 0 and sizes[3] + sizes[4] > 0, "プールの層構成が前提を満たしていない"
+
+    off = Simulation(_pool_cfg("tq_off", small_pool, n_steps=1, cap=cap),
+                     out_dir=tmp_path / "tq_off")
+    on = Simulation(_pool_cfg("tq_on", small_pool, n_steps=1, cap=cap,
+                              **{"pool.tier_quota.enabled": "true"}),
+                    out_dir=tmp_path / "tq_on")
+    assert off._pool_tier_quota is False and on._pool_tier_quota is True
+
+    c_off = Counter(key_of[a.pool_pid] for a in off.agents)
+    c_on = Counter(key_of[a.pool_pid] for a in on.agents)
+    assert len(off.agents) == len(on.agents) == cap           # どちらも cap 遵守
+    assert c_off["cadence"] == 0 and c_off["stochastic"] == 0  # 層優先では来街層が全滅
+    assert c_on["cadence"] > 0 and c_on["stochastic"] > 0      # クォータでは残る
+    assert c_on["workday_shift"] < c_off["workday_shift"]      # 溢れた層が譲る
+    # ON の割当は当日資格者の比率(day0=月曜)にぴったり一致する
+    quota = presence_mod.quota_by_ratio(sizes, cap)
+    for i, k in enumerate(_KEYS):
+        assert c_on.get(k, 0) == quota[i], k
+
+
+def test_quota_on_rotates_at_the_day_boundary(small_pool, tmp_path):
+    """ON でも日境界のローテーションが従来どおり起き、cap と層構成が保たれる。
+
+    150 step 走らせる必要はないので M-3 テストと同じく `_phase_pool_rotation` を直接呼ぶ。
+    """
+    from society.engine import scheduler
+    cap = 120
+    sim = Simulation(_pool_cfg("tq_rot", small_pool, n_steps=1, cap=cap,
+                               **{"pool.tier_quota.enabled": "true"}),
+                     out_dir=tmp_path / "tq_rot")
+    d0 = {a.pool_pid for a in sim.agents}
+    scheduler._phase_pool_rotation(sim, 144, 1440)          # day1(火曜)を起こす
+    d1 = {a.pool_pid for a in sim.agents}
+    assert len(d1) == cap and d0 != d1                       # cap 遵守 + 顔ぶれの入替
+    ev = [e for e in sim.logger.events if e.kind == "presence_change"]
+    assert ev and ev[-1].payload["n_present"] == len(d1)
+    key_of = {r.pid: r.key for r in sim._pool.presence_records()}
+    assert Counter(key_of[p] for p in d1)["stochastic"] > 0  # 来街層が翌日も残る
+
+
+# ============================================================ 第98バッチ 小粒A: 退避の残課題 2 件
+# 台帳 PENDING の「IF-C 残② `_rumors` を運ばない」「竹-4 残③ `_phys_*` を運ばない」を塞いだ
+# ことの機械固定。★受入条件の芯は「持たない個体の退避 dict が現行と完全同一」であること。
+def _bare_agent(aid: int = 11):
+    return Agent(id=aid, name="丙", age=30, occupation="会社員", persona="p",
+                 traits={}, states={}, mem=MemoryStore())
+
+
+def test_rumor_key_matches_rumors_module():
+    """pool の `_RUMOR_KEY` は society.rumors.RUMOR_KEY と同一(層の逆流を避けた写しの固定)。"""
+    from society import rumors as rumors_mod
+    assert pool_mod._RUMOR_KEY == rumors_mod.RUMOR_KEY
+
+
+def test_dehydrate_without_rumors_or_phys_is_unchanged():
+    """rumors / physics を持たない個体の退避 dict に新キーが 1 つも生えない(既定ラン不変)。
+
+    「属性が在って非空のときだけ入れる」設計の受入条件そのもの。空 dict / 空 body でも
+    キーを作らない(OFF ランと ON だが未経験のランで退避のバイト列が割れないこと)。
+    """
+    a = _bare_agent()
+    base = pool_mod.dehydrate(a)
+    assert "rumors" not in base and "phys_body" not in base
+
+    setattr(a, pool_mod._RUMOR_KEY, {})          # ON だが 1 件も知らない = 空 dict
+    a._phys_body = None                          # 物理 ON だが 1 度も積分していない
+    assert pool_mod.dehydrate(a) == base, "空の状態で退避 dict が変わっている"
+
+
+def test_dehydrate_hydrate_carries_rumors_and_phys_body():
+    """噂の知識(役割/冗長回数/知った step/源)と群集体感が往復で同値に戻る(挿入順も)。"""
+    a = _bare_agent()
+    setattr(a, pool_mod._RUMOR_KEY, {
+        "rumor-2": {"role": "stifler", "redundant": 3, "step": 40, "src": "enforcement"},
+        "rumor-1": {"role": "spreader", "redundant": 0, "step": 12, "src": "event_host"},
+    })
+    a._phys_body = {"blocked": 0.25, "contact": 1.5, "local_density": 0.75}
+    state = pool_mod.dehydrate(a)
+    assert list(state["rumors"]) == ["rumor-2", "rumor-1"], "知った順(挿入順)が壊れている"
+
+    import json
+    json.dumps(state)                            # JSON 安全(プリミティブ/dict のみ)
+
+    b = _bare_agent(12)
+    pool_mod.hydrate(b, state)
+    assert getattr(b, pool_mod._RUMOR_KEY) == getattr(a, pool_mod._RUMOR_KEY)
+    assert list(getattr(b, pool_mod._RUMOR_KEY)) == ["rumor-2", "rumor-1"]
+    assert b._phys_body == a._phys_body
+    # 退避辞書を書き換えても復元後の個体に波及しない(実体を共有しない)
+    state["rumors"]["rumor-1"]["redundant"] = 99
+    assert getattr(b, pool_mod._RUMOR_KEY)["rumor-1"]["redundant"] == 0
+
+
+def test_hydrate_tolerates_old_state_without_new_keys():
+    """旧 退避辞書(新キー無し)からの復元で属性を 1 つも生やさない(前方互換)。"""
+    a = _bare_agent()
+    old = pool_mod.dehydrate(a)                  # 新キーを持たない辞書
+    b = _bare_agent(13)
+    pool_mod.hydrate(b, old)
+    assert not hasattr(b, pool_mod._RUMOR_KEY)
+    assert not hasattr(b, "_phys_body")
+
+
+def test_dehydrate_does_not_carry_zone_ownership():
+    """ゾーン所有(走行レコード)は**意図的に運ばない**(再来街は別経路で組み直されるため)。"""
+    a = _bare_agent()
+    a._phys_zone = "scramble"
+    a._phys_pos = (1.0, 2.0)
+    a._phys_path = ["n1", "n2"]
+    state = pool_mod.dehydrate(a)
+    assert not [k for k in state if k.startswith("phys_") and k != "phys_body"]
+    b = _bare_agent(14)
+    pool_mod.hydrate(b, state)
+    assert getattr(b, "_phys_zone", None) is None

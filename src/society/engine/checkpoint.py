@@ -293,6 +293,90 @@ def save(sim, step: int, path: str | Path) -> Path:
             "government": getattr(sim, "government", None),
             "bank": getattr(sim, "bank", None),
             "vc_fund": getattr(sim, "vc_fund", None),
+            # ------------------------------------------------------------------
+            # 第98バッチ 小粒A(resume 整合の**全数**監査): 日/期ガードの未保存を一括で塞ぐ。
+            # これまで各バッチが「自分の機構の日カウンタ」を1件ずつ足してきた結果、同型の
+            # 未保存が src 全体に散らばって残っていた(AST で sim.<attr> 代入を全数走査して確定)。
+            # どれも第80 W2(weather の二重記録)と同じ型 —「mid-day resume が同じ暦日を
+            # もう一度処理する」= 二重発火 / 二重記録で resume≠straight になる。
+            # OFF ランでは -1/None/0 = 挙動不変(load は .get で旧 checkpoint 互換)。
+            "bank_day": getattr(sim, "_bank_day", -1),        # E-W1 融資の日次返済(二重返済)
+            "reflect_day": getattr(sim, "_reflect_day", -1),  # 第12 無意識層の日次更新(EMA 二重適用)
+            "freedom_day": getattr(sim, "_freedom_day", -1),  # 第17 価値充足の中立回帰(二重減衰)
+            "sched_day": getattr(sim, "_sched_day", -1),      # 予定の日次 GC
+            "partner_day": getattr(sim, "_partner_day", -1),  # H2 パートナー形成(同日二重成立)
+            "health_day": getattr(sim, "_health_day", -1),    # G6 発症/受診の日次抽選(二重抽選)
+            # 偶発イベント: stream キーが (agent.id, **day**) なので同じ日を引き直すと
+            # **同じ当たりがもう一度効く**(windfall の二重入金)= 特に害が大きい。
+            "chance_day": getattr(sim, "_chance_day", -1),
+            "goods_review_day": getattr(sim, "_goods_review_day", -1),      # 物流の補充レビュー(二重補充)
+            "council_budget_day": getattr(sim, "_council_budget_day", -1),  # 議会の区予算承認(二重記録)
+            "vc_review_day": getattr(sim, "_vc_review_day", -1),            # E-W2 VC 定期審査(二重出資)
+            "crowd_surge_day": getattr(sim, "_crowd_surge_day", -1),        # 群集の 1日1回記録
+            # 年中行事: 日カウンタ**だけ**戻すと today_event_line が None のまま当日が終わり
+            # プロンプト文脈が消えるので、第80 W2(cal_day + today_weather 3 点)とまったく
+            # 同じ様式で「当日の確定値」も一緒に運ぶ。行事の発生自体は暦の純関数。
+            "annual_day": getattr(sim, "_annual_day", -1),
+            "today_event_line": getattr(sim, "today_event_line", None),
+            "today_crowd_event": getattr(sim, "today_crowd_event", None),
+            # 合成地位(T6): 日カウンタ + **前日 rank**(L2 status_rank_mobility の材料)。
+            # status 値そのものは agents pickle に自然同梱。prev_rank を落とすと翌日の移動性が
+            # 0.0 に潰れ、mobility 自体も再開直後から当日の残り step で 0.0 に化ける。
+            "status_day": getattr(sim, "_status_day", -1),
+            "status_prev_rank": getattr(sim, "_status_prev_rank", None),
+            "status_rank_mobility": getattr(sim, "_status_rank_mobility", None),
+            # 世界観(C2/C6): 日カウンタ + 規範窓(直近 norm_window_days 日の開拓行動数 deque)。
+            # 日カウンタが無いと resume 直後の日境界が **first 扱い**になり、その日の worldview
+            # スナップショット(世界1件 + 全員1件)がまるごと落ちる。窓は日を跨ぐ状態なので運ぶ。
+            # 走査位置(_wv_pos)は**プロセス内 logger カウンタ由来**なので保存しない(load で 0
+            # = assets/gossip と同流儀)。★ただし worldview の走査は**日境界にしか走らない**ため、
+            # 直前の日境界〜checkpoint の区間の C2 応答は resume で失われる(毎 step 走査の
+            # gossip とは違う既知の残課題。ここでは埋められない=イベント本体の保存が要る)。
+            "wv_day": getattr(sim, "_wv_day", -1),
+            "wv_pioneer": list(getattr(sim, "_wv_pioneer", None) or ()),
+            # 都市・環境ショック(H4): 日カウンタ + **継続中の災害/インフラ障害そのもの**
+            # (種・解除日)+ 当日のプロンプト1行 + 電車の運休フラグ。★状態の本体が sim 側に
+            # ある(第96 traces と同じ型)ので、保存しないと resume 直後に災害が消え、電車が
+            # 勝手に復旧し、同じ日にもう一度 onset 抽選が走る。個体側の在宅フラグ
+            # (_disaster_homebound)は agents pickle に自然同梱。OFF では属性自体が生えない
+            # → None=挙動不変(load は .get で旧 checkpoint 互換)。
+            "disaster_state": ({
+                "day": int(getattr(sim, "_disaster_day", -1)),
+                "active": bool(getattr(sim, "_disaster_active", False)),
+                "kind": getattr(sim, "_disaster_kind", None),
+                "until_day": int(getattr(sim, "_disaster_until_day", -1)),
+                "infra_active": bool(getattr(sim, "_infra_active", False)),
+                "infra_kind": getattr(sim, "_infra_kind", None),
+                "infra_until_day": int(getattr(sim, "_infra_until_day", -1)),
+                "line": getattr(sim, "today_disaster_line", None),
+                "suspended": bool(getattr(getattr(sim, "transit", None),
+                                          "suspended", False)),
+            } if hasattr(sim, "_disaster_day") else None),
+            # 議会(名簿制 / SNTV)と立候補受付。**非エージェントの plain データ**で、第97 が
+            # 塞いだ government / bank / vc_fund とまったく同じ型の**既存欠陥** — 保存しないと
+            # resume 直後に議会が消え、_assembly_realism が同じ日に改選をやり直して
+            # council_elected / election_result を二重記録し、任期(term)も打ち直される。
+            "council": getattr(sim, "council", None),
+            "council_campaign": getattr(sim, "council_campaign", None),
+            # 卸(B2B)台帳・宅配の到着待ち・累積カウンタ 3 種(素の dict/list/int)。
+            # b2b の卸在庫は**物**なので落とすと resume で在庫が湧き欠品が消える。delivery の
+            # 到着待ちは「金は払ったが品はまだ」の中間状態=落とすと注文が宙に消える。
+            # 累積 3 種は L2 の常設列(第62 joint_total と同じ型)。
+            "b2b": getattr(sim, "_b2b", None),
+            "b2b_total": int(getattr(sim, "_b2b_total", 0)),
+            "delivery_pending": getattr(sim, "_delivery_pending", None),
+            "delivery_total": int(getattr(sim, "_delivery_total", 0)),
+            "service_total": int(getattr(sim, "_service_total", 0)),
+            # 屋外広告(OOH)のキャンペーン期。改定は期境界で 1 枠 1 draw なので、保存しないと
+            # resume 直後に同じ期のキャンペーンを引き直す(ad_campaign の二重記録 + 別 step キー
+            # からの draw)。枠(_ads_slots)は city からの決定論導出なので保存しない
+            # (street.py 側が resume で期を上書きしないよう getattr 既定に直してある)。
+            "ads_period": getattr(sim, "_ads_period", None),
+            "ads_campaigns": getattr(sim, "_ads_campaigns", None),
+            # 内面本格版(H6)の「起動後 1 回」フラグ。第88 mind_logged と同じ型 — 保存しないと
+            # resume 直後に precompute が再走し、全員ぶんの long_goal を二重記録する
+            # (目標/趣味の値は決定論なので同じ。記録だけが二重になる)。
+            "inner_life_init": bool(getattr(sim, "_inner_life_init", False)),
             # 第71バッチ: LLM 入出力ジャーナルの確定点(ファイル名 → {records, bytes})。
             # mark() が flush してから採るので、この時点のファイル末尾は必ず gzip メンバ境界
             # = 安全な切り詰め点。resume(load)がここまで巻き戻すことで、「checkpoint 後に
@@ -476,6 +560,69 @@ def load(sim, path: str | Path) -> int:
         sim._phys_state = phs
     # 第82: θ 恒常性の日境界(旧 checkpoint 互換 = 無ければ -1 = 従来どおり初日扱い)。
     sim._g_day = int(rt.get("g_day", -1))
+    # ---- 第98バッチ 小粒A: 日/期ガードの全数復元 --------------------------------
+    # 旧 checkpoint 互換 = キーが無ければ -1/None/0 = **従来の挙動そのまま**(getattr 既定と同値)。
+    sim._bank_day = rt.get("bank_day", -1)
+    sim._reflect_day = rt.get("reflect_day", -1)
+    sim._freedom_day = rt.get("freedom_day", -1)
+    sim._sched_day = rt.get("sched_day", -1)
+    sim._partner_day = rt.get("partner_day", -1)
+    sim._health_day = rt.get("health_day", -1)
+    sim._chance_day = rt.get("chance_day", -1)
+    sim._goods_review_day = rt.get("goods_review_day", -1)
+    sim._council_budget_day = rt.get("council_budget_day", -1)
+    sim._vc_review_day = rt.get("vc_review_day", -1)
+    sim._crowd_surge_day = rt.get("crowd_surge_day", -1)
+    sim._annual_day = rt.get("annual_day", -1)
+    if "today_crowd_event" in rt:               # 第80 W2 と同じ様式(当日の確定値も一緒に戻す)
+        sim.today_event_line = rt.get("today_event_line")
+        sim.today_crowd_event = rt.get("today_crowd_event")
+    sim._status_day = rt.get("status_day", -1)
+    spr = rt.get("status_prev_rank")            # 前日 rank(無ければ素通り=従来どおり mobility 0)
+    if spr is not None:
+        sim._status_prev_rank = spr
+    srm = rt.get("status_rank_mobility")
+    if srm is not None:
+        sim._status_rank_mobility = float(srm)
+    sim._wv_day = rt.get("wv_day", -1)
+    wvp = rt.get("wv_pioneer")                  # 規範窓(deque。maxlen は conf から組み直す)
+    if wvp:
+        from collections import deque as _deque
+        _wvcfg = getattr(sim, "worldviewcfg", None) or {}
+        sim._wv_pioneer = _deque(
+            wvp, maxlen=max(1, int(_wvcfg.get("norm_window_days", len(wvp)) or len(wvp))))
+        sim._wv_pos = 0                         # 走査位置は logger 由来=0 から(assets/gossip 同流儀)
+    dsr = rt.get("disaster_state")              # H4 ショック(旧 ckpt 互換=無ければ素通り=OFF は無風)
+    if dsr is not None:
+        sim._disaster_day = int(dsr["day"])
+        sim._disaster_active = bool(dsr["active"])
+        sim._disaster_kind = dsr["kind"]
+        sim._disaster_until_day = int(dsr["until_day"])
+        sim._infra_active = bool(dsr["infra_active"])
+        sim._infra_kind = dsr["infra_kind"]
+        sim._infra_until_day = int(dsr["infra_until_day"])
+        sim.today_disaster_line = dsr["line"]
+        if getattr(sim, "transit", None) is not None:
+            sim.transit.suspended = bool(dsr["suspended"])   # 運休は日次に打ち直される派生値
+    for _attr in ("council", "council_campaign"):   # 議会(government/bank/vc_fund と同型)
+        _obj = rt.get(_attr)
+        if _obj is not None:
+            setattr(sim, _attr, _obj)
+    _b2b = rt.get("b2b")
+    if _b2b:                                    # 未構築の空 dict は素通り(simulation の初期値のまま)
+        sim._b2b = _b2b
+    sim._b2b_total = int(rt.get("b2b_total", 0))
+    _dpn = rt.get("delivery_pending")
+    if _dpn is not None:
+        sim._delivery_pending = _dpn
+    sim._delivery_total = int(rt.get("delivery_total", 0))
+    sim._service_total = int(rt.get("service_total", 0))
+    _adp = rt.get("ads_period")                 # OOH キャンペーン期(枠は city から組み直す)
+    if _adp is not None:
+        sim._ads_period = int(_adp)
+        sim._ads_campaigns = rt.get("ads_campaigns") or {}
+    if rt.get("inner_life_init"):               # H6 起動後 1 回(long_goal の二重記録を防ぐ)
+        sim._inner_life_init = True
     if hasattr(sim, "_journal_rewind"):         # 第71: LLM ジャーナルを確定点まで巻き戻す
         sim._journal_rewind(rt.get("llm_journal"))
 

@@ -28,6 +28,7 @@ from ..world.routing import Router
 from ..world.transit import Transit
 from ..world import presence as presence_mod
 from ..world import pool as pool_mod
+from ..world import floors as _floors_mod
 from . import checkpoint, scheduler
 
 
@@ -1027,6 +1028,9 @@ class Simulation:
                 pool_dir = REPO_ROOT / pool_dir
             self._pool = pool_mod.PoolStore(pool_dir)
             self._pool_present_cap = int(poolcfg.get("present_cap", 300))
+            # 層別クォータ(DP-U3 案A。既定 OFF=従来の層優先 break=選抜集合が現行と完全一致)。
+            self._pool_tier_quota = bool(
+                (poolcfg.get("tier_quota", {}) or {}).get("enabled", False))
             self._dormant = pool_mod.DormantStore(cap=int(poolcfg.get("dormant_cap", 0)))
             # 退避スリム状態の台帳幅(M-3。既定 = 現行の素値 = 挙動不変)。dunbar の休眠関係が
             # 「再会する前に台帳から落ちる」相互作用を観察ランで緩められるようにする口。
@@ -1036,7 +1040,8 @@ class Simulation:
                                                       pool_mod._EP_CAP)))
             weekday = self._pool_weekday(0)
             day0 = presence_mod.present_for_day(
-                self._pool.presence_records(), 0, self._pool_present_cap, self.hub, weekday)
+                self._pool.presence_records(), 0, self._pool_present_cap, self.hub, weekday,
+                self._pool_tier_quota)
             for pid in day0:
                 self.agents.append(self.build_pool_agent(pid, self._pool.get(pid)))
             # 職場束ね直しの day0 coverage 統計を控える(起動時 1 件で記録=run_step step0)。
@@ -1344,7 +1349,8 @@ class Simulation:
             if agent.home_building and self.city.has_building(agent.home_building):
                 bld = self.city.building(agent.home_building)
                 agent.building = bld["id"]
-                agent.floor = agent.home_floor
+                # 3D-U0(world.floor_clamp・既定 OFF=そのまま): go_to_bed と同じ丸め方をする
+                agent.floor = _floors_mod.clamp(self, bld, agent.home_floor)
                 agent.x, agent.y = bld["centroid"]         # 実在の住宅建物内で就寝(go_to_bed と同じ位置)
             else:
                 agent.building = None

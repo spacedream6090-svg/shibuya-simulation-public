@@ -37,6 +37,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 
+from . import economy_sfc as sfc_mod
 from .factors import update as factor_update
 from .observer.schema import Event
 
@@ -294,11 +295,19 @@ def tick_crime(sim, step: int, sim_min: int) -> None:
                 continue
             stolen = min(float(victim.money), theft_amt)
             victim.money = max(0.0, float(victim.money) - theft_amt)
+            cr_payload = {"kind": "theft", "victim": int(victim.id),
+                          "offender": int(a.id),
+                          "amount": round(stolen, 1)}
+            # IF-E2 UNCOVERED(第98バッチ・既定 OFF=キーなし): 窃盗は相互合意が無いので
+            # **取引ではない**(SNA 2008 §3.98)。RoW(取引の相手方)ではなく K5
+            # (その他の資産変動)へ分類する。**加害者へは入金しない**(現行の動力学のまま)。
+            # 渡すのは丸める前の実減少額(stolen)= 会計は payload の丸めに引きずられない。
+            payee = sfc_mod.on_theft(sim, stolen)
+            if payee is not None:
+                cr_payload["payee"] = payee
             sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=a.id,
                                  kind="crime", x=a.x, y=a.y,
-                                 payload={"kind": "theft", "victim": int(victim.id),
-                                          "offender": int(a.id),
-                                          "amount": round(stolen, 1)}))
+                                 payload=cr_payload))
             factor_update.on_crime(victim, cg, cause="crime", step=step,
                                    sim_min=sim_min, logger=sim.logger)
             victim.remember("何かを盗まれたようだ")
