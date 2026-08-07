@@ -7,6 +7,9 @@ runs/
 uv.lock
 # チャレンジ限定データ(公共交通オープンデータチャレンジ)は再配布不可の可能性 → コミット禁止
 data/odpt_challenge/
+# 現実世界データの取得結果(RW-U1・scripts/rw_fetch/ が再取得可能)。ODPT チャレンジ枠を含み
+# 再配布不可の可能性があるためコミット禁止。取得設計は docs/research/rw-data-acquisition.md
+data/realworld/
 # 手動バックアップ(2026-07-12 フォルダ復元の源泉)はリポジトリに含めない
 shibuya　バックアップ/
 # ローカル個人設定
