@@ -25,6 +25,33 @@ def _to_min(text: str) -> int:
     return int(parts[0]) * 60 + int(parts[1])
 
 
+# 居住沿線ラベル → 路線名 の照合に要する最小の共通部分文字列長。
+# 名簿の residence_line は**居住エリアのラベル**(「二子玉川・田園都市線沿線」「杉並方面」)で
+# あって路線名ではない。路線名の核(「山手線」「東横線」「井の頭線」「田園都市線」)はこの
+# データでは 3 文字以上あり、2 文字以下の一致は事業者接頭辞(東京/東急/京王)や地名の
+# 偶然の重なりでしかない。誤った路線へ結ぶより**合併集合へ落とす**ほうが安全なので、
+# 閾値は保守側の 3 に置く(下げると偶然一致で別路線のダイヤに乗る)。
+_LINE_MATCH_MIN = 3
+
+
+def _lcs_len(a: str, b: str) -> int:
+    """最長共通**部分文字列**の長さ(連続。純関数・地名リテラルを 1 つも持たない)。"""
+    if not a or not b:
+        return 0
+    best = 0
+    prev = [0] * (len(b) + 1)
+    for i in range(1, len(a) + 1):
+        cur = [0] * (len(b) + 1)
+        ai = a[i - 1]
+        for j in range(1, len(b) + 1):
+            if ai == b[j - 1]:
+                cur[j] = prev[j - 1] + 1
+                if cur[j] > best:
+                    best = cur[j]
+        prev = cur
+    return best
+
+
 def _load_gtfs(gtfs_dir: Path, station_filters: list[str]) -> list[dict] | None:
     """GTFS から対象駅停車の路線別 始発/終電/中央間隔を再構成する(最小実装)。
 
@@ -109,6 +136,91 @@ class Transit:
         if self.suspended:                     # 運休(災害/運休の日。既定 False=通常運行=不変)
             return False
         return bool(self.lines_in_service(sim_min))
+
+    # ------------------------------------------------------------------ #
+    # 到着時刻の列挙(読み取り専用の純関数。状態を 1 バイトも変えない)
+    # ------------------------------------------------------------------ #
+    def arrivals_between(self, min_a: int, min_b: int) -> list[tuple[int, str]]:
+        """[min_a, min_b] (両端含む・**絶対** sim 分)の到着を (sim_min, 路線名) で返す。
+
+        ★分解能の正直な限界(ここを誤解すると解析が嘘になる)
+        --------------------------------------------------
+        本 class が持つダイヤは **路線ごとの (始発, 終電, 運転間隔) の 3 値だけ**で、
+        1 本 1 本の実発車時刻は**保持していない**。したがって本 helper が返すのは
+        「始発から運転間隔ぴったりで終電まで刻んだ**再構成**」であって実ダイヤの
+        コピーではない。
+
+          - file 経路(data/transit_shibuya.json)= 公表の始発/終電/日中間隔からの近似
+            (ファイルの meta.note に明記済み)。朝ラッシュの短縮間隔は入っていない。
+          - gtfs 経路(_load_gtfs)も同じ: 実発車時刻を読んだ**後で** first / last /
+            **中央値** headway の 3 値へ畳んでいる。つまり GTFS を入れても本 helper の
+            分解能は「等間隔の再構成」から上がらない(実時刻列を保持する改修が要る)。
+
+        再構成は完全な決定論(乱数ゼロ・呼ぶ順に依存しない)。並びは (時刻, 路線名) の
+        辞書順で、同一分に複数路線が着くときは**路線名の昇順**が先頭に来る。
+
+        日跨ぎ: 終電は 24:36 のように 1440 を超える値で保持されている(サービス日の
+        表現)。前日のサービス日から溢れた深夜の到着も拾うため走査は 1 日前から始める。
+        """
+        a, b = int(min_a), int(min_b)
+        if b < a:
+            return []
+        out: list[tuple[int, str]] = []
+        for day in range(a // 1440 - 1, b // 1440 + 1):
+            base = day * 1440
+            for line in self.lines:
+                first, last = int(line["_first"]), int(line["_last"])
+                headway = max(1, int(line.get("headway_min", 1) or 1))
+                name = str(line["name"])
+                t = first
+                while t <= last:
+                    s = base + t
+                    if a <= s <= b:
+                        out.append((s, name))
+                    t += headway
+        out.sort()
+        return out
+
+    def line_for_residence(self, label: str) -> str | None:
+        """居住沿線ラベル → **積んでいるダイヤの路線名** / None(該当なし)。読み取り専用。
+
+        ★照合規則を正直に(ここを誤解すると『沿線別のダイヤ』が嘘になる)
+        ------------------------------------------------------------
+        名簿の `residence_line` は envpack の `residence_lines`(居住エリアのラベル)で、
+        **路線名とは別の語彙**である。実データでは
+          「二子玉川・田園都市線沿線」「横浜・東横線沿線」「下北沢・井の頭線沿線」
+          「新宿・山手線沿線」… = 路線名を**含む**ラベル
+          「杉並方面」「世田谷方面」「目黒方面」「川崎・多摩方面」= 路線を名指さないラベル
+        の 2 種が混在する。**完全一致は 1 件も成立しない**(exact match 率 0%)。
+
+        そこで規則は「最長共通**部分文字列**が `_LINE_MATCH_MIN` 文字以上なら同じ路線」。
+        同点は (一致長の降順, 路線名の昇順) で解く = 完全な決定論。「新宿・山手線沿線」は
+        内回り/外回りの両方に 3 文字一致するので**路線名の昇順で内回り**に落ちる
+        (同じ駅の同じ改札に着くので、どちらを採っても到着の物理は変わらない)。
+        該当なし(= 路線を名指さない居住ラベル)は None を返し、呼び出し側は
+        **全路線の合併集合**へ落とす(誤った路線へ結ぶより安全側)。
+
+        地名・路線名のリテラルはコード側に 1 つも持たない(比較するのは名簿の値と
+        ダイヤの値だけ)= envpack ドクトリンに従う。
+        """
+        text = str(label or "")
+        if not text:
+            return None
+        # (一致長の降順, 路線名の昇順)= sort 1 発で同点解決まで決まる
+        scored = sorted((-_lcs_len(text, str(ln["name"])), str(ln["name"]))
+                        for ln in self.lines)
+        if not scored:
+            return None
+        best_n, best_name = -scored[0][0], scored[0][1]
+        return best_name if best_n >= _LINE_MATCH_MIN else None
+
+    def arrivals_of_day(self) -> list[tuple[int, str]]:
+        """定常日の到着を **分 of day** [0, 1440) で列挙する(arrivals_between の薄い別名)。
+
+        24:36 の終電は翌 0:36 の到着として 36 分の位置に現れる(前日サービス日からの
+        折り返しを arrivals_between が拾う)= 分 of day の領域で閉じた集合になる。
+        """
+        return self.arrivals_between(0, 1439)
 
 
 class BusNetwork:

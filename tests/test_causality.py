@@ -17,6 +17,12 @@
       device_id が載る。id は名簿の閉リストの中だけ。刻んでよい cause_type は
       device/schedule/boundary に閉じている(agent / physics / natural には刻まない)。
       OFF ではスコープを開く経路が構造的に存在しない。
+  (7) **装置 id の被覆 W3**: 窓を開けられない場所(1 行ごとに装置の個体が違う /
+      窓の周りが個体の行為)に per-emit の刻印を通し、実測で -1 質量の最大種だった
+      traffic_flow・無人 serve・org_output・dwell_decision と、制度移転
+      (tax / wage / 銀行)が装置 id を名乗る。★スタッフが応対した serve と
+      乗務員の居た dwell_decision には**付けない**(あれは個体の行為)。
+      刻んでも 9 列の L1 は OFF と完全一致(観測がシムを変えない)。
 """
 from __future__ import annotations
 
@@ -589,8 +595,10 @@ def test_device_id_catalogue_is_a_closed_list():
     """装置 id の名簿は 1 箇所(society/devices.py)。形も接頭辞も閉じている。"""
     from society import devices as D
     assert set(D.PROCESS_DEVICE_IDS) == {
-        D.DEV_COMMERCE_HOURS, D.DEV_COMMERCE_PRICING, D.DEV_GOV_MAIN,
-        D.DEV_LOGISTICS_GOODS, D.DEV_OPERATOR_INFRA, D.DEV_OPERATOR_TRANSIT}
+        D.DEV_BANK_MAIN, D.DEV_COMMERCE_HOURS, D.DEV_COMMERCE_PRICING,
+        D.DEV_GOV_MAIN, D.DEV_GOV_PAYROLL, D.DEV_GOV_TAX,
+        D.DEV_LOGISTICS_GOODS, D.DEV_OPERATOR_INFRA, D.DEV_OPERATOR_TRANSIT,
+        D.DEV_TRAFFIC_AMBIENT, D.DEV_TRAFFIC_OD}
     assert list(D.PROCESS_DEVICE_IDS) == sorted(D.PROCESS_DEVICE_IDS), "並びが不定"
     for did in D.PROCESS_DEVICE_IDS:
         assert D.device_id_is_known(did), did
@@ -599,9 +607,36 @@ def test_device_id_catalogue_is_a_closed_list():
     assert D.device_id_is_known(D.faregate_device_id("n123"))
     assert D.device_id_is_known(D.signal_device_id(42))
     assert D.device_id_is_known(D.transit_operator_device_id())
+    # W3 で足した動的 id の族(":" の右が地図 / 台帳から来るので列挙できない)
+    assert D.DYNAMIC_DEVICE_PREFIXES == frozenset(
+        {"faregate", "signal", "pos", "org", "train_op"})
+    assert D.device_id_is_known(D.pos_device_id("n42")) and \
+        D.pos_device_id("n42") == "pos:n42"
+    assert D.device_id_is_known(D.org_device_id("org_7")) and \
+        D.org_device_id("org_7") == "org:org_7"
+    assert D.traffic_device_id("ambient") == D.DEV_TRAFFIC_AMBIENT
+    assert D.traffic_device_id("od") == D.DEV_TRAFFIC_OD
+    # ★接頭辞の名簿は**導出**である(手で並べた 2 つ目の名簿を作らない = 腐らない)
+    assert D.DEVICE_ID_PREFIXES == (
+        {d.split(":")[0] for d in D.PROCESS_DEVICE_IDS} | D.DYNAMIC_DEVICE_PREFIXES)
     # 名簿に無い形は**検出できる**(捏造の検出器。禁止ではない)
     assert D.device_id_is_known("mystery:1") is False
     assert D.device_id_is_known("gov") is False and D.device_id_is_known("") is False
+
+
+def _known_ids(sim):
+    """ランに現れた device_id(名簿の形をしていることまで確かめる)。"""
+    from society import devices as D
+    ids = {e.device_id for e in sim.logger.events if e.device_id is not None}
+    assert all(D.device_id_is_known(i) for i in ids), sorted(ids)
+    return ids
+
+
+def _in_catalogue(device_id) -> bool:
+    """静的名簿の id か、動的 id の族(接頭辞が閉リストの中)か。"""
+    from society import devices as D
+    return (device_id in set(D.PROCESS_DEVICE_IDS)
+            or str(device_id).partition(":")[0] in D.DYNAMIC_DEVICE_PREFIXES)
 
 
 def test_on_process_scopes_stamp_their_device_id(tmp_path):
@@ -619,13 +654,11 @@ def test_on_process_scopes_stamp_their_device_id(tmp_path):
 
 def test_on_stamped_ids_are_all_in_the_catalogue(tmp_path):
     """ランに現れた device_id は 1 つ残らず名簿の中(未知の id を作っていない)。"""
-    from society import devices as D
     sim = _process_run(tmp_path, "cz_dev_closed")
-    ids = {e.device_id for e in sim.logger.events if e.device_id is not None}
+    ids = _known_ids(sim)
     assert ids, "検収の空回り(1 件も刻まれていない)"
-    assert all(D.device_id_is_known(i) for i in ids), sorted(ids)
-    assert ids <= set(D.PROCESS_DEVICE_IDS), \
-        f"世界プロセス以外の id が出た: {sorted(ids - set(D.PROCESS_DEVICE_IDS))}"
+    assert all(_in_catalogue(i) for i in ids), \
+        f"名簿にも動的 id の族にも無い id が出た: {sorted(i for i in ids if not _in_catalogue(i))}"
 
 
 def test_on_device_causes_have_no_actor(tmp_path):
@@ -704,7 +737,7 @@ def test_analyze_reports_device_breakdown(tmp_path):
     assert dev["n_stamped"] == sum(1 for e in sim.logger.events
                                    if e.device_id is not None) > 0
     assert dev["unknown_device_ids"] == {}
-    assert set(dev["per_device"]) <= set(D.PROCESS_DEVICE_IDS)
+    assert all(_in_catalogue(i) for i in dev["per_device"])
     assert dev["by_kind"]["public_budget"] == {D.DEV_GOV_MAIN: 3}
     assert sum(dev["per_device"].values()) == dev["n_stamped"]
     cv = rep["cross_validation"]
@@ -743,3 +776,291 @@ def test_analyze_still_works_on_a_w1_run_without_the_device_column(tmp_path):
     assert rep["cross_validation"]["n_cause_mismatch"] == 0
     md = ac.render_markdown(rep)
     assert "device_id` 列が無い" in md
+
+
+# --------------------------------------------------------------------------- #
+# (7) 装置 id の被覆(検収基準 7・W3)= 窓を開けられない場所の per-emit 刻印
+# --------------------------------------------------------------------------- #
+#: 経済・商業・行政・銀行・接客までひととおり点火する小ラン(48 step)。
+#: 実測(probe)で traffic_flow 48 / serve 13 / org_output 8 / tax 39 /
+#: price_change 13 / interest_paid 4 が出ることを確かめた組み合わせ。
+W3 = {"agents.personas_file": "data/personas_80.json",
+      "organizations.enabled": "true",
+      "economy.enabled": "true", "economy.fixed_cost_daily": 300,
+      "economy.accounts.enabled": "true", "economy.accounts.payday_dom": 1,
+      "economy.bank.enabled": "true", "economy.bank.deposit_rate": 3.65,
+      "commerce.enabled": "true", "government.enabled": "true",
+      "work.service.enabled": "true"}
+
+
+def _w3_run(tmp_path, name, n_steps=48, **ov):
+    sim = _sim(tmp_path, name, n_steps=n_steps, **{**CAUSALITY_ON, **W3, **ov})
+    sim.run()
+    return sim
+
+
+def _serve_sim(tmp_path, name, *, staffed: bool):
+    """work.service の接客 seam を**合成配置**で 1 件だけ踏む(tests/test_work_service.py と同型)。
+
+    フルランでは「無人の応対」しか出ないので、スタッフが応対した行と無人の行を
+    同じ土俵で比べるにはこの合成配置が要る(スタッフ有無だけが違う 2 本)。
+    """
+    sim = _sim(tmp_path, name, n_steps=1, n_agents=25,
+               **{**CAUSALITY_ON, "work.service.enabled": "true"})
+    node = sim.city.pois_by_cat("food")[0]["node"]
+    x, y = sim.city.node_xy(node)
+    for a in sim.agents:                        # 誰も勤務中スタッフにならない状態から始める
+        a.work_start_min = -1
+    customer = sim.agents[0]
+    customer.node, customer.x, customer.y = node, x, y
+    if staffed:
+        staff = sim.agents[1]
+        staff.node = staff.work_node = node
+        staff.x, staff.y = x, y
+        staff.work_start_min, staff.work_end_min = 0, 1440
+    since = len(sim.logger.events)
+    sim.logger.log(Event(step=3, sim_min=700, agent_id=customer.id, kind="spend",
+                         x=x, y=y, payload={"amount": 900.0, "balance": 9100.0,
+                                            "cat": "food"}))
+    from society.engine import scheduler as _sched
+    _sched._phase_work_service(sim, 3, 700, since)
+    return sim, node
+
+
+# ---- 7-1. 背景交通(-1 質量の最大種)------------------------------------------ #
+def test_on_traffic_flow_names_its_generator(tmp_path):
+    """★実測で最大の『行為者不明』だった traffic_flow が発生器の名を持つ。"""
+    from society import devices as D
+    sim = _sim(tmp_path, "cz_w3_traffic", n_steps=12, **CAUSALITY_ON)
+    sim.run()
+    rows = _kind(sim, "traffic_flow")
+    assert rows, "検収の空回り(背景交通が 1 件も出ていない)"
+    for e in rows:
+        assert e.agent_id == -1 and e.actor_id is None   # 行為者は今も居ない(正しい)
+        assert e.cause_type == C.BOUNDARY
+        assert e.device_id == D.DEV_TRAFFIC_AMBIENT == "traffic:ambient"
+    assert sim.traffic.mode == "ambient"                  # 既定モードの実測
+    assert D.traffic_device_id("od") == "traffic:od", "od は別の装置として名乗る"
+
+
+# ---- 7-2. 無人の応対だけが店頭装置(pos)を名乗る ------------------------------ #
+def test_on_unstaffed_serve_names_the_point_of_sale(tmp_path):
+    from society import devices as D
+    sim, node = _serve_sim(tmp_path, "cz_w3_pos_un", staffed=False)
+    rows = _kind(sim, "serve")
+    assert len(rows) == 1
+    e = rows[0]
+    assert e.agent_id == -1 and e.payload["unstaffed"] is True
+    assert e.device_id == D.pos_device_id(node) == f"pos:{node}"
+    assert e.cause_type == C.DEVICE and e.actor_id is None
+
+
+def test_on_staffed_serve_stays_an_agent_act_with_no_device_id(tmp_path):
+    """★スタッフが応対した行に装置 id は**付けない**(個体の行為を装置に化けさせない)。"""
+    sim, _node = _serve_sim(tmp_path, "cz_w3_pos_staffed", staffed=True)
+    rows = _kind(sim, "serve")
+    assert len(rows) == 1
+    e = rows[0]
+    assert e.agent_id == sim.agents[1].id and "unstaffed" not in e.payload
+    assert e.device_id is None, "スタッフの応対に店頭装置の id が付いた"
+    assert e.actor_id == sim.agents[1].id      # 行為者はそのスタッフのまま
+
+
+# ---- 7-3. 会社の日次産出 ------------------------------------------------------ #
+def test_on_org_output_names_the_org(tmp_path):
+    """職場キー経路(by_org OFF)。id は payload の org と 1 対 1 = 限界の開示。"""
+    from society import devices as D
+    sim = _w3_run(tmp_path, "cz_w3_org")
+    rows = _kind(sim, "org_output")
+    assert rows, "検収の空回り(org_output が出ていない)"
+    for e in rows:
+        assert e.agent_id == -1
+        assert e.device_id == D.org_device_id(e.payload["org"])
+        assert e.device_id.startswith("org:")
+
+
+# ---- 7-4. 値付け(窓を開けてはいけない場所の実例)------------------------------ #
+def test_on_price_change_names_the_pricing_device_and_spend_stays_agent(tmp_path):
+    """★店の値付けだけに id が付き、**隣の spend(客の行為)には付かない**。"""
+    from society import devices as D
+    sim = _w3_run(tmp_path, "cz_w3_price")
+    prices = _kind(sim, "price_change")
+    assert prices, "検収の空回り(価格変動が起きていない)"
+    for e in prices:
+        assert e.device_id == D.DEV_COMMERCE_PRICING == "commerce:pricing"
+        assert e.cause_type == C.DEVICE
+    spends = _kind(sim, "spend")
+    assert spends and all(e.device_id is None and e.cause_type == C.AGENT
+                          for e in spends), "客の消費に店の装置 id が付いた"
+    # 同じ step・同じ個体で隣り合っている(= 窓を開けていたら必ず巻き込む配置)
+    keys = {(e.step, e.agent_id) for e in prices}
+    assert keys & {(e.step, e.agent_id) for e in spends}, "隣接の検収が空回り"
+
+
+# ---- 7-5. 制度移転(行政・銀行)----------------------------------------------- #
+def test_on_tax_names_the_tax_office(tmp_path):
+    """agent_id は納税者(患者)。徴収したのは徴税制度 = gov:tax。"""
+    from society import devices as D
+    sim = _w3_run(tmp_path, "cz_w3_tax")
+    rows = _kind(sim, "tax")
+    assert rows, "検収の空回り(税が 1 件も徴収されていない)"
+    for e in rows:
+        assert e.agent_id >= 0 and e.device_id == D.DEV_GOV_TAX == "gov:tax"
+
+
+def test_on_civil_wage_names_the_payroll_and_ordinary_wage_stays_unstamped(tmp_path):
+    """公務員給与だけが gov:payroll。雇い主が emit 点に無い賃金は**無印のまま**。"""
+    from society import devices as D
+    from society.engine import scheduler as _sched
+    sim = _sim(tmp_path, "cz_w3_payroll", n_steps=1,
+               **{**CAUSALITY_ON, "economy.enabled": "true",
+                  "government.enabled": "true"})
+    for a in sim.agents[:2]:
+        a.occupation = "区職員"
+    _sched._phase_government(sim, 0, 0)             # 基準日(記録なし)
+    _sched._phase_government(sim, 1, 1440)          # 日境界 → ペイロール
+    civil = [e for e in _kind(sim, "wage") if e.payload.get("source") == "civil"]
+    assert civil, "検収の空回り(公務員給与が出ていない)"
+    for e in civil:
+        assert e.device_id == D.DEV_GOV_PAYROLL == "gov:payroll"
+    # 本業/バイトの賃金は雇い主が emit 点に無い = 刻まない(欠測を偽の id で埋めない)
+    plain = _sim(tmp_path, "cz_w3_wage_plain", n_steps=24,
+                 **{**CAUSALITY_ON, "economy.enabled": "true"})
+    plain.run()
+    ordinary = [e for e in _kind(plain, "wage")
+                if e.payload.get("source") != "civil"]
+    assert ordinary, "検収の空回り(賃金が 1 件も出ていない)"
+    assert all(e.device_id is None for e in ordinary)
+
+
+def test_on_bank_rows_name_the_bank(tmp_path):
+    """融資・返済・利息はすべて bank:main(agent_id は借り手 / 預金者 = 患者)。"""
+    from society import devices as D
+    from society.engine import scheduler as _sched
+    sim = _sim(tmp_path, "cz_w3_bank", n_steps=1,
+               **{**CAUSALITY_ON, "economy.enabled": "true",
+                  "economy.accounts.enabled": "true",
+                  "economy.bank.enabled": "true",
+                  "economy.bank.deposit_rate": 3.65})
+    a = next(x for x in sim.agents if not x.visitor)
+    a.period_income, a.account, a.money, a.arrears_days = 300000.0, 1000.0, 500.0, 0
+    assert _sched._maybe_loan(sim, a, 20000.0, 0, 600) > 0.0, "検収の空回り(融資が下りない)"
+    sim._bank_day = -1
+    a.account = 100000.0
+    _sched._phase_bank_day(sim, 1, 1440 * 40)
+    rows = _kind(sim, "loan_grant") + _kind(sim, "loan_repay")
+    assert len(rows) >= 2, "検収の空回り(融資 / 返済が揃っていない)"
+    for e in rows:
+        assert e.agent_id == a.id and e.device_id == D.DEV_BANK_MAIN == "bank:main"
+    # 預金利息もフルランで同じ id を名乗る
+    full = _w3_run(tmp_path, "cz_w3_interest")
+    itr = _kind(full, "interest_paid")
+    assert itr and all(e.device_id == D.DEV_BANK_MAIN for e in itr)
+
+
+# ---- 7-6. 乗務員不在のドア閉判断(payload → 列)-------------------------------- #
+def test_on_unstaffed_dwell_decision_names_the_train_operator(tmp_path):
+    """``payload["operator"]`` と**同じ文字列**が device_id 列に出る(後方互換つき)。"""
+    from society import transit_staff as TS
+    sim = _sim(tmp_path, "cz_w3_dwell", n_steps=1, n_agents=20,
+               **{**CAUSALITY_ON, "transit_staff.enabled": "true",
+                  "env.feedback.enabled": "true",
+                  "env.feedback.log_every_steps": "1",
+                  "env.feedback.transit.platform_threshold": "1"})
+    station = sim.city.station_node
+    for a in sim.agents:                                 # 合成高負荷(乗務員は 1 人も居ない)
+        a.loc, a.node, a.sleeping, a.route = "street", station, False, []
+        a.x, a.y = sim.city.node_xy(station)
+    sim_min = next(m for m in range(0, 1440, 10) if sim.transit.has_service(m))
+    assert TS.on_duty_crew(sim, sim_min) is None
+    TS.phase(sim, 0, sim_min, len(sim.logger.events))
+    rows = _kind(sim, "dwell_decision")
+    assert len(rows) == 1 and rows[0].agent_id == -1
+    e = rows[0]
+    assert e.device_id == TS.operator_device_id(station) == e.payload["operator"]
+    assert e.device_id.startswith("train_op:")
+
+
+# ---- 7-7. 見送った種(関係のダイナミクスは装置ではない)------------------------ #
+def test_on_relational_kinds_are_deliberately_unstamped(tmp_path):
+    """★``reputation_update`` / ``relation_tier`` / ``rent`` に装置 id を作らない。
+
+    どれも cause_type=device だが「それを管理する機関」が世界に居ない(関係は 2 人の
+    あいだの状態・家主は rest-of-world)。id を作れば存在しない制度を捏造することになる。
+    理由は observer/causality.py の見送り表に書いてある。
+    """
+    sim = _w3_run(tmp_path, "cz_w3_skip", **{"relations.enabled": "true"})
+    seen = set()
+    for e in sim.logger.events:
+        if e.kind in ("reputation_update", "relation_tier", "relation_break",
+                      "partner_formed", "rent"):
+            seen.add(e.kind)
+            assert e.device_id is None, f"{e.kind} に装置 id が付いた(制度の捏造)"
+    assert seen, "検収の空回り(見送り対象の種が 1 件も出ていない)"
+    src = (_ROOT / "src" / "society" / "observer" / "causality.py").read_text(
+        encoding="utf-8")
+    assert "関係のダイナミクスであって装置ではない" in src, "見送りの理由が書かれていない"
+    assert "rest-of-world" in src
+
+
+# ---- 7-8. 観測がシムを変えない / 決定論 / 名簿の閉包 --------------------------- #
+def test_on_w3_stamps_do_not_change_the_world(tmp_path):
+    """刻んでも既存 9 列の L1 は OFF と完全一致・LLM 呼数も同一。"""
+    off = _sim(tmp_path, "cz_w3_w_off", n_steps=48, **W3)
+    off.run()
+    on = _w3_run(tmp_path, "cz_w3_w_on")
+    assert _l1(off) == _l1(on)
+    assert on.llm.calls == off.llm.calls > 0
+
+
+def test_on_w3_is_deterministic(tmp_path):
+    a = _w3_run(tmp_path, "cz_w3_det_a")
+    b = _w3_run(tmp_path, "cz_w3_det_b")
+    assert _l1c(a) == _l1c(b)
+
+
+def test_on_w3_ids_are_all_in_the_catalogue(tmp_path):
+    """W3 の点火セットでも未知 id は 1 つも出ない(名簿が閉じている)。"""
+    sim = _w3_run(tmp_path, "cz_w3_closed")
+    ids = _known_ids(sim)
+    assert ids, "検収の空回り"
+    assert all(_in_catalogue(i) for i in ids), sorted(ids)
+    # W3 で狙った族が実際に出ている(空回りの検出)
+    heads = {i.partition(":")[0] for i in ids}
+    assert {"traffic", "pos", "org", "gov", "commerce"} <= heads, sorted(heads)
+
+
+def test_on_w3_never_stamps_agent_physics_or_natural(tmp_path):
+    """per-emit の刻印でも DEVICE_STAMPABLE の外には 1 件も付かない。"""
+    sim = _w3_run(tmp_path, "cz_w3_discipline")
+    for e in sim.logger.events:
+        if e.cause_type in (C.AGENT, C.PHYSICS, C.NATURAL):
+            assert e.device_id is None, f"{e.kind}({e.cause_type})に装置 id が付いた"
+
+
+def test_analyze_device_breakdown_includes_the_new_ids(tmp_path):
+    """事後解析: 突き合わせ 0 件のまま、W3 の装置が内訳に出る。"""
+    from society import devices as D
+    sim = _sim(tmp_path, "cz_w3_an", n_steps=48, **{**CAUSALITY_ON, **W3})
+    sim.run()
+    rep = ac.analyze(tmp_path / "cz_w3_an")
+    dev = rep["devices"]
+    assert dev["applicable"] is True and dev["unknown_device_ids"] == {}
+    assert dev["n_stamped"] == sum(1 for e in sim.logger.events
+                                   if e.device_id is not None) > 0
+    assert dev["by_kind"]["traffic_flow"] == {
+        D.DEV_TRAFFIC_AMBIENT: len(_kind(sim, "traffic_flow"))}
+    assert dev["by_kind"]["tax"] == {D.DEV_GOV_TAX: len(_kind(sim, "tax"))}
+    assert set(dev["by_kind"]["serve"]) == {
+        D.pos_device_id(e.payload["node"]) for e in _kind(sim, "serve")}
+    cv = rep["cross_validation"]
+    assert cv["n_cause_mismatch"] == 0 and cv["n_actor_mismatch"] == 0
+    # 接頭辞ロールアップ(W3 で足した節)と「まだ名乗れていない種」の一覧
+    assert dev["per_prefix"][D.TRAFFIC_PREFIX] == len(_kind(sim, "traffic_flow"))
+    # ★見送った/届いていない種が「まだ名乗れていない」側に正直に出る(wage の
+    #   本業経路 = 雇い主が emit 点に無い。埋めずに残したことがレポートに現れる)
+    assert "wage" in dev["stampable_without_device"]
+    assert set(dev["stampable_without_device"]) & set(dev["by_kind"]) == set()
+    md = ac.render_markdown(rep)
+    assert D.DEV_TRAFFIC_AMBIENT in md and "装置種(接頭辞)別" in md
+    assert ac.main([str(tmp_path / "cz_w3_an"), "--out", str(tmp_path / "w3.md")]) == 0

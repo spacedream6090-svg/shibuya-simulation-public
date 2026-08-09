@@ -1,6 +1,7 @@
 """シミュレーション本体: 構築(config→世界+エージェント)と実行ループ。"""
 from __future__ import annotations
 
+import bisect
 import json
 import math
 import time
@@ -123,6 +124,37 @@ def _natural_wake_step(start_tod: int, bedtime_min: int, sleep_steps: int,
         return None                                        # もう起きているべき時刻=覚醒開始
     remain = dur - since                                   # 残りの睡眠(分)。since<dur なので >=1
     return (remain + sm - 1) // sm                         # step 数へ切り上げ(>=1)
+
+
+def _snap_to_arrival(arrivals: list[tuple[int, str]],
+                     minute: int) -> tuple[int, str] | None:
+    """引かれた到着時刻を**時刻表の到着**へ量子化する(actor model Wave 3)。
+
+    境界の研究(Hänseler & Bierlaire の駅の需要モデル / SUMO の運用)が言うのは
+    「駅からの流入は**平滑ではなく列車ごとの塊(platoon)**である」ということ。
+    平滑な流入では改札の待ち行列もホームの滞留も**原理的に立たない**ので、
+    改札装置(P2)・駅員(P3a)の層が観測すべき現象そのものが消える。
+
+    規則(すべて決定論・乱数ゼロ・呼ぶ順に依存しない純関数):
+      (1) 通常 … `minute` **以上**で最も早い到着へ送る(= 次に来る電車に乗ってきた)。
+      (2) 始発前 … 最も早い到着へ**繰り下げ**る(始発待ち。lines_in_service の
+          「終電後は帰って来られない」と同じ発想の入場側)。(1) の自然な帰結でもある。
+      (3) 終電後 … 最後の到着へ**繰り上げ**る。3 規則のうちこれだけが時刻を早める
+          方向に動かす(送り先が翌サービス日になると『その日 1 日来ない』になり、
+          流入通勤者の往復が壊れるため)。
+      同着(同じ分に複数路線)は **路線名の昇順**で先頭を採る = arrivals_between が
+      (時刻, 路線名) 順に並べているので添字の先頭がそれ。
+
+    arrivals は arrivals_of_day() の並び(分 of day 昇順)。空なら None(= 呼び出し側は
+    量子化しない)。返り値 = (到着分, 路線名)。
+    """
+    if not arrivals:
+        return None
+    m = int(minute)
+    if m > arrivals[-1][0]:                 # (3) 終電後 = 最後の到着へ引き戻す
+        return arrivals[-1]
+    # (1)/(2) `("")` は任意の路線名より小さいので「時刻 >= m の先頭」を厳密に指す
+    return arrivals[bisect.bisect_left(arrivals, (m, ""))]
 
 
 class Simulation:
@@ -1319,6 +1351,69 @@ class Simulation:
         raise ValueError(f"router の子 backend '{b}' は未対応"
                          "(mock | ollama | vllm | openai_compat | anthropic)。")
 
+    def _inflow_pulse_arrivals(self) -> dict | None:
+        """駅到着のパルス量子化に使う「定常日の到着表」。既定 OFF は **None**(= 完全 no-op)。
+
+        conf: world.inflow_pulse.enabled(既定 false)。ON でも読むのは既にロード済みの
+        ダイヤ(self.transit)だけで、ファイル I/O も乱数も LLM も足さない。到着表は
+        **1 ラン 1 回**だけ組んで自身に保持し(pool の日次ローテーションが 1 体ごとに
+        呼ぶため)、以降は二分探索で引く(O(log n_arrivals) / 体)。
+        分解能の限界は Transit.arrivals_between の docstring(等間隔の再構成)に明記。
+
+        返り値 = {"all": 全路線の合併集合, "by_line": {路線名: その路線だけの到着}}。
+        **沿線別**に持つのが本質: 人は 1 本の路線に乗って来るので、量子化の相手は
+        その人の路線のダイヤであって全路線の合併ではない(合併は 9 路線 × 3〜6 分間隔で
+        ほぼ毎分に立つため、量子化しても塊が 1 つもできない = 実測済み)。
+        """
+        if hasattr(self, "_pulse_arrivals"):
+            return self._pulse_arrivals
+        table: dict | None = None
+        pcfg = self.cfg.world.get("inflow_pulse", {}) or {}
+        if bool(pcfg.get("enabled", False)):
+            allarr = self.transit.arrivals_of_day()
+            if allarr:
+                by_line: dict[str, list[tuple[int, str]]] = {}
+                for item in allarr:
+                    by_line.setdefault(item[1], []).append(item)
+                table = {"all": allarr, "by_line": by_line}
+        self._pulse_arrivals = table
+        return table
+
+    def _snap_agent_arrival(self, agent) -> None:
+        """流入通勤者 1 体の arrival_min を時刻表の到着へ量子化する(既定 OFF = 即 return)。
+
+        **冪等**(何度呼んでも結果が同じ)なので、通常の流入初期化と pool の
+        日次ローテーション(build_pool_agent)の両方から安全に呼べる: 2 回目は既に
+        ダイヤ上に乗った時刻を渡すことになり、規則(1) の「ちょうど一致」で同じ値へ戻る。
+
+        路線の決め方: 名簿の residence_line(居住エリアのラベル)を
+        Transit.line_for_residence で積んでいるダイヤの路線名へ照合し、当たればその
+        **路線のダイヤだけ**へスナップする。当たらない(路線を名指さない居住ラベル)なら
+        全路線の合併集合へ落とす(誤った路線へ結ぶより安全側)。照合規則と実データでの
+        当たり方は Transit.line_for_residence の docstring に明記。
+
+        対象は駅ゲートウェイの流入通勤者だけ。縁ゲートウェイ(徒歩流入)・非通勤者・
+        arrival_min 未設定(-1)は 1 バイトも触らない。乱数ゼロ・個体順に非依存。
+        """
+        pulse = self._inflow_pulse_arrivals()
+        if pulse is None:
+            return
+        if not getattr(agent, "commute", False) or agent.arrival_min < 0:
+            return
+        if agent.commute_gateway != "station" or not self.city.station_node:
+            return
+        line = self.transit.line_for_residence(
+            str(getattr(agent, "residence_line", "") or ""))
+        table = pulse["by_line"].get(line) if line else None
+        snapped = _snap_to_arrival(table or pulse["all"], agent.arrival_min)
+        if snapped is None:
+            return
+        # 属性は ON のときだけ生やす(改札装置と同じ流儀)。観測・検証用で世界の物理には
+        # 使わない(arrival_min が唯一の効き口)。pulse_line_src = 沿線照合の出自。
+        agent.pulse_train_min, agent.pulse_line = snapped
+        agent.pulse_line_src = "residence" if line else "union"
+        agent.arrival_min = int(snapped[0])
+
     def _init_inflow_commuters(self) -> None:
         """流入通勤者(commute=True)を朝の到着前=範囲外(loc=outside)に置き、朝の到着 step
         に既存の帰還機構(_phase_wake_and_returns)で enter_area させる。到着口は
@@ -1326,11 +1421,22 @@ class Simulation:
 
         すべて決定論(乱数を引かない=既存 stream の draw 順に影響しない)。commuter が
         居ない名簿(既定・procedural、既存 personas_40/80)では 1件も該当せず完全 no-op
-        =既定 config・既定地図での挙動バイト一致(docs/research/shibuya-inflow.md)。"""
+        =既定 config・既定地図での挙動バイト一致(docs/research/shibuya-inflow.md)。
+
+        ★駅到着のパルス量子化(world.inflow_pulse.enabled・既定 false)= actor model Wave 3。
+        ON のときだけ、**駅ゲートウェイの流入通勤者の arrival_min をその人の路線の
+        時刻表へスナップ**する(_snap_agent_arrival)。二峰分布の draw そのものには一切
+        触らない(persona 側の値・stream・消費順は 1 ビットも動かさない)= 量子化だけが
+        新しい。arrival_min は初日の return_at と、2 日目以降の
+        `_phase_wake_and_returns`(`_steps_until_tod(sim_min, arrival_min)`)の**両方**が
+        読むので、ここで 1 回書き換えれば全日がパルス化される。
+        縁ゲートウェイ(commute_gateway=="edge")は徒歩流入なので**触らない**。
+        OFF は _snap_agent_arrival が即 return = 1 体も触らない(属性すら生えない)。"""
         start_min = self.clock.start_min                 # day0 開始時刻(=07:00)
         for agent in self.agents:
             if not getattr(agent, "commute", False):
                 continue
+            self._snap_agent_arrival(agent)              # OFF は即 return(no-op)
             if agent.commute_gateway == "station" and self.city.station_node:
                 gw = self.city.station_node
             elif self.city.gateways:
@@ -1565,6 +1671,12 @@ class Simulation:
                             flat=self.flatcfg,
                             dt_min=self.dt_min)
         agent.pool_pid = pid
+        # 駅到着のパルス量子化(既定 OFF=即 return=no-op)。★pool の日次ローテーションで
+        # 途中入場する個体は _init_inflow_commuters(起動時 1 回)を通らないので、ここで
+        # 同じ純関数を通す(通さないと pool ON のランだけ流入が平滑に戻る=素材の取りこぼし。
+        # persona_pool.json は 500 record 中 145 が commute=true)。冪等なので day0 着席で
+        # 二重に呼ばれても値は動かない。
+        self._snap_agent_arrival(agent)
         # party_size(L4 来街者 record に実在=同行人数)を保持(S-R5 party の実体化が読む。無ければ None)。
         agent.party_size = record.get("party_size")
         self._init_agent_runtime(agent)

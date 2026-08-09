@@ -91,6 +91,7 @@ R1 ドクトリン
 """
 from __future__ import annotations
 
+from . import devices as devices_mod
 from . import envfeedback as envfb
 from .observer.schema import Event, register_event_kind
 
@@ -432,16 +433,23 @@ def _dwell(sim, step: int, sim_min: int, since_idx: int) -> None:
                "delay_s": round(inject * 60.0, 3), "delay_min": round(new, 3),
                "prev_min": round(prev, 3), "calibrated": bool(dcfg["calibrated"]),
                "unstaffed": crew is None}
+    operator = None
     if crew is None:
-        payload["operator"] = operator_device_id(str(station))
+        operator = operator_device_id(str(station))
+        payload["operator"] = operator          # ★payload は後方互換のため残す(過去ランと同じ読み方)
         x, y = sim.city.node_xy(station)
         agent_id = -1
     else:
         x, y = float(crew.x), float(crew.y)
         agent_id = int(crew.id)
-    sim.logger.log(Event(step=int(step), sim_min=int(sim_min), agent_id=agent_id,
-                         kind="dwell_decision", x=float(x), y=float(y),
-                         payload=payload))
+    event = Event(step=int(step), sim_min=int(sim_min), agent_id=agent_id,
+                  kind="dwell_decision", x=float(x), y=float(y), payload=payload)
+    if operator is None:
+        sim.logger.log(event)                   # 乗務員が居た回は**個体の行為**=装置 id なし
+    else:
+        # IF-F W3: 乗務員不在の回は運行装置が決めたことになっている。同じ文字列を
+        # device_id 列へ載せる(payload に埋めたままでは解析側が装置別に数えられない)。
+        devices_mod.log_device(sim, event, operator)
 
 
 def phase(sim, step: int, sim_min: int, since_idx: int = -1) -> None:

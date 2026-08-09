@@ -32,6 +32,7 @@ R1 呼数不変: どの機構も generate() を1本も足さない。営業時�
 """
 from __future__ import annotations
 
+from . import devices as devices_mod
 from .observer.schema import Event
 
 # カテゴリ別の既定営業時間 [開店時, 閉店時](24h表記。閉<=開 は翌朝までの夜間営業)。
@@ -233,10 +234,19 @@ def on_purchase(sim, agent, cat: str, base_amount: float, step: int,
         return None
     coef = price_coef(cfg, occ)
     if coef != 1.0:                                   # 動的価格(surge/セール)を記録
-        sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
-                             kind="price_change", x=agent.x, y=agent.y,
-                             payload={"poi": _poi_name(sim, agent.node, cat),
-                                      "cat": cat, "ratio": round(coef, 3)}))
+        # IF-F W3(observer.causality ON のときだけ): 値付けを決めたのは**店の側**なので
+        # device_id=commerce:pricing を刻む。agent_id は買おうとしている客(= 患者)である。
+        # ★**窓(cause_scope)ではなく per-emit の刻印**にしてある: この関数の外側で
+        #   呼び出し側が出す spend は「客が選んだ消費」= cause_type=agent であり、窓を
+        #   開けると客の行為に店の id が付く。per-emit なら price_change の 1 行だけに閉じる
+        #   (仮に窓を開けても devices.stamp / logger が DEVICE_STAMPABLE で弾くが、
+        #    二重の防御に頼らず**刻む範囲そのもの**を 1 行にしておく)。
+        devices_mod.log_device(
+            sim, Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                       kind="price_change", x=agent.x, y=agent.y,
+                       payload={"poi": _poi_name(sim, agent.node, cat),
+                                "cat": cat, "ratio": round(coef, 3)}),
+            devices_mod.DEV_COMMERCE_PRICING)
     return float(base_amount) * coef
 
 

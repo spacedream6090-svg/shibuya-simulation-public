@@ -101,12 +101,23 @@ R1 ドクトリン
 
   - 名簿は 2 段:(a)実体を持つ装置(``faregate:`` / ``signal:`` / ``operator:transit``)と
     (b)まだ ``Device`` 実体を持たない**世界プロセス**(``logistics:`` / ``commerce:`` /
-    ``gov:`` / ``operator:infra``)。**分けてあるのは正直さのため**で、(b)は次の波で
-    昇格させる順序表そのものである。
+    ``gov:`` / ``bank:`` / ``traffic:`` / ``operator:infra``)。**分けてあるのは正直さの
+    ため**で、(b)は次の波で昇格させる順序表そのものである。
   - スコープは ``observer.causality`` だけを見る(装置層 OFF のランでも同一性は刻める)。
     **既定 OFF は割り当てゼロ・logger 呼びゼロ**(``NO_SCOPE`` singleton)。
   - 刻んでよい cause_type は ``observer/causality.DEVICE_STAMPABLE`` で閉じてある
     (装置の窓の中で出ても、agent / physics / natural はその装置の作った出来事ではない)。
+
+W3(被覆の穴埋め)で足した口は **per-emit の刻印**(``stamp`` / ``log_device``)である。
+窓(スコープ)が使えない場所が 2 種類あるため:
+
+  1. **1 行ごとに装置の個体が違う**(``pos:<ノード>`` の無人応対・``org:<id>`` の日次産出・
+     ``train_op:<駅ノード>`` の乗務員不在ドア閉)。窓は 1 台ぶんしか立てられない。
+  2. **窓の周りが個体の行為**(購入 seam の値付け)。``spend`` は客が選んだ消費で、
+     店が決めたのは ``price_change`` だけである。窓を開けると客の行為に店の id が付く。
+
+per-emit 側も ``DEVICE_STAMPABLE`` を通す(``stamp`` の中で 1 度だけ検査する)ので、
+呼び出し点が誤って agent の行へ装置 id を渡しても**構造的に刻まれない**。
   - ``TransitOperator`` は「台風が電車を止める」を「台風を見た**事業者が止めると決める**」
     へ直す δ_ext の shim である(計算は素通し = ビット同値)。
 
@@ -147,6 +158,11 @@ AUDIT_MAX = 64
 FAREGATE_PREFIX = "faregate"
 SIGNAL_PREFIX = "signal"
 OPERATOR_PREFIX = "operator"          # 事業者(運行・供給)= 判断する装置
+TRAFFIC_PREFIX = "traffic"            # 背景交通(エージェントではない通過車両の発生器)
+POS_PREFIX = "pos"                    # 店頭の販売時点(point of sale)= 無人でも応対する側
+ORG_PREFIX = "org"                    # 会社そのもの(産出・給与の主体)
+BANK_PREFIX = "bank"                  # 銀行(与信・返済回収・利息)
+TRAIN_OP_PREFIX = "train_op"          # 運行装置(乗務員不在時のドア閉判断。transit_staff.py)
 
 # =========================================================================== #
 # 装置 id の**閉じた名簿**(IF-F W2: 因果台帳に装置の同一性を載せるための唯一の源)
@@ -156,32 +172,50 @@ OPERATOR_PREFIX = "operator"          # 事業者(運行・供給)= 判断する
 #   (a) **実体を持つ装置**の id … 地図データから導く(`faregate:<駅ノード>` /
 #       `signal:<交差点id>` / `operator:transit`)。`DeviceRegistry` に居る。
 #   (b) **世界プロセスの id** … まだ `Device` 実体を持たないが、世界に作用する処理
-#       として scheduler の phase 本体が 1 つの窓として回しているもの
-#       (物流・商業・行政・供給事業者)。**正直に「実体がまだ無い」と言うために
-#       名簿を (a) と分けてある**。次の波でここを `Device` へ昇格させる順序表になる。
+#       として scheduler / commerce の本体が回しているもの(物流・商業・行政・銀行・
+#       背景交通・供給事業者)。**正直に「実体がまだ無い」と言うために名簿を (a) と
+#       分けてある**。次の波でここを `Device` へ昇格させる順序表になる。
+#       W3 で足したのは bank(与信・回収・利息)・traffic(背景交通の発生器)と、
+#       gov の細分(main = 会計の締めの窓 / tax = 徴税 / payroll = 公務員給与)である。
+#       ★gov を割ったので、行政フェーズの窓(gov:main)の中で出る tax / wage は
+#         per-emit の刻印が勝ち、「会計の締め」ではなく「徴税」「給与」だと言える。
 #
 # ★id は**安定**(ランを跨いでも・conf を変えても同じ文字列)。解析側はこの名簿だけを
 #   見て「知らない装置 id」を検出できる(scripts/analyze_causality.py §6)。
+DEV_BANK_MAIN = "bank:main"                  # 銀行(融資の実行・返済回収・貸倒・預金利息)
 DEV_LOGISTICS_GOODS = "logistics:goods"      # (s,S) レビュー + 補充トリップ到着
 DEV_COMMERCE_HOURS = "commerce:hours"        # 営業時間による店舗の開閉遷移
-DEV_COMMERCE_PRICING = "commerce:pricing"    # ★予約済み(値付けは購入 seam 側=未配線)
-DEV_GOV_MAIN = "gov:main"                    # 行政会計の締め・ペイロール・給付
+DEV_COMMERCE_PRICING = "commerce:pricing"    # 需要連動の値付け(購入 seam の価格係数)
+DEV_GOV_MAIN = "gov:main"                    # 行政会計の締め・給付(日次の窓そのもの)
+DEV_GOV_TAX = "gov:tax"                      # 徴税(源泉徴収・消費税の計上)
+DEV_GOV_PAYROLL = "gov:payroll"              # 公務員給与(予算 fund_level からの歳出)
 DEV_OPERATOR_TRANSIT = "operator:transit"    # 運行事業者(遅延/運休の判断)
 DEV_OPERATOR_INFRA = "operator:infra"        # 供給事業者(停電/通信断/断水の告知)
+DEV_TRAFFIC_AMBIENT = "traffic:ambient"      # 背景交通(周期的フローの集約発生器)
+DEV_TRAFFIC_OD = "traffic:od"                # 背景交通(車を個体化した OD 走行)
 
 #: 世界プロセスの id(上記 (b))。**この並びが唯一の列挙**(テストが閉リストにする)。
+#: 昇順で並べる(解析レポートの列順が名簿の並びに依存しないことの担保)。
 PROCESS_DEVICE_IDS: tuple[str, ...] = (
-    DEV_COMMERCE_HOURS, DEV_COMMERCE_PRICING, DEV_GOV_MAIN,
-    DEV_LOGISTICS_GOODS, DEV_OPERATOR_INFRA, DEV_OPERATOR_TRANSIT)
+    DEV_BANK_MAIN, DEV_COMMERCE_HOURS, DEV_COMMERCE_PRICING,
+    DEV_GOV_MAIN, DEV_GOV_PAYROLL, DEV_GOV_TAX,
+    DEV_LOGISTICS_GOODS, DEV_OPERATOR_INFRA, DEV_OPERATOR_TRANSIT,
+    DEV_TRAFFIC_AMBIENT, DEV_TRAFFIC_OD)
 
-#: 装置 id の接頭辞の閉リスト((a) の動的 id も含めてここで閉じる)。
-#: ``train_op`` は別の feature module(``src/society/transit_staff.py``)が宣言している
-#: 運行装置 id(乗務員不在時のドア閉判断の記録主体)である。**まだ device_id 列へは
-#: 流れていない**(あちらは payload["operator"] に置いている)が、名簿は世界に 1 つで
-#: なければ意味が無いのでここに載せる = 後で流れ始めても未知 id 扱いにならない。
+#: **動的 id の族**(":" の右が地図 / 台帳 / 名簿から来るので事前に列挙できない)。
+#: 列挙できない = 名簿に書けない、ではない: **接頭辞のほうを閉じる**ことで
+#: 「知らない装置種が L1 に出た」は検出できる(解析 §6 の未知 id 検出)。
+#:   ``faregate:<駅ノード>`` / ``signal:<交差点id>`` … 実体を持つ装置(DeviceRegistry)
+#:   ``pos:<ノード>``   … 店頭の販売時点。**スタッフ不在の応対**を出した側(scheduler)
+#:   ``org:<org_id か職場キー>`` … 会社の日次産出(scheduler の org 締め)
+#:   ``train_op:<駅ノード>`` … 乗務員不在のドア閉判断(transit_staff.py が宣言)
+DYNAMIC_DEVICE_PREFIXES: frozenset[str] = frozenset(
+    {FAREGATE_PREFIX, SIGNAL_PREFIX, POS_PREFIX, ORG_PREFIX, TRAIN_OP_PREFIX})
+
+#: 装置 id の接頭辞の閉リスト。**世界プロセス id の頭 + 動的 id の族**から導出する
+#: (手で並べた 2 つ目の名簿を作らない = 片方だけ更新して腐る事故を構造的に潰す)。
 DEVICE_ID_PREFIXES: frozenset[str] = frozenset(
-    {FAREGATE_PREFIX, SIGNAL_PREFIX, OPERATOR_PREFIX, "commerce", "gov",
-     "logistics", "train_op"})
+    {did.partition(":")[0] for did in PROCESS_DEVICE_IDS}) | DYNAMIC_DEVICE_PREFIXES
 
 
 def device_id_is_known(device_id) -> bool:
@@ -193,6 +227,66 @@ def device_id_is_known(device_id) -> bool:
     text = str(device_id or "")
     head, sep, tail = text.partition(":")
     return bool(sep) and bool(tail) and head in DEVICE_ID_PREFIXES
+
+
+# ---- 動的 id の組み立て(**唯一の生成点**。呼び出し側で f 文字列を書かない)------- #
+def traffic_device_id(mode: str) -> str:
+    """背景交通の装置 id。``world.traffic.mode`` そのもの(ambient / od)を個体名にする。
+
+    ★``traffic:ambient`` 固定にしないのは正直さのため: od モードのランは
+      「周期的な集約フロー」ではなく「個体化した車の走行」であり、同じ id で呼ぶと
+      解析側が 2 つの別々の発生器を 1 台と数える。
+    """
+    return f"{TRAFFIC_PREFIX}:{mode}"
+
+
+def pos_device_id(node) -> str:
+    """店頭の販売時点(point of sale)の装置 id(ノード = その店の同一性)。"""
+    return f"{POS_PREFIX}:{node}"
+
+
+def org_device_id(org) -> str:
+    """会社の装置 id(``org_id``。無い経路では職場キー = work_building / work_node)。"""
+    return f"{ORG_PREFIX}:{org}"
+
+
+# =========================================================================== #
+# per-emit の刻印(スコープではなく **その 1 行だけ**)
+# --------------------------------------------------------------------------- #
+# 装置スコープ(``cause_scope``)は「窓の中で出た行を全部」刻む。窓を開けられない
+# 場所 — 1 行ごとに装置の個体が違う(``pos:<ノード>`` / ``org:<id>``)、あるいは
+# **窓の周りが個体の行為**である(購入 seam の値付け: ``spend`` は客の行為で、
+# ``price_change`` だけが店の値付け)— では窓を使ってはならない。そこで使うのが
+# この per-emit の刻印である。
+#
+# ★``DEVICE_STAMPABLE`` の検査を**この 1 関数に持たせる**のが要点:
+#   スコープ側(logger.log)と同じ線引きが per-emit 側にも構造的に効くので、
+#   呼び出し点が誤って agent / physics / natural の行に装置 id を渡しても**刻まれない**
+#   (購入 seam で ``spend`` に ``commerce:pricing`` が付く事故が原理的に起きない)。
+# =========================================================================== #
+def stamp(sim, event: Event, device_id: str) -> Event:
+    """1 件の emission へ装置 id を刻んで**その Event を返す**。
+
+    刻まない条件(どれも黙って素通し = ランを止めない):
+      - ``observer.causality`` が OFF(既定)… Event を 1 バイトも触らない
+      - 既に device_id がある(呼び出し点の明示が最優先。二重に上書きしない)
+      - その kind の cause_type が ``DEVICE_STAMPABLE`` の外(agent/physics/natural)
+    """
+    if (_causality.enabled(sim) and event.device_id is None
+            and _causality.cause_of(event.kind) in _causality.DEVICE_STAMPABLE):
+        event.device_id = str(device_id)
+    return event
+
+
+def log_device(sim, event: Event, device_id: str) -> Event:
+    """``stamp`` してから ``sim.logger.log``(呼び出し点を 1 行に保つための糖衣)。
+
+    ★イベントの**順序も内容も 1 つも変えない**: ここは log の前に列を 1 本埋めるだけで、
+      乱数も世界状態も触らない(causality OFF では ``sim.logger.log(event)`` と同一)。
+    """
+    stamp(sim, event, device_id)
+    sim.logger.log(event)
+    return event
 
 
 # =========================================================================== #
@@ -260,10 +354,9 @@ def _stamp(sim, event: Event, device_id: str) -> None:
     """自分の emission へ装置 id を**明示**する(logger の優先順位①)。
 
     ``phase`` / ``hold_exit`` の中は装置ごとに id が違うのでスコープではなく直接刻む。
-    OFF では Event を 1 バイトも触らない。
+    OFF では Event を 1 バイトも触らない(``stamp`` の別名 = 線引きは 1 箇所)。
     """
-    if _causality.enabled(sim):
-        event.device_id = str(device_id)
+    stamp(sim, event, device_id)
 
 
 # =========================================================================== #

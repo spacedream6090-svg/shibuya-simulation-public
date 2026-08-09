@@ -15,4 +15,6 @@
 """
 from __future__ import annotations
 
-__all__ = ["common", "ledger", "amedas", "wbgt", "shibuya_jinryu", "odpt_rt", "jma_xml", "cli"]
+__all__ = ["common", "ledger", "amedas", "wbgt", "shibuya_jinryu", "odpt_rt", "jma_xml", "cli",
+           # P4 境界較正の静的ソース(日次スケジューラには結線しない = 単発取得)。
+           "transport_census", "odpt_passenger_survey"]

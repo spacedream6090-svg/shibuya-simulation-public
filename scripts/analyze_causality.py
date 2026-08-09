@@ -16,7 +16,10 @@ L1 の ``agent_id`` は**行為者ではない**。「この行が誰の視点�
   3. データに現れたのに**分類表に無い kind**(= 表の穴。警告として大きく出す)
   4. **agent_id=-1 の質量ランキング**(どの種が最も多くの「行為者不明」を作っているか)
   5. **device_id 別の内訳**(W2。どの装置がどれだけの出来事を作っているか。
-     ``actor_id`` は int なので装置は名乗れない = 装置起因の行はこの列でしか所在が分からない)
+     ``actor_id`` は int なので装置は名乗れない = 装置起因の行はこの列でしか所在が分からない)。
+     W3 で **装置種(接頭辞)へのロールアップ**と、**刻めるのに 1 件も名乗っていない種**
+     の一覧を足した(前者は ``pos:<ノード>`` のような動的 id が何百も並ぶのを畳むため、
+     後者は「次にどこへ配線すべきか」を実測から出すため)
 
 を出す。②を**単一のスカラーで代表させない**のは意図的である。全 kind を混ぜた
 「帰属率 87%」のような数字は、``move_segment`` と ``health_update`` が毎 step 出る
@@ -280,14 +283,29 @@ def analyze(run_dir) -> dict:
     # 知らない id が出たら「名簿に足すべきか / 刻む側の誤りか」を人が決める材料として出す。
     unknown_devices = {d: n for d, n in sorted(per_device.items())
                        if not DEV.device_id_is_known(d)}
+    # 装置**種**(接頭辞)へのロールアップ(W3)。``pos:<ノード>`` / ``org:<id>`` のような
+    # 動的 id は個体が何百も出るので、id 別の表だけでは「どの層がどれだけ動いたか」が読めない。
+    per_prefix: dict[str, int] = {}
+    for did, n in per_device.items():
+        head = str(did).partition(":")[0] or "?"
+        per_prefix[head] = per_prefix.get(head, 0) + int(n)
+    # **刻めるのに 1 件も名乗っていない種**(= 次に配線すべき対象の一覧)。
+    # cause_type が DEVICE_STAMPABLE の中なのに device_id が 0 件の種だけを出す
+    # (agent / physics / natural はそもそも装置の出来事ではないので出さない)。
+    stampable_without_device = {
+        k: v["n"] for k, v in sorted(kinds.items(), key=lambda kv: (-kv[1]["n"], kv[0]))
+        if v["cause_type"] in C.DEVICE_STAMPABLE and not v["n_device"]}
     device_report = {
         "applicable": scanned["device_column"],
         "n_stamped": sum(per_device.values()),
         "per_device": dict(sorted(per_device.items())),
+        "per_prefix": dict(sorted(per_prefix.items())),
         "by_kind": device_by_kind,
         "known_prefixes": sorted(DEV.DEVICE_ID_PREFIXES),
         "process_ids": list(DEV.PROCESS_DEVICE_IDS),
+        "dynamic_prefixes": sorted(DEV.DYNAMIC_DEVICE_PREFIXES),
         "unknown_device_ids": unknown_devices,
+        "stampable_without_device": stampable_without_device,
     }
 
     return {
@@ -454,6 +472,17 @@ def render_markdown(rep: dict) -> str:
         L.append(f"> 刻印のある行: **{dev['n_stamped']:,}** 件 / 名簿の源: "
                  "`src/society/devices.py`")
         L.append("")
+        # ---- 装置**種**へのロールアップを先に出す(動的 id は個体が多いため)---- #
+        L.append("**装置種(接頭辞)別**"
+                 f"(動的 id の族 = {', '.join('`' + p + '`' for p in dev['dynamic_prefixes'])}):")
+        L.append("")
+        L.append("| 装置種 | 件数 | 個体数 |")
+        L.append("|---|---:|---:|")
+        for head, n in sorted(dev["per_prefix"].items(), key=lambda kv: (-kv[1], kv[0])):
+            n_ind = sum(1 for d in dev["per_device"]
+                        if str(d).partition(":")[0] == head)
+            L.append(f"| `{head}` | {n:,} | {n_ind:,} |")
+        L.append("")
         L.append("| device_id | 件数 | 内訳(kind) |")
         L.append("|---|---:|---|")
         for did, n in sorted(dev["per_device"].items(), key=lambda kv: (-kv[1], kv[0])):
@@ -462,6 +491,21 @@ def render_markdown(rep: dict) -> str:
             L.append(f"| `{did}` | {n:,} | "
                      + " / ".join(f"`{k}` {v:,}" for k, v in parts[:6])
                      + (" / …" if len(parts) > 6 else "") + " |")
+        L.append("")
+        # ---- 刻めるのに名乗っていない種 = 次に配線すべき対象 ---- #
+        gap = dev["stampable_without_device"]
+        L.append("**刻めるのに装置 id が 1 件も無い種**(cause_type が device/schedule/"
+                 "boundary なのに名乗っていない = 次に配線する候補):")
+        L.append("")
+        if gap:
+            L.append("| kind | 件数 |")
+            L.append("|---|---:|")
+            for k, n in list(gap.items())[:20]:
+                L.append(f"| `{k}` | {n:,} |")
+            if len(gap) > 20:
+                L.append(f"| … | 残り {len(gap) - 20} 種は JSON 側 |")
+        else:
+            L.append("なし(刻める種はすべてどこかの装置が名乗っている)。")
         L.append("")
         if dev["unknown_device_ids"]:
             L.append("> **警告: 名簿に無い装置 id。** `society/devices.py` の"

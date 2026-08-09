@@ -458,16 +458,41 @@ def test_on_envfeedback_gate_rule_is_not_double_applied(tmp_path):
     assert st_on["n_transit"] >= 0 and "delay_min" in st_on
 
 
-def test_scheduler_seams_are_gated_and_minimal():
-    """scheduler の seam は「gated な 6 行」だけ(_apply には 1 バイトも触れない)。
+#: scheduler が使ってよい ``devices_mod.<名前>`` の**閉じた台帳**(名前 → 出現回数)。
+#: 数を書くのは「気付かないうちに seam が増えた」を落とすため。増やすときは
+#: ここを直す = レビューで必ず目に入る(第100 IF-F の seam 規約)。
+_SCHEDULER_DEVICE_USES: dict[str, int] = {
+    # ---- (1) 世界に効く 3 行(装置層 world.devices が ON のときだけ挙動が変わる)----
+    "phase": 1, "hold_exit": 1, "pending_exits": 1,
+    # ---- (2) IF-F W2 の装置スコープ(商業 / 物流 / 行政の phase 本体)= 観測のみ ----
+    "cause_scope": 3,
+    "DEV_COMMERCE_HOURS": 1, "DEV_LOGISTICS_GOODS": 1, "DEV_GOV_MAIN": 1,
+    # ---- (3) IF-F W3 の per-emit 刻印 = 観測のみ(1 行ごとに装置の個体が違う所)----
+    #   traffic_flow / serve(無人)/ org_output×2 / tax / wage / loan_grant /
+    #   loan_repay×3 / interest_paid の 11 箇所
+    "log_device": 11,
+    "traffic_device_id": 1, "pos_device_id": 1, "org_device_id": 3,
+    "DEV_GOV_TAX": 1, "DEV_GOV_PAYROLL": 1, "DEV_BANK_MAIN": 5,
+}
 
-    内訳: 装置層の 3 行(phase / hold_exit / pending_exits)+ IF-F W2 の装置スコープ
-    3 行(商業 / 物流 / 行政の phase 本体)。スコープ行は `devices_mod.` を 2 回
-    含む(関数 + 定数)ので、部分文字列の出現数は 3 + 3×2 = 9 になる。
+
+def test_scheduler_seams_are_gated_and_minimal():
+    """scheduler の seam は**台帳に載っているものだけ**(_apply には 1 バイトも触れない)。
+
+    ★W3 で足したのは per-emit の刻印(``log_device``)だけで、**世界に効く行は 3 行のまま**
+      (phase / hold_exit / pending_exits)。観測が増えても世界に効く口は増えない、が要点。
     """
+    import re
     src = (REPO / "src" / "society" / "engine" / "scheduler.py").read_text(
         encoding="utf-8")
-    assert src.count("devices_mod.") == 9
+    tally: dict[str, int] = {}
+    for name in re.findall(r"devices_mod\.(\w+)", src):
+        tally[name] = tally.get(name, 0) + 1
+    assert tally == _SCHEDULER_DEVICE_USES, \
+        f"seam 台帳とのずれ: {sorted(set(tally.items()) ^ set(_SCHEDULER_DEVICE_USES.items()))}"
+    # ★世界に効く行は 3 行のまま(観測の追加が世界の口を増やしていない)
+    assert sum(_SCHEDULER_DEVICE_USES[k]
+               for k in ("phase", "hold_exit", "pending_exits")) == 3
     assert "from .. import devices as devices_mod" in src
     assert "devices_mod.phase(sim, step, sim_min)" in src
     assert "if via_station and devices_mod.hold_exit(sim, agent, step, sim_min):" in src
@@ -722,6 +747,83 @@ def test_causality_off_leaves_every_device_id_none(tmp_path):
                **{**ON, **DISASTER_ON})
     assert all(e.device_id is None for e in sim.logger.events)
     assert sim.logger.cause_device() is None
+
+
+# =========================================================================== #
+# (H-2) per-emit の刻印(IF-F W3)= 窓を開けられない場所のための口
+# =========================================================================== #
+def _mk_event(kind, agent_id=-1):
+    from society.observer.schema import Event
+    return Event(step=0, sim_min=0, agent_id=agent_id, kind=kind, x=0.0, y=0.0,
+                 payload={})
+
+
+def test_stamp_is_a_no_op_when_causality_is_off(tmp_path):
+    """既定(causality OFF)では ``stamp`` が Event を 1 バイトも触らない。"""
+    sim = _sim(tmp_path, "dev_w3_off", n_steps=1)
+    ev = _mk_event("traffic_flow")
+    assert D.stamp(sim, ev, D.DEV_TRAFFIC_AMBIENT) is ev
+    assert ev.device_id is None
+
+
+def test_stamp_refuses_agent_physics_and_natural_rows(tmp_path):
+    """★per-emit の刻印も ``DEVICE_STAMPABLE`` を通る(呼び出し点の誤りを構造で潰す)。
+
+    購入 seam で ``spend``(agent)に店の id が付く事故が原理的に起きないことの機械固定。
+    """
+    from society.observer import causality as C
+    sim = _sim(tmp_path, "dev_w3_guard", n_steps=1, **CAUSALITY_ON)
+    for kind in ("spend", "state_update", "weather", "move_segment"):
+        assert C.CAUSE_OF_KIND[kind] not in C.DEVICE_STAMPABLE
+        ev = _mk_event(kind, agent_id=1)
+        D.stamp(sim, ev, D.DEV_COMMERCE_PRICING)
+        assert ev.device_id is None, f"{kind}({C.CAUSE_OF_KIND[kind]})に装置 id が付いた"
+    for kind in ("price_change", "traffic_flow", "serve"):   # device / boundary
+        assert C.CAUSE_OF_KIND[kind] in C.DEVICE_STAMPABLE
+        ev = _mk_event(kind, agent_id=1)
+        D.stamp(sim, ev, D.DEV_COMMERCE_PRICING)
+        assert ev.device_id == D.DEV_COMMERCE_PRICING
+
+
+def test_stamp_never_overwrites_an_explicit_id(tmp_path):
+    """呼び出し点が既に名乗っていたら上書きしない(優先順位①を壊さない)。"""
+    sim = _sim(tmp_path, "dev_w3_prio", n_steps=1, **CAUSALITY_ON)
+    ev = _mk_event("traffic_flow")
+    ev.device_id = D.DEV_TRAFFIC_OD
+    D.stamp(sim, ev, D.DEV_TRAFFIC_AMBIENT)
+    assert ev.device_id == D.DEV_TRAFFIC_OD
+
+
+def test_log_device_logs_exactly_one_event_in_order(tmp_path):
+    """``log_device`` は「刻んで log する」だけ(件数も順序も 1 つも変えない)。"""
+    sim = _sim(tmp_path, "dev_w3_log", n_steps=1, **CAUSALITY_ON)
+    n0 = len(sim.logger.events)
+    a = D.log_device(sim, _mk_event("traffic_flow"), D.DEV_TRAFFIC_AMBIENT)
+    b = D.log_device(sim, _mk_event("shop_state"), D.DEV_COMMERCE_HOURS)
+    assert len(sim.logger.events) == n0 + 2
+    assert sim.logger.events[-2] is a and sim.logger.events[-1] is b
+    assert a.device_id == D.DEV_TRAFFIC_AMBIENT and b.device_id == D.DEV_COMMERCE_HOURS
+
+
+def test_dynamic_device_ids_have_a_single_construction_point():
+    """装置 id の文字列は devices.py にしかない(呼び出し側が自前で組み立てない)。
+
+    ★``scheduler._work_group_key`` は無関係な**別の名前空間**で ``org:<id>`` という
+      同じ形の文字列を作る(会議グループのキー)。これは ``Event.device_id`` へは
+      1 度も流れないので衝突しないが、形が同じである以上ここで見張っておく:
+      device_id 列に出る org: の生成点は ``devices.org_device_id`` だけ、という不変を
+      「scheduler 側の f 文字列は 1 つ(グループキー)しかない」で固定する。
+    """
+    sched = (REPO / "src" / "society" / "engine" / "scheduler.py").read_text(
+        encoding="utf-8")
+    for needle in ('"pos:', "'pos:", '"traffic:', "'traffic:", '"bank:', "'bank:",
+                   '"gov:', "'gov:"):
+        assert needle not in sched, f"scheduler が装置 id を自前で組み立てている: {needle}"
+    assert sched.count('f"org:') == 1, "org: の f 文字列が増えた(生成点の一元化が崩れた)"
+    assert 'return f"org:{org}"' in sched, "既知の別名前空間(会議グループキー)"
+    commerce = (REPO / "src" / "society" / "commerce.py").read_text(encoding="utf-8")
+    for needle in ('"commerce:', "'commerce:"):
+        assert needle not in commerce, f"commerce が装置 id を自前で組み立てている: {needle}"
 
 
 def test_frozen_metric_spec_files_are_untouched():

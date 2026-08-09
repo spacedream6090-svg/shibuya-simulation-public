@@ -85,6 +85,30 @@ ATTRIBUTION: dict[str, dict] = {
         "attribution": "出典: 気象庁ホームページ(防災情報XML)。加工して作成。",
         "redistribution": "ok",
     },
+    "transport_census": {
+        "source_name": "国土交通省 大都市交通センサス(第12回/第13回)",
+        "source_url": "https://www.mlit.go.jp/sogoseisaku/transport/sosei_transport_tk_000007.html",
+        # mlit.go.jp/link.html(2026-08-10 実取得)= PDL1.0。e-Stat 側は政府標準利用規約(第2.0版)
+        # で「クリエイティブ・コモンズ・ライセンスの表示 4.0 国際 …と互換性があり」と明記。
+        "license": ("公共データ利用規約(第1.0版) / PDL1.0(国土交通省サイト)。"
+                    "e-Stat 配布分は政府標準利用規約(第2.0版)= CC BY 4.0 互換・商用可"),
+        "license_url": "https://www.mlit.go.jp/link.html",
+        "attribution": ("出典: 「大都市交通センサス」(国土交通省) "
+                        "https://www.mlit.go.jp/sogoseisaku/transport/sosei_transport_tk_000007.html "
+                        "を加工して作成。"),
+        "redistribution": "ok",
+    },
+    "odpt_passenger_survey": {
+        "source_name": "公共交通オープンデータセンター(ODPT) 乗降者数情報 odpt:PassengerSurvey",
+        "source_url": "https://www.odpt.org/",
+        # ckan.odpt.org のデータセット頁が名乗るライセンス名(2026-08-10 実取得)。
+        # 全文は JS 描画の頁にしか無く機械取得できないため、原文の引用は研究文書側に置かない。
+        "license": "公共交通オープンデータ基本ライセンス(出典表示義務・派生物にも継承)",
+        "license_url": "https://developer.odpt.org/terms",
+        "attribution": "本データは公共交通オープンデータセンターのデータを利用して作成。",
+        # JR東・東急・京王はチャレンジ枠 = 再配布不可の可能性(odpt_rt と同じ扱い)。
+        "redistribution": "restricted",
+    },
 }
 
 # シミュ本体が読まないことを人にも伝えるための共通注記。

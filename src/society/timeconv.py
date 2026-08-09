@@ -281,6 +281,10 @@ TABLE: tuple[tuple[str, str, str], ...] = (
     ("world.traffic.signal_cycle_s", INVARIANT, "信号周期 [秒]。物理時間なので Δt と無関係"),
     ("world.traffic.cars_per_day", INVARIANT, "台/日。per-step 化はコード側が steps_per_day で行う"),
     ("world.traffic.od_cars_per_day", INVARIANT, "同上"),
+    ("world.inflow_pulse.enabled", INVARIANT,
+     "駅到着のパルス量子化の ON/OFF(真偽値)。スナップ先は時刻表の**分 of day**であって "
+     "step ではないので Δt に依存しない(分 → step の換算は既存の clock.min_to_steps / "
+     "_steps_until_tod が Δt 込みで行う=A9/A1 の経路をそのまま通る)"),
     ("indoor.meeting.window_min", INVARIANT, "分 of day の時刻帯。step ではない"),
     ("indoor.sfm.dt", INVARIANT, "屋内 SFM の物理積分刻み [秒]。社会レイヤー Δt と非同期(設計 §3.1)"),
     ("freedom.sat_step", INVARIANT, "自由行動 1 回あたりの充足量(出来事単位。step ではない)"),

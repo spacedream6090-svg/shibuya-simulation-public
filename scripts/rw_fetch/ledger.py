@@ -28,6 +28,9 @@ RETENTION_DAYS: dict[str, int | None] = {
     "shibuya_jinryu": None,
     "odpt_rt": 0,        # dct:valid=5分。後追い不可
     "jma_xml": 3,        # 長期フィードは「数日分」を掲載
+    # ↓ P4 境界較正の静的ソース。5年に1度/年1回の更新なので期限の概念が無い(日次対象外)。
+    "transport_census": None,
+    "odpt_passenger_survey": None,
 }
 
 # 日次実行で毎日取れているべきソース(未取得日の検出対象)。

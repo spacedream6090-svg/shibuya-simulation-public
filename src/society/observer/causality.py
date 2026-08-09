@@ -114,7 +114,40 @@ TICK_CAUSES: frozenset[str] = frozenset({PHYSICS, SCHEDULE})
 #:
 #: ★この線引きが無いと、交通事業者スコープの中で出る grievance の ``state_update`` まで
 #:   「事業者が起こした出来事」に化ける(実測: 遅延 1 回で街内人数ぶん出る)。
+#:
+#: ★W3(per-emit の刻印)でもこの集合が唯一の門番である。``society/devices.stamp`` が
+#:   刻む前にここを見るので、購入 seam で ``price_change``(device)だけが店の id を得て、
+#:   隣の ``spend``(agent)には**原理的に付かない**。
 DEVICE_STAMPABLE: frozenset[str] = frozenset({DEVICE, SCHEDULE, BOUNDARY})
+
+#: --------------------------------------------------------------------------- #
+#: **装置 id を与えない**と決めた device 系の種と、その理由(W3)
+#: --------------------------------------------------------------------------- #
+#: cause_type が ``device`` でも、「どの装置が起こしたか」を名乗れるとは限らない。
+#: 名乗れないものに id を付けると **存在しない制度を捏造する**ことになるので、
+#: 見送った種と理由をここに残す(``devices.PROCESS_DEVICE_IDS`` の裏面)。
+#:
+#:   ``reputation_update`` / ``relation_tier`` / ``relation_break`` /
+#:   ``relation_dormant`` / ``relation_rekindle`` / ``partner_formed`` /
+#:   ``gossip_*``
+#:       … **関係のダイナミクスであって装置ではない**。閾値を持つのは「2 人のあいだの
+#:         親密度」という状態そのもので、それを管理する第三者(名簿・登録所)は世界に
+#:         居ない。``relations:main`` のような id を作れば「関係を決めている機関がある」
+#:         という嘘の制度が台帳に生える。行為者が復元できないのは正しく、そこは
+#:         **payload の当事者ペア**が引き受けている(actor_of の問題であって device の
+#:         問題ではない)。
+#:   ``rent``
+#:       … 家主が**街に居ない**(IF-E2 が rest-of-world と宣言済み: 家賃の受け手は
+#:         ``row_out("rent_landlord")``)。域外の主体へ市内の装置 id を与えると、
+#:         経済台帳の RoW 宣言と因果台帳が食い違う。
+#:   ``wage`` のうち本業 / バイト / 日銭 / 退職金 / 来街者の財布補充
+#:       … 雇い主が emit 点に無い(``payer_org`` が渡らない経路)。誰が払ったか判らない
+#:         ものに ``org:?`` を作らない(欠測は欠測のまま出す)。
+#:   ``serve`` のうちスタッフが応対した行
+#:       … これは**個体の行為**である(agent_id = 応対したスタッフ)。無人の行だけが
+#:         店頭装置(``pos:<ノード>``)の応答なので、そちらにだけ id が付く。
+#:   ``dwell_decision`` のうち乗務員が居た行
+#:       … 同上(agent_id = 乗務員)。装置 id が付くのは ``unstaffed`` の行だけ。
 
 
 # --------------------------------------------------------------------------- #
@@ -209,14 +242,16 @@ CAUSE_OF_KIND: dict[str, str] = {
     "pov_image":     BOUNDARY,       # 顕著時の POV 撮影 = 観測装置(世界状態を動かさない)
 
     # ---- 経済(制度が動かす金。個体が選ぶのは「使うこと」だけ)------------------ #
-    "spend":         AGENT,
-    "wage":          DEVICE,
+    "spend":         AGENT,          # ★購入 seam で店の値付け(price_change)と隣り合うが
+                                     #  消費そのものは客の行為 = 装置 id は付かない(W3)
+    "wage":          DEVICE,         # device_id: 公務員給与=gov:payroll / 配属 org 由来=org:<id>
+                                     #  (雇い主が emit 点に無い経路は**無印**のまま = 欠測を偽らない)
     "withdraw":      DEVICE,         # 現金不足時の自動引き出し(ATM 近似)
-    "rent":          DEVICE,
-    "tax":           DEVICE,
-    "interest_paid": DEVICE,
-    "loan_grant":    DEVICE,
-    "loan_repay":    DEVICE,
+    "rent":          DEVICE,         # ★装置 id なし(家主は RoW = IF-E2 の宣言。上の見送り表)
+    "tax":           DEVICE,         # device_id=gov:tax(源泉徴収・消費税とも _log_tax 1 点)
+    "interest_paid": DEVICE,         # device_id=bank:main
+    "loan_grant":    DEVICE,         # device_id=bank:main
+    "loan_repay":    DEVICE,         # device_id=bank:main(完済/延滞/貸倒の 3 行とも)
     "vc_investment": DEVICE,
     "deposit":       DEVICE,         # 供託の拠出/返還/没収。phase=paid だけは個体発だが
                                      #  種としては行政の預り金機構なので device へ畳む(原則3)
@@ -227,12 +262,16 @@ CAUSE_OF_KIND: dict[str, str] = {
     "public_budget": DEVICE,
     "bankruptcy":    DEVICE,
     "eviction":      DEVICE,
-    "org_output":    DEVICE,
+    "org_output":    DEVICE,         # device_id=org:<org_id>(by_org 締め)/ org:<職場キー>
+                                     #  (node/building 単位の集計しか無い経路。限界を id で開示)
     "org_overdraft": DEVICE,
     "row_flow":      BOUNDARY,       # 域外(rest-of-world)との日次収支 = 枠の外の統計
     "production":    AGENT,          # 職場での産出(勤務している個体の労働)
     "study":         AGENT,
-    "serve":         DEVICE,         # 客の消費に応対を帰属させる自動処理(不在なら agent_id=-1)
+    "serve":         DEVICE,         # 客の消費に応対を帰属させる自動処理(不在なら agent_id=-1)。
+                                     #  ★不在の行だけ device_id=pos:<ノード>(店頭の販売時点が
+                                     #    応対した)。スタッフが応対した行は**個体の行為**なので
+                                     #    agent_id を残し装置 id は付けない(W3)
     "service_use":   AGENT,          # 受給側は個体の選択
     "order":         AGENT,
     "deliver":       AGENT,          # 配達員が届けた(agent_id = 配達員 = payload["courier"])
@@ -241,7 +280,8 @@ CAUSE_OF_KIND: dict[str, str] = {
     "stock_low":     DEVICE,
     "stock_out":     DEVICE,
     "b2b_trade":     DEVICE,
-    "price_change":  DEVICE,
+    "price_change":  DEVICE,         # device_id=commerce:pricing(購入 seam の per-emit 刻印。
+                                     #  隣の spend は agent なので刻まれない = W3 の線引きの実例)
     "shop_state":    DEVICE,
     "venture_open":  AGENT,
     "venture_sale":  DEVICE,         # 通行人の到着で自動発生する売上(店主は選んでいない)
@@ -333,7 +373,10 @@ CAUSE_OF_KIND: dict[str, str] = {
     "annual_event":  SCHEDULE,
     "crime":         AGENT,          # agent_id = 加害者(victim は payload)
     "nuisance":      AGENT,
-    "traffic_flow":  BOUNDARY,       # 背景交通 = エージェントではない通過車両の統計
+    "traffic_flow":  BOUNDARY,       # 背景交通 = エージェントではない通過車両の統計。
+                                     #  device_id=traffic:<mode>(ambient / od)= 発生器の同一性。
+                                     #  boundary なのに刻むのは DEVICE_STAMPABLE の定義どおり
+                                     #  (世界を動かさない観測でも、出したのはその装置である)
     "world_event":   BOUNDARY,       # シナリオイベント(実験者の注入)
     "scenario_shock": BOUNDARY,
     "chance_event":  BOUNDARY,       # 臨時収入/紛失 = 街の外から来る金(RoW)。
@@ -360,6 +403,9 @@ CAUSE_OF_KIND: dict[str, str] = {
                                      #  同じ kind が出る(payload.unstaffed)。判断そのものは
                                      #  ホーム負荷の決定論則なので原則3(迷ったら device)を適用。
                                      #  乗務員が居た回の行為者は actor_of が agent_id から戻す。
+                                     #  ★W3: 不在の回だけ device_id=train_op:<駅ノード>
+                                     #    (payload["operator"] と**同じ文字列**を列へ載せた。
+                                     #     payload は後方互換のため残す = 過去ランと同じ読み方)
     "transit_staff_bound": BOUNDARY,  # 起動時 1 回の持ち場束ね統計(workplace_bound と同型)
 }
 

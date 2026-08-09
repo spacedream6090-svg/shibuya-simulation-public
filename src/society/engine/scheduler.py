@@ -300,14 +300,17 @@ def _maybe_loan(sim, agent, need: float, step: int, sim_min: int,
     day = sim_min // 1440
     loan = bank.grant(agent.id, float(need), score, day)
     agent.account += float(need)
-    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
-                         kind="loan_grant", x=agent.x, y=agent.y,
-                         payload={"amount": round(float(need), 1),
-                                  "rate": round(loan["rate"], 4),
-                                  "term_days": loan["term_days"],
-                                  "score": round(score, 4),
-                                  "account": round(agent.account, 1),
-                                  "total_due": round(loan["total_due"], 1)}))
+    # IF-F W3: 与信を通したのは**銀行**(agent_id は借りた側 = 患者)。device_id=bank:main。
+    devices_mod.log_device(
+        sim, Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                   kind="loan_grant", x=agent.x, y=agent.y,
+                   payload={"amount": round(float(need), 1),
+                            "rate": round(loan["rate"], 4),
+                            "term_days": loan["term_days"],
+                            "score": round(score, 4),
+                            "account": round(agent.account, 1),
+                            "total_due": round(loan["total_due"], 1)}),
+        devices_mod.DEV_BANK_MAIN)
     return float(need)
 
 
@@ -315,7 +318,11 @@ def _phase_bank_day(sim, step: int, sim_min: int) -> None:
     """E-W1 融資の日次返済フェーズ(bank ON 時のみ)。loan_due の融資を repay_installment で回収し
     口座から控除(loan_repay)。完済で loans から除去。延滞が default_arrears_days に達したら
     bank.write_off + 未回収残を家賃滞納(rent_due)へ積んで既存 accounts の破産サイクルへ接続する。
-    OFF/融資なしは完全 no-op(loan_repay 0 件=バイト一致)。決定論(乱数なし)。"""
+    OFF/融資なしは完全 no-op(loan_repay 0 件=バイト一致)。決定論(乱数なし)。
+
+    IF-F W3: 回収・貸倒を決めたのは銀行なので 3 つの emit 点すべてに device_id=bank:main
+    を刻む(agent_id は返済した / できなかった個体 = 患者)。窓(cause_scope)ではなく
+    per-emit にしてあるのは、このフェーズが将来ほかの種を出したときに巻き込まないため。"""
     if not _bank_on(sim):
         return
     bank = _bank(sim)
@@ -335,31 +342,37 @@ def _phase_bank_day(sim, step: int, sim_min: int) -> None:
         if paid > 0.0:
             agent.account -= paid
             bank.receive(paid)
-            sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=aid,
-                                 kind="loan_repay", x=agent.x, y=agent.y,
-                                 payload={"amount": round(paid, 1),
-                                          "remaining": round(loan["remaining"], 1),
-                                          "account": round(agent.account, 1),
-                                          "status": status}))
+            devices_mod.log_device(
+                sim, Event(step=step, sim_min=sim_min, agent_id=aid,
+                           kind="loan_repay", x=agent.x, y=agent.y,
+                           payload={"amount": round(paid, 1),
+                                    "remaining": round(loan["remaining"], 1),
+                                    "account": round(agent.account, 1),
+                                    "status": status}),
+                devices_mod.DEV_BANK_MAIN)
             if status == "complete":
                 bank.loans.pop(aid, None)
             continue
-        sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=aid,   # 返済不能=延滞を記録
-                             kind="loan_repay", x=agent.x, y=agent.y,
-                             payload={"amount": 0.0,
-                                      "remaining": round(loan["remaining"], 1),
-                                      "account": round(agent.account, 1),
-                                      "arrears": int(loan["arrears_days"]),
-                                      "status": "arrears"}))
+        devices_mod.log_device(                          # 返済不能=延滞を記録
+            sim, Event(step=step, sim_min=sim_min, agent_id=aid,
+                       kind="loan_repay", x=agent.x, y=agent.y,
+                       payload={"amount": 0.0,
+                                "remaining": round(loan["remaining"], 1),
+                                "account": round(agent.account, 1),
+                                "arrears": int(loan["arrears_days"]),
+                                "status": "arrears"}),
+            devices_mod.DEV_BANK_MAIN)
         if economy_mod.loan_defaulted(loan, bcfg):      # 延滞閾値到達→貸倒→破産サイクルへ接続
             loss = bank.write_off(aid)
             agent.rent_due += loss                      # 未回収残を滞納へ=既存の破産処理が引き取る
-            sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=aid,
-                                 kind="loan_repay", x=agent.x, y=agent.y,
-                                 payload={"amount": 0.0, "remaining": 0.0,
-                                          "account": round(agent.account, 1),
-                                          "status": "defaulted",
-                                          "write_off": round(loss, 1)}))
+            devices_mod.log_device(
+                sim, Event(step=step, sim_min=sim_min, agent_id=aid,
+                           kind="loan_repay", x=agent.x, y=agent.y,
+                           payload={"amount": 0.0, "remaining": 0.0,
+                                    "account": round(agent.account, 1),
+                                    "status": "defaulted",
+                                    "write_off": round(loss, 1)}),
+                devices_mod.DEV_BANK_MAIN)
 
 
 def _money_median(sim) -> float:
@@ -506,11 +519,18 @@ def _log_org_output(sim, agent, step: int, sim_min: int) -> None:
 def _log_tax(sim, agent, tax: str, amount: float, to: str, base: float,
              step: int, sim_min: int) -> None:
     """税の徴収を記録(kind=tax)。所得税=income→nation / 住民税=resident→ward,metro /
-    消費税=consumption→nation(国分),metro(地方分)。base=課税の元(名目賃金 or 名目価格)。"""
-    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
-                         kind="tax", x=agent.x, y=agent.y,
-                         payload={"tax": tax, "amount": round(float(amount), 1),
-                                  "to": to, "base": round(float(base), 1)}))
+    消費税=consumption→nation(国分),metro(地方分)。base=課税の元(名目賃金 or 名目価格)。
+
+    IF-F W3: agent_id は**納税者**(= 金を取られた側 = 患者)であって行為者ではない。
+    徴収したのは徴税という制度なので device_id=gov:tax を刻む(源泉徴収も消費税も
+    この 1 関数を通るので、刻む場所は 1 箇所で足りる)。★行政フェーズ(gov:main の窓)の
+    中で出る tax もここで明示した id が勝つ = 「会計の締め」ではなく「徴税」だと言える。"""
+    devices_mod.log_device(
+        sim, Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                   kind="tax", x=agent.x, y=agent.y,
+                   payload={"tax": tax, "amount": round(float(amount), 1),
+                            "to": to, "base": round(float(base), 1)}),
+        devices_mod.DEV_GOV_TAX)
 
 
 def _withhold_wage(sim, agent, gross: float, step: int, sim_min: int) -> tuple[float, float]:
@@ -598,8 +618,19 @@ def _pay_wage(sim, agent, amount: float, step: int, sim_min: int,
         payload["tax"] = round(tax_total, 1)
     if payer is not None:                      # IF-E2(既定 OFF=キーなし): 支払側 org / RoW チャネル
         payload["payer"] = payer
-    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
-                         kind="wage", x=agent.x, y=agent.y, payload=payload))
+    # IF-F W3: agent_id は**受け取った本人**(患者)。払った主体を device_id で名乗らせる。
+    #   fund_level あり … 公務員給与 = 予算からの歳出 → gov:payroll
+    #   payer_org あり  … 配属 org の預金からの支払い → org:<org_id>
+    #   どちらも無い    … 本業/バイト/日銭/退職金/財布補充。**雇い主が emit 点に無い**ので
+    #                     刻まない(欠測を偽の id で埋めない = 名簿の正直さ)。
+    _wage_device = (devices_mod.DEV_GOV_PAYROLL if fund_level is not None
+                    else (devices_mod.org_device_id(payer_org) if payer_org else None))
+    event = Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                  kind="wage", x=agent.x, y=agent.y, payload=payload)
+    if _wage_device is None:
+        sim.logger.log(event)
+    else:
+        devices_mod.log_device(sim, event, _wage_device)
 
 
 def _atm_withdraw(sim, agent, need: float, step: int, sim_min: int) -> None:
@@ -1035,6 +1066,12 @@ def _phase_wake_and_returns(sim, step: int, sim_min: int) -> None:
             # (定型文=場所と予定時刻の純関数・LLM ゼロ・乱数ゼロ)。
             payload = {"gateway": agent.return_gateway,
                        "via": "train" if via_station else "walk"}
+            # 駅到着のパルス量子化(world.inflow_pulse。既定 OFF は属性自体が生えない
+            # =この 2 行を通らない=payload バイト一致)。どの列車で来たかを L1 に残す
+            # (新しい kind は 1 つも足さない = 既存 enter_area への追記のみ)。
+            if hasattr(agent, "pulse_train_min"):
+                payload.update({"train_min": agent.pulse_train_min,
+                                "line": agent.pulse_line})
             bnd = boundary_mod.on_return(sim, agent, step, sim_min)
             if bnd is not None:
                 payload.update(bnd)
@@ -1265,6 +1302,10 @@ def _phase_traffic(sim, step: int, sim_min: int) -> None:
 
     world.traffic.mode=od のとき、車を個体化した OD 走行に切り替える(1度だけ遅延設定)。
     既定 ambient は現行と完全同一(payload の n/total/segs も不変。log_extra() は空を返す)。
+
+    IF-F W3: 背景交通は**エージェントではない車の発生器**なので、causality ON のときだけ
+    device_id=traffic:<mode> を刻む(ambient / od は別の装置 = 同じ id で呼ばない)。
+    これが無いと traffic_flow は「1 step に 1 件・行為者不明」で -1 質量の最大種に居座る。
     """
     sim.traffic.ensure_mode(sim.cfg)
     segs = sim.traffic.step(step, sim_min)
@@ -1273,8 +1314,10 @@ def _phase_traffic(sim, step: int, sim_min: int) -> None:
     payload = {"n": len(segs), "total": sim.traffic.total_spawned,
                "segs": [s["pts"] for s in segs[:sim.traffic.max_log]]}
     payload.update(sim.traffic.log_extra())    # ambient={} / od={mode, cars}
-    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
-                         kind="traffic_flow", x=0.0, y=0.0, payload=payload))
+    devices_mod.log_device(
+        sim, Event(step=step, sim_min=sim_min, agent_id=-1,
+                   kind="traffic_flow", x=0.0, y=0.0, payload=payload),
+        devices_mod.traffic_device_id(sim.traffic.mode))
 
 
 # ---------------------------------------------------------------- 共通: 聴取
@@ -1795,11 +1838,15 @@ def _emit_org_day(sim, step: int, sim_min: int, day: int) -> list:
                      if sim.agent_by_id.get(w) is not None else base_w)
                     for w in sorted(workers)), 3)
                 basis = "headcount"
-            sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
-                                 kind="org_output", x=0.0, y=0.0,
-                                 payload={"org": str(oid), "output": out,
-                                          "n": len(workers), "kind": "office",
-                                          "basis": basis, "day": int(day)}))
+            # IF-F W3: 日次産出を出したのは**その会社**なので device_id=org:<org_id>。
+            # by_org 経路は org_id が主キーなので同一性が一意に決まる(下の職場キー経路と違う)。
+            devices_mod.log_device(
+                sim, Event(step=step, sim_min=sim_min, agent_id=-1,
+                           kind="org_output", x=0.0, y=0.0,
+                           payload={"org": str(oid), "output": out,
+                                    "n": len(workers), "kind": "office",
+                                    "basis": basis, "day": int(day)}),
+                devices_mod.org_device_id(oid))
         if ledger:                                 # (b) ledger 行(いずれかの列が非0の社のみ)
             prod = int(ent["production"])
             rev = float(ent["revenue_est"])
@@ -1872,10 +1919,16 @@ def _work_office_output(sim, step: int, sim_min: int, cfg: dict) -> None:
     for key in sorted(units):
         workers = sorted(units[key], key=lambda a: a.id)
         output = round(sum(work_mod.role_weight(a, cfg) for a in workers), 3)
-        sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
-                             kind="org_output", x=0.0, y=0.0,
-                             payload={"org": str(key), "output": output,
-                                      "n": len(workers), "kind": "office"}))
+        # IF-F W3: この経路は org 台帳(by_org)が OFF のときの集計なので、持っている
+        # 同一性は**職場キー**(work_building か work_node)しかない。org:<職場キー> を
+        # 刻んで「会社そのものではなく職場単位でしか名乗れない」という限界を id で開示する
+        # (捏造しない: org_id を推測して埋めることはしない)。
+        devices_mod.log_device(
+            sim, Event(step=step, sim_min=sim_min, agent_id=-1,
+                       kind="org_output", x=0.0, y=0.0,
+                       payload={"org": str(key), "output": output,
+                                "n": len(workers), "kind": "office"}),
+            devices_mod.org_device_id(key))
 
 
 def _phase_work_service(sim, step: int, sim_min: int, since_idx: int) -> None:
@@ -1951,9 +2004,15 @@ def _phase_work_service(sim, step: int, sim_min: int, since_idx: int) -> None:
             if fields_on:
                 payload["org_id"] = u_oid          # 一意なら org_id・多義/不在は null=unknown を正直開示
                 payload["floor"] = int(getattr(customer, "floor", 0) or 0)
-            sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
-                                 kind="serve", x=customer.x, y=customer.y,
-                                 payload=payload))
+            # IF-F W3: 無人の応対は**店頭の販売時点(pos)が応じた**ことにする(agent_id=-1 の
+            # 行に所在を与える唯一の手段)。★スタッフが応対した上の分岐には装置 id を付けない
+            # = あちらは agent_id を持つ**個体の行為**であり、装置に化けさせてはならない。
+            # 個体名はノード(その店)。org_id は多義のとき null に落ちるので同一性に使えない。
+            devices_mod.log_device(
+                sim, Event(step=step, sim_min=sim_min, agent_id=-1,
+                           kind="serve", x=customer.x, y=customer.y,
+                           payload=payload),
+                devices_mod.pos_device_id(node))
             if ledger_on and u_oid:
                 _org_day_entry(sim, u_oid)["serve_count"] += 1
 
@@ -3454,10 +3513,13 @@ def _phase_daily(sim, step: int, sim_min: int) -> None:
                 # 負でも貸せる」と既に宣言しているので理論的に整合する。
                 if sfc_mod.enabled(sim):
                     _bank(sim).capital -= itr
-                sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
-                                     kind="interest_paid", x=agent.x, y=agent.y,
-                                     payload={"amount": round(itr, 2),
-                                              "balance": round(agent.account, 1)}))
+                # IF-F W3: 利息を付けたのは銀行(agent_id は受け取った預金者 = 患者)。
+                devices_mod.log_device(
+                    sim, Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                               kind="interest_paid", x=agent.x, y=agent.y,
+                               payload={"amount": round(itr, 2),
+                                        "balance": round(agent.account, 1)}),
+                    devices_mod.DEV_BANK_MAIN)
         # 固定費(光熱費・サブスク等): 家賃以外の恒常的生活圧。来街者は街の外に住居=対象外
         # (既存 rent と同じ扱い)。既定 0.0=控除ゼロ=spend イベントなし=バイト一致。
         if fixed_cost > 0.0 and not agent.visitor:
