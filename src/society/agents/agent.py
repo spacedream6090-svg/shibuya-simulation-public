@@ -183,6 +183,16 @@ class Agent:
     ind_x: float = 0.0                # 屋内ミクロ x(建物内座標 m)。OFF/屋外時は 0.0
     ind_y: float = 0.0                # 屋内ミクロ y(建物内座標 m)。OFF/屋外時は 0.0
     ind_space_type: str = ""          # 現在区画の用途型(desk/seating/... = IndoorSpace 由来)。""=未割当
+    # ---- 計画駆動の圏外滞在(actor model P4、既定 OFF=すべて中立値。cognition/plan_boundary.py)----
+    #  「勤務先が街の外にある居住者」= 朝の計画のブロックがそのまま despawn/respawn の時刻表になる。
+    #  値の真実の源は (run.seed, agent.id) の純関数(plan_boundary.designated)であり、以下は
+    #  観測・checkpoint 用の**鏡**。planning.day_plan.boundary.enabled=false では誰も書かない
+    #  =すべて中立値のまま=L1 に一切現れない(バイト一致)。読む側は常に getattr 既定つきで
+    #  読む(古い checkpoint の Agent には属性そのものが無いため)。
+    work_outside: bool = False        # 勤務先が街の外(圏外通勤)か。OFF/非該当は False
+    work_outside_gateway: str = ""    # 圏外への出入口ノード(退出も帰還もここ)。""=未指名
+    work_outside_start_min: int = -1  # 骨格計画で使う圏外勤務の開始(分 of day)。-1=未指名
+    work_outside_end_min: int = -1    # 同・終了(分 of day)。-1=未指名
 
     def remember(self, text: str, kind: str = "event",
                  importance_bonus: float = 0.0) -> None:

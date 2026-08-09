@@ -11,6 +11,11 @@
 od は「本番だけ ON」を想定(config: world.traffic.mode)。既定 ambient は挙動不変。
 このモジュールは走行の物理だけを扱い、エージェントの内部状態には一切触れない。
 乱数は必ず RngHub.stream の新規ストリームから取る(D13)。
+
+★歩車信号の同一化(world.traffic.signal_from_crossings。**既定 false = 挙動不変**)
+  od モードの車側信号を、歩行者側と**同じ交差点表**(data/crossings_shibuya.json)から
+  導くトグル。ON は od の走行を変える(= 挙動変更)。詳細と式は下の
+  「歩車信号の同一化」ブロックに全部書いてある。
 """
 from __future__ import annotations
 
@@ -38,6 +43,81 @@ def _hash_frac(text: str) -> float:
     """文字列 → [0,1) の決定論値(プロセス非依存の sha256)。信号の位相・赤率に使う。"""
     h = int.from_bytes(hashlib.sha256(text.encode("utf-8")).digest()[:6], "big")
     return (h % 100000) / 100000.0
+
+
+# =========================================================================== #
+# 歩車信号の同一化(world.traffic.signal_from_crossings。**既定 OFF = 挙動不変**)
+# --------------------------------------------------------------------------- #
+# 何を直すのか
+#   同じ交差点なのに、**車の信号**(本 module)と**歩行者の信号**(world/sfm_core の
+#   SignalGate)が別々の数字で動いていた:
+#     - 車  … 赤率 = 0.35 + 0.20 × sha256(node)、周期 = conf の定数(既定 90 秒)
+#     - 歩行者 … 交差点表(conf の crossings_file)の実測値(周期 140 秒・青 37 秒・
+#                青点滅 10 秒 = 横断可能 47 秒)
+#   つまり**同一の交差点の 2 つの現示が統計的に独立**だった。ON にすると、交差点表に
+#   居るノードの車側パラメータをその交差点自身から導く = 歩車が同じ 1 台の装置になる。
+#
+# 車の赤率の式(**この 1 行が本トグルの全て**)
+#     r = 1 − (green_s + flash_s) / cycle_s          … 例 140/37/10 → 1 − 47/140 = 0.664
+#   意味: 交差点表が持っているのは**歩行者の横断可能窓**だけである。そこから車の現示を
+#   導くには 1 つ仮定が要る。ここでは「**車の青窓は歩行者の横断可能窓と同じ長さ**」
+#   という最小の仮定(等分割)を置き、残りを赤とした。**全方向歩行者専用の現示**を持つ
+#   交差点ではこれがほぼ実態と一致する: 140 秒中 47 秒が歩行者専用(= 車は全赤)で、
+#   残り 93 秒を 2 方向が分け合う → 1 方向あたり ≈ 46.5 秒 ≈ 47 秒。★これ以上のこと
+#   (方向別のスプリット・右折分離・オフセット協調)は**データが無いので主張しない**。
+#
+# clamp の意味: [0.20, 0.80] は**壊れた表行への保険**であって調整つまみではない
+#   (green+flash > cycle のような行が来ても信号が「常に青/常に赤」にならないため)。
+#   現行の表は全 80 行が 140/37/10 なので **clamp は 1 度も効かない**(テストで固定)。
+RED_RATIO_MIN = 0.20
+RED_RATIO_MAX = 0.80
+
+
+def crossing_id_of_node(node) -> int | None:
+    """車道グラフのノード id → 交差点表の id。
+
+    どちらも**同じ OSM node id** から作られている(車道側は接頭辞 "n" 付き)ので、
+    結合は「"n" を落として int にする」だけの純関数で足りる。★座標の近傍探索は
+    **使わない**: 近いだけの別ノードを同じ信号だと言い張ることになり、地図に無い
+    同一性を捏造する(20m 以内で拾えば 42/69 本が当たるが、それは identity ではない)。
+    """
+    text = str(node)
+    body = text[1:] if text[:1] == "n" else ""
+    return int(body) if body.isdigit() else None
+
+
+def vehicle_red_ratio(cycle_s: float, green_s: float, flash_s: float) -> float:
+    """歩行者の横断可能窓 → **車の赤率**(上のコメントの式。純関数・乱数ゼロ)。"""
+    cycle = float(cycle_s)
+    if cycle <= 0.0:
+        return 0.0
+    r = 1.0 - (float(green_s) + float(flash_s)) / cycle
+    return min(RED_RATIO_MAX, max(RED_RATIO_MIN, r))
+
+
+def load_signalized_crossings(path) -> dict:
+    """交差点表 → {crossing_id: 周期パラメータ}(**信号のある行だけ**)。
+
+    信号無しの横断歩道(表の 192 行中 112 行)は cycle_s を持たないので入れない
+    (= その交差点に当たったノードは従来の hash 経路のまま = 欠測を捏造しない)。
+    """
+    p = Path(str(path)) if path else (REPO_ROOT / "data" / "crossings_shibuya.json")
+    if not p.is_absolute():
+        p = REPO_ROOT / p
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return {}
+    out: dict[int, dict] = {}
+    for row in data.get("crossings", ()):
+        if not row.get("signal") or row.get("cycle_s") is None:
+            continue
+        out[int(row["id"])] = {"cycle_s": float(row["cycle_s"]),
+                               "green_s": float(row.get("green_s", 0.0)),
+                               "flash_s": float(row.get("flash_s", 0.0))}
+    return out
 
 
 class TrafficFlow:
@@ -76,6 +156,9 @@ class TrafficFlow:
         self.total_arrived = 0              # od: 目的地/域外に到達して消えた車
         self.sum_travel_steps = 0          # od: 旅行 step の総和(平均の分子)
         self.jam_events = 0                 # od: 容量超過で減速した (車, step) 回数
+        # ---- 歩車信号の同一化(既定 OFF = **空 dict** = _signal_delay_m は従来式)----
+        self.signal_cycle_of: dict[str, float] = {}   # node → その交差点自身の周期(秒)
+        self.n_signals_unified = 0                    # 表と結合できたノード数(観測用)
 
     # ------------------------------------------------------------------ #
     # モード設定(scheduler が毎 step 呼ぶ。ambient では何もしない)
@@ -118,10 +201,34 @@ class TrafficFlow:
         #   ので、通過する車には「一様到着を仮定した期待待ち時間」を距離換算で差し引く近似。
         self.signal_red = {s["node"]: 0.35 + 0.20 * _hash_frac(s["node"])
                            for s in feat.get("signals", []) if s["node"] in dg}
+        # ★歩車信号の同一化(既定 OFF ではこの 1 行の内側に入らない = 交差点表を
+        #   読みもしない = ハッシュ経路のバイト一致)。
+        if bool(tcfg.get("signal_from_crossings", False)):
+            self._unify_signals_with_crossings(tcfg.get("crossings_file"))
         self.signal_nodes = set(self.signal_red)
         self.od_dest_nodes = self._domain_dest_nodes(dg)
         self._route_cache: dict[tuple[str, str], list[str] | None] = {}
         self.mode = "od"
+
+    def _unify_signals_with_crossings(self, crossings_file) -> None:
+        """交差点表に居るノードの赤率と周期を**その交差点自身**から導く(ON のみ)。
+
+        表に無いノード(結合できない = 交差点表に信号の記載が無い)は**そのまま**
+        hash 由来の値を使う(欠測を平均で埋めない = 捏造しない)。決定論・乱数ゼロ・
+        静的データだけの純関数なので、同じ地図なら何度組んでも同じ表になる。
+        """
+        table = load_signalized_crossings(crossings_file)
+        if not table:
+            return
+        for node in sorted(self.signal_red):
+            cid = crossing_id_of_node(node)
+            row = table.get(cid) if cid is not None else None
+            if row is None:
+                continue                       # 表に無い → hash のまま(明示の後退)
+            self.signal_red[node] = vehicle_red_ratio(
+                row["cycle_s"], row["green_s"], row["flash_s"])
+            self.signal_cycle_of[node] = float(row["cycle_s"])
+        self.n_signals_unified = len(self.signal_cycle_of)
 
     def _load_features(self, path) -> dict | None:
         p = Path(str(path)) if path else (REPO_ROOT / "data"
@@ -274,9 +381,16 @@ class TrafficFlow:
 
     def _signal_delay_m(self, node: str, speed: float) -> float:
         """信号 1 基あたりの期待遅延を距離(m)に換算。r=赤率、周期 C のとき
-        一様到着の期待待ち = r²·C/2。それを当該速度で走れた距離に読み替えて差し引く。"""
+        一様到着の期待待ち = r²·C/2。それを当該速度で走れた距離に読み替えて差し引く。
+
+        ★C は既定では conf の定数(全交差点共通)。歩車信号の同一化 ON のときだけ、
+          結合できたノードは**その交差点自身の周期**を使う(signal_cycle_of)。
+          既定は空 dict なので式も演算順も従来と 1 ビットも変わらない。"""
         r = self.signal_red.get(node, 0.0)
-        delay_s = r * r * self.signal_cycle_s * 0.5
+        cycle = self.signal_cycle_s
+        if self.signal_cycle_of:
+            cycle = self.signal_cycle_of.get(node, cycle)
+        delay_s = r * r * cycle * 0.5
         return speed * delay_s / self.step_seconds
 
     def _step_od(self, step: int, sim_min: int) -> list[dict]:

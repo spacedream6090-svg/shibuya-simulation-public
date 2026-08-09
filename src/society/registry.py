@@ -186,6 +186,62 @@ FEATURES: tuple[Feature, ...] = (
        "信号サイクル 140 秒 < 1 step 600 秒 なので**サイクルごとのイベントは出さない**"
        "(出すと L1 が信号で溢れる)。sfm_core.SignalGate の時刻計算は 1 バイトも"
        "変更していない = 足したのは交差点表由来の安定 device_id とこの要約だけ"),
+    _f("world.devices.transit_operator", "strict", False, "none",
+       "運行事業者(TransitOperator)= 運休を**決める**装置。自然事象は台風そのものだけで、"
+       "『今日は止める』は外部入力への応答(DEVS δ_ext)である。ON にすると disaster.py の"
+       "運休判定が装置の δ_ext を**素通し**で通る(計算は 1 演算も変えない = 運休する日は"
+       "ビット同値)。得られるのは DEVS 監査(自発的遷移ゼロ)と装置名簿への登録であって、"
+       "挙動の変化ではない。L1 の device_id は observer.causality 側の仕事で独立に効く"),
+    # 歩車信号の同一化(実装 src/society/world/traffic.py)。★**挙動変更トグル**。
+    # strict の根拠: 静的データ(交差点表)だけの純関数で、乱数 stream を 1 本も引かず
+    #   LLM も呼ばない(同じ地図なら何度組んでも同じ表 = 完全な決定論)。
+    # affects_k=False: generate() の呼び出し点を足しも減らしもしない。
+    # fingerprint_risk=none: プロンプトへ 1 バイトも足さない(車の走行にしか出ない)。
+    _f("world.traffic.signal_from_crossings", "strict", False, "none",
+       "od モードの**車側**信号を、歩行者側と同じ交差点表(data/crossings_shibuya.json)"
+       "から導く。既定 OFF では同じ交差点なのに車(赤率 = 0.35+0.20×sha256(node)・周期は"
+       "conf の全交差点共通の定数)と歩行者(実測 140/37/10)が**統計的に独立**に動いている。"
+       "ON では OSM node id の完全一致で結合できたノード(実測 69 本中 23 本)だけ、"
+       "赤率 r = 1 − (green_s+flash_s)/cycle_s(140/37/10 → 0.664)とその交差点自身の周期を"
+       "使う。仮定は『車の青窓 ≈ 歩行者の横断可能窓』の 1 つだけで、方向別スプリット等は"
+       "データが無いので主張しない。★これは観測ではなく**走行が変わる挙動変更**であり、"
+       "主張できるのは『同一交差点の車と歩行者が同じ 1 台の装置になる』ことに限られる。"
+       "結合できないノードは従来の hash 値のまま(欠測を埋めない)"),
+
+    # ---- 駅員・車掌 = 持ち場を持つアクター(actor model P3a。実装 src/society/transit_staff.py)----
+    # strict の根拠: 当直の選定(最小 agent id)も合成当直表(名簿順 index の純関数)も
+    #   停車時間の演算も**完全決定論**で、乱数 stream を 1 本も引かない
+    #   (module に乱数の識別子が存在しないことを tests/test_transit_staff.py が AST 固定)。
+    # affects_k=False: generate() の呼び出しサイトを 1 つも足さず・減らさない。
+    # fingerprint_risk=none: **プロンプトへ 1 バイトも足さない**(遅延は従来どおり
+    #   「動けない」という世界の事実としてしか個体に届く経路が無い)。
+    _f("transit_staff.enabled", "strict", False, "none",
+       "駅員・車掌アクター層の親トグル。監査事実『電車は実体ではなく(has_service は"
+       "時刻表の述語)、遅延を作っていたのは主体なしの近似(env.feedback 規則1)と"
+       "日次サイコロ(disaster)だけ』の穴を塞ぐ。ON では駅員/車掌/電車運転士 が"
+       "駅ノードの持ち場へ束ねられ(work.bind_workplace が no_category で束ねられずに"
+       "残していた層)、**当直の車掌のドア閉判断**が L1 dwell_decision として世界に残る。"
+       "既定 OFF は束ね 0 件・dwell_decision 0 件・属性も生えない(L1 バイト一致)"),
+    _f("transit_staff.bind.enabled", "strict", False, "none",
+       "駅員・乗務員を駅ノードの持ち場へ束ねる(決定論・冪等・resume 安全)。合成当直表は"
+       "名簿順(agent id 昇順)index の純関数で、既に勤務窓を持つ個体の窓は上書きしない。"
+       "false にすると『判断だけ動かして束ねない』対照が作れる"),
+    _f("transit_staff.dwell.enabled", "strict", False, "none",
+       "車掌のドア閉判断(ホーム負荷 → 停車時間延長 → delay_min)。ON のとき "
+       "env.feedback 規則1 は**評価されない** = 同じ物理(停車時間 → 遅延)の二重計上を"
+       "防ぐ主体つき側の優先(改札装置が規則2 を置き換えるのと同じ線引き)。式・閾値・"
+       "上限・回復運転項は規則1 と**同一の関数**を呼ぶので、既定サブフラグでは"
+       "『誰が決めるか』だけが変わり数値は 1 ビットも変わらない"),
+    _f("transit_staff.dwell.require_service", "strict", False, "none",
+       "運行が無い step(終電後・運休)は停車時間を足さない(閉めるドアが無い)。"
+       "規則1 は運行の有無を見ずに注入していたので、ここだけが意図的な差である。"
+       "false にすると規則1 と全 step で完全同値になる"),
+    _f("transit_staff.dwell.calibrated", "strict", False, "none",
+       "停車時間の係数を東京の実測則(Palmqvist/Tomii/Ochiai 2020: **+15 人/車両 ≒ "
+       "+1 秒**・通勤列車の総遅延の約 9 割が 5 分以下の停車時間超過)へ差し替える。"
+       "既定 false = env.feedback.transit.dwell_sec_per_pax(legacy の既定係数)のまま"
+       "= 既存の数値を 1 も動かさない。差し替わるのは**係数だけ**で、式・上限・"
+       "回復運転項は共有のまま"),
 
     # ---- indoor ----
     _f("indoor.enabled", "strict", False, "none",
@@ -329,6 +385,22 @@ FEATURES: tuple[Feature, ...] = (
     #   commerce / health / disaster と同型で、レジストリ冒頭の方針どおり False 側。
     # fingerprint_risk=none: **プロンプトを 1 バイトも変えない**(if_then の書式は
     #   day_plan ON なら本トグルの ON/OFF と無関係に schema_prompt へ載る)。
+    # actor model P4: 計画駆動の圏外滞在。指名(誰が圏外通勤者か)も時刻表(いつ出て
+    #   いつ帰るか)も**決定論**((run.seed, agent.id) の純関数 + ブロックの start/end)
+    #   なので strict 等級。LLM の自由文は 1 バイトも読まない(親の day_plan が組んだ
+    #   ブロックの place/start/end という**構造化された欄だけ**を見る)。
+    # affects_k=True を正直に宣言する: 圏外の個体は _phase_drive の母集団から外れるので
+    #   **その間の発火機会がゼロになる** = generate() の総数が確実に動く(間接経路ではない)。
+    # fingerprint_risk=none: プロンプトを 1 バイトも変えない(schema_prompt も朝の計画文も
+    #   本トグルの ON/OFF と無関係)。圏外に居る間はそもそも 1 呼も発行しない。
+    _f("planning.day_plan.boundary.enabled", "strict", True, "none",
+       "計画駆動の圏外滞在(actor model P4 境界)。勤務先が街の外にある居住者を決定論で"
+       "指名し、その計画の work ブロックに boundary 欄(exit/gateway/exit_min/entry_min)を"
+       "刻む。**その欄がそのまま despawn/respawn の時刻表**であり境界機構は新設しない"
+       "(退出=既存 _try_exit・帰還=既存 _phase_wake_and_returns・L1 も exit_area/enter_area を"
+       "再利用し payload に boundary='plan' を足すだけ)。圏外ではイベント 0 件・乱数 0 本・"
+       "LLM 0 呼で、帰還時に定型の圧縮記憶 1 行だけが残る。統計駆動の流入通勤者(commute)"
+       "とは別台帳(payload の boundary 欄で機械的に分離できる)"),
     _f("planning.day_plan.use_contingency", "journal", False, "none",
        "day_plan の contingency(if_then)を実行時に消費する。ブロック実行の直前に "
        "CONDS 7 種を決定論評価し(前提機構が OFF の条件は常に不成立=捏造しない)、"
@@ -722,7 +794,12 @@ FEATURES: tuple[Feature, ...] = (
        "agent_id が患者である種は payload から行為者を戻す(hear→speaker / "
        "opinion_shift→source / transmission→from)。復元できないものは null で正直に"
        "開示する。分類は静的表なので事後解析は**この列が無い既存ランでも**同じ分類ができ、"
-       "列があるランでは表とエンジンの刻印を突き合わせて食い違いを報告する"),
+       "列があるランでは表とエンジンの刻印を突き合わせて食い違いを報告する。"
+       "W2 で 3 列目 device_id(装置の同一性。faregate:<駅> / signal:<交差点> / "
+       "logistics:goods / commerce:hours / gov:main / operator:transit)を足した: "
+       "actor_id は int(個体)なので装置は名乗れず、装置起因の行が『行為者不明』に"
+       "落ちていた。刻んでよい cause_type は device/schedule/boundary に閉じてある"
+       "(装置の窓の中で出ても agent/physics/natural はその装置の作った出来事ではない)"),
     _f("observer.llm_health.enabled", "strict", False, "none",
        "L2 に LLM 健全性 KPI 3列を足す(観測専用・累積カウンタ)"),
     # 第98バッチ W2-6: finalize のメモリ有界化(設計 src/society/observer/logger.py)。

@@ -459,14 +459,23 @@ def test_on_envfeedback_gate_rule_is_not_double_applied(tmp_path):
 
 
 def test_scheduler_seams_are_gated_and_minimal():
-    """scheduler の seam は「gated な 3 行」だけ(_apply には 1 バイトも触れない)。"""
+    """scheduler の seam は「gated な 6 行」だけ(_apply には 1 バイトも触れない)。
+
+    内訳: 装置層の 3 行(phase / hold_exit / pending_exits)+ IF-F W2 の装置スコープ
+    3 行(商業 / 物流 / 行政の phase 本体)。スコープ行は `devices_mod.` を 2 回
+    含む(関数 + 定数)ので、部分文字列の出現数は 3 + 3×2 = 9 になる。
+    """
     src = (REPO / "src" / "society" / "engine" / "scheduler.py").read_text(
         encoding="utf-8")
-    assert src.count("devices_mod.") == 3        # phase / hold_exit / pending_exits の 3 箇所だけ
+    assert src.count("devices_mod.") == 9
     assert "from .. import devices as devices_mod" in src
     assert "devices_mod.phase(sim, step, sim_min)" in src
     assert "if via_station and devices_mod.hold_exit(sim, agent, step, sim_min):" in src
     assert "for _held in devices_mod.pending_exits(sim, step):" in src
+    for seam in ("with devices_mod.cause_scope(sim, devices_mod.DEV_COMMERCE_HOURS):",
+                 "with devices_mod.cause_scope(sim, devices_mod.DEV_LOGISTICS_GOODS):",
+                 "with devices_mod.cause_scope(sim, devices_mod.DEV_GOV_MAIN):"):
+        assert seam in src, seam
 
 
 # =========================================================================== #
@@ -557,6 +566,162 @@ def test_signal_events_on_is_at_most_one_per_crossing_per_day(tmp_path):
     # 300 step = 2 日境界を跨ぐが、周期(140s)ごとには絶対に出ない
     assert len(evs) <= 3
     assert len(evs) * 140.0 < 300 * 600.0
+
+
+# =========================================================================== #
+# (G) 運行事業者 TransitOperator = 運休を**決める**装置(IF-F W2)
+# =========================================================================== #
+#: 必ず災害・遅延・運休・障害が起きる実験条件(確率 1.0 = 抽選の当たり外れに依存しない)。
+DISASTER_ON = {"disaster.enabled": "true", "disaster.days": "[0]",
+               "disaster.delay_prob": 1.0, "disaster.suspend_prob": 1.0,
+               "disaster.outage_prob": 1.0}
+OPERATOR_ON = {"world.devices.enabled": "true",
+               "world.devices.transit_operator": "true"}
+
+
+def test_shipped_default_operator_is_off():
+    cfg = load_config()
+    assert bool(cfg.world.devices.transit_operator) is False
+    assert D.build_cfg({})["transit_operator"] is False
+    assert D.build_cfg({"transit_operator": "true"})["transit_operator"] is True
+    feat = {f.id: f for f in R.FEATURES}["world.devices.transit_operator"]
+    assert feat.repro_tier == "strict" and feat.affects_k is False
+    assert feat.fingerprint_risk == "none" and feat.off_value is False
+    assert R.undeclared_toggles(load_config()) == []
+
+
+def test_operator_absent_by_default(tmp_path):
+    """既定 OFF では装置が居ない = disaster.py は従来の 1 行(バイト一致の構造保証)。"""
+    sim = _sim(tmp_path, "dev_op_none", n_steps=1, **DISASTER_ON)
+    assert D.transit_operator(sim) is None
+    sim2 = _sim(tmp_path, "dev_op_half", n_steps=1,
+                **{**DISASTER_ON, "world.devices.enabled": "true"})
+    assert D.transit_operator(sim2) is None, "親だけ ON で事業者が生えた"
+
+
+def test_operator_delta_ext_is_a_pass_through():
+    """δ_ext は disaster.py の従来式そのもの(新しい規則を 1 つも導入しない)。"""
+    dev = D.TransitOperator()
+    assert dev.device_id == D.transit_operator_device_id() == "operator:transit"
+    assert dev.kind == D.OPERATOR_PREFIX
+    cases = [(False, True, False, False),      # 平常
+             (True, True, False, True),        # 災害中 + 方針 ON → 止める
+             (True, False, False, False),      # 災害中でも方針 OFF → 止めない
+             (False, True, True, True),        # 遅延抽選が運休 → 止める
+             (True, False, True, True)]
+    for active, policy, delay, want in cases:
+        got = dev.on_input(-1, {"day": 3, "disaster_active": active,
+                                "suspend_transit": policy,
+                                "delay_suspend": delay}, 0)
+        assert got["suspended"] is want, (active, policy, delay)
+        assert got["device_id"] == "operator:transit"
+    assert dev.day == 3
+    assert dev.audit()["illegal"] == 0, "δ の外で状態が動いた(DEVS 契約違反)"
+    assert dev.audit()["ext"] == len(cases)
+
+
+def _suspend_days(sim) -> list:
+    """1 日ずつ tick_day を回して「その日運休か」を採る(実コード経由)。"""
+    from society import disaster as DIS
+    out = []
+    for day in range(4):
+        step = day * 144
+        DIS.tick_day(sim, step, sim.clock.sim_min(step))
+        out.append(bool(sim.transit.suspended))
+    return out
+
+
+def test_operator_shim_is_bit_identical_to_the_bare_write(tmp_path):
+    """★装置 ON/OFF で**運休する日が完全に一致**する(shim は素通し = 挙動不変)。"""
+    off = _sim(tmp_path, "dev_op_off", n_steps=1, **DISASTER_ON)
+    on = _sim(tmp_path, "dev_op_on", n_steps=1, **{**DISASTER_ON, **OPERATOR_ON})
+    got_off, got_on = _suspend_days(off), _suspend_days(on)
+    assert got_off == got_on, "事業者装置を通したら運休の日が変わった(shim ではない)"
+    assert any(got_off), "検収の空回り(1 日も運休していない)"
+    dev = D.transit_operator(on)
+    assert dev is not None and dev.audit()["ext"] == len(got_on)
+    assert dev.audit()["illegal"] == 0
+    assert dev.suspended is got_on[-1]
+
+
+def test_operator_run_l1_matches_without_the_device(tmp_path):
+    """フルランでも L1 が完全一致(装置の実体は世界を 1 バイトも変えない)。"""
+    off = _run(tmp_path, "dev_op_run_off", n_steps=24, n_agents=10, **DISASTER_ON)
+    on = _run(tmp_path, "dev_op_run_on", n_steps=24, n_agents=10,
+              **{**DISASTER_ON, **OPERATOR_ON})
+    assert _l1(off) == _l1(on)
+
+
+# =========================================================================== #
+# (H) 装置の同一性を L1 へ(IF-F W2。observer.causality と組んだときだけ)
+# =========================================================================== #
+CAUSALITY_ON = {"observer.causality.enabled": "true"}
+
+
+def test_device_emissions_stamp_their_own_id(tmp_path):
+    """改札装置の gate_pass / device_load は**自分の id** を明示で刻む(優先順位①)。"""
+    sim = _sim(tmp_path, "dev_stamp", n_steps=1, n_agents=20,
+               **{**ON, **CAUSALITY_ON})
+    _station_crowd(sim, 20)
+    _exit_all(sim, sim.agents[:20])
+    did = D.faregate_device_id(sim.city.station_node)
+    passes = _kind(sim, "gate_pass")
+    assert passes, "検収の空回り"
+    for e in passes:
+        assert e.device_id == did == e.payload["device_id"]
+        assert e.cause_type == "device"
+    for step in range(1, 12):                        # 時が進むと負荷要約が出る
+        D.phase(sim, step, sim.clock.sim_min(step))
+    loads = _kind(sim, "device_load")
+    assert loads and all(e.device_id == did for e in loads)
+
+
+def test_signal_summary_stamps_the_crossing_device_id(tmp_path):
+    sim = _run(tmp_path, "dev_stamp_sig", n_steps=24, n_agents=8,
+               zone_specs=[_SIG_ZONE],
+               **{"world.devices.enabled": "true",
+                  "world.devices.signal_events": "true", **CAUSALITY_ON})
+    evs = _kind(sim, "signal_summary")
+    assert evs and all(e.device_id == D.signal_device_id(42) for e in evs)
+
+
+def test_disaster_events_carry_the_operator_id_but_the_disaster_stays_natural(tmp_path):
+    """★自然事象は災害そのものだけ。運休/遅延/障害は**事業者(装置)の判断**。"""
+    sim = _run(tmp_path, "dev_op_cause", n_steps=24, n_agents=10,
+               **{**DISASTER_ON, **CAUSALITY_ON,
+                  "disaster.grievance": 0.05, "disaster.delay_grievance": 0.05})
+    dis = _kind(sim, "disaster")
+    assert dis, "検収の空回り(災害が起きていない)"
+    for e in dis:
+        assert e.cause_type == "natural" and e.device_id is None, \
+            "災害そのものに装置 id が付いた(自然事象を装置に化けさせている)"
+    delays = _kind(sim, "transit_delay")
+    assert delays and all(e.cause_type == "device"
+                          and e.device_id == D.DEV_OPERATOR_TRANSIT for e in delays)
+    outs = _kind(sim, "infra_outage")
+    assert outs and all(e.cause_type == "device"
+                        and e.device_id == D.DEV_OPERATOR_INFRA for e in outs)
+    # ★不満(state_update)は事業者の窓の中で出るが**装置の作った出来事ではない**
+    grief = [e for e in _kind(sim, "state_update") if e.device_id is not None]
+    assert grief == [], "身体側の力学に装置 id が付いた(帰属の汚染)"
+
+
+def test_causality_does_not_change_which_days_are_suspended(tmp_path):
+    """★因果の刻印は**札を付けるだけ**: 運休する日も L1 も OFF と完全一致。"""
+    off = _run(tmp_path, "dev_op_tag_off", n_steps=24, n_agents=10, **DISASTER_ON)
+    on = _run(tmp_path, "dev_op_tag_on", n_steps=24, n_agents=10,
+              **{**DISASTER_ON, **CAUSALITY_ON})
+    assert _l1(off) == _l1(on)
+    assert bool(off.transit.suspended) is bool(on.transit.suspended)
+    assert on.llm.calls == off.llm.calls > 0, "刻印で LLM 呼数が動いた"
+
+
+def test_causality_off_leaves_every_device_id_none(tmp_path):
+    """causality OFF では装置 id を 1 件も刻まない(装置層 ON でも)。"""
+    sim = _run(tmp_path, "dev_stamp_off", n_steps=24, n_agents=10,
+               **{**ON, **DISASTER_ON})
+    assert all(e.device_id is None for e in sim.logger.events)
+    assert sim.logger.cause_device() is None
 
 
 def test_frozen_metric_spec_files_are_untouched():

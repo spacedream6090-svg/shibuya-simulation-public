@@ -469,3 +469,8 @@ class Event:
     # 既定 OFF では logger が 1 度も埋めず parquet の列も生えない = 既存ランとバイト一致。
     cause_type: str | None = None
     actor_id: int | None = None
+    #   device_id  … その出来事を起こした**装置の同一性**(``society/devices.py`` が唯一の源。
+    #                "faregate:<駅ノード>" / "signal:<交差点id>" / "logistics:goods" 等)。
+    #                ``actor_id`` は int(個体)なので装置は別の列で名乗る = 型を汚さない。
+    #                復元できなければ None(捏造しない)。既定 OFF では常に None・列も生えない。
+    device_id: str | None = None

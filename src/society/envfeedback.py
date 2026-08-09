@@ -96,6 +96,13 @@ R1 ドクトリン
    であって、並んで待つ個体の列は作らない(既存の POI 選択経路だけを使う = 新しい
    ヒューリスティックを足さない、という指示に従った)。
 4. 閾値・係数はすべて **仮値**。実データ較正は未実施(上記「較正の口」)。
+5. **主体が居ない**。規則1〜3 はどれも「集約量が閾値を超えたらコード側が発火」であって、
+   その判断を下した者が世界に居ない。actor model の後続波がこの穴を規則ごとに塞ぐ:
+   - 規則2(改札)→ **装置**(P2・``devices.faregate_active`` が True のとき本規則は不評価)
+   - 規則1(停車時間)→ **当直の車掌**(P3a・``transit_staff.dwell_loop_active`` が True の
+     とき本規則は不評価。停車時間の式・閾値・上限・回復運転項は下の共有関数を**あちらが
+     そのまま呼ぶ**ので、既定サブフラグでは「誰が決めるか」だけが変わり数値は不変)
+   - 規則3(POI 占有)→ 未着手(店員アクターの波)
 """
 from __future__ import annotations
 
@@ -267,6 +274,103 @@ def _due(sim, step: int) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# 規則1 の**共有部品**(actor model P3a で車掌アクターと分け合う唯一の定義)
+# --------------------------------------------------------------------------- #
+# ★なぜ関数に割ったか: P3a(src/society/transit_staff.py)で「停車時間を決めるのは
+#   **車掌**」になった。もし向こうで同じ式を書き写したら、閾値・係数・上限・回復運転項が
+#   2 箇所に分かれ、**規則1 が見た負荷と車掌が見た負荷が静かにずれる**。定数も式も
+#   ここ 1 箇所にしか無い状態を保つため、集約・演算・状態書き込みを純関数へ割った。
+#   `update()` は下でこの 3 本を呼ぶだけ = 既定 OFF/ON いずれも数値はビット単位で不変。
+
+
+def aggregate(sim, station, since_idx: int) -> tuple[dict, int, int]:
+    """この step 末の集約を **1 箇所で**採る → ``(at_node, inflow, exchange)``。
+
+    - ``at_node``  … ノード別の在場人数(街の中に居て起きている個体だけ)
+    - ``inflow``   … 改札流入 = この step に駅ノードへ入った件数(規則2 の集約量)
+    - ``exchange`` … 乗降人数 = 電車で街を出た人 + 電車で街へ来た人(規則1 の主説明変数)
+
+    読み取り専用・完全決定論(乱数ゼロ・LLM ゼロ)。``since_idx < 0`` なら L1 を読まない。
+    """
+    at_node: dict[str, int] = {}
+    for agent in sim.agents:
+        if agent.loc == "outside" or agent.sleeping:
+            continue
+        at_node[agent.node] = at_node.get(agent.node, 0) + 1
+    inflow = 0
+    exchange = 0
+    if station is not None and since_idx >= 0:
+        for ev in sim.logger.events[since_idx:]:
+            payload = ev.payload or {}
+            if ev.kind == "arrive" and payload.get("node") == station:
+                inflow += 1
+            elif ev.kind == "enter_area" and payload.get("gateway") == station:
+                inflow += 1
+                exchange += 1
+            elif ev.kind == "exit_area" and payload.get("via") == "train":
+                exchange += 1
+    return at_node, inflow, exchange
+
+
+def platform_load(at_node: dict, station, exchange: int) -> int:
+    """ホーム負荷の**唯一の定義** = ホームに立っている人数 + この step の乗降人数。"""
+    return int(at_node.get(station, 0)) + int(exchange)
+
+
+def dwell_inject_min(tcfg: dict, excess: int, sec_per_pax: float | None = None) -> float:
+    """超過人数 → この step ぶんの停車時間超過[分](上限 ``dwell_cap_min`` つき)。
+
+    ``sec_per_pax=None`` は規則1 の既定係数(``dwell_sec_per_pax``)。P3a の較正版
+    (東京実証則 +15 人/車両 ≒ +1 秒)はここへ ``dwell_s_per_15pax / 15`` を渡す
+    = **式と上限は共有したまま係数だけ差し替える**(規則1 の既定数値は 1 も動かない)。
+    """
+    per_pax = float(tcfg["dwell_sec_per_pax"]) if sec_per_pax is None \
+        else float(sec_per_pax)
+    return min(float(tcfg["dwell_cap_min"]), excess * per_pax / 60.0)
+
+
+def advance_delay(tcfg: dict, prev_min: float, inject_min: float) -> float:
+    """回復運転項 γ<1 + 絶対上限で遅延[分]を 1 step 進める(非発散 T5 の本体)。"""
+    new = min(float(tcfg["delay_cap_min"]),
+              float(tcfg["recovery"]) * float(prev_min) + float(inject_min))
+    return 0.0 if new < 1e-9 else new
+
+
+def dwell_step(tcfg: dict, load: int, prev_min: float,
+               sec_per_pax: float | None = None) -> tuple[int, float, float]:
+    """規則1 の停車時間演算(合成)→ ``(excess, inject_min, new_delay_min)``。"""
+    excess = max(0, int(load) - int(tcfg["platform_threshold"]))
+    inject = dwell_inject_min(tcfg, excess, sec_per_pax)
+    return excess, inject, advance_delay(tcfg, prev_min, inject)
+
+
+def commit_delay(st: dict, new_min: float, excess: int) -> None:
+    """遅延[分]を状態へ書く**唯一の書き口**(下流の消費者を 1 バイトも変えないため)。"""
+    st["delay_min"] = new_min
+    if new_min > float(st["delay_max"]):
+        st["delay_max"] = new_min
+    if int(excess) > 0:
+        st["n_transit"] += 1
+
+
+def _staff_dwell_active(sim) -> bool:
+    """★駅員・車掌アクター層(actor model P3a・``src/society/transit_staff.py``)との優先順位。
+
+    ``transit_staff`` が停車時間ループを持っているとき、規則1 は **1 度も評価しない**
+    (``devices.faregate_active`` で規則2 を譲るのと**同じ形**)。規則1 は「ホーム負荷が
+    閾値を超えたらコード側が停車時間を延ばす」という**主体なしの近似**で、P3a は
+    「**当直の車掌**がドア閉を判断する」という主体つきモデルである。同じ物理(停車時間の
+    延長 → 遅延)を指しているので、両方効かせると二重計上になる。主体つきが勝つ =
+    ``delay_min`` も ``n_transit`` も規則1 側では 1 も動かない。
+    ★遅延 import の理由: 依存の向きは **transit_staff → envfeedback**(あちらが本 module の
+      共有部品を使う)。逆向きを module 先頭に書くと循環 import になる。
+    既定 OFF(``transit_staff.enabled=false``)では常に False = 従来と完全同一 = バイト一致。
+    """
+    from . import transit_staff as staff_mod
+    return staff_mod.dwell_loop_active(sim)
+
+
+# --------------------------------------------------------------------------- #
 # step 末の一括計算(§4.5)
 # --------------------------------------------------------------------------- #
 def update(sim, step: int, sim_min: int, since_idx: int) -> None:
@@ -282,57 +386,31 @@ def update(sim, step: int, sim_min: int, since_idx: int) -> None:
     st = state(sim)
     station = _station(sim)
 
-    # ---- 集約(この step 末の世界を 1 回だけ走査する)----
-    at_node: dict[str, int] = {}
-    for agent in sim.agents:
-        if agent.loc == "outside" or agent.sleeping:
-            continue
-        at_node[agent.node] = at_node.get(agent.node, 0) + 1
-
-    # この step の駅まわりのフロー(L1 を読むだけ)。
+    # ---- 集約(この step 末の世界を 1 回だけ走査する。P3a の車掌と共有する唯一の集約器)----
     #   inflow   … 改札通過 = 駅ノードへ入った件数(到着 + 範囲外からの帰還)= 規則2 の集約量
     #   exchange … 乗降人数 = 電車で街を出た人 + 電車で街へ来た人 = 規則1 の主説明変数
     #              (停車時間の実証モデルの説明変数は『そこに立っている人』ではなく『乗り降りする人』)
-    inflow = 0
-    exchange = 0
-    if station is not None and since_idx >= 0:
-        for ev in sim.logger.events[since_idx:]:
-            payload = ev.payload or {}
-            if ev.kind == "arrive" and payload.get("node") == station:
-                inflow += 1
-            elif ev.kind == "enter_area" and payload.get("gateway") == station:
-                inflow += 1
-                exchange += 1
-            elif ev.kind == "exit_area" and payload.get("via") == "train":
-                exchange += 1
+    at_node, inflow, exchange = aggregate(sim, station, since_idx)
 
     log_now = _due(sim, step)
 
     # ---- 規則1: ホーム密度 → 停車時間延長 → 遅延(回復運転で減衰)----
+    # ★駅員・車掌アクター(P3a)が居るランでは **1 度も評価しない**(_staff_dwell_active)。
+    #   主体なしの近似より主体つきモデルが勝つ = 規則2 が改札装置へ譲るのと同じ線引き。
     tcfg = cfg["transit"]
-    if tcfg["enabled"] and station is not None:
+    if tcfg["enabled"] and station is not None and not _staff_dwell_active(sim):
         # ホーム負荷 = ホームに立っている人 + この step の乗降人数。後者を入れないと、現行エンジンの
         # 駅が**通過点**(着いた step のうちに範囲外へ抜ける)なので step 末の在ノード人数がほぼ 0 に
         # なり、規則が原理的に発火しない(検収で実測して設計変更した)。実証モデルでも主説明変数は
         # 乗降人数であり、こちらの方が現実の機構に近い。
         standing = at_node.get(station, 0)
-        n = standing + exchange
+        n = platform_load(at_node, station, exchange)
         thr = int(tcfg["platform_threshold"])
-        excess = max(0, n - thr)
-        # 1 step ぶんの停車時間超過[分](上限つき)。乗降人数に比例する実証モデルの最小形(天井は Δt でスケールする=timeconv RATE)。
-        inject = min(float(tcfg["dwell_cap_min"]),
-                     excess * float(tcfg["dwell_sec_per_pax"]) / 60.0)
         prev = float(st["delay_min"])
-        # 回復運転項 γ<1 + 上限 = 発散しない(不動点 ≤ dwell_cap_min/(1−γ) かつ ≤ delay_cap_min)
-        new = min(float(tcfg["delay_cap_min"]),
-                  float(tcfg["recovery"]) * prev + inject)
-        if new < 1e-9:
-            new = 0.0
-        st["delay_min"] = new
-        if new > float(st["delay_max"]):
-            st["delay_max"] = new
-        if excess > 0:
-            st["n_transit"] += 1
+        # 1 step ぶんの停車時間超過[分](上限つき)+ 回復運転項 γ<1 + 上限 = 発散しない
+        # (不動点 ≤ dwell_cap_min/(1−γ) かつ ≤ delay_cap_min)。式は dwell_step が唯一の定義。
+        excess, inject, new = dwell_step(tcfg, n, prev)
+        commit_delay(st, new, excess)
         if log_now and (excess > 0 or (prev > 0.0 and new == 0.0)):
             _log(sim, step, sim_min, -1,
                  {"rule": RULE_TRANSIT, "node": station, "metric": "platform_n",

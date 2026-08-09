@@ -9,10 +9,14 @@
   (1) **網羅**: 登録された全 kind に cause_type がある。捏造の kind は落ちる。
   (2) **既定 OFF = バイト一致**: 既定 conf が false・ゴールデン L1 一致・
       L1 parquet の列が変更前の 9 列のまま(2 列が生えない)。
-  (3) **ON**: 2 列が生え、全イベントが cause_type を持ち、行為イベントの actor_id が
+  (3) **ON**: 3 列が生え、全イベントが cause_type を持ち、行為イベントの actor_id が
       行為者と一致し、患者 index の種(hear)は payload から行為者へ戻る。決定論。
   (4) **事後解析**: 行列の合計 = 件数・突き合わせ 0 件。刻印列が無いランでも表だけで動く。
   (5) **患者 override のキー名**が実装と一致する(合成 Event で 1 種ずつ確かめる)。
+  (6) **装置の同一性 W2**: 世界プロセスの phase 本体が装置スコープを開き、対象の kind に
+      device_id が載る。id は名簿の閉リストの中だけ。刻んでよい cause_type は
+      device/schedule/boundary に閉じている(agent / physics / natural には刻まない)。
+      OFF ではスコープを開く経路が構造的に存在しない。
 """
 from __future__ import annotations
 
@@ -48,8 +52,8 @@ CAUSALITY_ON = {"observer.causality.enabled": "true"}
 PRECHANGE_L1_COLUMNS = ["step", "sim_min", "agent_id", "kind", "x", "y",
                         "payload", "rng_stream", "llm_call_id"]
 
-#: ON のランで足りる 2 列(順序も固定)。
-NEW_L1_COLUMNS = ["cause_type", "actor_id"]
+#: ON のランで足りる 3 列(順序も固定)。device_id は W2 で足した装置の同一性。
+NEW_L1_COLUMNS = ["cause_type", "actor_id", "device_id"]
 
 
 def _cfg(name, n_steps=24, n_agents=12, **ov):
@@ -71,8 +75,8 @@ def _l1(sim):
 
 
 def _l1c(sim):
-    """決定論比較の形(新 2 列まで含める)。"""
-    return [[e.step, e.agent_id, e.kind, e.cause_type, e.actor_id,
+    """決定論比較の形(新 3 列まで含める)。"""
+    return [[e.step, e.agent_id, e.kind, e.cause_type, e.actor_id, e.device_id,
              json.dumps(e.payload, ensure_ascii=False, sort_keys=True)]
             for e in sim.logger.events]
 
@@ -175,12 +179,13 @@ def test_off_matches_golden(tmp_path):
     assert _l1(sim) == golden, "IF-F の seam がゴールデンを動かしている"
 
 
-def test_off_leaves_the_two_fields_none(tmp_path):
+def test_off_leaves_the_three_fields_none(tmp_path):
     sim = _sim(tmp_path, "cz_off_fields", **RICH)
     sim.run()
     assert sim.logger.causality_on is False
     assert sim.logger._cause is None
-    assert all(e.cause_type is None and e.actor_id is None
+    assert sim.logger.cause_device() is None, "OFF なのに装置スコープが開いた"
+    assert all(e.cause_type is None and e.actor_id is None and e.device_id is None
                for e in sim.logger.events), "OFF なのに刻印された"
 
 
@@ -205,7 +210,7 @@ def test_off_matches_pure_default(tmp_path):
 # --------------------------------------------------------------------------- #
 # (3) ON(検収基準 3)
 # --------------------------------------------------------------------------- #
-def test_on_adds_exactly_two_columns(tmp_path):
+def test_on_adds_exactly_three_columns(tmp_path):
     sim = _sim(tmp_path, "cz_on_pq", **CAUSALITY_ON, **RICH)
     sim.run()
     names = list(pq.read_schema(tmp_path / "cz_on_pq" / "l1_events.parquet").names)
@@ -399,7 +404,8 @@ def test_analyze_cli_and_markdown(tmp_path):
     assert rep["n_events"] > 0 and rep["cross_validation"]["n_cause_mismatch"] == 0
 
 
-def _write_l1(dir_path: Path, rows: list[dict], *, with_engine_cols: bool):
+def _write_l1(dir_path: Path, rows: list[dict], *, with_engine_cols: bool,
+              with_device_col: bool = False):
     """合成 L1 を 1 枚書く(実ランでは作れない縁のケースを固定するため)。"""
     import pyarrow as pa
     dir_path.mkdir(parents=True, exist_ok=True)
@@ -418,6 +424,8 @@ def _write_l1(dir_path: Path, rows: list[dict], *, with_engine_cols: bool):
     if with_engine_cols:
         cols["cause_type"] = pa.array([r.get("cause_type") for r in rows], pa.string())
         cols["actor_id"] = pa.array([r.get("actor_id") for r in rows], pa.int32())
+    if with_device_col:
+        cols["device_id"] = pa.array([r.get("device_id") for r in rows], pa.string())
     pq.write_table(pa.table(cols), dir_path / "l1_events.parquet", compression="zstd")
 
 
@@ -541,3 +549,197 @@ def test_summarize_folds_kind_counts():
     got = C.summarize({"speak": 3, "weather": 1, "wage": 2, "unknown_kind": 9})
     assert got[C.AGENT] == 3 and got[C.NATURAL] == 1 and got[C.DEVICE] == 2
     assert sum(got.values()) == 6, "未登録 kind を黙って数えた"
+
+
+# --------------------------------------------------------------------------- #
+# (6) 装置の同一性 device_id(検収基準 6・W2)
+# --------------------------------------------------------------------------- #
+#: 世界プロセスの装置スコープが実際に火を噴く小ラン。
+#:   commerce:hours   … 営業時間の開閉遷移(shop_state)
+#:   logistics:goods  … (s,S) レビュー + 補充到着(stock_low / delivery_trip / restock)
+#:   gov:main         … 行政会計の締め(public_budget)
+#: restock_hour=12 は「その日のレビューを 48 step の窓に入れる」ためだけの実験条件で、
+#: 発注点を上げてあるのは 12 人の小ランでも在庫が発注点を割るようにするため。
+PROCESS = {"economy.enabled": "true", "commerce.enabled": "true",
+           "commerce.inventory.enabled": "true",
+           "commerce.inventory.restock_hour": 12,
+           "commerce.inventory.reorder_point.food": 39,
+           "commerce.inventory.reorder_point.cafe": 39,
+           "commerce.inventory.reorder_point.shop": 29,
+           "commerce.inventory.reorder_point.nightlife": 29,
+           "government.enabled": "true"}
+
+#: 装置スコープが刻むはずの種 → 期待する device_id(**実測で確かめた対応**)。
+_EXPECTED_DEVICE_OF_KIND = {
+    "shop_state": "commerce:hours",
+    "stock_low": "logistics:goods",
+    "delivery_trip": "logistics:goods",
+    "restock": "logistics:goods",
+    "public_budget": "gov:main",
+}
+
+
+def _process_run(tmp_path, name, **ov):
+    sim = _sim(tmp_path, name, n_steps=48, **{**CAUSALITY_ON, **PROCESS, **ov})
+    sim.run()
+    return sim
+
+
+def test_device_id_catalogue_is_a_closed_list():
+    """装置 id の名簿は 1 箇所(society/devices.py)。形も接頭辞も閉じている。"""
+    from society import devices as D
+    assert set(D.PROCESS_DEVICE_IDS) == {
+        D.DEV_COMMERCE_HOURS, D.DEV_COMMERCE_PRICING, D.DEV_GOV_MAIN,
+        D.DEV_LOGISTICS_GOODS, D.DEV_OPERATOR_INFRA, D.DEV_OPERATOR_TRANSIT}
+    assert list(D.PROCESS_DEVICE_IDS) == sorted(D.PROCESS_DEVICE_IDS), "並びが不定"
+    for did in D.PROCESS_DEVICE_IDS:
+        assert D.device_id_is_known(did), did
+        assert did.count(":") == 1 and did.split(":")[0] in D.DEVICE_ID_PREFIXES
+    # 実体を持つ装置の動的 id も同じ形(接頭辞は名簿の中)
+    assert D.device_id_is_known(D.faregate_device_id("n123"))
+    assert D.device_id_is_known(D.signal_device_id(42))
+    assert D.device_id_is_known(D.transit_operator_device_id())
+    # 名簿に無い形は**検出できる**(捏造の検出器。禁止ではない)
+    assert D.device_id_is_known("mystery:1") is False
+    assert D.device_id_is_known("gov") is False and D.device_id_is_known("") is False
+
+
+def test_on_process_scopes_stamp_their_device_id(tmp_path):
+    """世界プロセスの phase 本体が開いた窓の中の種に device_id が載る。"""
+    sim = _process_run(tmp_path, "cz_dev_stamp")
+    seen = {}
+    for e in sim.logger.events:
+        if e.kind in _EXPECTED_DEVICE_OF_KIND:
+            assert e.device_id == _EXPECTED_DEVICE_OF_KIND[e.kind], \
+                f"{e.kind}: device_id={e.device_id}"
+            seen[e.kind] = seen.get(e.kind, 0) + 1
+    assert set(seen) == set(_EXPECTED_DEVICE_OF_KIND), \
+        f"検収の空回り(出ていない種がある): {sorted(set(_EXPECTED_DEVICE_OF_KIND) - set(seen))}"
+
+
+def test_on_stamped_ids_are_all_in_the_catalogue(tmp_path):
+    """ランに現れた device_id は 1 つ残らず名簿の中(未知の id を作っていない)。"""
+    from society import devices as D
+    sim = _process_run(tmp_path, "cz_dev_closed")
+    ids = {e.device_id for e in sim.logger.events if e.device_id is not None}
+    assert ids, "検収の空回り(1 件も刻まれていない)"
+    assert all(D.device_id_is_known(i) for i in ids), sorted(ids)
+    assert ids <= set(D.PROCESS_DEVICE_IDS), \
+        f"世界プロセス以外の id が出た: {sorted(ids - set(D.PROCESS_DEVICE_IDS))}"
+
+
+def test_on_device_causes_have_no_actor(tmp_path):
+    """世界プロセスの装置が起こした行に**偽の行為者**が入っていない。"""
+    sim = _process_run(tmp_path, "cz_dev_actor")
+    stamped = [e for e in sim.logger.events
+               if e.device_id is not None and e.kind in _EXPECTED_DEVICE_OF_KIND]
+    assert stamped, "検収の空回り"
+    for e in stamped:
+        assert e.agent_id == -1, f"{e.kind}: 前提(世界イベント)が崩れた"
+        assert e.actor_id is None, f"{e.kind}: 装置起因なのに行為者 id が入っている"
+        assert e.cause_type in C.DEVICE_STAMPABLE
+
+
+def test_on_scope_does_not_stamp_agent_or_physics_events(tmp_path):
+    """★窓の中で出ても agent / physics / natural には刻まない(DEVICE_STAMPABLE)。
+
+    これが無いと、装置の処理に連なって出る個体側の出来事(state_update など)まで
+    「その装置が起こした」ことになり、帰属が構造的に汚染される。
+    """
+    sim = _process_run(tmp_path, "cz_dev_discipline")
+    assert C.DEVICE_STAMPABLE == frozenset({C.DEVICE, C.SCHEDULE, C.BOUNDARY})
+    for e in sim.logger.events:
+        if e.cause_type in (C.AGENT, C.PHYSICS, C.NATURAL):
+            assert e.device_id is None, f"{e.kind}({e.cause_type})に装置 id が付いた"
+
+
+def test_on_device_scope_is_closed_even_on_exception(tmp_path):
+    """装置スコープは with(= try/finally)なので例外でも必ず閉じる。入れ子も戻す。"""
+    from society import devices as D
+    sim = _sim(tmp_path, "cz_dev_scope", n_steps=1, **CAUSALITY_ON)
+    assert sim.logger.cause_device() is None
+    with pytest.raises(RuntimeError):
+        with D.cause_scope(sim, D.DEV_GOV_MAIN):
+            assert sim.logger.cause_device() == D.DEV_GOV_MAIN
+            with D.cause_scope(sim, D.DEV_LOGISTICS_GOODS):
+                assert sim.logger.cause_device() == D.DEV_LOGISTICS_GOODS
+            assert sim.logger.cause_device() == D.DEV_GOV_MAIN, "入れ子から戻っていない"
+            raise RuntimeError("boom")
+    assert sim.logger.cause_device() is None, "例外で装置スコープが開きっぱなし"
+
+
+def test_off_device_scope_is_a_no_op_singleton(tmp_path):
+    """OFF ではスコープが**何もしない singleton**(割り当てゼロ・logger 不触)。"""
+    from society import devices as D
+    sim = _sim(tmp_path, "cz_dev_off_scope", n_steps=1)
+    scope = D.cause_scope(sim, D.DEV_GOV_MAIN)
+    assert scope is D.NO_SCOPE
+    with scope:
+        assert sim.logger.cause_device() is None
+    assert sim.logger.cause_device() is None
+
+
+def test_on_device_stamps_do_not_change_the_world(tmp_path):
+    """device_id を刻んでも既存 9 列のイベント列は OFF と完全一致(観測がシムを変えない)。"""
+    off = _sim(tmp_path, "cz_dev_w_off", n_steps=48, **PROCESS)
+    off.run()
+    on = _process_run(tmp_path, "cz_dev_w_on")
+    assert _l1(off) == _l1(on)
+    assert on.llm.calls == off.llm.calls > 0
+
+
+def test_on_device_stamping_is_deterministic(tmp_path):
+    a = _process_run(tmp_path, "cz_dev_det_a")
+    b = _process_run(tmp_path, "cz_dev_det_b")
+    assert _l1c(a) == _l1c(b)
+
+
+def test_analyze_reports_device_breakdown(tmp_path):
+    """事後解析が device_id 別の内訳を出し、突き合わせは 0 件のまま。"""
+    from society import devices as D
+    sim = _process_run(tmp_path, "cz_dev_an")
+    rep = ac.analyze(tmp_path / "cz_dev_an")
+    dev = rep["devices"]
+    assert rep["device_column"] is True and dev["applicable"] is True
+    assert dev["n_stamped"] == sum(1 for e in sim.logger.events
+                                   if e.device_id is not None) > 0
+    assert dev["unknown_device_ids"] == {}
+    assert set(dev["per_device"]) <= set(D.PROCESS_DEVICE_IDS)
+    assert dev["by_kind"]["public_budget"] == {D.DEV_GOV_MAIN: 3}
+    assert sum(dev["per_device"].values()) == dev["n_stamped"]
+    cv = rep["cross_validation"]
+    assert cv["n_cause_mismatch"] == 0 and cv["n_actor_mismatch"] == 0
+    md = ac.render_markdown(rep)
+    assert "装置の同一性" in md and D.DEV_GOV_MAIN in md
+    assert ac.main([str(tmp_path / "cz_dev_an"), "--out", str(tmp_path / "d.md")]) == 0
+
+
+def test_analyze_warns_about_device_ids_outside_the_catalogue(tmp_path):
+    """名簿に無い装置 id は警告 + 終了コード 1(表とデータのずれの検出器)。"""
+    d = tmp_path / "cz_dev_unknown"
+    _write_l1(d, [{"step": 0, "agent_id": -1, "kind": "restock",
+                   "cause_type": C.DEVICE, "device_id": "mystery:9"},
+                  {"step": 0, "agent_id": -1, "kind": "restock",
+                   "cause_type": C.DEVICE, "device_id": "logistics:goods"}],
+              with_engine_cols=True, with_device_col=True)
+    rep = ac.analyze(d)
+    assert rep["devices"]["unknown_device_ids"] == {"mystery:9": 1}
+    assert rep["devices"]["per_device"] == {"logistics:goods": 1, "mystery:9": 1}
+    md = ac.render_markdown(rep)
+    assert "名簿に無い装置 id" in md and "mystery:9" in md
+    assert ac.main([str(d), "--out", str(tmp_path / "u2.md")]) == 1
+
+
+def test_analyze_still_works_on_a_w1_run_without_the_device_column(tmp_path):
+    """W1 の ON ラン(2 列だけ)を『刻印なし』に落とさない(過去ランを捨てない)。"""
+    d = tmp_path / "cz_dev_w1"
+    _write_l1(d, [{"step": 0, "agent_id": 1, "kind": "speak",
+                   "cause_type": C.AGENT, "actor_id": 1}],
+              with_engine_cols=True)
+    rep = ac.analyze(d)
+    assert rep["engine_columns"] is True            # 突き合わせは生きている
+    assert rep["device_column"] is False
+    assert rep["devices"]["applicable"] is False and rep["devices"]["per_device"] == {}
+    assert rep["cross_validation"]["n_cause_mismatch"] == 0
+    md = ac.render_markdown(rep)
+    assert "device_id` 列が無い" in md

@@ -15,6 +15,8 @@ L1 の ``agent_id`` は**行為者ではない**。「この行が誰の視点�
   2. **kind ごとの行為者帰属率**(= 行為者 id を復元できたイベントの割合)
   3. データに現れたのに**分類表に無い kind**(= 表の穴。警告として大きく出す)
   4. **agent_id=-1 の質量ランキング**(どの種が最も多くの「行為者不明」を作っているか)
+  5. **device_id 別の内訳**(W2。どの装置がどれだけの出来事を作っているか。
+     ``actor_id`` は int なので装置は名乗れない = 装置起因の行はこの列でしか所在が分からない)
 
 を出す。②を**単一のスカラーで代表させない**のは意図的である。全 kind を混ぜた
 「帰属率 87%」のような数字は、``move_segment`` と ``health_update`` が毎 step 出る
@@ -66,6 +68,7 @@ if str(REPO_ROOT / "scripts") not in sys.path:      # `python scripts/...` 以�
 # l1_stream が src/ も sys.path へ入れる(society.* を import できるようにする)。
 from l1_stream import iter_record_batches, l1_paths, table_schema   # noqa: E402
 
+from society import devices as DEV                                   # noqa: E402
 from society.observer import causality as C                          # noqa: E402
 
 #: L1 から**実際に読む列**。因果の集計は座標を 1 度も使わないので x / y は読まない。
@@ -73,6 +76,11 @@ BASE_COLUMNS: tuple[str, ...] = ("step", "agent_id", "kind", "payload")
 
 #: ON のランにだけ存在するエンジン側の刻印列。
 ENGINE_COLUMNS: tuple[str, ...] = ("cause_type", "actor_id")
+
+#: W2 で足した 3 列目(装置の同一性)。**ENGINE_COLUMNS に入れない**のが要点:
+#: W1 の ON ランには 2 列しか無いので、ここを必須にすると過去の ON ランが
+#: 「刻印なし」に落ちて突き合わせが消える。あれば読む・無ければ黙る。
+DEVICE_COLUMN = "device_id"
 
 SCAN_BATCH_ROWS = 131_072
 
@@ -83,7 +91,7 @@ SCAN_BATCH_ROWS = 131_072
 class KindTally:
     """kind 1 種ぶんの累積。行数に比例するものを 1 つも持たない。"""
 
-    __slots__ = ("n", "n_actor", "n_neg_agent", "by_cause",
+    __slots__ = ("n", "n_actor", "n_neg_agent", "by_cause", "by_device",
                  "n_cause_mismatch", "n_actor_mismatch", "mismatch_example")
 
     def __init__(self) -> None:
@@ -91,12 +99,16 @@ class KindTally:
         self.n_actor = 0                 # 行為者 id を復元できた件数
         self.n_neg_agent = 0             # agent_id < 0(世界イベント)の件数
         self.by_cause: dict[str, int] = {}
+        self.by_device: dict[str, int] = {}   # device_id 別(刻印のあるランだけ)
         self.n_cause_mismatch = 0        # エンジンの刻印と表が食い違った件数
         self.n_actor_mismatch = 0
         self.mismatch_example: dict | None = None
 
     def add_cause(self, cause: str) -> None:
         self.by_cause[cause] = self.by_cause.get(cause, 0) + 1
+
+    def add_device(self, device_id: str) -> None:
+        self.by_device[device_id] = self.by_device.get(device_id, 0) + 1
 
 
 def scan(run_dir, *, batch_rows: int = SCAN_BATCH_ROWS) -> dict:
@@ -114,8 +126,11 @@ def scan(run_dir, *, batch_rows: int = SCAN_BATCH_ROWS) -> dict:
     # 使う(途中で ON にしたランで列が半分しか無いのに「あるつもり」で読まないため)。
     names = [set(table_schema(p).names) for p in paths]
     engine_cols = all(set(ENGINE_COLUMNS) <= n for n in names)
+    device_col = all(DEVICE_COLUMN in n for n in names)
 
     columns = list(BASE_COLUMNS) + (list(ENGINE_COLUMNS) if engine_cols else [])
+    if device_col:
+        columns.append(DEVICE_COLUMN)
     tallies: dict[str, KindTally] = {}
     unclassified: dict[str, int] = {}
     step_min, step_max, total = None, None, 0
@@ -129,6 +144,7 @@ def scan(run_dir, *, batch_rows: int = SCAN_BATCH_ROWS) -> dict:
         steps = d.get("step")
         e_cause = d.get("cause_type") if engine_cols else None
         e_actor = d.get("actor_id") if engine_cols else None
+        e_device = d.get(DEVICE_COLUMN) if device_col else None
         n = batch.num_rows
         total += n
         if steps:
@@ -164,6 +180,8 @@ def scan(run_dir, *, batch_rows: int = SCAN_BATCH_ROWS) -> dict:
             stamped = engine_cols and e_cause[i] is not None
             # 行列は「エンジンの刻印があればそれ・無ければ表」で組む(= 実測の分布)
             t.add_cause((e_cause[i] if stamped else table_cause) or "?")
+            if e_device is not None and e_device[i]:
+                t.add_device(str(e_device[i]))
             actor = C.as_actor_id(e_actor[i]) if stamped else table_actor
             if actor is not None:
                 t.n_actor += 1
@@ -179,6 +197,7 @@ def scan(run_dir, *, batch_rows: int = SCAN_BATCH_ROWS) -> dict:
                         t.mismatch_example = {"field": "actor_id",
                                               "engine": e_actor[i], "table": table_actor}
     return {"tallies": tallies, "engine_columns": engine_cols,
+            "device_column": device_col,
             "unclassified": unclassified, "n": total,
             # 0 行の L1(finalize は空でも canonical を書く)では -1 を返す = 欠測を
             # None のまま印字して「step None〜None」という読めない行を作らない。
@@ -198,11 +217,17 @@ def analyze(run_dir) -> dict:
     kinds: dict[str, dict] = {}
     matrix: dict[str, dict[str, int]] = {}
     per_cause: dict[str, int] = {c: 0 for c in C.CAUSE_TYPES}
+    per_device: dict[str, int] = {}
+    device_by_kind: dict[str, dict[str, int]] = {}
     per_cause_other = 0
     for kind in sorted(tallies):
         t = tallies[kind]
         table_cause = C.CAUSE_OF_KIND.get(kind)
         matrix[kind] = dict(sorted(t.by_cause.items()))
+        if t.by_device:
+            device_by_kind[kind] = dict(sorted(t.by_device.items()))
+            for did, v in t.by_device.items():
+                per_device[did] = per_device.get(did, 0) + int(v)
         for c, v in t.by_cause.items():
             if c in per_cause:
                 per_cause[c] += v
@@ -219,6 +244,7 @@ def analyze(run_dir) -> dict:
             "n_cause_mismatch": t.n_cause_mismatch,
             "n_actor_mismatch": t.n_actor_mismatch,
             "mismatch_example": t.mismatch_example,
+            "n_device": sum(t.by_device.values()),
         }
 
     # ---- 集計は「tick 系を明示的に除いた」ものだけ(単一スカラーの見出しを作らない)---- #
@@ -245,14 +271,31 @@ def analyze(run_dir) -> dict:
 
     unattributed = sorted(
         ({"kind": k, "n": v["n"], "n_neg_agent": v["n_neg_agent"],
-          "n_unattributed": v["n_unattributed"], "cause_type": v["cause_type"]}
+          "n_unattributed": v["n_unattributed"], "cause_type": v["cause_type"],
+          "n_device": v["n_device"]}
          for k, v in kinds.items() if v["n_unattributed"]),
         key=lambda r: (-r["n_unattributed"], r["kind"]))
+
+    # 装置 id の名簿照合(society/devices.py が唯一の源)。**捏造検出であって禁止ではない**:
+    # 知らない id が出たら「名簿に足すべきか / 刻む側の誤りか」を人が決める材料として出す。
+    unknown_devices = {d: n for d, n in sorted(per_device.items())
+                       if not DEV.device_id_is_known(d)}
+    device_report = {
+        "applicable": scanned["device_column"],
+        "n_stamped": sum(per_device.values()),
+        "per_device": dict(sorted(per_device.items())),
+        "by_kind": device_by_kind,
+        "known_prefixes": sorted(DEV.DEVICE_ID_PREFIXES),
+        "process_ids": list(DEV.PROCESS_DEVICE_IDS),
+        "unknown_device_ids": unknown_devices,
+    }
 
     return {
         "run_dir": str(run_dir),
         "paths": scanned["paths"],
         "engine_columns": scanned["engine_columns"],
+        "device_column": scanned["device_column"],
+        "devices": device_report,
         "n_events": scanned["n"],
         "step_range": [scanned["step_min"], scanned["step_max"]],
         "cause_types": list(C.CAUSE_TYPES),
@@ -396,18 +439,58 @@ def render_markdown(rep: dict) -> str:
             L.append(f"| `{k}` | {v['cause']:,} | {v['actor']:,} | `{v['example']}` |")
     L.append("")
 
+    # ---- 4-2. 装置の同一性(device_id)------------------------------------------- #
+    L.append("## 4-2. 装置の同一性(device_id)")
+    L.append("")
+    dev = rep["devices"]
+    if not dev["applicable"]:
+        L.append("このランには `device_id` 列が無い(W1 以前の ON ラン、または OFF ラン)。")
+        L.append("装置起因の行が**どの装置か**は復元できないため、この節は空である。")
+    elif not dev["per_device"]:
+        L.append("列はあるが刻印が 1 件も無い(装置スコープを通る機能が全て OFF のラン)。")
+    else:
+        L.append("> `actor_id` は int(個体 id)なので装置は名乗れない。装置起因の行が"
+                 "「行為者不明」に落ちるのを止めるための別列である。")
+        L.append(f"> 刻印のある行: **{dev['n_stamped']:,}** 件 / 名簿の源: "
+                 "`src/society/devices.py`")
+        L.append("")
+        L.append("| device_id | 件数 | 内訳(kind) |")
+        L.append("|---|---:|---|")
+        for did, n in sorted(dev["per_device"].items(), key=lambda kv: (-kv[1], kv[0])):
+            parts = sorted(((k, v[did]) for k, v in dev["by_kind"].items()
+                            if did in v), key=lambda kv: (-kv[1], kv[0]))
+            L.append(f"| `{did}` | {n:,} | "
+                     + " / ".join(f"`{k}` {v:,}" for k, v in parts[:6])
+                     + (" / …" if len(parts) > 6 else "") + " |")
+        L.append("")
+        if dev["unknown_device_ids"]:
+            L.append("> **警告: 名簿に無い装置 id。** `society/devices.py` の"
+                     " `DEVICE_ID_PREFIXES` に無い接頭辞が L1 に出ている"
+                     "(名簿に足すか、刻む側を直すかの判断が要る)。")
+            L.append("")
+            L.append("| device_id | 件数 |")
+            L.append("|---|---:|")
+            for did, n in dev["unknown_device_ids"].items():
+                L.append(f"| `{did}` | {n:,} |")
+            L.append("")
+    L.append("")
+
     # ---- 5. 行為者不明の質量ランキング ------------------------------------------ #
     L.append("## 5. 行為者が復元できないイベントの質量")
     L.append("")
     L.append("> 「どの種が最も多くの『誰が起こしたか分からない出来事』を作っているか」。")
     L.append("> 上から順に潰すのが、帰属率を上げる費用対効果の高い順序である。")
     L.append("")
+    L.append("> `device_id` 列があるランでは「装置 id で名乗れた件数」も併記する。")
+    L.append("> **装置 id で名乗れていない行 = 次に装置スコープを通すべき対象**である")
+    L.append("> (行為者 id が復元できない出来事は、装置が名乗れば所在が分かる)。")
+    L.append("")
     if rep["unattributed_ranking"]:
-        L.append("| kind | cause_type | 帰属不能 | うち agent_id=-1 | 総件数 |")
-        L.append("|---|---|---:|---:|---:|")
+        L.append("| kind | cause_type | 帰属不能 | うち agent_id=-1 | device_id あり | 総件数 |")
+        L.append("|---|---|---:|---:|---:|---:|")
         for r in rep["unattributed_ranking"][:40]:
             L.append(f"| `{r['kind']}` | `{r['cause_type'] or '?'}` | {r['n_unattributed']:,} | "
-                     f"{r['n_neg_agent']:,} | {r['n']:,} |")
+                     f"{r['n_neg_agent']:,} | {r.get('n_device', 0):,} | {r['n']:,} |")
         if len(rep["unattributed_ranking"]) > 40:
             L.append(f"| … | | | | 残り {len(rep['unattributed_ranking']) - 40} 種は JSON 側 |")
     else:
@@ -442,7 +525,9 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(rep, ensure_ascii=False, indent=2, sort_keys=True),
             encoding="utf-8")
         print(f"wrote {args.json_out}")
-    bad = bool(rep["unclassified_kinds"]) or bool(rep["cross_validation"]["by_kind"])
+    bad = (bool(rep["unclassified_kinds"])
+           or bool(rep["cross_validation"]["by_kind"])
+           or bool(rep["devices"]["unknown_device_ids"]))
     return 1 if bad else 0
 
 

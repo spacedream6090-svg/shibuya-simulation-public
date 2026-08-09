@@ -434,6 +434,11 @@ _NON_PROMPT_WORLD_READER_MODULES = frozenset({
     # プロンプト構築層ではない。**watch.py と完全に同じ位置づけ**(watch も section() /
     # revision_line() で 1 節を組むが、組む材料は cfg と自分の状態だけ)。P3 で契約経路へ。
     "engaged.py",
+    # 第103バッチ P4境界計画: 計画ブロックの boundary 印付けと despawn/respawn 実行層。
+    # 圏外通勤の指定(seed・id の純関数)とゲートウェイ解決に world(city.station_node・
+    # graph)を読むのが本務で、プロンプトは一切組まない(LLM 呼び出しゼロ・乱数ゼロを
+    # tests/test_plan_boundary.py が AST 固定)。day_plan.py と同じ位置づけ。P3 で契約経路へ。
+    "plan_boundary.py",
 })
 
 

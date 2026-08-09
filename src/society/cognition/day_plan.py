@@ -123,6 +123,7 @@ from __future__ import annotations
 import math
 
 from ..observer.schema import Event
+from . import plan_boundary as _bnd
 from .deliberate import _loads_lenient
 
 SCHEMA = 1
@@ -606,14 +607,22 @@ def validate_physical(sim, agent, blocks: list, cfg: dict,
     for i, b in enumerate(blocks):
         start, end, place = b["start"], b["end"], b["place"]
         at = day_min + (int(start) if start is not None else 0)
-        node = resolve_place(sim, agent, place, at, from_node=prev_node) \
-            if place is not None else None
-        b["node"] = node
-        if node is None and place not in (None, "street"):
-            errors.append(f"no_place:b{i}")
-        if place is not None and ccfg is not None and _commerce.enabled(sim) \
-                and not _commerce.is_open(ccfg, place, at):
-            errors.append(f"closed:b{i}")
+        # ---- P4 計画駆動の圏外滞在(既定 OFF=mark は常に None=以降は従来どおり)----
+        #  圏外ブロックは「地図の外」なので (a) 場所カテゴリの実在も (b) 営業時間も
+        #  問わない(そこに POI は無いし、街の営業時間は外の職場を閉めない)。
+        #  到達性だけは**縁(gateway)まで**を通常どおり見る = 移動時間は無料にしない。
+        gate = _bnd.mark(sim, agent, b)
+        if gate is not None:
+            node = gate
+        else:
+            node = resolve_place(sim, agent, place, at, from_node=prev_node) \
+                if place is not None else None
+            b["node"] = node
+            if node is None and place not in (None, "street"):
+                errors.append(f"no_place:b{i}")
+            if place is not None and ccfg is not None and _commerce.enabled(sim) \
+                    and not _commerce.is_open(ccfg, place, at):
+                errors.append(f"closed:b{i}")
         if prev_end is not None and start is not None:
             need = travel_min(sim, cfg, prev_node, node or prev_node)
             if int(start) < prev_end + need:
@@ -718,18 +727,27 @@ def repair(sim, agent, blocks: list, conts: list, cfg: dict,
     prev_node, prev_end = str(getattr(agent, "node", "") or ""), None
     for b in blocks:
         at = day_min + b["start"]
-        node = resolve_place(sim, agent, b["place"], at, from_node=prev_node)
-        if node is None and b["place"] != "street":
-            sub = ACT_PLACE[b["act"]]            # substitute: act の既定カテゴリへ
-            if sub != b["place"]:
-                node = resolve_place(sim, agent, sub, at, from_node=prev_node)
-                if node is not None or sub == "street":
-                    b["place"] = sub
-                    ops["substitute"] += 1
-        if node is None and b["place"] != "street":
-            ops["drop"] += 1                     # 場所が解けない = 実行不能
-            continue
-        b["node"] = node
+        # ---- P4 計画駆動の圏外滞在(既定 OFF=mark は常に None=以降は従来どおり)----
+        #  刻印はここが**最終**(LLM 経路・前日計画経路・骨格経路のいずれも repair を通る)。
+        #  圏外ブロックは地図内 POI へ解決しない = 従来なら drop されていた。縁ノードを
+        #  「この区間の物理的な居場所」として扱い、以降の移動時間・日内クランプは
+        #  通常ブロックと同じ規則で通す(新しいヒューリスティックを足さない)。
+        gate = _bnd.mark(sim, agent, b)
+        if gate is not None:
+            node = gate                          # b["node"] は mark が None に据えてある
+        else:
+            node = resolve_place(sim, agent, b["place"], at, from_node=prev_node)
+            if node is None and b["place"] != "street":
+                sub = ACT_PLACE[b["act"]]        # substitute: act の既定カテゴリへ
+                if sub != b["place"]:
+                    node = resolve_place(sim, agent, sub, at, from_node=prev_node)
+                    if node is not None or sub == "street":
+                        b["place"] = sub
+                        ops["substitute"] += 1
+            if node is None and b["place"] != "street":
+                ops["drop"] += 1                 # 場所が解けない = 実行不能
+                continue
+            b["node"] = node
         if prev_end is not None:
             need = travel_min(sim, cfg, prev_node, node or prev_node)
             if b["start"] < prev_end + need:
@@ -768,6 +786,13 @@ def skeleton(sim, agent, cfg: dict) -> list:
                 "with": [], "purpose": ACT_PURPOSE[act], "priority": priority,
                 "flex": flex, "reason": reason, "note": "",
                 "node": None, "state": "todo", "slid": 0}
+
+    # ---- P4 計画駆動の圏外滞在(既定 OFF=None=以降は従来の 2 分岐と完全同一)----
+    #  圏外通勤者は work_start_min < 0(地図内に職場が無い)ので、下の 2 分岐では
+    #  「勤務窓を持たない人」に落ちて圏外へ出ない。第 3 の骨格をここで返す。
+    out_rows = _bnd.skeleton_rows(sim, agent, cfg)
+    if out_rows is not None:
+        return out_rows
 
     ws = int(getattr(agent, "work_start_min", -1) or -1)
     pt = getattr(agent, "part_time", None)
@@ -888,6 +913,9 @@ def apply(sim, agent, step: int, sim_min: int, response: str,
     # 第94 IF-B: 前日の失敗理由は**持ち越さない**(未解決のまま日を跨いだら消す)。
     # 朝の計画生成は 1 日 1 回なのでここが日境界の単一作用点。既定 silent は no-op。
     _clear_why(sim, agent)
+    # P4 計画駆動の圏外滞在(既定 OFF=即 return=何も書かない): 圏外通勤フラグを
+    # (run.seed, agent.id) の純関数から確定する。以降の検証・修復・骨格がこれを読む。
+    _bnd.ensure(sim, agent)
     mid = model_id(sim, agent)
     st = _state(sim)
     row = _model_row(st, mid)
@@ -1413,6 +1441,23 @@ def plan_action(agent, sim, sim_min: int, step: int, rng, scfg=None):
     #   どちらも読まれない=分岐に使わない=世界を 1 バイトも動かさない。
     at_node = str(getattr(agent, "node", "") or "")
     index = _bi(plan, b)
+    # ---- P4 計画駆動の圏外滞在(既定 OFF=is_boundary が常に False=この節は即素通り)----
+    #  ブロックの場所が圏外 = このブロックの実行は「縁へ行って街を出る」ことそのもの。
+    #  退出の実行は既存の `_try_exit`、帰還は `_phase_wake_and_returns` が行う
+    #  (**境界機構を新設しない**)。state="away" は「出かけたがまだ帰っていない」の意で、
+    #  帰還時に "done" へ上がる(割り込み処理 _sweep は todo 以外を触らない)。
+    if _bnd.enabled(sim) and _bnd.is_boundary(b):
+        out = _bnd.begin(sim, agent, plan, b, index, rng)
+        b["state"] = "away"
+        _state(sim)["exec"] += 1
+        _log(sim, agent, step, sim_min, "plan_block_start",
+             {"act": b["act"], "place": b["place"], "aim": b["purpose"],
+              "priority": b["priority"], "flex": b["flex"], "start": b["start"],
+              "slid": int(b["slid"]), "version": int(plan["version"]),
+              "node": at_node, "block": index, "boundary": "plan",
+              "gateway": str(b["boundary"].get("gateway") or "")})
+        _clear_why(sim, agent)                   # 第94 IF-B: 計画が動いた=侵入は止まる
+        return out or None                       # {} = 既に縁に居る(移動不要)
     if b["place"] == "street":                   # 戸外・特定しない = 行き先は習慣ポリシーへ委ねる
         b["state"] = "done"                      # (消化そのものは起きたので黙って消さず数える)
         _state(sim)["exec"] += 1

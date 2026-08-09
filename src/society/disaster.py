@@ -34,6 +34,7 @@ R1 呼数不変: どの機構も generate() を1本も足さない。発生/遅�
 """
 from __future__ import annotations
 
+from . import devices as devices_mod
 from .factors import update as factor_update
 from .observer.schema import Event
 
@@ -218,7 +219,17 @@ def tick_day(sim, step: int, sim_min: int) -> None:
 
     確率判定はすべて世界レベルの新 stream "disaster"(agent_id=-1)から固定順に引く(決定論)。1日の
     交通麻痺(運休)= 災害の suspend_transit または 交通遅延の運休 のどちらか。transit.suspended を
-    毎日この時点で更新する(disaster OFF では触れない=has_service バイト一致)。"""
+    毎日この時点で更新する(disaster OFF では触れない=has_service バイト一致)。
+
+    ★因果の切り分け(IF-F W2): **自然事象は災害そのものだけ**である。運休・遅延・障害の告知は
+    それを見た**事業者(装置)の判断** = DEVS の δ_ext であって自然の続きではない。混ぜたままだと
+    台帳上「運休は自然が起こした」ことになり、**止めると決めた主体が世界から消える**。そこで
+      - 災害の発生/継続/解除(disaster)  … 装置スコープを開かない = natural のまま
+      - 遅延/運休(transit_delay)        … operator:transit の窓の中で出す
+      - インフラ障害(infra_outage)      … operator:infra の窓の中で出す
+      - 運休フラグの書き込み              … 運行事業者装置の δ_ext を**素通し**で通す
+    とする。**計算は 1 演算も変えていない**(下の suspend 式は従来と同一)ので、causality も
+    装置層も、どちらの ON/OFF でも運休する日は完全に同じである(テストで機械固定)。"""
     if not enabled(sim):
         return
     day = sim_min // 1440
@@ -228,8 +239,16 @@ def tick_day(sim, step: int, sim_min: int) -> None:
     cfg = sim.disastercfg
     rng = sim.hub.stream("disaster", "world", step)     # 世界レベルの日次判定(固定順=決定論)
     disaster_active = _update_disaster(sim, cfg, day, step, sim_min, rng)
-    delay_suspend = _roll_transit_delay(sim, cfg, step, sim_min, rng)
-    _update_infra(sim, cfg, day, step, sim_min, rng)
+    with devices_mod.cause_scope(sim, devices_mod.DEV_OPERATOR_TRANSIT):
+        delay_suspend = _roll_transit_delay(sim, cfg, step, sim_min, rng)
+    with devices_mod.cause_scope(sim, devices_mod.DEV_OPERATOR_INFRA):
+        _update_infra(sim, cfg, day, step, sim_min, rng)
     # 交通麻痺(運休): 災害中(suspend_transit)または 交通遅延の運休 の日は電車を止める。
-    sim.transit.suspended = bool(
-        (disaster_active and cfg["suspend_transit"]) or delay_suspend)
+    suspend = bool((disaster_active and cfg["suspend_transit"]) or delay_suspend)
+    operator = devices_mod.transit_operator(sim)        # 既定 OFF = None(下 2 行は通らない)
+    if operator is not None:
+        suspend = bool(operator.on_input(-1, {
+            "day": day, "disaster_active": disaster_active,
+            "suspend_transit": bool(cfg["suspend_transit"]),
+            "delay_suspend": delay_suspend}, sim_min)["suspended"])
+    sim.transit.suspended = suspend

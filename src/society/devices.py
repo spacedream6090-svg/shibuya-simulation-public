@@ -91,6 +91,25 @@ R1 ドクトリン
 - **負荷カウンタは checkpoint に載せない**: ``device_load`` の時間内訳は resume 直後の
   1 時間だけ過少になる(装置の DEVS 状態そのものは整備窓ごとに 0 へ戻るので resume 安全)。
 
+因果台帳への接続(IF-F W2。``observer.causality.enabled``)
+----------------------------------------------------------
+装置が世界に作用しても、L1 には「誰が起こしたか」しか列が無かった。``actor_id`` は
+**int(個体 id)**なので装置は名乗れず、装置起因の行は「行為者不明」に落ちる。
+そこで本 module が**装置 id の唯一の名簿**(``PROCESS_DEVICE_IDS`` /
+``DEVICE_ID_PREFIXES``)と**装置スコープ**(``cause_scope``)を持ち、
+``Event.device_id`` という別列で装置が名乗る。
+
+  - 名簿は 2 段:(a)実体を持つ装置(``faregate:`` / ``signal:`` / ``operator:transit``)と
+    (b)まだ ``Device`` 実体を持たない**世界プロセス**(``logistics:`` / ``commerce:`` /
+    ``gov:`` / ``operator:infra``)。**分けてあるのは正直さのため**で、(b)は次の波で
+    昇格させる順序表そのものである。
+  - スコープは ``observer.causality`` だけを見る(装置層 OFF のランでも同一性は刻める)。
+    **既定 OFF は割り当てゼロ・logger 呼びゼロ**(``NO_SCOPE`` singleton)。
+  - 刻んでよい cause_type は ``observer/causality.DEVICE_STAMPABLE`` で閉じてある
+    (装置の窓の中で出ても、agent / physics / natural はその装置の作った出来事ではない)。
+  - ``TransitOperator`` は「台風が電車を止める」を「台風を見た**事業者が止めると決める**」
+    へ直す δ_ext の shim である(計算は素通し = ビット同値)。
+
 **絶対に触らない範囲(明文規約)**
 --------------------------------
 1. ``observer/metrics_spec.py`` の**凍結ファイル群**は 1 バイトも変更しない。
@@ -99,6 +118,7 @@ R1 ドクトリン
 """
 from __future__ import annotations
 
+from .observer import causality as _causality
 from .observer.schema import Event, register_event_kind
 
 SCHEMA = 1
@@ -126,6 +146,124 @@ AUDIT_MAX = 64
 # 装置 id の接頭辞(**唯一の定義**。解析側はここだけを見れば装置種が判る)
 FAREGATE_PREFIX = "faregate"
 SIGNAL_PREFIX = "signal"
+OPERATOR_PREFIX = "operator"          # 事業者(運行・供給)= 判断する装置
+
+# =========================================================================== #
+# 装置 id の**閉じた名簿**(IF-F W2: 因果台帳に装置の同一性を載せるための唯一の源)
+# --------------------------------------------------------------------------- #
+# 2 種類ある。どちらも「":" の左が種・右が個体」という 1 つの形に揃えてある。
+#
+#   (a) **実体を持つ装置**の id … 地図データから導く(`faregate:<駅ノード>` /
+#       `signal:<交差点id>` / `operator:transit`)。`DeviceRegistry` に居る。
+#   (b) **世界プロセスの id** … まだ `Device` 実体を持たないが、世界に作用する処理
+#       として scheduler の phase 本体が 1 つの窓として回しているもの
+#       (物流・商業・行政・供給事業者)。**正直に「実体がまだ無い」と言うために
+#       名簿を (a) と分けてある**。次の波でここを `Device` へ昇格させる順序表になる。
+#
+# ★id は**安定**(ランを跨いでも・conf を変えても同じ文字列)。解析側はこの名簿だけを
+#   見て「知らない装置 id」を検出できる(scripts/analyze_causality.py §6)。
+DEV_LOGISTICS_GOODS = "logistics:goods"      # (s,S) レビュー + 補充トリップ到着
+DEV_COMMERCE_HOURS = "commerce:hours"        # 営業時間による店舗の開閉遷移
+DEV_COMMERCE_PRICING = "commerce:pricing"    # ★予約済み(値付けは購入 seam 側=未配線)
+DEV_GOV_MAIN = "gov:main"                    # 行政会計の締め・ペイロール・給付
+DEV_OPERATOR_TRANSIT = "operator:transit"    # 運行事業者(遅延/運休の判断)
+DEV_OPERATOR_INFRA = "operator:infra"        # 供給事業者(停電/通信断/断水の告知)
+
+#: 世界プロセスの id(上記 (b))。**この並びが唯一の列挙**(テストが閉リストにする)。
+PROCESS_DEVICE_IDS: tuple[str, ...] = (
+    DEV_COMMERCE_HOURS, DEV_COMMERCE_PRICING, DEV_GOV_MAIN,
+    DEV_LOGISTICS_GOODS, DEV_OPERATOR_INFRA, DEV_OPERATOR_TRANSIT)
+
+#: 装置 id の接頭辞の閉リスト((a) の動的 id も含めてここで閉じる)。
+#: ``train_op`` は別の feature module(``src/society/transit_staff.py``)が宣言している
+#: 運行装置 id(乗務員不在時のドア閉判断の記録主体)である。**まだ device_id 列へは
+#: 流れていない**(あちらは payload["operator"] に置いている)が、名簿は世界に 1 つで
+#: なければ意味が無いのでここに載せる = 後で流れ始めても未知 id 扱いにならない。
+DEVICE_ID_PREFIXES: frozenset[str] = frozenset(
+    {FAREGATE_PREFIX, SIGNAL_PREFIX, OPERATOR_PREFIX, "commerce", "gov",
+     "logistics", "train_op"})
+
+
+def device_id_is_known(device_id) -> bool:
+    """その装置 id が名簿の形をしているか(``種:個体`` で種が閉リストに在る)。
+
+    ★「知らない id を弾く」ためではなく **検出する**ため(装置の契約と同じ流儀:
+      ランは止めず、観測に残す)。解析側が未知 id を警告として大きく出す。
+    """
+    text = str(device_id or "")
+    head, sep, tail = text.partition(":")
+    return bool(sep) and bool(tail) and head in DEVICE_ID_PREFIXES
+
+
+# =========================================================================== #
+# 装置スコープ(IF-F W2)= 「いまこの装置の処理を回している」窓
+# --------------------------------------------------------------------------- #
+# ``observer.causality.enabled`` が ON のときだけ、窓の中で出た L1 へ ``device_id`` が
+# 刻まれる(刻んでよい cause_type は observer/causality.DEVICE_STAMPABLE で閉じてある)。
+#
+# ★**既定 OFF は割り当てゼロ・呼び出しゼロ**: `cause_scope` が「何もしない singleton」を
+#   返し、`__enter__` / `__exit__` は logger に 1 度も触らない(= L1 バイト一致)。
+# ★窓の開閉は `with` = try/finally と同義。例外が出ても必ず閉じる
+#   (scheduler._apply の行為スコープと同じ契約)。
+# ★入れ子は**前の値を保存して戻す**(装置の処理の中で別の装置の窓が開いても壊れない)。
+# =========================================================================== #
+class _NullScope:
+    """causality OFF の窓(何もしない)。**唯一のインスタンスを使い回す**。"""
+
+    __slots__ = ()
+
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *exc) -> bool:
+        return False
+
+
+NO_SCOPE = _NullScope()
+
+
+class _DeviceScope:
+    """causality ON の窓。開いているあいだ logger に装置 id を立てる。"""
+
+    __slots__ = ("logger", "device_id", "prev")
+
+    def __init__(self, logger, device_id: str):
+        self.logger = logger
+        self.device_id = str(device_id)
+        self.prev: str | None = None
+
+    def __enter__(self) -> str:
+        self.prev = self.logger.cause_device()
+        self.logger.set_cause_device(self.device_id)
+        return self.device_id
+
+    def __exit__(self, *exc) -> bool:
+        self.logger.set_cause_device(self.prev)   # 入れ子でも前の窓へ正しく戻る
+        return False
+
+
+def cause_scope(sim, device_id: str):
+    """装置スコープを開く(``with devices.cause_scope(sim, DEV_...):``)。
+
+    causality OFF では ``NO_SCOPE``(no-op singleton)を返す = 新経路を 1 つも通らない。
+    ★装置層(``world.devices.enabled``)とは**独立**に効く: 装置 id は観測(同一性)で
+      あって装置の実体ではないので、装置層 OFF のランでも「どの世界プロセスが出した行か」
+      は刻める。実体(DEVS の δ)を持たせるのが ``world.devices.*`` の仕事。
+    """
+    logger = getattr(sim, "logger", None)
+    if logger is None or not _causality.enabled(sim):
+        return NO_SCOPE
+    return _DeviceScope(logger, device_id)
+
+
+def _stamp(sim, event: Event, device_id: str) -> None:
+    """自分の emission へ装置 id を**明示**する(logger の優先順位①)。
+
+    ``phase`` / ``hold_exit`` の中は装置ごとに id が違うのでスコープではなく直接刻む。
+    OFF では Event を 1 バイトも触らない。
+    """
+    if _causality.enabled(sim):
+        event.device_id = str(device_id)
 
 
 # =========================================================================== #
@@ -385,11 +523,67 @@ class SignalDevice(Device):
 
 
 # =========================================================================== #
+# 運行事業者(TransitOperator)= 外生ショックに応答して運休を決める装置
+# =========================================================================== #
+def transit_operator_device_id() -> str:
+    """運行事業者の装置 id(**街に 1 事業者**の近似。地図に路線事業者の別が無いため)。"""
+    return DEV_OPERATOR_TRANSIT
+
+
+class TransitOperator(Device):
+    """電車を止めるかどうかを決める事業者 1 社。
+
+    何を直したのか
+    --------------
+    ``src/society/disaster.py`` は「台風の日は電車が止まる」を **世界の物理**として
+    直接書いていた(``sim.transit.suspended = ...`` の裸の代入)。しかし現実には
+
+      - **自然事象** = 台風・地震・大雪そのもの(世界の外から来る入力)
+      - **装置の判断** = それを見た運行事業者が「今日は止める」と決めること
+
+    の 2 段であり、後者は DEVS の **δ_ext(外部入力への応答)**である。因果台帳から見ると
+    この区別は決定的で、混ぜたままだと「運休は自然が起こした」ことになり、
+    **止める判断をした主体が台帳から消える**(誰も決めていない世界になる)。
+
+    契約
+    ----
+    - δ_ext の入力 = その日の外生ショック
+      ``{"day", "disaster_active", "suspend_transit", "delay_suspend"}``
+      (災害の継続か / 事業者方針として災害日に止めるか / 遅延抽選が運休を引いたか)
+    - 出力 = ``{"suspended": bool}``。**計算は disaster.py の従来式と 1 演算も違わない**
+      (この装置は素通しの shim であって、新しい規則を 1 つも導入しない)。
+    - 乱数は 1 本も引かない(抽選は disaster.py 側の "disaster" stream で既に済んでいる)。
+
+    ★正直な限界: 「路線ごと」「時間帯ごと」の部分運休は表現しない(地図に路線の別が
+      無いため)。事業者は 1 社・判断は 1 日 1 回・対象は街の電車全体である。
+    """
+
+    kind = OPERATOR_PREFIX
+    STATE = ("suspended", "day")
+
+    def __init__(self, device_id: str | None = None):
+        super().__init__(device_id or transit_operator_device_id())
+        self.suspended = False          # 直近の判断(世界の真値は sim.transit.suspended)
+        self.day = -1
+        self.seal()
+
+    # ---- δ_ext: 外生ショックへの応答(**決定論の応答関数**)-------------------- #
+    def _delta_ext(self, actor_id: int, input: dict, sim_min: int) -> dict:  # noqa: A002
+        susp = bool((bool(input.get("disaster_active"))
+                     and bool(input.get("suspend_transit")))
+                    or bool(input.get("delay_suspend")))
+        self.suspended = susp
+        self.day = int(input.get("day", -1))
+        return {"suspended": susp, "device_id": self.device_id}
+
+
+# =========================================================================== #
 # cfg 正準化(traces.build_cfg / rumors.build_cfg と同型: dict / OmegaConf 両対応)
 # =========================================================================== #
 DEFAULTS = {
     "enabled": False,
     "signal_events": False,
+    "transit_operator": False,           # 運休判断を装置(DEVS δ_ext)へ通すか
     "faregate": {
         "enabled": False,
         "n_gates": 8,                    # 地図データに改札口の本数が無いときの既定
@@ -416,13 +610,15 @@ def build_cfg(raw) -> dict:
     未知のキーは黙って捨てる(捏造しない)。
     """
     raw = dict(_to_plain(raw) or {})
-    cfg = {"enabled": False, "signal_events": False,
+    cfg = {"enabled": False, "signal_events": False, "transit_operator": False,
            "faregate": dict(DEFAULTS["faregate"])}
     for key, val in raw.items():
         if key == "enabled":
             cfg["enabled"] = bool(val)
         elif key == "signal_events":
             cfg["signal_events"] = bool(val)
+        elif key == "transit_operator":
+            cfg["transit_operator"] = bool(val)
         elif key == "faregate":
             got = dict(_to_plain(val) or {})
             fg = cfg["faregate"]
@@ -511,6 +707,8 @@ def build_registry(sim) -> DeviceRegistry:
         did = signal_device_id(sig.get("crossing_id", 0))
         if reg.get(did) is None:               # 同一交差点を複数ゾーンが指しても 1 台
             reg.add(SignalDevice(did, sig))
+    if cfg["transit_operator"]:
+        reg.add(TransitOperator())
     return reg
 
 
@@ -528,6 +726,20 @@ def faregate_of(sim):
     if not faregate_active(sim):
         return None
     found = registry_of(sim).of_kind(FAREGATE_PREFIX)
+    return found[0] if found else None
+
+
+def transit_operator(sim):
+    """この世界の運行事業者装置(**既定 OFF では None** = disaster.py は従来の 1 行)。
+
+    ``world.devices.enabled`` と ``world.devices.transit_operator`` の**両方**が
+    true のときだけ実体が居る。居ないときの運休計算は disaster.py 側の式そのままで、
+    居るときはその式が装置の δ_ext の中で**同じ演算**として走る(結果はビット同値)。
+    """
+    cfg = cfg_of(sim)
+    if not (cfg["enabled"] and cfg["transit_operator"]):
+        return None
+    found = registry_of(sim).of_kind(OPERATOR_PREFIX)
     return found[0] if found else None
 
 
@@ -554,13 +766,15 @@ def _new_events(sim) -> list:
 def _log_gate_pass(sim, agent_id: int, device, out: dict, direction: str,
                    step: int, sim_min: int, x: float, y: float) -> None:
     """``gate_pass`` 1 件(**待ちが出た通過だけ**。L1 の量を原理的に抑える)。"""
-    sim.logger.log(Event(step=int(step), sim_min=int(sim_min),
-                         agent_id=int(agent_id), kind="gate_pass", x=float(x),
-                         y=float(y),
-                         payload={"device_id": device.device_id,
-                                  "wait_s": round(float(out["wait_s"]), 3),
-                                  "queue_len": int(out["queue_len"]),
-                                  "dir": direction}))
+    event = Event(step=int(step), sim_min=int(sim_min),
+                  agent_id=int(agent_id), kind="gate_pass", x=float(x),
+                  y=float(y),
+                  payload={"device_id": device.device_id,
+                           "wait_s": round(float(out["wait_s"]), 3),
+                           "queue_len": int(out["queue_len"]),
+                           "dir": direction})
+    _stamp(sim, event, device.device_id)
+    sim.logger.log(event)
 
 
 def _tally(device, out: dict) -> None:
@@ -589,7 +803,7 @@ def _flush_load(sim, device, step: int, sim_min: int) -> None:
         return
     passed, held = int(load["passed"]), int(load["held"])
     if passed or held:
-        sim.logger.log(Event(
+        event = Event(
             step=int(step), sim_min=int(sim_min), agent_id=-1,
             kind="device_load", x=0.0, y=0.0,
             payload={"device_id": device.device_id, "kind": device.kind,
@@ -599,7 +813,9 @@ def _flush_load(sim, device, step: int, sim_min: int) -> None:
                                      if passed else 0.0),
                      "queue_max": int(load["queue_max"]),
                      "n_gates": int(getattr(device, "n_gates", 0)),
-                     "hour": int(load["hour"])}))
+                     "hour": int(load["hour"])})
+        _stamp(sim, event, device.device_id)
+        sim.logger.log(event)
     load.update({"passed": 0, "held": 0, "wait_sum": 0.0, "wait_max": 0.0,
                  "queue_max": 0, "hour": hour})
 
@@ -625,9 +841,10 @@ def _signal_summaries(sim, reg, step: int, sim_min: int) -> None:
                    "green_ratio": device.green_ratio(), "day": day}
         payload.update({k: round(float(v), 3)
                         for k, v in sorted(device.params.items())})
-        sim.logger.log(Event(step=int(step), sim_min=int(sim_min), agent_id=-1,
-                             kind="signal_summary", x=0.0, y=0.0,
-                             payload=payload))
+        event = Event(step=int(step), sim_min=int(sim_min), agent_id=-1,
+                      kind="signal_summary", x=0.0, y=0.0, payload=payload)
+        _stamp(sim, event, device.device_id)
+        sim.logger.log(event)
 
 
 def phase(sim, step: int, sim_min: int) -> None:

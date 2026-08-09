@@ -48,6 +48,7 @@ from .. import status as status_mod
 from .. import street as street_mod
 from .. import traces as traces_mod
 from .. import transit_live as transit_live
+from .. import transit_staff as transit_staff_mod
 from .. import truth_ledger as truth_ledger_mod
 from .. import work as work_mod
 from .. import worldview as worldview_mod
@@ -56,6 +57,7 @@ from ..cognition import deliberate, drive, planning, routine
 from ..cognition import engaged as engaged_mod
 from ..cognition import fire as fire_mod
 from ..cognition import perception_contract as contract_mod
+from ..cognition import plan_boundary as boundary_mod
 from ..cognition import plasticity as plasticity_mod
 from ..cognition import watch as watch_mod
 from ..cognition import reflection as reflection_mod
@@ -1027,10 +1029,18 @@ def _phase_wake_and_returns(sim, step: int, sim_min: int) -> None:
             agent.node = agent.return_gateway
             agent.x, agent.y = sim.city.node_xy(agent.node)
             agent.stay_until = step + 1
+            # 計画駆動の圏外滞在(actor model P4。既定 OFF=常に None=payload バイト一致):
+            # 圏外では出来事を 1 件も生成していないので、帰還のこの 1 点でだけ
+            # 「計画どおり・特筆事項なし」の圧縮記憶を 1 行入れ、ブロックを消化済みにする
+            # (定型文=場所と予定時刻の純関数・LLM ゼロ・乱数ゼロ)。
+            payload = {"gateway": agent.return_gateway,
+                       "via": "train" if via_station else "walk"}
+            bnd = boundary_mod.on_return(sim, agent, step, sim_min)
+            if bnd is not None:
+                payload.update(bnd)
             sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                                  kind="enter_area", x=agent.x, y=agent.y,
-                                 payload={"gateway": agent.return_gateway,
-                                          "via": "train" if via_station else "walk"}))
+                                 payload=payload))
             if agent.visitor:                     # 来街者の帰還 → 朝の計画を予約
                 _schedule_plan(sim, agent, step, sim_min)
                 # 来街者の財布補充(改善 P2 第9バッチ・既定 OFF): 帰宅のたび手持ちを基準額まで
@@ -1217,27 +1227,36 @@ def _try_exit(sim, agent, step: int, sim_min: int) -> None:
     agent.exit_intent = False
     agent.loc = "outside"
     agent.return_gateway = agent.node
-    rng = sim.hub.stream("outside", agent.id, step)
     homing_exit = agent.homing
-    if homing_exit:                                # 来街者の帰宅: 睡眠+朝の移動で戻る
-        agent.homing = False
-        if _lodging_on(sim):
-            agent.lodging_nights = 0               # 帰宅(範囲外退出)= 連泊カウントをリセット(Wave L)
-        if getattr(agent, "commute", False) and agent.arrival_min >= 0:
-            # 流入通勤者: 翌朝の到着時刻(arrival_min)に再流入(往復時刻を安定させる)
-            agent.return_at = step + _steps_until_tod(sim_min, agent.arrival_min,
-                                                      sim.clock.step_minutes)
+    # 計画駆動の圏外滞在(actor model P4。既定 OFF=常に None=以下は従来と完全同一):
+    # 朝の計画ブロックが境界の時刻表 = 帰還 step は**ブロックの終了時刻**から決まる
+    # ("outside" stream を 1 本も引かない)。統計駆動の流入通勤者(commute/arrival_min)
+    # とは別の台帳で、payload の boundary 欄だけで機械的に分離できる。
+    bnd = boundary_mod.on_exit(sim, agent, step, sim_min)
+    if bnd is None:
+        rng = sim.hub.stream("outside", agent.id, step)
+        if homing_exit:                            # 来街者の帰宅: 睡眠+朝の移動で戻る
+            agent.homing = False
+            if _lodging_on(sim):
+                agent.lodging_nights = 0           # 帰宅(範囲外退出)= 連泊カウントをリセット(Wave L)
+            if getattr(agent, "commute", False) and agent.arrival_min >= 0:
+                # 流入通勤者: 翌朝の到着時刻(arrival_min)に再流入(往復時刻を安定させる)
+                agent.return_at = step + _steps_until_tod(sim_min, agent.arrival_min,
+                                                          sim.clock.step_minutes)
+            else:
+                agent.return_at = (step + agent.sleep_steps
+                                   + sim.clock.dur_steps(int(rng.integers(0, 7))))
+            agent.reflect_step = step + 1          # 帰路の電車で今日を内省(k 処置)
         else:
-            agent.return_at = (step + agent.sleep_steps
-                               + sim.clock.dur_steps(int(rng.integers(0, 7))))
-        agent.reflect_step = step + 1              # 帰路の電車で今日を内省(k 処置)
-    else:
-        span = sim.cfg.world.outside_steps
-        agent.return_at = step + int(rng.integers(int(span[0]), int(span[1])))
+            span = sim.cfg.world.outside_steps
+            agent.return_at = step + int(rng.integers(int(span[0]), int(span[1])))
+    payload = {"gateway": agent.node, "homing": homing_exit,
+               "via": "train" if via_station else "walk"}
+    if bnd is not None:
+        payload.update(bnd)
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                          kind="exit_area", x=agent.x, y=agent.y,
-                         payload={"gateway": agent.node, "homing": homing_exit,
-                                  "via": "train" if via_station else "walk"}))
+                         payload=payload))
 
 
 # ---------------------------------------------------------------- 背景交通
@@ -3497,7 +3516,10 @@ def _phase_government(sim, step: int, sim_min: int) -> None:
 
     行政 OFF なら完全 no-op(tax/civic_service/public_budget 0 件・既存イベント列に無影響)。
     public_budget の agent_id は世界レベル(-1、world_event の既存流儀を踏襲)。給付を _phase_daily
-    より前に行い、給付後の残高で逼迫(money_pressure)が判定される=セーフティネットの間接経路。"""
+    より前に行い、給付後の残高で逼迫(money_pressure)が判定される=セーフティネットの間接経路。
+
+    IF-F W2: 会計の締め・ペイロール・給付は**行政という装置**の仕事なので、causality ON の
+    ときだけ装置スコープ gov:main を開く(既定 OFF は NO_SCOPE=従来と同じ 1 本道)。"""
     if not _government_on(sim):
         return
     gov = sim.government
@@ -3505,15 +3527,16 @@ def _phase_government(sim, step: int, sim_min: int) -> None:
     records = gov.daily(day)                   # 空=同日(何もしない)
     if not records:
         return
-    for rec in records:                        # 3主体の当日会計を締めて出力(Σ歳入−Σ歳出=残高変化)
-        sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
-                             kind="public_budget", x=0.0, y=0.0,
-                             payload={"level": rec["level"],
-                                      "revenue": round(rec["revenue"], 1),
-                                      "expense": round(rec["expense"], 1),
-                                      "balance": round(rec["balance"], 1)}))
-    _gov_payroll(sim, gov, step, sim_min)      # 当日分の歳出は次の日境界で締め・出力
-    _gov_benefits(sim, gov, step, sim_min)
+    with devices_mod.cause_scope(sim, devices_mod.DEV_GOV_MAIN):
+        for rec in records:                    # 3主体の当日会計を締めて出力(Σ歳入−Σ歳出=残高変化)
+            sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
+                                 kind="public_budget", x=0.0, y=0.0,
+                                 payload={"level": rec["level"],
+                                          "revenue": round(rec["revenue"], 1),
+                                          "expense": round(rec["expense"], 1),
+                                          "balance": round(rec["balance"], 1)}))
+        _gov_payroll(sim, gov, step, sim_min)  # 当日分の歳出は次の日境界で締め・出力
+        _gov_benefits(sim, gov, step, sim_min)
 
 
 # ---------------------------------------------------------------- 制度DSL(日次境界)
@@ -4441,8 +4464,12 @@ def _phase_commerce(sim, step: int, sim_min: int) -> None:
 
     営業時間は時刻の純関数(RNG不要・決定論)。遷移はカテゴリ単位=1日数件の sparse な世界イベント
     (agent_id=-1)。動的価格・在庫は購入時(_charge_meal / 建物内消費)に commerce.on_purchase で適用する
-    (ここでは開閉遷移のログのみ)。commerce OFF なら完全 no-op(shop_state 0 件=バイト一致)。"""
-    commerce_mod.tick_shop_state(sim, step, sim_min)
+    (ここでは開閉遷移のログのみ)。commerce OFF なら完全 no-op(shop_state 0 件=バイト一致)。
+
+    IF-F W2: 開閉遷移は**営業時間という装置**の仕事なので、causality ON のときだけ
+    装置スコープ commerce:hours を開く(OFF は NO_SCOPE=割り当てゼロ・logger 不触)。"""
+    with devices_mod.cause_scope(sim, devices_mod.DEV_COMMERCE_HOURS):
+        commerce_mod.tick_shop_state(sim, step, sim_min)
 
 
 def _goods_on(sim) -> bool:
@@ -4457,8 +4484,12 @@ def _phase_goods(sim, step: int, sim_min: int) -> None:
     在庫は購入点(_charge_meal / 建物内消費)で decrement される(ここでは補充=物流のみ)。到着は毎step、
     レビューは日次(restock_hour 以降の最初の step)。封鎖(災害の運休/shock_closure)で補充失敗→欠品波及。
     決定論・乱数ゼロ=新 stream を引かない。既存の scenario/disaster が確定した後に呼ぶ(その日の封鎖を読む)。
-    goods OFF なら完全 no-op(delivery_trip/restock/stock_low 0 件=乱数消費不変=ゴールデンを守る)。"""
-    goods_mod.tick(sim, step, sim_min)
+    goods OFF なら完全 no-op(delivery_trip/restock/stock_low 0 件=乱数消費不変=ゴールデンを守る)。
+
+    IF-F W2: 補充は**物流という装置**の仕事なので、causality ON のときだけ装置スコープ
+    logistics:goods を開く(stock_out は購入 seam 側で出るのでこの窓には入らない)。"""
+    with devices_mod.cause_scope(sim, devices_mod.DEV_LOGISTICS_GOODS):
+        goods_mod.tick(sim, step, sim_min)
 
 
 def _phase_delivery(sim, step: int, sim_min: int) -> None:
@@ -5177,6 +5208,13 @@ def run_step(sim, step: int) -> None:
     # devices.pending_exits 側で保証している=同 step に _try_exit が 2 回走らない)。
     for _held in devices_mod.pending_exits(sim, step):
         _try_exit(sim, _held, step, sim_min)
+    # 計画駆動の圏外滞在(actor model P4。既定 OFF=空 tuple=ループ 0 回=バイト一致):
+    # 上 2 つと**同じ形・同じ位置**の再試行口。_try_exit は「ノードに到着した step」に
+    # しか呼ばれないので、(a) 計画開始時に既に縁に居た(移動が発生しない)
+    # (b) 終電・遅延・改札待ちで保留された の 2 つはここでしか通る口が無い。
+    # 既に退出済みの個体は exit_intent が落ちているので二重には拾わない。
+    for _held in boundary_mod.pending_exits(sim, step):
+        _try_exit(sim, _held, step, sim_min)
     # 位置確定後: 共同行動/夕食共食の同席観測(既定OFF=no-op。第44バッチ)。編成→収束は済み、
     # ここで実際に POI/home で2人以上同席したグループを joint_activity で1件記録する。
     joint_mod.observe(sim, step, sim_min)          # 共同行動(S-R3)
@@ -5286,6 +5324,12 @@ def run_step(sim, step: int) -> None:
     #   計算すると step 内の処理順が結果に混入して同期バリア(第81)の意味が消える。
     # ★観測チャンネル(下)より前に置く: ext.transit_delay がこの step 末の遅延を見る。
     envfb_mod.update(sim, step, sim_min, _env_idx)
+    # 駅員・車掌アクター(actor model P3a。既定 OFF=即 return=バイト一致): 持ち場への束ね
+    # (初回 1 回・冪等)+ **当直の車掌のドア閉判断**(ホーム負荷 → 停車時間 → delay_min)。
+    # ★envfb_mod.update の**直後**に置く: 規則1 は ON のとき本 module へ譲る(二重適用の防止)
+    #   ので、譲られた側が同じ step のうちに delay_min を確定させないと、下の観測チャンネル
+    #   ext.transit_delay が 1 step 古い遅延を読む。集約(_env_idx)は規則1 と同じ起点を渡す。
+    transit_staff_mod.phase(sim, step, sim_min, _env_idx)
 
     # 観測チャンネル o_c(t)(第80。既定 OFF は上の _ch_idx=-1 でここに入らない)。
     # **読むだけ**: 世界状態から決定論計算してサイドカーへ積むだけで、L1/L2/L3・乱数・

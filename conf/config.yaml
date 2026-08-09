@@ -383,6 +383,23 @@ world:
     default_lanes: 2            # od: OSM に車線タグが無いエッジの既定車線数
     signal_cycle_s: 90          # od: 信号1周期の秒数。★1step=600s>周期なので緑赤の瞬時状態ではなく
                                 #     一様到着の期待待ち(r²·C/2)を距離換算で差し引く近似を使う
+    # ---- 歩車信号の同一化(既定 false = 現行挙動と完全同一)----
+    # ★true は **od の走行を変える挙動変更トグル**である(観測の追加ではない)。
+    # 現状(false): 同じ交差点なのに車と歩行者が別々の数字で動いている。
+    #   車     … 赤率 = 0.35 + 0.20 × sha256(node)・周期 = 上の signal_cycle_s(全交差点共通)
+    #   歩行者 … data/crossings_shibuya.json の実測(渋谷: 周期 140s・青 37s・青点滅 10s)
+    #   = 同一交差点の 2 つの現示が**統計的に独立**という、地図にも実測にも無い状態。
+    # true にすると、交差点表に載っているノード(車道グラフの OSM node id と交差点 id の
+    # 完全一致で結合。実測 69 本中 23 本 ≈ 33%)は
+    #     赤率 r = 1 − (green_s + flash_s) / cycle_s   … 140/37/10 なら 1 − 47/140 = 0.664
+    #     周期 C = その交差点自身の cycle_s(140s)     … 遅延式 r²·C/2 もこの C を使う
+    # になる。仮定は「車の青窓 ≈ 歩行者の横断可能窓」の 1 つだけ(スクランブルでは
+    # 140−47=93s を 2 方向が分け合い ≈46.5s ≈ 47s でほぼ実態と一致)。
+    # ★主張はここまで: **同じ交差点の車と歩行者が同じ 1 台の装置になる**、それだけである。
+    #   方向別スプリット・右折分離・オフセット協調はデータが無いので主張しない。
+    #   結合できないノード(表に無い/信号無しの横断歩道)は従来の hash 値のまま(捏造しない)。
+    signal_from_crossings: false
+    crossings_file: data/crossings_shibuya.json  # 上が true のときだけ読む(歩行者側と同一ファイル)
     free_speed_min: 3000        # od: 自由流速度の下限(m/10分。約18km/h。信号/渋滞で実効はこれ以下)
     free_speed_max: 5000        # od: 自由流速度の上限(m/10分。約30km/h)
     max_cars_log: 200           # od: traffic_flow payload の cars[] 上限(可視化補助)
@@ -508,6 +525,18 @@ world:
     # ★出すのは **1 交差点 1 日に最大 1 件**の signal_summary。信号サイクル(140 秒)は
     #   1 step(600 秒)より短いので、サイクルごとのイベントを出すと L1 が信号で溢れる。
     signal_events: false        # ★true で signal_summary(周期パラメータ+青割合)を日次 1 件
+    # ---- 運行事業者(TransitOperator)= 運休を「決める」装置(IF-F W2)----
+    # 現状(false): src/society/disaster.py が「台風の日は電車が止まる」を**世界の物理**として
+    #   裸で書いている(sim.transit.suspended への直接代入)。しかし現実には
+    #     自然事象 = 台風そのもの / 装置の判断 = それを見た事業者が「今日は止める」と決めること
+    #   の 2 段で、後者は DEVS の δ_ext である。混ぜたままだと因果台帳の上で
+    #   「運休は自然が起こした」ことになり、**止めると決めた主体が世界から消える**。
+    # true にすると同じ計算が運行事業者装置の δ_ext を通る(**素通しの shim** = 運休する日は
+    #   ビット同値。テストが同 seed で ON/OFF の運休日一致を機械固定している)。得られるのは
+    #   DEVS 監査(自発的遷移ゼロの証明)と装置名簿への登録であって、挙動の変化ではない。
+    # ★L1 の device_id(operator:transit / operator:infra)は **observer.causality** 側の
+    #   仕事で、このトグルとは独立に効く(同一性の観測 ≠ 装置の実体)。
+    transit_operator: false
 
 # ---- 空間レイヤ核(屋内ミクロ状態=シームレスズーム観察の土台。既定 OFF=現行挙動と完全同一)----
 # 全建物・全階の屋内間取り(vision.building_layout=決定論・ビューア floorLayout と同一系列)を
@@ -902,6 +931,31 @@ planning:
     use_contingency: false
     postpone_min: 60          # then=postpone のずらし幅[分](max_slide_min を超えたら削除)
     shorten_min: 30           # then=shorten の短縮幅[分](min_dur_min は下回らない)
+    # ---- 計画駆動の圏外滞在(actor model P4・**既定 OFF** = 第86 と完全同一)----
+    # 原文書: docs/plans/actor-model-migration-plan.md §4(境界)。実装 cognition/plan_boundary.py。
+    # 「勤務先が街の外にある居住者」を (run.seed, agent.id) の純関数で指名し、その人の計画の
+    # work ブロックに boundary 欄(exit/gateway/exit_min/entry_min)を刻む。**その欄がそのまま
+    # despawn/respawn の時刻表**であり、境界の出入りに別機構は作らない(退出=既存 _try_exit /
+    # 帰還=既存 _phase_wake_and_returns / L1 も既存の exit_area・enter_area を再利用)。
+    #   圏外に居る間: イベント 0 件・乱数 0 本・LLM 0 呼(loc=="outside" を既存エンジンが
+    #     構造的に素通りする。作用点は plan_boundary.py の docstring に file:line で列挙)。
+    #   帰還時: 「計画通りに実行、特筆事項なし」の圧縮記憶 1 行だけ(定型文の純関数)。
+    #   二系統の台帳は混ぜない: 計画駆動(本ブロック)= 居住者が圏外へ / 統計駆動(既存の
+    #     commute・arrival_min)= 域外住民が域内へ。L1 では payload.boundary=="plan" の有無で分離。
+    # 正直な近似(直さない): ①圏外は摩擦ゼロ(外での出来事・消費・出会いは生成しない)
+    #   ②フラックスは固定(域内の混雑・災害が「今日は出社しない」に効かない)。
+    # R1: enabled=false で新イベント 0 件・payload バイト一致・新 stream 0 本・プロンプト不変。
+    boundary:
+      enabled: false          # ★本番はユーザー判断で ON。false=第86 の day_plan と完全同一
+      outside_work_fraction: 0.7  # 指名率(**地図内に勤務先が解決しない居住者**に対する割合)。
+                                  # 未較正の暫定値(shibuya-inflow §1 表B: 区民の 6.9% しか区内で就業)
+      places: ["work"]        # 圏外扱いにする場所カテゴリ(education は既定で足さない=学校は地図内に在る)
+      gateway: station        # "station"=駅ノード / それ以外=city.gateways から決定論選択
+      start_min: 480          # 骨格計画での圏外勤務の開始(分 of day、8:00)
+      start_spread_min: 150   # 開始のばらつき幅[分](persona._pick_workplace と同じ 8:00〜10:30)
+      start_grid_min: 10      # ばらつきの刻み[分](= 正準 Δt)
+      hours_min: 480          # 圏外に居る長さ[分](8時間)
+      min_outside_steps: 1    # 退出が遅れて帰還時刻を過ぎた場合の最小滞在 step(必ず 1 step は外に居る)
 
 # ---- 確率的実行=行動のゆらぎ(P2 スライス S4。docs/plans/p2-interstitial-design.md §1 S4 /
 #      docs/research/interstitial-life.md §4.1 の実証3層 L1/L2/L3 + Gumbel)。既定 OFF=現行と完全同一 ----
@@ -1002,6 +1056,48 @@ transit_ride:
 transit:
   file: data/transit_shibuya.json  # 定刻ダイヤ(乱れなし)。GTFS 実ダイヤに差し替え可
   gtfs_dir: null                # ODPT 等の GTFS(stops.txt 等)を置いたフォルダを指定すると実ダイヤに切替
+
+# ---- 駅員・車掌 = 持ち場を持つアクター(actor model P3a。実装 src/society/transit_staff.py)----
+# 正典: docs/plans/actor-model-migration-plan.md「3a 駅員・車掌」= 車掌をドア閉判断エージェントに
+#   して**ダイヤ結合ループを内生化**する(ホーム密度 → 乗降時間 → 続行遅延 → 滞留)。
+# 監査事実: 電車は実体ではなく(transit.has_service は時刻表の述語)、遅延を作っていたのは
+#   env.feedback 規則1(主体なしの近似)と disaster の日次サイコロだけ。ペルソナに実在する
+#   駅員/車掌/電車運転士 は地図に対応 POI カテゴリが無く work.bind_workplace が束ねられない
+#   (no_category)ため、**一度も持ち場に立っていなかった**。
+# ★ON にすると env.feedback 規則1 は**評価されない**(同じ物理の二重計上の防止。改札装置が
+#   規則2 を置き換えるのと同じ線引き)。停車時間の式・閾値・上限・回復運転項は規則1 と
+#   **同一の関数**を呼ぶので、既定サブフラグでは「誰が決めるか」だけが変わり数値は不変。
+# ★env.feedback.enabled=false のときは本ブロックを ON にしても停車時間ループは動かない
+#   (遅延の下流の消費者=退出/帰還の待ち・ext.transit_delay が全部あちら側にあるため)。
+# 既定 OFF が保つ不変条件: 束ねを 1 件も行わない・dwell_decision / transit_staff_bound 0 件・
+#   sim にも agent にも属性が生えない・プロンプト 1 バイト不変・L1 バイト一致。
+transit_staff:
+  enabled: false                # ★駅員・車掌アクター層の親トグル。false=完全 no-op(バイト一致)
+  # ---- 持ち場への束ね(駅員・乗務員 → 駅ノード)----
+  bind:
+    enabled: true               # 親 enabled も要 true。false=判断だけ動かして束ねない実験用
+    station_occupations: ["駅員"]              # 駅係員(改札・ホーム・案内)= 在席するだけ
+    crew_occupations: ["車掌", "電車運転士"]    # 乗務員 = ドア閉を判断する層
+    # 合成当直表(ペルソナ pool の duty_pattern は record 側にあり agent へ届かないため、
+    # 名簿順(agent id 昇順)の index から決定論で割り振る。**乱数は 1 本も引かない**)。
+    # 既に勤務窓を持つ個体の窓は上書きしない。日跨ぎの直は現行の勤務窓判定が表現できない
+    # ので 24:00 で切る(= 終電帯は無人 → dwell_decision が unstaffed で出る)。
+    first_open: "05:00"         # 最初の直の始まり(初電の帯)
+    shift_hours: 8              # 1 直の長さ[時間](pool の duty_pattern.shift_hours と同値)
+    n_shifts: 2                 # 1 日に回す直の数(05:00-13:00 / 13:00-21:00)
+  # ---- 車掌のドア閉判断(= 停車時間延長 → 遅延)----
+  dwell:
+    enabled: true               # 親 enabled も要 true。true のとき規則1 は評価されない
+    require_service: true       # 運行が無い step(終電後・運休)は停車時間を足さない
+                                #   = 閉めるドアが無い。false にすると規則1 と全 step 完全同値
+    # ★東京の実測則(Palmqvist / Tomii / Ochiai 2020 ほか): **+15 人/車両 ≒ +1 秒の停車時間**、
+    #   通勤列車の総遅延の**約 9 割は 5 分以下の停車時間超過**。
+    #   既定 false = env.feedback.transit.dwell_sec_per_pax(規則1 の既定係数)をそのまま使う
+    #   = legacy の数値を 1 も動かさない。true のとき係数だけ dwell_s_per_15pax/15 に差し替わる
+    #   (式・上限 dwell_cap_min・回復運転項 recovery は共有のまま)。
+    calibrated: false
+    dwell_s_per_15pax: 1.0      # 東京実証則の係数[秒 / 15人](calibrated=true のときだけ効く)
+    log_every_steps: 1          # dwell_decision の記録間引き(観測装置の設定であって世界の量ではない)
 
 lod:
   max_llm_per_step: 300         # LLM 発火の step 上限(実機実測で更新)

@@ -222,6 +222,9 @@ TABLE: tuple[tuple[str, str, str], ...] = (
     ("indoor.markov.dwell_steps", STEPS, "平均滞在 step(遷移確率 = 1/dwell)"),
     ("world.devices.faregate.max_hold_steps", STEPS,
      "改札待ちで持ち越せる上限 [step]。実時間の安全弁を保つため逆比例"),
+    ("transit_staff.dwell.log_every_steps", STEPS,
+     "dwell_decision の記録周期 [step]。実時間の記録密度を保つため逆比例"
+     "(Δt=1 で不変のままだと L1 行数が10倍に膨れる)"),
     ("tools.permit_steps", STEPS, "許可待ちの長さ [step](0=待ちなし)"),
     ("tools.event_duration_steps", STEPS, "イベント開催時間 [step]"),
     ("tools.flyer_ttl_steps", STEPS, "チラシの寿命 [step]"),
@@ -373,6 +376,13 @@ TABLE: tuple[tuple[str, str, str], ...] = (
     ("planning.day_plan.transfer_min", INVARIANT, "移動/準備の最小時間[分](物理時間)"),
     ("planning.day_plan.max_slide_min", INVARIANT, "累積ずらしの上限[分](物理時間)"),
     ("planning.day_plan.day_end_min", INVARIANT, "計画が収まるべき終端。分 of day の時刻"),
+    # ---- 計画駆動の圏外滞在(actor model P4)。時刻・時間量は全て**物理時間[分]**で持つ ----
+    # (start_min / start_spread_min / start_grid_min / hours_min は棚卸し正規表現に
+    #  掛からない = 分の量として自明。ここに宣言が要るのは step を名に持つ 1 件だけ)。
+    ("planning.day_plan.boundary.min_outside_steps", INVARIANT,
+     "退出が遅れて帰還予定時刻を過ぎた場合の**最小滞在 tick 数**。物理的な滞在長ではなく"
+     "『滞在を空にしない』という構造的な下限(既定 1 = 少なくとも 1 tick は外に居る)"
+     "なので Δt を掛けてはいけない — 掛けると Δt=1 で下限だけが 10 倍に伸びる"),
     # ---- engaged モード(第87バッチ)。★時間量は**すべてシミュ内の分**で持つ ----
     # エピソードは「区間」なので step で持つと Δt を変えたとき『30 分の不応期』の意味が
     # 変わってしまう。ターン上限・試行上限は**件数**、比率・倍率は**無次元**なので不変。

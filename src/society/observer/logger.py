@@ -113,6 +113,10 @@ class ObserverLogger(FinalizeStreamMixin):
         # scheduler._apply が「いまこの行為を適用中」のあいだだけ (cause_type, 行為者 id)
         # を立てる。OFF では scheduler が set_cause を 1 度も呼ばない = None のまま。
         self._cause: tuple | None = None
+        # 装置スコープ(IF-F W2)。世界プロセスの phase 本体(物流・商業・行政・交通事業者)が
+        # 「いまこの装置の処理を回している」あいだだけ **装置 id の文字列**を立てる。
+        # OFF では devices.cause_scope が何もしない singleton を返すので None のまま。
+        self._device: str | None = None
 
     # ---- 来歴スコープ(scheduler._apply が開閉する。observer.llm_link ON のみ)----
     def set_prov(self, call_id: str, role: str, agent_id: int) -> None:
@@ -127,6 +131,20 @@ class ObserverLogger(FinalizeStreamMixin):
 
     def clear_cause(self) -> None:
         self._cause = None
+
+    # ---- 装置スコープ(devices.cause_scope が開閉する。observer.causality ON のみ)----
+    #   ★行為スコープ(set_cause)と**直交**する: あちらは「誰が」= int の行為者 id、
+    #     こちらは「どの装置が」= 文字列の装置 id。actor_id には 1 バイトも触らない
+    #     (装置は個体ではないので、装置起因の行から偽の行為者を作らない)。
+    def set_cause_device(self, device_id: str | None) -> None:
+        self._device = None if device_id is None else str(device_id)
+
+    def clear_cause_device(self) -> None:
+        self._device = None
+
+    def cause_device(self) -> str | None:
+        """いま開いている装置スコープの id(入れ子の保存/復帰に使う。無ければ None)。"""
+        return self._device
 
     # ---- L1 ----
     def log(self, event: Event) -> None:
@@ -175,6 +193,17 @@ class ObserverLogger(FinalizeStreamMixin):
                 event.actor_id = (self._cause[1] if own else
                                   _causality.actor_of(event.kind, event.agent_id,
                                                       event.payload))
+            # 装置の同一性(IF-F W2)。優先順位は cause_type と同じく
+            #   ① Event に明示された値(devices.py が自分の emission へ直接刻む)
+            #   ② いま開いている装置スコープ(世界プロセスの phase 本体)
+            # ★スコープが開いていても**刻んでよい cause_type は限られる**
+            #   (causality.DEVICE_STAMPABLE)。装置の処理の最中に出た行でも、
+            #   agent(別の主体の行為)と physics(個体の身体・空間の内部力学)と
+            #   natural(世界の外から来た入力)を作ったのはその装置ではない。
+            #   ここを緩めると grievance の state_update まで装置の作った出来事に化ける。
+            if (event.device_id is None and self._device is not None
+                    and event.cause_type in _causality.DEVICE_STAMPABLE):
+                event.device_id = self._device
         self.events.append(event)
 
     # ---- L1b ----
@@ -214,12 +243,15 @@ class ObserverLogger(FinalizeStreamMixin):
             "rng_stream":  pa.array([e.rng_stream for e in events], pa.string()),
             "llm_call_id": pa.array([e.llm_call_id for e in events], pa.string()),
         }
-        # 因果台帳 IF-F: **ON のときだけ** 2 列を末尾に足す(part / canonical の
+        # 因果台帳 IF-F: **ON のときだけ** 3 列を末尾に足す(part / canonical の
         # どちらもこの 1 関数を通るので、生える/生えないの判断はここ 1 箇所)。
         # OFF では dict が 1 バイトも変わらない = 既存ランと parquet スキーマ同一。
+        # device_id は W2 で足した 3 列目(装置の同一性。cause_type / actor_id を
+        # 1 バイトも動かさない **追記**なので、W1 の ON ランとも突き合わせられる)。
         if self.causality_on:
             cols["cause_type"] = pa.array([e.cause_type for e in events], pa.string())
             cols["actor_id"] = pa.array([e.actor_id for e in events], pa.int32())
+            cols["device_id"] = pa.array([e.device_id for e in events], pa.string())
         return pa.table(cols)
 
     def _rows_table(self, rows: list[dict]) -> pa.Table:

@@ -97,6 +97,25 @@ PROJECTION_4WAY: dict[str, str] = {
 #: 「エージェント帰属率」が個体数と step 数の関数になってしまい指標として死ぬ。
 TICK_CAUSES: frozenset[str] = frozenset({PHYSICS, SCHEDULE})
 
+#: **装置スコープが ``device_id`` を刻んでよい cause_type**(IF-F W2)。
+#:
+#: 装置スコープ(``society/devices.cause_scope``)は「いまこの装置の処理を回している」
+#: という窓でしかない。窓の中で出た行が全てその装置の作った出来事だとは限らないので、
+#: 刻んでよい語を**明示的に閉じる**:
+#:
+#:   - ``device`` / ``schedule`` … その装置の処理そのもの(刻む)
+#:   - ``boundary``              … その装置が出した**観測要約**(device_load /
+#:                                 signal_summary / public_budget 系。世界を動かさない
+#:                                 記録だが、出したのは確かにその装置なので刻む)
+#:   - ``agent``   … **別の主体の行為**。装置の窓の中で出ても行為者は個体である(刻まない)
+#:   - ``physics`` … 個体の身体・空間の内部力学(grievance の state_update 等)。
+#:                   装置の処理が引き金でも、その出来事を作ったのは身体である(刻まない)
+#:   - ``natural`` … 世界の外から来た入力(災害そのもの)。装置は起こしていない(刻まない)
+#:
+#: ★この線引きが無いと、交通事業者スコープの中で出る grievance の ``state_update`` まで
+#:   「事業者が起こした出来事」に化ける(実測: 遅延 1 回で街内人数ぶん出る)。
+DEVICE_STAMPABLE: frozenset[str] = frozenset({DEVICE, SCHEDULE, BOUNDARY})
+
 
 # --------------------------------------------------------------------------- #
 # kind → cause_type(**register_event_kind された全種を網羅する**。件数は書かない
@@ -301,9 +320,14 @@ CAUSE_OF_KIND: dict[str, str] = {
 
     # ---- 都市・環境・自然 ------------------------------------------------------ #
     "weather":       NATURAL,
-    "disaster":      NATURAL,
-    "transit_delay": DEVICE,
-    "infra_outage":  DEVICE,
+    "disaster":      NATURAL,        # ★自然事象は**災害そのもの**だけ(外生入力)
+    # ★運休・遅延・障害の告知は「自然の続き」ではなく**事業者(装置)の判断**である
+    #   (IF-F W2 で実体化した: 台風が線路を止めるのではなく、台風という外部入力を見た
+    #    運行事業者が止めると決める = DEVS の δ_ext)。分類は W1 の時点で既に device
+    #    だったので**表は 1 バイトも変えていない**。W2 で足したのは device_id 側の
+    #    同一性(operator:transit / operator:infra)であって、語の付け替えではない。
+    "transit_delay": DEVICE,         # 運行事業者の遅延/運休の判断(device_id=operator:transit)
+    "infra_outage":  DEVICE,         # 供給事業者の障害告知(device_id=operator:infra)
     "env_feedback":  DEVICE,         # 集約物理量の閾値超過でコード側が発火
     "crowd_surge":   SCHEDULE,       # 暦(大型行事)で決まる群集
     "annual_event":  SCHEDULE,
@@ -329,6 +353,14 @@ CAUSE_OF_KIND: dict[str, str] = {
     "gate_pass":     DEVICE,         # 改札装置が待たせた通過(待ちが出た回だけ記録)
     "device_load":   BOUNDARY,       # 装置 1 台 1 時間の負荷**要約**(世界を動かさない観測)
     "signal_summary": BOUNDARY,      # 信号の周期パラメータの開示(同上)
+
+    # ---- 鉄道の当直(駅員・車掌)。材料側 registration = src/society/transit_staff.py ---- #
+    "dwell_decision": DEVICE,        # ドア閉(停車時間延長)の判断。当直が居れば
+                                     #  agent_id = 乗務員だが、**居ない回は agent_id=-1** で
+                                     #  同じ kind が出る(payload.unstaffed)。判断そのものは
+                                     #  ホーム負荷の決定論則なので原則3(迷ったら device)を適用。
+                                     #  乗務員が居た回の行為者は actor_of が agent_id から戻す。
+    "transit_staff_bound": BOUNDARY,  # 起動時 1 回の持ち場束ね統計(workplace_bound と同型)
 }
 
 
