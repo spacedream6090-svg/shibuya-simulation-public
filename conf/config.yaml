@@ -492,6 +492,45 @@ world:
     drop_threshold: 0.05        # これ未満に薄れた痕跡はレコードごと消える(明示的失効ロジック)
     max_per_step: 32            # 1 step に集約する件数の上限(暴走時の L1 膨張を防ぐ安全弁)
 
+  # ---- 夜間経済 = 夜(00:00-05:00)を表現可能にする層(第101 III-1。**既定 OFF=現行と完全同一**)----
+  # 監査の指摘: 現行の街は**構造的に夜が無い**。(1) work._window が「閉<=開」を open+8h へ丸めるので
+  # 22:00→06:00 の夜勤が原理的に作れない(台帳のシフトは 4 種・最遅 close=23:00)(2) commerce の
+  # 営業時間表がカテゴリ 3 種だけで、コンビニは汎用 shop として 21:00-10:00 に強制閉店(3) 夜勤者の
+  # 生成器が無い(4) 終電を逃した個体は縁まで歩いて**世界から出る**。
+  # 実装 src/society/night.py。生成器側(夜勤者)は scripts/build_orgs.py --night-shifts が担う。
+  # R1: LLM 追加呼ゼロ・**乱数ゼロ**(避難先の選定は (距離, node id, poi id) の純関数)。
+  # OFF が保つ不変条件: night_refuge 0 件・agent に属性が生えない・営業時間表が 1 エントリも
+  #   変わらない・勤務窓の丸めが従来コードのまま・L1 バイト一致(golden_baseline_l1.json)。
+  night_economy:
+    enabled: false              # ★false=完全 no-op(バイト一致)。true で下の 3 点が同時に効く
+    midnight_shift: true        # 日跨ぎシフト(close<open を「翌朝まで」と読む)。親 enabled 配下。
+                                #   false にすると営業時間と避難先だけを有効にできる
+    # 営業時間の上書き(cat **または** subcat → [開店時, 閉店時]。24h 表記・開==閉 = 24 時間営業)。
+    # ★正直な限界: 現行地図 v7(data/shibuya_osm_wide_v7.json)の POI は cat しか持たない
+    #   (build_map.poi_category が OSM の shop=convenience を汎用 shop へ潰し、生タグを保存して
+    #   いない)。よって **subcat 系のエントリ(convenience/net_cafe/sauna/karaoke/club)は v7 では
+    #   1 件も当たらない = 完全な no-op**。地図 v8 が POI に subcat を通した時点で、この表を
+    #   1 バイトも書き換えずにそのまま効きはじめる(前方互換)。今すぐ効くのは cat に当たる
+    #   nightlife だけ。POI 名の一般名詞マッチは誤判定が多すぎるので既定では使わない(下記)。
+    hours:
+      convenience: [0, 0]       # コンビニ = 24 時間営業  ※v8 待ち
+      net_cafe: [0, 0]          # ネットカフェ・複合カフェ = 24 時間(終電後の受け皿) ※v8 待ち
+      sauna: [0, 0]             # サウナ・カプセル = 24 時間 ※v8 待ち
+      karaoke: [11, 5]          # カラオケ 11:00〜翌 05:00 ※v8 待ち
+      club: [22, 5]             # クラブ 22:00〜翌 05:00 ※v8 待ち
+      nightlife: [18, 5]        # 夜遊び(v7 でも当たる。commerce の既定と同値=明示のみ)
+    # サブカテゴリ判定の名称キーワード(subcat → キーワード列)。**既定は空 = 1 件も分類しない**。
+    # ★ETHICS §2: 実在企業名(ブランド名)はソース/config に書かない。v7 の POI 名で一般名詞
+    #   (「ストア」「マート」等)を拾うと Apple Store / ABC マート等をコンビニと誤判定する
+    #   (実測: 一般名詞ヒット 21 件のうちコンビニ相当は 4 件)。運用者が明示したときだけ効く。
+    subcat_keywords: {}
+    refuge:                     # 終電後の避難先(ネカフェ/サウナ/カラオケ)。親 enabled 配下
+      enabled: true
+      cats: [nightlife]         # 避難先とみなす POI カテゴリ(v7 で実在するもの)
+      subcats: [net_cafe, sauna, karaoke]   # 同 サブカテゴリ(v8 / subcat_keywords で活きる)
+      max_dist_m: 800.0         # 駅からこの距離までの避難先だけを使う(終電後の徒歩圏)
+      max_stay_min: 480         # 始発が見つからない(運休等)ときの滞在上限 [分]。街に固まらない安全弁
+
   # ---- 装置(device)層 = 目標を持たないアクター(actor model P2。**既定 OFF=現行と完全同一**)----
   # 設計文書「世界に作用するものは全てアクターにする」の装置(device)の層。装置の契約は
   #   状態を変えてよいのは (a) 宣言済みのスケジュール/物理[DEVS δ_int] か
@@ -1116,6 +1155,100 @@ transit_staff:
     calibrated: false
     dwell_s_per_15pax: 1.0      # 東京実証則の係数[秒 / 15人](calibrated=true のときだけ効く)
     log_every_steps: 1          # dwell_decision の記録間引き(観測装置の設定であって世界の量ではない)
+
+# ---- ラッシュ時の車内 = シミュレートされた空間(Wave 4 II-1。実装 src/society/transit_interior.py)----
+# 監査事実: 駅からの流入は**瞬間移動**だった(loc=outside → enter_area の 1 step)。渋谷に着く人の
+#   大半は直前まで十数分、混雑率 111〜167% の車内で他人と密着していたのに、その時間は存在しなかった。
+# ★前提: world.inflow_pulse.enabled が ON でなければ「同じ列車の乗客」という集団が立たない
+#   (全員が別々の分に着く)。したがって本層は **2 つの ON の論理積**でしか動かない
+#   (transit_staff が env.feedback の ON を要求するのと同じ「誰も読まない数字を書かない」線引き)。
+# ★★会話は 1 本も増やさない: 車内は静かな同席(スマホ 70〜84% / うたた寝 / 読書)で、見知らぬ他人との
+#   会話はほぼゼロ(車内の迷惑行為の第 1 位が「騒々しい会話」51.8% = 話しかけない規範が強い)。
+#   同席は L1 に**記録するだけ**で、そこから何かが起きるかは既存の関係機構が街の中で決める
+#   (= familiar strangers は通勤の規則性から自然に生まれる、という PNAS 2013 の枠組み)。
+# 既定 OFF が保つ不変条件: train_* の L1 0 件・agent に属性が生えない・記憶に 1 行も入らない・
+#   sim にも state が生えない・プロンプト 1 バイト不変・L1 バイト一致。
+transit_interior:
+  enabled: false                # ★車内層の親トグル。false=完全 no-op(バイト一致)
+  ride_minutes: 15              # 乗車の長さ[分]。降車(帰還 step)から遡ってこの長さが車内
+                                #   実効は max(1, round(ride_minutes / Δt)) step
+  include_plan_returnees: true  # 計画駆動の圏外帰還者(planning.day_plan.boundary)も駅から帰るなら
+                                #   列車に乗せる。★帰還時刻そのものは 1 ビットも動かさない
+                                #   (その時刻に着く列車の名前を後付けするだけ = 読むだけ)
+  # ---- 車両諸元の既定(路線表に当たらない路線はこれ)。20 m 4 扉のありふれた通勤形式 ----
+  # ★基盤(src)は路線名のリテラルを 1 つも持たない(envpack ドクトリン)。実諸元は下の lines 表 = データ。
+  default_line:
+    cars: 10                    # 編成両数
+    car_len_m: 20.0             # 1 両の長さ[m]
+    capacity: 150               # 1 両の定員[人] ★物理的上限ではない(混雑率 250% まで乗る)
+    seats: 51                   # 1 両の座席数
+    doors: 4                    # 片側のドア数(= ドア脇区画の数)
+    congestion: 1.30            # 混雑率アンカー(ピーク時・最混雑区間)
+  # ---- 路線別の諸元と混雑率アンカー(match = 路線名の部分一致トークン。最長一致が勝つ)----
+  # 混雑率は国土交通省の三大都市圏 混雑率調査(渋谷**方向**のピーク 1 時間・最混雑区間)。
+  # ★半蔵門線は渋谷が最混雑区間ではない(ピークは渋谷の**先**)ので、渋谷到着時点の値としては低い。
+  # 車両諸元は各形式の公表値。★銀座線だけ 16 m 3 扉(20 m 4 扉の定数を絶対に流用しない)。
+  lines:
+    - {match: "山手線",     cars: 11, car_len_m: 20.0, capacity: 157, seats: 51, doors: 4, congestion: 1.36}
+      # E235 系 11 両(先頭 142 / 中間 160・中間の座席 51)= 編成 1,724 人。capacity は 1 両平均
+    - {match: "埼京線",     cars: 10, car_len_m: 20.0, capacity: 160, seats: 51, doors: 4, congestion: 1.67}
+      # ★渋谷方向の最混雑(167%)= 本シムで最も押し込まれる路線
+    - {match: "銀座線",     cars: 6,  car_len_m: 16.0, capacity: 104, seats: 40, doors: 3, congestion: 1.53}
+      # ★16 m 3 扉・6 両(先頭 93 / 中間 106・座席 28/40)。20 m 4 扉の定数を流用しない
+    - {match: "田園都市線", cars: 10, car_len_m: 20.0, capacity: 153, seats: 52, doors: 4, congestion: 1.38}
+      # 2020 系 10 両 = 編成 1,526 人(先頭 141 / 中間 152・座席 48/54)。池尻大橋→渋谷
+    - {match: "東横線",     cars: 9,  car_len_m: 20.0, capacity: 150, seats: 51, doors: 4, congestion: 1.24}
+    - {match: "副都心線",   cars: 10, car_len_m: 20.0, capacity: 150, seats: 51, doors: 4, congestion: 1.17}
+    - {match: "半蔵門線",   cars: 10, car_len_m: 20.0, capacity: 150, seats: 51, doors: 4, congestion: 1.11}
+    - {match: "井の頭線",   cars: 5,  car_len_m: 20.0, capacity: 150, seats: 51, doors: 4, congestion: 1.25}
+  # ---- 時間帯の混雑倍率([開始分, 終了分, 倍率]・分 of day の半開区間。最初に当たった窓が勝つ)----
+  # アンカーは「ピーク 1 時間」の値なので、日中はその 60〜80%・深夜早朝は更に下へ落とす。
+  congestion_scale:
+    windows:
+      - [420, 540, 1.00]        # 07:00-09:00 朝ラッシュ = アンカーそのもの
+      - [540, 1020, 0.70]       # 09:00-17:00 日中
+      - [1020, 1200, 0.95]      # 17:00-20:00 夕ラッシュ
+      - [1200, 1380, 0.60]      # 20:00-23:00 夜
+    default: 0.45               # それ以外(早朝・終電帯)
+  # ---- 立客の区画別シェア(1 両の立位定員 = 定員 − 座席 を割る比)----
+  # 実測: 立客はドア脇の吹き溜まりに ~49%・座席前の帯に ~31%・残りが中央通路。
+  zone_share: {door: 0.49, front: 0.31, aisle: 0.20}
+  # ---- 車両選択(logit-lite = 誤差項なしの決定論 argmax)----
+  # ★UCL の推定にある「降車駅の出口位置(重み ~0.44)」の項は**持たない**: 本シムの駅は
+  #   1 ノードで全員が同じ改札から出るため恒等的に消える。消える項を重みつきで残すのは嘘。
+  car_choice:
+    pos_weight: 1.0             # 編成上の「好みの位置」との距離のペナルティ
+    load_weight: 0.6            # その車両に既に居る地図内乗客数 / 目標乗車人数 のペナルティ
+  # ---- 車内行動(静かな同席の 3 種)。★会話はここに無い(語彙として存在させない)----
+  # スマホ 70〜84% の中央、うたた寝は**着席時のみ**(立位では他 2 種へ重み比で再配分)。
+  activity: {smartphone: 0.77, doze: 0.13, read: 0.10}
+  memory:
+    enabled: true               # 降車後に読む圧縮記憶 1 行(乗車 1 回につき 1 行だけ)
+    crowd_bands: [0.9, 1.5]     # 乗車率の段の境目 → 空いていた / 混んでいた / ぎゅうぎゅうだった
+                                #   ★文面に数字は 1 つも出ない(個体は混雑率という統計量を知らない)
+  # ---- 不快・疲労(Evans & Wener: 効くのは車両平均ではなく**座席周りの局所密度**)----
+  comfort:
+    density_floor: 1.0          # 局所密度がこれを超えた分だけ疲労が乗る(1.0 = 公称容量)
+    fatigue_per_step: 0.02      # 1 step・超過密度 1.0 あたりの疲労[/step]
+    fatigue_max: 0.12           # 1 乗車で乗せる疲労の上限(安全弁)
+  # ---- 同席の記録(familiar strangers の素材。ここから何も起こさない)----
+  copresence:
+    enabled: true
+    max_pairs_per_car: 24       # 1 乗車 1 人あたりに控える同席相手の上限(L1 の量の上限)
+    max_pairs_per_day: 8        # ★1 日 1 **人**あたりの記録上限。総量の硬い上限は
+                                #   n_agents × この値。グローバルな日次カウンタにしないのは
+                                #   resume のため(sim 側の日次カウンタは checkpoint に載せられず、
+                                #   上限が binding なランで resume ≠ straight になる)。
+                                #   個体側の予算なら agents pickle に自然同梱される
+    adjacent_only: false        # true = 同一/隣接区画の対だけを記録する(相互作用可能な距離に限る)
+  # ---- 車掌の巡回(transit_staff も ON のときだけ)----
+  conductor:
+    enabled: true
+    patrol_interval_steps: 1    # 何 step ごとに 1 両進むか
+    dwell_load_weight: 0.0      # ★既定 0 = 観測のみ。車内の立客数を停車時間の負荷へ足す重み。
+                                #   0 にしてあるのは、ホーム密度 → 停車時間の較正(+15 人/車両 ≒ +1 秒)を
+                                #   既に env.feedback 規則1 が**ホーム側の人数**で持っているため
+                                #   (素で足すと同じ物理の二重計上)。0 でも payload には出る
 
 lod:
   max_llm_per_step: 300         # LLM 発火の step 上限(実機実測で更新)
@@ -3299,10 +3432,32 @@ physics:
     channels: false
   # ゾーン宣言。**空 = 既定 = 物理 OFF**。
   zones: []
-  # ---- 記入例(コメントアウト。ON にするときはこのブロックを zones: の下へ移す)----
+  # ★★ 実配置は conf/zones_shibuya.yaml にある(第100バッチ Wave4 I-2。2026-08-06)★★
+  #   渋谷の 3 空間 = スクランブル交差点(orca・実信号 140/37/10 を data/crossings_shibuya.json の
+  #   crossing_id 291758776「渋谷駅前」pedestrian_scramble から table 引き)/ ハチ公前広場(sfm)/
+  #   センター街 入口〜中程(sfm)を、**data/shibuya_osm_wide_v7.json の実座標**で宣言してある。
+  #   使い方:  python scripts/run.py --profile conf/zones_shibuya.yaml
+  #            観察ラン(conf/observe.yaml)や本番(conf/production.yaml)と併せるときは、
+  #            --profile が 1 本しか取れないので **同ファイルの `physics:` ブロックを相手の
+  #            プロファイルへそのまま貼る**(world.map が wide_v7 でなければその行も一緒に)。
+  #   検収:    tests/test_zones_shibuya.py(内部ノード/ゲート/面積/信号の実体/較正の選択/
+  #            resume/決定論/既定 OFF の不変)。
+  #   ★ここ(基底)は `zones_enabled: false` / `zones: []` のまま **絶対に触らない**
+  #     = ゴールデンは 1 バイトも動かない。ON は常に profile 側の opt-in である。
+  #   ★正直な申告(実測): 所有は「経路がゾーンを通り抜ける個体」に対して**現在地から**始まる
+  #     (グラフ移動は 1 step で 800 m 進むので、そうしないとゾーンを跳び越す個体を取りこぼす)。
+  #     そのため zone_gate の span_m は数百 m に達し、**L2 の zone_occupancy /
+  #     zone_density_mean は「ポリゴン内の人数」ではなく「所有中の人数」**である。
+  #     ポリゴン内の実密度を見たいときは個体側の Perception.body.local_density を使うこと。
+  # ---- 記入例(コメントアウト。上の実配置を使わず自分で書くときの雛形)----
   # 交差点ゾーン: 開放平面の多方向交差流 = P2 決定の割当規則で **engine: orca**。
   # 信号は既存の交差点表(data/crossings_shibuya.json)から引く(cycle/green/flash を実測値で)。
   # crossing_id 250652228 は同表の 1 件(cycle_s 140 / green_s 37 / flash_s 10)。
+  # ※雛形なので任意の 1 件を挙げているだけ。**実際のスクランブル交差点は 291758776**
+  #   (scramble: true / crossing_ref: pedestrian_scramble / name: 渋谷駅前)で、
+  #   その id はグラフのノード id n291758776 と同じ = conf/zones_shibuya.yaml はそちらを使う。
+  # ※ポリゴンは平面図形なので、地上の交差点を囲むと**真下の地下通路ノードも囲む**。
+  #   地上だけを縫い付けたいゾーンには `layers: [0]` を書くこと(既定 [] = 全レイヤー)。
   # zones:
   #   - id: scramble
   #     engine: orca              # 交差流の実測: 効率 0.924 vs SFM 0.530・反転 1/5(P2 決定)
@@ -3329,3 +3484,68 @@ physics:
   #     polygon: [[-60, -80], [10, -80], [10, -20], [-60, -20]]
   #     walls: { mode: layered_json, path: data/plateau/ubld_lod4.json, layers: [3] }
   #     walkable: { mode: polygons_json, path: data/plateau/tran_lod3.json }
+
+# --------------------------------------------------------------------------- #
+# 街の顔 = 路上の生業と条例(Wave 4 III-3。実装 src/society/street_life.py。**既定 OFF**)
+#
+# 何を足すのか: 本シムの路上には「店」と「通行人」しか居なかった。現実の渋谷の路上で
+# いちばん目に入るのは**そこで生計を立てている人**である。
+#   ティッシュ配り / ストリートミュージシャン / キッチンカー営業者 / 路上占い師 /
+#   街頭演説者 / 募金スタッフ / 路上生活者 / 路上支援員(区の巡回相談)
+# の 8 役割を L5 名簿に足し、持ち場と時間帯に沿った日課を tier0(LLM 追加呼ゼロ・
+# **乱数ゼロ**)で回す。持ち場は**地図の構造から決定論導出**する(駅ノード・POI 密度・
+# POI カテゴリ・レイヤー)= conf にもコードにも地名・ブランド名を 1 つも書かない。
+#
+# ★客引き / スカウトは**独立した職業にしない**: 渋谷区の条例(2025-04 改正で過料 5 万円・
+#   立入調査・氏名公表)は**雇い主(店)も対象**にしており、実際の客引きは夜の店に雇われた
+#   従業員の副業務である。そこで「夜間店舗に職場を持つ既存の従業者の決定論的な部分集合」が
+#   夜の時間帯に店の前で客引きに立つ(touting)。近傍の警察官が警告(touting_warning)→
+#   再犯で過料(touting_fine)→ クールダウンで持ち場を移す=いたちごっこ。
+# ★既存の迷惑行為「客引き」(society_diversity.nuisance_kinds)は本機構 ON のとき
+#   **供給を止める**(併存ではなく置き換え)= 同じ出来事を二重に出さない。
+#
+# ★尊厳規約(路上生活者。ユーザー承認済みの明文条件):
+#   語彙は「路上生活者」のみ / 犯罪・迷惑機構に**一切接続しない**(加害者・被害者・周囲の
+#   すべてから除外)/ 記憶・行動・発火の権利は他と完全同一 / 区の支援事業が世界に存在する
+#   (outreach_contact → 積み重なれば既存の住居機構経由で shelter_move)/ 夜は公園のそば・
+#   地下通路、日中は街を移動、雨天は屋根のある場所へ。
+#
+# R1: LLM 追加呼ゼロ・**乱数 stream ゼロ**・プロンプトの節ゼロ増(路上の出来事は既存の
+#   記憶欄に定型 1 行が入るだけ)。OFF が保つ不変条件: 新 12 種の L1 が 0 件・agent に属性が
+#   生えない・sim に state が生えない・summary に street_life キーなし・プロンプト 1 バイト
+#   不変・L1 バイト一致(golden_baseline_l1.json)。
+street_life:
+  enabled: false                # ★false=完全 no-op(バイト一致)。true で路上の生業・条例が動く
+  # ---- 持ち場(地図からの決定論導出)----
+  posts_per_role: 4             # 1 役割に用意する持ち場ノード数(id 昇順で循環割当)
+  notice_radius_m: 25.0         # 路上の出来事に気づく距離[m](知覚半径とは別系統)
+  notice_cap: 8                 # 1 セッションで記憶 1 行が入る人数の上限(暴走の安全弁)
+  # ---- 活動(**確率ではなく決定論の刻み**: 何人に 1 人が応じるか = 乱数を引かない)----
+  tissue_accept_every: 4        # 通行人の 4 人に 1 人が受け取る
+  stall_price: 900.0            # キッチンカーの単価[円]
+  stall_buy_every: 6
+  fortune_fee: 2000.0           # 路上占いの料金[円]
+  fortune_every: 12
+  donation_amount: 300.0        # 街頭募金の 1 口[円](街の外の団体へ = SFC ON では RoW)
+  donation_every: 8
+  # ---- 客引き(条例の対象)----
+  tout_every: 4                 # 夜間店舗の従業者の 4 人に 1 人が客引きに立つ(決定論)
+  tout_accept_every: 10
+  tout_bands: [1140, 1440]      # 客引きの時間帯[分 of day]= 19:00〜24:00
+  zone_radius_m: 700.0          # 条例の啓発区域(駅からおよそ 700 m)
+  # ---- 条例パトロール ----
+  fine_amount: 50000.0          # 過料 5 万円(渋谷区の条例 2025-04 改正)
+  fine_grievance: 0.0           # 過料を受けた不満(factors 経由。0.0=接続しない=既定)
+  warn_before_fine: 1           # 何回目の警告までは過料にしないか(1=2 回目で過料)
+  cooldown_steps: 6             # 警告/退去のあと活動を止める step 数(いたちごっこ)
+  # ---- 路上生活者(尊厳規約)----
+  rough_money_cap: 3000.0       # 手持ちの上限[円](名簿の既定レンジは住民向けのため丸める)
+  # ★巡回相談が届く範囲[m]。notice_radius_m(25m=路上の視聴距離)とは**別の値**にする:
+  #   巡回相談は「その一帯を回る」行為で、公園や地下通路という**範囲**を対象にするから。
+  #   25m を使い回した初版は接触が**実測 0 件**になった(支援員と路上生活者が同じ帯に
+  #   街に居ても最近接 121m)= 支援事業が世界に存在しないのと同じ状態だった。
+  outreach_radius_m: 150.0
+  outreach_period_days: 3       # 区の巡回相談の周期[日]
+  outreach_shelter_after: 3     # 何回の相談で住居へ移行するか(0=移行なし)
+  # ---- L1 安全弁 ----
+  max_events_per_step: 32       # 1 step に出す本機構の L1 件数の上限(超過分は捨てる)

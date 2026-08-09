@@ -29,6 +29,15 @@ R1 呼数不変: どの機構も generate() を1本も足さない。観光属�
   発火判断に食わせず名簿・config・新 stream・物理位置・犯罪履歴(k 非依存)のみ参照する=compute_matched
   下の k 不変性(k=free==k=off の呼数一致)で担保する。grievance は drive(発火系)には接続しない。
 
+★路上の生業(Wave 4 III-3 = src/society/street_life.py)との関係(2 点。既定 OFF では無風):
+  1. **迷惑行為「客引き」の重複解消**: street_life が ON のとき、tick_crime は nuisance の種類から
+     「客引き」を**供給しない**(nuisance_kinds_for)。あちらでは客引きが「夜の店に雇われた従業員が
+     条例の禁止行為として行うこと」= 主体・場所・罰則(過料5万円)を持つ行為になるので、同じ出来事を
+     無主体の確率イベントとして二重に出すと条例の効き目が測れなくなる(併存ではなく**置き換え**)。
+  2. **路上生活者の尊厳規約**: street_life が ON のとき、路上生活者は加害者・被害者・周囲の
+     **すべて**から除外される(_street_life_excluded)。これは現実の主張ではなく「この機構と
+     結びつけない」という設計判断で、L1 の crime/nuisance に彼らの id が 1 度も現れないことを保証する。
+
 既定 OFF(enabled=false)= 観光属性・言語属性を付けず・観光回遊なし・伝播障壁なし・犯罪/迷惑なし・
   危険地帯回避なし・"tourist"/"crime" stream も引かない=イベント 0 件・乱数消費不変(ゴールデン
   golden_baseline_l1.json を守る)。新イベント種は crime / nuisance / tourist_visit(schema.py 登録済み=編集しない)。
@@ -245,11 +254,50 @@ def safe_dests(sim, agent, dests: list[str]) -> list[str]:
 
 
 # ---------------------------------------------------------------- 犯罪・迷惑行為(毎step)
-def _pick_victim(here: list, offender):
-    """同ノードの被害者(自分・警察官を除く最小 id)。居なければ None。"""
+def _pick_victim(here: list, offender, exclude: frozenset = frozenset()):
+    """同ノードの被害者(自分・警察官・尊厳規約の除外 id を除く最小 id)。居なければ None。"""
     cands = sorted((o for o in here if o.id != offender.id
-                    and o.occupation not in POLICE_OCCS), key=lambda o: o.id)
+                    and o.occupation not in POLICE_OCCS
+                    and int(o.id) not in exclude), key=lambda o: o.id)
     return cands[0] if cands else None
+
+
+# ---------------------------------------------------------------- 路上の生業(Wave 4 III-3)との接続
+# 迷惑行為の「客引き」= street_life の ``touting`` と同じ出来事(下の nuisance_kinds_for を参照)
+_TOUTING_KIND = "客引き"
+
+
+def _street_life_excluded(sim) -> frozenset:
+    """犯罪・迷惑機構から**除外する** id 集合(``street_life`` の尊厳規約 2)。
+
+    ★``street_life`` が OFF(既定)なら必ず空集合 = 下のフィルタが完全 no-op になり、
+      ゴールデン L1 バイト一致が壊れない(ON でも 路上生活者が名簿に居なければ空)。
+    ★これは「路上生活者は犯罪をしない」という現実の主張ではなく、**この機構と
+      結びつけない**という設計判断である(結びつければシムがスティグマを再生産する)。
+      除外は加害者・被害者・周囲の**すべて**に掛ける = L1 の crime / nuisance の
+      payload に彼らの id が 1 度も現れない(tests/test_street_life.py が機械固定)。
+    """
+    from . import street_life as street_life_mod
+    return street_life_mod.rough_sleeper_ids(sim)
+
+
+def nuisance_kinds_for(sim, cfg: dict) -> list:
+    """この step に使う迷惑行為の種類(``street_life`` ON なら「客引き」を**供給しない**)。
+
+    ★重複の解消(単一の源): 客引きは ``street_life`` が ON のとき「夜の店に雇われた
+      従業員が条例の禁止行為として行うこと」= **主体と場所と罰則を持つ行為**になる。
+      同じ出来事を「無主体の確率イベント(nuisance)」として二重に出すと、L1 の
+      客引き件数が 2 つの機構の和になり、条例の効き目(``touting_fine`` 後の減少)が
+      測れなくなる。そこで ON のときだけ ``nuisance_kinds`` から客引きを外す
+      (=**併存ではなく置き換え**)。他の 3 種(ナンパ・喧嘩・騒ぎ)は無関係なので残る。
+    ★OFF(既定)では cfg の値をそのまま返す = 従来と完全同一(バイト一致)。
+    """
+    kinds = cfg["nuisance_kinds"] or ["迷惑行為"]
+    from . import street_life as street_life_mod
+    if not street_life_mod.enabled(sim):
+        return kinds
+    out = [k for k in kinds if k != _TOUTING_KIND]
+    return out or ["迷惑行為"]
 
 
 def tick_crime(sim, step: int, sim_min: int) -> None:
@@ -279,18 +327,21 @@ def tick_crime(sim, step: int, sim_min: int) -> None:
     theft_amt = float(cfg["theft_amount"])
     cg = float(cfg["crime_grievance"])
     ng = float(cfg["nuisance_grievance"])
-    kinds = cfg["nuisance_kinds"] or ["迷惑行為"]
+    kinds = nuisance_kinds_for(sim, cfg)
+    excluded = _street_life_excluded(sim)                      # 尊厳規約 2(OFF は空集合)
     cn = _crime_nodes(sim)
     for a in sorted(sim.agents, key=lambda a: a.id):           # offender は id 昇順=決定論
         if a.loc == "outside" or a.sleeping:
             continue
         if a.occupation in POLICE_OCCS:                        # 警察官は加害しない
             continue
+        if int(a.id) in excluded:                              # 尊厳規約 2: 加害者にしない
+            continue
         if a.node in police_nodes:                             # 近傍(同ノード)警察官で抑止
             continue
         r = sim.hub.stream("crime", a.id, step).random()
         if cp > 0.0 and r < cp:                                # 窃盗
-            victim = _pick_victim(at_node[a.node], a)
+            victim = _pick_victim(at_node[a.node], a, excluded)
             if victim is None:
                 continue
             stolen = min(float(victim.money), theft_amt)
@@ -314,7 +365,8 @@ def tick_crime(sim, step: int, sim_min: int) -> None:
             cn[a.node] += 1
         elif npb > 0.0 and r < cp + npb:                       # 迷惑行為(客引き/ナンパ/喧嘩/騒ぎ)
             bystanders = [o for o in at_node[a.node]
-                          if o.id != a.id and o.occupation not in POLICE_OCCS]
+                          if o.id != a.id and o.occupation not in POLICE_OCCS
+                          and int(o.id) not in excluded]   # 尊厳規約 2: 周囲にも入れない
             if not bystanders:
                 continue
             kind = kinds[(int(a.id) + step) % len(kinds)]

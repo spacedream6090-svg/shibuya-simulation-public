@@ -93,6 +93,7 @@ from __future__ import annotations
 
 from . import devices as devices_mod
 from . import envfeedback as envfb
+from . import transit_interior as interior_mod
 from .observer.schema import Event, register_event_kind
 
 SCHEMA = 1
@@ -374,6 +375,39 @@ def on_duty_crew(sim, sim_min: int):
     return best
 
 
+def on_duty_crews(sim, sim_min: int) -> tuple:
+    """この step に乗務している乗務員**全員**(**agent id 昇順**)。居なければ空 tuple。
+
+    ★``on_duty_crew``(単数)と**同じ 3 条件**を使う(乗務員職 / 駅ノードに居る /
+      勤務窓の中)。単数版は「その先頭 1 人」であり、本関数はそれを一般化しただけで
+      ドア閉判断の側は 1 バイトも変えていない(単数版の実装には触っていない)。
+    ★用途は Wave 4 II-1(``transit_interior``)の**車内巡回**。同 step に複数の列車が
+      着くとき、受け持ちを名簿順の剰余で割り当てるために全員の名簿が要る。
+      ★正直な限界: 乗務員は駅ノードに束ねられた個体で**列車に紐づいていない**ので、
+      乗務員が列車より少なければ 1 人が複数の列車を受け持つ形になる(列車エンティティを
+      作るまでこれは直らない)。
+    """
+    cfg = cfg_of(sim)
+    station = _station(sim)
+    if not station:
+        return ()
+    _, crew_occ = _roles(cfg)
+    if not crew_occ:
+        return ()
+    from .cognition import routine as _routine     # 遅延 import(循環と重い import の回避)
+    cal = getattr(sim, "calendarcfg", None)
+    out = []
+    for agent in sim.agents:
+        if str(getattr(agent, "occupation", "")) not in crew_occ:
+            continue
+        if agent.loc == "outside" or agent.sleeping or agent.node != station:
+            continue
+        if not _routine.in_work_window(agent, sim_min, cal):
+            continue
+        out.append(agent)
+    return tuple(sorted(out, key=lambda a: int(a.id)))
+
+
 # =========================================================================== #
 # (3) 単一作用点(step 末)
 # =========================================================================== #
@@ -414,6 +448,11 @@ def _dwell(sim, step: int, sim_min: int, since_idx: int) -> None:
     # 集約は envfeedback と**同じ関数**(規則1 が見た負荷と 1 も違わないための唯一の担保)
     at_node, _inflow, exchange = envfb.aggregate(sim, station, since_idx)
     load = envfb.platform_load(at_node, station, exchange)
+    # Wave 4 II-1(車内層): 当直の車掌は**車内の立客**も見ている。既定 OFF(および
+    # transit_interior.conductor.dwell_load_weight=0.0)では **必ず 0** を返すので、
+    # ここは恒等 = 既存の delay_min は 1 ビットも動かない(バイト一致)。重みを上げると
+    # ホーム密度と車内立客の二重計上になることは conf 側に明記してある。
+    load += interior_mod.dwell_extra_load(sim)
     excess, inject, new = envfb.dwell_step(tcfg, load, prev, _sec_per_pax(dcfg))
     door = _in_service(sim, sim_min) or not dcfg["require_service"]
     if not door:
@@ -433,6 +472,9 @@ def _dwell(sim, step: int, sim_min: int, since_idx: int) -> None:
                "delay_s": round(inject * 60.0, 3), "delay_min": round(new, 3),
                "prev_min": round(prev, 3), "calibrated": bool(dcfg["calibrated"]),
                "unstaffed": crew is None}
+    # 車内層 ON のときだけ「車掌が何を見ていたか」を欄として残す(OFF は空 dict = 追記なし
+    # = payload バイト一致)。重み 0 でも出す = **観測と作用を分けて**記録する。
+    payload.update(interior_mod.dwell_payload(sim))
     operator = None
     if crew is None:
         operator = operator_device_id(str(station))

@@ -29,6 +29,14 @@ _WORK_CAT: dict[str, str | None] = {
     "大学生": "education",
     "フリーランス": None, "バンドマン": None, "配達員": None,
     "写真家": None, "無職": None,
+    # ---- 路上の生業(Wave 4 III-3。実装 src/society/street_life.py・既定 OFF)----
+    # 全員 None = **決まった職場 POI を持たない**(持ち場は路上のノードであって POI ではない)。
+    # 持ち場と勤務窓は street_life.bind が ON のときだけ与える(OFF では職場なし=従来と同じ
+    # 「職場を持たない職業」の扱いに落ちる)。★None を明示するのは _WORK_CAT.get の既定と
+    # 同値だが、「この職業は職場 POI を持たない」という設計判断を表に残すため。
+    "ティッシュ配り": None, "ストリートミュージシャン": None,
+    "キッチンカー営業者": None, "路上占い師": None, "街頭演説者": None,
+    "募金スタッフ": None, "路上生活者": None, "路上支援員": None,
 }
 
 

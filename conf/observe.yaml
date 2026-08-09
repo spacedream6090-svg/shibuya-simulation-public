@@ -79,3 +79,15 @@ relations:
 # work:
 #   service: { enabled: true, indoor_fields: true, office: { by_org: true }, ledger: { enabled: true } }
 # # → 事後: python scripts/build_occupancy.py runs/<run>  で 🏙在館タブ用サイドカーを生成(L1 不変)。
+
+# ---- (7) 屋外の連続物理ゾーン(P3 境界縫合 竹-4。**既定は入っていない = opt-in**)----
+# 渋谷の 3 空間(スクランブル交差点=実信号 140/37/10 の ORCA / ハチ公前広場=SFM /
+# センター街 入口〜中程=SFM)を、地図の実座標で宣言した profile が別ファイルにある:
+#     conf/zones_shibuya.yaml  (検収: tests/test_zones_shibuya.py)
+# scripts/run.py の --profile は 1 本しか取らないので、観察ランと併せるときは
+# **同ファイルの `physics:` ブロックと `world.map:` の行をこのファイルへそのまま貼る**
+# (この repo の合成作法。上の「production.yaml を土台に chance だけ足す」と同じ)。
+#   → ON にすると位置と到着時刻が物理で決まる = 世界が変わる(registry: strict / affects_k=false)。
+#   → ON のコスト実測(mock・n=100・48step): 2.93 s/step(OFF 0.27 s/step)= +2.66 s/step。
+#     ゾーンに 1 人でも居れば 1 step あたり 12,000 サブステップを回すので、**コストは人数より
+#     ゾーン数でほぼ決まる**(人数が増えても step あたりのコストはほとんど伸びない)。

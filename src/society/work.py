@@ -122,6 +122,10 @@ def build_cfg(raw: dict | None) -> dict:
             "default_close": str(bind.get("default_close", "18:00")),
             # occupation/role → 職場 POI カテゴリ(org_id が無い層=L5 等を束ねたい時の写像。既定=空)。
             "occ_cat": {str(k): str(v) for k, v in (bind.get("occ_cat") or {}).items()},
+            # 日跨ぎシフト(第101 III-1「夜間開放」)。**conf の work ブロックには無い**:
+            # 値は world.night_economy から night.wire_work が 1 回だけ注入する(既定 False)。
+            # False のとき _window は従来コード(閉<=開 → open+8h の丸め)を文字どおり通す。
+            "midnight_shift": bool(bind.get("midnight_shift", False)),
         },
     }
 
@@ -307,16 +311,25 @@ def _resolve_building(city, node: str, poi_building=None, poi_id=None) -> tuple[
     return (str(blds[0]["id"]), 1) if blds else (None, 0)
 
 
-def _window(bcfg: dict, entry: dict | None, record: dict) -> tuple[int, int]:
-    """勤務窓(open, close 分)。台帳 shift → record.shift_pattern → config 既定 の順に後退。"""
+def _window(bcfg: dict, entry: dict | None, record: dict) -> tuple[int, int, bool]:
+    """勤務窓 (open, close, 日跨ぎか)[分]。台帳 shift → record.shift_pattern → config 既定 の順に後退。
+
+    ★第101 III-1「夜間開放」。``midnight_shift``(= world.night_economy が ON のときだけ
+      night.wire_work が立てる)のとき、**close < open は「翌朝まで」の意味**として受ける
+      (22:00→06:00 の夜勤が表現できるようになる)。close == open は長さゼロの退化なので
+      夜勤とは読まず従来どおり丸める。
+    ★OFF のときは**従来の 2 行を文字どおり通す**(閉<=開 → open+8h の丸め)= バイト一致。
+      監査の指摘どおり、この丸めが「夜勤が原理的に作れない」唯一の原因だった。"""
     sp = record.get("shift_pattern") or {}
     op = (entry or {}).get("open") or sp.get("open")
     cl = (entry or {}).get("close") or sp.get("close")
     o = _hhmm_to_min(op, _hhmm_to_min(bcfg["default_open"], 9 * 60))
     c = _hhmm_to_min(cl, _hhmm_to_min(bcfg["default_close"], 18 * 60))
+    if bcfg.get("midnight_shift") and c < o:                # 日跨ぎ(夜勤): 翌朝まで働く
+        return o, c, True
     if c <= o:                                              # 逆転の保険(閉<=開)は既定8時間窓に補正
         c = o + 8 * 60
-    return o, c
+    return o, c, False
 
 
 def _resolve_node(record: dict, city, book: dict, bcfg: dict, key: str):
@@ -381,7 +394,32 @@ def bind_workplace(agent, record: dict, city, book: dict, bcfg: dict) -> tuple[b
         agent.work_building = bld
         agent.work_floor = int(floor) if int(floor) >= 1 else 1
     if int(getattr(agent, "work_start_min", -1)) < 0:      # 勤務窓が無い個体にだけ窓を補う
-        o, c = _window(bcfg, entry, record)
+        o, c, wraps = _window(bcfg, entry, record)
         agent.work_start_min = o
         agent.work_end_min = c
+        if wraps:                                          # 日跨ぎ(夜勤)= 第101 III-1。
+            # ★既定 OFF ではこの属性が**そもそも生えない**ので routine.in_work_window の
+            #   getattr(既定 False)は従来式へ落ちる = L1 バイト一致(証明可能な no-op)。
+            agent.work_wraps = True
+            _fix_night_commute(agent, record, o, c)
     return had, True, how
+
+
+def _fix_night_commute(agent, record: dict, o: int, c: int) -> None:
+    """夜勤者の**通勤の向き**を昼勤前提から夜勤前提へ直す(第101 III-1。ON 経路のみ)。
+
+    なぜ要るか(実測の穴): pool 経路の L2 は occupation が persona._WORK_CAT に載らないので
+    ``_pick_workplace`` が None を返し、``persona.build_agent`` は流入通勤者の到着時刻を
+    **既定の 08:30** にする(職場不明時の後退値)。勤務窓だけ夜勤にしても、本人は朝 8:30 に
+    街へ入り、就寝(=帰宅)トリガに触れて即座に帰る = 夜勤者が夜に街へ居ない。
+    ここで到着を「出勤 lead 分前」に、帰宅トリガが勤務窓の中に埋まっている場合だけ
+    「退勤 30 分後」に直す(どちらも o / c の純関数 = 乱数ゼロ・決定論)。
+
+    ★bedtime は**勤務窓に埋まっているときだけ**触る: 生成器(build_persona_pool)が既に
+      退勤後へずらしてある個体の個体差(10 分刻みの散らし)を潰さないため。"""
+    if getattr(agent, "commute", False):
+        lead = max(0, int(record.get("arrival_lead_min", 40) or 40))
+        agent.arrival_min = (int(o) - lead) % 1440
+    m = int(getattr(agent, "bedtime_min", 0)) % 1440
+    if m >= int(o) or m < int(c):                          # 帰宅トリガが勤務窓の中
+        agent.bedtime_min = (int(c) + 30) % 1440

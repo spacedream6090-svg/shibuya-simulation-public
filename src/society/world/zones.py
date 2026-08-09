@@ -108,6 +108,15 @@ SFM_DEFAULTS = {
 ZONE_DEFAULTS = {
     "id": "",
     "polygon": (),                # [(x,y), …] 地図ローカル m。3 点以上。
+    "layers": (),                 # 所属を許す垂直レイヤー(地図の node.layer)。
+                                  # ★既定 () = **全レイヤー**(= 従来の幾何だけの判定と 1 バイト同値)。
+                                  #   `[0]` と書くと地上ノードだけがゾーン内と見なされる。
+                                  #   必要な理由(実測): ポリゴンは平面図形なので、地上の交差点を
+                                  #   囲むと**その真下の地下通路ノードまで囲んでしまう**
+                                  #   (実地図の交差点ポリゴン 1 件で layer -1/-2 のノードが
+                                  #   3 件入った)。そのままだと地下を歩いている個体が地上の
+                                  #   ゾーンに所有され、**地下で赤信号を待つ**。
+                                  #   幾何(`contains`)は一切変えず、**ノードの所属判定だけ**を絞る。
     "engine": "sfm",              # "sfm" | "orca"(P2 決定: 既定 sfm・多方向交差流だけ orca)
     "dt_sub": 0.05,               # 物理サブステップ [s](P2 条件1: 0.02–0.05)
     "max_sub_steps": 12000,       # 1 世界 step で回すサブステップ上限(600s/0.05s = 12000)
@@ -149,6 +158,7 @@ class Zone:
 
     id: str
     polygon: tuple[tuple[float, float], ...]
+    layers: tuple[int, ...]
     engine: str
     dt_sub: float
     max_sub_steps: int
@@ -477,6 +487,7 @@ def _build_zone(spec: dict, repo_root: Path, step_seconds: float | None = None) 
     return Zone(
         id=zid,
         polygon=poly,
+        layers=tuple(int(k) for k in (merged["layers"] or ())),
         engine=engine,
         dt_sub=dt_sub,
         # 明示宣言があればそれを尊重し、無ければ Δt から導く(第99)。
@@ -510,10 +521,25 @@ def _check_disjoint(zones) -> None:
 # --------------------------------------------------------------------------- #
 # ゲート(グラフ ⇄ ゾーン の唯一の出入口)
 # --------------------------------------------------------------------------- #
+def node_in(zone: Zone, graph, node: str) -> bool:
+    """グラフノードがゾーンに**所属する**か(幾何 + 垂直レイヤー)。
+
+    `zone.layers` が空(既定)なら幾何だけ = `contains` と完全に同値(従来どおり)。
+    非空なら `graph.nodes[node]["layer"]` がその集合に含まれることも要求する。
+    ★ `Zone.contains(x, y)` 側(= 物理座標の内外判定)は**一切変えない**。
+      物理はもともと 2 次元平面で走るので、変えるべきは「どのノードを縫い付けるか」だけ。
+    """
+    d = graph.nodes[node]
+    if not zone.contains(float(d["x"]), float(d["y"])):
+        return False
+    if zone.layers and int(d.get("layer", 0)) not in zone.layers:
+        return False
+    return True
+
+
 def inside_nodes(zone: Zone, graph) -> tuple[str, ...]:
     """ゾーンの内側にあるグラフノード(id 昇順)。"""
-    return tuple(sorted(n for n, d in graph.nodes(data=True)
-                        if zone.contains(float(d["x"]), float(d["y"]))))
+    return tuple(sorted(n for n in graph.nodes if node_in(zone, graph, n)))
 
 
 def gates_of(zone: Zone, graph) -> tuple[str, ...]:
@@ -547,7 +573,7 @@ def route_span(zone: Zone, graph, node: str, route):
         (= 目的地がゾーン内。到着処理はグラフ側の責務なので所有しない = 正直な適用範囲)
     """
     seq = [node] + list(route or ())
-    ins = [zone.contains(*_xy(graph, n)) for n in seq]
+    ins = [node_in(zone, graph, n) for n in seq]
     try:
         first_in = ins.index(True)
     except ValueError:
@@ -556,11 +582,6 @@ def route_span(zone: Zone, graph, node: str, route):
         if not ins[j]:
             return seq[:j + 1], seq[j + 1:]
     return None
-
-
-def _xy(graph, node):
-    d = graph.nodes[node]
-    return float(d["x"]), float(d["y"])
 
 
 # --------------------------------------------------------------------------- #

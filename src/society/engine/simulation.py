@@ -745,6 +745,15 @@ class Simulation:
         raw_work = (OmegaConf.to_container(raw_work, resolve=True)
                     if OmegaConf.is_config(raw_work) else raw_work)
         self.workcfg = _work_mod.build_cfg(raw_work)
+        # 夜間経済(world.night_economy。第101 III-1。既定 OFF=現行挙動と完全同一)。
+        # 日跨ぎシフト(work._window の丸め)・24h/POI 単位の営業時間(commerce)・終電後の
+        # 避難先(scheduler._try_exit)の 3 点をこの 1 ブロックで束ねる。OFF は
+        # night_refuge 0 件・営業時間表 不変・勤務窓の丸め 従来どおり=L1 バイト一致。
+        from .. import night as _night_mod
+        self.nightcfg = _night_mod.build_cfg((cfg.get("world", {}) or {})
+                                             .get("night_economy", None))
+        _night_mod.wire_work(self.nightcfg, self.workcfg)
+        self._night_refuge_pois = None              # 避難先候補 POI(ON 時のみ 1 回だけ組む)
         self._work_day = -1                        # 日次境界(オフィス産出集計)の進行管理
         # 会社観測データ層 B4(work.service.ledger / office.by_org。既定 OFF=バイト一致・サイドカー不在)。
         # 動力学(scheduler)が per-day アキュムレータへ積み、observer(OrgLedger)が日次境界で読むだけ。

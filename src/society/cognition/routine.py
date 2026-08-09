@@ -344,6 +344,11 @@ def in_work_window(agent, sim_min: int, cal: dict | None = None) -> bool:
             and not _calendar.is_workday(cal, sim_min):
         return False
     m = _minutes_of_day(sim_min)
+    # 日跨ぎの勤務窓(夜勤 22:00→06:00。第101 III-1「夜間開放」)。work.bind_workplace が
+    # world.night_economy ON のときだけ agent.work_wraps を立てる = **既定 OFF では属性が
+    # 生えない**ので getattr の既定値 False で従来式へ落ちる(バイト一致)。
+    if getattr(agent, "work_wraps", False):
+        return m >= agent.work_start_min or m < agent.work_end_min
     return agent.work_start_min <= m < agent.work_end_min
 
 
@@ -855,7 +860,11 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
         if agent.node == agent.work_node:
             if agent.work_building \
                     and sim.city.has_building(agent.work_building):
-                left_steps = max(1, sim.clock.min_to_steps(agent.work_end_min - m))
+                # 退勤までの残り[分]。%1440 は日跨ぎ勤務(夜勤。第101 III-1)への対応で、
+                # 非日跨ぎでは in_work_window が m < work_end_min を保証しているので
+                # (work_end_min - m) と厳密に同値 = 従来と 1 ビットも変わらない。
+                left_steps = max(1, sim.clock.min_to_steps(
+                    (agent.work_end_min - m) % 1440))
                 return {"type": "enter_building", "building": agent.work_building,
                         "floor": agent.work_floor, "stay_steps": left_steps,
                         "activity": "working"}

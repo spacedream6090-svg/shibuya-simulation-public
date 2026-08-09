@@ -258,6 +258,54 @@ FEATURES: tuple[Feature, ...] = (
        "= 既存の数値を 1 も動かさない。差し替わるのは**係数だけ**で、式・上限・"
        "回復運転項は共有のまま"),
 
+    # ---- ラッシュ時の車内 = シミュレートされた空間(Wave 4 II-1。実装 transit_interior.py)----
+    # strict の根拠: 車両選択(誤差項なしの argmax)・座席抽選・区画割当・車内行動の
+    #   いずれも **(run.seed, agent id, 日, 到着分) の安定ハッシュ**の純関数で、乱数
+    #   stream を 1 本も引かない(module に stream / hub / random の識別子が存在しない
+    #   ことを tests/test_transit_interior.py が AST 固定)。
+    # affects_k=False: **generate() の呼び出しサイトを 1 つも足さない**。乗車中の個体は
+    #   loc=="outside" なので scheduler の active 母集団に構造的に入らない
+    #   (= 車内で LLM は 1 本も撃たれない)。会話経路も 1 本も作らない。
+    # fingerprint_risk=possible: 降車後の記憶に定型 1 行が増える(traces と同じ等級)。
+    _f("transit_interior.enabled", "strict", False, "possible",
+       "ラッシュ時の**車内**を空間にする親トグル。監査事実『駅からの流入は瞬間移動で、"
+       "混雑率 111〜167% の車内に居た十数分が世界に存在しない』を塞ぐ。ON では "
+       "world.inflow_pulse が作った (路線, 到着分) の群 = **同じ 1 本の列車の乗客**へ "
+       "車両(編成・定員・座席・扉数は路線別=conf の表。★銀座線だけ 16 m 3 扉)と "
+       "区画(ドア脇 / 座席前 / 通路)を決定論で割り当て、降車で train_ride / "
+       "train_copresence / train_patrol を残す。★**会話は 1 本も増やさない**(車内は"
+       "静かな同席 = スマホ 70〜84%・見知らぬ他人との会話はほぼゼロ・騒々しい会話は"
+       "迷惑行為の第 1 位 51.8%)。同席は記録するだけで、そこから何かが起きるかは既存の"
+       "関係機構が街の中で決める(familiar strangers は通勤の規則性から自然に生まれる)。"
+       "★world.inflow_pulse.enabled が OFF のときは本トグルを ON にしても動かない"
+       "(列車ごとの塊が立たないので『列車の形をしていない列車』になるため)。"
+       "既定 OFF は train_* 0 件・属性も記憶も state も生えない(L1 バイト一致)"),
+    _f("transit_interior.include_plan_returnees", "strict", False, "possible",
+       "計画駆動の圏外帰還者(planning.day_plan.boundary)も駅から帰るなら列車に乗せる。"
+       "★帰還時刻そのものは **1 ビットも動かさない**(その時刻に着く列車の名前を"
+       "ダイヤから**読むだけ**で後付けする)。false にすると流入通勤者だけが車内を持つ"
+       "対照が作れる", True),
+    _f("transit_interior.memory.enabled", "strict", False, "possible",
+       "降車後に読む圧縮記憶 1 行(乗車 1 回につき 1 行だけ)。文面は (路線名, 混雑段, "
+       "行動) だけの純関数で、数字・実験条件・k・機構語を 1 バイトも含まない"
+       "(混雑は『空いていた/混んでいた/ぎゅうぎゅうだった』の**段の語**でしか出さない = "
+       "個体は混雑率という統計量を知らない)。false = 車内の物理だけ回して"
+       "プロンプトへ 1 バイトも足さない対照", True),
+    _f("transit_interior.copresence.enabled", "strict", False, "none",
+       "同じ車両に居合わせた対を L1 へ記録する(**1 日 1 対 1 件**・総量上限つき)。"
+       "familiar strangers(顔見知りの他人)の**素材**であって、ここから関係も会話も"
+       "起こさない(PNAS 2013 の枠組み = 通勤の規則性から自然に生まれるものを"
+       "こちらから出会わせない)。プロンプトには 1 バイトも入らない", True),
+    _f("transit_interior.copresence.adjacent_only", "strict", False, "none",
+       "同一/隣接区画の対だけを記録する(= 相互作用の可能性がある距離に限る)。"
+       "既定 false = 同一車両の全対を記録し、隣接かどうかは payload の "
+       "zone_adjacent 欄で残す(解析側で切れる)"),
+    _f("transit_interior.conductor.enabled", "strict", False, "none",
+       "車掌の車内巡回(受け持ち列車の車両を patrol_interval_steps ごとに 1 つ進む)と、"
+       "その車両の乗客との同席記録。★transit_staff.enabled も ON でないと動かない"
+       "(乗務員という個体が居ないため)。車内負荷を停車時間へ足すかは "
+       "conductor.dwell_load_weight(既定 0.0 = 観測のみ)が別に決める", True),
+
     # ---- indoor ----
     _f("indoor.enabled", "strict", False, "none",
        "空間レイヤ核(全建物・全階の間取りと区画用途型を決定論保持)"),
@@ -510,6 +558,53 @@ FEATURES: tuple[Feature, ...] = (
        "(Heylighen: 減衰速度は情報が陳腐化する速度に合わせる。古い痕跡は無関係ではなく誤誘導)。"
        "**演算は集約と蒸発の 2 つだけで拡散は無い**(Parunak factor 0)。"
        "既定 OFF は trace_mark 0 件・state なし・プロンプト不変(L1 バイト一致)"),
+    # Wave 4 III-3: 街の顔 = 路上の生業と条例(設計 src/society/street_life.py)。
+    # strict の根拠: **乱数 stream を 1 本も引かない**(持ち場は地図の純関数・受諾は id の
+    #   剰余・パトロールは同ノード判定)。LLM の自由文を 1 バイトも読まない。
+    # ★affects_k=False: generate() の呼び出しサイトを 1 つも足さず・減らさず、プロンプトの
+    #   **節**も増やさない(路上の出来事は既存の記憶欄に定型 1 行が入るだけ = perception_contract
+    #   の追随不要)。位置・所持金経由で発火数が間接的に動くのは本レジストリの規約どおり False。
+    # fingerprint_risk=possible: 路上の出来事の定型 1 行が当事者の記憶に載る(当人から見て
+    #   差分に気づく余地がある)。文面は**役割だけの純関数**で、金額・件数・config・実験条件は
+    #   1 文字も出ない。
+    _f("street_life.enabled", "strict", False, "possible",
+       "路上の生業 8 役割(ティッシュ配り/ストリートミュージシャン/キッチンカー営業者/"
+       "路上占い師/街頭演説者/募金スタッフ/路上生活者/路上支援員)を持ち場と時間帯の"
+       "日課で回し、渋谷区の条例(客引き禁止・過料5万円・啓発区域700m)を警告→過料→"
+       "クールダウンのいたちごっことして実装する。★客引きは独立した職業にせず、"
+       "夜間店舗の従業者の**決定論的な部分集合**が行う副業務にする(条例が雇い主も"
+       "対象にしている構造に合わせた)。ON のとき society_diversity の迷惑行為「客引き」は"
+       "供給を止める(併存ではなく置き換え=条例の効き目が測れるようにする)。"
+       "★路上生活者には尊厳規約が掛かる: 中立語のみ・犯罪/迷惑機構から完全除外・"
+       "権利は他と同一・区の支援事業(巡回相談→住居移行)が世界に存在する。"
+       "既定 OFF は新 12 種の L1 0 件・state なし・プロンプト不変(L1 バイト一致)"),
+    # Wave 4 III-1: 夜間開放 = 夜(00:00-05:00)を表現可能にする(設計 src/society/night.py)。
+    # strict の根拠: **乱数 stream を 1 本も引かない**(避難先は (距離, node id, poi id) の
+    #   純関数・営業時間は時刻の純関数・勤務窓は台帳値の読み替え)。LLM の自由文を 1 バイトも
+    #   読まない。始発判定は既存の運行述語 transit.has_service をそのまま使う。
+    # ★affects_k=False: generate() の呼び出しサイトを 1 つも足さず・減らさない。避難した個体に
+    #   内省(reflect_step)を**立てない**のは意図的で、立てると夜 1 回ぶん呼数が増えるため。
+    #   位置(夜に街へ残る)経由で発火数が間接的に動くのは本レジストリの規約どおり False。
+    # fingerprint_risk=none: プロンプトを 1 バイトも変えない(新しい欄も行も足さない)。
+    #   増えるのは L1 の night_refuge 1 種と、夜に街へ居る個体が居るという世界の状態だけ。
+    _f("world.night_economy.enabled", "strict", False, "none",
+       "監査が指摘した「夜が構造的に空」を 3 点で閉じる: (1) 日跨ぎシフト(work._window の"
+       "『閉<=開 → open+8h』の丸めを外し 22:00→06:00 を表現可能にする。routine.in_work_window は"
+       "agent.work_wraps が立った個体だけ円環判定へ落ちる)(2) POI 単位/24 時間の営業時間"
+       "(cat に加え subcat を引き当てる。コンビニ 24h 等。**現行地図 v7 は subcat を持たないので"
+       "その分は no-op = 地図 v8 待ちであることを正直に宣言する**)(3) 終電後の避難先"
+       "(縁のゲートウェイまで歩いて世界から出る代わりに、徒歩圏の営業中 POI へ移り始発まで"
+       "街に留まる。実在の渋谷: 終電 ~24:40 / 始発 04:34 / ネットカフェ・サウナが受け皿)。"
+       "夜勤者そのものは生成器側(scripts/build_orgs.py --night-shifts + build_persona_pool の"
+       "L2 継承)が作るので、**本トグルを ON にしても台帳/プールを再生成しない限り夜勤者は"
+       "1 人も居ない**(運用上の前提)。"
+       "既定 OFF は night_refuge 0 件・営業時間表 不変・勤務窓の丸め 従来どおり(L1 バイト一致)"),
+    _f("world.night_economy.midnight_shift", "strict", False, "none",
+       "日跨ぎシフトだけを個別に切る子トグル(親 enabled 配下)。false にすると営業時間と"
+       "避難先だけが効き、work._window は従来の丸め(閉<=開 → open+8h)を文字どおり通す"),
+    _f("world.night_economy.refuge.enabled", "strict", False, "none",
+       "終電後の避難先だけを個別に切る子トグル(親 enabled 配下)。false にすると"
+       "終電後の homing は従来どおり縁のゲートウェイへ歩いて退出する"),
     # 第88バッチ 心モデル固定 + 三層知能配置(設計 §5)。
     # journal 等級の根拠: 個体ごとに**別のモデル**が自由文を書く。事後に再生するには
     #   モデル別の llm_cache / llm_journal(子ごとに 1 本)が要る = 単体では非決定。

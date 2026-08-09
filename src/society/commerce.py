@@ -33,6 +33,8 @@ R1 呼数不変: どの機構も generate() を1本も足さない。営業時�
 from __future__ import annotations
 
 from . import devices as devices_mod
+from . import night as night_mod          # 夜間経済(第101 III-1)。night 側は commerce を
+#                                           module 直下で import しない = 循環しない
 from .observer.schema import Event
 
 # カテゴリ別の既定営業時間 [開店時, 閉店時](24h表記。閉<=開 は翌朝までの夜間営業)。
@@ -101,14 +103,12 @@ def _clip(x: float, lo: float, hi: float) -> float:
 
 
 # ---------------------------------------------------------------- 営業時間(時刻の純関数)
-def is_open(cfg: dict, cat: str, sim_min: int) -> bool:
-    """カテゴリ cat の店が sim_min の時刻に開いているか(時刻からの純関数・RNG不要・決定論)。
+def is_open_window(hc, sim_min: int) -> bool:
+    """営業時間窓 (open_min, close_min) が sim_min に開いているか(時刻の純関数・決定論)。
 
-    hours にゲート設定の無いカテゴリ(office/service/leisure 等)は常時営業=True。夜間営業
-    (open>close)は「open 以降 or 翌朝 close 未満」で開店。open==close は 24 時間営業扱い。"""
-    hc = cfg["hours"].get(cat)
-    if hc is None:
-        return True
+    夜間営業(open>close)は「open 以降 or 翌朝 close 未満」で開店。open==close は 24 時間営業。
+    ★第101 III-1: 窓の**引き当て**(cat / subcat / 夜間の上書き)と、窓の**判定**(この式)を
+      分ける。夜間経済層(night.py)は引き当てだけを差し替え、この式は 1 か所に保つ。"""
     o, c = hc
     if o == c:
         return True                                # 24 時間営業
@@ -118,8 +118,26 @@ def is_open(cfg: dict, cat: str, sim_min: int) -> bool:
     return m >= o or m < c                          # 夜間営業(翌朝まで)
 
 
-def is_open_poi(cfg: dict, poi: dict, sim_min: int) -> bool:
-    """POI(dict)が営業中か。cat から is_open を引く(routine の行き先候補フィルタ用)。"""
+def is_open(cfg: dict, cat: str, sim_min: int) -> bool:
+    """カテゴリ cat の店が sim_min の時刻に開いているか(時刻からの純関数・RNG不要・決定論)。
+
+    hours にゲート設定の無いカテゴリ(office/service/leisure 等)は常時営業=True。夜間営業
+    (open>close)は「open 以降 or 翌朝 close 未満」で開店。open==close は 24 時間営業扱い。"""
+    hc = cfg["hours"].get(cat)
+    if hc is None:
+        return True
+    return is_open_window(hc, sim_min)
+
+
+def is_open_poi(cfg: dict, poi: dict, sim_min: int, ncfg: dict | None = None) -> bool:
+    """POI(dict)が営業中か(routine / day_plan の行き先候補フィルタ用)。
+
+    ncfg(夜間経済 world.night_economy の正準 cfg)を渡すと POI 単位の営業時間
+    (24h コンビニ・ネカフェ等の subcat 上書き)を見る。**既定 None / 夜間 OFF では
+    従来どおり cat だけを見る**(同じ表・同じ式=バイト一致)。"""
+    if ncfg is not None and ncfg.get("enabled"):
+        hc = night_mod.poi_hours(cfg, ncfg, poi)
+        return True if hc is None else is_open_window(hc, sim_min)
     return is_open(cfg, str(poi.get("cat", "")), sim_min)
 
 
@@ -142,7 +160,10 @@ def filter_open(sim, pois: list, sim_min: int) -> list:
     out = pois
     if enabled(sim):
         cfg = sim.commercecfg
-        out = [p for p in out if is_open_poi(cfg, p, sim_min)]
+        # 第101 III-1(夜間経済。既定 OFF=None 相当=従来と完全同一): POI 単位の営業時間
+        # (24h コンビニ・ネカフェ等)を見るための cfg を渡すだけ。OFF は cat 判定のまま。
+        ncfg = getattr(sim, "nightcfg", None)
+        out = [p for p in out if is_open_poi(cfg, p, sim_min, ncfg)]
     if blocked:
         kept = [p for p in out if p.get("node") not in blocked]
         if kept:
@@ -159,9 +180,12 @@ def tick_shop_state(sim, step: int, sim_min: int) -> None:
     if not enabled(sim):
         return
     cfg = sim.commercecfg
+    # 第101 III-1: 夜間の上書き(例 nightlife の窓)を反映した**実効**カテゴリ表を使う。
+    # 夜間 OFF なら cfg["hours"] と同一オブジェクト = 走査順・値とも従来どおり(バイト一致)。
+    hours = night_mod.cat_hours(cfg, getattr(sim, "nightcfg", None))
     state = sim._commerce_open                       # dict cat -> bool(前回の開閉状態)
-    for cat in sorted(cfg["hours"]):
-        now = is_open(cfg, cat, sim_min)
+    for cat in sorted(hours):
+        now = is_open_window(hours[cat], sim_min)
         was = state.get(cat)
         if was is None:
             state[cat] = now                         # 初回=ベースライン(ログしない)

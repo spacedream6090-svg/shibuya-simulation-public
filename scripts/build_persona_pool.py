@@ -123,7 +123,73 @@ _L5_ROLES = [
      {"days": "all", "rotates": True, "shift_hours": 8}, True),
     ("配信者",      "配信者",       16, ["ハチ公前", "スクランブル交差点", "センター街", "宮下パーク"],
      {"days": "all", "rotates": False, "shift_hours": 6}, True),
+    # ---- 街の顔 = 路上の生業(Wave 4 III-3。実装 src/society/street_life.py・既定 OFF)----
+    # ★**必ず末尾に足す**: L5 の id は _L5_ROLES の並び順に振られる(idx_global)ので、
+    #   途中に挿すと既存 L5 の id が全部ずれる。末尾追加なら既存 id と既存 rng 消費は不変。
+    # ★人数の根拠(現実の実数 vs 名簿。過大に盛らない方針で下限側に寄せた):
+    #   ティッシュ配り 30 … 公表統計は無い。配布は道路使用許可つきで駅出口・商店街入口の
+    #     10 地点前後に集中し、目視で常時 10〜20 人規模。朝夕 2 交替で常時 15 人 = フル 30。
+    #   ストリートミュージシャン 15 … 路上演奏の許可は事実上下りず黙認と退去の循環。
+    #     夜間に 3〜4 地点 × 同時 2〜4 組 = 常時 8〜16 人。フル 15。
+    #   キッチンカー営業者 6 … 許可された区画の出店枠は 1 日数台。フル 6(昼 1 帯のみ)。
+    #   路上占い師 4 … 夜の裏通りに数人(定点観測の常連は片手で数えられる規模)。
+    #   街頭演説者 4 … 政治的主体の本体は既存の議員 34 名。専業の街頭要員(政党スタッフ等)は
+    #     少数なのでフル 4。選挙期の増員は本波では扱わない(module docstring の限界 5)。
+    #   募金スタッフ 6 … 駅前の街頭募金は日により 1〜2 団体 × 3〜5 人。フル 6。
+    #   路上生活者 80 … 区の昼間概数調査 74 人(23 区最多)、夜間推計 150〜200 人。
+    #     ★**昼間実数側の 74 に寄せた 80** を採る(夜間推計は幅が大きく、盛ると
+    #       「路上生活者だらけの渋谷」という現実に無い像を作るため)。
+    #   路上支援員 4 … 区の巡回相談は少人数チーム。支援事業が世界に存在することを示す最小数。
+    # ★visitor=False(この街で暮らしている)。路上生活者は commute も residence_line も持たない。
+    ("ティッシュ配り", "ティッシュ配り", 30,
+     ["駅ハチ公口", "駅東口", "駅西口", "商店街入口"],
+     {"days": "weekday", "rotates": True, "shift_hours": 3}, False),
+    ("ストリートミュージシャン", "ストリートミュージシャン", 15,
+     ["ハチ公前", "センター街入口", "駅前広場", "公園通り"],
+     {"days": "all", "rotates": False, "shift_hours": 5}, False),
+    ("キッチンカー営業者", "キッチンカー営業者", 6,
+     ["区役所前", "オフィス街の広場", "公園そばの空地"],
+     {"days": "weekday", "rotates": False, "shift_hours": 3}, False),
+    ("路上占い師", "路上占い師", 4,
+     ["駅東口の路地", "道玄坂の裏通り", "宮益坂の路地"],
+     {"days": "all", "rotates": False, "shift_hours": 4}, False),
+    ("街頭演説者", "街頭演説者", 4,
+     ["ハチ公前", "駅東口", "区役所前"],
+     {"days": "all", "rotates": False, "shift_hours": 3}, False),
+    ("募金スタッフ", "募金スタッフ", 6,
+     ["駅前広場", "ハチ公前", "駅東口"],
+     {"days": "all", "rotates": True, "shift_hours": 4}, False),
+    ("路上生活者", "路上生活者", 80,
+     ["公園のそば", "地下通路", "高架下", "駅の周辺"],
+     {"days": "all", "rotates": False, "shift_hours": 0}, False),
+    ("路上支援員", "路上支援員", 4,
+     ["区の相談窓口", "巡回ルート"],
+     {"days": "weekday", "rotates": False, "shift_hours": 2}, False),
+    # ---- 車掌(Wave 4 II-1。★**死んでいた config の修復**)-------------------------- #
+    # 監査事実: conf の transit_staff.bind.crew_occupations は既定で
+    #   ["車掌", "電車運転士"] を指しているのに、**名簿に「車掌」が 1 人も居なかった**
+    #   (_L5_ROLES に行が無い = 乗務員の半分が世界に存在しない設定キーだった)。
+    #   その結果、ドア閉判断は電車運転士だけが担い、車内の巡回にいたっては担い手が
+    #   原理的に居なかった。ここは新機能ではなく**設定と名簿の食い違いの修復**である。
+    # ★**必ず末尾に足す**(上の注記と同じ理由): L5 の id は並び順に振られるので、
+    #   途中に挿すと既存 L5 の id が全部ずれる。末尾追加なら既存 id と rng 消費は不変。
+    # 人数の根拠(過大に盛らない方針で下限側):
+    #   渋谷駅に乗り入れる 9 路線のうち、ワンマン運転でない = 車掌が乗務する系統は
+    #   JR(山手・埼京)と東急・京王・メトロの一部。1 系統あたり当駅に関わる乗務員を
+    #   常時 3〜5 人 × 2 交替と見て 40。既存の「電車運転士 60」より少なくしてあるのは
+    #   ワンマン系統には運転士だけが乗るためで、**運転士 ≥ 車掌**という向きは現実と一致する。
+    ("車掌", "車掌", 40,
+     ["山手線", "埼京線", "東横・副都心線", "田園都市・半蔵門線", "井の頭線"],
+     {"days": "all", "rotates": True, "shift_hours": 8}, True),
 ]
+
+# 役割ごとの persona 文の中核(既定は「{post}で{role}として働いている」)。
+# ★路上生活者だけは「働いている」が事実に合わないので専用文にする。文面は**中立語のみ**
+#   (蔑称・スティグマ語を 1 語も使わない = street_life.py の尊厳規約 1)。
+_L5_ROLE_SENTENCE: dict[str, str] = {
+    "路上生活者": "渋谷の{post}で寝起きし、路上で生活している。",
+    "路上支援員": "渋谷区の路上生活者支援の仕事で、{post}を回って相談に応じている。",
+}
 # 議員(選挙なし・事前決定。occupation は tools.COUNCILOR_OCCS に合致)。
 COUNCILOR_OCC = "議員"
 N_COUNCILORS = 34            # 現実の渋谷区議会=34議席。config の assembly.size(=9)以上を満たす
@@ -298,6 +364,47 @@ def gen_L1(writer: ShardWriter, n: int, seed: int, pop: dict) -> None:
             })
 
 
+# ------------------------------------------------------------------ 夜勤(Wave 4 III-1「夜間開放」)
+# 台帳(scripts/build_orgs.py --night-shifts)が社に載せた ``night_shift`` を L2 の個体へ継承する。
+# ★台帳に night_shift が 1 件も無ければ以下は全部 no-op = 従来のプールと 1 バイトも変わらない。
+# ★決定論・**乱数を 1 draw も引かない**(枠の割当は末尾から数えるだけ・就寝時刻は退勤時刻の
+#   純関数)。既存の rng 消費順を動かさないので、夜勤なし台帳での再生成は完全に同一出力。
+def _hhmm_min(text, default: int = 0) -> int:
+    """"HH:MM" → 分 of day(society/work._hhmm_to_min と同じ規約)。"""
+    try:
+        h, m = str(text).split(":")
+        return int(h) * 60 + int(m)
+    except (ValueError, AttributeError, TypeError):
+        return int(default)
+
+
+def is_night_shift(sp: dict | None) -> bool:
+    """その shift_pattern が日跨ぎ(夜勤)か = close < open。"""
+    if not sp:
+        return False
+    return _hhmm_min(sp.get("close"), 0) < _hhmm_min(sp.get("open"), 0)
+
+
+def night_slot_count(company: dict, k: int) -> int:
+    """その社の従業者スロット k のうち夜勤に回す枠数(台帳 night_shift.share の丸め)。
+
+    ★build_orgs.night_slot_count と同一の式。台帳生成器を import せずに済ませるため
+      ここに写経してあり、tests/test_night_economy.py が両者の一致を機械で固定する。"""
+    ns = company.get("night_shift")
+    if not ns or k <= 0:
+        return 0
+    n = int(round(int(k) * float(ns.get("share", 0.0))))
+    return max(0, min(int(k), n))
+
+
+def night_bedtime_min(sp: dict, i: int) -> int:
+    """夜勤者の就寝時刻 = **退勤(close)の 30 分後**から 10 分刻みで 1 時間ぶん散らす。
+
+    L2 の bedtime_min は「帰宅トリガ」として使われる(persona.build_agent)ので、夜勤者は
+    夕方ではなく**朝**に帰る。決定論(i の純関数)= rng を 1 draw も引かない。"""
+    return (_hhmm_min(sp.get("close"), 6 * 60) + 30 + (int(i) % 6) * 10) % 1440
+
+
 # ------------------------------------------------------------------ L2 域内従業者(需要駆動)
 def _build_L2_slots(orgs: dict, fraction: float):
     """組織台帳の employees / 教職員数から従業者スロット(org_id/role/occupation/shift/days)を展開。"""
@@ -310,7 +417,16 @@ def _build_L2_slots(orgs: dict, fraction: float):
         roles = c.get("roles") or ["スタッフ"]
         sp = c.get("shift_pattern", {})
         days = sp.get("days", "mon-fri")
+        # 夜勤枠は**末尾から**確保する(日勤側の role 巡回を 1 バイトも動かさないため)。
+        # 台帳に night_shift が無ければ n_night=0 = 従来と完全に同一のスロット列。
+        n_night = night_slot_count(c, k)
         for i in range(k):
+            if n_night and i >= k - n_night:
+                nsp = c["night_shift"]
+                nroles = nsp.get("roles") or roles
+                nrole = nroles[i % len(nroles)]
+                slots.append((c["id"], nrole, nrole, nsp, nsp.get("days", days)))
+                continue
             role = roles[i % len(roles)]
             slots.append((c["id"], role, role, sp, days))
     # 学校の教職員(capacity から逆算: おおむね生徒12人に1人)
@@ -352,8 +468,13 @@ def gen_L2(writer: ShardWriter, slots, seed: int) -> None:
         for i in range(m):
             org_id, role, occ, sp, days = slots[base + i]
             pid = f"L2_{idx_global:08d}"; idx_global += 1
+            # Wave 4 III-1: 夜勤スロットは「夜勤で通っている」+ 就寝時刻を退勤後へずらす。
+            # 台帳に night_shift が無ければ is_night_shift は常に False = 従来と完全に同一。
+            night = is_night_shift(sp)
+            commuting = "夜勤で通勤している" if night else "通勤している"
+            bedtime = night_bedtime_min(sp, i) if night else int(depart[i])
             persona = (f"あなたは{names[i]}、{int(age[i])}歳の{occ}({gender[i]}性)。"
-                       f"{line[i]}に住んでいて、渋谷({role})に通勤している。{ton[i]}。"
+                       f"{line[i]}に住んでいて、渋谷({role})に{commuting}。{ton[i]}。"
                        "自分の言葉で自然に、短く話す。")
             writer.add({
                 "id": pid, "layer": "L2", "presence": "workday_shift",
@@ -363,7 +484,7 @@ def gen_L2(writer: ShardWriter, slots, seed: int) -> None:
                 "traits": {"internal_locus": float(locus[i]), "nfc": float(nfc[i]),
                            "risk_tolerance": float(risk[i])},
                 "drive_threshold": float(thr[i]), "fire_weight": float(fw[i]),
-                "bedtime_min": int(depart[i]), "sleep_steps": int(slp[i]),
+                "bedtime_min": int(bedtime), "sleep_steps": int(slp[i]),
                 "has_bicycle": bool(bike[i]), "has_car": bool(car[i]),
                 "arrival_lead_min": int(lead[i]), "commute_gateway": str(gate[i]),
                 "residence_line": str(line[i]),
@@ -535,9 +656,11 @@ def gen_L5(writer: ShardWriter, seed: int, fraction: float):
         for i in range(k):
             post = posts[i % len(posts)]
             pid = f"L5_{idx_global:08d}"; idx_global += 1
+            # 役割別の中核文(既定 = 従来の「{post}で{role}として働いている」= バイト一致)。
+            core = _L5_ROLE_SENTENCE.get(role, "渋谷の{post}で{role}として働いている。")
             persona = (f"あなたは{names[i]}、{int(age[i])}歳の{occ}({gender[i]}性)。"
-                       f"渋谷の{post}で{role}として働いている。"
-                       "自分の言葉で自然に、短く話す。")
+                       + core.format(post=post, role=role)
+                       + "自分の言葉で自然に、短く話す。")
             writer.add({
                 "id": pid, "layer": "L5", "presence": "duty",
                 "name": names[i], "age": int(age[i]), "gender": gender[i],

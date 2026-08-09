@@ -94,6 +94,30 @@ def _load_gtfs(gtfs_dir: Path, station_filters: list[str]) -> list[dict] | None:
         return None
 
 
+def snap_to_arrival_of_day(table, min_of_day: int):
+    """到着表(**昇順**の ``(分 of day, 路線名)``)から「その分以上で最も早い到着」。
+
+    ★**読み取り専用の純関数**(状態を 1 バイトも変えない・乱数もファイル I/O も無い)。
+    ``engine/simulation._snap_to_arrival`` と**同じ 3 規則**を「分 of day」の領域で持つ
+    (あちらは絶対 sim 分の領域):
+
+      (1) 通常   … 与えられた分**以上**で最も早い到着へ
+      (2) 始発前 … 表の先頭(= その日の始発)へ ((1) が自然に満たす)
+      (3) 終電後 … 表の末尾(= その日の最終到着)へクランプ
+
+    同着(同じ分に複数路線)は表の並びどおり = **路線名の昇順**が先に来る
+    (``arrivals_between`` が ``(時刻, 路線名)`` で sort しているため)= 一意。
+    表が空なら ``None``(捏造しない)。
+    """
+    if not table:
+        return None
+    m = int(min_of_day) % 1440
+    for t, name in table:
+        if int(t) >= m:
+            return (int(t), str(name))
+    return (int(table[-1][0]), str(table[-1][1]))
+
+
 class Transit:
     def __init__(self, path: str | Path, gtfs_dir: str | Path | None = None,
                  station_filters: list[str] | None = None):
@@ -221,6 +245,15 @@ class Transit:
         折り返しを arrivals_between が拾う)= 分 of day の領域で閉じた集合になる。
         """
         return self.arrivals_between(0, 1439)
+
+    def arrival_at_or_after(self, min_of_day: int):
+        """分 of day 以上で最も早い到着 ``(分 of day, 路線名)`` / ``None``(ダイヤ空)。
+
+        ``arrivals_of_day`` + ``snap_to_arrival_of_day`` の薄い別名(**読むだけ**)。
+        毎 step 呼ぶ用途では呼び出し側が ``arrivals_of_day()`` を 1 回だけ組んで
+        ``snap_to_arrival_of_day`` を直接使うこと(本 method は表を毎回組み直す)。
+        """
+        return snap_to_arrival_of_day(self.arrivals_of_day(), int(min_of_day))
 
 
 class BusNetwork:

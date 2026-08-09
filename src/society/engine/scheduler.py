@@ -30,6 +30,7 @@ from .. import joint as joint_mod
 from .. import lodging as lodging_mod
 from .. import mind as mind_mod
 from .. import mobility as mobility_mod
+from .. import night as night_mod
 from .. import opinion as opinion_mod
 from .. import party as party_mod
 from .. import physics as physics_mod
@@ -46,7 +47,9 @@ from .. import devices as devices_mod
 from .. import services as services_mod
 from .. import status as status_mod
 from .. import street as street_mod
+from .. import street_life as street_life_mod
 from .. import traces as traces_mod
+from .. import transit_interior as transit_interior_mod
 from .. import transit_live as transit_live
 from .. import transit_staff as transit_staff_mod
 from .. import truth_ledger as truth_ledger_mod
@@ -1228,6 +1231,7 @@ def _phase_move(sim, step: int, sim_min: int) -> None:
             if getattr(agent, "lodging_intent", False) \
                     and agent.node == agent.lodging_node:   # ホテル到着=チェックイン(Wave L。既定OFF=フラグ立たず no-op)
                 _lodging_checkin(sim, agent, step, sim_min)
+            night_mod.on_arrive(sim, agent, step, sim_min)  # 夜の避難先に到着=始発まで滞在(既定OFF=no-op)
             if agent.exit_intent:
                 _try_exit(sim, agent, step, sim_min)   # homing はこの中で参照する
             if not agent.route:                        # 再ルート(終電後の徒歩帰宅)以外
@@ -1239,6 +1243,8 @@ def _try_exit(sim, agent, step: int, sim_min: int) -> None:
         return                                     # 夜の帰宅の代わりにホテルへ(退出しない。Wave L)
     via_station = (agent.node == sim.city.station_node)
     if via_station and not sim.transit.has_service(sim_min):
+        if night_mod.take_refuge(sim, agent, step, sim_min):
+            return                                 # 終電後: 縁へ歩く代わりに夜の避難先へ(第101 III-1)
         if agent.homing and sim.city.gateways:     # 終電後の帰宅: 徒歩で縁へ
             gate = sim.city.gateways[agent.id % len(sim.city.gateways)]
             path, used_mode = sim.router.route(agent.node, gate, "walk")
@@ -5284,6 +5290,11 @@ def run_step(sim, step: int) -> None:
     _phase_traffic(sim, step, sim_min)
     _phase_enforcement(sim, step, sim_min)         # 執行ルート: 警察官が近傍の違反者を執行(既定OFF)
     _phase_diversity(sim, step, sim_min)           # 毎step: 犯罪・迷惑行為(近傍警察官で抑止。既定OFF=no-op。後続波 H5)
+    # 路上の生業 + 条例パトロール(Wave 4 III-3。既定OFF=即 return=バイト一致)。
+    # **_phase_enforcement / _phase_diversity と同じ位置**(位置確定後)に置く: 持ち場に
+    # 立っているか・近傍に警察官が居るかを、この step の確定した co-location で判定するため。
+    # 乱数ゼロ・LLM 追加呼ゼロ・プロンプトの欄ゼロ増(路上の出来事は既存の記憶欄に 1 行入るだけ)。
+    street_life_mod.phase(sim, step, sim_min)
     _phase_health_tick(sim, step, sim_min)         # 疲労ゲージの毎step更新(既定OFF=no-op。後続波 H1)
     street_mod.phase(sim, step, sim_min)           # 街頭広告の視認判定(既定OFF=no-op。第18バッチ)
     # 位置が確定したこの時点で空間索引を1回だけ張る。以降の _phase_drive/_decide の
@@ -5386,6 +5397,15 @@ def run_step(sim, step: int) -> None:
     #   計算すると step 内の処理順が結果に混入して同期バリア(第81)の意味が消える。
     # ★観測チャンネル(下)より前に置く: ext.transit_delay がこの step 末の遅延を見る。
     envfb_mod.update(sim, step, sim_min, _env_idx)
+    # ラッシュ時の車内(Wave 4 II-1。既定 OFF=即 return=バイト一致): (路線, 到着分)の群
+    # =「同じ 1 本の列車の乗客」に**車両と区画**を与え、降車で train_ride / train_copresence を
+    # 出す。★置き場所は環境フィードバックの更新と駅員・車掌フェーズの**あいだ**:
+    #   (a) 降車(_phase_wake_and_returns)は step の前半に済んでいるので、この時点で
+    #       「まだ圏外に居る = 車内」が確定している。
+    #   (b) 下の車掌(transit_staff)が**同じ step のうちに**車内負荷を読めるように、
+    #       車掌より先に車内を確定させる(読む側が 1 step 古い数字を見ない)。
+    # ★会話経路は 1 本も作らない(車内は静かな同席)= generate() 呼数は ON/OFF で完全一致。
+    transit_interior_mod.phase(sim, step, sim_min)
     # 駅員・車掌アクター(actor model P3a。既定 OFF=即 return=バイト一致): 持ち場への束ね
     # (初回 1 回・冪等)+ **当直の車掌のドア閉判断**(ホーム負荷 → 停車時間 → delay_min)。
     # ★envfb_mod.update の**直後**に置く: 規則1 は ON のとき本 module へ譲る(二重適用の防止)

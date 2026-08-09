@@ -697,6 +697,70 @@ SHIFT_BY_CAT: dict[str, dict] = {
     "service": {"open": "09:00", "close": "19:00", "days": "mon-sat", "shift_hours": 8, "rotates": True},
 }
 
+# ============================================================================
+# 夜勤シフト(Wave 4 III-1「夜間開放」。**--night-shifts を渡したときだけ台帳に載る**)
+# ----------------------------------------------------------------------------
+# 監査の指摘: 上の 4 種は最遅でも close=23:00 で、**夜勤が語彙として存在しない**。
+# ここは「渋谷の夜を実際に動かしている職種」を産業大分類へ割り付ける表で、
+# close < open が「翌朝まで」= 日跨ぎシフトを意味する(読み手は society/work._window。
+# world.night_economy.enabled が ON のときだけ日跨ぎとして解釈される)。
+#
+# 割付の根拠(実査): 渋谷区の夜間は ①ビルメンテナンス・警備(区内サービス業の最大職種群)
+# ②事業系ごみ収集・深夜物流(深夜帯に集中)③深夜営業の飲食(バー)④24 時間営業の食品小売
+# ⑤24 時間営業の娯楽・入浴施設 が主。いずれも既存の産業大分類に収まるので**新しい業種は
+# 作らない**(台帳のスキーマを増やさない)。
+#
+# share = その社の従業者のうち夜勤に回る比率 / min_employees = これ未満の社には夜勤枠を作らない
+# (1 人しか居ない事業所に 24 時間の交代要員を置かないための下限)。roles は夜勤枠だけに使う
+# 役割名(日勤の role 巡回は 1 バイトも変えない)。
+# ★決定論: 台帳側では乱数を 1 draw も引かない(全社に night_shift を載せ、実際に何人が夜勤に
+#   なるかは従業者数 × share の丸めだけで決まる = 小さい社では自然に 0 人になる)。
+NIGHT_SHIFT_BY_KEY: dict[str, dict] = {
+    # サービス業(施設管理/メンテ・警備)= 建物の清掃・設備巡回・常駐警備
+    "SV": {"open": "22:00", "close": "06:00", "days": "all", "shift_hours": 8,
+           "rotates": True, "share": 0.30, "min_employees": 4,
+           "roles": ["夜間清掃", "設備巡回", "常駐警備"]},
+    # 運輸業・郵便業(配送/物流)= 事業系ごみ収集・深夜の積み込み
+    "TR": {"open": "23:00", "close": "07:00", "days": "all", "shift_hours": 8,
+           "rotates": True, "share": 0.25, "min_employees": 4,
+           "roles": ["深夜配送", "回収", "夜間仕分け"]},
+    # 宿泊業・飲食サービス業 = 深夜営業のバー・ダイニング
+    "FB": {"open": "20:00", "close": "04:00", "days": "all", "shift_hours": 8,
+           "rotates": True, "share": 0.18, "min_employees": 4,
+           "roles": ["深夜ホール", "深夜キッチン"]},
+    # 卸売業・小売業 = 24 時間営業の食品小売(深夜帯の店番)
+    "WR": {"open": "22:00", "close": "06:00", "days": "all", "shift_hours": 8,
+           "rotates": True, "share": 0.10, "min_employees": 5,
+           "roles": ["深夜スタッフ"]},
+    # 生活関連サービス業・娯楽業 = 24 時間営業の娯楽・入浴施設
+    "LS": {"open": "22:00", "close": "06:00", "days": "all", "shift_hours": 8,
+           "rotates": True, "share": 0.12, "min_employees": 5,
+           "roles": ["夜間フロント", "夜間スタッフ"]},
+}
+
+
+def night_shift_for(industry_key: str, employees: int) -> dict | None:
+    """その社に載せる夜勤シフト(該当しなければ None)。**決定論・乱数ゼロ**。
+
+    ``min_employees`` 未満の社には夜勤枠を作らない(1 人の店に 24 時間交代を置かない)。"""
+    spec = NIGHT_SHIFT_BY_KEY.get(str(industry_key))
+    if spec is None or int(employees) < int(spec["min_employees"]):
+        return None
+    return dict(spec)
+
+
+def night_slot_count(company: dict, k: int) -> int:
+    """その社の従業者スロット k のうち何枠を夜勤に回すか(決定論・乱数ゼロ)。
+
+    台帳に ``night_shift`` が無い社は常に 0 = 既存の生成結果と 1 バイトも変わらない。
+    丸めは四捨五入なので、share を下回る小さい社では自然に 0 枠になる。"""
+    ns = company.get("night_shift")
+    if not ns or k <= 0:
+        return 0
+    n = int(round(int(k) * float(ns.get("share", 0.0))))
+    return max(0, min(int(k), n))
+
+
 # 名称の手続き生成トークン(実在地名は可・実在企業名は使わない=R17)。
 _PLACE_TOKENS = [
     "道玄坂", "宮益坂", "神南", "宇田川", "センター街", "公園通り", "桜丘", "円山", "松濤", "神泉",
@@ -768,8 +832,13 @@ def _gen_company_name(rng: random.Random, it: dict,
         n += 1
 
 
-def build_companies_dist(real_names: set[str], count: int, seed: int) -> list[dict]:
-    """産業大分類×規模帯の目標分布から count 社を決定論生成(workplace_poi は未割付)。"""
+def build_companies_dist(real_names: set[str], count: int, seed: int,
+                         night_shifts: bool = False) -> list[dict]:
+    """産業大分類×規模帯の目標分布から count 社を決定論生成(workplace_poi は未割付)。
+
+    night_shifts=True(CLI --night-shifts)のときだけ、該当業種の社に ``night_shift`` を
+    1 キー足す(Wave 4 III-1)。**乱数は 1 draw も引かない**ので、既定 False の出力は
+    従来と完全に同一(社名も規模も割付も 1 バイトも動かない)。"""
     rng = random.Random(seed)
     shares = _normalize([it["share"] for it in INDUSTRY_SPEC])
     n_by_ind = _quota(count, shares)
@@ -786,6 +855,7 @@ def build_companies_dist(real_names: set[str], count: int, seed: int) -> list[di
                 emp = _sample_employees(rng, band)
                 name = _gen_company_name(rng, it, real_names, seen_names)
                 detail = it["details"][rng.randrange(len(it["details"]))]
+                night = night_shift_for(it["key"], emp) if night_shifts else None
                 companies.append({
                     "id": f"co_{it['key'].lower()}_{seq:05d}",
                     "name": name,
@@ -800,6 +870,8 @@ def build_companies_dist(real_names: set[str], count: int, seed: int) -> list[di
                     "output_kinds": list(it["output"]),
                     "shift_pattern": dict(SHIFT_BY_CAT[it["cat"]]),
                 })
+                if night is not None:              # 夜勤枠(--night-shifts のときだけ生える)
+                    companies[-1]["night_shift"] = night
     return companies
 
 
@@ -885,10 +957,11 @@ def _dist_stats(companies: list[dict]) -> dict:
     }
 
 
-def build_ledger_dist(map_path: Path, count: int, seed: int) -> dict:
+def build_ledger_dist(map_path: Path, count: int, seed: int,
+                      night_shifts: bool = False) -> dict:
     """分布駆動の組織台帳(会社~count + 学校)を組み立てて返す。"""
     buildings, real_names = load_buildings(map_path)
-    companies = build_companies_dist(real_names, count, seed)
+    companies = build_companies_dist(real_names, count, seed, night_shifts)
     placed = place_on_buildings(companies, buildings)
     # 学校ブロックは既存の代表校キュレーション(build_orgs)をそのまま再利用(改変なし)。
     by_cat, _ = load_map(map_path)
@@ -914,6 +987,8 @@ def build_ledger_dist(map_path: Path, count: int, seed: int) -> dict:
             "anchors": {"target_establishments": count, "target_employees": 257000,
                         "employees_tolerance": "±10%"},
             "work_hours_standard": WORK_HOURS,
+            # Wave 4 III-1: 夜勤枠を載せたか(false の台帳からは夜勤者が 1 人も生まれない)。
+            "night_shifts": bool(night_shifts),
             "target_industry_distribution": target_ind,
             "realized": stats,
             "poi_coverage": round(placed / max(1, len(companies)), 4),
@@ -954,7 +1029,8 @@ def _run_dist_mode(args) -> None:
     map_path = Path(args.map) if args.map else DEFAULT_WIDE_MAP
     if not map_path.is_absolute():
         map_path = REPO_ROOT / map_path
-    ledger = build_ledger_dist(map_path, int(args.count), int(args.seed))
+    ledger = build_ledger_dist(map_path, int(args.count), int(args.seed),
+                               bool(getattr(args, "night_shifts", False)))
     out = Path(args.orgs_out) if args.orgs_out else DEFAULT_DIST_OUT
     if not out.is_absolute():
         out = REPO_ROOT / out
@@ -989,6 +1065,11 @@ def main() -> None:
     ap.add_argument("--count", type=int, default=11000, help="--dist で生成する組織数(既定 11000)")
     ap.add_argument("--report", action="store_true",
                     help="--dist の生成レポートを docs/research/org-book-11k.md へ出力")
+    ap.add_argument("--night-shifts", action="store_true",
+                    help="夜勤シフト(22:00-06:00 の施設管理/警備・23:00-07:00 の深夜物流・"
+                         "20:00-04:00 の深夜飲食 等)を台帳に載せる(Wave 4 III-1)。"
+                         "**既定 OFF = 従来と 1 バイトも変わらない台帳**。ON にした台帳から"
+                         "プールを再生成すると L2 に夜勤者が生まれる")
     args = ap.parse_args()
 
     if args.dist:

@@ -295,6 +295,8 @@ CAUSE_OF_KIND: dict[str, str] = {
     "medical_visit": AGENT,
     "lodging_checkin": AGENT,
     "lodging_checkout": DEVICE,      # 滞在終了は日数で自動
+    "night_refuge":  DEVICE,         # 終電が無いという**運行の事実**が行き先を決めた(第101 III-1。
+                                     #  個体は「避難先を選ぶ」判断をしていない = 距離の純関数)
     "move_home":     AGENT,          # 生活の自己決定 P2(敷金を払って移る)
     "relocate":      DEVICE,         # 内生的な世帯転居(通勤逼迫/家賃逼迫のルール)
     "move_in":       DEVICE,
@@ -373,6 +375,27 @@ CAUSE_OF_KIND: dict[str, str] = {
     "annual_event":  SCHEDULE,
     "crime":         AGENT,          # agent_id = 加害者(victim は payload)
     "nuisance":      AGENT,
+
+    # ---- 路上の生業と条例(Wave 4 III-3。材料側 registration = src/society/street_life.py)---- #
+    # ★agent: その個体が持ち場に立って**選んで行った**生業。居なければこの行は存在しない。
+    "street_performance": AGENT,     # 路上演奏(agent_id = 演奏者)
+    "street_speech":      AGENT,     # 街頭演説(agent_id = 演説者)
+    "tissue_offer":       AGENT,     # ティッシュ配布(agent_id = 配布者)
+    "stall_sale":         AGENT,     # キッチンカーの販売(agent_id = 売り手)
+    "donation":           AGENT,     # 街頭募金(agent_id = 募金スタッフ)
+    "fortune_reading":    AGENT,     # 路上占い(agent_id = 占い師)
+    "touting":            AGENT,     # 客引き(agent_id = 客引きに立った従業者)
+    # ★device: 執行は**条例というルールが世界状態(客引きの現場に警察官が居る)に反応**して
+    #   発火する。警察官が「選んだ」のはその場に居ることであって、この出来事ではない
+    #   (既存の enforcement / detention と同じ扱い = 分類の原則 2・3 の「device に寄せる」)。
+    "touting_warning":    DEVICE,    # agent_id = 警察官(target は payload)
+    "touting_fine":       DEVICE,    # agent_id = 警察官(target は payload)
+    "street_disperse":    DEVICE,    # 警察官の接近に反応して持ち場を移した(agent_id = 移した本人)
+    # ★agent: 区の支援員が巡回して**声をかける**行為(agent_id = 支援員・target は payload)
+    "outreach_contact":   AGENT,
+    # ★device: 住居への移行は「相談回数が閾値に達した」ことに制度が反応して起きる
+    #   (当人がその step に選んだ行為ではない)。
+    "shelter_move":       DEVICE,
     "traffic_flow":  BOUNDARY,       # 背景交通 = エージェントではない通過車両の統計。
                                      #  device_id=traffic:<mode>(ambient / od)= 発生器の同一性。
                                      #  boundary なのに刻むのは DEVICE_STAMPABLE の定義どおり
@@ -407,6 +430,22 @@ CAUSE_OF_KIND: dict[str, str] = {
                                      #    (payload["operator"] と**同じ文字列**を列へ載せた。
                                      #     payload は後方互換のため残す = 過去ランと同じ読み方)
     "transit_staff_bound": BOUNDARY,  # 起動時 1 回の持ち場束ね統計(workplace_bound と同型)
+
+    # ---- ラッシュ時の車内。材料側 registration = src/society/transit_interior.py ---- #
+    # ★``physics`` を選んだ理由(原則 3 のタイブレークではなく積極的な選択):
+    #   車両も区画も座席も、個体が**選んだ**ものではない(乗る列車はダイヤが、
+    #   座れるかは乗車率が決める)。かといって「制度が反応した」わけでもなく、
+    #   これは**身体が空間のどこに在るか**という連続力学そのものである
+    #   (= 語彙表の physics 「駆動するのは暦ではなく状態」)。
+    #   加えて physics は TICK_CAUSES に入っている = 帰属率の分母から外れるので、
+    #   毎日全通勤者ぶん出る車内の行が「エージェント帰属率」を薄めない。
+    #   高頻度の受動観測を agent/device に置くとその指標が死ぬ(traffic_flow を
+    #   boundary に置いたのと同じ配慮を、こちらは physics で行っている)。
+    "train_ride":       PHYSICS,     # 1 乗車の締め(agent_id = 乗客。本人の選択ではない)
+    "train_copresence": PHYSICS,     # 同じ車両に居合わせた 1 対(agent_id = 小さい方の id)
+    "train_patrol":     DEVICE,      # 車掌の巡回。agent_id = 乗務員だが、進む先は
+                                     #  step から決まる決定論の当直規則であって本人の選択ではない
+                                     #  (dwell_decision と同じ扱い = 乗務員が居る行も device)
 }
 
 

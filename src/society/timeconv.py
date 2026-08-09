@@ -225,6 +225,28 @@ TABLE: tuple[tuple[str, str, str], ...] = (
     ("transit_staff.dwell.log_every_steps", STEPS,
      "dwell_decision の記録周期 [step]。実時間の記録密度を保つため逆比例"
      "(Δt=1 で不変のままだと L1 行数が10倍に膨れる)"),
+    # ---- ラッシュ時の車内(Wave 4 II-1)。**時間らしいキーは 3 種**に分かれる ----
+    ("transit_interior.conductor.patrol_interval_steps", STEPS,
+     "車掌が 1 両進む間隔 [step]。巡回の**実時間の速さ**を保つため逆比例"
+     "(Δt=1 で不変のままだと巡回が 10 倍速くなり、1 編成を舐める実時間が 1/10 になる)"),
+    ("transit_interior.comfort.fatigue_per_step", RATE,
+     "1 step・超過密度 1.0 あたりの疲労蓄積 [/step]。毎 step の加算量なので線形"
+     "(health.fatigue_gain_* と同族)"),
+    ("transit_interior.ride_minutes", INVARIANT,
+     "乗車の長さ [**分**]。step ではなく実時間の分なので Δt に依らない"
+     "(step への換算はコード側の ride_steps が max(1, round(分/Δt)) で行う"
+     "= A1/A9 と同じ『分を持って step へ換算する』側の作法)"),
+    ("transit_interior.congestion_scale.windows", INVARIANT,
+     "時間帯の混雑倍率 [[開始分, 終了分, 倍率]]。**分 of day の時刻帯**と無次元倍率で"
+     "step ではない(indoor.meeting.window_min と同じ族)"),
+    ("transit_interior.copresence.max_pairs_per_day", INVARIANT,
+     "1 日 1 人あたりに記録する同席の対の上限 [件/人/day]。per-day のレートなので"
+     "Δt 非依存(1 日の実時間の長さは Δt を変えても 1440 分のまま)"),
+    ("transit_interior.copresence.max_pairs_per_car", INVARIANT,
+     "1 乗車 1 人あたりに控える同席相手の上限 [件]。件数であって時間量ではない"),
+    ("transit_interior.comfort.fatigue_max", INVARIANT,
+     "1 **乗車**あたりに乗せる疲労の上限。出来事(乗車)単位の総量であって"
+     "per-step のレートではない(freedom.sat_step と同じ族)"),
     ("tools.permit_steps", STEPS, "許可待ちの長さ [step](0=待ちなし)"),
     ("tools.event_duration_steps", STEPS, "イベント開催時間 [step]"),
     ("tools.flyer_ttl_steps", STEPS, "チラシの寿命 [step]"),
@@ -258,6 +280,12 @@ TABLE: tuple[tuple[str, str, str], ...] = (
      "痕跡の蒸発の半減期 [step](0=減衰しない persistent の意味なので 0 のまま保たれる)"),
     ("world.traces.max_per_step", RATE,
      "1 step に集約する痕跡の上限 [件/step](1日あたりの総量を保つ安全弁)"),
+    # Wave 4 III-3(路上の生業と条例)。クールダウンは実時間で同じ長さを保ち、L1 の
+    # 安全弁は「件/step」なので 1 日あたりの総量が保たれるようにする(traces と同型)。
+    ("street_life.cooldown_steps", STEPS,
+     "警告/退去のあと客引き・演奏を止める長さ [step](いたちごっこの周期)"),
+    ("street_life.max_events_per_step", RATE,
+     "1 step に出す路上イベントの上限 [件/step](1日あたりの総量を保つ安全弁)"),
     ("beliefs.witness_window", STEPS, "目撃可能な窓 [step]"),
     ("beliefs.fact_ttl_steps", STEPS, "fact の鮮度 [step]"),
     ("beliefs.verify_deadline_steps", STEPS, "現場確認の有効期限 [step]"),
@@ -286,6 +314,16 @@ TABLE: tuple[tuple[str, str, str], ...] = (
      "step ではないので Δt に依存しない(分 → step の換算は既存の clock.min_to_steps / "
      "_steps_until_tod が Δt 込みで行う=A9/A1 の経路をそのまま通る)"),
     ("indoor.meeting.window_min", INVARIANT, "分 of day の時刻帯。step ではない"),
+    # Wave 4 III-1(夜間開放)。**どれも step 量ではない**ので不変で正しい:
+    #   hours は「分 of day の時刻帯」(indoor.meeting.window_min と同族)、max_stay_min は
+    #   分(実時間。step 換算は呼び出し側の clock.min_to_steps が Δt 込みで行う = A1 の経路)、
+    #   max_dist_m は距離。
+    ("world.night_economy.hours.*", INVARIANT,
+     "営業時間 [開店時, 閉店時](24h 表記の**時**)。分 of day の時刻帯なので step ではない"),
+    ("world.night_economy.refuge.max_stay_min", INVARIANT,
+     "避難先の滞在上限 [分]。実時間の量で、step 換算は clock.min_to_steps が行う"),
+    ("world.night_economy.refuge.max_dist_m", INVARIANT,
+     "避難先を探す半径 [m]。距離であって時間ではない"),
     ("indoor.sfm.dt", INVARIANT, "屋内 SFM の物理積分刻み [秒]。社会レイヤー Δt と非同期(設計 §3.1)"),
     ("freedom.sat_step", INVARIANT, "自由行動 1 回あたりの充足量(出来事単位。step ではない)"),
     ("worldview.ctrl_step", INVARIANT, "介入 1 回あたりの更新量(出来事単位)"),
