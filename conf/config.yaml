@@ -475,6 +475,40 @@ world:
     drop_threshold: 0.05        # これ未満に薄れた痕跡はレコードごと消える(明示的失効ロジック)
     max_per_step: 32            # 1 step に集約する件数の上限(暴走時の L1 膨張を防ぐ安全弁)
 
+  # ---- 装置(device)層 = 目標を持たないアクター(actor model P2。**既定 OFF=現行と完全同一**)----
+  # 設計文書「世界に作用するものは全てアクターにする」の装置(device)の層。装置の契約は
+  #   状態を変えてよいのは (a) 宣言済みのスケジュール/物理[DEVS δ_int] か
+  #                       (b) エージェントの行為への応答[DEVS δ_ext] のときだけで、
+  #   **自発的に(spontaneously)状態を変えてはならない**。
+  # 実装 src/society/devices.py。契約は型で与えるだけでなく**機械が検査できる**形にしてある
+  #   (δ の窓の外で状態属性へ代入が起きたら監査証跡に illegal として残る)。
+  # ★装置は決定論的な応答関数 = **乱数を 1 本も引かない**(module に乱数の識別子が存在しない
+  #   ことを tests/test_devices.py が AST で固定)。LLM 追加呼ゼロ・プロンプト 1 バイト不変。
+  # OFF が保つ不変条件: registry を組まない=sim に devices が生えない・agent に属性が生えない・
+  #   gate_pass / device_load / signal_summary 0 件・L1 バイト一致(golden_baseline_l1.json)。
+  devices:
+    enabled: false              # ★装置層の親トグル。false=完全 no-op(バイト一致)
+    # ---- 改札(faregate)= 通路の配列 + FIFO 待ち行列 ----
+    # env.feedback 規則2(改札スループット飽和 → 入場規制)の**細粒度な置き換え**。
+    # 規則2 は「1 step の駅流入件数 > 容量 なら数 step 入場規制」という全体一括の近似で、
+    # 個体ごとの待ち時間を持たない。本装置が ON のとき envfeedback は規則2 を**評価しない**
+    # (同じ物理の二重計上を防ぐ。規則1=停車時間→遅延 と 規則3=POI 占有 はそのまま生きる)。
+    # ★較正値は**実測系の公表値**: 日本の駅の自動改札は持続 60 人/分/通路(IC タッチ 0.2 秒)。
+    #   エスカレーターの実測は約 80 人/分で、理論値・公称値は実測より 35〜60% 高く出る
+    #   → **公称値(nameplate)は絶対に使わない**という原則をこのブロックの既定に適用した。
+    faregate:
+      enabled: false            # ★改札の待ち行列を効かせる実験で ON(親 enabled も要 true)
+      n_gates: 8                # 通路(改札機)の本数。地図データに本数が無いための既定値
+      service_rate_per_min: 60  # 1 通路あたりの持続処理人数[人/分]=1.0 秒/人(実測系公表値)
+      max_hold_steps: 3         # 1 回の退出で待たせる上限[step](必ず通す安全弁=非発散)
+    # ---- 歩行者信号(SignalGate)の観測 ----
+    # 信号は「位相 = 絶対時刻の純関数」= 記憶を持たない固定スケジュール装置で、既に
+    # world/sfm_core.py に実装がある。装置層が足すのは **同一性(交差点表由来の device_id)**
+    # と、この観測 1 本だけ(時刻計算は 1 バイトも変えない)。
+    # ★出すのは **1 交差点 1 日に最大 1 件**の signal_summary。信号サイクル(140 秒)は
+    #   1 step(600 秒)より短いので、サイクルごとのイベントを出すと L1 が信号で溢れる。
+    signal_events: false        # ★true で signal_summary(周期パラメータ+青割合)を日次 1 件
+
 # ---- 空間レイヤ核(屋内ミクロ状態=シームレスズーム観察の土台。既定 OFF=現行挙動と完全同一)----
 # 全建物・全階の屋内間取り(vision.building_layout=決定論・ビューア floorLayout と同一系列)を
 # 「単一の真実」として保持し、区画(zone)に用途型(SpaceType)を決定論割当する層。実装
@@ -1822,6 +1856,28 @@ observer:
   # 読むだけ・乱数ゼロ・LLM 呼ゼロ・プロンプト 1 バイト不変。
   # OFF では一時キーすら積まれない = ゴールデン L1 バイト一致。実装 src/society/provlink.py。
   llm_link: false
+  # ---- 因果台帳 IF-F(第100バッチ 2026-08-09・**既定 OFF**)----
+  # 正典: docs/research/llm-world-interface-audit.md §2(誰が何を起こしたかが L1 から
+  #       復元できない)/ 実装と分類表 src/society/observer/causality.py。
+  # L1 の agent_id は「この行の主語」ではなく「**この行が誰の視点で記録されたか**」で、
+  # 種によって意味が違う(speak=話した本人 / hear=聞いた側 / wage=受け取った本人 /
+  # weather=-1)。同じ 1 列に同居しているので「エージェントが起こした変化」と
+  # 「装置が起こした変化」を事後に分離できず、**『世界を変えた人』の測定が成立しない**。
+  # ON にすると L1 に 2 列が生える:
+  #   - cause_type … agent / device / schedule / physics / natural / boundary の 6 語
+  #                  (設計文書の 4 分類への射影は causality.PROJECTION_4WAY。
+  #                   schedule と physics は device の下位 = DEVS の δ_int)
+  #   - actor_id   … その出来事に結びつく行為者 id。hear→payload["speaker"]・
+  #                  opinion_shift→["source"]・transmission→["from"] のように
+  #                  **agent_id が患者(受け手)である種は payload から戻す**。
+  #                  復元できないもの(世界イベントの -1)は null で正直に開示する。
+  # 分類は kind 単位の静的表なので、事後解析(scripts/analyze_causality.py)は
+  # **この列が無い既存ランでも同じ分類ができる**。列がある場合は表と突き合わせて
+  # 食い違いを報告する(表の誤りを検出する装置)。
+  # 読むだけ・乱数ゼロ・LLM 呼ゼロ・プロンプト 1 バイト不変。
+  # OFF では logger が刻印経路にも入らず parquet の列も生えない = L1 バイト一致。
+  causality:
+    enabled: false
   # ---- 状態ハッシュチェーン(第78バッチ 2026-07-31・**既定 OFF**)----
   # 検証ラン(run.mode=verify)専用の装置。ON にすると各 step の終了時に world state の
   # **正準シリアライズ**(dict/set はキーでソート・浮動小数は固定桁十進・集約順固定)を
@@ -2200,11 +2256,20 @@ work:
     enabled: false              # ★ON 推奨(本番): true(L2 の work_node coverage 拡大=serve/org_output の網羅率↑)
     book: data/organizations_shibuya_wide11k.json  # org_id が参照する台帳(100万プールの母体)
     rebind_bound: false         # 既に work_node を持つ個体も実 POI へ束ね直すか(既定=未束のみ=coverage 拡大に限定)
-    poi_match_fallback: true    # 台帳ノードが現行地図に無い時、POI カテゴリ + 安定ハッシュで決定論マッチ
+    poi_match_fallback: true    # 台帳ノードが「現行地図に無い」**または「その業種の POI を実際に
+                                # 持たない」**時、POI カテゴリ + 安定ハッシュで決定論マッチ(第100)。
+                                # ★後者の条件が第100の是正点: 台帳は産業×規模帯→建物の分布で置いた
+                                #   合成値なので node が地図の POI 実体と食い違う(実測 wide_v7: 同カテゴリ
+                                #   POI のある node に居るのは food 401/1650・shop 986/3850 社のみ)。
+                                #   食い違ったまま束ねると客の来ない場所に店員が立ち serve が永久不在。
+                                #   false にすると旧挙動(台帳 node を無条件採用)へ戻る。
     seed: 20260722              # 決定論マッチの安定ハッシュ seed(run.seed 非依存)
     default_open: "09:00"       # 勤務窓の既定(台帳/record の shift_pattern が無い時の後退値)
     default_close: "18:00"
-    occ_cat: {}                 # occupation/role → 職場 POI カテゴリ(org_id が無い層=L5 等を束ねたい時。既定=空)
+    occ_cat: {}                 # occupation/role → 職場 POI カテゴリ(org_id が無い層=L5 等を束ねたい時。既定=空)。
+                                # 空でも persona._WORK_CAT(既存の職業→職場カテゴリ表)を後退参照する。
+                                # 地図に対応カテゴリが無い役割(駅員/警察官/運転士/議員)は束ねず
+                                # n_unbound_after に正直に数える(推測で写像を作らない)。
 
 # ---- 欲求プロファイルの個人差 W2-2(文献: docs/lit/needs__individual-differences.md)----
 # ON 時: traits・年齢・職業から5次元の価値プロファイル(刺激/安全/関係/有能/自律)を決定論生成し、

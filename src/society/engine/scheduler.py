@@ -34,6 +34,7 @@ from .. import opinion as opinion_mod
 from .. import party as party_mod
 from .. import physics as physics_mod
 from .. import provlink as provlink_mod
+from ..observer import causality as causality_mod
 from .. import reject as reject_mod
 from .. import relations as relations_mod
 from .. import relations_endo as relations_endo_mod
@@ -41,6 +42,7 @@ from .. import rumors as rumors_mod
 from .. import pov as pov_mod
 from .. import b2b as b2b_mod
 from .. import delivery as delivery_mod
+from .. import devices as devices_mod
 from .. import services as services_mod
 from .. import status as status_mod
 from .. import street as street_mod
@@ -1199,6 +1201,12 @@ def _try_exit(sim, agent, step: int, sim_min: int) -> None:
                 agent.trip_mode = used_mode
                 return                             # exit_intent 維持 → 縁で再試行
         agent.exit_intent = False                  # 終電後: 出かけるのをやめる
+        return
+    # 装置層 P2 改札(actor model。既定 OFF=常に False=バイト一致): 改札は「目標を持たない
+    # アクター」= 通路数 × 処理間隔(既定 60 人/分/通路)の待ち行列で、通れなければ駅に留まる。
+    # ★envfeedback 規則2(入場規制)の**細粒度な置き換え**であり二重には効かない:
+    #   装置 ON のとき envfeedback.update は規則2 を評価しない(devices.faregate_active)。
+    if via_station and devices_mod.hold_exit(sim, agent, step, sim_min):
         return
     # 環境フィードバック 規則1/2(第84。既定 OFF=常に False=バイト一致): 遅延ぶん・入場規制中は
     # 改札を通れない=駅に留まる(exit_intent は維持。再試行は _phase_move 直後の pending_exits)。
@@ -2771,16 +2779,28 @@ def _apply(sim, agent, action: dict, step: int, sim_min: int) -> None:
 
     既定 OFF では ``_prov`` が**そもそも積まれない**ので ``prov is None`` の
     分岐しか通らない = ゴールデン L1 バイト一致(構造による保証)。
+
+    IF-F(第100バッチ・observer.causality。既定 OFF)も同じ場所で**因果スコープ**を
+    開閉する。「いまこの行為を適用中」の間に**その行為者自身**が出したイベントは、
+    エンジンが「誰が起こしたか」を直接知っている(静的表の推定より強い証拠)。
+    どちらも OFF なら従来どおり ``_apply_action`` を素通しする 1 本道しか通らない。
     """
     prov = provlink_mod.take(action)
-    if prov is None:
+    cause_on = causality_mod.enabled(sim)          # conf を 1 度読んで sim にキャッシュ
+    if prov is None and not cause_on:
         _apply_action(sim, agent, action, step, sim_min)
         return
-    sim.logger.set_prov(prov[0], prov[1], int(agent.id))
+    if prov is not None:
+        sim.logger.set_prov(prov[0], prov[1], int(agent.id))
+    if cause_on:
+        sim.logger.set_cause(causality_mod.AGENT, int(agent.id))
     try:
         _apply_action(sim, agent, action, step, sim_min)
     finally:
-        sim.logger.clear_prov()
+        if prov is not None:
+            sim.logger.clear_prov()
+        if cause_on:
+            sim.logger.clear_cause()
 
 
 def _apply_action(sim, agent, action: dict, step: int, sim_min: int) -> None:
@@ -5138,6 +5158,10 @@ def run_step(sim, step: int) -> None:
     fire_mod.note_plan_due(sim, step)
     _phase_planning(sim, step, sim_min)            # 起床/帰還の直後 step に朝の一日計画
     _phase_tools(sim, step, sim_min)               # イベント開始で会場へ発つ→次の移動で反映
+    # 装置層(actor model P2。既定 OFF=即 return=バイト一致): 装置の δ_int(整備窓の更新)+
+    # 入場方向(この step の帰還=enter_area)の δ_ext + 要約の記録。**physics と同じ位置**に
+    # 置く = この step の退出(_try_exit / 下の再試行)が同じ整備窓の残り定員を消費する。
+    devices_mod.phase(sim, step, sim_min)
     # P3 境界縫合(竹-4。既定 OFF=即 return=バイト一致): **_phase_move の直前**に置く。
     # この時点の (x,y) が「この step の開始時の位置」= 2 層タイムラインの下層(dt_sub)が
     # 刻むのはまさにこの step の 600 秒だから。物理が所有した個体は _phase_move が飛ばす。
@@ -5147,6 +5171,11 @@ def run_step(sim, step: int) -> None:
     # 遅延/入場規制で待たされ、駅に留まっている個体の**再試行**。_try_exit は「到着した step」
     # にしか呼ばれないので、待たせた個体にはここでしか通る口が無い。
     for _held in envfb_mod.pending_exits(sim, step):
+        _try_exit(sim, _held, step, sim_min)
+    # 装置層 P2(既定 OFF=空 tuple=ループ 0 回=バイト一致): 改札の待ち行列で駅に留まって
+    # いる個体の再試行(上と同じ理由・同じ形。両者が同じ個体を返さないことは
+    # devices.pending_exits 側で保証している=同 step に _try_exit が 2 回走らない)。
+    for _held in devices_mod.pending_exits(sim, step):
         _try_exit(sim, _held, step, sim_min)
     # 位置確定後: 共同行動/夕食共食の同席観測(既定OFF=no-op。第44バッチ)。編成→収束は済み、
     # ここで実際に POI/home で2人以上同席したグループを joint_activity で1件記録する。

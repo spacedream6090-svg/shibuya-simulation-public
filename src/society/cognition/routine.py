@@ -102,6 +102,27 @@ def _stochastic_cfg(sim):
     return cfg
 
 
+def _world_prob(sim, key: str) -> float:
+    """`world.<key>`(確率定数)を sim に一度だけキャッシュして返す。
+
+    config は走行開始前に確定する(`load_config` の Δt 変換 `timeconv.apply_dt` と
+    `registry.apply_mode` が唯一の書き換え点で、どちらも `Simulation.__init__` より前 /
+    その中の1回きり)。step ループ中に `cfg.world.*` へ書く箇所は存在しないので、
+    値は毎 step 読むのと同一で、消えるのは OmegaConf のノード解決コストだけ。
+    **キーごとに遅延**して読む(=そのキーを使う分岐に初めて入った時に初めて解決する)ため、
+    読まれる config キーの集合も現行と完全に同じ。`_stoch_cfg` / `_media_settings` と同じ作法。
+    """
+    cache = getattr(sim, "_routine_world_probs", None)
+    if cache is None:
+        cache = {}
+        sim._routine_world_probs = cache
+    value = cache.get(key)
+    if value is None:
+        value = float(sim.cfg.world[key])
+        cache[key] = value
+    return value
+
+
 def _cat_of(activity: str = "", what: str = "") -> str:
     """activity ラベル or 計画語彙 what を3分類へ写す(既定=discretionary)。"""
     if what:
@@ -347,6 +368,26 @@ def in_meal_window(sim_min: int) -> bool:
     return any(a <= m < b for a, b in MEAL_WINDOWS)
 
 
+def _lynch_pool(sim):
+    """Lynch の候補ノード列と重み配列を1回だけ作ってキャッシュする(値は毎回作るのと同一)。
+
+    `sim.dests` は Simulation 構築時に1度だけ組まれて以後不変(engine 側に再代入も追記も
+    無い)、`sim.landmark_score` も ON のとき構築時に1度だけ作られる。よって
+    「score を持つ dests」とその重みは走行中ずっと同じ = 呼び出しごとに作り直す必要が無い。
+    列の順序も重みの値も元の内包表記と同一で、呼び出し側は現在地1点を抜くだけになる。
+    保険として `len(sim.dests)` が変わったら作り直す。
+    戻り値 (候補列, 重み配列, ノード→添字)。"""
+    n = len(sim.dests)
+    cached = getattr(sim, "_lynch_pool_cache", None)
+    if cached is None or cached[3] != n:
+        score = sim.landmark_score
+        pool = [d for d in sim.dests if d in score]
+        pool_w = np.array([max(0.0, float(score[d])) for d in pool], dtype=float)
+        cached = (pool, pool_w, {d: i for i, d in enumerate(pool)}, n)
+        sim._lynch_pool_cache = cached
+    return cached[0], cached[1], cached[2]
+
+
 def _lynch_destination(agent, sim, rng: np.random.Generator) -> str:
     """Lynch 都市イメージ プラグイン(既定 OFF、ON 時のみ・新 stream で呼ばれる)。
 
@@ -354,11 +395,15 @@ def _lynch_destination(agent, sim, rng: np.random.Generator) -> str:
     不透明スコア)で重み付けサンプルする。この関数は score 値を見るだけで因子名は知らない。
     候補が無ければ現在地(=stay)。既定 decide の draw 順は一切汚さない(専用 rng)。
     """
-    score = sim.landmark_score
-    cands = [d for d in sim.dests if d != agent.node and d in score]
+    pool, pool_w, index = _lynch_pool(sim)
+    hit = index.get(agent.node)
+    if hit is None:                        # 現在地は候補に含まれない = 全部が候補
+        cands, weights = pool, pool_w.copy()   # copy: 下で /= により破壊するため
+    else:                                  # 現在地の1点だけを抜く(順序・値は元の内包表記と同一)
+        cands = pool[:hit] + pool[hit + 1:]
+        weights = np.delete(pool_w, hit)
     if not cands:
         return agent.node
-    weights = np.array([max(0.0, float(score[d])) for d in cands], dtype=float)
     total = weights.sum()
     if total <= 0.0:
         return cands[int(rng.integers(len(cands)))]
@@ -860,7 +905,7 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
 
     # ---- 食事時間帯: 実在の飲食店へ(残高が価格に満たない店は避ける=経済 v0)----
     if in_meal_window(sim_min) \
-            and rng.random() < float(sim.cfg.world.meal_prob):
+            and rng.random() < _world_prob(sim, "meal_prob"):
         foods = sim.city.pois_by_cat("food") + sim.city.pois_by_cat("nightlife")
         foods = [p for p in foods if p["node"] != agent.node
                  and agent.money >= _poi_price(sim, p)]
@@ -905,14 +950,14 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
 
     # ---- 次の行動 ----
     r = rng.random()
-    if r < float(sim.cfg.world.exit_prob) and sim.exit_points:
+    if r < _world_prob(sim, "exit_prob") and sim.exit_points:
         gate = sim.exit_points[int(rng.integers(len(sim.exit_points)))]
         return {"type": "move_to", "dest": gate, "stay_steps": 0,
                 "mode": _choose_mode(agent, sim, gate, rng), "exit": True}
     blds = sim.city.buildings_at(agent.node)
     blds = [b for b in blds if b["kind"] not in ("residential", "house?")
             or b["id"] == agent.home_building]      # 他人の家には入らない
-    if blds and r < float(sim.cfg.world.building_enter_prob):
+    if blds and r < _world_prob(sim, "building_enter_prob"):
         bld = blds[int(rng.integers(len(blds)))]
         return {"type": "enter_building", "building": bld["id"],
                 "stay_steps": sim.clock.dur_steps(int(rng.integers(2, 7)))}  # 20-60分

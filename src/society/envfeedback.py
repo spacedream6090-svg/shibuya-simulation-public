@@ -101,6 +101,7 @@ from __future__ import annotations
 
 import math
 
+from . import devices as devices_mod
 from .factors import update as factor_update
 from .observer.schema import Event
 
@@ -343,8 +344,17 @@ def update(sim, step: int, sim_min: int, since_idx: int) -> None:
                   "cap_min": float(tcfg["delay_cap_min"])})
 
     # ---- 規則2: 改札スループット飽和 → 入場規制 ----
+    # ★装置層(actor model P2 / src/society/devices.py)との優先順位:
+    #   `world.devices.faregate.enabled` が ON のとき、本規則は **1 度も評価しない**。
+    #   規則2 は「1 step の駅流入件数 > 容量 なら数 step 入場規制」という**全体一括の
+    #   近似**で、装置層の改札(通路数 × 処理間隔の待ち行列)と**同じ物理**(改札の
+    #   処理能力の飽和)を指しているため、両方効かせると同じ現象の二重計上になる。
+    #   細粒度モデルが在るときは細粒度が勝つ = `gate_until` も `n_gate` も 1 も動かない
+    #   (tests/test_devices.py が「装置 ON で envfeedback 規則2 の状態が不動」を固定)。
+    #   規則1(停車時間 → 遅延)と規則3(POI 占有)は別の物理なのでそのまま生きる。
+    #   既定 OFF(devices.enabled=false)では常に False = 従来と完全同一 = バイト一致。
     gcfg = cfg["gate"]
-    if gcfg["enabled"] and station is not None:
+    if gcfg["enabled"] and station is not None and not devices_mod.faregate_active(sim):
         cap = float(gcfg["capacity_per_min"]) * _dt_min(sim) * gate_scale(sim)
         active = int(st["gate_until"]) > step
         if not active and inflow > cap and step >= int(st["gate_cool_until"]):

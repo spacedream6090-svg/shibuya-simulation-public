@@ -335,6 +335,12 @@ def load_signal(spec: dict, repo_root: Path):
       explicit … conf 直書きの cycle_s / green_s / flash_s / offset_s
       table    … 交差点表 JSON(`{"crossings":[{"id":…, "cycle_s":…, "green_s":…,
                  "flash_s":…}, …]}`)から `crossing_id` の 1 件を引く
+
+    ★返す dict には `crossing_id` を必ず含める(actor model P2 / society/devices.py)。
+      信号は「位相 = 絶対時刻の純関数」= 記憶を持たない固定スケジュール**装置**なのに、
+      これまで **どの交差点の信号なのかを外から指す名前が無かった**。`SignalGate` は
+      この値から安定 device_id を導く(`SignalGate(**zone.signal)` の呼び出し形は不変)。
+      時刻計算には一切使わないので、既存ランの位相・現示は 1 バイトも動かない。
     """
     mode = str(spec.get("mode", "none"))
     if mode == "none":
@@ -342,7 +348,8 @@ def load_signal(spec: dict, repo_root: Path):
     if mode == "explicit":
         return {"cycle_s": float(spec["cycle_s"]), "green_s": float(spec["green_s"]),
                 "flash_s": float(spec.get("flash_s", 0.0)),
-                "offset_s": float(spec.get("offset_s", 0.0))}
+                "offset_s": float(spec.get("offset_s", 0.0)),
+                "crossing_id": int(spec.get("crossing_id", 0))}
     if mode == "table":
         path = Path(str(spec.get("path", "")))
         if not path.is_absolute():
@@ -354,7 +361,8 @@ def load_signal(spec: dict, repo_root: Path):
                 return {"cycle_s": float(row["cycle_s"]),
                         "green_s": float(row["green_s"]),
                         "flash_s": float(row.get("flash_s", 0.0)),
-                        "offset_s": float(spec.get("offset_s", 0.0))}
+                        "offset_s": float(spec.get("offset_s", 0.0)),
+                        "crossing_id": cid}
         raise ValueError(f"交差点表に id={cid} が無い: {path}")
     raise ValueError(f"未知の physics.zones[].signal.mode: {mode}(可: {SIGNAL_MODES})")
 

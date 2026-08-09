@@ -163,6 +163,29 @@ FEATURES: tuple[Feature, ...] = (
        "暦(日付・曜日・祝日)。全プロンプトへ日付1行を注入する"),
     _f("world.calendar.weekday_work", "strict", False, "none",
        "本業勤務・登校を平日だけに絞る"),
+    # 装置(device)層 = 目標を持たないアクター(actor model P2。実装 src/society/devices.py)。
+    # strict の根拠: 装置は**決定論的な応答関数**であり乱数 stream を 1 本も引かない
+    #   (設計契約。module に乱数の識別子が存在しないことを tests/test_devices.py が AST 固定)。
+    # affects_k=False: generate() の呼び出しサイトを 1 つも足さず・減らさない。
+    # fingerprint_risk=none: **プロンプトへ 1 バイトも足さない**(待たされたことは
+    #   「動けない」という世界の事実としてしか現れない=新語彙も新欄も無い)。
+    _f("world.devices.enabled", "strict", False, "none",
+       "装置層の親トグル。装置が状態を変えてよいのは (a) 宣言済みのスケジュール/物理"
+       "[DEVS δ_int] か (b) エージェントの行為への応答[DEVS δ_ext] のときだけ、という"
+       "契約を型と監査証跡で与える。ON では装置名簿(id → 装置)が sim に生え、"
+       "改札 / 歩行者信号がその契約の下で動く。既定 OFF は名簿を組まない(L1 バイト一致)"),
+    _f("world.devices.faregate.enabled", "strict", False, "none",
+       "改札装置(通路配列 + FIFO 待ち行列)。通路数 × 処理間隔(既定 60 人/分/通路 = "
+       "日本の駅改札の**実測系公表値**。公称値は使わない)で個体ごとの待ち時間を出し、"
+       "整備窓(= 1 step)の定員を超えた個体だけ退出遷移が遅れる。ON のとき "
+       "env.feedback 規則2(改札スループット飽和 → 入場規制)は**評価されない** = "
+       "同じ物理(改札の処理能力飽和)の二重計上を防ぐ細粒度側の優先。既定 OFF は "
+       "gate_pass 0 件・agent に属性が生えない"),
+    _f("world.devices.signal_events", "strict", False, "none",
+       "歩行者信号装置の観測(signal_summary を **1 交差点 1 日に最大 1 件**)。"
+       "信号サイクル 140 秒 < 1 step 600 秒 なので**サイクルごとのイベントは出さない**"
+       "(出すと L1 が信号で溢れる)。sfm_core.SignalGate の時刻計算は 1 バイトも"
+       "変更していない = 足したのは交差点表由来の安定 device_id とこの要約だけ"),
 
     # ---- indoor ----
     _f("indoor.enabled", "strict", False, "none",
@@ -686,6 +709,20 @@ FEATURES: tuple[Feature, ...] = (
        "ON のときだけ、熟慮経路に迷い込んだ plan/recall/reflect を "
        "fallback{reason:misrouted_action} として計上する(従来は無音の no-op=観測の穴)。"
        "DAG はシム側に持たせない(捕集と組み立ての分離)= 観測がシムを変えない"),
+    # 第100バッチ IF-F(因果台帳)。分類表と実装 src/society/observer/causality.py。
+    # strict の根拠: L1 に**記録専用の 2 列**を足すだけの層。分類は kind 単位の静的表で、
+    #   LLM の自由文を新たに読む経路を 1 つも足さず、乱数も 1 本も引かない。
+    # affects_k=False: generate() の呼び出し点を足しも減らしもしない。
+    # fingerprint_risk=none: プロンプトを 1 バイトも変えない(2 列は L1 にしか出ない)。
+    _f("observer.causality.enabled", "strict", False, "none",
+       "L1 の各イベントへ cause_type(agent/device/schedule/physics/natural/boundary)と "
+       "actor_id を刻む。agent_id は『この行が誰の視点で記録されたか』であって行為者では"
+       "ないため(hear=聞いた側 / wage=受け取った側 / weather=-1)、そのままでは"
+       "『エージェントが起こした変化』と『装置が起こした変化』を事後に分離できない。"
+       "agent_id が患者である種は payload から行為者を戻す(hear→speaker / "
+       "opinion_shift→source / transmission→from)。復元できないものは null で正直に"
+       "開示する。分類は静的表なので事後解析は**この列が無い既存ランでも**同じ分類ができ、"
+       "列があるランでは表とエンジンの刻印を突き合わせて食い違いを報告する"),
     _f("observer.llm_health.enabled", "strict", False, "none",
        "L2 に LLM 健全性 KPI 3列を足す(観測専用・累積カウンタ)"),
     # 第98バッチ W2-6: finalize のメモリ有界化(設計 src/society/observer/logger.py)。

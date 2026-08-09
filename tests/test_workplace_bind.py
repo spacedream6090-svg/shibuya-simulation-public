@@ -214,3 +214,154 @@ def test_bind_fallback_deterministic_pure_function():
     u2 = work_mod._stable_uniform(20260722, "food\x1fL2_00000001")
     assert u1 == u2 and 0.0 <= u1 < 1.0
     assert work_mod._stable_uniform(20260722, "food\x1fL2_00000002") != u1
+
+
+# =========================================================================== #
+# 第100バッチ P3b 前提: 被覆の穴を実際に塞ぐ(coverage を正直に測る)
+# =========================================================================== #
+_BOUND = "work.bind_workplace.enabled"
+_REBIND = "work.bind_workplace.rebind_bound"
+
+
+def _is_bound(a) -> bool:
+    """スタッフ資格の必要条件(work_node があり勤務窓が開いている)。共在は別条件。"""
+    return bool(getattr(a, "work_node", "")) and int(getattr(a, "work_start_min", -1)) >= 0
+
+
+# ------------------------------------------------------ ON: 母数が「勤務地を持つべき層」を覆う
+def test_on_eligibility_covers_role_bearing_layers(small_pool, tmp_path):
+    """束ね母数(bind_eligible)が org_id 保有者だけでなく role を持つ L5・就業 occupation も覆う。
+
+    旧実装は org_id 保有者だけを数えていたので、地図に対応 POI カテゴリの無い L5(駅員/警察官/
+    議員 等)が統計の**外**に落ち、n_unbound_after=0 が実態より良く見えていた。"""
+    on = _pool_sim("elig", small_pool, tmp_path, **{_BOUND: "true"})
+    stat, det = on._workbind_stat, on._workbind_detail
+    # 母数 = 束ね手段/不能理由タグの総数(全 eligible が必ず 1 つのタグを受ける)
+    assert sum(det["how"].values()) == stat["n_total"] > 0
+    # L5(role を持つ duty/議員)が母数に入っている
+    assert det["by_layer"].get("L5", {}).get("n", 0) > 0
+    # 明示 org_id を持つ層(L2)は 1 体も未束ねで残らない
+    n_org = sum(1 for a in on.agents
+                if (on._pool.get(a.pool_pid) or {}).get("org_id"))
+    n_org_unbound = sum(1 for a in on.agents
+                        if (on._pool.get(a.pool_pid) or {}).get("org_id") and not _is_bound(a))
+    assert n_org > 0 and n_org_unbound == 0, f"org 所属なのに未束ね: {n_org_unbound}/{n_org}"
+
+
+# ------------------------------------------------------ ON: 束ねられないものは「理由つきで数える」
+def test_on_unresolvable_is_counted_not_hidden(small_pool, tmp_path):
+    """地図に対応 POI カテゴリが存在しない層は束ねず、n_unbound_after + 理由タグで開示する。
+
+    推測で職業→カテゴリ写像を作らない(_WORK_CAT / occ_cat / 台帳 cat のどれにも無い職業は
+    no_category)。開示の在り処は _workbind_detail(L1 の workplace_bound は 4 列固定の契約)。"""
+    on = _pool_sim("unres", small_pool, tmp_path, **{_BOUND: "true"})
+    stat, det = on._workbind_stat, on._workbind_detail
+    reasons = {k: v for k, v in det["how"].items()
+               if k in ("no_category", "no_poi_in_map", "no_ledger_node")}
+    assert sum(reasons.values()) == stat["n_unbound_after"], (reasons, stat)
+    assert stat["n_unbound_after"] > 0, "不能ゼロは母数が狭すぎる疑い(L5 が抜けている)"
+    # 不能は「地図に職場カテゴリが無い役割」に限られる(L2/L3 の org 所属は 0)
+    assert det["by_layer"].get("L2", {}).get("unbound_after", 0) == 0
+    assert det["unresolved_occ"], "不能理由の職業内訳が空"
+    # 統計の恒等式(束ね前後の差 = 新規束ね数)は母数を広げても壊れない
+    assert stat["n_unbound_before"] - stat["n_unbound_after"] == stat["n_bound"]
+
+
+# ------------------------------------------------------ ON: 束ね先は「客が実際に来る場所」
+def test_on_bound_node_actually_carries_that_workplace(small_pool, tmp_path):
+    """束ね先ノードは現行地図でその業種の POI を実際に持つ(=客の消費と共在しうる)。
+
+    台帳 organizations_shibuya_wide11k は「産業×規模帯→建物」の分布で置いた合成値なので、
+    workplace_poi.node は地図の POI 実体と食い違うものが多い(実測 wide_v7: food は 1,650社中
+    401社しか同カテゴリ POI のあるノードに居ない)。食い違ったまま束ねると『客が絶対に来ない
+    場所に店員が立つ』= serve が構造的に永久不在になる。"""
+    on = _pool_sim("realpoi", small_pool, tmp_path, **{_BOUND: "true", _REBIND: "true"})
+    city, bcfg, book = on.city, on._workbind_cfg, on._workbind_book
+    checked = 0
+    for a in sorted(on.agents, key=lambda x: x.id):
+        rec = on._pool.get(a.pool_pid) or {}
+        if not work_mod.bind_eligible(rec, bcfg) or not _is_bound(a):
+            continue
+        cat = work_mod._cat_for(rec, book.get(str(rec.get("org_id") or "")), bcfg)
+        if not cat:
+            continue
+        assert work_mod._node_is_workplace_of(city, a.work_node, cat), \
+            f"{a.pool_pid}: work_node={a.work_node} に {cat} の POI が無い"
+        checked += 1
+    assert checked > 0, "検査対象の束ね個体が居ない"
+
+
+# ------------------------------------------------------ ON: 地図語彙の食い違いは既存表で吸収
+def test_on_category_fallback_reuses_day_plan_table(small_pool, tmp_path):
+    """POI カテゴリの解決は day_plan.MAP_FALLBACK_CATS(既存表)を再利用する=新表を作らない。"""
+    from society.cognition.day_plan import MAP_FALLBACK_CATS
+    assert MAP_FALLBACK_CATS.get("education") == ("school",)
+    on = _pool_sim("catfb", small_pool, tmp_path, **{_BOUND: "true"})
+    city = on.city
+    # education が空の地図でも school 側から拾える(逆に education がある地図では素通り)
+    got = work_mod._pois_for_cat(city, "education")
+    assert got or not (city.pois_by_cat("education") or city.pois_by_cat("school"))
+    # occupation → カテゴリは persona._WORK_CAT(既存表)の再利用
+    assert work_mod._occ_cat_table() is _WORK_CAT
+
+
+# ------------------------------------------------------ ON: 冪等(2 回束ねても 1 回と同じ)
+def test_on_bind_is_idempotent(small_pool, tmp_path):
+    """rebind_bound=true で同じ個体を 2 回束ねても work_node/勤務窓が動かない(resume 再入の安全)。
+
+    work_node は agents pickle に載って resume を跨ぐので、再入で二重束ねのドリフトが起きると
+    resume != straight になる。束ねが (pool_pid, 固定属性) の純関数であることの機械固定。"""
+    sim = _pool_sim("idem", small_pool, tmp_path, **{_BOUND: "true", _REBIND: "true"})
+    n = 0
+    for a in sorted(sim.agents, key=lambda x: x.id):
+        rec = sim._pool.get(a.pool_pid) or {}
+        if not work_mod.bind_eligible(rec, sim._workbind_cfg):
+            continue
+        before = (a.work_node, a.work_building, a.work_floor,
+                  a.work_start_min, a.work_end_min)
+        for _ in range(2):
+            work_mod.bind_workplace(a, rec, sim.city, sim._workbind_book,
+                                    sim._workbind_cfg)
+        after = (a.work_node, a.work_building, a.work_floor,
+                 a.work_start_min, a.work_end_min)
+        assert before == after, f"{a.pool_pid}: 再束ねでドリフト {before} -> {after}"
+        n += 1
+    assert n > 0
+
+
+# ------------------------------------------------------ ON: 束ねは乱数を 1 draw も引かない
+def test_on_bind_draws_no_randomness(small_pool, tmp_path):
+    """束ね関数は RngHub を触らない(決定論=hashlib 純関数)。識別子を AST で機械固定する。
+
+    文字列/コメントは除いて **実行される識別子だけ**を見る(docstring に「乱数ゼロ」と書いてある
+    のを誤検知しない)。traces.py の propagation 不在固定と同型の AST 固定。"""
+    import ast
+    import inspect
+    tree = ast.parse(inspect.getsource(work_mod))
+    names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    names |= {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    names |= {a.name.split(".")[0] for n in ast.walk(tree)
+              if isinstance(n, ast.Import) for a in n.names}
+    names |= {str(n.module or "").split(".")[0] for n in ast.walk(tree)
+              if isinstance(n, ast.ImportFrom)}
+    for word in ("rng", "random", "RngHub", "hub", "stream", "numpy", "np"):
+        assert word not in names, f"work.py が乱数側の識別子 {word!r} を使っている"
+    sim = _pool_sim("norng", small_pool, tmp_path, **{_BOUND: "true", _REBIND: "true"})
+    a = next(x for x in sorted(sim.agents, key=lambda x: x.id) if x.work_node)
+    rec = sim._pool.get(a.pool_pid) or {}
+    before = a.work_node
+    work_mod.bind_workplace(a, rec, sim.city, sim._workbind_book, sim._workbind_cfg)
+    assert a.work_node == before
+
+
+# ------------------------------------------------------ ON: coverage が実数として上がる
+def test_on_raises_staff_capable_population(small_pool, tmp_path):
+    """ON でスタッフ資格(work_node + 勤務窓)を満たす在場者が実数として増える。
+
+    ★共在(勤務窓に work_node へ在場)は別条件で、本テストは緩めない。実測の unstaffed 率は
+    在場密度に支配される(docs 参照)ので、ここでは『資格者が増える』ことだけを固定する。"""
+    off = _pool_sim("cap_off", small_pool, tmp_path)
+    on = _pool_sim("cap_on", small_pool, tmp_path, **{_BOUND: "true"})
+    n_off = sum(1 for a in off.agents if _is_bound(a))
+    n_on = sum(1 for a in on.agents if _is_bound(a))
+    assert n_on > n_off, (n_off, n_on)

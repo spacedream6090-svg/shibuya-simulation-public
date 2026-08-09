@@ -52,6 +52,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from . import causality as _causality
 from .finalize import (FINALIZE_BATCH_ROWS, FINALIZE_ROW_GROUP_ROWS,  # noqa: F401
                        FinalizeStreamMixin)
 from .schema import EVENT_KINDS, Event
@@ -103,6 +104,15 @@ class ObserverLogger(FinalizeStreamMixin):
         # scheduler が一時キー(_prov)を 1 度も積まないので **None のまま**
         # = 下の分岐に入らない = 既存ランと L1 バイト一致。設計は society/provlink.py。
         self._prov: tuple | None = None
+        # ---- 因果台帳 IF-F(observer.causality.enabled。既定 OFF=False のまま)----
+        # True のときだけ log() が Event.cause_type / actor_id を埋め、_l1_table が
+        # 2 列を足す。**False のときは分岐に入る経路が構造的に存在しない**ので
+        # 既存ランと L1 バイト一致(parquet のスキーマも 9 列のまま)。
+        # 立てるのは observer/causality.apply_cfg(engine/simulation.py が 1 度だけ呼ぶ)。
+        self.causality_on: bool = False
+        # scheduler._apply が「いまこの行為を適用中」のあいだだけ (cause_type, 行為者 id)
+        # を立てる。OFF では scheduler が set_cause を 1 度も呼ばない = None のまま。
+        self._cause: tuple | None = None
 
     # ---- 来歴スコープ(scheduler._apply が開閉する。observer.llm_link ON のみ)----
     def set_prov(self, call_id: str, role: str, agent_id: int) -> None:
@@ -110,6 +120,13 @@ class ObserverLogger(FinalizeStreamMixin):
 
     def clear_prov(self) -> None:
         self._prov = None
+
+    # ---- 因果スコープ(scheduler._apply が開閉する。observer.causality ON のみ)----
+    def set_cause(self, cause_type: str, actor_id: int) -> None:
+        self._cause = (str(cause_type), int(actor_id))
+
+    def clear_cause(self) -> None:
+        self._cause = None
 
     # ---- L1 ----
     def log(self, event: Event) -> None:
@@ -129,6 +146,35 @@ class ObserverLogger(FinalizeStreamMixin):
             if event.llm_call_id is None:
                 event.llm_call_id = self._prov[0]
             event.payload.setdefault("llm_role", self._prov[1])
+        # 因果台帳 IF-F(observer.causality)。**既定 OFF ではこの分岐に入る経路が無い**
+        # (causality_on を True にするのは apply_cfg 1 箇所だけ)= L1 バイト一致。
+        #
+        # 優先順位
+        #   ① Event に明示された値(呼び出し点が自分で名乗った場合。現状はゼロ箇所)
+        #   ② 行為スコープ(scheduler._apply)… **行為者 id の直接知識**。
+        #      ただし cause_type については「行為の最中に出た」としか言えず、
+        #      **表より粗い**。そこで表が agent と分類している種でだけスコープの値を採り、
+        #      それ以外は表を信じる。ここでスコープを優先すると、客の支払いに連なって
+        #      出る withdraw(自動引き出し)や stock_out(在庫枯渇)や state_update
+        #      (状態の力学)まで「その個体が起こした」ことになり、**帰属率が構造的に
+        #      過大評価される**(実測: 24 step の mock で state_update 5 件がこれに当たる)。
+        #      causality.py の分類の原則3「迷ったら device 側へ寄せる」と同じ判断。
+        #   ③ CAUSE_OF_KIND の表 + actor_of の復元(patient 種は payload から行為者を戻す)
+        #
+        # ②を**行為者自身のイベントに限る**のは provlink と同じ線引きである:
+        # 聞き手の hear / opinion_shift は別主体の activity なのでスコープでは刻まず、
+        # ③の PATIENT_ACTOR_OVERRIDES が payload から本当の行為者を戻す。
+        if self.causality_on:
+            table_cause = _causality.cause_of(event.kind)
+            own = self._cause is not None and event.agent_id == self._cause[1]
+            if event.cause_type is None:
+                event.cause_type = (self._cause[0]
+                                    if own and self._cause[0] == table_cause
+                                    else table_cause)
+            if event.actor_id is None:
+                event.actor_id = (self._cause[1] if own else
+                                  _causality.actor_of(event.kind, event.agent_id,
+                                                      event.payload))
         self.events.append(event)
 
     # ---- L1b ----
@@ -157,7 +203,7 @@ class ObserverLogger(FinalizeStreamMixin):
 
     # ---- テーブル生成(part / 直接出力で同一スキーマを共有)----
     def _l1_table(self, events: list[Event]) -> pa.Table:
-        return pa.table({
+        cols = {
             "step":        pa.array([e.step for e in events], pa.int32()),
             "sim_min":     pa.array([e.sim_min for e in events], pa.int32()),
             "agent_id":    pa.array([e.agent_id for e in events], pa.int32()),
@@ -167,7 +213,14 @@ class ObserverLogger(FinalizeStreamMixin):
             "payload":     pa.array([_dumps(e.payload) for e in events], pa.string()),
             "rng_stream":  pa.array([e.rng_stream for e in events], pa.string()),
             "llm_call_id": pa.array([e.llm_call_id for e in events], pa.string()),
-        })
+        }
+        # 因果台帳 IF-F: **ON のときだけ** 2 列を末尾に足す(part / canonical の
+        # どちらもこの 1 関数を通るので、生える/生えないの判断はここ 1 箇所)。
+        # OFF では dict が 1 バイトも変わらない = 既存ランと parquet スキーマ同一。
+        if self.causality_on:
+            cols["cause_type"] = pa.array([e.cause_type for e in events], pa.string())
+            cols["actor_id"] = pa.array([e.actor_id for e in events], pa.int32())
+        return pa.table(cols)
 
     def _rows_table(self, rows: list[dict]) -> pa.Table:
         keys = sorted({k for row in rows for k in row})

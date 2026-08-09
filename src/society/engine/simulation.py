@@ -218,6 +218,10 @@ class Simulation:
         from ..observer import finalize as _finalize_mod
         self._finalize_cfg = _finalize_mod.cfg_of_config(cfg)
         _finalize_mod.apply_cfg(self.logger, self._finalize_cfg)
+        # IF-F 因果台帳(observer.causality.enabled。既定 OFF=属性を 1 つも触らない)。
+        # finalize と同じ「ON のときだけ立てる」流儀 = 既定ランは初期値のまま=バイト一致。
+        from ..observer import causality as _causality_mod
+        _causality_mod.apply_cfg(self.logger, _causality_mod.cfg_of_config(cfg))
         self.items = ItemStore()
         # ---- 場所の意味づけ最小版 D1(labeling.place_binding。既定 OFF=完全 no-op=バイト一致)----
         # ON 時だけ LabelSystem が束縛台帳を持つ(状態は LabelSystem 内に閉じるので checkpoint の
@@ -812,6 +816,9 @@ class Simulation:
         self._workbind_stat = None                 # day0 present の coverage 統計(起動時 1 件で記録)
         self._workbind_agg = {"n_total": 0, "n_unbound_before": 0,
                               "n_bound": 0, "n_unbound_after": 0}
+        # 束ね手段/不能理由の内訳(L1 には出さない実行時カウンタ。workplace_bound の payload は
+        # observer/schema.py で 4 列固定の契約なので、そこは 1 列も増やさない)。
+        self._workbind_detail = {"how": {}, "by_layer": {}, "unresolved_occ": {}}
         if self._workbind_cfg["enabled"]:
             self._workbind_book = _work_mod.load_bind_book(self._workbind_cfg, REPO_ROOT)
         # 「世界を変える」ツール群(host_event/post_flyer/found_group/propose/open_venture)
@@ -1583,9 +1590,9 @@ class Simulation:
             return
         from .. import work as _work_mod
         if not _work_mod.bind_eligible(record, self._workbind_cfg):
-            return                                 # 勤務地を持たない層(L1/L4/org_id 無し L5)は対象外
-        had, has = _work_mod.bind_workplace(agent, record, self.city,
-                                            self._workbind_book, self._workbind_cfg)
+            return                                 # 勤務地を持たない層(L1 の無職・L4 来街者)は対象外
+        had, has, how = _work_mod.bind_workplace(agent, record, self.city,
+                                                 self._workbind_book, self._workbind_cfg)
         agg = self._workbind_agg
         agg["n_total"] += 1
         if not had:
@@ -1594,6 +1601,18 @@ class Simulation:
             agg["n_unbound_after"] += 1
         if has and not had:
             agg["n_bound"] += 1
+        # 束ね手段/不能理由の内訳(**L1 には出さない**=observer/schema.py の workplace_bound は
+        # 4 列固定の契約。検収・診断が sim から直接読むための実行時カウンタ)。層は pool record の
+        # layer(L1..L5)。決定論=イベント列にも乱数にも一切触れない。
+        det = self._workbind_detail
+        det["how"][how] = det["how"].get(how, 0) + 1
+        lay = str(record.get("layer") or "?")
+        det["by_layer"].setdefault(lay, {"n": 0, "unbound_after": 0})
+        det["by_layer"][lay]["n"] += 1
+        if not has:
+            det["by_layer"][lay]["unbound_after"] += 1
+            occ = str(record.get("occupation") or record.get("role") or "?")
+            det["unresolved_occ"][occ] = det["unresolved_occ"].get(occ, 0) + 1
 
     def _pool_update_budget(self) -> None:
         """S6a の N 比例 cap を、pool ON 時は当日の在場数 len(self.agents) で更新する(1行の接続)。

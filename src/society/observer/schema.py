@@ -462,3 +462,10 @@ class Event:
     payload: dict[str, Any] = field(default_factory=dict)
     rng_stream: str = ""
     llm_call_id: str | None = None
+    # ---- 因果台帳 IF-F(第100バッチ・observer.causality.enabled。既定 OFF=常に None)----
+    #   cause_type … 「何がこの出来事を起こしたか」の 6 語(observer/causality.py が唯一の源)
+    #   actor_id   … その出来事に結びつく行為者 id(復元できなければ None。世界イベントの -1 も None)
+    # **末尾の既定つきフィールド**なので既存 201 箇所の構築は 1 行も変わらない。
+    # 既定 OFF では logger が 1 度も埋めず parquet の列も生えない = 既存ランとバイト一致。
+    cause_type: str | None = None
+    actor_id: int | None = None

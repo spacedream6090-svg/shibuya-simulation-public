@@ -154,8 +154,17 @@ def test_old_run_html_byte_identical_end_to_end(tmp_path):
                          cwd=REPO_ROOT, capture_output=True)
     if src.returncode != 0:
         pytest.skip("git 不在(HEAD 版を取れない)")
-    head_py = tmp_path / "make_viewer_head.py"
+    # W4-C 以降の make_viewer は scripts/run_dt.py を __file__ 相対で読む。
+    # HEAD 版コピーをリポ外で走らせるため、リポと同形の viz/ + scripts/ を組む
+    # (run_dt.py も HEAD 版=このテストの主張「HEAD と現行の一致」を純に保つ)。
+    (tmp_path / "viz").mkdir()
+    head_py = tmp_path / "viz" / "make_viewer_head.py"
     head_py.write_bytes(src.stdout)
+    run_dt_src = subprocess.run(["git", "show", "HEAD:scripts/run_dt.py"],
+                                cwd=REPO_ROOT, capture_output=True)
+    if run_dt_src.returncode == 0:
+        (tmp_path / "scripts").mkdir()
+        (tmp_path / "scripts" / "run_dt.py").write_bytes(run_dt_src.stdout)
 
     rd = _write_run(tmp_path, "old_e2e", indoor_on=False, n_agents=5, n_steps=6)
 

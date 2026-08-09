@@ -43,6 +43,22 @@ _MANY_THRESHOLD = 8
 # (org_output)の帰属から漏れる。台帳 organizations の workplace_poi.node へ org_id で直束ねし、
 # 台帳ノードが現行地図に無い時は POI カテゴリ + 安定ハッシュで決定論マッチする(organizations.
 # commute_to_poi の pool 版)。純関数(pool_pid・固定属性のみ)=run.seed 非依存=hydrate 再入不変。
+#
+# 第100バッチ(P3b 前提)の是正 3 点【実測 2026-08-09・mock ≤24step】:
+#  (1) **台帳ノードの実在検査**: 台帳は「産業×規模帯 → 建物」の分布で置いた合成値なので、
+#      workplace_poi.node は地図の POI 実体と食い違うものが多い(wide_v7: 同カテゴリ POI を持つ
+#      node に居るのは food 401/1,650・shop 986/3,850・office 498/4,015・service 78/1,485 社)。
+#      旧実装は node が graph にありさえすれば採用していたため、**客が絶対に来ない場所に店員が
+#      立ち**、束ね ON でも unstaffed 96%・不在 serve の 100% が「誰の職場でもない node」だった。
+#      → 同カテゴリ POI を持たない台帳ノードは決定論 POI マッチへ落として実在の店へ着地させる。
+#  (2) **母数の是正**: 旧 bind_eligible は org_id 保有者だけを数えていたため、地図に対応 POI
+#      カテゴリの無い L5(駅員/運転士/警察官/配信者/議員)が統計の外へ落ち、n_unbound_after=0 が
+#      実態より良く見えていた。role 保有層と _WORK_CAT 就業者を母数に入れ、束ねられないものは
+#      理由タグつきで数える(推測で職業→カテゴリ写像を発明しない)。
+#  (3) **写像の再利用**: occupation→カテゴリは persona._WORK_CAT、地図語彙差(education→school)は
+#      day_plan.MAP_FALLBACK_CATS。どちらも既存表で、この層で新しい対応表を作らない。
+# ★残る制約(束ねでは閉じない): serve の成立には共在(勤務窓に work_node へ在場)が要る。実測では
+#   在場密度が支配的で、cap=300 では unstaffed 90.7%→89.8% とほぼ動かず、cap=1,500 で 84.0%→65.8%。
 _BIND_DEFAULT_BOOK = "data/organizations_shibuya_wide11k.json"
 
 
@@ -171,15 +187,73 @@ def role_weight(agent, cfg: dict) -> float:
 
 
 # ---------------------------------------------------------------- 職場束ね直し(bind_workplace)
-def bind_eligible(record: dict, bcfg: dict) -> bool:
-    """束ね対象か(=域内従業者/学生)。org_id を持つ(L2/L3学生)か occ_cat に写像がある層(L5 等)。
+# 写像表は**既存のものだけを再利用する**(この層で新しい職業→カテゴリ表を発明しない):
+#   - occupation/role → 勤務 POI カテゴリ = persona._WORK_CAT(職場割当の唯一の源)
+#   - POI カテゴリの地図語彙差(education→school)= day_plan.MAP_FALLBACK_CATS
+# どちらも遅延 import(work.py は engine から module 直下で読まれるので循環を作らない)。
+def _occ_cat_table() -> dict:
+    from .agents.persona import _WORK_CAT
+    return _WORK_CAT
 
-    L1 住民・L4 来街者・org_id 無しの L5 は対象外=coverage 統計の母数に入れない(勤務地を持たない
-    層を『未束ね』に数えない=L2 の work_node coverage の指標を薄めない)。"""
+
+def _cat_aliases(cat) -> tuple[str, ...]:
+    """POI カテゴリ + 地図語彙の追加照会先(day_plan.MAP_FALLBACK_CATS と同一の表)。"""
+    from .cognition.day_plan import MAP_FALLBACK_CATS
+    c = str(cat)
+    return (c,) + tuple(MAP_FALLBACK_CATS.get(c, ()))
+
+
+def _pois_for_cat(city, cat) -> list[dict]:
+    """カテゴリの POI 群(空なら追加照会先を順に見る)。決定論・乱数なし。"""
+    for c in _cat_aliases(cat):
+        pois = city.pois_by_cat(c)
+        if pois:
+            return list(pois)
+    return []
+
+
+def _node_is_workplace_of(city, node: str, cat) -> bool:
+    """その node が現行地図で「その業種の職場」か(同カテゴリの POI を持つか)。
+
+    cat 不明の台帳エントリは判定材料が無いので True(従来どおり node をそのまま信じる)。"""
+    if not cat:
+        return True
+    alias = set(_cat_aliases(cat))
+    return any(p.get("cat") in alias for p in city.pois_at_node(node))
+
+
+def _cat_for(record: dict, entry: dict | None, bcfg: dict) -> str | None:
+    """束ね先の POI カテゴリ。台帳 cat → occ_cat(config)→ persona._WORK_CAT の順に後退。
+
+    どれにも当たらない層(駅員・警察官・タクシー運転手・議員 等=地図に対応 POI カテゴリが
+    そもそも存在しない)は None=束ね不能として**正直に数える**(推測で写像を作らない)。"""
+    cat = (entry or {}).get("cat")
+    if cat:
+        return str(cat)
+    occ = str(record.get("occupation") or record.get("role") or "")
+    cat = bcfg["occ_cat"].get(occ) or _occ_cat_table().get(occ)
+    return str(cat) if cat else None
+
+
+def bind_eligible(record: dict, bcfg: dict) -> bool:
+    """束ね対象か(=勤務地を持つべき層)。coverage 統計の母数はここで決まる。
+
+    対象: ① org 所属(org_id。L2 従業者/L3 学生)② occ_cat(config)に写像がある層
+          ③ **role を持つ層**(L5 duty の駅員/運転士/警察官/配信者・議員。org_id は無いが
+             「渋谷で働いている」ペルソナ)④ occupation が persona._WORK_CAT に載る就業者。
+    対象外: L1 の無職/フリーランス/バンドマン等(_WORK_CAT が None=決まった職場を持たない)と
+            L4 来街者(role も org_id も持たない)。
+    ★③④ を母数に入れるのは意図的で、「束ねられなかった」ことを n_unbound_after として
+      可視化するため(旧実装は org_id 保有者だけを数えていたので、地図に対応カテゴリの無い
+      L5 が丸ごと統計の外に落ち、coverage が実態より良く見えていた)。"""
     if record.get("org_id"):
         return True
     occ = str(record.get("occupation") or record.get("role") or "")
-    return occ in bcfg.get("occ_cat", {})
+    if occ in bcfg.get("occ_cat", {}):
+        return True
+    if str(record.get("role") or ""):
+        return True
+    return _occ_cat_table().get(occ) is not None
 
 
 def _hhmm_to_min(s, default: int) -> int:
@@ -246,51 +320,62 @@ def _window(bcfg: dict, entry: dict | None, record: dict) -> tuple[int, int]:
 
 
 def _resolve_node(record: dict, city, book: dict, bcfg: dict, key: str):
-    """束ね先を決める。(node, building, floor, entry) を返す(束ね不能なら None)。
+    """束ね先を決める。(node, building, floor, entry, how) を返す(node=None なら how=不能理由)。
 
-    ① 台帳直束ね: record.org_id → book[org_id].node が現行地図にあれば採用(最精度)。
-    ② 決定論マッチ: 台帳ノードが地図に無い/org_id 無しのとき、POI カテゴリ(台帳 cat →
-       occupation 写像)で city.pois_by_cat から安定ハッシュ(pool_pid の純関数)で1つ選ぶ。"""
+    ① 台帳直束ね: record.org_id → book[org_id].node。**現行地図でその node が実際にその業種の
+       職場である**(同カテゴリの POI を持つ)ときだけ採用する。
+       ★この追加条件が第100バッチの是正点。台帳(build_orgs.py --dist)は組織を「産業×規模帯 →
+       建物」の分布で置いた合成値なので、workplace_poi.node は**地図の POI 実体と一致しない**
+       ものが多数ある(実測 2026-08-09・wide_v7: 同カテゴリ POI を持つ node に居るのは
+       food 401/1,650・shop 986/3,850・office 498/4,015・service 78/1,485 社のみ)。
+       食い違ったまま束ねると「客が絶対に行かない場所に店員が立つ」= serve が構造的に永久
+       不在になる(実測: 束ね ON でも unstaffed 96%・不在 serve の 100% が『誰の職場でもない
+       node』で発生)。なので食い違いは②へ落として**実在の POI へ着地**させる。
+       poi_match_fallback=false のときは②を使わない設定なので、従来どおり node を無条件採用する。
+    ② 決定論マッチ: POI カテゴリ(台帳 cat → occ_cat → persona._WORK_CAT)で
+       city.pois_by_cat から安定ハッシュ(pool_pid の純関数)で1つ選ぶ。地図語彙の食い違いは
+       day_plan.MAP_FALLBACK_CATS で追加照会する(education→school)。"""
     org_id = record.get("org_id")
     entry = book.get(str(org_id)) if org_id else None
-    if entry and entry.get("node") and entry["node"] in city.graph:      # ① 台帳直束ね
+    fb = bcfg["poi_match_fallback"]
+    # ① 台帳直束ね(node が現行地図に在り、かつ実際にその業種の POI を持つときだけ)
+    if entry and entry.get("node") and entry["node"] in city.graph \
+            and (not fb or _node_is_workplace_of(city, entry["node"], entry.get("cat"))):
         bld, floor = _resolve_building(city, entry["node"], entry.get("building"),
                                        entry.get("poi_id"))
         fl = int(entry.get("floor") or 0) or floor
-        return entry["node"], bld, fl, entry
-    if not bcfg["poi_match_fallback"]:
-        return None
-    cat = (entry or {}).get("cat")                                       # ② 決定論マッチ
+        return entry["node"], bld, fl, entry, "ledger"
+    if not fb:
+        return None, None, 0, entry, "no_ledger_node"
+    cat = _cat_for(record, entry, bcfg)                                  # ② 決定論マッチ
     if not cat:
-        occ = str(record.get("occupation") or record.get("role") or "")
-        cat = bcfg["occ_cat"].get(occ)
-    if not cat:
-        return None
-    pois = city.pois_by_cat(str(cat))
+        return None, None, 0, entry, "no_category"
+    pois = _pois_for_cat(city, cat)
     if not pois:
-        return None
+        return None, None, 0, entry, "no_poi_in_map"
     idx = int(_stable_uniform(bcfg["seed"], f"{cat}\x1f{key}") * len(pois)) % len(pois)
     poi = pois[idx]
     bld, floor = _resolve_building(city, poi["node"], poi.get("building"), poi.get("id"))
     fl = int(poi.get("floor") or 0) or floor
-    return poi["node"], bld, fl, entry
+    return poi["node"], bld, fl, entry, "poi_match"
 
 
-def bind_workplace(agent, record: dict, city, book: dict, bcfg: dict) -> tuple[bool, bool]:
+def bind_workplace(agent, record: dict, city, book: dict, bcfg: dict) -> tuple[bool, bool, str]:
     """勤務中に通う職場 POI を work_node へ束ねる(決定論・乱数ゼロ・LLM ゼロ)。
 
-    戻り値: (had_before, has_after)。既に work_node を持つ個体は rebind_bound=false なら不変。
+    戻り値: (had_before, has_after, how)。how = kept(既束ねを触らず)/ ledger(台帳直束ね)/
+    poi_match(決定論 POI マッチ)/ no_category・no_poi_in_map・no_ledger_node(**束ね不能の理由**
+    =正直に数えるためのタグ)。既に work_node を持つ個体は rebind_bound=false なら不変。
     work_start_min<0 のときだけ勤務窓を補う(既存の勤務窓・出勤 routine は壊さない)。付与規則は
     (pool_pid, 固定属性)の純関数=run.seed 非依存=hydrate 再入で同一 work_node。"""
     had = bool(getattr(agent, "work_node", "")) and int(getattr(agent, "work_start_min", -1)) >= 0
     if had and not bcfg["rebind_bound"]:
-        return True, True
+        return True, True, "kept"
     key = str(getattr(agent, "pool_pid", "") or record.get("id", ""))
-    res = _resolve_node(record, city, book, bcfg, key)
-    if res is None:
+    node, bld, floor, entry, how = _resolve_node(record, city, book, bcfg, key)
+    if node is None:
         has = bool(getattr(agent, "work_node", "")) and int(getattr(agent, "work_start_min", -1)) >= 0
-        return had, has
-    node, bld, floor, entry = res
+        return had, has, how
     agent.work_node = node
     if bld is not None:                                    # 建物内の職場: 入館して勤務
         agent.work_building = bld
@@ -299,4 +384,4 @@ def bind_workplace(agent, record: dict, city, book: dict, bcfg: dict) -> tuple[b
         o, c = _window(bcfg, entry, record)
         agent.work_start_min = o
         agent.work_end_min = c
-    return had, True
+    return had, True, how

@@ -220,6 +220,8 @@ TABLE: tuple[tuple[str, str, str], ...] = (
     ("world.scenario_params.duration_steps", STEPS,
      "scenario の継続時間 [step]。実時間の長さを保つため逆比例"),
     ("indoor.markov.dwell_steps", STEPS, "平均滞在 step(遷移確率 = 1/dwell)"),
+    ("world.devices.faregate.max_hold_steps", STEPS,
+     "改札待ちで持ち越せる上限 [step]。実時間の安全弁を保つため逆比例"),
     ("tools.permit_steps", STEPS, "許可待ちの長さ [step](0=待ちなし)"),
     ("tools.event_duration_steps", STEPS, "イベント開催時間 [step]"),
     ("tools.flyer_ttl_steps", STEPS, "チラシの寿命 [step]"),

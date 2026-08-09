@@ -427,13 +427,35 @@ class SignalGate:
 
     位相・秒数はすべて config or サイドカー由来の固定値。内部で乱数を一切引かない
     (同一入力 → 同一 bool =決定論)。
+
+    ★装置としての同一性(actor model P2 / src/society/devices.py)
+    ------------------------------------------------------------
+    本クラスは「位相 = 絶対時刻の純関数」= **記憶を持たない固定スケジュール装置**
+    (DEVS の δ_int だけを持ち、状態ベクトルが空)であり、装置層が言う device の
+    条件を最初から満たしている。足りなかったのは **同一性**(どの交差点の信号なのかを
+    外から指す名前)だけなので、`crossing_id`(交差点表 = world/zones.py の
+    `signal.crossing_id`)から安定 id を導いて `device_id` に持たせる。
+    ★**時刻計算(位相・青 / 青点滅 / 赤の窓)は 1 バイトも変えていない**
+      (既存 tests/test_crossing_signals.py が無修正で緑であることがその証拠)。
+      `crossing_id` 未指定(既存の全呼び出し)では `device_id` は None のままで、
+      属性が 2 つ増える以外に一切の差分が無い。
     """
 
-    def __init__(self, cycle_s, green_s, flash_s=0.0, offset_s=0.0):
+    def __init__(self, cycle_s, green_s, flash_s=0.0, offset_s=0.0,
+                 crossing_id=None, device_id=None):
         self.cycle_s = float(cycle_s)
         self.green_s = float(green_s)
         self.flash_s = float(flash_s)
         self.offset_s = float(offset_s)
+        # 装置としての同一性(既存呼び出しでは両方 None = 従来と同一の振る舞い)。
+        # ★接頭辞は society/devices.py の SIGNAL_PREFIX と同じ文字列でなければならない
+        #   (tests/test_devices.py が両者の一致を機械固定する)。ここで society 層を
+        #   import しないのは、sfm_core が「純粋な物理コア」であるという既存の線引きを
+        #   崩さないため(viz/sfm.py からの再export 経路も society に依存しない)。
+        self.crossing_id = (None if crossing_id is None else int(crossing_id))
+        self.device_id = (device_id if device_id is not None
+                          else (None if self.crossing_id is None
+                                else f"signal:{self.crossing_id}"))
         if self.cycle_s <= 0.0:
             raise ValueError("cycle_s must be > 0")
         if not (0.0 <= self.green_s <= self.cycle_s):
@@ -461,6 +483,10 @@ class SignalGate:
         return self.phase(sim_sec) < self.green_s + self.flash_s
 
     @classmethod
-    def scramble(cls, cycle_s, green_s, flash_s=0.0):
-        """全方向同相ゲート(offset 0 = 全方向同相で一斉に青)を作る。"""
-        return cls(cycle_s, green_s, flash_s, offset_s=0.0)
+    def scramble(cls, cycle_s, green_s, flash_s=0.0, crossing_id=None):
+        """全方向同相ゲート(offset 0 = 全方向同相で一斉に青)を作る。
+
+        `crossing_id` は装置としての同一性のためだけの任意引数(既定 None = 従来と同一)。
+        """
+        return cls(cycle_s, green_s, flash_s, offset_s=0.0,
+                   crossing_id=crossing_id)
