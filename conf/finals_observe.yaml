@@ -1,0 +1,640 @@
+# =============================================================================
+# 本選観察ラン ONセット候補(Wave 4 Day 3・2026-08-12)
+#
+# ユーザー方針(wave4-reality-coverage-plan.md §4-2「実装が終われば全てON」)を、
+# **1本の自己完結プロファイル**として実体化したもの。--profile は 1 本しか取れないので
+# production.yaml / observe.yaml / zones_shibuya.yaml の3系統をここへ合流させてある
+# (zones_shibuya.yaml の合成作法「physics: ブロックと world.map 行を相手へ貼る」に従う)。
+#
+#   python scripts/run.py --profile conf/finals_observe.yaml run.name=obs_finals
+#
+# ★これは**候補**である。承認は OBS-U1/U3(PENDING §3)= 8/14。承認前に本ランは開始しない。
+# ★本選のバックエンド配線(vLLM 艦隊)は入れていない。conf/profiles/finals-vllm7.yaml の
+#   model: ブロックを下の model: へ貼るか、dotlist で上書きする(用途=配線 と 用途=世界 の分離)。
+#
+# 前提(このプロファイルは以下が再生成済みであることを要求する。Day 3 で実施済み):
+#   ① 地図 v8            data/shibuya_osm_wide_v8.json           (POI 2,337・コンビニ93・subcat 付き)
+#   ② 組織台帳(センサス較正+夜勤)
+#        python scripts/build_orgs.py --census --count 9872 --night-shifts \
+#               --map data/shibuya_osm_wide_v8.json --report
+#        → data/organizations_shibuya_census.json (9,872社 / 従業者 222,849 / 夜勤枠 3,370社)
+#   ③ ペルソナプール(②から再生成=夜勤者と新職業が載る)
+#        python scripts/build_persona_pool.py --orgs data/organizations_shibuya_census.json
+#        → data/persona_pool (100万件 / L2 224,240 / L5 1,247)
+#   ②③ を飛ばすと night_economy の夜勤者・street_life/city_ops の担い手が名簿に居らず、
+#   「ONにしたのに1件も出ない」族が大量に出る(第107縦煙の実測)。
+#
+# 何を入れて何を入れなかったかの根拠表は docs/log/devlog.md の Day 3 エントリを正典とする。
+# =============================================================================
+
+# ============================================================================
+# (0) ラン基本 — 規模は DP-U3 決定(本線10日ラン=25万・現実同等規模)
+# ============================================================================
+run:
+  seed_auto: true          # 観察ラン=実験者が seed を選ばない(採取して config/summary に記録)
+  n_agents: 250000         # pool ON では present_cap が実効。名目 N も揃えておく(smoke_wide と同じ流儀)
+  n_steps: 1440            # 10日 = 144 step/日 × 10(Δt=10 分)。8/16-8/26 の本線
+  dt_min: 10               # ★正準。≠10 は「別の世界」= 触らない
+  start_tod: "00:00"       # day 境界=深夜0時。natural_start と併せて初日から全員に朝計画が出る
+  natural_start: true      # 初日コールドスタート改善。★conf に「本番 ON はユーザー判断」= OBS-U1 で承認を取る
+  mode: observe            # 機能レジストリ: 全 repro_tier を許可(宣言を manifest に残すだけ)
+
+# ============================================================================
+# (1) 観察ランの必須記録(observe.yaml (1b)。外してはならない層)
+# ============================================================================
+model:
+  # backend/servers は本選で conf/profiles/finals-vllm7.yaml の model: ブロックへ差し替える。
+  # ここは基底(mock)のまま=縦煙とドライランがそのまま通る。
+  journal: true            # 全 LLM 呼のプロンプト全文+応答を llm_journal.jsonl.gz に残す
+  cache_mode: free         # 観察ランは新規推論を許す(再生は llm_cache から replay で行う)
+  reflect_think: false     # think=true は内省 JSON が全滅する実測(第34)。本番既定
+  reflect_max_tokens: 768  # 右サイズ化(vLLM の KV 予約が縮み高並列が改善)
+
+# ============================================================================
+# (2) 名簿 = 100万プール(pool)+ 層別クォータ(DP-U3 案A)
+# ============================================================================
+# ★agents.personas_file は **null のまま**(プールが名簿を供給する)。ここに固定名簿を書くと
+#   organizations.attach が「pool の密 id % 名簿人数」で無関係な配属を撒くので絶対に書かない。
+pool:
+  enabled: true
+  dir: data/persona_pool   # ②③ で再生成したプール(L2 224,240 = センサス従業者 222,849 + 教職員)
+  present_cap: 250000      # 在場 = 25万(DP-U3 本線)
+  dormant_cap: 50000       # ★既定 0(無制限)は日次ローテーションで際限なく膨れる。LRU で有界化
+  # ---- 層別クォータ(第98 小粒G・DP-U3 案A)----
+  # OFF だと平日は workday_shift が cap を食い切り cadence/stochastic が 0 人=来街者ゼロの街に
+  # なる(第91 実測)。ON の実走照合は Day 3 で完了(平日 day0・cap 25万で計算値と 5 層すべて差 0)。
+  tier_quota:
+    enabled: true
+  # 忘却/再会を観察するランなので退避台帳を広げる(dunbar ON との相互作用。conf の注記どおり)
+  relations_cap: 60
+  episodes_cap: 60
+
+# ============================================================================
+# (3) 世界 — 地図 v8 + 暦 + 夜 + 装置 + 痕跡 + 設備
+# ============================================================================
+world:
+  # ★v8 が本番地図(ユーザー決定 2026-08-10 §4-1)。night_economy の subcat 表(convenience/
+  #   net_cafe/sauna/karaoke/club)と medical の subcat=hospital は **v8 でしか当たらない**。
+  map: data/shibuya_osm_wide_v8.json
+
+  calendar:
+    enabled: true
+    start_date: "auto"     # 実行当日を初日に(本選は 8/16)。weather.mode=generated が月を読む
+    weekday_work: true
+
+  # ---- 夜間解禁(Wave 4 III-1)。1つのクランプ修正が夜の街全体を開ける ----
+  night_economy:
+    enabled: true          # 日跨ぎシフト(close<open)+ 24h コンビニ + 深夜営業 + 終電後の受け皿
+
+  # ---- 駅到着のパルス化(Wave 3)。transit_interior と faregate の前提 ----
+  inflow_pulse:
+    enabled: true
+
+  # ---- 装置層 DEVS(Wave 1-2)----
+  devices:
+    enabled: true
+    faregate:
+      enabled: true        # 改札 60人/分。★inflow_pulse ON が前提(平滑流入では待ち行列が立たない)
+    signal_events: true    # signal_summary 日次 1 件(観測)
+    transit_operator: true # 運休判定を装置 δ_ext 経由へ(素通し=ビット同値)
+
+  # ---- 場所のイベント履歴=スティグマジー(IF-D)----
+  traces:
+    enabled: true          # incidents_interpersonal.guardian.w_trace の前提でもある
+
+  # ---- 昇降設備の摩耗・閉じ込め(H5)----
+  facilities:
+    enabled: true
+    # ★★ Day 3 のリビルド検収で見つかった**名簿と conf の食い違い**への提案(要 Fable 承認)。
+    #   基底の responder_occupations は ["設備保守員", "警備員"] だが、再生成した名簿には
+    #   **どちらも 1 人も居ない**(実測: 設備保守員 0 / 警備員 0)。実際に居るのは
+    #   センサス台帳が生やした L2 の夜勤ロール **「設備巡回」3,944 人 / 「常駐警備」3,875 人**。
+    #   このままでは故障の対応者が原理的に 0 人=facility_call/dispatch/restore が永久に出ない。
+    #   city_ops.night_cleaning.occupations が ["夜間清掃員", "夜間清掃"](L5 役割名 + 台帳ロール名)
+    #   を**両方**並べている前例と同型に、台帳ロール名を足す。src は 1 行も触っていない。
+    responder_occupations: ["設備保守員", "警備員", "設備巡回", "常駐警備"]
+    # escalator.traps は **false のまま**(「エスカレータで閉じ込め」は現実に反する対照条件)
+
+  # ---- 都市リアリズム(production 由来)----
+  floor_clamp:
+    enabled: true          # 階を実階数へ丸める(conf「★観察ランで ON」)
+  elevation:
+    enabled: true          # 標高 z を payload へ(表示・観測専用)
+  heights:
+    enabled: true          # 建物実高さ(PLATEAU)
+  vision:
+    enabled: true          # 壁による視線遮蔽(outdoor は重いので据え置き)
+  scene_desc:
+    enabled: true          # 方向つき視界の構造化シーン記述(追加 LLM 呼ゼロ)
+  traffic:
+    mode: od               # 信号69基・車線・一方通行295区間
+    signal_from_crossings: true   # 車と歩行者を同一交差点装置へ(Wave 2 device_id 統一)
+
+# ============================================================================
+# (4) 交通 — 駅員/車掌 + 車内空間
+# ============================================================================
+transit:
+  file: data/transit_odpt.json    # ODPT 実ダイヤ(東京メトロ3路線)
+
+transit_staff:
+  enabled: true            # 駅員(在席)+ 車掌(ドア閉判断)。遅延の内生化
+  dwell:
+    calibrated: true       # 東京実測則(+15人/車両 ≒ +1秒)へ係数差替
+
+transit_interior:
+  enabled: true            # 車両割当 + 車内ゾーン + 静かな共在 + familiar strangers + 車掌巡回
+                           # ★world.inflow_pulse ON との論理積でしか動かない(上で ON 済み)
+
+transit_ride:
+  taxi:
+    prob: 0.02             # 現実較正(徒歩圏2kmの街でタクシーは例外的)
+  bus:
+    enabled: true
+  bus_table:
+    enabled: true          # 実バスダイヤ(GTFS 静的表)
+
+# ============================================================================
+# (5) 屋外の連続物理ゾーン(P3 竹-4 / P4-2)
+#     conf/zones_shibuya.yaml の physics: ブロックを**そのまま**貼ったもの(合成作法)。
+#     コスト実測: +2.66 s/step(人数ではなくゾーン数でほぼ決まる)。
+#     ★incidents_env.crowd は zones ON のランでしか密度を測れない(H5 の設計上の制約)。
+# ============================================================================
+physics:
+  sfm:
+    far_field:
+      enabled: true        # P4-2。A/B/C 受入が揃うのはこの構成だけ(v_of_s / wall は ON にしない)
+      a2: 0.119
+      b2: 1.890
+      cutoff_factor: 2.5
+      taper_m: 1.0
+
+  zones_enabled: true
+  # perception.channels は **false のまま**(true にすると第80 の σ 較正をやり直す必要がある)
+
+  zones:
+    # 並び順に意味がある: 信号を持つ scramble を先頭に置く(逆順だと赤信号を無視して車道を渡る)
+    - id: scramble
+      engine: orca
+      dt_sub: 0.05
+      layers: [0]
+      polygon: [[9.92, -3.37], [0.58, 14.05], [-12.27, 10.08], [-22.54, 9.53],
+                [-32.34, 2.27], [-22.85, -13.82], [-4.22, -16.8], [1.38, -10.67]]
+      arrive_radius_m: 1.0
+      signal:
+        mode: table
+        path: data/crossings_shibuya.json
+        crossing_id: 291758776        # 実測 cycle 140 / green 37 / flash 10
+        offset_s: 0.0
+      orca:
+        pref_noise: 0.05
+        radius_margin_m: 0.05
+        separation_iters: 64
+      gate:
+        min_gap_m: 0.10
+        band_m: 3.0
+
+    - id: hachiko_square
+      engine: sfm
+      dt_sub: 0.05
+      layers: [0]
+      polygon: [[-24.0, -56.0], [14.0, -56.0], [14.0, -27.0], [-24.0, -27.0]]
+      arrive_radius_m: 1.0
+      sfm:
+        noise: 0.0
+        wall_range_m: 2.0
+      gate:
+        min_gap_m: 0.10
+        band_m: 3.0
+
+    - id: center_gai
+      engine: sfm
+      dt_sub: 0.05
+      layers: [0]
+      polygon: [[-85.71, 12.02], [-76.77, 11.05], [-70.69, 67.09], [-79.63, 68.06]]
+      arrive_radius_m: 1.0
+      sfm:
+        noise: 0.0
+        wall_range_m: 2.0
+      gate:
+        min_gap_m: 0.10
+        band_m: 3.0
+
+# ============================================================================
+# (6) 街路の顔と都市運営(Wave 4 III-3 / III-4)
+# ============================================================================
+street_life:
+  enabled: true            # 客引き/スカウト・ティッシュ配り・路上音楽・キッチンカー・占い・
+                           # 街頭演説・募金・路上生活者(尊厳規約は street_life.py が機械固定)
+city_ops:
+  enabled: true            # 交番8箇所への警官配置・ごみ収集・納品・ビル夜間清掃・救急出動
+                           # ★ems は health.enabled(下で ON)・waste の深夜班は night_economy が前提
+
+# ============================================================================
+# (7) 身体と事件レイヤー(第107 H1〜H5)
+# ============================================================================
+health:
+  enabled: true
+  fatigue_gain_work: 0.02
+  fatigue_gain_move: 0.015
+  fatigue_threshold_gain: 0.1
+  onset_prob: 0.02
+  medical_prob: 0.5
+  # ---- 重症度 S0-S4 と死(H1)。★ユーザー決定 2026-08-11「死は現実量で実装」----
+  severity:
+    enabled: true          # mortality は本トグル配下(別オプトインは無い)。現実量較正済み
+
+medical:
+  enabled: true            # 搬送・受診・入院・会計(金の三本足)。★health.severity + city_ops.ems +
+                           #   **v8 地図**(subcat=hospital)が前提。3つとも上で満たしてある
+
+lost_property:
+  enabled: true            # 落とす→拾う→交番→返還/所有権(chance の windfall/loss の機能代替)
+
+incidents_interpersonal:
+  enabled: true            # 窃盗・喧嘩・110番(RAT=共在なければ事件なし)
+                           # detain_steps は **0 のまま**(勾留 seam は発火権が動くので踏まない)
+
+incidents_env:
+  enabled: true            # 火災 / 設備 / 群集 / 交通(全焼0既定・群集は生成しない=既存混雑を読む)
+
+# ============================================================================
+# (8) 情報・認知・計画(IF-A〜E)
+# ============================================================================
+information:
+  rumors:
+    enabled: true          # 噂オブジェクト+MT型 stifler(既存会話に相乗り=発話本文は非注入)
+
+cognition:
+  channels:
+    enabled: true          # 読み取り専用・L1 バイト不変(σ 較正の観測点)
+  # ---- 拒否通知(IF-B)----
+  # ★engaged 水準は cognition.engaged.enabled が OFF のとき memory へ**縮退**する(仕様)。
+  #   認知スタック本体(fire / watch / g_update / engaged)は **OBS-U3 で 8/14 に判断**する留保項目
+  #   なのでここでは開けない。承認が出たら下の4行を外す(縦煙で共存は確認済み)。
+  rejection_notify: engaged
+  # fire:      { enabled: true }
+  # watch:     { enabled: true }
+  # g_update:  { enabled: true }
+  # engaged:   { enabled: true }
+
+planning:
+  day_plan:
+    enabled: true          # 構造化された朝の計画(conf「★本番はユーザー判断で ON」)
+    use_contingency: true  # 第86 のデッドデータ(if_then)を消費する
+    boundary:
+      enabled: true        # 計画駆動の圏外滞在(despawn/respawn=朝の計画が予定表)
+                           # transit_interior.include_plan_returnees の前提
+
+# ============================================================================
+# (9) 偶発イベント chance = **運用退役**(第107 決着)
+# ============================================================================
+# ユーザー原理「運は世界のアルゴリズムでなく人の行動から」(2026-08-11)。
+#   windfall  → H3 拾得(lost_property)   loss → H3 遺失 + H4 窃盗被害
+#   encounter → 既存の共在で機能代替完備
+# 機能代替が完備したので本選 ONセットでは切る。**コード削除は本選後**(golden 保護)。
+# observe.yaml は chance.enabled=true を持つが、本ファイルはそれを意図的に上書きする。
+chance:
+  enabled: false
+
+# ============================================================================
+# (10) 天候 — ★generated(H1 熱中症チャネルの前提)
+# ============================================================================
+# 既定 synthetic は WBGT 欠測 = heat チャネルが恒久的に不活性(第107 残課題)。
+#   generated … 実測30年から較正した確率生成器(3状態マルコフ + 2変量AR(1) + 年効果)。
+#               repro_tier=strict(静的ファイルと seed の純関数・ネットワーク呼び出しゼロ)。
+#               較正済みは **8月のみ**(data/snapshot/weather_gen_params.json)= 本選 8/16-8/26 に一致。
+#   table     … 凍結実測を実日付で引くが、凍結範囲は 1996-2025 年の8月 = **2026年は範囲外**で
+#               synthetic へフォールバックする。よって table は採らない。
+weather:
+  enabled: true
+  mode: generated
+  rain_grievance: 0.01
+  extra_prompt_fields: true   # 最低気温・湿度・降水・猛暑日・暑さ指数を天気1行へ(mode≠synthetic で有効)
+
+# ============================================================================
+# (11) 経済・組織・制度(production 相当のリアリズム)
+# ============================================================================
+agents: {}                 # ★personas_file は書かない(= null のまま。(2) の注記参照)
+
+organizations:
+  enabled: true
+  commute_to_poi: true
+  book: data/organizations_shibuya_census.json   # ★v8 + センサス較正 + 夜勤の台帳
+  # ★正直な限界: pool ラン(agents.personas_file=null)では organizations.attach が 0 件を返す
+  #   = agent.org_id は付かない。これは PENDING §3「pool 経路の agent.org_id 付与」= 判断待ち。
+  #   台帳自体は career の再配属先・commerce.inventory.b2b の卸先として読まれる。
+
+government:
+  enabled: true
+media:
+  enabled: true
+  prompt_context: true
+needs:
+  enabled: true
+affect:
+  enabled: true
+  arousal_gain: 0.15
+  importance_arousal_w: 2.0
+  importance_novelty_w: 1.5
+  salience_k: 4
+  threshold_gain: 0.05
+schedule:
+  enabled: true
+tools:
+  equip_all: true
+  permit_steps: 6
+  permit_deny_prob: 0.15
+rules:
+  allow_declare: true
+recursion:
+  enabled: true
+lodging:
+  enabled: true
+housing:
+  relocation:
+    enabled: true
+household:
+  enabled: true
+  realistic: true
+  family_dinner:
+    enabled: true
+  cohabit:
+    enabled: true
+
+factors:
+  relative_deprivation_grievance: 0.012
+
+economy:
+  fixed_cost_daily: 300
+  visitor_refresh: true
+  min_wage_hourly: 1226
+  accounts:
+    enabled: true
+    eviction_days: 30
+    bankruptcy_days: 60
+  consumption:
+    enabled: true
+  payment:
+    enabled: true
+  bank:
+    enabled: true
+  vc:
+    enabled: true
+  org_accounting:
+    enabled: true          # IF-E2 案B(2026-08-06 決定)。RoW を宣言して総マネー保存を立てる
+
+commerce:
+  enabled: true
+  stock_grievance: 0.02
+  inventory:
+    enabled: true
+    b2b:
+      enabled: true
+services:
+  enabled: true
+  self_dev:
+    enabled: true
+delivery:
+  enabled: true
+
+work:
+  service:
+    enabled: true
+    indoor_fields: true
+    office:
+      by_org: true
+    ledger:
+      enabled: true
+  # ★bind_workplace は **入れない**(PENDING §3 = ユーザー判断待ち)。ON にすると spend/economy
+  #   統計が激変し(serve 1259→301)、ON/OFF 跨ぎの比較が原理的に不可能になる。
+
+career:
+  enabled: true
+  severance_days: 5
+  unfair_ratio: 0.3
+  layoff_prob: 0.0002
+  switch_prob: 0.0004
+  rehire_prob: 0.02
+  by_choice:
+    enabled: true
+
+institution_routes:
+  labor:
+    enabled: true
+  vote:
+    enabled: true
+    deposit: 30000
+  enforcement:
+    enabled: true
+    detention_steps: 3
+  deliberation:
+    enabled: true
+  assembly:
+    enabled: true
+    size: 9
+    from_roster: true      # 名簿制議会(ユーザー決定: 本番シミュ内で選挙は行わない)
+    term_days: 99999
+    realism:
+      enabled: false
+
+annual_events:
+  enabled: true
+  ambient: true
+disaster:
+  enabled: true
+  onset_prob: 0.01
+  grievance: 0.06
+  stay_home_bias: 0.7
+  delay_prob: 0.05
+  suspend_prob: 0.3
+  delay_grievance: 0.02
+  outage_prob: 0.02
+  outage_grievance: 0.03
+society_diversity:
+  enabled: true
+  tourist_ratio: 0.5
+  foreign_ratio: 0.2
+  crime_prob: 0.000002     # ★incidents_interpersonal.theft.supersede_diversity=true なので窃盗の
+  nuisance_prob: 0.005     #   供給は H4 側へ移る(二重計上しない)。ここは残る族のための較正値
+  crime_grievance: 0.08
+  nuisance_grievance: 0.03
+env:
+  feedback:
+    enabled: true          # ★transit_staff.dwell / devices.faregate が ON なので規則1/2 は評価されない
+                           #   (置換関係。規則3=POI だけが効く。conf の依存表どおり)
+
+# ============================================================================
+# (12) 心・社会・情報環境(観察の主眼)
+# ============================================================================
+relations:
+  enabled: true
+  dunbar:
+    enabled: true          # 認知枠。pool.relations_cap を 60 に広げてある((2) 参照)
+  endogenous_accept:
+    enabled: true
+  endogenous_invite:
+    enabled: true
+  endogenous_quality:
+    enabled: true
+friend_graph:
+  enabled: true
+hierarchy:
+  enabled: true
+gossip:
+  enabled: true
+joint:
+  enabled: true
+party:
+  enabled: true            # 同行人数(L4 record の party_size)。pool ON が前提
+inner_life:
+  enabled: true
+  hobbies:
+    leisure_bias: 0.3
+drive:
+  boredom:
+    enabled: true
+  drift:
+    enabled: true
+routine:
+  stochastic:
+    enabled: true
+  # gumbel は入れない(行き先選択の分布形を変える=較正済み既定からの逸脱を本選で混ぜない)
+conversation:
+  enabled: true
+prompts:
+  variety_hint: true
+  reflect_variety: false   # 実LLM検収で丸写し(placeholder echo)33% = 正味悪化のため OFF 据え置き
+  dialog_history: true
+  reply_partner: closeness
+  interstitial:
+    enabled: true
+reflection:
+  self_model_days: 0
+  deep:
+    enabled: true
+  implicit_self:
+    enabled: true
+memory:
+  agentic_pull: true
+  actr:
+    enabled: true
+worldview:
+  enabled: true
+ontology:
+  enabled: true
+beliefs:
+  enabled: true
+  verify_actions: true
+labeling:
+  mode: open               # LLM が自由に造語できる(自然な語の誕生の観察=natural coinage)
+  place_binding:
+    enabled: true
+  norm_stage:
+    enabled: true
+freedom:
+  open_actions: true
+  undefined_register: true
+  explicit_nothing: true
+  satiation_gain: 0
+  p2:
+    move_home: true
+    buy: true
+    study: true
+    partnership: true
+    deviance: true
+psych:
+  sdt:
+    enabled: true
+  collective:
+    enabled: true
+  lynch:
+    enabled: true
+  searle:
+    enabled: true
+info_env:
+  enabled: true
+  recommendation:
+    enabled: true
+  influence:
+    enabled: true
+  misinfo:
+    enabled: true
+    flame_grievance: 0.02
+ads:
+  enabled: true
+  large: ["QFRONT", "SHIBUYA 109", "ハチ公前広場"]
+  slots: ["渋谷マークシティ"]
+crowd_visual:
+  enabled: true
+sns_geo:
+  enabled: true
+lod:
+  input_res:
+    enabled: true
+  # n_proportional は入れない: 25万 × 0.15 = 37,500 呼/step。LLM 予算は DP-U4(呼数)の決定事項で、
+  # 8/15-16 の診断ランで R_eff を実測してから決める。
+  n_proportional:
+    enabled: false
+  max_llm_per_step: 300
+lens:
+  enabled: true
+  deviation:
+    enabled: true
+  structure:
+    enabled: true
+  assets:
+    enabled: true
+
+# ============================================================================
+# (13) 観測 — 25万 × 10日を「書き終われる」形にする
+# ============================================================================
+observer:
+  causality:
+    enabled: true          # cause_type / actor_id / device_id(「世界を変えた人」の測定に必須)
+  llm_link: true           # 行為 → 思考の PROV リンク
+  llm_health:
+    enabled: true          # watchdog の監視対象(本選10日ランでは ON)
+  finalize:
+    streaming: true        # ★25万体では必須。OFF だと「書き終わり」で落ちる(第99 実測)
+  regression:
+    enabled: false         # ★25万では OFF(窓合計が在場個体数に比例して常駐する)。退行検出は縦煙の仕事
+  flush_every_steps: 6     # L1 を 1 シミュ時間ごとに part flush(バッファ OOM の回避)
+  snapshot_every: 144      # L3 は 25万 × 250B/体 ≈ 60MB/回。1日1回に絞る
+  checkpoint_every: 72     # 半日ごと。★25万体の完全状態 pickle=ディスクを先に確認すること
+  initial_frame:
+    days: 1
+
+# ============================================================================
+# (14) 意図的に入れなかったもの(全部ここに理由を残す=「忘れていた」と区別する)
+# ============================================================================
+# ● ユーザー/台帳の判断待ち
+#   work.bind_workplace.enabled(+ rebind_bound) … PENDING §3。ON で serve 84%→66%・spend が激変
+#   cognition.fire / watch / g_update / engaged  … OBS-U3「認知 ON の 8/14 留保」
+#   cognition.policy_cache.enabled               … PENDING §3(resume で空になる問題が未決)
+#   model.mind.enabled                           … DP-U2 案C の最終判定が 8/15(vLLM 同居性能の実測)
+#   lod.n_proportional.enabled                   … DP-U4(呼数)の決定待ち
+# ● 未配線・実装なし
+#   SoA … **conf キーが存在しない**(src/society/engine/soa.py と bench_soa.py のみ)。載せ替え未実施
+# ● 実験ノブ(観察ランに入れると主張が壊れる)
+#   k.writeback(free 据置)/ controls.mode / world.scenario / world.mod / spark.* / rewards /
+#   ablate.*(llm_off・propagation_off・cognitive_tier・shuffle_partners・context_shuffle・
+#            persona_swap・context_sever・prompt_paraphrase)/ experiment.flat_traits /
+#   observer.state_hash / model.cache_mode=replay
+# ● 較正を壊す/実測で悪化
+#   physics.perception.channels … true で ext.crowd_local の意味が変わり第80 σ 較正がやり直し
+#   physics.sfm.v_of_s          … 限界効用ほぼゼロ(最大相対誤差 0.113→0.131 と微悪化)
+#   physics.sfm.wall.{a,b}      … 単独 ON は悪化。かつ本3ゾーンは walls 宣言ゼロ=評価されない
+#   routine.stochastic.gumbel   … 行き先分布の形を変える(較正済み既定からの逸脱を本選で混ぜない)
+#   prompts.reflect_variety     … 実LLM で丸写し 33%(正味悪化)
+# ● 再現不能(repro_tier=none)
+#   transit_ride.live.* … SUMO 外部プロセス。observe モードでは許可されるが事後再生できない
+# ● 規模の都合
+#   indoor.*(markov/sfm/tracks/meeting/los)… PENDING §4「D16 屋内 ON」未解決。
+#     indoor_tracks ON はディスク +19GB(W4-E 申告)。25万では別途容量計画が要る
+#   pov.enabled … POV 画像(CPU レンダ)。容量・時間コストが 25万で成立しない
+#   world.vision.outdoor … 建物 footprint で屋外も遮蔽する重い版
+#   observer.regression … (13) の理由
+# ● 現実に反する対照条件(conf が明記)
+#   world.facilities.escalator.traps / incidents_interpersonal.theft.supersede_diversity=false /
+#   brawl.require_intox=false / brawl.night_only=false / transit_staff.dwell.require_service=false /
+#   transit_interior.include_plan_returnees=false

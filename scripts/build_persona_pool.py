@@ -8,7 +8,7 @@
 設計(docs/plans/persona-pool.md §2/§5 + docs/plans/w2-execution-plan.md §4 P5):
   5層をすべて**決定論**(seed 固定・LLM 不使用)で生成し、シャーディングした JSONL に吐く。
     L1 住民      : shibuya_population.json の周辺分布から IPF で骨格(夜間人口 ~3万)
-    L2 域内従業者: 組織台帳 organizations_shibuya_wide11k.json の employees を需要源に逆算
+    L2 域内従業者: 組織台帳(既定 organizations_shibuya_wide11k.json・--orgs で差替可)の employees を需要源に逆算
                    (会社 employees の総和 + 学校の教職員)。org_id/role/shift を本人に埋め込む
     L3 定期来街  : 学生(学校 capacity から逆算・org_id=学校)+ 常連(習い事等・週次)
     L4 非定期来街: 回転の主層(観光/買物/ビジネス来訪の匿名合成セグメント。数十万)
@@ -55,6 +55,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 SCHEMA_VERSION = "persona-pool-1.0"
 PART_SIZE = 50_000            # 1 シャードの最大レコード数
+
+# 組織台帳の既定パス(従来のハードコードをそのまま既定値へ移しただけ = 無指定なら 1 バイトも
+# 変わらない)。--orgs でセンサス較正台帳 data/organizations_shibuya_census.json 等に差し替える。
+# ★docs/research/economy-census-calibration.md §8 ④ が既にこの引数を前提に書かれていた
+#   (「引数は同スクリプトの --help を参照」)が、実装が無かった = 本選前リビルドの詰まり。
+DEFAULT_ORGS_FILE = "data/organizations_shibuya_wide11k.json"
 
 # ---- 層コード(SeedSequence の第2要素。決定論の名前空間分離)----
 LC = {"L1": 1, "L2": 2, "L3": 3, "L4": 4, "L5": 5}
@@ -750,7 +756,8 @@ def gen_L5(writer: ShardWriter, seed: int, fraction: float):
 
 # ------------------------------------------------------------------ メイン
 def build_pool(out_dir: Path, seed: int, fraction: float,
-               orgs: dict, pop: dict, total_target: int):
+               orgs: dict, pop: dict, total_target: int,
+               orgs_file: str = DEFAULT_ORGS_FILE):
     t0 = time.time()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -815,8 +822,10 @@ def build_pool(out_dir: Path, seed: int, fraction: float,
             "visit_cadence", "subtype", "visit_purpose", "visit_rate", "is_foreign",
             "party_size", "revisit", "post", "duty_pattern", "seat_id", "party"],
         "sources": {
-            "organizations": "data/organizations_shibuya_wide11k.json",
+            "organizations": orgs_file,
             "population_marginals": "data/shibuya_population.json"},
+        "organizations_meta": {k: orgs.get("meta", {}).get(k)
+                               for k in ("map", "mode", "night_shifts", "seed")},
         "employees_ledger_total": sum(c["size"]["employees"] for c in orgs["companies"]),
         "llm_targets_count": len(llm_targets),
         "elapsed_sec": round(time.time() - t0, 2),
@@ -887,18 +896,25 @@ def main(argv=None):
                     help="出力ディレクトリ(既定 data/persona_pool・.gitignore 済み)")
     ap.add_argument("--no-councilors-json", action="store_true",
                     help="data/personas_councilors.json を書かない")
+    ap.add_argument("--orgs", default=DEFAULT_ORGS_FILE,
+                    help="L2/L3学生の需要源になる組織台帳 JSON(既定=正準 11k 台帳)。"
+                         "センサス較正台帳を使うなら "
+                         "--orgs data/organizations_shibuya_census.json")
     args = ap.parse_args(argv)
 
     out_dir = Path(args.out)
     if not out_dir.is_absolute():
         out_dir = REPO_ROOT / out_dir
 
-    orgs = json.loads((REPO_ROOT / "data" / "organizations_shibuya_wide11k.json")
-                      .read_text(encoding="utf-8"))
+    orgs_path = Path(args.orgs)
+    if not orgs_path.is_absolute():
+        orgs_path = REPO_ROOT / orgs_path
+    orgs = json.loads(orgs_path.read_text(encoding="utf-8"))
     pop = json.loads((REPO_ROOT / "data" / "shibuya_population.json")
                      .read_text(encoding="utf-8"))
 
-    meta, councilors = build_pool(out_dir, args.seed, args.fraction, orgs, pop, args.total)
+    meta, councilors = build_pool(out_dir, args.seed, args.fraction, orgs, pop, args.total,
+                                  orgs_file=str(args.orgs).replace("\\", "/"))
 
     if not args.no_councilors_json:
         cpath = _write_councilors_json(councilors, args.seed)
