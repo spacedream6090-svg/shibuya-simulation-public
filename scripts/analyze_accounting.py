@@ -245,6 +245,13 @@ MONEY_KINDS: frozenset[str] = frozenset({
     # IF-E2 案B: 域内に客が居ない org(office/education)への**輸出代金**が
     # production の payload に revenue として載る(ON のときだけ。OFF はキーなし=金額ゼロ)。
     "production",
+    # ---- H2 医療(medical.enabled。既定 OFF のランには 1 件も出ない)----
+    # ems_transport = 救急搬送の公費(区 → RoW ems_operation)。cost に載る。
+    # medical_bill  = 保険給付 7 割(RoW insurance_reimbursement → 医療機関 org)。
+    #                 **amount = 実際に動いた額**で、受け手 org を特定できなかった回は 0
+    #                 (保険者も医療機関も街の外 = 街の残高は 1 円も動かない)。
+    #                 自己負担 3 割は spend(cat="medical")側で会計済み = ここでは数えない。
+    "ems_transport", "medical_bill",
 })
 
 #: 金額は payload に出るが**別のイベントで既に会計済み**の種(二重計上の禁止リスト)。
@@ -261,6 +268,9 @@ DERIVED_MONEY_KINDS: frozenset[str] = frozenset({
     # ---- IF-E2 案B(economy.org_accounting ON のランでのみ現れる)----
     "org_overdraft",    # org の預金が負に落ちた通知。金は wage 側で既に会計済み
     "row_flow",         # その日の域外収支の**日次集計**。個々のフローは spend/wage 側で会計済み
+    # ---- H2 医療(medical.enabled)----
+    "hospital_admit",     # 入院の開始(在院という状態。金額キーを持たない)
+    "hospital_discharge",  # 退院。入院費は同じ step の spend / medical_bill 側で会計済み
 })
 
 
@@ -503,6 +513,25 @@ def flows_for(kind: str, payload: dict, ctx: dict) -> list[Flow]:
             # 特定できなかった仕入れは RoW(域外資本の店)が払う = EXTERNAL → ORG。
             out.append(Flow(party_sector(p.get("payer")) or ORG,
                             party_sector(p.get("payee")) or ORG, amt, "b2b_trade"))
+    elif kind == "ems_transport":
+        # H2 医療①: 救急搬送の公費。支出主体は区(payer="government")で、受け手は
+        # **街の外**(救急を運行するのは東京消防庁 = 都 = 本シムの行政ではない)。
+        # 行政が未構築の世界では payer が載らない = 街の残高が 1 円も動いていないので
+        # フローを立てない(動いていない金を動いたことにしない)。
+        cost = _f(p, "cost")
+        src = party_sector(p.get("payer"))
+        if cost and src is not None:
+            out.append(Flow(src, party_sector(p.get("payee")) or EXTERNAL, cost,
+                            "ems:public_transport"))
+    elif kind == "medical_bill":
+        # H2 医療③: 保険給付(街の外の保険者 → 医療機関 org)。amount は**実際に動いた額**で、
+        # 受け手 org を台帳で特定できなかった回は 0(保険者も医療機関も街の外)。
+        # 自己負担(self_pay)は spend 側で会計済みなので**ここでは数えない**(二重計上の禁止)。
+        amt = _f(p, "amount")
+        dst = party_sector(p.get("payee"))
+        if amt and dst is not None:
+            out.append(Flow(party_sector(p.get("payer")) or EXTERNAL, dst, amt,
+                            "medical:insurance"))
     elif kind == "production":
         # IF-E2 案B: 域内に客が居ない org(全 org の 36.5%・従業者の 51.5%)の**輸出代金**。
         # 地域会計では観光サテライト勘定(非居住者の域内消費=輸出)の逆向き適用にあたる。

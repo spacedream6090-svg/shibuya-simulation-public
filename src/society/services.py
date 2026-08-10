@@ -57,7 +57,14 @@ _DEFAULT_SERVICES: dict[str, dict] = {
                  "price": 4000, "stay": 3, "band": "mood", "magnitude": 0.03,
                  "daily_rate": 0.05, "age": [12, 90], "remember": "髪を整えて気分が上がった"},
     # 任意受診・健診(病気起点でない=既存 medical_visit と非重複): 体調管理=活力。年数回。
+    #   ★exclude_subcats(H2 レーン 2026-08-10 の是正): 地図 v8 は総合病院を subcat=hospital で
+    #     区別しているが cat は service に潰れているため、名前ヒントだけで引くと**総合病院が
+    #     健診の行き先として選ばれていた**(v8 の hospital 7 件には名称が「〜クリニック」の
+    #     施設が実在する)。病院は救急の**搬送先**(src/society/medical.py)であって歩いて
+    #     行く場所ではないので、ここから除く。★subcat を持たない地図(v7 以前)では
+    #     何も落ちない=完全同値(lodging の love_hotel フィルタと同型)。
     "clinic": {"cats": ["service"], "hints": ["クリニック", "医院", "診療", "歯科", "内科", "眼科"],
+               "exclude_subcats": ["hospital"],
                "price": 3000, "stay": 2, "band": "vitality", "magnitude": 0.02,
                "daily_rate": 0.012, "age": [0, 120], "remember": "健康のために受診してきた"},
     # 塾・習い事・スクール: 学習素地=効力感。該当層(若年)。週1-2回。
@@ -104,6 +111,8 @@ def build_cfg(raw) -> dict:
         services[str(k)] = {
             "cats": [str(c) for c in (d.get("cats") or [])],
             "hints": [str(h) for h in (d.get("hints") or [])],
+            # 除外するサブカテゴリ(既定 空=何も落とさない=従来と完全同値)。
+            "exclude_subcats": [str(s) for s in (d.get("exclude_subcats") or [])],
             "price": float(d.get("price", 0.0)),
             "stay": max(1, int(d.get("stay", 2))),
             "band": str(d.get("band", "mood")),
@@ -252,14 +261,21 @@ def _index(sim) -> dict:
             if not node:
                 continue
             x, y = sim.city.node_xy(node)
-            entries.append((node, str(p.get("name", "")), float(x), float(y)))
+            # subcat は地図 v8 以降だけが持つ(v7 以前は常に "" = 除外が何も落とさない)。
+            entries.append((node, str(p.get("name", "")), float(x), float(y),
+                            str(p.get("subcat") or "")))
         idx[c] = entries
     sim._service_index = idx
     return idx
 
 
-def _matches(svc: dict, name: str) -> bool:
-    """POI 名 name がサービス定義の hints に該当するか(hints 空=汎用=常に一致)。"""
+def _matches(svc: dict, name: str, subcat: str = "") -> bool:
+    """POI 名 name がサービス定義に該当するか(hints 空=汎用=常に一致)。
+
+    ★exclude_subcats に載るサブカテゴリは**先に落とす**(既定 空=何も落とさない=従来同値)。
+    """
+    if subcat and subcat in (svc.get("exclude_subcats") or ()):
+        return False
     hints = svc["hints"]
     if not hints:
         return True
@@ -273,8 +289,8 @@ def _nearest_poi(sim, agent, svc: dict, radius2: float):
     best_node = None
     best_key = None
     for cat in svc["cats"]:
-        for node, name, x, y in idx.get(cat, ()):
-            if not _matches(svc, name):
+        for node, name, x, y, subcat in idx.get(cat, ()):
+            if not _matches(svc, name, subcat):
                 continue
             d2 = (x - ax) ** 2 + (y - ay) ** 2
             if d2 > radius2:
@@ -351,7 +367,8 @@ def service_dest(agent, sim, step: int, sim_min: int):
 def _poi_name(sim, node: str, svc: dict) -> str | None:
     """node 上でサービス定義に一致する POI 名(観測用。無ければ None)。"""
     for p in sim.city.pois_at_node(node):
-        if p.get("cat") in svc["cats"] and _matches(svc, str(p.get("name", ""))):
+        if p.get("cat") in svc["cats"] and _matches(svc, str(p.get("name", "")),
+                                                    str(p.get("subcat") or "")):
             return p.get("name")
     return None
 

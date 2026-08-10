@@ -163,6 +163,10 @@ POS_PREFIX = "pos"                    # 店頭の販売時点(point of sale)= �
 ORG_PREFIX = "org"                    # 会社そのもの(産出・給与の主体)
 BANK_PREFIX = "bank"                  # 銀行(与信・返済回収・利息)
 TRAIN_OP_PREFIX = "train_op"          # 運行装置(乗務員不在時のドア閉判断。transit_staff.py)
+# 昇降設備(エレベーター / エスカレーター。**摩耗する装置** = facility_devices.py が宣言)。
+# ★実体を持つ装置(DeviceRegistry に居る)だが、id の右は**地図の建物 id**なので
+#   事前に列挙できない = 動的 id の族(faregate / signal と同じ扱い)。
+LIFT_PREFIX = "lift"
 
 # =========================================================================== #
 # 装置 id の**閉じた名簿**(IF-F W2: 因果台帳に装置の同一性を載せるための唯一の源)
@@ -209,8 +213,11 @@ PROCESS_DEVICE_IDS: tuple[str, ...] = (
 #:   ``pos:<ノード>``   … 店頭の販売時点。**スタッフ不在の応対**を出した側(scheduler)
 #:   ``org:<org_id か職場キー>`` … 会社の日次産出(scheduler の org 締め)
 #:   ``train_op:<駅ノード>`` … 乗務員不在のドア閉判断(transit_staff.py が宣言)
+#:   ``lift:<建物 id>-ev|-es`` … 昇降設備(facility_devices.py が宣言。**実体を持つ装置**で
+#:       DEVS の δ_int/δ_ext を実装するが、id の右が地図の建物 id なので列挙できない)
 DYNAMIC_DEVICE_PREFIXES: frozenset[str] = frozenset(
-    {FAREGATE_PREFIX, SIGNAL_PREFIX, POS_PREFIX, ORG_PREFIX, TRAIN_OP_PREFIX})
+    {FAREGATE_PREFIX, SIGNAL_PREFIX, POS_PREFIX, ORG_PREFIX, TRAIN_OP_PREFIX,
+     LIFT_PREFIX})
 
 #: 装置 id の接頭辞の閉リスト。**世界プロセス id の頭 + 動的 id の族**から導出する
 #: (手で並べた 2 つ目の名簿を作らない = 片方だけ更新して腐る事故を構造的に潰す)。

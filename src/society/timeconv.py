@@ -296,6 +296,50 @@ TABLE: tuple[tuple[str, str, str], ...] = (
      "倒れた個体がその場に留まる長さ [step]。実時間で同じ長さを保つ"),
     ("city_ops.ems.on_scene_steps", STEPS,
      "救急隊が現場に留まる長さ [step]。実時間で同じ長さを保つ"),
+    # H5(事件レイヤーの環境側 3 族: 火災 / 交通 / 群集)。L1 の安全弁は「件/step」=
+    # 1 日あたりの総量を保つ(traces と同型)。燃焼と現場滞在の長さは**実時間で同じ長さ**。
+    # ★曝露ハザードは「曝露 1 単位 × 1 step あたりの確率」なので **RATE**: Δt を細かく
+    #   すると同じ瞬時曝露が step 数ぶん繰り返されるため、線形に割らないと件数が Δt に
+    #   比例して増える(1 日あたりの期待件数を保つ変換)。
+    # ★これ以外の incidents_env のキーは全部 Δt 非依存(件/日のレート・重み・分 of day・
+    #   距離 m・気温 ℃・m/分の速度・人/m² の密度閾値・面積比)なので TABLE に載せない。
+    ("incidents_env.max_events_per_step", RATE,
+     "1 step に出す環境事件イベントの上限 [件/step](1日あたりの総量を保つ安全弁)"),
+    ("incidents_env.fire.on_scene_steps", STEPS,
+     "消防隊が現場に留まる長さ [step]。実時間で同じ長さを保つ"),
+    ("incidents_env.fire.burn_steps.*", STEPS,
+     "重度別の燃焼の長さ [step]。実時間で同じ長さを保つ(鎮火までの実時間は Δt に依らない)"),
+    ("incidents_env.traffic.hazard_per_exposure", RATE,
+     "曝露 1 単位あたりの事故ハザード [件/(曝露·step)]。1 日あたりの期待件数を保つ"),
+    # H5(設備 = 摩耗する装置)。L1 の安全弁は「件/step」= 1 日あたりの総量を保つ。
+    # ★これ以外の world.facilities のキーは Δt 非依存: 故障率は **件/台/日**、保守周期は
+    #   **日**、復旧は**分**、摩耗は**利用 1 回あたり / 日あたり**(module 側が分へ割る)、
+    #   速度は m/分 = いずれも実時間の単位である。
+    ("world.facilities.max_events_per_step", RATE,
+     "1 step に出す設備イベントの上限 [件/step](1日あたりの総量を保つ安全弁)"),
+    # H3(遺失物ループ)。時効・寿命・気づくまでの遅れはいずれも**実時間で同じ長さ**を保つ
+    # (3 か月時効は遺失物法 7 条の実時間・「携帯は 10 分で気づく」も実時間の主張)。
+    # 落下率は **件/人日** なので Δt に依存しない(module 側で steps_per_day で割る)=
+    # 分類は INVARIANT。確率・倍率・金額・分 of day の時刻帯も同様に Δt 非依存。
+    ("lost_property.statute_steps", STEPS,
+     "遺失物法 7 条の 3 か月時効 [step]。実時間で同じ長さを保つ"),
+    ("lost_property.abandon_steps", STEPS,
+     "誰にも拾われないまま路上の物が消えるまで [step]。実時間で同じ長さを保つ"),
+    ("lost_property.notice_delay.*", STEPS,
+     "持ち主が紛失に気づくまでの遅れ [step](品目別)。実時間で同じ長さを保つ"),
+    ("lost_property.max_events_per_step", RATE,
+     "1 step に出す遺失物イベントの上限 [件/step](1日あたりの総量を保つ安全弁)"),
+    ("lost_property.base_daily.*", INVARIANT,
+     "落下率は **件/人日**(Δt 非依存)。per-step 化は module 側で steps_per_day で割る"),
+    # H4(対人 = RAT収束)。酩酊の残存と勾留の長さは**実時間で同じ長さ**を保つ。
+    # ★これ以外の incidents_interpersonal のキーは Δt 非依存(ペア条件付き確率・重み・
+    #   閾値・分 of day の時刻帯)なので TABLE に載せない。
+    ("incidents_interpersonal.intox.steps", STEPS,
+     "酩酊マーカーの残存 [step]。実時間で同じ長さを保つ"),
+    ("incidents_interpersonal.report.detain_steps", STEPS,
+     "勾留の長さ [step](既定 0=勾留 seam を踏まない)。実時間で同じ長さを保つ"),
+    ("incidents_interpersonal.max_events_per_step", RATE,
+     "1 step に出す対人事件イベントの上限 [件/step](1日あたりの総量を保つ安全弁)"),
     ("beliefs.witness_window", STEPS, "目撃可能な窓 [step]"),
     ("beliefs.fact_ttl_steps", STEPS, "fact の鮮度 [step]"),
     ("beliefs.verify_deadline_steps", STEPS, "現場確認の有効期限 [step]"),
@@ -498,6 +542,25 @@ TABLE: tuple[tuple[str, str, str], ...] = (
     ("career.rehire_prob", INVARIANT, "日次確率"),
     ("health.onset_prob", INVARIANT, "日次発症確率"),
     ("health.medical_prob", INVARIANT, "発症 1 回あたりの受診確率"),
+    # 重症度の状態機械(H1)。転帰の待ち時間だけが step 単位で、残りは日次レート・割合・
+    # 気温閾値・年齢帯係数 = Δt 非依存(実時刻を保つため転帰の 2 本だけ逆比例させる)。
+    ("health.severity.arrest_outcome_steps", STEPS, "心停止の転帰が確定するまでの長さ"),
+    ("health.severity.severe_outcome_steps", STEPS, "致死性の重症の転帰が確定するまでの長さ"),
+    # H2 医療(搬送・入院)。**実時間で同じ長さを保つ 2 本**だけが step 単位で、残りは
+    # 日数・割合・金額・半径 m = Δt 非依存(下の医療ワイルドカードで INVARIANT へ畳む)。
+    ("medical.transport.steps", STEPS,
+     "現場 → 病院の搬送にかかる長さ [step]。実時間で同じ長さを保つ"),
+    ("medical.admit.mild_steps", STEPS,
+     "軽症の在院の長さ [step](数時間で帰宅)。実時間で同じ長さを保つ"),
+    ("medical.max_events_per_step", RATE,
+     "1 step に出す医療イベントの上限 [件/step](1 日あたりの総量を保つ安全弁)"),
+    ("medical.*", INVARIANT,
+     "トグル = Δt 非依存(上限件数と搬送・在院の step 長は上で個別に分類済み)"),
+    ("medical.*.*", INVARIANT,
+     "在院日数・自己負担割合・金額・半径 m・1 日あたりの上限件数・POI 語彙 = Δt 非依存"),
+    ("health.severity.*", INVARIANT,
+     "日次ハザード・重症度分布の割合・WBGT 閾値/勾配・年齢帯係数・金額 = Δt 非依存"
+     "(発症は『その日その個体が発症するか』の判定で、毎 step の Bernoulli ではない)"),
     ("housing.relocation.job_prob", INVARIANT, "日次転居確率"),
     ("housing.relocation.rent_prob", INVARIANT, "日次転居確率"),
     ("disaster.onset_prob", INVARIANT, "日次発生確率"),

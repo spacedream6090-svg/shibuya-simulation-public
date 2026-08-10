@@ -48,9 +48,10 @@ Wave 4 III-3 と同じ轍)。そこで救急は **3 段の因果連鎖**とし�
    (``sick`` は ``health`` 側の日程どおりに治り、本 module は治さないし悪くもしない)。
    入院・搬送先・重症度・死は**作らない**。理由: それらは「健康とは何か」の意味論を
    決める話で、既存の ``illness`` が単一の真偽値しか持たない現状では、ここで決め打つと
-   健康機構の後続設計を縛ってしまう。★申し送り: 重症度階層(軽症/中等症/重症)と
-   搬送先(医療機関 POI)を ``health`` 側に入れるのが本筋で、そのとき本 module の
-   ``_collapse_gate`` は「重症度が閾値を超えた」という**既存状態の読み取り**に置き換わる。
+   健康機構の後続設計を縛ってしまう。★申し送りは**果たされた**: 重症度階層は
+   ``health.severity``(H1)が持ち、``_collapse_gate`` は「S3/S4 への遷移」という
+   **既存状態の読み取り**に置き換わった。搬送先・入院・医療費は ``medical.py``(H2)が
+   持ち、本 module は「出動が決まった」ことを 1 行で伝えるだけである(所有の分離)。
 2. **回復は既存の ``wake_up`` で観測される**。専用の ``ems_recover`` 種は作らない
    (出来事を 2 度数えないため)。``wake_up`` の ``slept_steps`` は本人の通常の睡眠長を
    載せる既存仕様なので、倒れて起きた回のその欄は**意味を持たない**(正直な既知の粗さ)。
@@ -270,6 +271,26 @@ DEFAULTS: dict = {
         "speed_m_per_min": 300.0,      # response_min の換算(モデル値。実走行ではない)
         "max_calls_per_day": 8,        # 1 日に出す連鎖の上限(L1 の安全弁)
         "ward_calls_per_day": 65.0,    # ★参照値のみ(実測 65 件/日)。判定には使わない
+        # ---- 傍観者モデル(**重症度 H1 が ON のときだけ効く**。OFF では最近傍が必ず通報する)
+        #  実測との整合: 集団としての P(誰かが動く) は 0.85〜0.95(実 CCTV 研究で介入は規範・91%)。
+        #  Darley-Latané 型の人数減衰は**曖昧で軽微な状況にだけ**効かせ、危険事態は減衰なし
+        #  (メタ分析: 危険が明白なほど傍観者効果は消え、むしろ人数が増えると助かる)。
+        #    P(誰かが動く) = 1 − (1 − solo)^(n^(1−alpha))
+        # solo=0.65 は「n=3〜5 で集団 P が 0.85〜0.95 に載る」ことから逆算した値
+        # (tests/test_health_severity.py が帯の内側にあることを機械固定する)。
+        "bystander_solo_prob": 0.65,      # 1 人しか居合わせないときの介入率
+        "bystander_alpha_ambiguous": 0.4,  # 曖昧・軽微(見かけが中等症以下)の責任分散
+        "bystander_alpha_danger": 0.0,     # 危険が明白(見かけが重症以上)= 減衰なし
+        "bystander_related_mult": 1.5,     # 家族・同居人・同僚が居合わせたときの倍率
+        "bystander_max_prob": 0.98,
+        # ---- 通報までの所要時間の分布(実測 46% 1分未満 / 29% 1〜5分 / 25% 5分超)
+        #  ★正直な限界: 既定 Δt=10 分ではどのビンも同じ 1 刻みに丸まるため、**発火時刻は
+        #    動かさず観測量として payload に載せる**(より細かい Δt で意味を持つ)。
+        "call_delay_fast_min": 0.5,
+        "call_delay_mid_min": 3.0,
+        "call_delay_slow_min": 8.0,
+        "call_delay_fast_share": 0.46,
+        "call_delay_mid_share": 0.29,
     },
 }
 
@@ -337,7 +358,12 @@ def build_cfg(raw) -> dict:
                                    ("enabled",))
     cfg["ems"] = _block(raw.get("ems"), DEFAULTS["ems"], ("crew_occupations",),
                         ("call_radius_m", "collapse_fatigue", "speed_m_per_min",
-                         "ward_calls_per_day"), ("enabled", "require_sick"))
+                         "ward_calls_per_day", "bystander_solo_prob",
+                         "bystander_alpha_ambiguous", "bystander_alpha_danger",
+                         "bystander_related_mult", "bystander_max_prob",
+                         "call_delay_fast_min", "call_delay_mid_min",
+                         "call_delay_slow_min", "call_delay_fast_share",
+                         "call_delay_mid_share"), ("enabled", "require_sick"))
     # 0 除算・退化の防止(刻みと区画は 1 以上)
     for blk, keys in (("police", ("shift_hours", "n_shifts", "patrol_every")),
                       ("waste", ("grid_cols", "grid_rows", "stops_per_round",
@@ -568,7 +594,8 @@ def _state(sim) -> dict:
     if st is None:
         st = {"schema": SCHEMA, "bound": False, "by_kind": {}, "dropped": 0,
               "rounds": 0, "cleanings": 0, "collapses": 0, "calls": 0,
-              "self_calls": 0, "dispatches": 0, "dispatch_unstaffed": 0,
+              "self_calls": 0, "no_call": 0, "dispatches": 0,
+              "dispatch_unstaffed": 0,
               "trips_staffed": 0, "trips_unstaffed": 0, "rounds_by_kind": {},
               "ems_arrived": 0, "calls_by_day": {}, "cleaned_night": {},
               "notes": []}
@@ -909,9 +936,28 @@ def _night_cleaning(sim, cfg: dict, st: dict, bud: _Budget, agent,
 # =========================================================================== #
 # ⑤ 救急 = **通報から始まる行為の連鎖**(collapse → ems_call → ems_dispatch)
 # =========================================================================== #
+def _health_mod():
+    """健康 module の遅延 import(循環と重い import の回避。``_routine`` と同じ作法)。"""
+    from . import health as _health
+    return _health
+
+
+def _severity_on(sim) -> bool:
+    """重症度の状態機械(レーン H1)が有効か = **倒れる引き金が本物になっているか**。"""
+    return bool(_health_mod().severity_on(sim))
+
+
 def _collapse_gate(agent, ecfg: dict, day: int, steps_per_day: int,
-                   step_of_day: int) -> str:
-    """その個体がこの step に倒れるか。**既存の健康状態 + 安定ハッシュの純関数**。
+                   step_of_day: int, step: int = -1, sev_on: bool = False) -> str:
+    """その個体がこの step に倒れるか。
+
+    ★**世代交代**(レーン H1・2026-08-10): 本 module の docstring が最初から申し送っていた
+      とおり、``sev_on``(= health.severity.enabled)のときは下の暫定ハッシュゲートを捨て、
+      「**重症度が S3/S4 へ遷移したこと**そのもの」を引き金にする。判定は健康側の純関数
+      ``health.collapse_source`` の読み取りだけで、本 module は健康状態へ 1 バイトも書かない。
+      severity OFF のランは従来どおり下のハッシュゲート(既存挙動と完全同一)。
+
+    以下は **severity OFF のときの暫定ゲート**の説明(据え置き)。
 
     戻り値は引き金の名前(``"illness"`` / ``"fatigue"``)。倒れないなら空文字。
     ★乱数を 1 本も引かない: 「その日倒れるか」も「その日の何 step 目か」も
@@ -925,6 +971,8 @@ def _collapse_gate(agent, ecfg: dict, day: int, steps_per_day: int,
       同じ個体が同じ日に 2 回倒れることも、抜けることも無い(``city_ops_down`` の印が
       治療中の再発火を止めるのとは別に、構造として重複しない)。
     """
+    if sev_on:
+        return _health_mod().collapse_source(agent, int(step))
     source = ""
     if bool(getattr(agent, "sick", False)):
         source = "illness"
@@ -967,6 +1015,97 @@ def _caller_for(sim, patient, radius_m: float):
     return best
 
 
+def _bystanders(sim, patient, radius_m: float) -> list:
+    """患者に居合わせた個体(近い順・同距離は id 昇順)。``_caller_for`` と同じ絞り込み。"""
+    r2 = float(radius_m) * float(radius_m)
+    found = []
+    for other in sim.agents:
+        if int(other.id) == int(patient.id):
+            continue
+        if other.loc == "outside" or other.sleeping:
+            continue
+        if getattr(other, "city_ops_down", False):
+            continue
+        dx = float(other.x) - float(patient.x)
+        dy = float(other.y) - float(patient.y)
+        d2 = dx * dx + dy * dy
+        if d2 <= r2:
+            found.append((d2, int(other.id), other))
+    found.sort(key=lambda t: (t[0], t[1]))
+    return [t[2] for t in found]
+
+
+def _is_related(patient, other) -> bool:
+    """関係者(同居人・恋人・同僚)か = 傍観者効果を弱める側の共変量。"""
+    oid = int(other.id)
+    if oid in {int(x) for x in (getattr(patient, "housemates", None) or ())}:
+        return True
+    if getattr(patient, "partner_id", None) is not None \
+            and int(patient.partner_id) == oid:
+        return True
+    work = str(getattr(patient, "work_node", "") or "")
+    return bool(work) and work == str(getattr(other, "work_node", "") or "")
+
+
+def _call_delay_min(ecfg: dict, patient, day: int, step: int) -> float:
+    """通報までの所要時間[分]を実測分布(46/29/25%)から決定論で引く。
+
+    ★これは**観測量**である: 既定 Δt=10 分ではどのビンも同じ 1 刻みに丸まるので
+      発火時刻は動かさない(より細かい Δt で意味を持つ。正直な既知の粗さ)。
+    """
+    u = (_stable_hash(f"ems_delay/{int(patient.id)}/{int(day)}/{int(step)}")
+         % 10000) / 10000.0
+    fast = float(ecfg["call_delay_fast_share"])
+    if u < fast:
+        return float(ecfg["call_delay_fast_min"])
+    if u < fast + float(ecfg["call_delay_mid_share"]):
+        return float(ecfg["call_delay_mid_min"])
+    return float(ecfg["call_delay_slow_min"])
+
+
+def _bystander_caller(sim, ecfg: dict, patient, day: int, step: int):
+    """居合わせた集団から通報者を決める(**決定論・乱数ゼロ**の傍観者モデル)。
+
+    戻り値 ``(caller, n_bystanders, group_prob)``。``caller`` が ``None`` なら
+    「誰も動かず、本人も呼べなかった」= 通報そのものが起きない(目撃されない倒れ)。
+
+    較正(計画書 §1):
+      - 集団としての P(誰かが動く) = 1 − (1 − solo)^(n^(1−alpha)) を 0.85〜0.95 帯に置く。
+      - alpha は**状況の曖昧さ**で切り替える: 見かけが重症以上なら 0(責任分散なし・
+        人数が増えるほど誰かが動く)、中等症以下なら 0.4(Darley-Latané 型の減衰)。
+      - 家族・同居人・同僚が居合わせれば個人の介入率に倍率がかかる。
+      - 誰も動かなかったとき、**本人に意識があれば**(= 心停止でなければ)自分で呼ぶ。
+        心停止で誰も居合わせなければ通報そのものが起きない(目撃されなかった倒れ)。
+    """
+    health = _health_mod()
+    cands = _bystanders(sim, patient, float(ecfg["call_radius_m"]))
+    apparent = int(health.apparent_severity(patient))
+    danger = apparent >= health.S_SEVERE
+    alpha = float(ecfg["bystander_alpha_danger"] if danger
+                  else ecfg["bystander_alpha_ambiguous"])
+    solo = float(ecfg["bystander_solo_prob"])
+    if cands and any(_is_related(patient, o) for o in cands):
+        solo = min(float(ecfg["bystander_max_prob"]),
+                   solo * float(ecfg["bystander_related_mult"]))
+    n = len(cands)
+    if n <= 0:
+        group = 0.0
+    else:
+        eff = float(n) ** (1.0 - alpha)
+        group = min(float(ecfg["bystander_max_prob"]), 1.0 - (1.0 - solo) ** eff)
+    acts = n > 0 and (_stable_hash(f"bystander/{int(patient.id)}/{int(day)}/{int(step)}")
+                      % 10000) < int(round(group * 10000.0))
+    if acts:
+        # 動くのは**関係者が居ればその最近傍**、居なければ単純な最近傍(id 昇順で一意)
+        for other in cands:
+            if _is_related(patient, other):
+                return other, n, group
+        return cands[0], n, group
+    if apparent < health.S_ARREST:                 # 意識がある = 本人が自分で呼ぶ
+        return patient, n, group
+    return None, n, group
+
+
 def _on_duty_crew(sim, ecfg: dict, node: str, sim_min: int):
     """通報に応えられる当直の救急隊(現場に最も近い 1 人。同距離は id 昇順)。
 
@@ -998,9 +1137,57 @@ def _on_duty_crew(sim, ecfg: dict, node: str, sim_min: int):
     return best
 
 
+def request_ems(sim, patient, caller=None, source: str = "", *,
+                step: int = -1, sim_min: int = 0) -> dict:
+    """通報に応える当直を割り当てる**公開シーム**(救急の実体を持つのは本 module だけ)。
+
+    戻り値 ``{"crew", "response_min", "unstaffed", "node"}``。``crew`` が None のときは
+    ``unstaffed=True``(救急が OFF / 当直が全員出動中 = **ひっ迫**)。
+
+    ★**L1 を 1 件も出さない**: 出来事の記録は呼び出し側が自分の予算(``_Budget``)で行う。
+      そうしないと呼び出し側ごとに違う payload 規約(source 欄など)を本 module が
+      知らなければならなくなる。ここが引き受けるのは「誰が応えるか」の**選定と印**だけである。
+    ★``crew`` に付ける印(``city_ops_ems_until`` / ``city_ops_ems_home``)は本 module のもので、
+      持ち場へ戻す処理は ``_ems_restore`` が従来どおり行う(復帰経路を二重に作らない)。
+    ★乱数を 1 本も引かない(選定は距離と id の純関数)。
+    ★他レーン(身体・環境事件)がこの関数を通ってくるので、``_on_duty_crew`` の private を
+      直接呼ばせない = 選定規則が 1 箇所に閉じる(綴り替えで黙って 0 件になるのを防ぐ)。
+    """
+    node = str(getattr(patient, "node", "") or "")
+    out: dict = {"crew": None, "response_min": None, "unstaffed": True, "node": node}
+    if not enabled(sim):
+        return out
+    ecfg = cfg_of(sim)["ems"]
+    if not ecfg["enabled"]:
+        return out
+    crew = _on_duty_crew(sim, ecfg, node, sim_min)
+    if crew is None:
+        return out                                 # 当直不在 = ひっ迫(呼び出し側が記録する)
+    dist = ((float(crew.x) - float(patient.x)) ** 2
+            + (float(crew.y) - float(patient.y)) ** 2) ** 0.5
+    crew.city_ops_ems_home = str(getattr(crew, "work_node", "") or "")
+    crew.city_ops_ems_until = int(step) + max(1, int(ecfg["on_scene_steps"]))
+    crew.work_node = node                          # 持ち場が現場へ移る(移動は routine)
+    out["crew"] = crew
+    out["response_min"] = round(dist / max(1.0, float(ecfg["speed_m_per_min"])), 1)
+    out["unstaffed"] = False
+    return out
+
+
+def _medical_mod():
+    """医療の受け皿(H2)の遅延 import。**あちらが OFF なら全関数が即 return する**。"""
+    from . import medical as _medical
+    return _medical
+
+
 def _ems_chain(sim, cfg: dict, st: dict, bud: _Budget, step: int,
                sim_min: int) -> None:
-    """救急の 3 段(倒れる → 通報 → 出動)。**すべて既存状態の決定論**・乱数ゼロ。"""
+    """救急の 3 段(倒れる → 通報 → 出動)。**すべて既存状態の決定論**・乱数ゼロ。
+
+    ★レーン H1 が ON のときは ① の引き金が「重症度 S3/S4 への遷移」に、② の通報者選定が
+      **較正済みの傍観者モデル**(集団 P≒0.85〜0.95・危険事態は責任分散なし)に替わる。
+      どちらも読むだけ・乱数ゼロという本 module の性質は変わらない。
+    """
     ecfg = cfg["ems"]
     day = int(sim_min) // 1440
     steps_per_day = max(1, int(sim.clock.steps_per_day))
@@ -1009,6 +1196,7 @@ def _ems_chain(sim, cfg: dict, st: dict, bud: _Budget, step: int,
     cap = int(ecfg["max_calls_per_day"])
     if done >= cap:
         return
+    sev_on = _severity_on(sim)
     radius = float(ecfg["call_radius_m"])
     treat = max(1, int(ecfg["treatment_steps"]))
     # ★走査は 1 パスで**候補を絞ってから**並べる(25 万体で毎 step 全体を sort しない)。
@@ -1019,7 +1207,8 @@ def _ems_chain(sim, cfg: dict, st: dict, bud: _Budget, step: int,
             continue
         if getattr(agent, "city_ops_down", False):
             continue
-        source = _collapse_gate(agent, ecfg, day, steps_per_day, step_of_day)
+        source = _collapse_gate(agent, ecfg, day, steps_per_day, step_of_day,
+                                step, sev_on)
         if source:
             candidates.append((int(agent.id), source, agent))
     for _aid, source, patient in sorted(candidates, key=lambda t: t[0]):
@@ -1036,31 +1225,52 @@ def _ems_chain(sim, cfg: dict, st: dict, bud: _Budget, step: int,
         patient._pending_activity = ""
         patient._pending_stay = 0
         patient._ride_pending = None
+        payload = {"node": str(patient.node), "source": source,
+                   "until_step": int(step) + treat}
+        if sev_on:                                 # 見かけの重症度(前兆状態の同梱)
+            payload["sev"] = int(_health_mod().apparent_severity(patient))
         bud.log(Event(step=step, sim_min=sim_min, agent_id=int(patient.id),
-                      kind="collapse", x=patient.x, y=patient.y,
-                      payload={"node": str(patient.node), "source": source,
-                               "until_step": int(step) + treat}))
+                      kind="collapse", x=patient.x, y=patient.y, payload=payload))
         st["collapses"] += 1
         patient.remember(COLLAPSE_TEXT)
         # ---- ② 通報(**この行為が出動の原因**)------------------------------- #
-        caller = _caller_for(sim, patient, radius)
-        self_call = caller is None
+        call_extra: dict = {}
+        if sev_on:
+            caller, n_by, group_p = _bystander_caller(sim, ecfg, patient, day, step)
+            if caller is None:
+                # ★誰も動かず本人も呼べない = **目撃されなかった倒れ**。出動は起きない。
+                #   黙って通り過ぎず、無通報として数える(正直な稼働率の観測)。
+                st["no_call"] = int(st.get("no_call", 0)) + 1
+                continue
+            self_call = int(caller.id) == int(patient.id)
+            call_extra = {"bystanders": int(n_by),
+                          "group_prob": round(float(group_p), 3),
+                          "delay_min": _call_delay_min(ecfg, patient, day, step)}
+        else:
+            caller = _caller_for(sim, patient, radius)
+            self_call = caller is None
+            if self_call:
+                caller = patient
         if self_call:
-            caller = patient
             st["self_calls"] += 1
         dist_m = 0.0 if self_call else round(
             ((float(caller.x) - float(patient.x)) ** 2
              + (float(caller.y) - float(patient.y)) ** 2) ** 0.5, 1)
+        call_payload = {"patient": int(patient.id), "node": str(patient.node),
+                        "self_call": bool(self_call), "dist_m": dist_m}
+        call_payload.update(call_extra)
         bud.log(Event(step=step, sim_min=sim_min, agent_id=int(caller.id),
                       kind="ems_call", x=caller.x, y=caller.y,
-                      payload={"patient": int(patient.id), "node": str(patient.node),
-                               "self_call": bool(self_call), "dist_m": dist_m}))
+                      payload=call_payload))
         st["calls"] += 1
         done += 1
         st["calls_by_day"][day] = done
         caller.remember(SELF_CALL_TEXT if self_call else CALL_TEXT)
         # ---- ③ 出動(通報に応える行為)-------------------------------------- #
-        crew = _on_duty_crew(sim, ecfg, str(patient.node), sim_min)
+        #  ★選定と印は**公開シーム** request_ems に閉じる(他レーンと同じ 1 本の口を通る)。
+        answer = request_ems(sim, patient, caller, "collapse", step=step,
+                             sim_min=sim_min)
+        crew = answer["crew"]
         if crew is None:
             # ★当直が居ない = **誰も応えなかった**。救急を運行する装置は世界に存在しない
             #   ので装置 id は作らず、無人であることだけを正直に記録する
@@ -1073,19 +1283,26 @@ def _ems_chain(sim, cfg: dict, st: dict, bud: _Budget, step: int,
                                    "response_min": None, "unstaffed": True}))
             st["dispatch_unstaffed"] += 1
             continue
-        cx, cy = float(crew.x), float(crew.y)
-        dist = ((cx - float(patient.x)) ** 2 + (cy - float(patient.y)) ** 2) ** 0.5
-        response_min = round(dist / max(1.0, float(ecfg["speed_m_per_min"])), 1)
-        crew.city_ops_ems_home = str(getattr(crew, "work_node", "") or "")
-        crew.city_ops_ems_until = int(step) + max(1, int(ecfg["on_scene_steps"]))
-        crew.work_node = str(patient.node)         # 持ち場が現場へ移る(移動は routine)
+        disp_payload = {"node": str(patient.node), "patient": int(patient.id),
+                        "caller": int(caller.id), "crew": int(crew.id),
+                        "response_min": answer["response_min"], "unstaffed": False}
+        if sev_on:
+            # ★**重症度は搬送先で確定する**(東京実測: 搬送の 52.8% が軽症)。通報時点の
+            #   見かけ(apparent)と確定(confirmed)を分けて両方載せる = 「通報は不確実性から
+            #   生まれる」の観測可能な再現。確定を刻むのは健康側(本 module は書かない)。
+            health = _health_mod()
+            disp_payload["apparent"] = int(health.apparent_severity(patient))
+            disp_payload["confirmed"] = int(health.note_confirmed(sim, patient, step))
         bud.log(Event(step=step, sim_min=sim_min, agent_id=int(crew.id),
                       kind="ems_dispatch", x=crew.x, y=crew.y,
-                      payload={"node": str(patient.node), "patient": int(patient.id),
-                               "caller": int(caller.id), "crew": int(crew.id),
-                               "response_min": response_min, "unstaffed": False}))
+                      payload=disp_payload))
         st["dispatches"] += 1
         crew.remember(DISPATCH_TEXT)
+        # ---- ④ 搬送(医療の受け皿 H2。**あちらが OFF なら 1 バイトも動かない**)------ #
+        #  ★本 module は搬送先も入院も持たない(限界 1 の宣言どおり)。患者を病院へ運ぶのは
+        #    医療側の意味論なので、ここは「出動が決まった」ことを伝えるだけである
+        #    (健康状態を 1 バイトも書かないのと同じ線引き = 所有の分離)。
+        _medical_mod().on_ems_dispatch(sim, patient, crew, step, sim_min)
 
 
 def _ems_restore(sim, st: dict, step: int) -> None:
@@ -1192,6 +1409,9 @@ def provenance(sim) -> dict | None:
                 "cleanings": int(st["cleanings"]),
                 "collapses": int(st["collapses"]), "calls": int(st["calls"]),
                 "self_calls": int(st["self_calls"]),
+                # ★傍観者モデル ON のとき「誰も動かず本人も呼べなかった」件数
+                #   (目撃されなかった倒れ)。severity OFF では常に 0。
+                "no_call": int(st.get("no_call", 0)),
                 "dispatches": int(st["dispatches"]),
                 "dispatch_unstaffed": int(st["dispatch_unstaffed"]),
                 "ems_arrived": int(st["ems_arrived"]),

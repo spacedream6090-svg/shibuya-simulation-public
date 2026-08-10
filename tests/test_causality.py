@@ -609,7 +609,7 @@ def test_device_id_catalogue_is_a_closed_list():
     assert D.device_id_is_known(D.transit_operator_device_id())
     # W3 で足した動的 id の族(":" の右が地図 / 台帳から来るので列挙できない)
     assert D.DYNAMIC_DEVICE_PREFIXES == frozenset(
-        {"faregate", "signal", "pos", "org", "train_op"})
+        {"faregate", "signal", "pos", "org", "train_op", "lift"})
     assert D.device_id_is_known(D.pos_device_id("n42")) and \
         D.pos_device_id("n42") == "pos:n42"
     assert D.device_id_is_known(D.org_device_id("org_7")) and \

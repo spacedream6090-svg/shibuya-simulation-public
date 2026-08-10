@@ -2055,6 +2055,37 @@ class Simulation:
         _trprov = _traces_prov.provenance(self)
         if _trprov is not None:
             summary["traces"] = _trprov
+        # ---- 対人事件の収束化 H4(incidents_interpersonal.enabled=false = 既定はキーなし)----
+        # 計画書 §7「分母の罠」の観測側: 犯罪は人口比ではなく**共在機会比**で較正するので、
+        # 件数だけでなく candidates / pairs_seen / weight_sum / draws を必ず並べて出す
+        # (来街ピークで事件が過剰になっていないかを事後に判定できるようにする)。
+        # パターン検収量(場所集中 node_hhi / 反復被害 victim_repeat_rate)と、
+        # 通報層の非緊急率(実測 110 番の 16% と突き合わせる)も同じキーに残す。
+        from .. import incidents_interpersonal as _inc_prov
+        _icprov = _inc_prov.provenance(self)
+        if _icprov is not None:
+            summary["incidents_interpersonal"] = _icprov
+        # ---- 遺失物ループ H3(lost_property.enabled=false = 既定はキーなし)----
+        # 計画書 §3 が検証ターゲットに指名した **品目別返還率**(傘 ≈1% / 財布 60-80% /
+        # 携帯 87% = 東京都遺失物センター実測)の分子・分母をそのまま残す。分母は実測の定義に
+        # 合わせて「届けられた件数」(turnins)。落下・気づき・拾得・素通り・着服・時効・失効の
+        # 件数を品目別に並べるので、較正のどの段が外れたのかが 1 枚で判る。
+        # ★貨幣保存の第 3 項(cash_held = 世界に在るが誰の残高でもない現金)も一級市民として出す
+        #   = 「拾得金は必ず誰かの drop から」(§4)を事後に機械検証するための観測量。
+        from .. import lost_property as _lost_prov
+        _lpprov = _lost_prov.provenance(self)
+        if _lpprov is not None:
+            summary["lost_property"] = _lpprov
+        # ---- 医療の受け皿 H2(medical.enabled=false = 既定はキーなし)----
+        # 計画書 §2 の検証ターゲット: **搬送先が地図に在るか**(n_hospitals。subcat を持たない
+        # 地図では 0 = 搬送が起きないことが数字で判る)・確定重症度別の入院件数(東京実測の
+        # 程度別構成と突き合わせる)・**金の三本足の合計**(公費 / 自己負担 / 保険給付)。
+        # ★受け手 org を特定できなかった保険給付(insurance_to_row)も一級市民として出す
+        #   = 「街の残高が 1 円も動いていない」ことを事後に機械検証するための観測量。
+        from .. import medical as _med_prov
+        _mdcprov = _med_prov.provenance(self)
+        if _mdcprov is not None:
+            summary["medical"] = _mdcprov
         # ---- org の会計主体化 + rest-of-world IF-E2 案B(economy.org_accounting=false = 既定はキーなし)----
         # 案B 固有の新しい研究量 =「この街の経済が域外にどれだけ依存しているか」。RoW のチャネル別
         # 累積・org 預金の分布・当座借越の件数・受け手解決の段別件数・**接続できていない金の経路**

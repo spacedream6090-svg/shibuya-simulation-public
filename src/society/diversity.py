@@ -228,6 +228,17 @@ def _crime_nodes(sim) -> Counter:
     return cn
 
 
+def note_crime_node(sim, node: str) -> None:
+    """そのノードの犯罪履歴を 1 件積む(危険地帯 = 治安回避の材料)。
+
+    ★H4(``incidents_interpersonal``)が窃盗の世代交代で出した事件も、従来の窃盗と
+      **同じ履歴**に積まれるようにするための公開口(あちらから private を触らせない)。
+      本 module が OFF でも安全: ``is_danger`` / ``safe_dests`` が OFF なら常に無効化
+      されるので、カウンタが積まれても行き先は 1 つも変わらない。
+    """
+    _crime_nodes(sim)[str(node)] += 1
+
+
 def is_danger(sim, node: str) -> bool:
     """このノードが危険地帯(犯罪履歴 ≥ danger_threshold)か。OFF / 閾値0以下は常に False。"""
     if not enabled(sim):
@@ -281,6 +292,16 @@ def _street_life_excluded(sim) -> frozenset:
     return street_life_mod.rough_sleeper_ids(sim)
 
 
+def _theft_superseded(sim) -> bool:
+    """窃盗の枝を H4(``incidents_interpersonal``)へ**明け渡す**か。
+
+    ★**既定 OFF では必ず False** = 下の窃盗の枝が 1 バイトも変わらない
+      (``_street_life_excluded`` が OFF で空集合を返すのと同じ「二重に保守的」な形)。
+    """
+    from . import incidents_interpersonal as incidents_mod
+    return incidents_mod.superseded_theft(sim)
+
+
 def nuisance_kinds_for(sim, cfg: dict) -> list:
     """この step に使う迷惑行為の種類(``street_life`` ON なら「客引き」を**供給しない**)。
 
@@ -329,6 +350,7 @@ def tick_crime(sim, step: int, sim_min: int) -> None:
     ng = float(cfg["nuisance_grievance"])
     kinds = nuisance_kinds_for(sim, cfg)
     excluded = _street_life_excluded(sim)                      # 尊厳規約 2(OFF は空集合)
+    theft_superseded = _theft_superseded(sim)                  # H4 世代交代(OFF は必ず False)
     cn = _crime_nodes(sim)
     for a in sorted(sim.agents, key=lambda a: a.id):           # offender は id 昇順=決定論
         if a.loc == "outside" or a.sleeping:
@@ -341,6 +363,14 @@ def tick_crime(sim, step: int, sim_min: int) -> None:
             continue
         r = sim.hub.stream("crime", a.id, step).random()
         if cp > 0.0 and r < cp:                                # 窃盗
+            # ★H4 世代交代(``incidents_interpersonal``。**既定 OFF では必ず False**):
+            #   窃盗は「1人1step のレート抽選」から「共在ペアの上の条件付き確率」へ移った。
+            #   併存させると L1 の crime 件数が 2 機構の和になり RAT の効き目が測れないので
+            #   **置き換える**(``street_life`` ON で「客引き」の供給を止めたのと同じ作法)。
+            #   ★抽選そのものは飛ばさない: ここで continue するのは**枝の中身だけ**で、
+            #     stream "crime" の消費列は ON/OFF で 1 バイトも変わらない。
+            if theft_superseded:
+                continue
             victim = _pick_victim(at_node[a.node], a, excluded)
             if victim is None:
                 continue

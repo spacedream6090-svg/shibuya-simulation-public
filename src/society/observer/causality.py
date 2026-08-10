@@ -359,6 +359,10 @@ CAUSE_OF_KIND: dict[str, str] = {
     # ---- 身体・健康 ------------------------------------------------------------ #
     "illness":       PHYSICS,
     "health_update": PHYSICS,
+    # ★physics: 死は**身体の出来事**であって選択でも装置の作用でもない(レーン H1・
+    #   ユーザー決定 §6-1)。境界 despawn と同型の永続退場だが、退場の**原因**は身体側に
+    #   あるので boundary ではなく physics へ分類する(``collapse`` と同じ族)。
+    "death":         PHYSICS,
 
     # ---- 都市・環境・自然 ------------------------------------------------------ #
     "weather":       NATURAL,
@@ -375,6 +379,19 @@ CAUSE_OF_KIND: dict[str, str] = {
     "annual_event":  SCHEDULE,
     "crime":         AGENT,          # agent_id = 加害者(victim は payload)
     "nuisance":      AGENT,
+
+    # ---- 対人事件の収束化 H4(材料側 registration = src/society/incidents_interpersonal.py)---- #
+    # ★agent: 喧嘩は**双方向**の行為(agent_id = id の小さい側・相手は payload["other"])。
+    #   共在ペア(加害者候補 × 標的 × 監視者不在)が揃ったときだけ起きるので、
+    #   「誰も居なければ起きない」= 主体の無い出来事にはなり得ない。
+    "brawl":              AGENT,
+    # ★agent: **通報という行為**そのもの(agent_id = 通報者)。誤通報・非緊急通報も行為で、
+    #   これが無ければ下の臨場は起きない(``ems_call`` → ``ems_dispatch`` と同じ因果の形)。
+    "crime_report":       AGENT,
+    # ★agent: 通報に応えて現場へ向かう当直の行為(agent_id = 警察官)。因果の親は
+    #   ``crime_report`` で、時刻表でも閾値でもない。当直が居ない回は agent_id=-1 かつ
+    #   payload.unstaffed=true(``ems_dispatch`` と同じ理由で device_id は与えない)。
+    "police_response":    AGENT,
 
     # ---- 路上の生業と条例(Wave 4 III-3。材料側 registration = src/society/street_life.py)---- #
     # ★agent: その個体が持ち場に立って**選んで行った**生業。居なければこの行は存在しない。
@@ -396,6 +413,27 @@ CAUSE_OF_KIND: dict[str, str] = {
     # ★device: 住居への移行は「相談回数が閾値に達した」ことに制度が反応して起きる
     #   (当人がその step に選んだ行為ではない)。
     "shelter_move":       DEVICE,
+    # ---- 遺失物ループ H3(完全内生の事件。材料側 registration = src/society/lost_property.py)---- #
+    # ★この族の存在理由そのものが「運を世界のアルゴリズムで作らない」(計画書 §6-2 のユーザー
+    #   原理)なので、因果の型を 1 件ずつ選ぶことに意味がある。
+    # ★physics: **落とす**のは不注意という身体の出来事で、本人が「ここで落とす」と決めた
+    #   わけではない(``collapse`` / ``wake_up`` と同じ族)。共変量(移動・飲酒・混雑)は
+    #   すべて世界の状態で、思考は 1 つも読んでいない。
+    "lost_drop":     PHYSICS,
+    # ★agent: 気づいて**交番へ届け出る**のは行為(``ems_call`` = 通報と同じ線引き)。
+    #   気づくこと自体は時間経過だが、この行が立つのは届出が起きたときだけ。
+    "lost_notice":   AGENT,
+    # ★agent: 拾う / 届ける / 着服 は、居合わせた個体が**選んだ**こと。
+    #   ここが「運」を行為に溶かした場所そのもの = 計画書 §4 の第一歩。
+    "lost_pickup":   AGENT,          # agent_id = 拾得者(owner は payload)
+    "lost_turnin":   AGENT,          # agent_id = 拾得者(post は payload)
+    "lost_keep":     AGENT,          # ★占有離脱物横領(payload.offense / guardians = RAT)
+    # ★agent: 返還は持ち主が**引き取りに行った**結果(agent_id = 落とし主・finder は payload)。
+    #   報労金(遺失物法 28 条)は持ち主 → 拾得者の直接授受なので装置は介在しない。
+    "lost_return":   AGENT,
+    # ★schedule: 3 か月時効(遺失物法 7 条)も路上の物の失効も、**暦が来たから**起きる
+    #   (``crowd_surge`` / ``annual_event`` と同じ族)。誰も何も選んでいない。
+    "lost_expire":   SCHEDULE,
     # ---- 都市運営 = 見えない労働力(Wave 4 III-4。材料側 registration = src/society/city_ops.py)---- #
     # ★boundary: 起動時 1 回の束ね統計(``workplace_bound`` / ``transit_staff_bound`` と同型)。
     "city_ops_bound":     BOUNDARY,
@@ -420,6 +458,20 @@ CAUSE_OF_KIND: dict[str, str] = {
     #   ため cause_type も device にしない。``dwell_decision`` に train_op を与えられたのは
     #   運行事業者が既に IF-F W2 で実体化していたからで、ここにその前提は無い)。
     "ems_dispatch":       AGENT,
+    # ---- 医療の受け皿 H2(材料側 registration = src/society/medical.py)---- #
+    # ★agent: 患者を病院へ運ぶのは**隊員の行為**(agent_id = 隊員)。因果の親は
+    #   ``ems_dispatch`` で、時刻表でも閾値でもない。``ems_dispatch`` と同じ理由で
+    #   **装置 id は与えない**(救急車という装置は世界に実体を持たない)。
+    "ems_transport":      AGENT,
+    # ★device: 入院を決めるのは**医療機関**であって患者ではない(重症で運ばれた本人は
+    #   選んでいない)。``lodging_checkin`` が agent なのは自分で泊まると決めたからで、
+    #   ここにその前提は無い。★装置 id は与えない(病院を装置として実体化していない)。
+    "hospital_admit":     DEVICE,
+    # ★device: 退院は在院日数の経過による自動遷移(``lodging_checkout`` と同じ族)。
+    "hospital_discharge": DEVICE,
+    # ★device: 医療費の内訳(自己負担 3 割 / 保険 7 割)は**制度が決める**会計処理で、
+    #   誰の選択でもない(``tax`` / ``rule_bonus`` と同じ族)。
+    "medical_bill":       DEVICE,
     "traffic_flow":  BOUNDARY,       # 背景交通 = エージェントではない通過車両の統計。
                                      #  device_id=traffic:<mode>(ambient / od)= 発生器の同一性。
                                      #  boundary なのに刻むのは DEVICE_STAMPABLE の定義どおり
@@ -443,6 +495,44 @@ CAUSE_OF_KIND: dict[str, str] = {
     "gate_pass":     DEVICE,         # 改札装置が待たせた通過(待ちが出た回だけ記録)
     "device_load":   BOUNDARY,       # 装置 1 台 1 時間の負荷**要約**(世界を動かさない観測)
     "signal_summary": BOUNDARY,      # 信号の周期パラメータの開示(同上)
+
+    # ---- 事件レイヤー H5(環境側 3 族)。材料側 registration = src/society/incidents_env.py ---- #
+    # ★device: 出火は**器具(装置)の使用に起因する**(実測で 73% が器具に帰属可能)。
+    #   個体が「今日ここで火を出す」と選んだわけではないので agent ではなく、身体・空間の
+    #   連続力学でもないので physics でもない(語彙表の定義どおり)。**装置 id は与えない**:
+    #   個々の器具は世界に実体を持たず、id を作れば無い設備を捏造することになる
+    #   (``ems_dispatch`` に装置 id を与えなかったのと同じ線引き)。
+    "fire_start":     DEVICE,
+    # ★agent: **これが出場の原因である**(agent_id = 第一発見者)。誰も見つけなければ
+    #   通報は起きず、出場も起きない(火は誰にも知られないまま鎮まる)。
+    "fire_report":    AGENT,
+    # ★agent: 通報に応えて現場へ向かう当直の行為(agent_id = 隊員)。当直が居ない回は
+    #   agent_id=-1 かつ payload.unstaffed=true(``ems_dispatch`` と同じ作法)。
+    "fire_dispatch":  AGENT,
+    # ★device: 鎮火は隊の行為だが、**無人で燃え尽きた回も同じ kind が出る**
+    #   (``dwell_decision`` と同型)。原則 3(迷ったら device)を適用して少なく見積もる。
+    "fire_out":       DEVICE,
+    # ★device: 横断部の接触。加害車両は**背景交通(エージェントではない通過車両)**なので
+    #   運転者は世界に存在しない。世界に居ない主体を捏造しないための分類で、行を出した
+    #   発生器の同一性は device_id=traffic:<mode> が引き受ける(agent_id は被害者 = 視点)。
+    "traffic_accident": DEVICE,
+    # ★physics: 群集密度が閾値を跨いだこと**そのもの**(誰かが集めたのではない)。
+    #   語彙表の physics「駆動するのは暦ではなく状態」がそのまま当てはまる。
+    "crowd_density_incident": PHYSICS,
+    # ★physics: 事件による負傷は身体の出来事(``collapse`` と同じ族)。
+    "injury":         PHYSICS,
+
+    # ---- 設備(昇降設備の DEVS 摩耗)。材料側 registration = src/society/facility_devices.py ---- #
+    # ★device: 故障は装置の内部状態(摩耗)に対する応答。device_id=lift:<建物 id>-ev|-es。
+    "facility_fault":  DEVICE,
+    # ★agent: インターホンの通報は**閉じ込められた人 / 居合わせた人の行為**。
+    "facility_call":   AGENT,
+    # ★agent: 通報に応えて現場へ向かう対応者の行為(不在なら agent_id=-1・unstaffed)。
+    "facility_dispatch": AGENT,
+    # ★device: 復旧は装置の δ_int(修理時間の経過)。対応者が着いたかは復旧時刻を変えない。
+    "facility_restore": DEVICE,
+    # ★schedule: 月 1 回の保守点検は**暦だけで決まる**制度(DEVS の δ_int)。
+    "facility_maintenance": SCHEDULE,
 
     # ---- 鉄道の当直(駅員・車掌)。材料側 registration = src/society/transit_staff.py ---- #
     "dwell_decision": DEVICE,        # ドア閉(停車時間延長)の判断。当直が居れば

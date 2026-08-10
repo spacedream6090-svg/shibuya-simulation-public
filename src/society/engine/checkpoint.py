@@ -28,6 +28,8 @@ import pickle
 from pathlib import Path
 
 from .. import ablate as _ablate_ckpt
+from .. import facility_devices as _facility_mod
+from .. import medical as _medical_mod
 from .. import worldview as _wv_ckpt
 
 FORMAT = 1
@@ -211,6 +213,36 @@ def save(sim, step: int, path: str | Path) -> Path:
             # logger カウンタ由来なので**保存しない**(load で 0 に戻る = rumors と同流儀)。
             # 既定 OFF では state 自体が生えない → None=挙動不変(load は .get で旧 ckpt 互換)。
             "trace_state": getattr(sim, "_trace_state", None),
+            # H5(事件レイヤーの環境側 3 族): 進行中の火災(鎮火予定 step・重度・出場した
+            # 隊員)・群集の閾値跨ぎの武装フラグ・日次カウンタ・累積タリー。**状態の本体が
+            # sim 側にある**(場所と世界の出来事に紐づくので agents pickle には載らない)=
+            # ここで保存しないと resume 直後に燃えている火が消え、群集の「1 エピソード 1 件」
+            # が二重に出る。watermark は持たない機構なので保存する状態はこれで全部。
+            # 既定 OFF では state 自体が生えない → None=挙動不変(load は .get で旧 ckpt 互換)。
+            "incenv_state": getattr(sim, "_incenv_state", None),
+            # H5(設備 = 摩耗する装置): **DEVS 状態そのもの**(台ごとの wear / uses /
+            # 故障中か / 復旧予定の絶対時刻 / 次の保守の絶対時刻)と累積タリー。装置は
+            # sim.facilities(名簿オブジェクト)に居るので pickle には載せず、素の dict へ
+            # 落として保存する(load 側が復元値から名簿を組み直す)。保存しないと resume で
+            # 全台の摩耗が 0 に戻り、故障ハザードが straight と食い違う。
+            "facility_state": _facility_mod.state_of(sim),
+            # H3(遺失物ループ): **進行中の遺失物そのもの**(どの品目がどこに落ちていて、
+            # 誰が落とし主で、中にいくら入っていて、いま拾われているのか届いているのか)と
+            # 累積タリー・通し番号・現金の在庫。★痕跡(IF-D)と同じく**状態の本体が sim 側に
+            # ある**(物は場所に紐づくので agents pickle には載らない)= 保存しないと resume
+            # 直後に街の落とし物が全部消え、しかも財布の中の現金が**世界から蒸発する**
+            # (所持金から分離済みなので、在庫を失うと総マネー保存が破れる)。時効・寿命は
+            # 「落ちた step からの経過」で計算するので、seq と items を戻せば日境界を跨いだ
+            # resume でも straight と同じ決着になる。
+            # 既定 OFF では state 自体が生えない → None=挙動不変(load は .get で旧 ckpt 互換)。
+            "lost_state": getattr(sim, "_lost_state", None),
+            # H4(対人事件の収束化): 累積タリー(候補・共在ペア・抽選・事件・通報・応答)と
+            # パターン検収の材料(被害者別・ノード別の件数)。★事件そのものは L1 に確定して
+            # いるが、summary.incidents_interpersonal の分母(共在機会比)と反復被害/場所集中の
+            # 集計は sim 側にしか無いので、保存しないと mid-day resume で straight と食い違う
+            # (第96 IF-D の trace_state と同じ理由)。★酩酊の印(agent._inc_intox_until)は
+            # agents pickle に自然同梱される。既定 OFF では state 自体が生えない → None=挙動不変。
+            "incident_state": getattr(sim, "_inc_state", None),
             # 第88バッチ 心モデル固定: L1 `mind_assign` を出し終えた agent_id。
             # **割当そのものは保存しない** — 誕生時固定は (master_seed, agent_id) の純関数
             # (専用 stream mind_model / mind_tier)なので resume でも pool 再入場でも同じ
@@ -285,6 +317,11 @@ def save(sim, step: int, path: str | Path) -> Path:
             #   「Σ(全主体残高)+RoW 累積=一定」が resume で必ず破れる(第96 traces と同じ型)。
             # 既定 OFF では state 自体が生えない → None=挙動不変(load は .get で旧 ckpt 互換)。
             "sfc_state": getattr(sim, "_sfc_state", None),
+            # H2 医療(搬送・入院・医療費の累計タリー)。**個体の在院状態は agent pickle に
+            # 自然同梱される**ので、ここで中央管理するのは世界側のカウンタだけ
+            # (第96 traces / H3 遺失物 / H4 対人事件と同じ型)。OFF では属性自体が生えない
+            # → None = 挙動不変(load は .get で旧 checkpoint 互換)。
+            "medical_state": getattr(sim, "_med_state", None),
             # ★同バッチで塞ぐ**既存欠陥**: 非エージェントの残高 3 つ(行政 / 銀行 / VC ファンド)は
             #   どれも checkpoint に入っておらず、resume で初期値へ戻っていた(研究文書 §3-0 の
             #   「重要な構造的事実」)。いずれも sim 参照を持たない plain データなので
@@ -539,9 +576,24 @@ def load(sim, path: str | Path) -> int:
     trs = rt.get("trace_state")                 # 第96 IF-D(旧 ckpt 互換=無ければ素通り)
     if trs is not None:
         sim._trace_state = trs
+    ies = rt.get("incenv_state")                # H5 環境事件(旧 ckpt 互換=無ければ素通り)
+    if ies is not None:
+        sim._incenv_state = ies
+    # H5 設備(DEVS 状態)。復元値から**名簿を組み直す**ので、ここで名簿を捨てる
+    # (旧 ckpt 互換=無ければ no-op = OFF ランは無風)。
+    _facility_mod.restore_state(sim, rt.get("facility_state"))
+    lps = rt.get("lost_state")                  # H3 遺失物(旧 ckpt 互換=無ければ素通り)
+    if lps is not None:
+        # items のキーは JSON を経由しない pickle なので int のまま戻る(sorted の決定論を保つ)
+        sim._lost_state = lps
+    ics = rt.get("incident_state")              # H4 対人事件(旧 ckpt 互換=無ければ素通り)
+    if ics is not None:
+        sim._inc_state = ics
     sfc = rt.get("sfc_state")                   # 第97 IF-E2(旧 ckpt 互換=無ければ素通り)
     if sfc is not None:
         sim._sfc_state = sfc
+    # H2 医療(旧 ckpt 互換=無ければ no-op = OFF ランは無風)。
+    _medical_mod.restore_state(sim, rt.get("medical_state"))
     # 非エージェント残高 3 つ(既存欠陥の修復)。旧 checkpoint / 未構築ランでは None=従来どおり
     # 遅延構築に任せる(= resume で初期値に戻る旧挙動)。
     for _attr in ("government", "bank", "vc_fund"):

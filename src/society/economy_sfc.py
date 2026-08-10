@@ -163,6 +163,10 @@ CHANNELS_IN: tuple[str, ...] = (
     "chance_windfall",     # 偶発の臨時収入(拾得・還付・当選小口)= 外生(chance.py)
     "b2b_buyer_unknown",   # 買い手の小売 POI を台帳で特定できなかった仕入れ = 域外資本の店
     "subsidy_no_authority",  # 行政が未構築の世界での rule_bonus(支給主体が街に居ない)
+    # H2 医療: 保険給付の 7 割は**保険者(協会けんぽ・国保)から医療機関へ**入る。保険者は
+    # 街の中に居ないので新部門を作らず、**名前のある RoW チャネル**として正直に開示する
+    # (計画書 §6-4 でユーザー承認済み。tax_gap / clamp_gap と同じ流儀)。
+    "insurance_reimbursement",
 )
 #: 街 → RoW(域外への支払・帰属不能)
 CHANNELS_OUT: tuple[str, ...] = (
@@ -176,6 +180,10 @@ CHANNELS_OUT: tuple[str, ...] = (
     "fine_no_authority",   # government OFF 時の罰金(徴収主体が街に居ない)
     "seizure",             # 破産の資産圧縮(債権者が街に居ない)
     "chance_loss",         # 偶発の紛失・急な出費 = 外生の流出(chance.py)
+    # H2 医療: 救急搬送の公費。★支出主体は区(本シムの government)だが、**救急を運行するのは
+    # 東京消防庁 = 都**であって街の中に運行主体の org は 1 つも存在しない(計画書 §7 の
+    # 「管轄混同」への回答)。したがって受け手は街の外 = 本チャネルへ落とす。
+    "ems_operation",
 )
 CHANNELS: tuple[str, ...] = CHANNELS_IN + CHANNELS_OUT
 
@@ -184,6 +192,7 @@ CHANNELS: tuple[str, ...] = CHANNELS_IN + CHANNELS_OUT
 #: §3.98 が「窃盗は取引ではなく other flows」と定めるので、ここに来るものは**取引ではない**。
 K5_KINDS: tuple[str, ...] = (
     "theft",               # 窃盗: 被害者から減るが加害者は受け取らない(受け取り側が未記録)
+    "lost_property",       # 遺失: 誰にも拾われないまま失われた現金(受け取り手が世界に居ない)
 )
 
 #: 本 module が残高に**接続した** L1 の金額運搬種(analyze_accounting.MONEY_KINDS の部分集合)。
@@ -197,6 +206,9 @@ COVERED_KINDS: frozenset[str] = frozenset({
     "crime",         # 窃盗 = 非取引 → K5(その他の資産変動)
     "chance_event",  # 臨時収入/紛失 = 外生 → RoW の chance_windfall / chance_loss
     "b2b_trade",     # 卸→小売 = org 預金間の実移転(買い手不明なら RoW から)
+    # ---- H2 医療(身体と事件のレイヤー。既定 OFF)----
+    "ems_transport",  # 救急搬送の公費 = 区(ward)の歳出 → RoW(ems_operation)
+    "medical_bill",   # 保険給付 7 割 = RoW(insurance_reimbursement)→ 医療機関 org
 })
 #: **接続できていない**金額運搬種と、その理由(ゼロと偽らない)。IF-E の監視装置と対で持つ。
 #: ★第98バッチで**空になった**。辞書と ``summary.org_accounting.uncovered_kinds_declared`` は
@@ -546,11 +558,18 @@ def _consumption_tax(sim, nominal: float, cat: str) -> float:
 
 
 def on_spend(sim, agent, nominal: float, actual: float, cat: str,
-             step: int, sim_min: int) -> str | None:
+             step: int, sim_min: int, payee_node: str | None = None) -> str | None:
     """消費の受け手へ入金する(``_spend`` の唯一の呼び出し点)。戻り値 = payload の ``payee``。
 
     内税なので受け手が受け取るのは **実支払 − 消費税**(行政は既存経路で消費税を歳入計上済み)。
-    家計 −実支払 / 行政 +消費税 / 受け手 +(実支払−消費税) で合計 0 = 不変量が閉じる。"""
+    家計 −実支払 / 行政 +消費税 / 受け手 +(実支払−消費税) で合計 0 = 不変量が閉じる。
+
+    ★``payee_node``(H2 医療。既定 None = 従来と 1 バイトも変わらない): 受け手が
+      **払った人の居場所では決まらない**消費のための口。医療がその唯一の例で、中等症の受診は
+      自宅や路上で発火するため ``resolve_payee``(building/floor → node)がどうしても当たらず、
+      医療費が黙って ``unknown_payee`` へ漏れていた(IF-E の監査発見)。受診先・搬送先を
+      知っているのは医療側なので、そこから場所を渡してもらって ``resolve_payee_at_node`` で
+      引く(b2b の買い手解決と**同じ鍵**= 精度も同じ = 決まらなければ従来どおり RoW)。"""
     if not enabled(sim):
         return None
     amt = float(actual)
@@ -573,7 +592,10 @@ def on_spend(sim, agent, nominal: float, actual: float, cat: str,
     if ch is not None:                                 # 構造的に街の外(光熱費・運輸)
         st["payee"]["row"] += 1
         return row_out(sim, ch, net)
-    oid, stage = resolve_payee(sim, agent, cat)
+    if payee_node:                                     # 場所が渡された消費(医療)
+        oid, stage = resolve_payee_at_node(sim, str(payee_node), cat), "node"
+    else:
+        oid, stage = resolve_payee(sim, agent, cat)
     if oid is None:
         st["payee"]["row"] += 1
         return row_out(sim, "unknown_payee", net)
@@ -647,6 +669,54 @@ def escrow_out(sim, amount: float, *, to_government: bool = False) -> str | None
 
 
 # --------------------------------------------------------------------------- #
+# 遺失物の中の現金(H3 ``lost_property``。**既定 OFF の機構からしか呼ばれない**)
+#
+# 落とした財布の中の現金は、拾われるまで **街の中に在るが誰の残高でもない**。供託金
+# (``escrow`` = 行政の預り金)と構造は同じ「主体を持たない域内残高」だが、勘定は分ける:
+# 供託は行政が預かっている金で、遺失物の現金は**まだ誰も預かっていない**。混ぜると
+# finance サイドカーの ``escrow`` 列の意味(議案/立候補供託の残高)が壊れる。
+#
+# ★これを city_total に足す理由: 足さないと「財布を落とした瞬間に街から金が消え、
+#   拾われた瞬間に湧く」ことになり、閉じた不変量 Σ(全主体残高)+RoW+K5 が破れる。
+#   拾得金が必ず誰かの drop から出ることを**会計でも**保証するのが H3 の核心
+#   (計画書 §4「★拾得金は必ず誰かの drop から = 貨幣保存則(IF-E ゼロ和検査)と整合」)。
+# --------------------------------------------------------------------------- #
+def _lost(st: dict) -> float:
+    # 旧 checkpoint(第97/98バッチ)からの resume でもキーが生える(setdefault = 互換の作法)
+    return float(st.setdefault("lost", 0.0))
+
+
+def on_lost_hold(sim, amount: float) -> str | None:
+    """財布の現金が所持金から分離された(街の中の「遺失物」へ移った)。"""
+    if not enabled(sim):
+        return None
+    st = _state(sim)
+    st["lost"] = _lost(st) + float(amount)
+    return "lost_property"
+
+
+def on_lost_release(sim, amount: float) -> str | None:
+    """遺失物の中の現金が誰かの財布へ入った(返還 / 着服 / 時効取得)。"""
+    if not enabled(sim):
+        return None
+    st = _state(sim)
+    st["lost"] = _lost(st) - float(amount)
+    return "lost_property"
+
+
+def on_lost_lapse(sim, amount: float) -> str | None:
+    """誰にも拾われないまま失われた現金 = **K5(取引でない資産変動)**。
+
+    SNA 2008 §3.98 の窃盗と同じ理由で RoW(取引の相手方)へ落としてはならない
+    (受け取り手が世界に存在しない)。``on_theft`` と同じ扱いにする。"""
+    if not enabled(sim):
+        return None
+    st = _state(sim)
+    st["lost"] = _lost(st) - float(amount)
+    return k5_out(sim, "lost_property", float(amount))
+
+
+# --------------------------------------------------------------------------- #
 # 第98バッチ IF-E2 UNCOVERED — 残り 4 種の記帳口(いずれも既定 OFF で即 return)
 #
 # 共通規約: **金額もタイミングも既存の動力学を 1 つも変えない**。呼び出し元は支給/被害/仕入れを
@@ -676,6 +746,54 @@ def on_rule_bonus(sim, amount: float) -> str | None:
     gov.day_exp["ward"] += amt              # public_budget の内部整合(残高=前+歳入−歳出)を保つ
     _state(sim)["bonus_out"] += amt
     return "government"
+
+
+def on_ems_transport(sim, amount: float):
+    """救急搬送の**公費**を記帳する(H2 ``medical.py`` からの唯一の口)。戻り値 ``(payer, payee)``。
+
+    ``on_rule_bonus`` と同型の「区(ward)の歳出」だが、**受け手が違う**: bonus は家計が受け取る
+    (だから相手方は街の中)のに対し、救急を運行するのは東京消防庁 = **都**であって、街の中に
+    運行主体の org は 1 つも存在しない。したがって受け手は RoW の ``ems_operation`` に置く
+    (区は都区財政調整を通じて消防費を負担する側なので、支出主体=区・受け手=街の外が実態に近い)。
+    区 −額 / RoW +額 = 総マネー保存 ``city + RoW + K5`` はそのまま閉じる。
+
+    行政がまだ実体化していない世界では**街の残高が 1 円も動かない**ので None を返す
+    (= 街の外どうしの取引。``ems_transport`` の payload には payer/payee が載らず、
+    解析側もフローを立てない = 動いていない金を動いたことにしない)。"""
+    if not enabled(sim):
+        return None
+    amt = float(amount)
+    if amt <= 0.0:
+        return None
+    gov = getattr(sim, "government", None)
+    if gov is None:
+        return None
+    gov.balance["ward"] -= amt
+    gov.day_exp["ward"] += amt              # public_budget の内部整合(残高=前+歳入−歳出)を保つ
+    st = _state(sim)
+    st["ems_out"] = float(st.get("ems_out", 0.0)) + amt
+    return "government", row_out(sim, "ems_operation", amt)
+
+
+def on_insurance(sim, node: str, cat: str, amount: float):
+    """医療保険の給付(**街の外の保険者 → 医療機関 org**)。戻り値 ``(payer, payee)``。
+
+    受け手は ``(node, POI種別)`` の台帳索引で引く(``resolve_payee_at_node`` = b2b の買い手と
+    同じ鍵)。**決まらなければ None**: 保険者も医療機関も街の外に居るので、街の残高は 1 円も
+    動かない(RoW → RoW の取引を RoW の累積へ足すと、域外依存度の指標が水増しになる)。
+    その分は medical 側の provenance ``insurance_to_row`` に出るので、黙って消えることはない。"""
+    if not enabled(sim):
+        return None
+    amt = float(amount)
+    if amt <= 0.0:
+        return None
+    oid = resolve_payee_at_node(sim, str(node), str(cat))
+    if oid is None:
+        return None
+    credit_org(sim, oid, amt)
+    st = _state(sim)
+    st["insurance_in"] = float(st.get("insurance_in", 0.0)) + amt
+    return row_in(sim, "insurance_reimbursement", amt), str(oid)
 
 
 def on_theft(sim, amount: float) -> str | None:
@@ -735,7 +853,11 @@ def on_b2b_trade(sim, node: str, cat: str, seller_org, amount: float,
 # 不変量(§4-1 (b): Σ(全主体残高) + RoW 累積 = 一定。ABCredit.jl 流のスカラー総マネー保存)
 # --------------------------------------------------------------------------- #
 def city_total(sim) -> float:
-    """街の中に**実在する**全残高の合計(家計 + org + 行政 + 供託 + 銀行 + VC)。"""
+    """街の中に**実在する**全残高の合計(家計 + org + 行政 + 供託 + 遺失物 + 銀行 + VC)。
+
+    ``lost``(H3 遺失物の中の現金)は「街の中に在るが誰の残高でもない」金。既定 OFF の
+    ``lost_property`` が動かないランでは常に 0.0 = 従来と完全同一(``.get`` で旧 ckpt 互換)。
+    """
     total = 0.0
     for a in sim.agents:
         total += float(a.money) + float(getattr(a, "account", 0.0) or 0.0)
@@ -743,6 +865,7 @@ def city_total(sim) -> float:
     if st is not None:
         total += sum(st["org"].values())
         total += float(st["escrow"])
+        total += float(st.get("lost", 0.0))
     gov = getattr(sim, "government", None)
     if gov is not None:
         total += sum(gov.balance.values())
@@ -908,7 +1031,12 @@ def provenance(sim) -> dict | None:
         "k5_kinds": {k: round(v, 1) for k, v in sorted((st.get("k5") or {}).items())},
         "bonus_out_total": round(float(st.get("bonus_out", 0.0)), 1),
         "b2b_transfer_total": round(float(st.get("b2b_transfer", 0.0)), 1),
+        # H2 医療の三本足のうち、**街の残高を動かした 2 本**の累計(既定 OFF は 0.0)。
+        "ems_out_total": round(float(st.get("ems_out", 0.0)), 1),
+        "insurance_in_total": round(float(st.get("insurance_in", 0.0)), 1),
         "escrow": round(float(st["escrow"]), 1),
+        # H3 遺失物: 街の中に在るが誰の残高でもない現金(既定 OFF のランでは常に 0.0)
+        "lost_property_held": round(float(st.get("lost", 0.0)), 1),
         "city_total": round(city_total(sim), 1),
         "total_money": round(total_money(sim), 1),
         # ★接続できていない金の経路の宣言。第98バッチで**空になった**が、キーは後方互換と

@@ -119,6 +119,23 @@ class Agent:
     sick_until: int = -1              # この step まで病気(-1=非病気)
     withdrawn: bool = False           # 引きこもり傾向(慢性高 grievance→自由時間の外出抑制)
     chronic_days: int = 0             # 高 grievance の連続日数(メンタル判定用のカウンタ)
+    # ---- 重症度の状態機械(レーン H1 世代交代、既定 OFF=すべて中立値。src/society/health.py)----
+    #  health.severity.enabled=false では誰も書かない=すべて中立値のまま=上の sick ブールが
+    #  そのまま現行動作(挙動バイト一致)。severity ON のときだけ health.py が唯一の書き手になり、
+    #  既存の消費者(routine.in_work_window / _sick_home / city_ops.ems)へは互換写像で sick を渡す。
+    #  states 監査集合には入れない(fatigue/arousal と同じ内部量=R²(k) を汚さない)。
+    severity: int = 0                 # S0 健康 / S1 軽症 / S2 中等症 / S3 重症 / S4 心停止
+    sev_channel: str = ""             # 発症チャネル(illness/heatstroke/alcohol/trauma/cardiac)
+    sev_until: int = -1               # この step で回復予定(-1=発症していない)
+    sev_outcome_step: int = -1        # S4/致死性 S3 の転帰が確定する step(-1=転帰待ちなし)
+    sev_fatal: bool = False           # 転帰が死か(発症時に決まる。治療との接続は H2 レーン)
+    sev_presentee: bool = False       # 軽症でも予定どおり出勤するか(presenteeism)
+    sev_cared: bool = False           # この発症で既に受診したか(1 発症 1 回)
+    sev_confirmed: int = -1           # 搬送先で確定した重症度(-1=未確定。見かけとは別物)
+    sev_frailty: float = 1.0          # 体力係数(年齢帯の通院者率 × 個体差。全ハザードの乗数)
+    sev_collapse_step: int = -1       # S3/S4 へ遷移した step(=救急の引き金。city_ops が読む)
+    sev_pending: dict | None = None   # その日の発症予約 {day, slot_min, ch, sev, days, …}
+    dead: bool = False                # 永続退場(死)。境界 despawn と同型で世界から居なくなる
     # ---- 世帯・家族・恋愛(後続波 H2、既定 OFF。src/society/household.py)----
     #  すべて中立(OFF 不変)。household.enabled=false ではどれも設定されず=挙動バイト一致。
     household_id: str | None = None   # 所属世帯 id(同一世帯は home を共有)。None=世帯なし=個人

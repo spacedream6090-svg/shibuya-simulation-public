@@ -231,6 +231,10 @@ _NOT_A_KIND = {
     # observe.py は建物の滞在統計を JSON キー "stay" で出す(EVENT_KIND の
     # "stay"(その場に留まる)とは無関係。observe は stay イベントを読まない)。
     "observe": {"stay"},
+    # analyze_communities は共同体ライフサイクルの内部語彙 birth/merge/split/death を
+    # 持つ(第64バッチ以来)。第107で L1 kind "death"(個人の死)が誕生して名前が
+    # 衝突したが、共同体の「消滅」は L1 の death イベントを 1 行も読まない。
+    "analyze_communities": {"death"},
 }
 
 _MIGRATED = ["analyze_founders", "audit_uncertainty", "detect_emergence",

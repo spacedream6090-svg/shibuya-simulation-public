@@ -340,12 +340,21 @@ def test_floor_is_assigned_only_in_the_two_known_files():
     別モジュールが屋内位置の階を書き始めたらここで落ちる = クランプの網羅が
     静かに破れることを防ぐ(``home_floor`` / ``work_floor`` は名簿の値なので対象外)。
     """
-    allowed = {"scheduler.py", "simulation.py"}
+    allowed = {"scheduler.py", "simulation.py",
+               # 第107: 入退院の屋内配置(病院に入る=floor 1 / 出る=floor 0 の
+               # 定数のみ。クランプが守る「可変な階の書き込み」ではない)
+               "medical.py"}
     offenders = []
     for path in sorted((REPO_ROOT / "src" / "society").rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
+        # 第107: percept_index 照会の番兵(lost_property._Probe = hearers_of が
+        # 要求する duck-type)は agent ではない = agent.floor の書き手ではない。
+        probe_spans = [(c.lineno, c.end_lineno) for c in ast.walk(tree)
+                       if isinstance(c, ast.ClassDef) and c.name == "_Probe"]
         for node in ast.walk(tree):
             if not isinstance(node, ast.Assign):
+                continue
+            if any(lo <= node.lineno <= hi for lo, hi in probe_spans):
                 continue
             for tgt in node.targets:
                 if isinstance(tgt, ast.Attribute) and tgt.attr == "floor" \

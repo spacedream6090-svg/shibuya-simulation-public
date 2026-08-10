@@ -294,7 +294,16 @@ def test_3d_head_byte_identity_matrix(tmp_path):
     assert H.build_html("t", scene, tracks) == MV3.build_html("t", scene, tracks), \
         "屋内データ無しのランで HTML が変わった(後方互換違反)"
     # ② 屋内データ有り + 明示 OFF
-    head_ind = H.build_html("t", scene, tracks, indoor_json=ind)
+    #    ★HEAD 側の呼び方は epoch で変える: street-only 機能が HEAD に入る前は
+    #    「機能前の素の出力へ戻れるか」、入った後は「明示 OFF 同士で byte 同一か」。
+    #    HEAD コピー実行ハーネスは機能をコミットした後の初ゲートで自己矛盾化する
+    #    (auto 既定 ON の HEAD vs 明示 OFF の作業木)= Wave 1 の repo-shape と
+    #    同族の既知の罠(第107で発火・恒久修正)。
+    import inspect
+    head_kw = ({"street_only": False}
+               if "street_only" in inspect.signature(H.build_html).parameters
+               else {})
+    head_ind = H.build_html("t", scene, tracks, indoor_json=ind, **head_kw)
     assert head_ind == MV3.build_html("t", scene, tracks, indoor_json=ind,
                                       street_only=False), \
         "--no-street-only が HEAD 出力へ戻らない(逃げ道が壊れている)"

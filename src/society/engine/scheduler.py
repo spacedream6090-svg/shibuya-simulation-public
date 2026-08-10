@@ -25,9 +25,12 @@ from .. import gossip as gossip_mod
 from .. import goods as goods_mod
 from .. import health as health_mod
 from .. import household as household_mod
+from .. import incidents_interpersonal as incidents_mod
 from .. import inner_life as inner_life_mod
 from .. import joint as joint_mod
 from .. import lodging as lodging_mod
+from .. import lost_property as lost_mod
+from .. import medical as medical_mod
 from .. import mind as mind_mod
 from .. import mobility as mobility_mod
 from .. import night as night_mod
@@ -45,6 +48,8 @@ from .. import b2b as b2b_mod
 from .. import city_ops as city_ops_mod
 from .. import delivery as delivery_mod
 from .. import devices as devices_mod
+from .. import facility_devices as facilities_mod
+from .. import incidents_env as incidents_env_mod
 from .. import services as services_mod
 from .. import status as status_mod
 from .. import street as street_mod
@@ -655,7 +660,8 @@ def _atm_withdraw(sim, agent, need: float, step: int, sim_min: int) -> None:
 
 
 def _spend(sim, agent, amount: float, cat: str, step: int, sim_min: int,
-           chosen: bool = False, item: str | None = None) -> None:
+           chosen: bool = False, item: str | None = None,
+           payee_node: str | None = None) -> None:
     """消費(食事・買い物・nightlife・taxi・bus)。残高は 0 未満にしない。
 
     口座 ON(E5): 金額 ≥ card_threshold は口座から(カード)。未満は現金で、現金が
@@ -667,7 +673,10 @@ def _spend(sim, agent, amount: float, cat: str, step: int, sim_min: int,
     IF-E2 案B(economy.org_accounting。既定 OFF=完全 no-op=payload バイト一致): 支払の**その場で**
     受け手(org / venture / RoW)を台帳の静的索引で解決し、**実支払−消費税**を入金する
     (venture 既存経路と同じ流儀=支払者を減らし受取者を増やすのが同一操作。Caiani の deposit
-    transfer)。payload に受け手を示す payee キーが 1 つ増える。"""
+    transfer)。payload に受け手を示す payee キーが 1 つ増える。
+    payee_node(H2 医療・既定 None=既存呼び出しは 1 バイトも変わらない): 受け手が**払った人の
+    居場所では決まらない**消費のために、支払先の場所を明示で渡す口。医療がその唯一の例で、
+    受診・入院は自宅や路上で発火するため従来は受け手が解決できず黙って RoW へ漏れていた。"""
     if amount <= 0:
         return
     sfc_on = sfc_mod.enabled(sim)
@@ -682,7 +691,8 @@ def _spend(sim, agent, amount: float, cat: str, step: int, sim_min: int,
             payload["item"] = item
         if sfc_on:                              # 受け手へ入金(実支払=床クリップ後の実際の減少額)
             actual = before - (agent.money + float(getattr(agent, "account", 0.0) or 0.0))
-            payee = sfc_mod.on_spend(sim, agent, amount, actual, cat, step, sim_min)
+            payee = sfc_mod.on_spend(sim, agent, amount, actual, cat, step, sim_min,
+                                     payee_node=payee_node)
             if payee is not None:
                 payload["payee"] = payee
             if abs(actual - float(amount)) > 1e-9:   # 床クリップで名目より少なく払った(正直開示)
@@ -719,7 +729,8 @@ def _spend(sim, agent, amount: float, cat: str, step: int, sim_min: int,
         payload["item"] = item
     if sfc_on:                                  # IF-E2: 受け手へ入金(現金+口座の実減少額が実支払)
         actual = before - (agent.money + float(getattr(agent, "account", 0.0) or 0.0))
-        payee = sfc_mod.on_spend(sim, agent, amount, actual, cat, step, sim_min)
+        payee = sfc_mod.on_spend(sim, agent, amount, actual, cat, step, sim_min,
+                                 payee_node=payee_node)
         if payee is not None:
             payload["payee"] = payee
         if abs(actual - float(amount)) > 1e-9:  # 床クリップで名目より少なく払った(正直開示)
@@ -2450,6 +2461,8 @@ def _phase_drive(sim, step: int, sim_min: int) -> None:
         d = affect.threshold_delta(a, sim.affectcfg) if affect_on else 0.0
         if health_on:                       # 高疲労→閾値↑(休息へ寄る)。gain=0 で 0=恒等
             d += health_mod.fatigue_threshold_delta(a, sim.healthcfg)
+            # 軽症でも出勤している個体の性能デバフ(H1 severity。既定 OFF=0.0=恒等)
+            d += health_mod.severity_threshold_delta(a, sim.healthcfg)
         return drive.effective_threshold(a, d)
 
     # 発火の関数形(B段 seam)。fixed=閾値ゲート+個人重み抽選(現行)。
@@ -4480,6 +4493,27 @@ def _phase_health_tick(sim, step: int, sim_min: int) -> None:
         health_mod.tick_fatigue(agent, cfg, step, sim_min, sim.logger)
 
 
+def _medical_spend(sim, step: int, sim_min: int):
+    """医療の支払い口(既存 ``_spend`` の薄い包み)。**受診先ノードを任意で受ける**。
+
+    H1(受診)も H2(入院)もこの 1 本を使う。第 4 引数 ``payee_node`` は既定 None =
+    従来と 1 バイトも変わらない(受け手は今までどおり支払者の居場所から解決される)。"""
+    def _pay(agent, amount, cat, payee_node=None):
+        _spend(sim, agent, amount, cat, step, sim_min, payee_node=payee_node)
+    return _pay
+
+
+def _phase_health_severity(sim, step: int, sim_min: int) -> None:
+    """毎step: 予約された発症の発火・回復・転帰(死)。**乱数ゼロの純粋な状態機械**。
+
+    ★``city_ops.phase`` の**直前**に置く: S3/S4 への遷移が刻む ``sev_collapse_step`` を、
+      同じ step のうちに救急の行為連鎖(倒れる→通報→出動)が読むため。
+    health OFF / severity OFF なら完全 no-op(新経路を 1 行も通さない=バイト一致)。"""
+    if not _health_on(sim) or not health_mod.severity_on(sim):
+        return
+    health_mod.severity_tick(sim, step, sim_min, _medical_spend(sim, step, sim_min))
+
+
 def _phase_health(sim, step: int, sim_min: int) -> None:
     """日次境界: 病気の発症/回復・受診(新 stream "health")+ メンタル(慢性高 grievance→引きこもり)。
 
@@ -4491,7 +4525,14 @@ def _phase_health(sim, step: int, sim_min: int) -> None:
     受診は既存 spend(cat="medical")。メンタルの grievance 参照は health.py(CHECKED_DIRS 外)に閉じる。
 
     health OFF なら完全 no-op(illness/medical_visit/health_update 0 件・health stream も引かない=
-    乱数消費不変=ゴールデンを守る)。来街者は街の外に生活基盤=対象外(economy/career と同型)。"""
+    乱数消費不変=ゴールデンを守る)。来街者は街の外に生活基盤=対象外(economy/career と同型)。
+
+    ★世代交代(レーン H1・health.severity.enabled。既定 false=下の現行経路をそのまま通る):
+    ON のときは単一の真偽値 sick を **S0〜S4 の重症度状態機械**へ置き換え、5 つの発症チャネル
+    (急病/熱中症/急性アルコール/外傷/心停止)を独立ハザード × frailty で引く(新 stream
+    "health_onset")。★来街者も対象にする: 熱中症・急性アルコール・転倒・路上の心停止は
+    **街頭人口に起きる出来事**で、居住者に限ると来街者主体の街の実態を大きく取りこぼすため
+    (この差は severity ON のときだけ生じる = 既定挙動は 1 バイトも変わらない)。"""
     if not _health_on(sim):
         return
     day = sim_min // 1440
@@ -4500,6 +4541,12 @@ def _phase_health(sim, step: int, sim_min: int) -> None:
     sim._health_day = day
     cfg = sim.healthcfg
     medical_cost = float(cfg["medical_cost"])
+    if health_mod.severity_on(sim):                    # H1 世代交代(既定 OFF=この枝を通らない)
+        health_mod.severity_day(sim, step, sim_min,
+                                _medical_spend(sim, step, sim_min))
+        for agent in sim.agents:
+            health_mod.update_mental(agent, cfg, step, sim_min, sim.logger)
+        return
     for agent in sim.agents:                           # id 昇順=決定論
         if agent.visitor:
             continue
@@ -4739,6 +4786,17 @@ def _phase_lodging(sim, step: int, sim_min: int) -> None:
                              kind="lodging_checkout", x=agent.x, y=agent.y,
                              payload={"poi": getattr(agent, "lodging_poi", ""),
                                       "nights_stayed": int(getattr(agent, "lodging_nights", 0))}))
+
+
+# ---------------------------------------------------------------- 医療の受け皿(H2)
+def _phase_medical(sim, step: int, sim_min: int) -> None:
+    """毎step: 救急搬送の到着(=入院)と退院(既定 OFF=no-op。H2 医療の受け皿)。
+
+    ★``_phase_lodging`` と**同じ位置**(_phase_wake_and_returns の直前)に置く: 退院で
+      sleeping を落とすので後段の起床フェーズが二重に起こさない(宿泊のチェックアウトと同型)。
+    入院費の支払いは既存 ``_spend`` 経路(cat="medical")で、受け手には**病院ノード**を渡す。
+    medical OFF なら完全 no-op(新 4 種の L1 0 件・state なし・乱数消費不変=ゴールデンを守る)。"""
+    medical_mod.phase(sim, step, sim_min, _medical_spend(sim, step, sim_min))
 
 
 # ---------------------------------------------------------------- 内面本格版(後続波 H6)
@@ -5251,6 +5309,7 @@ def run_step(sim, step: int) -> None:
     _phase_status(sim, step, sim_min)              # 日次境界: 社会的地位スコアの再計算(既定OFF=no-op。第11バッチ)
     _phase_world_events(sim, step, sim_min)
     _phase_lodging(sim, step, sim_min)             # 宿泊のチェックアウト(checkout_hour。既定OFF=no-op。Wave L)
+    _phase_medical(sim, step, sim_min)             # 搬送の到着=入院 / 退院(既定OFF=no-op。H2 医療)
     _phase_wake_and_returns(sim, step, sim_min)
     # 第81(記録専用・OFF は no-op): 朝計画の対象者を _phase_planning が消費する前に控える。
     # 「内省・会話も第一級の発火源」(計画書 §6-3)を認知イベント列に載せるためだけの1行で、
@@ -5301,6 +5360,7 @@ def run_step(sim, step: int) -> None:
     # 担当ビルに入っているか・倒れた個体の近くに誰が居合わせたかを、この step の確定した
     # co-location で判定するため。救急は「倒れる → 近くの誰かが通報する → 当直が応える」の
     # 行為連鎖で、時刻表では 1 件も撃たない。乱数ゼロ・LLM 追加呼ゼロ・プロンプトの欄ゼロ増。
+    _phase_health_severity(sim, step, sim_min)     # 身体: 発症の発火・回復・転帰(既定OFF=no-op。H1)
     city_ops_mod.phase(sim, step, sim_min)
     _phase_health_tick(sim, step, sim_min)         # 疲労ゲージの毎step更新(既定OFF=no-op。後続波 H1)
     street_mod.phase(sim, step, sim_min)           # 街頭広告の視認判定(既定OFF=no-op。第18バッチ)
@@ -5309,6 +5369,19 @@ def run_step(sim, step: int) -> None:
     # 動くので索引を使わず live 走査(perception.py の設計注記を参照)。
     sim.percept_index = build_index(
         sim.agents, float(sim.cfg.world.perception_radius_m))
+    # 対人事件の収束化 H4(既定 OFF=即 return=バイト一致): 事件を「1人1step のレート抽選」
+    # ではなく **共在ペアの上の条件付き確率**(Birks/Groff の RAT)にする層。**唯一の共在索引**
+    # (直上で張った sim.percept_index)の上でしか発火しないので、この位置でなければならない
+    # (計画書 §3「共在判定の一本化」)。共在が無ければ乱数を 1 本も引かない = 「誰もいなければ
+    # 起きない」が制御フローの構造で保証される。LLM 追加呼ゼロ・プロンプトの欄ゼロ増。
+    incidents_mod.phase(sim, step, sim_min)
+    # 遺失物ループ H3(既定 OFF=即 return=バイト一致): 落とす→気づく→拾う→届ける/無視/着服→
+    # 返還+報労金/時効。**incidents(H4)と同じ位置**(直上で張った sim.percept_index の上)に
+    # 置く: 落下地点の共在をこの step の確定した co-location で判定するため(計画書 §3
+    # 「共在判定の一本化」= 新しい全対全スキャンを 1 つも足さない)。落とすかどうかだけが
+    # 確率事象(新 stream "lost_drop")で、拾う/届ける/着服は乱数を 1 粒も引かない決定論。
+    # LLM 追加呼ゼロ・プロンプトの欄ゼロ増(当事者の記憶に定型 1 行が入るだけ)。
+    lost_mod.phase(sim, step, sim_min)
     worldview_mod.phase(sim, step, sim_min)        # 主観的世界モデル: 期待の検証と更新(既定OFF=no-op。第20バッチ)
     _phase_drive(sim, step, sim_min)               # 欲求→申請→抽選→発火権
     _phase_c2(sim, step, sim_min)                  # 会話3層 C2/C3(既定OFF=no-op。P2 S3)。
@@ -5363,6 +5436,16 @@ def run_step(sim, step: int) -> None:
                                                    # (既定OFF=no-op。第96バッチ)。**演算はこの 2 つだけ**=拡散なし
                                                    # (Parunak の propagation factor 0)。rumors の後=同じ L1 を別の
                                                    # watermark で走査する独立層(噂は人へ・痕跡は場所へ)
+    # 事件レイヤー H5(環境側 3 族: 火災 / 交通 / 群集。既定OFF=即 return=バイト一致)。
+    # **step 末**に置く理由: (a) 火災の第一発見者・事故の被害者・通報者は _apply 後の確定した
+    # 位置で決めたい (b) 群集は physics.phase がこの step に測った密度(sim._phys_state)を
+    # **読むだけ**で、状態を 1 ミリも動かさない (c) 交通の曝露は _phase_traffic が進めた
+    # 背景交通の瞬時のエッジ占有を読む。乱数は新 stream 2 本・LLM 追加呼ゼロ・欄ゼロ増。
+    incidents_env_mod.phase(sim, step, sim_min)
+    # 設備 = 摩耗する装置(昇降設備の DEVS。既定OFF=即 return=バイト一致)。
+    # incidents_env の**後**に置く: 利用(δ_ext)は L1 の floor_move / enter_building を
+    # 自前の watermark で走査するので、この step の階移動を同 step で摩耗に反映できる。
+    facilities_mod.phase(sim, step, sim_min)
 
     _bl = (sim.cfg.get("engine", {}) or {}).get("batch_llm", {}) or {}
     if ablate_mod.llm_off(sim):

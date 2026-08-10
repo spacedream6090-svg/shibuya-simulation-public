@@ -618,6 +618,50 @@ world:
   inflow_pulse:
     enabled: false              # ★駅流入を列車ごとの塊にする実験で true
 
+  # ---- 設備 = **摩耗する装置**(昇降設備の DEVS。H5。**既定 OFF=現行と完全同一**)----
+  # 実装 src/society/facility_devices.py。world.devices(改札・信号)と同じ DEVS 契約に従う:
+  #   δ_int(on_schedule)= 月 1 回の保守・待機摩耗・修理完了(**宣言済みのスケジュール**)
+  #   δ_ext(on_input)  = 利用(エージェント)/ 故障(**世界からの外部入力**・actor_id=-1)
+  # ★装置自身は乱数を 1 本も引かない(= devices.py の設計契約)。故障の抽選は module の
+  #   phase 側が専用 stream "incident_facility" から **1 step に最大 2 本**だけ引く(台数非依存)。
+  # 連鎖: 故障 → 閉じ込め → **インターホン通報(行為)** → 対応者の出動(行為) → 復旧。
+  # ★停電・漏水は**作らない**: 東京の SAIDI は年約 13 分 = 10 日ランの期待値 0.4 秒。
+  #   「起きない」が正しい答えなので、起こす機構を書けばそれは較正ではなく演出になる。
+  # OFF が保つ不変条件: 名簿を組まない・facility_* 0 件・agent に属性が生えない・
+  #   stream "incident_facility" を引かない・L1 バイト一致(golden_baseline_l1.json)。
+  facilities:
+    enabled: false              # ★false=完全 no-op(バイト一致)。true で昇降設備が摩耗しはじめる
+    max_events_per_step: 16     # 1 step に出す本機構の L1 件数の上限(超過分は捨てる)
+    # 対応者の職(**名簿に実在するものを先に置く**)。日本のビルで閉じ込めに最初に応じるのは
+    # 防災センター/管理会社の常駐者(=警備員)で、保守会社の技術者はそのあと 30〜80 分で着く。
+    # 「設備保守員」は L5 名簿にまだ居ないので、名簿を再生成したランでだけ効く(前方互換)。
+    responder_occupations: ["設備保守員", "警備員"]
+    response_speed_m_per_min: 80.0   # response_min の換算(徒歩。モデル値であって実走行ではない)
+    maintenance_days: 30        # 月 1 回の保守(法定検査は年 1 回だが保守点検契約は月次が慣行)
+    wear_full: 500.0            # この摩耗で故障ハザードが (1+wear_gain) 倍になる
+    wear_gain: 1.0
+    use_wear: 1.0               # 1 回の昇降で進む摩耗
+    idle_wear_per_day: 1.0      # 待機だけでも進む摩耗(経年劣化の代理)
+    elevator:
+      enabled: true
+      min_levels: 5             # この階数以上の建物に 1 台(地図に設備台数が無いための代理)
+      # ★較正アンカー: EV 閉じ込め **全国およそ 1 万件/年** ÷ **全国設置台数 ≒ 78 万台**
+      #   = 0.0128 件/台/年 = 3.5e-5 件/台/日。地図 v7 の該当 405 棟で 0.014 件/日
+      #   (= 10 日ランの期待値 0.14 件)。**「何も起きない日が正しい」**側に落ちる較正である。
+      fault_per_day: 3.5e-5
+      repair_min_lo: 30.0       # 復旧まで 30〜80 分(台ごとに安定ハッシュで決まる決定論値)
+      repair_min_hi: 80.0
+      traps: true               # エレベーターは閉じ込める
+    escalator:
+      enabled: true
+      min_levels: 3             # retail / station の建物だけが対象(kind による代理判定)
+      # ★**推定**(アンカーではない): エスカレーターは構造上「閉じ込め」が起きないので
+      #   「閉じ込め件数」という統計そのものが存在しない。桁を合わせた仮の値である。
+      fault_per_day: 5.0e-5
+      repair_min_lo: 30.0
+      repair_min_hi: 80.0
+      traps: false              # 停止するだけ(閉じ込めない)
+
 # ---- 空間レイヤ核(屋内ミクロ状態=シームレスズーム観察の土台。既定 OFF=現行挙動と完全同一)----
 # 全建物・全階の屋内間取り(vision.building_layout=決定論・ビューア floorLayout と同一系列)を
 # 「単一の真実」として保持し、区画(zone)に用途型(SpaceType)を決定論割当する層。実装
@@ -2802,6 +2846,138 @@ health:
   # ---- メンタル(慢性高 grievance→引きこもり。既定 閾値高で通常不発)----
   mental_grievance_threshold: 0.7  # 「高 grievance」とみなす閾値
   mental_withdraw_days: 3       # 高 grievance がこの日数続いたら引きこもり(0=メンタル無効)
+  # ======================================================================================
+  # 重症度の状態機械(身体と事件のレイヤー H1 2026-08-10。正典 docs/plans/body-incident-layer-plan.md §1)
+  # ======================================================================================
+  # 上の「病気」は真偽値ひとつ(sick)しか持たず、軽い風邪も路上で倒れる事態も同じ 1 ビットだった。
+  # enabled: true にすると S0 健康 → S1 軽症 → S2 中等症 → S3 重症 → S4 心停止 → {回復, 死亡} の
+  # 状態機械へ置き換わる。既定 false では上の単一真偽値の現行動作と**完全同値**(新経路を通らない)。
+  #   発症チャネル5種 … 各=独立ハザード × 共変量 × frailty。新 stream "health_onset"(既存 draw 順不変)
+  #   frailty        … 年齢帯の通院者率(65+ ≒ 0.70)から導く体力係数が全ハザードを乗算する
+  #   sick-role      … S1=予定どおり出勤しうる(presenteeism)/ S2=受診または停留 / S3+=行動不能
+  #   救急の引き金   … city_ops の暫定ハッシュゲートを「S3/S4 への遷移そのもの」へ置換(世代交代)
+  #   死             … ユーザー決定(計画書 §6-1)により**本トグル配下**。境界 despawn と同型の永続退場
+  # ★数値はすべて実測アンカーつき(下のコメント)。「面白さのための増量」は較正破壊なので行わない。
+  severity:
+    enabled: false              # ★ON 推奨(本番): true(身体の階層化=重症度・発症チャネル・死)
+    # ---- frailty(年齢帯の通院者率 → 全ハザードの乗数)----
+    frailty_ref: 0.40           # 基準の通院者率(この値で frailty=1.0。20代 ≒0.15 / 65-74 ≒0.69)
+    frailty_jitter: 0.25        # 個体差の幅((seed, id) の安定ハッシュ=純関数。乱数は引かない)
+    frailty_min: 0.20
+    frailty_max: 3.00
+    # ---- ① 急病(現行 onset_prob の後継。S1-S2 帯)----
+    acute_illness_daily: 0.0068  # 成人の感冒・胃腸炎などの発症 年2〜3回 ≒ 2.5/365 /人日
+    acute_illness_days_lo: 3     # 回復まで(日)
+    acute_illness_days_hi: 7
+    acute_illness_mild: 0.85     # 残りが S2(中等症)
+    # ---- ② 熱中症: λ(WBGT) の閾値関数(sim.today_weather["wbgt"] を読む)----
+    #  ★正直な依存関係: WBGT を作るのは weather.mode が generated / table のときだけで、
+    #    既定の synthetic では欠測(null)= 熱中症は 1 件も起きない。欠測を 0 と偽って
+    #    発生させることはしない(このチャネルを効かせたいランは weather.mode を上げる)。
+    #  都の日次搬送(23区)から。WBGT 28 で ≒3e-6 /人日、WBGT 33 で ≒2.6e-5 /人日 を通る指数曲線。
+    #  λ = heat_base × exp(heat_slope × (WBGT − heat_ref_wbgt))、WBGT < floor では 0(発生しない)。
+    heat_base: 3.0e-6
+    heat_ref_wbgt: 28.0
+    heat_slope: 0.432           # ln(2.6e-5 / 3e-6) / 5 ≒ 0.432(32 以上で急峻になる勾配)
+    heat_floor_wbgt: 25.0
+    heat_outdoor_mult: 2.0      # 屋外(路上)に居るあいだの増幅
+    heat_elderly_mult: 3.0      # 65 歳以上の増幅
+    heat_mild: 0.55
+    heat_moderate: 0.40         # 残りが S3
+    heat_days_lo: 1
+    heat_days_hi: 2
+    # ---- ③ 急性アルコール(夜間店舗に居るときだけ実現する)----
+    #  都の急性アルコール搬送(≒1.8万件/年)を夜間の飲酒機会数で割り戻した水準。74% が軽症(実測)。
+    alcohol_nightlife_daily: 3.0e-4   # 夜に夜間店舗へ居る個体 1 人日あたり。20代ピークの年齢重みつき
+    alcohol_weekend_mult: 1.6   # 金・土の増幅
+    alcohol_mild: 0.74
+    alcohol_moderate: 0.24      # 残りが S3
+    alcohol_days_lo: 1
+    alcohol_days_hi: 1
+    # ---- ④ 外傷(転倒)----
+    #  一般負傷は搬送のおよそ2割。区の 65 件/日 × 0.2 ÷ 23 万人 ≒ 5.7e-5 /人日 を年齢重み込みの
+    #  平均として置いた基準値(高齢で 5 倍・65 歳未満で 0.5 倍)。
+    trauma_daily: 3.0e-5
+    trauma_night_mult: 1.5
+    trauma_crowd_mult: 1.4
+    trauma_crowd_n: 6           # 近傍にこの人数以上で「混雑」とみなす(索引 percept_index に相乗り)
+    trauma_mild: 0.62
+    trauma_moderate: 0.33
+    trauma_days_lo: 2
+    trauma_days_hi: 10
+    # ---- ⑤ 心停止 / 脳卒中(極低率・**年齢帯レート必須**)----
+    #  年齢帯別の OHCA 発生率(人口10万対/年)を日次へ直した内部表を引く: <20 ≒2 / 20-39 ≒7 /
+    #  40-64 ≒40 / 65-74 ≒180 / 75+ ≒700。全国平均(≒100)の直適用は禁忌(街頭人口は 20-40 代)。
+    cardiac_scale: 1.0          # 年齢帯レートへの一括較正係数(1.0=表そのまま)
+    cardiac_arrest_share: 0.45  # 発症のうち S4(心停止)の割合。残りは S3(脳卒中等)
+    cardiac_days_lo: 7
+    cardiac_days_hi: 21
+    ward_ohca_per_day: 0.6      # ★参照値のみ(渋谷実測 0.5〜0.7 件/日)。判定には使わない
+    # ---- 進行(状態機械が単なる「跳躍」に退化しないための項)----
+    worsen_daily: 0.02          # 発症中の 1 日あたり悪化確率(S1→S2→S3)
+    # ---- sick-role ----
+    presenteeism: 0.45          # 軽症で予定どおり出勤する割合(日本の実測 ≒45%)
+    seek_care: 0.62             # 中等症で受診する割合(残りは自宅停留)
+    care_cost: 3000             # 受診1回の自己負担(既存 spend cat="medical")
+    mild_threshold_gain: 0.06   # 軽症で出勤している個体の性能デバフ(発火閾値の上げ幅)
+    # ---- 搬送先での確定(通報時点の「見かけ」と分離する)----
+    #  東京消防庁の搬送人員の程度別構成: 軽症 52.8 / 中等症 38.6 / 重症 7.3 / 死亡 1.3 %。
+    #  ★「全通報が重病ではない」= 通報は不確実性から生まれる、の観測可能な再現。
+    confirm_mild: 0.528
+    confirm_moderate: 0.386
+    confirm_severe: 0.073
+    # ---- 死(ユーザー決定 §6-1。本トグル配下・別オプトインにしない)----
+    ohca_survival: 0.10         # OHCA の生存退院率 ≒10% → P(死|S4) = 0.90
+    severe_fatality: 0.005      # ★S3 の致死率。搬送全体の死亡 1.3%(東京)から OHCA 寄与を
+                                #   差し引いた**残差として置いた較正値**で、単独の実測ではない
+    arrest_outcome_steps: 6     # S4 の転帰が確定するまでの長さ
+    severe_outcome_steps: 144   # 致死性 S3 の転帰が確定するまでの長さ
+
+# ======================================================================================
+# 医療の受け皿(身体と事件のレイヤー H2 2026-08-10。正典 docs/plans/body-incident-layer-plan.md §2)
+# ======================================================================================
+# H1(上の重症度)が「倒れる」まで、city_ops の救急連鎖が「通報 → 出動」までを作った。ここが
+# 足すのはその続き=搬送先・入院・医療費(実装 src/society/medical.py)。
+#   搬送先 … 地図の subcat=hospital(v8 は 7 件)。★subcat を持たない地図(v7 以前)では
+#            **0 件 = 搬送が起きない**(名前から病院を推測しない=無い施設を捏造しない)
+#   入院   … 確定重症度で在院長が決まる(軽症=数時間で帰宅 / 中等症=数日 / 重症=長期)。
+#            物理は宿泊(lodging)と同型の「非自宅建物で N 泊」テンプレート
+#   金の三本足 … ① 救急搬送=公費(区の歳出 → RoW ems_operation。運行主体の都は街の外)
+#                ② 患者 3 割=既存 spend cat="medical"(**受け手を受診先ノードで解決する是正**)
+#                ③ 保険 7 割=RoW チャネル insurance_reimbursement(新部門は作らない)
+# ★治療は転帰を変えない(死は H1 が発症時に決める=レーン H1 の設計判断を再開封しない)。
+# ★高額療養費・年齢別負担割合・病床数の制約は作っていない(持っていないデータで埋めない)。
+# 既定 OFF=新 4 種(ems_transport / hospital_admit / hospital_discharge / medical_bill)0 件・
+#   agent に属性が生えず・乱数消費不変(ゴールデン golden_baseline_l1.json をバイト一致で守る)。
+medical:
+  enabled: false                # ★ON 推奨(本番・要 health.severity.enabled=true + city_ops.ems)
+  max_events_per_step: 24       # 1 step に出す本レーンの L1 件数の上限(暴走の安全弁)
+  transport:
+    enabled: true               # 搬送(現場 → 病院)。false では倒れた個体はその場に留まる
+    steps: 3                    # 搬送にかかる長さ(★モデル値であって走行時間ではない)
+    max_per_day: 24             # 1 日に出す搬送の上限(L1 の安全弁)
+    hold_crew: true             # 搬送中は隊を戻さない(= 救急車ひっ迫が観測できる)
+  hospital:
+    poi_cats: [service]         # 地図が amenity=hospital を潰しているカテゴリ
+    subcat: hospital            # v8 が付けるサブカテゴリ(これが搬送先の判定)
+    name_keywords: []           # ★既定は空: 名前から病院を推測しない(捏造の防止)
+  clinic:
+    enabled: true               # 自力受診(中等症)の受診先解決=医療費の受け手の是正
+    poi_cats: [service]
+    hints: [クリニック, 医院, 診療, 歯科, 内科, 眼科]   # ★subcat=hospital は必ず除く
+    radius_m: 1500              # 受診先を探す半径(徒歩圏の医院)
+  admit:
+    enabled: true               # 入院(在院という状態)。false では搬送されても在院しない
+    mild_steps: 18              # 軽症の在院の長さ(既定 Δt=10 分で 3 時間 = 数時間で帰宅)
+    moderate_days: 3            # 中等症の在院日数
+    severe_days: 14             # 重症の在院日数(一般病床の平均在院日数 ≒16 日が上位アンカー)
+    arrest_days: 21             # 心停止から蘇生した場合(重症より長い)
+    max_days: 30                # 在院長の上限(暴走の安全弁)
+  money:
+    enabled: true               # 金の三本足。false では搬送・入院だけが起き会計は動かない
+    ems_cost: 45000             # 救急出動 1 件あたりの公費(消防庁の試算 ≒4.5 万円/件)
+    coinsurance: 0.3            # 患者の自己負担割合(健康保険法=3 割。年齢別・上限は未実装)
+    admit_self_pay_per_day: 10500  # 入院 1 日あたりの自己負担(急性期 ≒3.5 万円/日 × 3 割)
 
 # ---- 世帯・家族・恋愛(現実ギャップ 後続波 H2 2026-07-07。すべて既定 OFF=現行挙動と完全同一)----
 # 現状は全員独立個人。生活の紐帯(世帯・同居・家族・恋愛)を最小・非LLM・決定論で載せる
@@ -3133,7 +3309,10 @@ services:
   #   賃金へ結ぶ唯一の経路 / ジム→fitness=観測のみ。gain/(1+現在値) の逓減で累積))
   services:
     grooming: {cats: [service], hints: [美容, 理容, 床屋, サロン, ヘア, ネイル], price: 4000, stay: 3, band: mood,     magnitude: 0.03,  daily_rate: 0.05,  age: [12, 90],  remember: 髪を整えて気分が上がった}
-    clinic:   {cats: [service], hints: [クリニック, 医院, 診療, 歯科, 内科, 眼科], price: 3000, stay: 2, band: vitality, magnitude: 0.02,  daily_rate: 0.012, age: [0, 120],  remember: 健康のために受診してきた}
+    # ★exclude_subcats(H2 是正): 地図 v8 の総合病院(subcat=hospital)は名前ヒントに当たる
+    #   ものが実在する(「〜クリニック」)。病院は救急の**搬送先**であって健診で歩いて行く
+    #   場所ではないのでここから除く。subcat を持たない地図では何も落ちない=完全同値。
+    clinic:   {cats: [service], hints: [クリニック, 医院, 診療, 歯科, 内科, 眼科], exclude_subcats: [hospital], price: 3000, stay: 2, band: vitality, magnitude: 0.02,  daily_rate: 0.012, age: [0, 120],  remember: 健康のために受診してきた}
     lesson:   {cats: [education, service], hints: [塾, スクール, 教室, 予備校, アカデミー], price: 5000, stay: 3, band: learning, magnitude: 0.02, daily_rate: 0.20, age: [8, 35], remember: 習い事で新しいことを学んだ, dev_axis: skill, dev_gain: 0.08, dev_remember: 学びの積み重ねが力になってきた}
     gym:      {cats: [service, leisure], hints: [ジム, フィットネス, スポーツ, ヨガ, プール], price: 2000, stay: 4, band: vitality, magnitude: 0.025, daily_rate: 0.20, age: [15, 75], remember: ジムで汗を流してすっきりした, dev_axis: fitness, dev_gain: 0.08, dev_remember: ジム通いの成果を感じる}
     laundry:  {cats: [service], hints: [クリーニング, ランドリー, 洗濯], price: 1200, stay: 1, band: mood, magnitude: 0.015, daily_rate: 0.14, age: [18, 90], remember: 衣類を整えてもらった}
@@ -3242,6 +3421,60 @@ chance:
     windfall:  {weight: 1.0, money_lo: 1000, money_hi: 20000}   # 臨時収入(拾得/還付/当選小口)= money+
     loss:      {weight: 1.0, money_lo: 1000, money_hi: 20000}   # 財布紛失/急な出費 = money−(手持ちの範囲)
     encounter: {weight: 2.0, closeness: 1.5}                    # 偶然の再会/出会い = closeness+(双方)
+
+# ---- 遺失物ループ H3 = 完全内生の事件(実装 src/society/lost_property.py。既定 OFF=現行と完全同一)----
+# 正典: docs/plans/body-incident-layer-plan.md §3(遺失物行)+ §4(chance_event の溶解)。
+# 落とす(移動/飲酒/混雑のハザード)→ 気づく(品目別の遅れ+遺失届)→ 拾う(落下地点の共在=
+# sim.percept_index)→ 届ける/無視/着服 → 交番 → 返還+報労金5-20%(遺失物法28条)/ 3か月時効(同7条)。
+# ★上の chance.windfall(臨時収入=拾得)の**構造的な代替**: 拾得金は必ず誰かの drop から出る
+#   =貨幣保存(IF-E ゼロ和検査)と整合する。chance の退役は H3+H4 完了後の別バッチ。
+# 較正の出どころは lost_property.py の docstring「較正」節(警視庁 拾得454万件/年 → 渋谷来街者
+# スケール ≈2.9e-3件/人日 / 東京都遺失物センターの品目別返還率 傘1%・財布60-80%・携帯87%)。
+# R1: 新 stream "lost_drop" 1本のみ(落とすかどうかだけが確率事象)・追加 LLM 呼ゼロ。
+lost_property:
+  enabled: false                # ★false=完全 no-op(L1 バイト一致)。true で遺失物ループが動く
+  # ---- ① 落とす: 共変量を1つも掛けない基底の落下率[件/人日]。品目構成は警視庁の受理内訳の桁 ----
+  base_daily:                   # 合計 2.0e-3。曝露分布で期待値化すると実現 2.92e-3=都実測の目標
+    umbrella: 0.00008           # 傘   (実現構成比 7.4%。警視庁の受理内訳の桁)
+    wallet:   0.00016           # 財布 (8.7%)
+    phone:    0.00016           # 携帯 (8.7%)
+    other:    0.00160           # その他(証明書類・衣類等が大半=75.1%)
+  move_mult: 1.8                # 移動中(経路を持っている)=遺失の主戦場
+  crowd_mult: 1.5               # 混雑ノード(財布・携帯)
+  crowd_threshold: 8            # 同一ノードの在場者数(これ以上を「混雑」と呼ぶ)
+  drink_mult: 3.0               # 飲酒(夜の nightlife ノード。財布・携帯のみ)
+  rain_mult: 5.0                # 雨/雪の日(傘のみ)
+  dry_mult: 0.2                 # 雨でない日の傘(そもそも持ち歩いていない)
+  indoor_mult: 2.0              # 店内の置き忘れ(傘のみ)
+  drink_start_min: 1080         # 飲酒帯の始まり 18:00(分 of day)
+  drink_end_min: 300            # 同・終わり 05:00(日をまたぐ帯)
+  drink_cats: ["nightlife"]
+  indoor_cats: ["shop", "food", "cafe", "nightlife"]
+  # ---- ② 気づく/引き取る: notice_prob × claim_prob が実測の品目別返還率になる ----
+  notice_delay:                 # 紛失に気づくまでの遅れ(携帯は即・傘は次に降るまで)
+    phone: 1
+    wallet: 3
+    other: 9
+    umbrella: 18
+  notice_prob:  {phone: 0.99, wallet: 0.98, other: 0.60, umbrella: 0.35}
+  claim_prob:   {phone: 0.92, wallet: 0.73, other: 0.36, umbrella: 0.03}
+  # ---- ③ 拾う/届ける/着服 ----
+  pickup_prob:  {phone: 0.80, wallet: 0.85, other: 0.45, umbrella: 0.25}
+  turnin_prob: 0.78             # 拾った人が届ける確率(1−これ=着服)。日本の財布返還実験の水準
+  temptation: 0.25              # 金額が大きいほど着服へ傾く強さ(0=金額に無感応)
+  guardian_mult: 1.20           # 監視者(同席者)が居るときの届ける倍率(RAT の guardianship)
+  # ---- ④ 金(すべて家計間の直接授受=総額は1円も増減しない)----
+  wallet_cash_frac: 0.35        # 財布に入れて持ち歩く現金の割合(所持金比)
+  wallet_cash_max: 50000
+  item_value:   {umbrella: 1500, wallet: 3000, phone: 60000, other: 3000}
+  reward_lo: 0.05               # 報労金の下限(遺失物法28条: 5%以上)
+  reward_hi: 0.20               # 同・上限(20%以下)
+  # ---- ⑤ 時間 ----
+  statute_steps: 12960          # 3か月時効(遺失物法7条)= 90日
+  abandon_steps: 432            # 誰にも拾われないまま消えるまで = 3日
+  # ---- ⑥ 安全弁 ----
+  max_events_per_step: 24       # 本 module が1 step に出す L1 件数の上限
+  max_items: 4096               # 同時に存在する未解決の遺失物の上限
 
 # ---- 宿泊・ホテル滞在(第9バッチ Wave L 2026-07-07。既定 OFF=現行挙動と完全同一)----
 # 来街者(visitor)が夜の帰宅退出の代わりにホテルへ宿泊する(実装 src/society/lodging.py +
@@ -3648,3 +3881,215 @@ city_ops:
     speed_m_per_min: 300.0      # response_min の換算(モデル値。実走行時間ではない)
     max_calls_per_day: 8        # 1 日に出す連鎖の上限(L1 の安全弁)
     ward_calls_per_day: 65.0    # ★参照値のみ(区の実測 65 件/日 ≒ 22 分に 1 件)。判定に使わない
+    # ---- 傍観者モデル(**health.severity.enabled が true のときだけ効く**)----
+    #  OFF のときは従来どおり「最近傍の誰かが必ず通報する」。ON のときは居合わせた集団から
+    #  決定論で通報者を選ぶ: P(誰かが動く) = 1 − (1 − solo)^(n^(1−alpha))。
+    #  実測との整合 = 集団としての介入率 0.85〜0.95(実 CCTV 研究で介入は規範・91%)。
+    #  責任分散(Darley-Latané)は**曖昧で軽微な状況にだけ**効かせ、危険が明白な事態では
+    #  alpha=0(メタ分析: 危険なほど傍観者効果は消え、人数が増えるほど誰かが動く)。
+    bystander_solo_prob: 0.65        # 1 人しか居合わせないときの介入率(帯から逆算した値)
+    bystander_alpha_ambiguous: 0.4   # 見かけが中等症以下 = 曖昧・軽微(責任分散が効く)
+    bystander_alpha_danger: 0.0      # 見かけが重症以上 = 危険が明白(責任分散なし)
+    bystander_related_mult: 1.5      # 家族・同居人・同僚が居合わせたときの倍率
+    bystander_max_prob: 0.98
+    # 通報までの所要時間の分布(実測 46% が 1 分未満 / 29% が 1〜5 分 / 25% が 5 分超)。
+    # ★正直な限界: 既定 Δt ではどのビンも同じ 1 刻みに丸まるので、**発火時刻は動かさず**
+    #   観測量として ems_call の payload に載せる(より細かい Δt で意味を持つ)。
+    call_delay_fast_min: 0.5
+    call_delay_mid_min: 3.0
+    call_delay_slow_min: 8.0
+    call_delay_fast_share: 0.46
+    call_delay_mid_share: 0.29
+
+# ---- 対人事件の収束化 H4(docs/plans/body-incident-layer-plan.md §3 対人行・§6-3 ユーザー決定)----
+# ★**既定 OFF=現行と完全同一**(L1 バイト一致・乱数消費不変・プロンプト不変)。
+#
+# ユーザー決定(原文)「**H4はエージェントドリブンで設計**」= レート抽選の残滓を残さない。
+# 事件は「誰もいなければ起きない」を**構造で**保証する:
+#   基底レート(pair_prob)は **共在ペア 1 組 1 step あたりの条件付き確率**としてのみ存在し、
+#   人口にも時間にも直接掛からない。共在ペアが空なら乱数は 1 本も引かれない
+#   (src/society/incidents_interpersonal.py の _pair_draw が唯一の抽選点)。
+#
+# RAT(Birks / Groff)の 3 要素はすべて**既存 agent 状態と世界状態の純関数**:
+#   動機   = 金欠 / 滞納・立退き・破産(一時的で回復可能)/ 酩酊 / 疲労  ★人格ラベルは作らない
+#   標的   = 携行現金 / 携帯 / 酩酊 / 孤立(VIVA の観測可能な代理)
+#   監視   = 同席者数 + 交番の近接 + traces の摘発痕跡 + 同ノードの警察官
+#            ★block 以上なら**抽選そのものを行わない**(事後フィルタにしない)
+#
+# ★トップレベルのキーを incidents_interpersonal にした理由: H3(遺失物)/ H5(火災・設備)が
+#   同時進行の別レーンなので、共有の incidents: ブロックを 3 レーンで奪い合わない
+#   (所有権が config から一意に読める = street_life / city_ops と同じ「1 レーン 1 ブロック」)。
+incidents_interpersonal:
+  enabled: false                # ★false=完全 no-op(バイト一致)。true で共在収束が動く
+  max_events_per_step: 16       # 1 step に出す本機構の L1 件数の上限(超過分は捨てて数える)
+  max_pairs_per_offender: 8     # 1 候補が同 step に見る共在ペア数の上限(O(n・k) の頭を抑える)
+  # ---- 動機(加害者候補)。★一時的で回復可能な状態だけ = 新しい人格ラベルを付けない ----
+  motive:
+    money_low: 1500.0           # 手持ちがこれ未満 = 金欠(円)
+    w_money: 0.50
+    w_distress: 0.30            # 家賃滞納 / 立退き / 破産(既存フィールドの読み取り)
+    w_intox: 0.40
+    w_fatigue: 0.20
+    w_grievance: 0.0            # ★既定 0: 構成概念(不満)を発火判断に食わせない(R1)。
+                                #   >0 にすると k 非依存性の主張が弱まるので実験条件として明示すること
+    min: 0.05                   # これ未満の動機は候補にしない(前置フィルタ)
+  # ---- 標的の適性(VIVA = 価値・慣性・可視性・接近可能性の観測可能な代理)----
+  target:
+    cash_ref: 8000.0            # これだけ持っていれば価値項が飽和(円)
+    w_cash: 0.60
+    w_phone: 0.20
+    w_intox: 0.40
+    w_alone: 0.40               # 同伴者が居ない(孤立)
+    min: 0.05
+  # ---- 監視(guardianship)。★閾値以上なら抽選そのものを行わない ----
+  guardian:
+    w_watcher: 0.34             # 同席者 1 人あたり(3 人で block に届く = 目があれば起きない)
+    w_koban: 1.00               # 交番・警察署の近く
+    w_trace: 0.50               # traces(IF-D)の摘発痕跡 1.0 あたり。traces OFF なら常に 0
+    block: 1.00                 # このスコア以上で不発。★0 以下 = 「常に監視されている」対照条件
+    koban_radius_m: 60.0
+    koban_keywords: ["交番", "警察署"]      # 一般名詞のみ(ブランド名・地名は書かない)
+    koban_cats: ["service", "police"]     # v7/v8 は amenity=police→service。police は前方互換
+    police_blocks: true         # 同ノードの警察官は無条件で抑止(G3 執行との接続)
+  # ---- 酩酊 = 夜間店舗に居た痕跡の減衰する印(血中濃度は作らない)----
+  intox:
+    steps: 12                   # 印の寿命[step](既定 dt=10 分なら 2 時間)
+    cats: ["nightlife"]
+    open_hour: 18               # 夜間店舗の窓(commerce の既定表と同値)
+    close_hour: 5
+  # ---- 窃盗(既存 diversity.crime_prob の世代交代)----
+  theft:
+    enabled: true
+    # ★較正値: 共在ペア 1 組 1 step あたりの条件付き確率。**実測してから置いた値**:
+    #   production の規模(mock 100 体 144 step)の共在重み和 theft 251.4 / brawl 27.9 から、
+    #   窃盗が既存の実測較正値 ~2.8e-5 件/人日(渋谷区の認知件数 ÷ 昼間人口。許容帯 1e-5〜3e-4)
+    #   と同水準(theft 2.4e-5 + brawl 0.4e-5)になるように置いた。★同じ値でも人口密度が上がれば
+    #   1 人あたりの件数は増える(共在の機会が増えるから = RAT そのもの)。別の規模で回すときは
+    #   summary の weight_by_kind / per_person_day / per_pair_step を見て置き直すこと。
+    #   ★分母は人口比ではなく**共在機会比**
+    #   (summary.incidents_interpersonal の pairs_seen / weight_sum / per_pair_step)。
+    pair_prob: 0.0000095        # = 9.5e-6(実測: production 100 体で共在重み和 251.4)
+    amount: 3000.0              # 被害額(diversity.theft_amount と同値)
+    grievance: 0.0              # 被害者の不満増分(factors 経由。0=金銭のみ)
+    supersede_diversity: true   # ★true = diversity.tick_crime は窃盗の枝を供給しない(置き換え)
+  # ---- 喧嘩(酒 x 密度 x 閉店放出)----
+  brawl:
+    enabled: true
+    pair_prob: 0.000014         # = 1.4e-5(実測: production 100 体で共在重み和 27.9)
+    density_min: 3              # 同席者がこの人数以上のときだけ(密度項)
+    require_intox: true         # 片方以上が酩酊していること(酒項)
+    closing_window_min: 60      # 閉店から何分を「放出」とみなすか
+    closing_boost: 0.16         # ★閉店 +1 時間の実証弾性 +16%(検証対象)
+    night_only: true            # 夜間店舗の窓 or 閉店放出の帯でだけ起きる
+    injury_density: 5           # 密度がこれ以上 かつ 双方酩酊 → S2(中等症)。既定は S1
+    grievance: 0.0
+  # ---- 通報層(110 番 = 目撃者/被害者の行為。★新しい乱数を 1 本も引かない完全決定論)----
+  report:
+    enabled: true
+    victim_base: 1.00           # 被害者本人の通報確率(傍観者ではないので人数減衰なし)
+    witness_base: 0.70          # 目撃者 1 人あたりの通報確率(人数減衰の基点)
+    kin_bonus: 0.30             # 家族・同居人・恋人は倍率>1(関係者)
+    threshold: 0.50             # ★**集団**の通報確率 1-Π(1-p) がこれ以上なら通報が起きる。
+                                #   個人 p は n^-alpha で落ちるが集団の確率は人数で上がる
+                                #   (既定値: n=3→0.83 / n=5→0.90 / n=8→0.94 = 実測 0.85-0.95 の帯)
+    alpha_ambiguous: 0.40       # 曖昧・軽微な状況の**個人**の人数減衰(Darley & Latane)
+    alpha_danger: 0.0           # ★危険事態は人数で落ちない(メタ分析。介入が規範)
+    clear_radius_m: 12.0        # これより遠い目撃者は加害者を特定できない(誤通報の内生の源)
+    response: true              # 通報への臨場(police_response)を出す
+    speed_m_per_min: 300.0      # response_min の換算(モデル値。実走行時間ではない)
+    detain_steps: 0             # ★既定 0: >0 で既存の勾留 seam(detained_until)を使うが、
+                                #   勾留は発火権を止める=LLM 呼数が動くので既定では 1 も動かさない
+    ward_calls_per_day: 0.0     # ★参照値のみ(判定には使わない)。0=未設定
+
+# ============================================================================ #
+# 事件レイヤー H5 = 環境側の 3 族(火災 / 交通 / 群集)。**既定 OFF=現行と完全同一**
+# ---------------------------------------------------------------------------- #
+# 実装 src/society/incidents_env.py。計画 docs/plans/body-incident-layer-plan.md §3 の
+# 「火災 = 薄いレート + 完全アクター連鎖」「交通 = 曝露の積」「群集 = 生成しない = 状態が事件」。
+#
+# ★較正の書き方(計画 §7「管轄混同」= 渋谷署 ≠ 渋谷区・消防も同様 = 3 倍ズレの源)
+#   換算を 3 段に割って**全部 conf のキーとして外に出す**:
+#     ① jurisdiction_per_day … アンカー(**管轄スケール**の実測値)
+#     ② jurisdiction_to_ward … 管轄 → 区スケールの換算(**既定 1.0**)
+#     ③ area_share           … 区 → この世界の規模比(0 = 地図 bbox から自動計算)
+#   ②の既定を 1.0 にしたのは**少なく見積もる向き**へ倒すため: 火災 0.66 件/日 は年 241 件で、
+#   渋谷区を 2 署が分担するので素朴には ×2 だが、それは東京消防庁管内の総火災件数(年約 4,000 件)を
+#   23 区へ按分した水準(区あたり年 60〜200 件)と 2〜8 倍食い違う。「アンカー × 署数」は
+#   **上振れの上限側**であって実測ではない。上限側を測るランは 2.0(火災)/ 3.0(交通)を書く。
+#   ③は地図メタの bbox から計算する(v7 では約 3.8 km² / 渋谷区 15.11 km² ≒ 0.25)。
+#
+# ★停電・漏水は**作らない**(skip の明示): 東京の SAIDI は年約 13 分 = 10 日ランの期待値 0.4 秒。
+#   「起きない」が正しい答えなので、起こす機構を書けばそれは較正ではなく演出になる。
+#
+# R1: LLM 追加呼ゼロ・プロンプトの節ゼロ増(出来事は既存の記憶欄に定型 1 行が入るだけ)・
+#   新しい乱数は新 stream 2 本("incident_fire" / "incident_traffic")だけ・群集は乱数ゼロ。
+# OFF が保つ不変条件: 新 7 種の L1 0 件・sim に state が生えない・agent に属性が生えない・
+#   stream を 1 本も引かない・プロンプト 1 バイト不変・L1 バイト一致(golden_baseline_l1.json)。
+incidents_env:
+  enabled: false                # ★false=完全 no-op(バイト一致)。true で 3 族が動きはじめる
+  max_events_per_step: 24       # 1 step に出す本機構の L1 件数の上限(超過分は捨てる)
+  area_share: 0.0               # 0 = 地図 bbox から自動計算(発明した定数を置かない)
+  # ---- ① 火災(薄いレート → 第一発見者 → 119 → 出場 → 鎮火)----
+  fire:
+    enabled: true
+    jurisdiction_per_day: 0.66  # ★アンカー(消防署管轄スケールの実測 = 年 241 件)
+    jurisdiction_to_ward: 1.0   # ★管轄 → 区。既定 1.0(上限側は 2.0)
+    # ★重度分布のアンカー = **ぼや 175 : 全焼 0**(同じ年報)。頻度と**同時に**較正する
+    #   ことが計画 §7 の要求(= 災害映画化の防止)。全焼の重み 0 = 既定では 1 件も起きない。
+    #   ★固定アンカーは「ぼやが 7 割強」と「全焼ゼロ」の 2 点だけで、残余 66 件を
+    #     部分焼 : 半焼 = 3 : 1 に割ったのは**仮定**である(ここを差し替えれば試せる)。
+    severity_weights: {boya: 175.0, partial: 50.0, half: 16.0, total: 0.0}
+    # ★出火原因の **73% は器具使用に帰属可能**(kitchen+heating+electrical = 0.73)。
+    #   none(0.27)= たばこ・放火・不明の族 = 器具に帰属できない残り。
+    appliance_weights: {kitchen: 0.34, heating: 0.20, electrical: 0.19, none: 0.27}
+    # 用途別の火災荷重(飲食は火気を扱うので高い)。用途は地図の POI cat と建物 kind の純関数。
+    use_weights: {eating: 4.0, retail: 2.0, office: 1.5, lodging: 2.0,
+                  public: 1.0, residential: 1.0, other: 0.5}
+    level_gain: 0.05            # 階数 1 につき荷重 +5%(規模の代理)
+    cold_temp_c: 20.0           # この気温を下回るほど暖房起因が増える(季節の共変量)
+    cold_gain: 0.5              # 最も寒い日の出火レート倍率の上乗せ
+    discover_radius_m: 40.0     # 第一発見者を探す半径(建物内に居る者が優先)
+    response_reference_min: 9.0 # ★実測アンカー(通報から現着まで 9 分)。payload に併記する
+    speed_m_per_min: 300.0      # response_min の換算(モデル値。実走行時間ではない)
+    on_scene_steps: 3           # 隊が現場に留まる長さ[step]
+    burn_steps:                 # 重度別の燃焼の長さ[step](実時間で同じ長さを保つ)
+      boya: 1
+      partial: 2
+      half: 3
+      total: 4
+    injury_severities: [half, total]   # 負傷者が出る重度(ぼやでは出ない)
+    max_per_day: 8              # 1 日に出す出火の上限(L1 の安全弁)
+  # ---- ② 交通(曝露の積。被害者は**実在の横断中エージェント**)----
+  traffic:
+    enabled: true
+    jurisdiction_per_day: 0.9   # ★アンカー(警察署管内 328 件/年)
+    jurisdiction_to_ward: 1.0   # ★管轄 → 区。既定 1.0(渋谷区は 3 署 = 上限側は 3.0)
+    pedestrian_share: 0.22      # 人身事故のうち**人対車両**の割合(残りは車対車=巻き込まれない)
+    # 曝露 1 単位(**横断中の歩行者 1 人 × その step に走った車 1 台**)あたりのハザード。
+    # ★正直な限界(実測して判ったこと): ambient の背景交通は 1 step で経路を走り切るので
+    #   「その step にその node に居た車」という量が世界に残っていない(step 末の cars は
+    #   常に空)。持っていない量を node へ按分すると捏造になるので、車流は街全体の
+    #   台数(traffic.last_n)を使い、場所の情報は歩行者側だけが持つ。
+    # ★既定値の出どころ(実測): 参照ラン(既定地図・60 体・144 step)の曝露の積の総和は
+    #   144,916/日。アンカー 0.9 × 0.22 × area_share(0.0476)= 0.0094 件/日 を割り戻すと
+    #   2.95e-7 → 丸めて 3.0e-7。**人数・地図が変われば合わなくなる暫定値**なので、
+    #   provenance が「実測件数/日 vs アンカー」を必ず並べて出す(city_ops と同じ流儀)。
+    hazard_per_exposure: 3.0e-7
+    # 人身事故の重度。★死亡は **H1(身体レイヤー)の管轄**なので既定重み 0(計画 §6-1)。
+    severity_weights: {light: 92.0, serious: 7.0, fatal: 0.0}
+    injury_severities: [light, serious, fatal]
+    call_radius_m: 40.0         # 通報者を探す半径(居なければ本人が自分で呼ぶ)
+    signalized_only: false      # true = 信号のある交差点だけを横断部とみなす
+    max_per_day: 8              # 1 日に出す事故の上限(L1 の安全弁)
+  # ---- ③ 群集(**生成しない = 状態が事件**。人工的な群集注入は禁忌)----
+  crowd:
+    enabled: true
+    # 密度の 3 閾値[人/m²]。4 = 歩行が困難になる水準(near-miss)/ 6 = 群集事故が
+    # 起こりうる水準 / 13 = 群集雪崩の水準(明石歩道橋の実測級)。
+    # ★物理ゾーン(physics.zones_enabled)が ON のランでしか測っていない = OFF では 0 件。
+    #   測っていない量を推定して埋めることはしない(捏造しない)。
+    levels: [4.0, 6.0, 13.0]
+    hysteresis: 0.85            # 閾値 × この係数を下回ったら「跨ぎ」を再武装(上をうろつく
+                                #   あいだ何度も出さない = 1 エピソード 1 件にするための係数)
+    guard_radius_m: 50.0        # 雑踏警備(警備員・警察官)の頭数を数える半径。**読むだけ**
+    max_per_day: 24             # 1 日に出す群集 incident の上限(L1 の安全弁)

@@ -155,6 +155,43 @@ _REL_CAP = 20       # 退避する関係台帳の上限(接触回数の多い上
 # 下層)ため、ここでは文字列で持ち、一致は tests/test_pool_rotation.py が機械固定する。
 _RUMOR_KEY = "_rumors"
 
+# 身体(病気・重症度)の退避対象。**`society.health._SLIM_FIELDS` と同一でなければならない**が、
+# 上の `_RUMOR_KEY` と同じ理由(world/ は下層なので society 直下の機構 module を import すると
+# 依存の向きが逆流する)で写しを持つ。一致は tests/test_health_severity.py が機械固定する。
+# 各要素 = (属性名, 型, 既定値)。**既定値と等しい欄はキーを作らない**(退避 dict のバイト列不変)。
+_HEALTH_FIELDS = (("sick", bool, False), ("sick_until", int, -1),
+                  ("severity", int, 0), ("sev_channel", str, ""),
+                  ("sev_until", int, -1), ("sev_outcome_step", int, -1),
+                  ("sev_fatal", bool, False), ("sev_presentee", bool, False),
+                  ("sev_cared", bool, False), ("sev_confirmed", int, -1),
+                  ("sev_frailty", float, 1.0), ("dead", bool, False))
+
+_HEALTH_PENDING = "sev_pending"
+
+
+def _health_slim(agent) -> dict:
+    """身体状態の退避辞書(健康な個体・健康 OFF のランでは **空 dict** = 現行と完全同一)。"""
+    out: dict = {}
+    for name, cast, default in _HEALTH_FIELDS:
+        got = getattr(agent, name, default)
+        got = str(got or "") if cast is str else cast(got)
+        if got != default:
+            out[name] = got
+    pending = getattr(agent, _HEALTH_PENDING, None)
+    if pending:
+        out[_HEALTH_PENDING] = dict(pending)       # プリミティブのみ(JSON 安全・実体非共有)
+    return out
+
+
+def _health_apply(agent, state: dict) -> None:
+    """退避辞書 → 再来街エージェント(**キー欠落を許容** = 旧 退避辞書からは何も生やさない)。"""
+    for name, cast, _default in _HEALTH_FIELDS:
+        if name in state:
+            setattr(agent, name, cast(state[name]))
+    pending = state.get(_HEALTH_PENDING)
+    if pending:
+        setattr(agent, _HEALTH_PENDING, dict(pending))
+
 # 実効値(conf: pool.relations_cap / pool.episodes_cap)。既定は上の素値=挙動不変。
 # ★なぜ引数ではなくモジュール状態か: dehydrate の呼び出し口は
 #   `_phase_pool_rotation`(engine/scheduler.py)の 1 行だけで、そこは sim も cfg も
@@ -225,6 +262,15 @@ def dehydrate(agent, *, ep_cap: int | None = None, rel_cap: int | None = None) -
         state["phys_body"] = {"blocked": float(body["blocked"]),
                               "contact": float(body["contact"]),
                               "local_density": float(body["local_density"])}
+    # --- レーン H1(2026-08-10): **監査で見つかったバグの同梱修正** -----------------------
+    # ★``sick`` / ``sick_until`` はこれまで退避辞書に 1 つも載っていなかった = 住民がプール
+    #   回転(退場 → 再来街)のたびに病気を忘れていた。重症度(severity 一式)と一緒に塞ぐ。
+    # ★同じ「属性が在って**既定値でない**ときだけキーを足す」設計なので、健康な個体・
+    #   健康 OFF のランでは退避 dict が現行と 1 バイトも変わらない
+    #   (tests/test_pool_rotation.py の dict 等値がそのまま守られる)。
+    health = _health_slim(agent)
+    if health:
+        state["health"] = health
     # ★**ゾーン所有(_phys_zone と _FIELDS の走行レコード)は意図的に運ばない**。あれは
     #   「いま歩いている経路 agent.route の途中」という**その旅に固有の**状態で、再来街時は
     #   build_pool_agent が別の node / route で個体を組み直すため、復元すると physics._run_zone が
@@ -263,3 +309,6 @@ def hydrate(agent, state: dict) -> None:
         agent._phys_body = {"blocked": float(body["blocked"]),
                             "contact": float(body["contact"]),
                             "local_density": float(body["local_density"])}
+    health = state.get("health")                  # H1: 病気/重症度を持ち越す(キー欠落は許容)
+    if health:
+        _health_apply(agent, health)

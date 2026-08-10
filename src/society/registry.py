@@ -558,6 +558,29 @@ FEATURES: tuple[Feature, ...] = (
        "(Heylighen: 減衰速度は情報が陳腐化する速度に合わせる。古い痕跡は無関係ではなく誤誘導)。"
        "**演算は集約と蒸発の 2 つだけで拡散は無い**(Parunak factor 0)。"
        "既定 OFF は trace_mark 0 件・state なし・プロンプト不変(L1 バイト一致)"),
+    # H3(身体と事件のレイヤー): 遺失物ループ = **完全内生の事件**
+    # (設計 src/society/lost_property.py / docs/plans/body-incident-layer-plan.md §3・§4)。
+    # strict の根拠: 新 stream は "lost_drop" 1 本だけ((agent, step) 個体別キー = 編成順非依存)で、
+    #   それ以外の分岐(気づく/拾う/届ける/着服/引き取る)は **乱数を 1 粒も引かない**
+    #   決定論(性格 traits・規範状態 states・金額・監視者の純関数 × sha256 ジッタ)。
+    #   既定 OFF では stream も引かない = 乱数消費不変。
+    # ★affects_k=False: generate() の呼び出しサイトを 1 つも足さず、プロンプトの**節**も
+    #   増やさない(増えるのは既存の記憶欄に並ぶ定型 1 行だけ = street_life と同じ帯域)。
+    # fingerprint_risk=possible: 記憶の定型 1 行が当事者のプロンプトに載り、所持金が動く
+    #   (= FixedLLM で ON≠OFF になりうる。career / crowd / chance と同型)。ただし文面は
+    #   (出来事, 品目) の純関数で、金額・件数・確率・実験条件・機構語は 1 文字も出ない。
+    _f("lost_property.enabled", "strict", False, "possible",
+       "計画書 §3 の「遺失物」= **完全内生の事件**(本命)。落とす(移動・飲酒・混雑の共変量つき"
+       "ハザード)→ 気づく(品目別の遅れ + 遺失届)→ 拾う(落下地点の共在 = sim.percept_index)"
+       "→ **届ける / 無視 / 着服**(すべて行為)→ 交番/駅事務室 → 返還 + 報労金 5-20%"
+       "(遺失物法 28 条・持ち主 → 拾得者の直接授受)/ 3 か月時効で拾得者取得(同 7 条)。"
+       "較正 = 都実測 拾得 454 万件/年を渋谷来街者スケールへ換算(≈2.9e-3 件/人日)。"
+       "検証ターゲット = **品目別返還率**(傘 ≈1% / 財布 60-80% / 携帯 87% = 東京都遺失物"
+       "センター実測)。★これが §4 の chance_event 溶解の第一歩 = **拾得金は必ず誰かの"
+       "drop から**出ることを構造で保証する(貨幣保存 = IF-E ゼロ和検査と整合)。"
+       "着服は crime を出さず payload の offense / guardians(RAT の監視者数)で宣言する"
+       "(diversity の較正済み窃盗系列と混線させないため)。"
+       "既定 OFF は lost_* 0 件・state なし・所持金不変・プロンプト不変(L1 バイト一致)"),
     # Wave 4 III-3: 街の顔 = 路上の生業と条例(設計 src/society/street_life.py)。
     # strict の根拠: **乱数 stream を 1 本も引かない**(持ち場は地図の純関数・受諾は id の
     #   剰余・パトロールは同ノード判定)。LLM の自由文を 1 バイトも読まない。
@@ -654,6 +677,124 @@ FEATURES: tuple[Feature, ...] = (
        "倒れる引き金を『既存の病気(health の sick)』に限るかの指定。既定 true = 健康機構が"
        "OFF(または onset_prob=0)のランでは救急の連鎖が 1 件も起きない(正直な依存関係)。"
        "false にすると既存の疲労ゲージ(fatigue>=collapse_fatigue)も引き金になる",
+       off_value=True),
+    # ---- 事件レイヤー H5(環境側 3 族。設計 src/society/incidents_env.py)---- #
+    # strict の根拠: 乱数は**新しい named stream 2 本だけ**("incident_fire" /
+    #   "incident_traffic")で、既存の draw 順に 1 本も挿さない。群集は乱数ゼロ
+    #   (物理層が測った密度の閾値跨ぎ = 完全決定論)。LLM の自由文を 1 バイトも読まない。
+    # affects_k=False: generate() の呼び出しサイトを 1 つも足さず・減らさず、プロンプトの
+    #   **節**も増やさない(出来事は既存の記憶欄に定型 1 行が入るだけ = street_life / city_ops
+    #   と同じ線引き)。位置経由の間接的な発火数の揺れは本レジストリの規約どおり False。
+    # fingerprint_risk=possible: 出来事の定型 1 行が当事者の記憶に載る(city_ops と同等級)。
+    _f("incidents_env.enabled", "strict", False, "possible",
+       "事件レイヤーの環境側 3 族を載せる: (1) 火災(建物ハザードの薄いレート → "
+       "**第一発見者 → 119 → 出場 → 鎮火** の完全アクター連鎖。誰も見つけなければ通報も"
+       "出場も起きない)(2) 交通(P(事故) ∝ 歩行者流 × 車流 = **曝露の積**だけが引き金で、"
+       "被害者は実在の横断中エージェント。加害車両は背景交通なので device_id=traffic:<mode>)"
+       "(3) 群集(**生成しない = 状態が事件**。SFM ゾーンの密度が 4/6/13 人/m² を跨ぐこと"
+       "自体を incident 化。人工的な群集注入は禁忌・雑踏警備は読み取りのみ)。"
+       "★較正は 3 段(管轄アンカー → 区への換算 → 地図 bbox からの規模比)で、**重度分布を"
+       "頻度と同時に較正する**(火災 ぼや175:全焼0 / 事故 軽傷92:重傷7:死亡0)= 災害映画化の防止。"
+       "★停電・漏水は**作らない**(東京 SAIDI 年 13 分 = 起きないが正解)。"
+       "既定 OFF は新 7 種の L1 0 件・state なし・stream 未使用・プロンプト不変(L1 バイト一致)"),
+    _f("incidents_env.fire.enabled", "strict", False, "none",
+       "火災だけを個別に切る子トグル(親 incidents_env.enabled 配下)。false では"
+       "fire_start / fire_report / fire_dispatch / fire_out が 0 件になる",
+       off_value=True),
+    _f("incidents_env.traffic.enabled", "strict", False, "none",
+       "交通事故だけを個別に切る子トグル(親配下)。false では traffic_accident が 0 件。"
+       "★ON でも world.traffic が OFF のランでは車が 1 台も走っていない = 曝露ゼロ = 0 件",
+       off_value=True),
+    _f("incidents_env.traffic.signalized_only", "strict", False, "none",
+       "横断部を『信号のある交差点だけ』に限るかの指定。既定 false = 車と歩行者が同じ"
+       "ノードに居ること自体を曝露とみなす(信号表を持たない地図でも成立させるため)"),
+    _f("incidents_env.crowd.enabled", "strict", False, "none",
+       "群集の状態 incident だけを個別に切る子トグル(親配下)。false では"
+       "crowd_density_incident が 0 件。★ON でも physics.zones_enabled が OFF のランでは"
+       "密度を**誰も測っていない**ので 0 件(測っていない量を推定して埋めない)",
+       off_value=True),
+    # ---- 設備 = 摩耗する装置(設計 src/society/facility_devices.py)---- #
+    # strict の根拠: 乱数は**新 stream 1 本だけ**("incident_facility")で、1 step に
+    #   最大 2 draw(発生数 + 台の選択)= 台数非依存。**装置自身は 1 本も引かない**
+    #   (devices.py の設計契約どおり。故障は世界からの外部入力として δ_ext へ渡す)。
+    # affects_k=False / fingerprint_risk=possible(閉じ込め・通報の定型 1 行が記憶に載る)。
+    _f("world.facilities.enabled", "strict", False, "possible",
+       "昇降設備(エレベーター/エスカレーター)を DEVS の装置として世界に置く: "
+       "wear clock(利用 δ_ext + 待機 δ_int)+ **月 1 回の保守で摩耗リセット** → 故障 → "
+       "**閉じ込め → インターホン通報(行為) → 対応者の出動(行為) → 復旧**。"
+       "較正アンカー = EV 閉じ込め **全国およそ 1 万件/年** ÷ 全国設置台数 ≒ 78 万台 = "
+       "3.5e-5 件/台/日(地図 v7 の該当 405 棟で 0.014 件/日 = 10 日ランの期待値 0.14 件 = "
+       "**何も起きない日が正しい**側の較正)。★停電・漏水は作らない(SAIDI 年 13 分)。"
+       "既定 OFF は装置名簿を組まず facility_* 0 件・state なし・L1 バイト一致"),
+    _f("world.facilities.elevator.enabled", "strict", False, "none",
+       "エレベーターだけを個別に切る子トグル(親 world.facilities.enabled 配下)",
+       off_value=True),
+    _f("world.facilities.elevator.traps", "strict", False, "none",
+       "エレベーターの故障で**閉じ込め**が起きるかの指定(既定 true = 現実どおり)。"
+       "false にすると停止するだけになる(閉じ込めの寄与を切る対照条件)", off_value=True),
+    _f("world.facilities.escalator.enabled", "strict", False, "none",
+       "エスカレーターだけを個別に切る子トグル(親配下)。★故障率は**推定**であって"
+       "アンカーではない(閉じ込めが構造上起きないので統計そのものが存在しない)",
+       off_value=True),
+    _f("world.facilities.escalator.traps", "strict", False, "none",
+       "エスカレーターの故障で閉じ込めが起きるかの指定。**既定 false = 構造上起きない**。"
+       "true にするのは現実に反するので、対照条件としてのみ意味を持つ"),
+    # H4: 対人事件の収束化(設計 src/society/incidents_interpersonal.py /
+    # docs/plans/body-incident-layer-plan.md §3 対人行 + §6-3 ユーザー決定
+    # 「H4はエージェントドリブンで設計」= レート抽選の残滓を残さない)。
+    # strict の根拠: 乱数は**新 named stream "incident_pair" 1 本だけ**で、それを引くのは
+    #   _pair_draw ただ 1 つ。その本体の先頭は「共在ペアが空なら return」= **共在が無ければ
+    #   乱数は 1 本も引かれない**(tests が AST で機械固定)。動機・標的適性・監視スコア・
+    #   通報意思はすべて既存 agent 状態と世界状態の純関数で、LLM の自由文を 1 バイトも読まない。
+    # ★affects_k=False: generate() の呼び出しサイトを 1 つも足さず・減らさず、プロンプトの
+    #   **節**も増やさない(出来事は既存の記憶欄に定型 1 行が入るだけ = street_life / city_ops と
+    #   同じ線引き = perception_contract の追随不要)。所持金・位置経由で発火数が間接的に動くのは
+    #   本レジストリの規約どおり False。★report.detain_steps を既定 0 にしてあるのは、勾留が
+    #   発火権を止める(= 呼数が動く)ため = 既定 ON セットでは 1 も動かさないという判断。
+    # fingerprint_risk=possible: 出来事の定型 1 行が当事者・目撃者の記憶に載る(路上の生業と
+    #   同等級)。文面は**出来事の種類だけの純関数**で、金額・件数・監視者数・config・
+    #   実験条件は 1 文字も出ない(数値は L1 payload 側にだけ載る)。
+    _f("incidents_interpersonal.enabled", "strict", False, "possible",
+       "対人事件(窃盗・喧嘩)を「1人1step のレート抽選」から **共在ペアの上の条件付き確率**へ"
+       "世代交代させる(Birks / Groff の RAT)。加害者候補(動機状態=金欠・滞納/立退き/破産・"
+       "酩酊・疲労。**すべて一時的で回復可能** = 新しい人格ラベルを作らない)× 標的"
+       "(携行現金・携帯・酩酊・孤立 = VIVA の観測可能な代理)× **監視者不在**"
+       "(同席者数 + 交番近接 + traces の摘発痕跡 + 同ノードの警察官。閾値以上なら"
+       "**抽選そのものを行わない**)が揃ったときだけ発火する。喧嘩は **酒 x 密度 x 閉店放出**の"
+       "関数で、閉店 +1 時間の実証弾性 **+16%**(closing_boost)が検証対象。"
+       "通報層 crime_report は**目撃者/被害者の行為**で、曖昧・軽微な状況にだけ人数減衰"
+       "(Darley & Latane)が掛かり危険事態では掛からない = 非緊急通報・誤通報が**内生で**出る"
+       "(実測 110 番の 16% が非緊急と突き合わせられる)。ON のとき society_diversity の窃盗は"
+       "供給を止める(併存ではなく置き換え=RAT の効き目が測れるようにする。**乱数の消費列は"
+       "1 バイトも変えない**)。既定 OFF は新 3 種の L1 0 件・crime も従来経路のまま・"
+       "state なし・プロンプト不変(L1 バイト一致)"),
+    _f("incidents_interpersonal.theft.supersede_diversity", "strict", False, "none",
+       "窃盗の世代交代だけを個別に切る子トグル(親 incidents_interpersonal.enabled 配下)。"
+       "false にすると RAT の窃盗と society_diversity のレート窃盗が**併存**する"
+       "(L1 の crime 件数が 2 機構の和になるので、比較実験のときだけ使うこと)",
+       off_value=True),
+    _f("incidents_interpersonal.theft.enabled", "strict", False, "none",
+       "窃盗(RAT の共在収束版)だけを個別に切る子トグル(親配下)。false では crime が 0 件"),
+    _f("incidents_interpersonal.brawl.enabled", "strict", False, "none",
+       "喧嘩(酒 x 密度 x 閉店放出)だけを個別に切る子トグル(親配下)。false では brawl が 0 件"),
+    _f("incidents_interpersonal.brawl.require_intox", "strict", False, "none",
+       "喧嘩の発火に『片方以上が酩酊していること』を課すかの指定(親配下)。既定 true = "
+       "酒の項が無ければ喧嘩は起きない。false にすると密度と閉店放出だけで起きる対照条件になる",
+       off_value=True),
+    _f("incidents_interpersonal.brawl.night_only", "strict", False, "none",
+       "喧嘩を『夜間店舗の窓 or 閉店放出の帯』に限るかの指定(親配下)。既定 true。"
+       "false にすると昼間の混雑でも喧嘩が起きる対照条件になる",
+       off_value=True),
+    _f("incidents_interpersonal.guardian.police_blocks", "strict", False, "none",
+       "同ノードの警察官を無条件の抑止にするかの指定(親配下)。既定 true = 既存 G3 執行の"
+       "『近傍の警察官が犯罪を抑止する』線引きをそのまま引き継ぐ",
+       off_value=True),
+    _f("incidents_interpersonal.report.enabled", "strict", False, "none",
+       "通報層(110 番 = crime_report → police_response)だけを個別に切る子トグル(親配下)。"
+       "false では事件だけが起きて誰も通報しない世界になる"),
+    _f("incidents_interpersonal.report.response", "strict", False, "none",
+       "通報への臨場(police_response)を出すかの指定(親 report.enabled 配下)。"
+       "false では通報だけが記録され、応答の有無は世界に現れない",
        off_value=True),
     # 第88バッチ 心モデル固定 + 三層知能配置(設計 §5)。
     # journal 等級の根拠: 個体ごとに**別のモデル**が自由文を書く。事後に再生するには
@@ -1168,6 +1309,60 @@ FEATURES: tuple[Feature, ...] = (
        "誤情報・訂正・炎上のダイナミクス(誤情報タグは専用 stream の抽選=内容非依存)"),
     _f("health.enabled", "strict", False, "possible",
        "健康(疲労・病気・欠勤・受診・引きこもり)"),
+    # 身体と事件のレイヤー H1(2026-08-10。正典 docs/plans/body-incident-layer-plan.md §1)。
+    # strict の根拠: 発症は 5 つの独立ハザード × frailty を **新 named stream "health_onset"**
+    #   から引くだけ(1 個体 1 日あたり固定長 12 本 = 分岐で消費順が動かない)。発火・進行・
+    #   回復・転帰・傍観者の通報者選定はすべて決定論の純関数で、LLM の自由文を 1 バイトも
+    #   読まない。frailty も (seed, agent.id) の安定ハッシュ = seed から再構成できる。
+    # affects_k=False: generate() の呼び出し点を 1 つも足さない。欠勤・在宅・倒れ・死で
+    #   co-location が変わり発火数が間接的に動きうるのは親トグル health と同型で、
+    #   レジストリ冒頭の方針どおり False 側(間接効果は compute_matched 対照で切り分ける)。
+    # fingerprint_risk=possible: プロンプトの**欄**は 1 つも増えないが、定型 1 行の記憶
+    #   (「暑さで気分が悪くなった」等)が ON のときだけ入り、当人にとって観測可能な世界の
+    #   事実(倒れた人が居る・同僚が居なくなった)が起きる = 親 health と同じ等級。
+    # ★死(mortality)はユーザー決定 §6-1 により**本トグル配下**に含める(別オプトインに
+    #   しない)。量は較正で担保する: OHCA 生存退院 ≒10% / 搬送の死亡 ≒1.3%。
+    _f("health.severity.enabled", "strict", False, "possible",
+       "重症度の状態機械(S0 健康→S1 軽症→S2 中等症→S3 重症→S4 心停止→{回復, 死亡})。"
+       "単一の真偽値 sick を置き換え、発症チャネル 5 種(急病/熱中症/急性アルコール/"
+       "外傷/心停止)を独立ハザード × frailty(年齢帯の通院者率由来)で引く。"
+       "sick-role(軽症の presenteeism・中等症の受診/停留)と、救急の引き金の世代交代"
+       "(city_ops の暫定ハッシュゲート → S3/S4 への遷移そのもの)・傍観者モデルの較正・"
+       "搬送先での重症度確定・死(境界 despawn と同型の永続退場)を含む。"
+       "既定 false では単一真偽値の現行動作と完全同値"),
+    # ---- 医療の受け皿 H2(設計 src/society/medical.py /
+    # docs/plans/body-incident-layer-plan.md §2)。H1(重症度)と city_ops(救急連鎖)の続き。
+    # strict の根拠: **乱数 stream を 1 本も引かない**(搬送先は地図の純関数・在院長は
+    #   確定重症度の純関数・金額は config の純関数)。LLM の自由文を 1 バイトも読まない。
+    # affects_k=False: generate() の呼び出しサイトを 1 つも足さず、プロンプトの**節**も
+    #   増やさない(出来事は既存の記憶欄に定型 1 行が入るだけ)。在院で物理位置が変わり
+    #   対面 co-location が動くのは本レジストリの規約どおり False(位置経由の間接効果)。
+    # fingerprint_risk=possible: 出来事の定型 1 行が当事者の記憶に載る(H1 と同等級)。
+    _f("medical.enabled", "strict", False, "possible",
+       "医療の受け皿(搬送・入院・医療費)。(1) 搬送先 = 地図の subcat=hospital(v8 は 7 件。"
+       "**subcat を持たない地図では 0 件 = 搬送が起きない**= 名前から病院を推測しない)"
+       "(2) 入院 = 確定重症度で在院長が決まる(軽症=数時間 / 中等症=数日 / 重症=長期。"
+       "物理は宿泊 lodging と同型の『非自宅建物で N 泊』)(3) 金の三本足 = 救急搬送の公費"
+       "(区の歳出 → RoW ems_operation。運行主体の都は街の外)/ 患者 3 割(既存 spend "
+       "cat=medical。**受け手を受診先ノードで解決する是正**を含む)/ 保険 7 割"
+       "(RoW チャネル insurance_reimbursement)。★治療は転帰を変えない(死は H1 が発症時に"
+       "決める設計判断を再開封しない)。既定 OFF は新 4 種の L1 0 件・state なし・"
+       "agent に属性が生えず・プロンプト不変(L1 バイト一致)"),
+    _f("medical.transport.enabled", "strict", False, "none",
+       "救急搬送(現場 → 病院)だけを個別に切る子トグル(親 medical.enabled 配下)。"
+       "false では ems_transport / hospital_admit が 0 件になる(倒れた個体はその場に留まる)"),
+    _f("medical.transport.hold_crew", "strict", False, "none",
+       "搬送のあいだ救急隊を現場復帰させないかの指定(親配下)。既定 true = 搬送中の隊は"
+       "次の通報に応えられない(救急車ひっ迫が観測できる)。false では現着時間だけで戻る",
+       off_value=True),
+    _f("medical.clinic.enabled", "strict", False, "none",
+       "自力受診(中等症)の受診先解決だけを個別に切る子トグル(親配下)。false では"
+       "医療費の受け手が従来どおり支払者の居場所から解決される(= 多くが RoW へ漏れる)"),
+    _f("medical.admit.enabled", "strict", False, "none",
+       "入院だけを個別に切る子トグル(親配下)。false では搬送されても在院せずその場で目覚める"),
+    _f("medical.money.enabled", "strict", False, "none",
+       "金の三本足(公費・自己負担・保険給付)だけを個別に切る子トグル(親配下)。"
+       "false では搬送・入院という**物理と状態**だけが起き、会計は 1 円も動かない"),
     _f("household.enabled", "strict", False, "possible",
        "世帯・家族・恋愛のマスター"),
     _f("household.realistic", "strict", False, "none",
