@@ -13,6 +13,7 @@ data/poi_patch_shibuya.json から読み、各 POI をローカル m 座標の**
 - 地図 bbox(ノードの座標範囲+margin)外の POI はスキップして警告(端のノードへ引き寄せると
   位置が嘘になるため)。bbox 外項目は広域地図(wide)採用時に入れる。
 - id は "p_patch_NN"(連番・決定論)。既存 POI と同名がある場合はスキップ(二重追加防止)。
+- 項目が "subcat" を持つときだけ、地図 v8 の第2階層としてそのまま載せる(無ければキー無し)。
 - meta.description に補完の来歴を追記(監査可能性)。
 """
 from __future__ import annotations
@@ -70,9 +71,14 @@ def main() -> None:
         node = nearest_node(nodes, x, y)
         dist = ((node["x"] - x) ** 2 + (node["y"] - y) ** 2) ** 0.5
         poi = {"id": f"p_patch_{seq:02d}", "name": name,
-               "cat": str(entry["cat"]),
-               "x": round(float(node["x"]), 1), "y": round(float(node["y"]), 1),
-               "node": node["id"]}
+               "cat": str(entry["cat"])}
+        # v8: 地図側の第2階層(subcat)をパッチからも通す。**キーがある項目だけ**なので、
+        #     subcat を書いていない従来の patch JSON では出力が 1 バイトも変わらない。
+        if entry.get("subcat"):
+            poi["subcat"] = str(entry["subcat"])
+        poi.update({"x": round(float(node["x"]), 1),
+                    "y": round(float(node["y"]), 1),
+                    "node": node["id"]})
         seq += 1
         city["pois"].append(poi)
         existing.add(name)

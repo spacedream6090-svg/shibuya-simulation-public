@@ -292,6 +292,29 @@ model:
 
 world:
   map: data/shibuya_osm.json    # ★OSM 実道路網(渋谷駅中心 約1.0×0.7km)。旧: data/shibuya_core.json
+  # ---- 地図の版(既定はここ=コア。本番/日次は conf/production.yaml・daily.yaml が wide を指す)----
+  #   data/shibuya_osm_wide_v7.json … 本番の現行既定(2.0×2.0km・attic 2025-04-01)。**据え置き**。
+  #   data/shibuya_osm_wide_v8.json … v7 と**同一スナップショット(attic 2025-04-01)を再取得**して
+  #     組み直した版(第101 Wave4 III-2)。道路グラフ・建物・線路・ゲートウェイは v7 と
+  #     **完全同値(バイト一致)**で、差分は POI だけ(1,975 → 2,337 = +362):
+  #       (a) v7 が取りこぼしていた業態を追加(神社仏閣 29・ラブホ 63・病院 7・銭湯/サウナ 4・
+  #           ゲーセン 4・パチンコ 8 …)= v7 の POI の cat は 1 件も変わらない
+  #           (build_map.poi_category は v7 判定を先に通し、None のときだけ救済する構造)
+  #       (b) 重複排除キーの是正((name,cat) → (name,cat,node))= チェーン店の全店が載る。
+  #           v7 は同名を 1 件へ潰しており **コンビニが 93 → 9 件**(9 割消失)だった
+  #       (c) POI に subcat(第2階層 11 語)を付与 → world.night_economy.hours の
+  #           convenience/net_cafe/sauna/karaoke/club が**表を 1 バイトも書き換えずに**当たる
+  #           (v7 では 1 件も当たらない no-op だった。tests/test_map_v8.py が固定)
+  #       ※建物の差分は POI 由来の用途格上げ 2 棟の kind のみ(generic→office/public。形は同一)
+  #     ★opt-in: 既定は v7 のまま(ゴールデン L1 バイト一致を守る)。使うときは
+  #       world.map=data/shibuya_osm_wide_v8.json を上書きする。組織台帳(data/organizations_*)
+  #       は v7 の POI id を参照しているので、v8 本採用時は build_orgs.py を --map v8 で再生成する
+  #       のが清潔(未再生成でも node/建物 id は同値なので解決は node 経由へ後退するだけ)。
+  #     生成: python scripts/build_map.py --bbox 35.6505 139.6905 35.6685 139.7115 \
+  #             --osm-date 2025-04-01 --out data/shibuya_osm_wide_v8_prepatch.json
+  #           python scripts/patch_map.py --base data/shibuya_osm_wide_v8_prepatch.json \
+  #             --patch data/poi_patch_shibuya.json --out data/shibuya_osm_wide_v8.json
+  #     出典: © OpenStreetMap contributors(ODbL 1.0)。data/ は公開ミラー除外。
   scenario: baseline            # baseline(既定=no-op)| shock_closure | shock_event(#8 摂動カタログ)
   # scenario_params: 選んだ scenario の引数(baseline では未使用)。座標は地図ローカル m(原点=スクランブル交差点)。
   #   shock_closure(区間封鎖): at_step から duration_steps の間、center 半径 radius_m 内の道路を封鎖し
@@ -513,11 +536,11 @@ world:
     #   1 バイトも書き換えずにそのまま効きはじめる(前方互換)。今すぐ効くのは cat に当たる
     #   nightlife だけ。POI 名の一般名詞マッチは誤判定が多すぎるので既定では使わない(下記)。
     hours:
-      convenience: [0, 0]       # コンビニ = 24 時間営業  ※v8 待ち
-      net_cafe: [0, 0]          # ネットカフェ・複合カフェ = 24 時間(終電後の受け皿) ※v8 待ち
-      sauna: [0, 0]             # サウナ・カプセル = 24 時間 ※v8 待ち
-      karaoke: [11, 5]          # カラオケ 11:00〜翌 05:00 ※v8 待ち
-      club: [22, 5]             # クラブ 22:00〜翌 05:00 ※v8 待ち
+      convenience: [0, 0]       # コンビニ = 24 時間営業  ※subcat は v8 地図で供給(93 店)・v7 は no-op
+      net_cafe: [0, 0]          # ネットカフェ = 24 時間(終電後の受け皿) ※v8 で供給(パッチ 1 店)
+      sauna: [0, 0]             # サウナ・カプセル = 24 時間 ※v8 で供給(4 店)
+      karaoke: [11, 5]          # カラオケ 11:00〜翌 05:00 ※v8 で供給(17 店)
+      club: [22, 5]             # クラブ 22:00〜翌 05:00 ※v8 で供給(17 店)
       nightlife: [18, 5]        # 夜遊び(v7 でも当たる。commerce の既定と同値=明示のみ)
     # サブカテゴリ判定の名称キーワード(subcat → キーワード列)。**既定は空 = 1 件も分類しない**。
     # ★ETHICS §2: 実在企業名(ブランド名)はソース/config に書かない。v7 の POI 名で一般名詞
@@ -3549,3 +3572,79 @@ street_life:
   outreach_shelter_after: 3     # 何回の相談で住居へ移行するか(0=移行なし)
   # ---- L1 安全弁 ----
   max_events_per_step: 32       # 1 step に出す本機構の L1 件数の上限(超過分は捨てる)
+
+# ---- 都市運営 = 見えない労働力(Wave 4 III-4。実装 src/society/city_ops.py・既定 OFF)----
+# 街を成り立たせているのに世界に 1 人も居なかった層を載せる: 交番の警察官・ごみ収集・
+# 納品の運転手・ビルの夜間清掃・救急。**すべて tier0**(LLM 追加呼ゼロ・乱数 stream ゼロ・
+# 判定は id / step / sim_min / 地図 / 暦 / 既存状態 の純関数)。
+# ★救急は**時刻表ではなく行為の連鎖**である(ユーザー指定の設計原則「世界の出来事は
+#   すべて誰かの行為に対応する」): 既存の健康機構が成立させた状態から個体が倒れ(collapse)、
+#   **近くに居合わせた誰かが通報し**(ems_call)、当直の救急隊がその通報に応える(ems_dispatch)。
+#   したがって health.enabled=false / onset_prob=0 のランでは救急の連鎖は 1 件も起きない
+#   (正直な依存関係。ems.require_sick=false にすれば既存の疲労ゲージが代替の引き金になる)。
+# ★自販機の補充は**作っていない**: 地図に自販機 POI が 1 件も無いため(無い行き先へ
+#   行かせない)。★v8 を実査した上での判断である: v8 は subcat を通している
+#   (convenience 93 / love_hotel 63 / karaoke 17 / club 17 / sauna 4 / net_cafe 1 /
+#   hospital 7 …)のに自販機は 0 件だった(地図生成器が amenity=vending_machine を
+#   拾っていない)。地図側で通すのが先で、そのとき役割を足せば成立する。
+#   ★同じ実査の副産物: v8 の hospital subcat 7 件は、搬送先を持つ救急(重症度→搬送→入院)を
+#   後続で設計するときの受け皿になる。
+city_ops:
+  enabled: false                # ★false=完全 no-op(バイト一致)。true で見えない労働力が動く
+  max_events_per_step: 24       # 1 step に出す本機構の L1 件数の上限(超過分は捨てる)
+  # ---- ① 交番配置(名簿の警察官 140 人は今までどこにも束ねられていなかった)----
+  police:
+    enabled: true
+    occupations: ["警察官"]
+    poi_cats: ["service", "police"]   # v7/v8 は amenity=police→service。police は前方互換(現状 0 件)
+    name_keywords: ["交番", "警察署"]   # 一般名詞のみ(ブランド名・地名は書かない)
+    first_open: 0               # 最初の直の始まり[分 of day]
+    shift_hours: 8
+    n_shifts: 3                 # 24 時間を 3 直で回す(交番の実態)
+    patrol_every: 4             # 名簿順で n 人に 1 人は持ち場を持たない「巡回ユニット」
+  # ---- ② ごみ収集(可燃 2 回/週の地区別曜日表・繁華街の期限 07:30・事業系は深夜)----
+  waste:
+    enabled: true
+    occupations: ["清掃作業員"]
+    grid_cols: 3                # 地区 = 地図 bbox の格子分割(区の実際の収集区割りは持たない)
+    grid_rows: 2
+    stops_per_round: 6          # 1 巡回で回るノード数
+    ward_start_min: 300         # 05:00
+    ward_deadline_min: 450      # 07:30(繁華街の収集期限)
+    commercial_enabled: true
+    commercial_start_min: 120   # 02:00(事業系=民間業者の深夜収集)
+    commercial_end_min: 300     # 05:00
+    commercial_every: 2         # 名簿順で n 人に 1 人が深夜班
+    commercial_cats: ["nightlife", "food"]
+    require_night: true         # ★false にしない限り、夜間開放 OFF では深夜班を束ねない
+  # ---- ③ 納品の運転手化(物流①の delivery_trip に運転席の人を与える)----
+  driver:
+    enabled: true
+    occupations: ["納品ドライバー"]
+    start_min: 240              # 04:00(荷捌き場への集中帯)
+    end_min: 660                # 11:00
+    stops_per_round: 8
+    stop_cats: ["shop", "food", "cafe", "nightlife"]
+  # ---- ④ ビル夜間清掃(この街最大のサービス業)----
+  night_cleaning:
+    enabled: true
+    occupations: ["夜間清掃員", "夜間清掃"]   # L5 新役割 + 台帳(build_orgs)の夜勤ロール名
+    start_min: 1320             # 22:00
+    end_min: 300                # 05:00(日跨ぎ。夜間開放 OFF では 24:00 へ畳む)
+    max_per_night: 16           # 1 晩に出す night_cleaning の上限(1 人 1 棟の割当)
+  # ---- ⑤ 救急(通報から始まる行為の連鎖。時刻表では撃たない)----
+  ems:
+    enabled: true
+    crew_occupations: ["救急隊員", "消防士"]
+    first_open: 0
+    shift_hours: 8
+    n_shifts: 3
+    collapse_per_10k: 400       # 既存の病人のうち 1 日に 1 万人あたり何人が倒れるか(決定論)
+    require_sick: true          # false = 既存の疲労ゲージも引き金にする(健康 OFF でも動く)
+    collapse_fatigue: 0.95      # require_sick=false のときの疲労側の閾値
+    call_radius_m: 40.0         # 通報者を探す半径[m](居なければ本人が自分で呼ぶ)
+    treatment_steps: 3          # 倒れた個体がその場に留まる長さ[step]
+    on_scene_steps: 3           # 救急隊が現場に留まる長さ[step]
+    speed_m_per_min: 300.0      # response_min の換算(モデル値。実走行時間ではない)
+    max_calls_per_day: 8        # 1 日に出す連鎖の上限(L1 の安全弁)
+    ward_calls_per_day: 65.0    # ★参照値のみ(区の実測 65 件/日 ≒ 22 分に 1 件)。判定に使わない

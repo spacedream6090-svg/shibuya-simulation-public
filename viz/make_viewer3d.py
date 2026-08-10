@@ -1,6 +1,18 @@
 """Web3D ビューア生成(バッチE / 3D 可視化)。
 
 使い方:  python viz/make_viewer3d.py runs/<name> [--no-traffic] [--tracks-binary]
+                                     [--lateral-offset] [--street-only|--no-street-only]
+
+  --lateral-offset : 街路上の人を中心線から横へ散らす(I-1 λ)。λ=hash(agent_id, edge) の
+    純関数で、道路クラス既定の帯を建物フットプリントで clamp した幅へ写す。中心線に
+    刺さったビーズ列に見える問題への手当て。**表示専用**でシミュには一切触れない。
+  --street-only / --no-street-only : 現実に街頭で目に入るものだけを描く。建物内の人は
+    非表示、建物をクリックするとその建物「だけ」屋内が見える(既存の X 線トグルへ相乗り)。
+    電車の中の人は元から非表示(w=-3 電車で圏外 / w=-1 範囲外)。
+    **既定は屋内データ(indoor overlay)を持つラン=ON**(ユーザー決定「屋内・車内の人は
+    既定で描かない」)。屋内データを持たない旧ランは OFF のままなので生成 HTML は従来と
+    バイト同一。フラグは両方向の明示上書き。
+  --lateral-offset は既定 OFF=フラグ無しでは λ の JS は 1 バイトも入らない。
 生成物:  runs/<name>/viewer3d.html
   自己完結の単一 HTML。three.js(r128, MIT)本体・OrbitControls・シーンデータを埋め込み。
   ブラウザで開けば即グリグリ(OrbitControls)+ 再生 + 昼夜 + クリックで人物情報。
@@ -53,6 +65,26 @@ def _load_tracks_bin():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+_LAT_CORE = None
+
+
+def _lateral_core_js() -> str:
+    """λ 横オフセットの中核 JS を viz/make_viewer.py から借りる(_load_export3d と同じ流儀)。
+
+    2D と 3D で **同一の文字列**を使うのが要点。λ は (agent_id, edge) の純関数なので、
+    同じ地図・同じ人なら 2D と 3D で必ず同じ側・同じ量へずれる(2 実装に割ると必ずズレる)。
+    重い依存(pyarrow/yaml)を持つモジュールなので **必要になった時だけ**読む。
+    """
+    global _LAT_CORE
+    if _LAT_CORE is None:
+        spec = importlib.util.spec_from_file_location(
+            "make_viewer_for_lat", REPO_ROOT / "viz" / "make_viewer.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _LAT_CORE = mod._LATERAL_CORE_JS
+    return _LAT_CORE
 
 
 def _load_notable():
@@ -167,7 +199,9 @@ def build_html(run_name: str, scene_json: str, tracks_json: str,
                chunk_dir: str = "tracks_bin",
                has_ubld4: bool = False,
                plateau_tex_src: str | None = None,
-               tex_note: bool = False) -> str:
+               tex_note: bool = False,
+               lateral: bool = False,
+               street_only: bool | None = None) -> str:
     three_js, orbit_js, lic = _read_vendor()
     html = _TEMPLATE
     html = html.replace("__RUN_NAME__", run_name)
@@ -195,6 +229,14 @@ def build_html(run_name: str, scene_json: str, tracks_json: str,
         html = _inject_notable(html, notable_json)
     if indoor_json is not None:         # indoor overlay(フロア板+接近フェード+実座標エージェント)
         html = _inject_indoor(html, indoor_json)
+    # I-1 街路可視性の既定(ユーザー決定「屋内・車内の人は既定で描かない」):
+    #   street_only=None(既定) → **屋内データを持つ新ランでは ON**、持たない旧ランでは OFF。
+    # 旧ランは注入経路にそもそも入らないので従来とバイト同一が保たれる(indoor 注入と同じ
+    # 「データが在る時だけ形が変わる」ゲート)。True/False を明示すれば両方向に上書きできる。
+    if street_only is None:
+        street_only = indoor_json is not None
+    if lateral or street_only:          # I-1: λ 横オフセット / 街路可視性
+        html = _inject_street(html, lateral, street_only)
     if tracks_binary:                   # 軌跡バイナリ(P0): JSON 埋め込み → チャンク遅延ロード
         html = _inject_tracks_binary(html, chunk_dir)
     return html
@@ -1219,6 +1261,127 @@ _INDOOR_MAIN = r"""// ========== 屋内オーバレイ本体: floorLayout3d(n_ov
 """
 
 
+# ============================================================ 街路可視性 + λ(I-1)
+def _inject_street(html: str, lateral: bool, street_only: bool) -> str:
+    """街路可視性(3D)と λ 横オフセットを後付け注入する。
+
+    どちらも **明示フラグを立てた時だけ**呼ばれる(既定 OFF)=呼ばれなければ HTML は
+    従来とバイト同一。注入点は placeAgents のループ頭 1 箇所だけで、`_inject_indoor` が
+    使う `_p.set(...)` 行とは別のアンカーなので、屋内注入の有無に依らず共存できる。
+
+    可視性の考え方(ユーザー決定): 3D は「現実に街頭で目に入るもの」だけを描く。
+      * 建物の中の人は既定で描かない → 建物を選ぶとその建物の中だけが見える
+        (X 線=既存の建物半透明トグルへそのまま相乗り)。
+      * 電車の中の人は既に描かれない(export_3d --rich-tracks の w=-3=電車で圏外。
+        rich-tracks 無しでも退出時は w=-1=範囲外)。placeAgents が元から隠している。
+    シミュレーションは常に全員を回している。ここで変えるのはカメラに映すものだけ。
+    """
+    if not (lateral or street_only):
+        return html
+    anchor = "    const [x,y,w] = pos[i];"
+    body = "    let [x,y,w] = pos[i];\n"
+    if street_only:
+        body += ("    if(w>=1000 && typeof window.__streetHidden==='function'"
+                 " && window.__streetHidden(w)){\n"
+                 "      _m.compose(_p.set(0,-9999,0), _q, _hide);"
+                 " agents.setMatrixAt(i,_m); continue; }\n")
+    if lateral:
+        body += ("    if(w===0 && typeof window.__latXY==='function'){\n"
+                 "      const _lo=window.__latXY(TRACKS.ids[i], x, y);"
+                 " if(_lo){ x=_lo[0]; y=_lo[1]; } }\n")
+    html = _replace_once(html, anchor, body.rstrip("\n"), "street-place")
+    js = ""
+    if lateral:
+        js += _LATERAL_3D_ADAPTER + _lateral_core_js()
+    if street_only:
+        js += _STREET_ONLY_JS
+        toggle = ('      <label class="chk"><input type="checkbox" id="lyStreetOnly" checked>'
+                  ' 街頭の視界だけ(建物内は選択時のみ)</label>')
+        anchor_toggle = ('      <label class="chk"><input type="checkbox" id="lyDayNight" checked>'
+                         ' 昼夜ライティング</label>')
+        html = _replace_once(html, anchor_toggle, anchor_toggle + "\n" + toggle,
+                             "street-toggle")
+        anchor_data = '<script type="application/json" id="scene-data">'
+        html = _replace_once(html, anchor_data,
+                             _STREET_FOCUS_BAR + "\n" + anchor_data, "street-focusbar")
+    html = _replace_once(html, "// ---------- ループ", js + "// ---------- ループ",
+                         "street-main")
+    return html
+
+
+# λ の中核 JS(make_viewer と共有)へ渡すアダプタ。SCENE.roads の klass が唯一の
+# 道路クラス情報(export_3d が city.edges[].klass をそのまま持ち出したもの)。
+_LATERAL_3D_ADAPTER = r"""
+window.__latAdapter = { edges:(SCENE.roads||[]), blds:(SCENE.buildings||[]),
+  ek:r=>r.klass, eg:r=>r.g, bfp:b=>b.footprint };
+"""
+
+_STREET_ONLY_JS = r"""// ========== 街路可視性: 現実に街頭で見えるものだけ描く(表示専用/シミュ非干渉) ==========
+// 屋内(w>=1000)は既定で非表示。建物をクリックするとその建物「だけ」中身が見える。
+// 電車内・範囲外・睡眠は placeAgents が元から隠している(w=-1/-2/-3)。
+(function(){
+  let focusBi = -1;
+  function _on(){ const el=document.getElementById('lyStreetOnly'); return el? el.checked : true; }
+  window.__streetHidden = function(w){
+    if(!_on()) return false;                    // OFF=従来どおり全部描く
+    if(w < 1000) return false;                  // 路上は常に見える
+    return Math.floor((w-1000)/100) !== focusBi;  // 注目中の 1 棟だけ中を見せる
+  };
+  window.__streetFocus = function(bi){
+    focusBi = (bi===null || bi===undefined)? -1 : (bi|0);
+    const el=document.getElementById('streetFocus');
+    if(el){ const b=(focusBi>=0)? SCENE.buildings[focusBi] : null;
+      el.textContent = b? ('🏢 ' + (b.name || b.kind || ('建物#'+focusBi)) + ' の屋内を表示中(クリックで解除)') : '';
+      el.style.display = b? 'block' : 'none'; }
+    if(focusBi>=0){                              // 既存の X 線トグルへ相乗り(外殻を透かす)
+      const xr=document.getElementById('xray');
+      if(xr && !xr.checked){ xr.checked=true; xr.dispatchEvent(new Event('change')); } }
+    if(typeof placeAgents==='function') placeAgents(t);
+  };
+  window.__streetFocusBi = function(){ return focusBi; };
+  // ---- 建物の当たり判定: クリック点(地面)を含むフットプリントを線形走査で探す
+  function _inFP(fp, px, py){ let c=false;
+    for(let i=0,j=fp.length-1;i<fp.length;j=i++){
+      const xi=fp[i][0], yi=fp[i][1], xj=fp[j][0], yj=fp[j][1];
+      if(((yi>py)!==(yj>py)) && (px < (xj-xi)*(py-yi)/((yj-yi)||1e-9) + xi)) c=!c; }
+    return c; }
+  function _bldAt(px, py){
+    for(let bi=0; bi<SCENE.buildings.length; bi++){
+      const fp=SCENE.buildings[bi].footprint;
+      if(fp && fp.length>2 && _inFP(fp, px, py)) return bi; }
+    return -1; }
+  const _plane = new THREE.Plane(new THREE.Vector3(0,1,0), 0), _hitP = new THREE.Vector3();
+  let _dXY = null;
+  renderer.domElement.addEventListener('pointerdown', e=>{ _dXY=[e.clientX,e.clientY]; });
+  renderer.domElement.addEventListener('pointerup', e=>{
+    if(!_on() || !_dXY) return;
+    if(Math.hypot(e.clientX-_dXY[0], e.clientY-_dXY[1]) > 5) return;   // ドラッグは無視
+    mouse.x = (e.clientX/window.innerWidth)*2 - 1;
+    mouse.y = -(e.clientY/window.innerHeight)*2 + 1;
+    raycaster.setFromCamera(mouse, camera);
+    if(raycaster.intersectObject(agents).length) return;   // 人のクリックは既存パネルに譲る
+    let px=null, py=null;
+    const hit = raycaster.intersectObjects(scene.children, true);
+    if(hit.length){ px=hit[0].point.x; py=-hit[0].point.z; }
+    else if(raycaster.ray.intersectPlane(_plane, _hitP)){ px=_hitP.x; py=-_hitP.z; }
+    if(px===null) return;
+    const bi=_bldAt(px, py);
+    window.__streetFocus(bi>=0? bi : -1);
+  });
+  const _so=document.getElementById('lyStreetOnly');
+  if(_so) _so.addEventListener('change', ()=>{ if(!_so.checked) window.__streetFocus(-1);
+    else if(typeof placeAgents==='function') placeAgents(t); });
+})();
+
+"""
+
+_STREET_FOCUS_BAR = (
+    '<div id="streetFocus" style="position:fixed;left:50%;bottom:64px;'
+    'transform:translateX(-50%);z-index:55;padding:6px 14px;border-radius:8px;'
+    'background:rgba(12,16,22,.84);color:#dfe7f2;font:12px/1.6 system-ui,sans-serif;'
+    'display:none"></div>')
+
+
 # ============================================================ 軌跡バイナリ(P0)
 _TRACKS_BIN_LOADING = (
     '<div id="binload" style="position:fixed;left:50%;top:50%;'
@@ -1403,6 +1566,16 @@ def main(argv: list) -> int:
         return 1
     run_dir = Path(args[0]).resolve()
     tracks_binary = "--tracks-binary" in flags
+    # I-1: λ は既定 OFF(立てなければ HTML は従来とバイト同一)。
+    lateral = "--lateral-offset" in flags
+    # 街路可視性は **屋内データを持つ新ランでは既定 ON**(build_html が None を解決する)。
+    # 明示フラグは両方向の上書き: --street-only=強制 ON / --no-street-only=強制 OFF。
+    if "--street-only" in flags:
+        street_only = True
+    elif "--no-street-only" in flags:
+        street_only = False
+    else:
+        street_only = None                 # auto(屋内データの有無で決める)
     scene_json, tracks_json, plateau_json, terrain_json = _ensure_scene(run_dir, tracks_binary)
     if "--no-traffic" in flags:
         tracks_json = (_mark_no_traffic(tracks_json) if tracks_binary
@@ -1443,16 +1616,23 @@ def main(argv: list) -> int:
     notable_json = _ensure_notable(run_dir, tracks_json)
     # 屋内オーバレイ(space_move / indoor_tracks サイドカー有=新ランのみ。無ければ None=バイト同一)
     indoor_json = _ensure_indoor(run_dir, tracks_json)
+    # 告知用に auto を解決する(build_html 側と同じ規則。判定の正典は build_html)。
+    street_eff = (indoor_json is not None) if street_only is None else street_only
     html = build_html(run_dir.name, scene_json, tracks_json,
                       plateau_json=plateau_json, terrain_json=terrain_json,
                       has_extras=has_extras, mode_legend=mode_legend,
                       notable_json=notable_json, indoor_json=indoor_json,
                       tracks_binary=tracks_binary, has_ubld4=has_ubld4,
-                      tex_note=has_tex)
+                      tex_note=has_tex, lateral=lateral, street_only=street_only)
     out = run_dir / "viewer3d.html"
     out.write_text(html, encoding="utf-8")
     mb = out.stat().st_size / 1024 / 1024
     print(f"  {out}  ({mb:.2f} MB)")
+    if lateral or street_eff:
+        auto = "" if street_only is not None else "(既定=屋内データ有り)"
+        print(f"  I-1: λ横オフセット={'ON' if lateral else 'OFF'} "
+              f"街頭の視界だけ={'ON' if street_eff else 'OFF'}{auto}"
+              f"{'(建物クリックで屋内を開示)' if street_eff else ''}")
     if tracks_binary:
         n_chunks, chunk_bytes = _write_tracks_chunks(run_dir)
         bin_mb = (run_dir / "scene3d" / "tracks.bin").stat().st_size / 1024 / 1024
@@ -1476,7 +1656,8 @@ def main(argv: list) -> int:
                           has_extras=has_extras, mode_legend=mode_legend,
                           notable_json=notable_json, indoor_json=indoor_json,
                           tracks_binary=lite_binary, has_ubld4=has_ubld4,
-                          plateau_tex_src=("plateau_tex.js" if has_tex else None))
+                          plateau_tex_src=("plateau_tex.js" if has_tex else None),
+                          lateral=lateral, street_only=street_only)
         lite_p = run_dir / "viewer3d_lite.html"
         lite_p.write_text(lite, encoding="utf-8")
         print(f"  {lite_p}  ({lite_p.stat().st_size/1024/1024:.2f} MB)"

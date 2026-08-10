@@ -991,8 +991,14 @@ def test_persona_pool_generator_declares_conductors():
     assert role == occ == "車掌"
     assert n == 40 and posts and visitor is True
     assert duty["rotates"] is True and duty["shift_hours"] == 8
-    # ★末尾に足してある(途中に挿すと既存 L5 の id が全部ずれる)
-    assert B._L5_ROLES[-1][1] == "車掌"
+    # ★**追記**であって挿入ではない(途中に挿すと既存 L5 の id が全部ずれる)。
+    #   ★「最後の要素であること」では固定しない: 以後の波も同じ規約で**さらに末尾へ**
+    #     足すので、それを禁じてしまうと規約と矛盾する。固定すべきは
+    #     「車掌が、車掌より前に居た全役割よりも後ろに居る」= 挿入されていないこと。
+    names = [r[1] for r in B._L5_ROLES]
+    earlier = ["駅員", "電車運転士", "バス運転士", "タクシー運転手", "警察官", "配信者"]
+    assert names.index("車掌") > max(names.index(x) for x in earlier), \
+        "車掌が既存役割の途中に挿入された(既存 L5 の id がずれる)"
     # 乗務員 2 職の両方が名簿に実在し、運転士 ≥ 車掌(ワンマン系統の分)
     assert roles["電車運転士"][2] >= n
     # conf 側の既定と綴りが一致している(綴り違いで永久に 0 人になるのを防ぐ)

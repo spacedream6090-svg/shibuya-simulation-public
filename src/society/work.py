@@ -33,6 +33,10 @@ DEFAULT_SERVE_BY_CAT = {
     "cafe": "飲食の接客",
     "nightlife": "接客・サービス",
     "shop": "販売・レジ対応",
+    # 第106: services.py の受給 _spend は cat="service" で出る(services.py:30 が
+    # 「work.serve_by_cat と対の seam」と明記)。センサス較正台帳は service 職場 1,972 社を
+    # 持つため、この行が無いと構造的に無人接客になる。work.service 既定 OFF=golden 不変。
+    "service": "窓口・施術の接客",
 }
 
 # ダイジェストで「業務が多かった」と言い換える件数の閾値(客観記述の粒度)。

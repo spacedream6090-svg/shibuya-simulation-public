@@ -271,16 +271,33 @@ def test_subcat_is_never_guessed_by_default():
 
 
 def test_v7_map_has_no_subcat_so_overrides_are_documented_noop():
-    """★正直な限界の機械化: 現行地図(v7 / 既定地図)の POI は subcat を 1 件も持たない。
+    """★正直な限界の機械化 → **v8 到来(Wave4 III-2)でこの境界が動いた**ことの固定。
 
-    したがって既定の convenience / net_cafe / sauna / karaoke / club のエントリは
-    **今は 1 件も当たらない**(地図 v8 待ち)。この事実が変わったら(= v8 が入ったら)
-    このテストが落ちて、conf のコメントを更新する契機になる。"""
+    (a) v7 / 旧コア地図の POI は subcat を 1 件も持たない = 既定の convenience /
+        net_cafe / sauna / karaoke / club のエントリは **これらの地図では今も no-op**。
+        ここは v8 が来ても変わらない(v7 は凍結された過去のスナップショット)。
+    (b) 地図 v8(data/shibuya_osm_wide_v8.json)は subcat を通す = 同じ表が**書き換え
+        ゼロで効きはじめる**(前方互換だったことの実証)。v8 の詳細な健全性は
+        tests/test_map_v8.py が持つ。ここでは「夜間層の消費側から見えるか」だけを見る。
+    ※ conf/config.yaml の night_economy ブロックにある「※v8 待ち」の注記は、この
+      テストが緑になった時点で「v8 で実データが当たる」へ更新する対象(注記のみ)。"""
     ncfg = night.build_cfg({"enabled": True})
     for path in ("data/shibuya_osm.json", "data/shibuya_osm_wide_v7.json"):
         doc = json.loads((REPO_ROOT / path).read_text(encoding="utf-8"))
         subs = {night.poi_subcat(ncfg, p) for p in doc["pois"]}
-        assert subs == {None}, f"{path} に subcat を持つ POI がある(v8 到来? conf の注記を更新すること)"
+        assert subs == {None}, f"{path} に subcat を持つ POI がある(v7 は凍結スナップショット)"
+    # --- v8: subcat が実データで当たる(表は 1 バイトも書き換えていない)---
+    v8 = json.loads((REPO_ROOT / "data" / "shibuya_osm_wide_v8.json")
+                    .read_text(encoding="utf-8"))
+    subs = [night.poi_subcat(ncfg, p) for p in v8["pois"]]
+    got = {s for s in subs if s}
+    assert got, "v8 地図から subcat が 1 件も引けない"
+    # 夜間層が名前で知っている 4 語が実データで当たる(net_cafe だけは OSM 側の実要素が
+    # name タグを持たないため、poi_patch_shibuya.json の一般名 1 件で手当てしてある)。
+    for key in ("convenience", "karaoke", "club", "net_cafe"):
+        assert subs.count(key) > 0, f"v8 に subcat={key} の POI が無い"
+    # 避難先(refuge)が subcat 経路で増える: v8 では sauna / karaoke が候補に入る
+    assert subs.count("sauna") > 0, "v8 に subcat=sauna の POI が無い"
 
 
 def test_cat_level_override_applies_when_on(tmp_path):

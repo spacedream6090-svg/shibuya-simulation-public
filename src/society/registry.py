@@ -605,6 +605,56 @@ FEATURES: tuple[Feature, ...] = (
     _f("world.night_economy.refuge.enabled", "strict", False, "none",
        "終電後の避難先だけを個別に切る子トグル(親 enabled 配下)。false にすると"
        "終電後の homing は従来どおり縁のゲートウェイへ歩いて退出する"),
+    # Wave 4 III-4: 都市運営 = 見えない労働力(設計 src/society/city_ops.py)。
+    # strict の根拠: **乱数 stream を 1 本も引かない**(持ち場は地図の純関数・当直表は名簿順の
+    #   剰余・収集の曜日表は暦の純関数・倒れる判定は (agent id, 経過日) の安定ハッシュ)。
+    #   LLM の自由文を 1 バイトも読まない。
+    # ★affects_k=False: generate() の呼び出しサイトを 1 つも足さず・減らさず、プロンプトの
+    #   **節**も増やさない(出来事は既存の記憶欄に定型 1 行が入るだけ)。倒れた個体は既存の
+    #   睡眠機構でその場に留まるが、朝の計画は 1 日 1 回のガード(plan_day)に守られるので
+    #   呼数は増えない。位置経由で発火数が間接的に動くのは本レジストリの規約どおり False。
+    # fingerprint_risk=possible: 出来事の定型 1 行が当事者の記憶に載る(街路の生業と同等級)。
+    _f("city_ops.enabled", "strict", False, "possible",
+       "街を成り立たせているのに世界に 1 人も居なかった層を載せる: (1) 交番配置"
+       "(地図の警察施設 POI へ名簿の警察官を 3 直で束ねる。patrol_every 人に 1 人は"
+       "名簿どおり『巡回ユニット』のまま持ち場を持たない)(2) ごみ収集(可燃 2 回/週の"
+       "**地区別曜日表**・繁華街の期限 07:30・事業系は民間業者が深夜 02:00-05:00。"
+       "地区は地図の格子分割=区の実際の収集区割りは持っていないので作らない)"
+       "(3) 納品の運転手化(物流① delivery_trip の agent_id が当直の納品ドライバーになる。"
+       "**時刻・数量・(s,S) 判定は 1 も変えない**=変えたのは誰が運んだかだけ。不在なら"
+       "unstaffed=true の正直な無人マーカー)(4) ビルの夜間清掃(office 建物へ束ね 22:00-05:00)"
+       "(5) 救急(**時刻表ではなく行為の連鎖**: 既存の健康状態から倒れる collapse → "
+       "近くに居合わせた誰かが通報する ems_call → 当直が応える ems_dispatch)。"
+       "★自販機の補充は作らない(地図 v7 に自販機 POI が無く、無い行き先を捏造しないため)。"
+       "既定 OFF は新 6 種の L1 0 件・state なし・プロンプト不変(L1 バイト一致)"),
+    _f("city_ops.police.enabled", "strict", False, "none",
+       "交番配置だけを個別に切る子トグル(親 city_ops.enabled 配下)。false では警察官の"
+       "持ち場を従来どおり work.bind_workplace の結果のままにする"),
+    _f("city_ops.waste.enabled", "strict", False, "none",
+       "ごみ収集だけを個別に切る子トグル(親配下)。false では収集班を束ねず"
+       "waste_collection が 0 件になる"),
+    _f("city_ops.waste.commercial_enabled", "strict", False, "none",
+       "事業系(民間業者の深夜 02:00-05:00 収集)だけを個別に切る孫トグル。"
+       "false では全班が区の家庭ごみ(朝)だけを回る"),
+    _f("city_ops.waste.require_night", "strict", False, "none",
+       "深夜班を『夜間開放(world.night_economy)ON のときだけ束ねる』かの指定。"
+       "既定 true = 深夜に起きている作業員が世界に居ないランでは黙って空回りさせない"
+       "(束ねない理由は L1 city_ops_bound の notes に残す)。false にすると夜間開放 OFF でも"
+       "深夜の窓を与える(実際に起きているかは名簿の就寝時刻しだい=正直な近似)",
+       off_value=True),
+    _f("city_ops.driver.enabled", "strict", False, "none",
+       "納品の運転手化だけを個別に切る子トグル(親配下)。false では delivery_trip が"
+       "従来どおり agent_id=-1 の世界イベントのまま(payload も従来の 5 キーのまま)"),
+    _f("city_ops.night_cleaning.enabled", "strict", False, "none",
+       "ビル夜間清掃だけを個別に切る子トグル(親配下)。false では清掃員を束ねず"
+       "night_cleaning が 0 件になる"),
+    _f("city_ops.ems.enabled", "strict", False, "none",
+       "救急の行為連鎖(collapse → ems_call → ems_dispatch)だけを個別に切る子トグル"),
+    _f("city_ops.ems.require_sick", "strict", False, "none",
+       "倒れる引き金を『既存の病気(health の sick)』に限るかの指定。既定 true = 健康機構が"
+       "OFF(または onset_prob=0)のランでは救急の連鎖が 1 件も起きない(正直な依存関係)。"
+       "false にすると既存の疲労ゲージ(fatigue>=collapse_fatigue)も引き金になる",
+       off_value=True),
     # 第88バッチ 心モデル固定 + 三層知能配置(設計 §5)。
     # journal 等級の根拠: 個体ごとに**別のモデル**が自由文を書く。事後に再生するには
     #   モデル別の llm_cache / llm_journal(子ごとに 1 本)が要る = 単体では非決定。

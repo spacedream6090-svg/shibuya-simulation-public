@@ -1,8 +1,11 @@
 """実行結果 → HTML ビューア v5(sim⇄viz 疎結合: ログを読むだけ)。
 
 使い方:  python viz/make_viewer.py runs/day80 [--no-traffic] [--start-tod HH:MM]
+                                   [--lateral-offset]
   --start-tod : 壁時計の開始時刻を明示上書き(既定は run の sim_min 列から復元。
                 sim_min 列が無い旧ランのフォールバック値でもある。未指定既定 07:00)。
+  --lateral-offset : 街路上の人を中心線から横へ散らす(I-1 λ。表示専用でシミュには
+                非干渉)。既定 OFF=未指定なら生成 HTML は従来とバイト同一。
 生成物(2ファイル分離、ユーザー要望 2026-07-04):
   viewer.html    — 地図ビューア(OSM タイル・レイヤー・再生・フォーカス・フロアビュー)
   dashboard.html — 情報ダッシュボード(出来事 / ネット[X風SNS・LINE風DM・検索] /
@@ -3424,6 +3427,147 @@ function orgMapColor(i, s0){ return _orgColorById[D.ids[i]]||'#8a97a5'; }
 """
 
 
+# ============================================================ λ 横オフセット(I-1)
+# 街路上の人が「中心線に刺さったビーズ」に見える問題への表示専用の手当て。
+# 位置 = 中心線 + n̂ · sign(λ)·(gap + |λ|·side)
+#   λ      = hash(agent_id, edge) を [-1,1) へ写した **純関数**(乱数ゼロ・状態ゼロ・
+#            問い合わせ時に何も更新しない)。同じ人は同じ道でいつも同じ側を歩く。
+#   n̂      = **最近傍 edge セグメントの左法線**(進行方向ではなく街路固定のフレーム。
+#            進行方向を使うと対向者どうしで左右が反転して同じ側に重なるため)。
+#   gap    = 車道半幅(=歩道の内縁。footway/pedestrian は 0=全幅を歩ける)
+#   side   = 歩道幅。帯は建物フットプリントまでの距離で clamp(壁にめり込ませない)。
+# 連続性: 最近傍 edge と次近傍 edge のオフセットを距離差で重み混合する。edge が
+#   切り替わる瞬間は両者が等距離 → 重みが対称 → 横位置が飛ばない(C0 連続)。交差点でも
+#   複数 edge が混ざるので、専用の交差点処理なしにある程度なめらかになる。
+# ★シミュレーションには一切触れない(観測専用)。全員が常に居るのは変わらず、描画位置だけの話。
+#
+# 2D(make_viewer)と 3D(make_viewer3d)で **同一の文字列**を使う(λ の値が両ビューアで
+# 一致することの保証)。3D 側は importlib で本モジュールからこの定数を借りる。
+# 呼び出し側は先に window.__latAdapter = {edges, blds, ek, eg, bfp} を用意する。
+_LATERAL_CORE_JS = r"""
+// ========== λ 横オフセット(街路幅への扇状展開・表示専用/シミュ非干渉) ==========
+(function(){
+  if(window.__latXY) return;
+  const AD = window.__latAdapter || null;
+  const EDGES = (AD && AD.edges) || [], BLDS = (AD && AD.blds) || [];
+  const eK = (AD && AD.ek) || (e=>e.k), eG = (AD && AD.eg) || (e=>e.g),
+        bFP = (AD && AD.bfp) || (b=>b.fp);
+  if(!EDGES.length){ window.__latXY = function(){ return null; }; return; }
+  // クラス別の帯[m]: [gap=車道半幅(歩道の内縁), side=歩道幅]。合計が片側の最大横ずれ。
+  const BAND = { footway:[0,1.0], path:[0,1.0], steps:[0,0.75], corridor:[0,0.75],
+    elevator:[0,0.6], cycleway:[0,1.25], pedestrian:[0,4.0], living_street:[1.5,1.75],
+    service:[1.5,1.25], residential:[2.5,1.5], unclassified:[2.5,1.5],
+    tertiary:[3.5,1.75], secondary:[4.5,2.0], primary:[5.5,2.0], trunk:[5.5,2.0] };
+  const BAND_DEF=[1.5,1.5];        // 未知クラス(片側 1.5〜3.0m = 歩道帯 3m 相当)
+  const CELL=40.0;                 // 空間格子[m]
+  const BLEND=6.0;                 // edge 遷移/交差点の混合幅[m]
+  const WALL=0.6;                  // 建物壁からの余白[m]
+  const BMAX=10.0;                 // 片側の絶対上限[m](どんな clamp 解でもこれを超えない)
+  function _key(cx,cy){ return cx*100003 + cy; }
+  function _segD(px,py,x0,y0,x1,y1){          // 点→線分の最短距離 + 線分方向
+    const dx=x1-x0, dy=y1-y0, L2=dx*dx+dy*dy;
+    let u = L2? ((px-x0)*dx+(py-y0)*dy)/L2 : 0;
+    if(!(u>0)) u=0; else if(u>1) u=1;
+    const qx=x0+dx*u, qy=y0+dy*u;
+    return [Math.hypot(px-qx,py-qy), dx, dy];
+  }
+  // ---- 空間格子: edge セグメント / 建物(bbox)。生成は 1 回きり。
+  const EG=new Map(), BG=new Map();
+  function _bucket(M,cx,cy,v1,v2){ const k=_key(cx,cy); let a=M.get(k);
+    if(!a){ a=[]; M.set(k,a); } a.push(v1); if(v2!==undefined) a.push(v2); }
+  for(let ei=0; ei<EDGES.length; ei++){ const g=eG(EDGES[ei]); if(!g||g.length<2) continue;
+    for(let j=1;j<g.length;j++){
+      const cx0=Math.floor(Math.min(g[j-1][0],g[j][0])/CELL), cx1=Math.floor(Math.max(g[j-1][0],g[j][0])/CELL);
+      const cy0=Math.floor(Math.min(g[j-1][1],g[j][1])/CELL), cy1=Math.floor(Math.max(g[j-1][1],g[j][1])/CELL);
+      for(let cx=cx0;cx<=cx1;cx++) for(let cy=cy0;cy<=cy1;cy++) _bucket(EG,cx,cy,ei,j); } }
+  for(let bi=0; bi<BLDS.length; bi++){ const fp=bFP(BLDS[bi]); if(!fp||fp.length<2) continue;
+    let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity;
+    for(const p of fp){ if(p[0]<x0)x0=p[0]; if(p[0]>x1)x1=p[0];
+                        if(p[1]<y0)y0=p[1]; if(p[1]>y1)y1=p[1]; }
+    const cx0=Math.floor(x0/CELL), cx1=Math.floor(x1/CELL);
+    const cy0=Math.floor(y0/CELL), cy1=Math.floor(y1/CELL);
+    for(let cx=cx0;cx<=cx1;cx++) for(let cy=cy0;cy<=cy1;cy++) _bucket(BG,cx,cy,bi); }
+  function _bldDist(px,py){                    // 近傍建物の外周までの最短距離(無ければ ∞)
+    const cx=Math.floor(px/CELL), cy=Math.floor(py/CELL); let best=Infinity;
+    for(let a=-1;a<=1;a++) for(let b=-1;b<=1;b++){ const arr=BG.get(_key(cx+a,cy+b)); if(!arr) continue;
+      for(const bi of arr){ const fp=bFP(BLDS[bi]);
+        for(let j=1;j<fp.length;j++){ const d=_segD(px,py,fp[j-1][0],fp[j-1][1],fp[j][0],fp[j][1])[0];
+          if(d<best) best=d; } } }
+    return best;
+  }
+  // ---- edge ごとの帯(遅延計算+キャッシュ。実際に人が乗った edge しか計算しない)
+  const _band=new Map();
+  function bandOf(ei){
+    let v=_band.get(ei); if(v) return v;
+    const e=EDGES[ei], g=eG(e), base=BAND[eK(e)] || BAND_DEF;
+    let gap=base[0], side=base[1];
+    const m=g[Math.floor(g.length/2)] || g[0];
+    const lim=Math.max(0.5, Math.min(BMAX, _bldDist(m[0],m[1]) - WALL));
+    const tot=gap+side;
+    if(tot>lim){ const s=lim/tot; gap*=s; side*=s; }
+    v=[gap,side]; _band.set(ei,v); return v;
+  }
+  // ---- λ = (agent_id, edge) の純関数(FNV-1a 32bit)。RNG も内部状態の更新も無い。
+  const _lam=new Map();
+  function _fnv(s){ let h=2166136261>>>0; s=''+s;
+    for(let i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=Math.imul(h,16777619); } return h>>>0; }
+  function lamOf(id, ei){ const k=id+'@'+ei; let v=_lam.get(k);
+    if(v===undefined){ v=(_fnv(k)/4294967296)*2-1; _lam.set(k,v); } return v; }
+  // ---- 最近傍 2 edge(別 edge であること)
+  function _near2(px,py){
+    const cx=Math.floor(px/CELL), cy=Math.floor(py/CELL); let b1=null, b2=null;
+    for(let a=-1;a<=1;a++) for(let b=-1;b<=1;b++){ const arr=EG.get(_key(cx+a,cy+b)); if(!arr) continue;
+      for(let q=0;q<arr.length;q+=2){ const ei=arr[q], j=arr[q+1], g=eG(EDGES[ei]);
+        const r=_segD(px,py,g[j-1][0],g[j-1][1],g[j][0],g[j][1]);
+        if(!b1 || r[0]<b1.d){ if(b1 && b1.ei!==ei) b2=b1; b1={ei:ei,d:r[0],dx:r[1],dy:r[2]}; }
+        else if(ei!==b1.ei && (!b2 || r[0]<b2.d)) b2={ei:ei,d:r[0],dx:r[1],dy:r[2]}; } }
+    if(b1 && b2 && b1.ei===b2.ei) b2=null;
+    return [b1,b2];
+  }
+  function _off(rec, id){
+    const L=Math.hypot(rec.dx, rec.dy); if(!(L>0)) return [0,0];
+    const nx=-rec.dy/L, ny=rec.dx/L;                 // 左法線(街路固定フレーム)
+    const bd=bandOf(rec.ei), l=lamOf(id, rec.ei);
+    const mag=(l<0?-1:1)*(bd[0]+Math.abs(l)*bd[1]);
+    return [nx*mag, ny*mag];
+  }
+  // (agent_id, x, y) -> [x', y'] / 適用できないときは null(呼び出し側は元位置のまま)
+  window.__latXY = function(id, x, y){
+    if(!(x===x) || !(y===y)) return null;
+    const nn=_near2(x,y), b1=nn[0]; if(!b1) return null;
+    const o1=_off(b1,id); let ox=o1[0], oy=o1[1], ws=1, b2=nn[1];
+    if(b2){ const w2=Math.max(0, Math.min(1, 1-(b2.d-b1.d)/BLEND));
+      if(w2>0){ const o2=_off(b2,id); ox+=o2[0]*w2; oy+=o2[1]*w2; ws+=w2; } }
+    ox/=ws; oy/=ws;
+    const rx=x+ox, ry=y+oy;
+    if(!(rx===rx) || !(ry===ry)) return null;        // NaN は必ず握り潰す(元位置へ)
+    return [rx, ry];
+  };
+  window.__latBandOf = bandOf;                       // 検査用(帯の実測)
+  window.__latLamOf  = lamOf;                        // 検査用(λ の決定論)
+  window.__latMax    = BMAX;
+})();
+"""
+
+# 2D 側アダプタ + posAt ラップ(MAP_HTML の __COMMUNITY_JS__ 経由で注入)。
+# posAt を 1 回だけ包み、**路上(w===0)の x,y だけ**を差し替える。w は触らないので
+# フロアフィルタ・情報パネル・当たり判定は従来の意味のまま(当たり判定も同じ posAt を
+# 見ているので、見えている位置とクリック位置がズレない)。
+_LATERAL_2D_JS = r"""
+window.__latAdapter = { edges:(D.edges||[]), blds:(D.buildings||[]),
+  ek:e=>e.k, eg:e=>e.g, bfp:b=>b.fp };
+""" + _LATERAL_CORE_JS + r"""
+(function(){ if(window.__latWrap2D) return; window.__latWrap2D=true;
+  const _posAt0 = posAt;
+  posAt = function(t){ const arr=_posAt0(t);
+    if(typeof window.__latXY!=='function') return arr;
+    for(let i=0;i<arr.length;i++){ const p=arr[i]; if(p[2]!==0) continue;
+      const o=window.__latXY(D.ids[i], p[0], p[1]); if(o){ p[0]=o[0]; p[1]=o[1]; } }
+    return arr; };
+})();
+"""
+
+
 # ============================================================ ダッシュボード
 DASH_HTML = r"""<!DOCTYPE html>
 <html lang="ja"><head><meta charset="utf-8">
@@ -4397,6 +4541,13 @@ def main() -> None:
         comm_option += '<option value="org">🏢会社</option>'
         comm_hook += "\n  if(mode==='org') return orgMapColor(i, s0);"
         comm_js += _ORG_MAP_JS
+    # I-1 λ 横オフセット: --lateral-offset を **明示した時だけ** 注入(既定 OFF=未指定なら
+    # comm_js は 1 文字も増えない → 旧ランの viewer.html はバイト同一)。テンプレートは無改変で、
+    # 既存 __COMMUNITY_JS__ トークンへ追記合成する(org/occ と同型の後方互換)。
+    # __COMMUNITY_JS__ は MAP_HTML にしか無いので dashboard.html には一切入らない。
+    lateral_on = "--lateral-offset" in flags
+    if lateral_on:
+        comm_js += _LATERAL_2D_JS
     # 屋内セマンティックズーム(B5): floorSpecs(=indoor ラン)が有る時「だけ」JS/フック/クリックを注入。
     # 無ければ3トークンとも空文字→ MAP_HTML/DASH_HTML は従来とバイト同一(後方互換の合格条件)。
     has_indoor = "floorSpecs" in data
@@ -4432,6 +4583,9 @@ def main() -> None:
     print(f"  steps={data['nSteps']} agents={len(data['ids'])} "
           f"posts={len(data['net']['posts'])} dms={len(data['net']['dms'])} "
           f"searches={len(data['net']['searches'])} vocab={len(data['vocab'])}")
+    if lateral_on:
+        print(f"  λ 横オフセット(I-1): ON  edges={len(data['edges'])} "
+              f"buildings={len(data['buildings'])}(帯の clamp 材料)")
     if has_orgs:
         print(f"  会社(B7): {data['orgs']['n_orgs']}社 系列={data['orgs']['source']}")
     # 在館タブは occupancy.parquet が有る時だけ出る。屋内/建物の在館データが在るのに未生成なら案内

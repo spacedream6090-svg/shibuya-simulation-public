@@ -225,14 +225,30 @@ def test_on_revisitor_memory_preserved(small_pool, tmp_path):
     x = entrants[0]
 
     sim = Simulation(_pool_cfg("mem", small_pool, n_steps=210), out_dir=tmp_path / "mem")
-    # 事前にドーマント退避ストアへ x のスリム状態(識別可能な belief)を仕込む
+    # 事前にドーマント退避ストアへ**全再来街候補**のスリム状態(識別可能な belief)を仕込む。
+    # ★1 人(entrants[0])だけを仕込む形だと、その 1 人がたまたま日跨ぎのあとに買い物を
+    #   すると所持金の検査が落ちる(実測: 復元された 777 円で 1800 円の夜遊びを試みて
+    #   残高 0 になる個体が entrants[0] に来ることがある)。復元の検査と「復元後は普通に
+    #   暮らす」ことは別問題なので、**取引をしなかった個体**で所持金を固定する。
+    #   名簿(プール)に役割が 1 つ増えるだけで entrants[0] は入れ替わるので、
+    #   特定の 1 個体に依存しない形にしておく。
     assert x not in {a.pool_pid for a in sim.agents}        # x は day0 不在
-    sim._dormant.save(x, {"beliefs": ["__memtest__"], "money": 777.0})
+    for pid in entrants:
+        sim._dormant.save(pid, {"beliefs": ["__memtest__"], "money": 777.0})
     sim.run()
     live = {a.pool_pid: a for a in sim.agents}
     assert x in live, "再来街者 x が day1 に present になっていない"
     assert "__memtest__" in live[x].beliefs                 # 記憶(信念)が復元された
-    assert live[x].money == 777.0                            # 所持金も持続
+    revisitors = [live[pid] for pid in entrants if pid in live]
+    assert revisitors, "day1 に戻った再来街者が 1 人も居ない(検査が空回り)"
+    for a in revisitors:
+        assert "__memtest__" in a.beliefs                   # 全員の記憶が復元された
+    moved = {e.agent_id for e in sim.logger.events
+             if e.kind in ("spend", "wage", "chance_event")}
+    quiet = [a for a in revisitors if a.id not in moved]
+    assert quiet, "取引をしなかった再来街者が 1 人も居ない(所持金の検査が空回り)"
+    for a in quiet:
+        assert a.money == 777.0                             # 所持金も持続
 
 
 def test_on_resume_byte_matches_straight(small_pool, tmp_path):

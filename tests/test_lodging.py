@@ -50,6 +50,33 @@ def _make_visitors(sim, bedtime_min=16 * 60, money=200000.0):
         a.bedtime_min = int(bedtime_min)
 
 
+# ------------------------------------------------------------- love_hotel 除外(第106)
+def test_love_hotel_subcat_is_excluded_from_lodging_pool(tmp_path):
+    """v8 地図の subcat=love_hotel は宿泊プールに入らない。
+
+    v8 で hotel カテゴリは 26→89 に増えたが、増分はほぼ全てラブホテル(円山町)で
+    観光・終電宿泊の受け皿とは営業実態が異なる。v7 以前は subcat キー自体が無い=
+    フィルタは何も落とさない(完全同値)ことも同時に固定する。"""
+    from society import lodging as lodging_mod
+
+    sim = _sim(tmp_path, "lh_pool")
+    base = list(lodging_mod.hotels(sim))          # v7 系地図: subcat 不在=全件残る
+    assert all(p.get("subcat") != "love_hotel" for p in base)
+
+    # 合成: love_hotel subcat を持つ POI を hotel カテゴリに注入→プールから除外される
+    sim2 = _sim(tmp_path, "lh_pool2")
+    injected = {"id": "p_test_lh", "name": "テストホテル", "cat": "hotel",
+                "subcat": "love_hotel", "node": "n1", "x": 0.0, "y": 0.0}
+    normal = {"id": "p_test_h", "name": "テスト宿", "cat": "hotel",
+              "node": "n2", "x": 1.0, "y": 1.0}
+    sim2.city._poi_by_cat.setdefault("hotel", []).extend([injected, normal])
+    sim2._lodging_hotels = None                   # lodging 側キャッシュを無効化して再構築させる
+    got = lodging_mod.hotels(sim2)
+    ids = {p.get("id") for p in got}
+    assert "p_test_lh" not in ids
+    assert "p_test_h" in ids
+
+
 # --------------------------------------------------------------------- OFF 既定
 def test_off_matches_pure_default(tmp_path):
     """明示 OFF と純粋既定が L1 完全一致(144 step)。Wave L の新イベントは 1 件も出ない(seam が no-op)。"""

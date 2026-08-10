@@ -286,6 +286,16 @@ TABLE: tuple[tuple[str, str, str], ...] = (
      "警告/退去のあと客引き・演奏を止める長さ [step](いたちごっこの周期)"),
     ("street_life.max_events_per_step", RATE,
      "1 step に出す路上イベントの上限 [件/step](1日あたりの総量を保つ安全弁)"),
+    # Wave 4 III-4(都市運営)。L1 の安全弁は「件/step」= 1 日あたりの総量を保つ(traces と同型)。
+    # 治療・現着の長さは**実時間で同じ長さ**を保つ(逆比例)。
+    # ★これ以外の city_ops のキーは全部 Δt 非依存(分 of day の時刻帯・件数・距離・
+    #   曜日・m/分の速度)なので TABLE に載せない = 棚卸し正規表現にも掛からない綴りである。
+    ("city_ops.max_events_per_step", RATE,
+     "1 step に出す都市運営イベントの上限 [件/step](1日あたりの総量を保つ安全弁)"),
+    ("city_ops.ems.treatment_steps", STEPS,
+     "倒れた個体がその場に留まる長さ [step]。実時間で同じ長さを保つ"),
+    ("city_ops.ems.on_scene_steps", STEPS,
+     "救急隊が現場に留まる長さ [step]。実時間で同じ長さを保つ"),
     ("beliefs.witness_window", STEPS, "目撃可能な窓 [step]"),
     ("beliefs.fact_ttl_steps", STEPS, "fact の鮮度 [step]"),
     ("beliefs.verify_deadline_steps", STEPS, "現場確認の有効期限 [step]"),

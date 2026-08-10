@@ -72,10 +72,15 @@ def enabled(sim) -> bool:
 
 
 def hotels(sim) -> list:
-    """hotel カテゴリ POI の一覧(決定論の安定順・sim に一度だけキャッシュ)。無ければ空=機構 no-op。"""
+    """hotel カテゴリ POI の一覧(決定論の安定順・sim に一度だけキャッシュ)。無ければ空=機構 no-op。
+
+    ★subcat=love_hotel は宿泊プールから除外する(第106): v8 地図で hotel カテゴリが 26→89 に
+    増えた実体はほぼ全てラブホテル(円山町)で、観光・終電宿泊の受け皿とは営業実態が異なる。
+    v7 以前の地図は subcat キー自体を持たない=フィルタは何も落とさず完全同値(golden 安全)。"""
     cache = getattr(sim, "_lodging_hotels", None)
     if cache is None:
-        cache = sorted(sim.city.pois_by_cat("hotel"),
+        cache = sorted((p for p in sim.city.pois_by_cat("hotel")
+                        if p.get("subcat") != "love_hotel"),
                        key=lambda p: (str(p.get("id", "")), str(p.get("name", "")),
                                       str(p.get("node", ""))))
         sim._lodging_hotels = cache

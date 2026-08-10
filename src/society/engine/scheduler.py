@@ -42,6 +42,7 @@ from .. import relations_endo as relations_endo_mod
 from .. import rumors as rumors_mod
 from .. import pov as pov_mod
 from .. import b2b as b2b_mod
+from .. import city_ops as city_ops_mod
 from .. import delivery as delivery_mod
 from .. import devices as devices_mod
 from .. import services as services_mod
@@ -5295,6 +5296,12 @@ def run_step(sim, step: int) -> None:
     # 立っているか・近傍に警察官が居るかを、この step の確定した co-location で判定するため。
     # 乱数ゼロ・LLM 追加呼ゼロ・プロンプトの欄ゼロ増(路上の出来事は既存の記憶欄に 1 行入るだけ)。
     street_life_mod.phase(sim, step, sim_min)
+    # 都市運営 = 見えない労働力(Wave 4 III-4。既定OFF=即 return=バイト一致)。
+    # **street_life と同じ位置**(位置確定後)に置く: 収集班が担当ノードに居るか・夜間清掃員が
+    # 担当ビルに入っているか・倒れた個体の近くに誰が居合わせたかを、この step の確定した
+    # co-location で判定するため。救急は「倒れる → 近くの誰かが通報する → 当直が応える」の
+    # 行為連鎖で、時刻表では 1 件も撃たない。乱数ゼロ・LLM 追加呼ゼロ・プロンプトの欄ゼロ増。
+    city_ops_mod.phase(sim, step, sim_min)
     _phase_health_tick(sim, step, sim_min)         # 疲労ゲージの毎step更新(既定OFF=no-op。後続波 H1)
     street_mod.phase(sim, step, sim_min)           # 街頭広告の視認判定(既定OFF=no-op。第18バッチ)
     # 位置が確定したこの時点で空間索引を1回だけ張る。以降の _phase_drive/_decide の

@@ -40,6 +40,9 @@ DATA = REPO_ROOT / "data"
 DEFAULT_MAP = DATA / "shibuya_osm.json"
 DEFAULT_WIDE_MAP = DATA / "shibuya_osm_wide_v7.json"      # 分布駆動(--dist)の既定広域地図
 DEFAULT_DIST_OUT = DATA / "organizations_shibuya_wide11k.json"  # 分布駆動の既定出力(新ファイル)
+# センサス較正(--census)の既定出力。正準 11k 台帳を事故で上書きしないよう別ファイルにする。
+DEFAULT_CENSUS_OUT = DATA / "organizations_shibuya_census.json"
+DEFAULT_CENSUS_JSON = DATA / "realworld" / "census_r3" / "station_area_industry.json"
 DEFAULT_REPORT = REPO_ROOT / "docs" / "research" / "org-book-11k.md"
 DEFAULT_ROSTERS = [DATA / "personas_80.json", DATA / "personas_100_inflow.json"]
 
@@ -687,14 +690,60 @@ INDUSTRY_SPEC: list[dict] = [
          output=["service"],
          words=["サービス", "協同", "コンプレックス", "ユニオン", "エージェント"]),
 ]
-IND_BY_KEY: dict[str, dict] = {it["key"]: it for it in INDUSTRY_SPEC}
+# ============================================================================
+# センサス較正モード専用の追加業種(Wave 4 IV-1。**--census を渡したときだけ台帳に載る**)
+# ----------------------------------------------------------------------------
+# 監査の指摘: 接客(work.serve_by_cat)は {food, cafe, nightlife, shop} を張っているのに、
+# 台帳の職場カテゴリは {office, shop, food, service} しか無い = **nightlife の職場が
+# 構造的に存在せず、ナイトライフ消費は永遠に無人接客(unstaffed)になる**。
+#
+# 令和3年経済センサスの町丁目表では、駅周辺13町丁目に中分類 80「娯楽業」が実在する
+# (254 事業所 / 4,980 人 = 事業所の 2.6%)。既存 LS(生活関連サービス業・娯楽業)は
+# 大分類 N をまるごと1バケットにして cat="shop" に潰していたため、この 254 事業所は
+# 「服屋」として台帳に載っていた。--census ではセンサス中分類にならって
+#   N78 洗濯・理容・美容・浴場業 + N79 その他の生活関連サービス業 → LS(cat=service)
+#   N80 娯楽業                                                   → AM(cat=nightlife)
+# の 2 バケットへ割る。★INDUSTRY_SPEC 本体には足さない(足すと既定分布が動く)。
+CENSUS_EXTRA_INDUSTRY_SPEC: list[dict] = [
+    dict(key="AM", name="娯楽業", cat="nightlife", tier="店員", cls="SMALL", share=0.0,
+         details=["ライブハウス", "クラブ/バー併設", "カラオケ", "ゲームセンター", "劇場・興行", "スポーツ施設"],
+         products=["音楽・興行・遊興の提供", "深夜帯の娯楽サービス運営"],
+         roles=["フロア", "バーテンダー", "音響", "受付", "店長"],
+         generalist=["店長", "受付"],
+         output=["service", "content"],
+         words=["ホール", "ラウンジ", "ナイト", "サウンド", "ステージ", "アミューズメント", "クラブ", "シアター"]),
+]
+
+# --census のときだけ差し替える業種定義(既定モードの値は 1 バイトも変えない)。
+#   LS: 娯楽業を AM へ切り出したので、名称・事業内容から娯楽を外す。職場カテゴリは
+#       「物を売る店(shop)」ではなく役務提供(service)= services.py の受給側 POI カテゴリと揃え、
+#       需要(service_use)と供給(serve)が同じ接点で対になるようにする。
+#   ★details の要素数は既定と同じに保つ(rng の消費数を業種間で揃えるため)。
+CENSUS_SPEC_OVERRIDE: dict[str, dict] = {
+    "LS": {"name": "生活関連サービス業", "cat": "service",
+           "details": ["美容室", "ネイル/エステ", "リラクゼーション", "クリーニング", "フィットネス", "写真スタジオ"],
+           "products": ["ヘア・美容・リラクゼーションの提供", "洗濯・理容・浴場等の生活関連サービスの提供"]},
+}
+CENSUS_CAT_OVERRIDE: dict[str, str] = {k: v["cat"] for k, v in CENSUS_SPEC_OVERRIDE.items()
+                                       if "cat" in v}
+
+
+def _census_spec(it: dict, census_mode: bool) -> dict:
+    """--census のときだけ業種定義を差し替えた辞書を返す。既定モードは同一オブジェクト(不変)。"""
+    ov = CENSUS_SPEC_OVERRIDE.get(it["key"]) if census_mode else None
+    return {**it, **ov} if ov else it
+
+ALL_INDUSTRY_SPEC: list[dict] = INDUSTRY_SPEC + CENSUS_EXTRA_INDUSTRY_SPEC
+IND_BY_KEY: dict[str, dict] = {it["key"]: it for it in ALL_INDUSTRY_SPEC}
 
 # 業種別の営業時間・シフト(shift_pattern)。オフィス=平日日勤 / 小売飲食=長時間・週末含む・交代制。
+# nightlife は --census で生える AM 専用(close < open = 日跨ぎ。既定モードでは誰も引かない)。
 SHIFT_BY_CAT: dict[str, dict] = {
     "office":  {"open": "09:00", "close": "18:00", "days": "mon-fri", "shift_hours": 8, "rotates": False},
     "shop":    {"open": "10:00", "close": "21:00", "days": "all",     "shift_hours": 8, "rotates": True},
     "food":    {"open": "07:00", "close": "23:00", "days": "all",     "shift_hours": 8, "rotates": True},
     "service": {"open": "09:00", "close": "19:00", "days": "mon-sat", "shift_hours": 8, "rotates": True},
+    "nightlife": {"open": "18:00", "close": "02:00", "days": "all",   "shift_hours": 8, "rotates": True},
 }
 
 # ============================================================================
@@ -738,12 +787,25 @@ NIGHT_SHIFT_BY_KEY: dict[str, dict] = {
            "roles": ["夜間フロント", "夜間スタッフ"]},
 }
 
+# センサス較正専用の夜勤枠。★NIGHT_SHIFT_BY_KEY 本体には足さない(同表は「既定の産業大分類の
+# 夜勤語彙」= INDUSTRY_SPEC のキーだけで閉じている、という不変条件をテストが固定しているため)。
+# 娯楽業(--census でのみ生える AM)= ライブハウス・クラブ・カラオケの深夜営業。
+# 日勤帯より夜勤帯が本業なので share は他業種より高い。
+CENSUS_NIGHT_SHIFT_BY_KEY: dict[str, dict] = {
+    "AM": {"open": "22:00", "close": "05:00", "days": "all", "shift_hours": 7,
+           "rotates": True, "share": 0.40, "min_employees": 3,
+           "roles": ["深夜フロア", "深夜バー", "夜間音響"]},
+}
+
 
 def night_shift_for(industry_key: str, employees: int) -> dict | None:
     """その社に載せる夜勤シフト(該当しなければ None)。**決定論・乱数ゼロ**。
 
-    ``min_employees`` 未満の社には夜勤枠を作らない(1 人の店に 24 時間交代を置かない)。"""
-    spec = NIGHT_SHIFT_BY_KEY.get(str(industry_key))
+    ``min_employees`` 未満の社には夜勤枠を作らない(1 人の店に 24 時間交代を置かない)。
+    センサス較正でだけ生える業種(AM 娯楽業)は CENSUS_NIGHT_SHIFT_BY_KEY 側に置いてある
+    (既定モードではその業種の社が 1 件も無いので、参照しても結果は変わらない)。"""
+    spec = NIGHT_SHIFT_BY_KEY.get(str(industry_key)) or \
+        CENSUS_NIGHT_SHIFT_BY_KEY.get(str(industry_key))
     if spec is None or int(employees) < int(spec["min_employees"]):
         return None
     return dict(spec)
@@ -801,6 +863,102 @@ def _quota(total: int, shares: list[float]) -> list[int]:
     return base
 
 
+# ============================================================================
+# センサス較正(Wave 4 IV-1。**--census を渡したときだけ効く**。無指定なら 1 バイトも変わらない)
+# ----------------------------------------------------------------------------
+# 入力 = scripts/calibrate_orgs_census.py が書く data/realworld/census_r3/station_area_industry.json。
+# その `sim_buckets` は「令和3年経済センサス-活動調査 町丁目別表の駅周辺13町丁目実測」を
+# 台帳の industry_key へ写像したもの(事業所数・従業者数)。ここで使うのは **2 本の実測列だけ**:
+#   ① 産業別 事業所数 → 社数の割付(最大剰余法)
+#   ② 産業別 従業者数 → 従業者質量の割付(最大剰余法)+ 産業内は既存の裾長サンプルの相対形を保存
+# 規模帯(SIZE_BANDS)は町丁目表に無い次元なので、**帯は駆動側ではなく従業者数からの派生ラベル**
+# になる(_band_of)。これが唯一の意味変更で、正直に meta と研究文書へ書いてある。
+# ============================================================================
+def _band_of(employees: int) -> str:
+    """従業者数 → 規模帯ラベル(センサス較正では帯は駆動側でなく派生ラベル)。"""
+    n = int(employees)
+    for label, lo, hi in SIZE_BANDS:
+        if lo <= n <= hi:
+            return label
+    return SIZE_BANDS[-1][0] if n >= SIZE_BANDS[-1][1] else SIZE_BANDS[0][0]
+
+
+def load_census(path: Path) -> dict:
+    """センサス集計 JSON を読む(`sim_buckets` 必須)。"""
+    doc = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(doc, dict) or not doc.get("sim_buckets"):
+        raise ValueError(f"センサス集計に sim_buckets が無い: {path} "
+                         "(scripts/calibrate_orgs_census.py で生成すること)")
+    return doc
+
+
+def census_specs(census: dict) -> list[dict]:
+    """センサスに事業所が 1 件でもある産業だけを ALL_INDUSTRY_SPEC の並び順で返す。"""
+    b = census["sim_buckets"]
+    unknown = sorted(set(b) - {s["key"] for s in ALL_INDUSTRY_SPEC})
+    if unknown:
+        raise ValueError(f"台帳に定義の無い産業キーがセンサス集計にある: {unknown}")
+    return [s for s in ALL_INDUSTRY_SPEC
+            if int(b.get(s["key"], {}).get("establishments", 0) or 0) > 0]
+
+
+def census_cat(it: dict, census_mode: bool) -> str:
+    """職場POIカテゴリ。既定モードは INDUSTRY_SPEC の cat をそのまま(不変)。"""
+    return CENSUS_CAT_OVERRIDE.get(it["key"], it["cat"]) if census_mode else it["cat"]
+
+
+def _rescale_to_quota(raw: list[int], target: int) -> list[int]:
+    """`raw` の相対形を保ったまま合計を `target` へ一致させる(最大剰余法・各社 >=1・乱数ゼロ)。
+
+    裾長(1 人の店 〜 数百人の本社)の形は `raw` が持っているので、比を保って総和だけを
+    センサスの従業者質量へ合わせる。`target` が件数未満なら全社 1 人(呼び出し側が meta に記録)。
+    """
+    n = len(raw)
+    if n == 0:
+        return []
+    if target <= n:
+        return [1] * n
+    rest = target - n                              # 先に全社へ 1 人ずつ確保してから比例配分
+    s = float(sum(raw)) or float(n)
+    exact = [rest * (r / s) for r in raw]
+    base = [int(x) for x in exact]
+    rem = rest - sum(base)
+    order = sorted(range(n), key=lambda i: (exact[i] - base[i], -i), reverse=True)
+    for k in range(rem):
+        base[order[k % n]] += 1
+    return [1 + b for b in base]
+
+
+def _apply_census_employees(companies: list[dict], spans: list[tuple[int, int]],
+                            specs: list[dict], census: dict, count: int,
+                            night_shifts: bool) -> dict:
+    """産業ごとの従業者質量をセンサス実測比へ割り直す(決定論・乱数ゼロ)。戻り値=検収用の要約。"""
+    b = census["sim_buckets"]
+    tot_est = sum(int(b[s["key"]]["establishments"]) for s in specs)
+    tot_emp = sum(int(b[s["key"]]["employees"]) for s in specs)
+    target_total = int(round(count * tot_emp / tot_est)) if tot_est else 0
+    emp_by_ind = _quota(target_total, _normalize([float(b[s["key"]]["employees"]) for s in specs]))
+    degenerate = []
+    for it, (start, end), e_i in zip(specs, spans, emp_by_ind):
+        chunk = companies[start:end]
+        if not chunk:
+            continue
+        if e_i <= len(chunk):
+            degenerate.append(it["key"])
+        raw = [int(c["size"]["employees"]) for c in chunk]
+        for c, emp in zip(chunk, _rescale_to_quota(raw, e_i)):
+            c["size"] = {"employees": emp, "band": _band_of(emp)}
+            c.pop("night_shift", None)
+            if night_shifts:
+                ns = night_shift_for(c["industry_key"], emp)
+                if ns is not None:
+                    c["night_shift"] = ns
+    return {"target_employees_total": target_total,
+            "census_employees_per_establishment": round(tot_emp / tot_est, 3) if tot_est else 0.0,
+            "employees_by_industry_target": {s["key"]: e for s, e in zip(specs, emp_by_ind)},
+            "degenerate_industries": degenerate}
+
+
 def _sample_employees(rng: random.Random, band: tuple[str, int, int]) -> int:
     """規模帯内の従業者数をサンプル。300+ は log 一様(平均~650)で長い裾を作る。"""
     _, lo, hi = band
@@ -833,19 +991,35 @@ def _gen_company_name(rng: random.Random, it: dict,
 
 
 def build_companies_dist(real_names: set[str], count: int, seed: int,
-                         night_shifts: bool = False) -> list[dict]:
+                         night_shifts: bool = False,
+                         census: dict | None = None,
+                         out_plan: dict | None = None) -> list[dict]:
     """産業大分類×規模帯の目標分布から count 社を決定論生成(workplace_poi は未割付)。
 
     night_shifts=True(CLI --night-shifts)のときだけ、該当業種の社に ``night_shift`` を
     1 キー足す(Wave 4 III-1)。**乱数は 1 draw も引かない**ので、既定 False の出力は
-    従来と完全に同一(社名も規模も割付も 1 バイトも動かない)。"""
+    従来と完全に同一(社名も規模も割付も 1 バイトも動かない)。
+
+    census(CLI --census)を渡すと、産業別の社数と従業者質量が経済センサス実測比になる
+    (Wave 4 IV-1)。**census=None の経路は上と同一のコードを通る**ので、無指定の出力は
+    従来と 1 バイトも変わらない(tests/test_census_calibration.py がバイト一致を固定)。
+    """
     rng = random.Random(seed)
-    shares = _normalize([it["share"] for it in INDUSTRY_SPEC])
+    census_mode = census is not None
+    specs = census_specs(census) if census_mode else INDUSTRY_SPEC
+    if census_mode:
+        shares = _normalize([float(census["sim_buckets"][it["key"]]["establishments"])
+                             for it in specs])
+    else:
+        shares = _normalize([it["share"] for it in INDUSTRY_SPEC])
     n_by_ind = _quota(count, shares)
     companies: list[dict] = []
     seen_names: set[str] = set()
+    spans: list[tuple[int, int]] = []      # 産業ごとの [開始, 終了) = 従業者再割付の単位
     seq = 0
-    for it, n_i in zip(INDUSTRY_SPEC, n_by_ind):
+    for it, n_i in zip(specs, n_by_ind):
+        it = _census_spec(it, census_mode)          # 既定モードでは同一オブジェクト(不変)
+        start = len(companies)
         band_dist = _normalize(SIZE_CLASS_DIST[it["cls"]])
         n_by_band = _quota(n_i, band_dist)
         for bidx, n_ib in enumerate(n_by_band):
@@ -855,7 +1029,8 @@ def build_companies_dist(real_names: set[str], count: int, seed: int,
                 emp = _sample_employees(rng, band)
                 name = _gen_company_name(rng, it, real_names, seen_names)
                 detail = it["details"][rng.randrange(len(it["details"]))]
-                night = night_shift_for(it["key"], emp) if night_shifts else None
+                # センサス較正では従業者数が後段で割り直されるので、夜勤枠もその後に判定する。
+                night = night_shift_for(it["key"], emp) if (night_shifts and not census_mode) else None
                 companies.append({
                     "id": f"co_{it['key'].lower()}_{seq:05d}",
                     "name": name,
@@ -872,6 +1047,11 @@ def build_companies_dist(real_names: set[str], count: int, seed: int,
                 })
                 if night is not None:              # 夜勤枠(--night-shifts のときだけ生える)
                     companies[-1]["night_shift"] = night
+        spans.append((start, len(companies)))
+    if census_mode:
+        plan = _apply_census_employees(companies, spans, specs, census, count, night_shifts)
+        if out_plan is not None:                   # 検収用の要約(meta へ載せる。台帳本体は不変)
+            out_plan.update(plan)
     return companies
 
 
@@ -908,10 +1088,12 @@ def _building_slots(buildings: list[dict], kinds: set[str]) -> list[dict]:
     return slots
 
 
-def place_on_buildings(companies: list[dict], buildings: list[dict]) -> int:
+def place_on_buildings(companies: list[dict], buildings: list[dict],
+                       cat_by_key: dict[str, str] | None = None) -> int:
     """各社を建物×階へ決定論束縛(大組織→高prestige/高層ビル優先)。戻り値=割付済み数。
 
     商業系建物のテナント枠が不足する場合のみ、住宅系建物(house?)へ溢れ分を割り付ける。
+    `cat_by_key`(--census のときだけ渡す)は職場POIカテゴリの差し替え表。None = 従来と同一。
     """
     commercial = set(_BLD_PER_FLOOR.keys())
     slots = _building_slots(buildings, commercial)
@@ -919,12 +1101,14 @@ def place_on_buildings(companies: list[dict], buildings: list[dict]) -> int:
         slots += _building_slots(buildings, {"house?"})  # 溢れ分の予備(prestige最下位)
     order = sorted(range(len(companies)),
                    key=lambda j: (-int(companies[j]["size"]["employees"]), companies[j]["id"]))
+    override = dict(cat_by_key or {})
     placed = 0
     for rank, j in enumerate(order):
         if rank >= len(slots):
             break
         sl = slots[rank]
-        cat = IND_BY_KEY[companies[j]["industry_key"]]["cat"]
+        key = companies[j]["industry_key"]
+        cat = override.get(key) or IND_BY_KEY[key]["cat"]
         companies[j]["workplace_poi"] = {
             "cat": cat, "building": sl["building"], "node": sl["node"],
             "floor": sl["floor"], "x": sl["x"], "y": sl["y"],
@@ -958,22 +1142,35 @@ def _dist_stats(companies: list[dict]) -> dict:
 
 
 def build_ledger_dist(map_path: Path, count: int, seed: int,
-                      night_shifts: bool = False) -> dict:
-    """分布駆動の組織台帳(会社~count + 学校)を組み立てて返す。"""
+                      night_shifts: bool = False, census: dict | None = None,
+                      census_file: str = "") -> dict:
+    """分布駆動の組織台帳(会社~count + 学校)を組み立てて返す。
+
+    census(--census)を渡すと産業構成が経済センサス実測比になる。None = 従来と完全同一。
+    """
     buildings, real_names = load_buildings(map_path)
-    companies = build_companies_dist(real_names, count, seed, night_shifts)
-    placed = place_on_buildings(companies, buildings)
+    plan: dict = {}
+    companies = build_companies_dist(real_names, count, seed, night_shifts, census, plan)
+    census_mode = census is not None
+    specs = census_specs(census) if census_mode else INDUSTRY_SPEC
+    cat_by_key = {it["key"]: census_cat(it, True) for it in specs} if census_mode else None
+    placed = place_on_buildings(companies, buildings, cat_by_key)
     # 学校ブロックは既存の代表校キュレーション(build_orgs)をそのまま再利用(改変なし)。
     by_cat, _ = load_map(map_path)
     schools = build_orgs(by_cat, seed)["schools"]
     stats = _dist_stats(companies)
-    target_ind = {it["key"]: {"industry": it["name"],
+    if census_mode:
+        shares = _normalize([float(census["sim_buckets"][it["key"]]["establishments"])
+                             for it in specs])
+    else:
+        shares = _normalize([i["share"] for i in INDUSTRY_SPEC])
+    target_ind = {it["key"]: {"industry": _census_spec(it, census_mode)["name"],
                               "target_count_share": round(s, 4), "size_class": it["cls"]}
-                  for it, s in zip(INDUSTRY_SPEC, _normalize([i["share"] for i in INDUSTRY_SPEC]))}
-    return {
+                  for it, s in zip(specs, shares)}
+    doc = {
         "meta": {
-            "generator": "scripts/build_orgs.py --dist",
-            "mode": "distribution-driven",
+            "generator": "scripts/build_orgs.py --dist" + (" --census" if census_mode else ""),
+            "mode": "census-calibrated" if census_mode else "distribution-driven",
             "seed": seed, "target_count": count,
             "map": str(map_path.relative_to(REPO_ROOT)).replace("\\", "/"),
             "note": ("架空の組織台帳(R17: 実在企業名・学校名なし)。産業大分類×従業者規模帯の"
@@ -997,6 +1194,45 @@ def build_ledger_dist(map_path: Path, count: int, seed: int,
         "companies": companies,
         "schools": schools,
     }
+    if census_mode:
+        # ★センサス較正のときだけ足すブロック(既定モードの meta は 1 キーも増えない)。
+        cm = census.get("_meta", {})
+        area = census.get("area", {})
+        cat_counts: dict[str, int] = {}
+        for c in companies:
+            cat_counts[cat_by_key[c["industry_key"]]] = cat_counts.get(
+                cat_by_key[c["industry_key"]], 0) + 1
+        doc["meta"]["census"] = {
+            "file": census_file,
+            "source": cm.get("source", ""),
+            "attribution": cm.get("attribution", ""),
+            "survey": cm.get("survey", {}),
+            "area": {"name": (cm.get("area_definition") or {}).get("name", ""),
+                     "blocks": list(area.get("blocks", [])),
+                     "establishments": area.get("establishments"),
+                     "employees": area.get("employees")},
+            "employee_plan": plan,
+            "workplace_cat_counts": cat_counts,
+            "cat_overrides": {k: v for k, v in CENSUS_CAT_OVERRIDE.items()
+                              if k in {s["key"] for s in specs}},
+            "census_only_industries": [s["key"] for s in CENSUS_EXTRA_INDUSTRY_SPEC
+                                       if s["key"] in {t["key"] for t in specs}],
+        }
+        doc["meta"]["honesty"] = (
+            "産業別の事業所数・従業者数は令和3年経済センサス-活動調査 町丁目別表の"
+            "駅周辺13町丁目実測(scripts/calibrate_orgs_census.py)。社数は事業所数シェア、"
+            "産業別の従業者総和は従業者シェアの最大剰余法割付で実測比に一致する。"
+            "★規模帯(SIZE_BANDS)は町丁目表に無い次元なので、帯は駆動側ではなく従業者数からの"
+            "派生ラベルであり、産業内の規模分布(裾の形)は依然として全国構造からの近似である"
+            "(社ごとの従業者数の実表を再現したとは主張しない)。")
+        doc["meta"]["anchors"] = {
+            "target_establishments": count,
+            "target_employees": plan.get("target_employees_total"),
+            "census_establishments": area.get("establishments"),
+            "census_employees": area.get("employees"),
+            "employees_tolerance": "0(最大剰余法で完全一致)"}
+        doc["meta"]["sources_doc"] = "docs/research/economy-census-calibration.md"
+    return doc
 
 
 def write_generation_report(ledger: dict, out_path: Path) -> None:
@@ -1005,7 +1241,9 @@ def write_generation_report(ledger: dict, out_path: Path) -> None:
     lines = ["# 組織台帳 ~1.1万 生成レポート(P6・分布駆動)", "",
              f"- 生成器: `{m['generator']}` / seed={m['seed']} / map=`{m['map']}`",
              f"- 会社 {st['n_companies']} 社 + 学校 {m['counts']['schools']} 校",
-             f"- 従業者総和: **{st['employees_total']:,}** (目標~257,000・平均 {st['employees_per_org']} 人/社)",
+             f"- 従業者総和: **{st['employees_total']:,}** "
+             f"(目標~{int(m.get('anchors', {}).get('target_employees') or 0):,}・"
+             f"平均 {st['employees_per_org']} 人/社)",
              f"- POI(建物)割付率: **{m['poi_coverage']:.1%}**", "",
              "## 産業大分類の分布(目標事業所数シェア → 実現)", "",
              "| key | 産業 | 規模クラス | 目標件数シェア | 実現件数 | 実現件数シェア | 従業者 | 従業者シェア |",
@@ -1029,9 +1267,22 @@ def _run_dist_mode(args) -> None:
     map_path = Path(args.map) if args.map else DEFAULT_WIDE_MAP
     if not map_path.is_absolute():
         map_path = REPO_ROOT / map_path
+    census = census_file = None
+    if getattr(args, "census", None):
+        cpath = Path(args.census)
+        if not cpath.is_absolute():
+            cpath = REPO_ROOT / cpath
+        census = load_census(cpath)
+        try:
+            census_file = str(cpath.relative_to(REPO_ROOT)).replace("\\", "/")
+        except ValueError:                              # リポジトリ外の指定もそのまま記録する
+            census_file = str(cpath)
     ledger = build_ledger_dist(map_path, int(args.count), int(args.seed),
-                               bool(getattr(args, "night_shifts", False)))
-    out = Path(args.orgs_out) if args.orgs_out else DEFAULT_DIST_OUT
+                               bool(getattr(args, "night_shifts", False)),
+                               census, census_file or "")
+    # --census は既定の出力先を分けて、正準 11k 台帳を事故で上書きしない。
+    default_out = DEFAULT_CENSUS_OUT if census is not None else DEFAULT_DIST_OUT
+    out = Path(args.orgs_out) if args.orgs_out else default_out
     if not out.is_absolute():
         out = REPO_ROOT / out
     out.write_text(json.dumps(ledger, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -1041,7 +1292,9 @@ def _run_dist_mode(args) -> None:
           f"従業者総和 {st['employees_total']:,} (平均 {st['employees_per_org']}/社)  "
           f"POI割付 {ledger['meta']['poi_coverage']:.1%}")
     if args.report:
-        rep = Path(args.report) if isinstance(args.report, str) else DEFAULT_REPORT
+        default_rep = (REPO_ROOT / "docs" / "research" / "org-book-census.md"
+                       if census is not None else DEFAULT_REPORT)
+        rep = Path(args.report) if isinstance(args.report, str) else default_rep
         if not rep.is_absolute():
             rep = REPO_ROOT / rep
         write_generation_report(ledger, rep)
@@ -1070,9 +1323,15 @@ def main() -> None:
                          "20:00-04:00 の深夜飲食 等)を台帳に載せる(Wave 4 III-1)。"
                          "**既定 OFF = 従来と 1 バイトも変わらない台帳**。ON にした台帳から"
                          "プールを再生成すると L2 に夜勤者が生まれる")
+    ap.add_argument("--census", nargs="?", const=str(DEFAULT_CENSUS_JSON), default=None,
+                    help="経済センサス(令和3)駅周辺集計 JSON で産業構成を較正する(Wave 4 IV-1)。"
+                         "既定パス data/realworld/census_r3/station_area_industry.json は"
+                         "scripts/calibrate_orgs_census.py が生成する。**無指定 = 従来と 1 バイトも"
+                         "変わらない台帳**。指定時は --dist を暗黙に立て、出力先も"
+                         "data/organizations_shibuya_census.json へ分ける(正準台帳を上書きしない)")
     args = ap.parse_args()
 
-    if args.dist:
+    if args.dist or args.census:
         # 分布駆動モードは既定 --map を広域地図へ切替(明示指定があればそれを優先)。
         if args.map == str(DEFAULT_MAP):
             args.map = None

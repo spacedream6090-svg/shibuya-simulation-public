@@ -9,6 +9,19 @@
 
 出典: OpenStreetMap contributors(ODbL)。ダウンロードは Overpass 公式 API のみ使用。
 
+v8 の追加(第101バッチ Wave4 III-2「地図 v8」):
+  - POI に **subcat(サブカテゴリ)** を付ける第2階層。**13 個の top cat は 1 つも動かさない**
+    (day_plan.PLACE_CATS / commerce の営業時間表 / vision の salience 表が cat に依存する)。
+    v7 では OSM の生タグが捨てられており、コンビニ・ネカフェ・サウナ・パチンコ・ゲーセン・
+    神社仏閣・病院・ラブホ・保育が「識別不能」または「そもそも取り込まれない」状態だった。
+  - 取り込み拡大は **v7 が None を返した POI だけ**に効く(下の poi_category を参照:
+    先に v7 と 1 バイト同じ判定を通し、None のときだけ subcat 由来の top cat へ落とす)
+    = v7 で cat が付いていた POI の cat は**構造的に変わりえない**。
+  - POI の重複排除キーを (name, cat) → (name, cat, node) へ。旧キーはチェーン店を
+    全店 1 件へ潰しており、コンビニは実測 93 → 9 件(9 割消失)だった。
+  - --raw-out / --raw-in: Overpass 生データを保存/再利用(同じ取得を何度も投げない礼儀。
+    取得日の違う版・パラメータ違いの版をネットワーク無しで組み直せる)。
+
 v6 の追加:
   - bbox / 取得日 / 出力先をコマンドラインで指定可能(既定=現行範囲・最新)
   - entrance=main/yes/exit ノード(建物外周上)を取り込み building.entrances に格納。
@@ -228,7 +241,121 @@ def point_in_poly(x: float, y: float, poly: list) -> bool:
     return inside
 
 
+# --------------------------------------------------------------------------- #
+# サブカテゴリ(v8)= cat の中の「実態の違い」を運ぶ第2階層。
+#
+# 設計の掟(3つ):
+#   (1) **top cat は増やさない・動かさない**。day_plan.PLACE_CATS(15語)・commerce の
+#       営業時間表(food/shop/nightlife)・vision の salience 表・joint の poi_cat が
+#       cat の語彙に依存しているので、cat を増やすと 4 箇所の意味論が同時にずれる。
+#   (2) subcat は **OSM の生タグからの純関数**。POI 名(ブランド名)は 1 文字も見ない
+#       (ETHICS §2: 実在企業名をソースへ書かない。night.py の subcat_keywords が
+#        「既定で空」なのと同じ線引き)。
+#   (3) 語彙は **閉じた 11 語**。消費側(src/society/night.py の DEFAULT_HOURS /
+#       refuge.subcats)が知っている convenience / net_cafe / sauna / karaoke / club を
+#       含む上位集合で、残り 6 語は「v7 で取りこぼしていた実在業態」。
+#
+# subcat → top cat の割り当て理由(1 語ずつ):
+#   convenience → shop     … v7 でも shop=convenience は cat=shop。**cat は不変**のまま
+#                            24h 営業(night.hours)だけが subcat で引き当てられるようにする。
+#   pachinko    → shop     … v7 で shop=pachinko は既に cat=shop。amenity=gambling だけの
+#                            パーラーも同じ箱へ寄せる(昼から開く遊技場=商業。nightlife に
+#                            移すと 18-05 になり実態<10:00-23:00>から遠のく)。
+#   karaoke     → nightlife… v7 で amenity=karaoke_box は既に nightlife。**cat は不変**。
+#   club        → nightlife… v7 で amenity=nightclub は既に nightlife。**cat は不変**。
+#   net_cafe    → nightlife… v7 では取り込まれず(amenity=internet_cafe はどの分岐にも
+#                            当たらない)。終電後の受け皿=夜の業態なので nightlife。
+#   sauna       → nightlife… 同上(leisure=sauna / amenity=public_bath は v7 で落ちる)。
+#                            銭湯は昼も開くが、既定の窓は leisure(常時)より nightlife
+#                            (18-05)の方が「深夜に開いている」実態に近い。night_economy
+#                            ON では subcat=sauna が 24h を引き当てて上書きする。
+#   arcade      → leisure  … ゲームセンターは遊興施設。leisure は commerce の営業時間表に
+#                            エントリが無い=常時営業扱いで、10:00-23:30 の実態に対して
+#                            shop(10-21)より害が小さい。
+#   worship     → landmark … 神社仏閣・教会は待ち合わせ/目印の場所(city.dests が
+#                            cat=landmark のノードを目的地に載せる)。金王八幡宮が v7 で
+#                            手動パッチ(attraction)だった穴を OSM 側で埋める。
+#   hospital    → service  … v7 は clinic/dentist/pharmacy だけを service にしていた。
+#                            総合病院を同じ箱へ(公共サービス施設)。
+#   love_hotel  → hotel    … 宿泊施設。lodging の宿カテゴリと同じ箱。
+#   childcare   → school   … 保育園・幼稚園。v7 で kindergarten は既に cat=school なので
+#                            **cat は不変**、childcare(認可外・保育所)を同じ箱へ足す。
+SUBCAT_TOPCAT = {
+    "convenience": "shop",
+    "pachinko": "shop",
+    "karaoke": "nightlife",
+    "club": "nightlife",
+    "net_cafe": "nightlife",
+    "sauna": "nightlife",
+    "arcade": "leisure",
+    "worship": "landmark",
+    "hospital": "service",
+    "love_hotel": "hotel",
+    "childcare": "school",
+}
+# 消費側(src/society/night.py)が既に知っている語(v8 で初めて実データが当たる)。
+NIGHT_SUBCATS = ("convenience", "net_cafe", "sauna", "karaoke", "club")
+
+
+# サブカテゴリの判定表(**キーを跨いだ値マッチ**)。上から順に評価する決定論。
+#
+# ★なぜキー(amenity/shop/leisure/tourism)を固定しないのか: 日本の OSM は同じ業態を
+#   別のキーに載せる揺れが大きく、渋谷 bbox の実測(2025-04-01 スナップショット)では
+#     ラブホテル  amenity=love_hotel 63 件 / tourism=love_hotel **0 件**
+#     ゲーセン    leisure=amusement_arcade 3 件 / amenity=amusement_arcade **0 件**
+#                 leisure=adult_gaming_centre 1 件
+#     カラオケ    amenity=karaoke_box 16 件 / leisure=karaoke 2 件
+#     パチンコ    amenity=gambling 8 件 / shop=pachinko **0 件**
+#   だった(= キーで決め打つと、実在する業態の 9 割を取り逃す)。値の方が業態を一意に
+#   指しているので、4 つのキーに載った値の集合で照合する。
+SUBCAT_TAG_VALUES: tuple[tuple[str, frozenset], ...] = (
+    ("convenience", frozenset({"convenience"})),
+    ("pachinko",    frozenset({"pachinko", "gambling"})),
+    ("karaoke",     frozenset({"karaoke_box", "karaoke"})),
+    ("club",        frozenset({"nightclub"})),
+    ("net_cafe",    frozenset({"internet_cafe", "manga_cafe"})),
+    ("sauna",       frozenset({"sauna", "public_bath"})),
+    ("arcade",      frozenset({"amusement_arcade", "adult_gaming_centre"})),
+    ("worship",     frozenset({"place_of_worship"})),
+    ("hospital",    frozenset({"hospital"})),
+    ("love_hotel",  frozenset({"love_hotel"})),
+    ("childcare",   frozenset({"childcare", "kindergarten"})),
+)
+# 業態を載せうる OSM のキー(この 4 つ以外は見ない = 建物タグ等の誤爆を避ける)。
+SUBCAT_TAG_KEYS = ("amenity", "shop", "leisure", "tourism")
+
+
+def poi_subcategory(tags: dict) -> str | None:
+    """OSM タグ → POI サブカテゴリ(閉じた 11 語)。判らなければ None。
+
+    **名前を見ない**(生タグだけの純関数)。判定順は SUBCAT_TAG_VALUES の並び=決定論。
+    ここが返す語は必ず SUBCAT_TOPCAT のキー = 語彙は機械で閉じている。"""
+    values = {tags.get(k) for k in SUBCAT_TAG_KEYS}
+    values.discard(None)
+    if not values:
+        return None
+    for sub, vals in SUBCAT_TAG_VALUES:
+        if values & vals:
+            return sub
+    return None
+
+
 def poi_category(tags: dict, landmark_name_kws: tuple = LANDMARK_NAME_KWS) -> str | None:
+    """OSM タグ → POI カテゴリ(v8: v7 の判定 → 取りこぼしを subcat の top cat で救済)。
+
+    **v7 で cat が付いていた POI の cat は絶対に変わらない**: 先に v7 と 1 バイト同じ
+    `_poi_category_v7` を通し、それが None のときだけ subcat 由来の top cat へ落とす。
+    よって v8 の POI 集合は v7 の**上位集合**(cat の付け替えは起きえない)。"""
+    cat = _poi_category_v7(tags, landmark_name_kws)
+    if cat is not None:
+        return cat
+    sub = poi_subcategory(tags)
+    if sub is not None:
+        return SUBCAT_TOPCAT[sub]
+    return None
+
+
+def _poi_category_v7(tags: dict, landmark_name_kws: tuple = LANDMARK_NAME_KWS) -> str | None:
     """OSM タグ → POI カテゴリ。v6 拡大(ユーザー要望 2026-07-06): 飲食だけでなく
     office(会社)/school(学校)/cinema(映画館)/hall(イベントホール・劇場)/
     landmark(待ち合わせ名所)まで対象を広げる。既存カテゴリ体系(food/nightlife/
@@ -307,7 +434,8 @@ def build(raw: dict, bbox: tuple[float, float, float, float],
           landmark_name_kws=_DEFAULT,
           hachiko_fallback=_DEFAULT,
           map_name: str | None = None,
-          description: str | None = None) -> dict:
+          description: str | None = None,
+          fetched_at: str | None = None) -> dict:
     """OSM 生データ → シミュ地図 JSON。
 
     汎用化(D2): 街固有の定数を引数化。**すべて None/既定=現行渋谷値**なので、位置引数だけで
@@ -567,9 +695,18 @@ def build(raw: dict, bbox: tuple[float, float, float, float],
         name = tags.get("name:ja") or tags.get("name")
         if not cat or not name:
             return
-        if (name, cat) in seen_poi_names:
+        # v8: 重複排除キーに **道路ノード** を足す((name, cat) → (name, cat, node))。
+        #   ★理由(実測): 旧キーはチェーン店を全店 1 件へ潰していた。渋谷 bbox の
+        #     shop=convenience は「名前付き 93 要素 → 9 件」= コンビニの 9 割が地図から
+        #     消えていた(同名ブランドが別の場所に何店もあるのが実態)。夜間経済
+        #     (24h 営業)の受け皿がこれでは成立しない。
+        #   ★同一ノードの同名同カテゴリだけを潰す = 「同じ店がノードとウェイの両方で
+        #     マップされている」二重取りは従来どおり 1 件に畳まれる(元の目的は保つ)。
+        #   ★純増(additive): 残る POI の id は要素 id 由来なので **既存 POI の id は不変**。
+        node = nearest_node(x, y)
+        if (name, cat, node) in seen_poi_names:
             return
-        seen_poi_names.add((name, cat))
+        seen_poi_names.add((name, cat, node))
         host = None
         for b in big_buildings:
             if (abs(x - b["cx"]) < 120 and abs(y - b["cy"]) < 120
@@ -585,7 +722,10 @@ def build(raw: dict, bbox: tuple[float, float, float, float],
                 floor = 0
         p = {"id": f"p_{src_id}", "name": name, "cat": cat,
              "x": round(x, 1), "y": round(y, 1),
-             "node": nearest_node(x, y)}
+             "node": node}
+        sub = poi_subcategory(tags)
+        if sub:                                  # v8: 生タグ由来の第2階層(無ければキーごと無い)
+            p["subcat"] = sub
         if host:
             p["building"] = host["id"]
             p["floor"] = floor
@@ -654,14 +794,27 @@ def build(raw: dict, bbox: tuple[float, float, float, float],
         "version": 6, "name": map_name or "shibuya_osm",
         "description": description or _default_desc,
         "attribution": "© OpenStreetMap contributors (ODbL)",
+        # 出典・ライセンスの明示(data/ は公開ミラー除外だが、由来は地図自身に埋める)。
+        "license": "ODbL 1.0",
+        "license_url": "https://opendatacommons.org/licenses/odbl/1-0/",
+        "source": "OpenStreetMap via Overpass API",
         "origin_latlon": list(origin_ll), "bbox": list(bbox),
         "crs": "local-m",
+        # v8: POI の第2階層。語彙は閉じている(消費側 src/society/night.py が知る 5 語 +6)。
+        "subcat_vocab": sorted(SUBCAT_TOPCAT),
     }
     if osm_date:
         meta["osm_date"] = osm_date
+    if fetched_at:
+        meta["fetched_at"] = str(fetched_at)     # Overpass から取得した UTC 時刻(ISO8601)
+    sub_counts: dict[str, int] = {}
+    for p in pois:
+        if p.get("subcat"):
+            sub_counts[p["subcat"]] = sub_counts.get(p["subcat"], 0) + 1
     meta["_stats"] = {"main_entrance_override": n_main_override,
                       "buildings_with_entrances": n_with_entrances,
-                      "hachiko_source": hachiko_source}
+                      "hachiko_source": hachiko_source,
+                      "subcats": dict(sorted(sub_counts.items()))}
     return {
         "meta": meta,
         "nodes": nodes_out,
@@ -695,6 +848,9 @@ def _report(data: dict, out: Path) -> None:
     print(f"  POI 拡大(v6): office={cats.get('office', 0)} school={cats.get('school', 0)} "
           f"cinema={cats.get('cinema', 0)} hall={cats.get('hall', 0)} "
           f"landmark={cats.get('landmark', 0)}  ハチ公={stats.get('hachiko_source', '?')}")
+    subs = stats.get("subcats", {})
+    detail = " ".join(f"{k}={v}" for k, v in sorted(subs.items())) or "(該当タグ無し)"
+    print(f"  POI subcat(v8): {sum(subs.values())} 件  {detail}")
 
 
 def bbox_center(bbox: tuple[float, float, float, float]) -> tuple[float, float]:
@@ -765,18 +921,36 @@ def main() -> None:
     og.add_argument("--origin-bbox-center", action="store_true",
                     help="原点を bbox の中心に")
     ap.add_argument("--name", default=None, help="地図メタ name(既定=shibuya_osm)")
+    ap.add_argument("--description", default=None,
+                    help="地図メタ description(既定=渋谷の定型文)")
     ap.add_argument("--landmarks-file", default=None,
                     help='ランドマーク表 JSON([[name,lat,lon,cat],...])。既定=渋谷14件')
     ap.add_argument("--no-landmark-kws", action="store_true",
                     help="名称マッチのランドマーク寄せ(ハチ公/モヤイ等)を無効化")
     ap.add_argument("--no-hachiko-fallback", action="store_true",
                     help="名所フォールバック(渋谷ハチ公像)を無効化")
+    # ---- 生データのキャッシュ(v8: 同じ取得を何度も Overpass へ投げない)----
+    ap.add_argument("--raw-out", default=None,
+                    help="Overpass 生データの保存先 JSON(取得時刻を _fetched_at に埋める)")
+    ap.add_argument("--raw-in", default=None,
+                    help="保存済み生データから組む(ネットワーク不使用。--raw-out の出力を渡す)")
     args = ap.parse_args()
 
     bbox = tuple(args.bbox)
-    print(f"Overpass API から取得中... bbox={bbox} date={args.osm_date or '最新'}",
-          file=sys.stderr)
-    raw = fetch_overpass(bbox, args.osm_date)
+    if args.raw_in:
+        raw = json.loads(Path(args.raw_in).read_text(encoding="utf-8"))
+        print(f"生データを再利用: {args.raw_in}(取得 {raw.get('_fetched_at', '?')})",
+              file=sys.stderr)
+    else:
+        print(f"Overpass API から取得中... bbox={bbox} date={args.osm_date or '最新'}",
+              file=sys.stderr)
+        raw = fetch_overpass(bbox, args.osm_date)
+        from datetime import datetime, timezone
+        raw["_fetched_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if args.raw_out:
+            Path(args.raw_out).write_text(json.dumps(raw, ensure_ascii=False),
+                                          encoding="utf-8")
+            print(f"  生データ保存: {args.raw_out}", file=sys.stderr)
     print(f"  elements: {len(raw['elements'])}", file=sys.stderr)
 
     origin, mode = resolve_origin(
@@ -791,7 +965,8 @@ def main() -> None:
     data = build(raw, bbox, args.osm_date, origin=origin, landmarks=landmarks,
                  landmark_name_kws=(() if args.no_landmark_kws else _DEFAULT),
                  hachiko_fallback=(None if args.no_hachiko_fallback else _DEFAULT),
-                 map_name=args.name)
+                 map_name=args.name, description=args.description,
+                 fetched_at=raw.get("_fetched_at"))
     out = Path(args.out)
     if not out.is_absolute():
         out = REPO_ROOT / out

@@ -33,6 +33,10 @@ R1 呼数不変: generate() を1本も足さない。在庫 decrement・(s,S)判
   判定に k・内面状態(構成概念)を一切食わせず、在庫量・時刻(sim_min)・config・物理位置のみ参照する。
   品切れは spend を抑制するだけで移動体・co-location を変えない(補充トリップは agent_id=-1 の
   世界イベント=個体の位置を動かさない)=compute_matched 下の k 不変性で呼数一致を担保する。
+  ★Wave 4 III-4(city_ops)ON のときだけ、delivery_trip の agent_id が **当直の納品ドライバー**に
+  なる(payload に driver / 不在なら unstaffed を足す)。それでも本 module は**誰の位置も動かさない**
+  (ドライバーの持ち場は city_ops.bind が起動時に与えるもので、ここでは帰属を記録するだけ)。
+  city_ops OFF では分岐をどちらも通らず agent_id=-1 と payload 5 キーが従来と完全同一。
 
 既定 OFF(commerce.inventory.enabled=false)= 在庫実体なし・品切れなし・delivery_trip/restock/
   stock_low/stock_out(実在庫版)とも 0 件・所持/ダイジェストも生えない・乱数消費不変(ゴールデン
@@ -43,6 +47,7 @@ from __future__ import annotations
 
 import hashlib
 
+from . import city_ops as _city_ops
 from .observer.schema import Event
 
 # カテゴリ別の既定 (s,S) 較正(正典 §3.4: 生鮮 food は回転が速い=在庫厚め・発注点高め、日用 shop は
@@ -314,10 +319,27 @@ def review_and_order(sim, step: int, sim_min: int) -> None:
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
                              kind="stock_low", x=0.0, y=0.0,
                              payload={"poi": node, "cat": str(cat), "level": int(level)}))
-        sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
-                             kind="delivery_trip", x=0.0, y=0.0,
-                             payload={"from": frm, "to": node, "cat": str(cat),
-                                      "qty": int(qty), "eta": int(arrive)}))
+        # ---- 納品の運転手化(Wave 4 III-4 city_ops。**既定 OFF は 1 バイトも変わらない**)----
+        # ★変えたのは「誰が運んだか」だけ: 発注判定・数量 qty・到着 eta・(s,S) は 1 も動かない。
+        #   city_ops OFF(または運転手が当直に居ない)では下の 2 分岐をどちらも通らないので、
+        #   agent_id=-1 と payload の 5 キーが従来と完全に同一 = ゴールデン L1 バイト一致。
+        #   運転手が居ない ON のランでは unstaffed=true を出す(= 黙って無人で運ばない。
+        #   transit_staff の dwell_decision と同じ「正直な無人マーカー」の作法)。
+        trip_payload = {"from": frm, "to": node, "cat": str(cat),
+                        "qty": int(qty), "eta": int(arrive)}
+        trip_agent_id, trip_x, trip_y = -1, 0.0, 0.0
+        driver = _city_ops.assign_delivery_driver(sim, node, step, sim_min)
+        if driver is not None:
+            trip_agent_id = int(driver.id)
+            trip_x, trip_y = float(driver.x), float(driver.y)
+            trip_payload["driver"] = int(driver.id)
+            _city_ops.note_delivery_trip(sim, True)
+        elif _city_ops.enabled(sim):
+            trip_payload["unstaffed"] = True
+            _city_ops.note_delivery_trip(sim, False)
+        sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=trip_agent_id,
+                             kind="delivery_trip", x=trip_x, y=trip_y,
+                             payload=trip_payload))
         pending[key] = arrive
 
 

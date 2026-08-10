@@ -396,6 +396,30 @@ CAUSE_OF_KIND: dict[str, str] = {
     # ★device: 住居への移行は「相談回数が閾値に達した」ことに制度が反応して起きる
     #   (当人がその step に選んだ行為ではない)。
     "shelter_move":       DEVICE,
+    # ---- 都市運営 = 見えない労働力(Wave 4 III-4。材料側 registration = src/society/city_ops.py)---- #
+    # ★boundary: 起動時 1 回の束ね統計(``workplace_bound`` / ``transit_staff_bound`` と同型)。
+    "city_ops_bound":     BOUNDARY,
+    # ★agent: 収集班がその日の担当地区を回りきった 1 巡回(agent_id = 収集作業員)。
+    #   曜日表は「いつ回るか」を決めるだけで、回るのは人である(``serve`` のスタッフが
+    #   応対した行を agent に置いたのと同じ線引き)。
+    "waste_collection":   AGENT,
+    # ★agent: 夜間清掃は担当ビルに**居る**清掃員の行為(agent_id = 清掃員)。
+    "night_cleaning":     AGENT,
+    # ★physics: 倒れるのは**身体の出来事**であって選択ではない(``illness`` /
+    #   ``wake_up`` / ``health_update`` と同じ族)。引き金は既存の健康状態で、
+    #   本人が「今日はここで倒れる」と決めたわけではない。
+    "collapse":           PHYSICS,
+    # ★agent: **これが救急出動の原因である**(agent_id = 通報者)。居合わせた誰かが
+    #   通報しなければ出動は起きない = 本波で「無主体の時刻表出動」を捨てた理由そのもの。
+    #   近くに誰も居なければ患者本人が通報する(payload.self_call=true・agent_id = 本人)。
+    "ems_call":           AGENT,
+    # ★agent: 通報に応えて現場へ向かう当直の行為(agent_id = 隊員)。因果の親は
+    #   ``ems_call`` で、時刻表でも閾値でもない。当直が居ない回は agent_id=-1 かつ
+    #   payload.unstaffed=true(★装置 id は**与えない**: 救急を運行する装置は世界に
+    #   存在せず、id を作れば無い制度を捏造することになる = DEVICE_STAMPABLE の外に置く
+    #   ため cause_type も device にしない。``dwell_decision`` に train_op を与えられたのは
+    #   運行事業者が既に IF-F W2 で実体化していたからで、ここにその前提は無い)。
+    "ems_dispatch":       AGENT,
     "traffic_flow":  BOUNDARY,       # 背景交通 = エージェントではない通過車両の統計。
                                      #  device_id=traffic:<mode>(ambient / od)= 発生器の同一性。
                                      #  boundary なのに刻むのは DEVICE_STAMPABLE の定義どおり
