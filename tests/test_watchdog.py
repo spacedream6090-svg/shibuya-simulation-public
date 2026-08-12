@@ -251,6 +251,174 @@ def test_backup_generations_rotate_to_keep(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# (e) ディスク残量ガード(レーンREL 2026-08-12)
+#
+# ここは**子プロセスを起こさない純粋な単体テスト**。閾値判定は純関数 `disk_state` に
+# 切り出してあるので、実際にディスクを埋めずに全分岐を踏める(障害注入 drill の
+# 「ダミーファイルでディスクを枯らす」は 8/15 の実機側でやる)。
+# --------------------------------------------------------------------------- #
+GB = 1 << 30
+
+
+def _wd(tmp_path, **opts):
+    """子プロセスを起こさずに Watchdog インスタンスだけ作る。"""
+    argv = ["--run-dir", str(tmp_path / "run")]
+    for k, v in opts.items():
+        argv += [f"--{k.replace('_', '-')}", str(v)]
+    return WD.Watchdog(WD.parse_args(argv + ["--", "noop"]))
+
+
+def _log(wd) -> str:
+    return wd.log_path.read_text(encoding="utf-8")
+
+
+def test_disk_state_thresholds():
+    # 測れない = "unknown"(0 と偽らない)
+    assert WD.disk_state(None, 20.0, 5.0) == "unknown"
+    assert WD.disk_state(100 * GB, 20.0, 5.0) == "ok"
+    assert WD.disk_state(20 * GB, 20.0, 5.0) == "ok"        # 閾値ちょうどは ok
+    assert WD.disk_state(19 * GB, 20.0, 5.0) == "warn"
+    assert WD.disk_state(5 * GB, 20.0, 5.0) == "warn"       # 致命はちょうどでは出ない
+    assert WD.disk_state(4 * GB, 20.0, 5.0) == "critical"
+    assert WD.disk_state(0, 20.0, 5.0) == "critical"
+    # 閾値 0 = その段を使わない
+    assert WD.disk_state(1, 0.0, 0.0) == "ok"
+    assert WD.disk_state(1 * GB, 20.0, 0.0) == "warn"
+    # 設定ミス(crit >= warn)でも「厳しい方が勝つ」だけで壊れない
+    assert WD.disk_state(10 * GB, 5.0, 20.0) == "critical"
+
+
+def test_disk_args_defaults_and_overrides(tmp_path):
+    ns = WD.parse_args(["--run-dir", str(tmp_path)])
+    assert (ns.disk_warn_gb, ns.disk_crit_gb, ns.disk_check_min) == (20.0, 5.0, 5.0)
+    ns = WD.parse_args(["--run-dir", str(tmp_path), "--disk-warn-gb", "200",
+                        "--disk-crit-gb", "50", "--disk-check-min", "0"])
+    assert (ns.disk_warn_gb, ns.disk_crit_gb, ns.disk_check_min) == (200.0, 50.0, 0.0)
+    wd = _wd(tmp_path, disk_warn_gb=200, disk_crit_gb=50, disk_check_min=0)
+    assert wd.disk_warn_gb == 200.0 and wd.disk_crit_gb == 50.0
+    assert wd.disk_check_sec == 0.0                        # 0 = 監視しない
+
+
+def test_disk_free_bytes_uses_existing_ancestor(tmp_path, monkeypatch):
+    """まだ作られていない backup-dir でも、実在する祖先で測れる。"""
+    deep = tmp_path / "not" / "yet" / "there"
+    assert WD._existing_ancestor(deep) == tmp_path
+    assert WD.disk_free_bytes(deep) == WD.disk_free_bytes(tmp_path)
+    assert WD.disk_free_bytes(deep) > 0
+
+    def _boom(_p):                                 # 測れない環境(権限・特殊 FS 等)
+        raise OSError("nope")
+
+    monkeypatch.setattr(WD.shutil, "disk_usage", _boom)
+    assert WD.disk_free_bytes(deep) is None        # 0 と偽らない
+
+
+def test_check_disk_logs_one_line_and_stays_quiet_when_ok(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(WD, "disk_free_bytes", lambda p: 100 * GB)
+    wd = _wd(tmp_path)
+    wd.check_disk()
+    lines = [ln for ln in _log(wd).splitlines() if "disk " in ln]
+    assert len(lines) == 1, lines
+    assert "free=100.0GB" in lines[0] and "state=ok" in lines[0]
+    assert "[watchdog]" not in capsys.readouterr().out    # 正常時はコンソールに出さない
+
+
+def test_check_disk_warns_below_threshold(tmp_path, monkeypatch):
+    monkeypatch.setattr(WD, "disk_free_bytes", lambda p: 10 * GB)
+    wd = _wd(tmp_path)
+    wd.check_disk()
+    log = _log(wd)
+    assert "state=warn" in log
+    assert "WARN disk" in log
+    assert "DISK CRITICAL" not in log
+    assert wd.last_disk["state"] == "warn" and wd.last_disk["free_gb"] == 10.0
+
+
+def test_check_disk_critical_is_emphasised_before_backup(tmp_path, monkeypatch):
+    monkeypatch.setattr(WD, "disk_free_bytes", lambda p: 2 * GB)
+    wd = _wd(tmp_path)
+    wd.check_disk(tag="backup gen step=144")
+    log = _log(wd)
+    assert "*** DISK CRITICAL ***" in log
+    assert "backup gen step=144 の直前" in log
+    assert "ランは止めない" in log                          # 止める判断は人間に残す
+
+
+def test_do_backup_checks_disk_first(tmp_path, monkeypatch):
+    """世代コピー(run 中で最大の書き込み)の直前に必ず 1 回測る。"""
+    seen = []
+    monkeypatch.setattr(WD, "disk_free_bytes", lambda p: seen.append(p) or (3 * GB))
+    wd = _wd(tmp_path)
+    ck = wd.run_dir / "checkpoint"
+    ck.mkdir(parents=True, exist_ok=True)
+    (ck / "ckpt-000010.pkl.gz").write_bytes(b"dummy")
+    wd._do_backup(10)
+    assert seen, "backup 前に残量を測っていない"
+    log = _log(wd)
+    assert "*** DISK CRITICAL ***" in log and "backup gen step=10" in log
+    assert "backup gen created" in log                     # 警告だけ・バックアップは続く
+    assert len(list(wd.backup_dir.glob("gen-*"))) == 1
+
+
+def test_disk_unknown_is_logged_once_then_silent(tmp_path, monkeypatch):
+    monkeypatch.setattr(WD, "disk_free_bytes", lambda p: None)
+    wd = _wd(tmp_path)
+    wd.check_disk()
+    wd.check_disk()
+    assert _log(wd).count("free=unknown") == 1
+    assert wd.last_disk["state"] == "unknown" and wd.last_disk["free_gb"] is None
+
+
+def test_disk_targets_split_when_backup_is_on_another_volume(tmp_path, monkeypatch):
+    monkeypatch.setattr(WD, "disk_free_bytes", lambda p: 50 * GB)
+    wd = _wd(tmp_path)
+    assert len(wd._disk_targets()) == 1                     # 同一ボリューム = 1 本
+    monkeypatch.setattr(WD, "_volume_key",
+                        lambda p: "R" if "backup" in str(p) else "L")
+    assert [lbl for lbl, _ in wd._disk_targets()] == ["run", "backup"]
+    wd.check_disk()
+    assert _log(wd).count("state=ok") == 2
+    assert len(wd.last_disk["targets"]) == 2
+    # 消費側が常に読める形(run ボリュームの値が最上位)であること
+    assert wd.last_disk["label"] == "run" and wd.last_disk["free_gb"] == 50.0
+
+
+def test_maybe_check_disk_respects_interval(tmp_path, monkeypatch):
+    monkeypatch.setattr(WD, "disk_free_bytes", lambda p: 100 * GB)
+    wd = _wd(tmp_path, disk_check_min=1)                    # 60s 間隔
+    wd._maybe_check_disk(1000.0)
+    wd._maybe_check_disk(1001.0)                            # 間隔内 = 測らない
+    assert _log(wd).count("disk run=") == 1
+    wd._maybe_check_disk(1000.0 + 61.0)
+    assert _log(wd).count("disk run=") == 2
+
+
+def test_disk_monitoring_off_writes_nothing(tmp_path, monkeypatch):
+    """--disk-check-min 0 = 残量監視を丸ごと切る(世代バックアップ直前の点検も黙る)。"""
+    monkeypatch.setattr(WD, "disk_free_bytes", lambda p: 1 * GB)
+    wd = _wd(tmp_path, disk_check_min=0)
+    wd._maybe_check_disk(1000.0)
+    ck = wd.run_dir / "checkpoint"
+    ck.mkdir(parents=True, exist_ok=True)
+    (ck / "ckpt-000010.pkl.gz").write_bytes(b"dummy")
+    wd._do_backup(10)
+    log = _log(wd)
+    assert "disk " not in log and "DISK CRITICAL" not in log
+    assert "backup gen created" in log             # バックアップ自体は普通に走る
+
+
+def test_status_json_carries_disk(tmp_path, monkeypatch):
+    monkeypatch.setattr(WD, "disk_free_bytes", lambda p: 7 * GB)
+    wd = _wd(tmp_path)
+    wd.check_disk()
+    wd.write_status("running", pid=123)
+    st = _status(wd.run_dir)
+    assert st["disk"]["state"] == "warn"
+    assert st["disk"]["free_gb"] == 7.0
+    assert st["disk"]["warn_gb"] == 20.0 and st["disk"]["crit_gb"] == 5.0
+
+
+# --------------------------------------------------------------------------- #
 # 実 run.py の煙テスト: mock 20人×48step / checkpoint_every=12 → 正常終了
 # --------------------------------------------------------------------------- #
 def test_real_run_py_smoke_completes(tmp_path):

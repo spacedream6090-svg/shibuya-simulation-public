@@ -37,6 +37,20 @@ LLM 健全性の監視(P0バッチ 2026-07-29 追加)
   stdlib 限定方針を壊さないため import は関数内・失敗許容)。
 - 事後(ラン終了後)の点検は `python scripts/watchdog_llm.py <run-dir>` を使う。
 
+ディスク残量ガード(レーンREL 2026-08-12 追加)
+----------------------------------------------
+- 監視サイクルごと(`--disk-check-min`・既定5分)に **ラン対象ドライブの空き容量を1行**
+  watchdog.log へ記録する(`disk run=... free=..GB state=ok`)。backup-dir が別ボリュームなら
+  そちらも 1 行。
+- `--disk-warn-gb`(既定20GB)を下回ると **警告**(コンソールにも出す)。
+  `--disk-crit-gb`(既定5GB)を下回ると **致命警告**とし、さらに
+  **世代バックアップ(= 新しい checkpoint コピー)を書く直前**に強調して警告する
+  (数十GBのコピーがディスクを踏み抜く直前の最後の一声)。
+- **警告のみ。ランは絶対に止めない**(llm_fallback_rate と同じ流儀)。何を消すか=
+  checkpoint 世代の剪定か転送済み世代の削除か、は**人間の判断**に残す。
+- 空き容量は `shutil.disk_usage`(stdlib)。取得できない環境では state="unknown" として
+  1 回だけ記録し、以後は黙る(欠測を 0 と偽らない)。
+
 記録
 ----
 - `<run-dir>/watchdog.log`: タイムスタンプ付きの全アクション。
@@ -65,10 +79,65 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RUN_PY = REPO_ROOT / "scripts" / "run.py"
 CKPT_GLOB = "ckpt-*.pkl.gz"
 PART_GLOB = "*.part-*.parquet"
+GB = float(1 << 30)
 
 
 def _now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+# --------------------------------------------------------------------------- #
+# ディスク残量(純関数で切り出す = 閾値判定を単体テストできるように)
+# --------------------------------------------------------------------------- #
+def disk_state(free_bytes: int | None, warn_gb: float, crit_gb: float) -> str:
+    """空き容量の状態を返す: "unknown" | "critical" | "warn" | "ok"。
+
+    - `free_bytes is None`(取得できなかった)は **"unknown"**。0 と偽らない。
+    - 閾値 0 以下は「その段を使わない」の意味(--disk-warn-gb 0 で無効化)。
+    - 致命判定が先。crit >= warn という設定ミスをしても「より厳しい方」が勝つだけで、
+      判定が壊れることはない。
+    """
+    if free_bytes is None:
+        return "unknown"
+    free_gb = float(free_bytes) / GB
+    if crit_gb > 0 and free_gb < crit_gb:
+        return "critical"
+    if warn_gb > 0 and free_gb < warn_gb:
+        return "warn"
+    return "ok"
+
+
+def _existing_ancestor(path: Path) -> Path | None:
+    """まだ作られていない dir(例: backup-dir)でも測れるよう、実在する祖先まで遡る。"""
+    p = path
+    while True:
+        if p.exists():
+            return p
+        if p.parent == p:
+            return None
+        p = p.parent
+
+
+def disk_free_bytes(path: Path) -> int | None:
+    """path が載っているボリュームの空きバイト。測れなければ None(捏造しない)。"""
+    base = _existing_ancestor(Path(path))
+    if base is None:
+        return None
+    try:
+        return int(shutil.disk_usage(str(base)).free)
+    except OSError:
+        return None
+
+
+def _volume_key(path: Path):
+    """同一ボリュームかの判定キー(Windows はドライブ、POSIX は st_dev)。"""
+    base = _existing_ancestor(Path(path))
+    if base is None:
+        return None
+    try:
+        return os.stat(str(base)).st_dev
+    except OSError:
+        return str(base.anchor) or None
 
 
 def _ckpt_step(path: Path | None) -> int | None:
@@ -106,6 +175,13 @@ class Watchdog:
         self._health_unavailable_logged = False
         self._health_warned = False
         self.last_health: dict | None = None
+        # ---- ディスク残量ガード(レーンREL)----
+        self.disk_warn_gb = float(getattr(args, "disk_warn_gb", 20.0) or 0.0)
+        self.disk_crit_gb = float(getattr(args, "disk_crit_gb", 5.0) or 0.0)
+        self.disk_check_sec = float(getattr(args, "disk_check_min", 5.0) or 0.0) * 60.0
+        self._disk_next_t = 0.0
+        self._disk_unavailable_logged = False
+        self.last_disk: dict | None = None
 
         # --- 監督状態 ---
         self.restarts = 0
@@ -144,6 +220,8 @@ class Watchdog:
         }
         if self.last_health is not None:      # P0バッチ: 直近の LLM 健全性(監視できたときのみ)
             data["llm_health"] = self.last_health
+        if self.last_disk is not None:        # レーンREL: 直近のディスク残量
+            data["disk"] = self.last_disk
         tmp = self.status_path.with_name(self.status_path.name + ".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
                        encoding="utf-8")
@@ -267,6 +345,68 @@ class Watchdog:
                      f"(step={health.get('step')})", echo=False)
 
     # ------------------------------------------------------------------ #
+    # ディスク残量ガード(レーンREL。警告のみ・プロセスは止めない)
+    # ------------------------------------------------------------------ #
+    def _disk_targets(self) -> list[tuple[str, Path]]:
+        """測るべきパス。backup-dir が run-dir と別ボリュームなら 2 本になる。"""
+        out: list[tuple[str, Path]] = [("run", self.run_dir)]
+        kr, kb = _volume_key(self.run_dir), _volume_key(self.backup_dir)
+        if kb is not None and kb != kr:
+            out.append(("backup", self.backup_dir))
+        return out
+
+    def check_disk(self, tag: str | None = None) -> dict | None:
+        """残量を 1 行ずつ記録し、閾値を跨いでいれば警告する。**止めない**。
+
+        `tag` は「いつの点検か」(例: "before backup gen step=144")。致命閾値を
+        下回っているときだけ、tag を添えて強調警告する = 大きなコピーを始める直前の
+        最後の一声。何を消すかの判断は人間に残す(自動で剪定はしない)。
+        """
+        snaps: list[dict] = []
+        for label, path in self._disk_targets():
+            free = disk_free_bytes(path)
+            state = disk_state(free, self.disk_warn_gb, self.disk_crit_gb)
+            snap = {"label": label, "path": str(path), "state": state,
+                    "free_gb": (round(free / GB, 2) if free is not None else None),
+                    "warn_gb": self.disk_warn_gb, "crit_gb": self.disk_crit_gb,
+                    "checked": _now_iso()}
+            snaps.append(snap)
+            if state == "unknown":
+                if not self._disk_unavailable_logged:
+                    self._disk_unavailable_logged = True
+                    self.log(f"disk {label}={path} free=unknown "
+                             "(shutil.disk_usage が測れない環境。以後は黙る)",
+                             echo=False)
+                continue
+            free_gb = free / GB
+            line = (f"disk {label}={path} free={free_gb:.1f}GB state={state} "
+                    f"(warn<{self.disk_warn_gb:g}GB crit<{self.disk_crit_gb:g}GB)")
+            self.log(line, echo=(state != "ok"))
+            if state == "critical":
+                self.log(f"*** DISK CRITICAL *** {label} の空きが {free_gb:.1f}GB "
+                         f"(< {self.disk_crit_gb:g}GB)"
+                         + (f" — {tag} の直前" if tag else "")
+                         + "。checkpoint 世代の剪定 / 転送済みバックアップ世代の削除を"
+                           "検討すること(ランは止めない=停止判断は人間)")
+            elif state == "warn":
+                self.log(f"WARN disk {label} の空きが {free_gb:.1f}GB "
+                         f"(< {self.disk_warn_gb:g}GB)。残り日数×日次増分を見積もって"
+                         "退避・剪定の計画を(ランは継続する)")
+        # status.json 用: **常に run ボリュームの値を最上位**に置く(消費側が
+        # `status["disk"]["free_gb"]` で必ず読める)。別ボリュームがあるときだけ targets を足す。
+        primary = dict(snaps[0])
+        if len(snaps) > 1:
+            primary["targets"] = snaps
+        self.last_disk = primary
+        return self.last_disk
+
+    def _maybe_check_disk(self, now: float) -> None:
+        if self.disk_check_sec <= 0 or now < self._disk_next_t:
+            return
+        self._disk_next_t = now + max(self.disk_check_sec, 30.0)
+        self.check_disk()
+
+    # ------------------------------------------------------------------ #
     # バックアップ(世代管理)
     # ------------------------------------------------------------------ #
     def _gen_step(self, gen: Path) -> int:
@@ -294,6 +434,11 @@ class Watchdog:
             self.last_backup_time = now
 
     def _do_backup(self, step: int) -> None:
+        # 世代コピー(checkpoint+part 群)は run 中で最も大きな書き込み。踏み抜く前に一声。
+        # (--disk-check-min 0 = 残量監視そのものを切る、なのでここも黙る)
+        if self.disk_check_sec > 0:
+            self.check_disk(tag=f"backup gen step={step}")
+            self._disk_next_t = time.monotonic() + max(self.disk_check_sec, 30.0)
         self.backup_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         gen = self.backup_dir / f"gen-{step:06d}-{ts}"
@@ -470,6 +615,7 @@ class Watchdog:
                     self._maybe_backup(pending_step)
                     pending_step = None
                 self._maybe_check_llm_health(now)   # P0バッチ: 警告のみ(kill しない)
+                self._maybe_check_disk(now)         # レーンREL: 残量1行+閾値警告(止めない)
 
             uptime = time.monotonic() - start
 
@@ -496,6 +642,9 @@ class Watchdog:
         self.log(f"watchdog start. run_dir={self.run_dir} "
                  f"backup_dir={self.backup_dir} max_restarts={self.max_restarts} "
                  f"stall={self.stall_sec:.0f}s")
+        if self.disk_check_sec > 0:                 # 起動直後に残量の基準線を 1 行残す
+            self.check_disk(tag="watchdog start")
+            self._disk_next_t = time.monotonic() + max(self.disk_check_sec, 30.0)
         if (self.run_dir / "summary.json").exists():
             self.log("summary.json already present; run already complete. "
                      "nothing to do (delete it to force a fresh run).")
@@ -600,6 +749,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         "警告のみでランは止めない。observer.llm_health.enabled=true が前提")
     p.add_argument("--health-check-min", type=float, default=10.0,
                    help="LLM 健全性の点検間隔・分(既定10。最小30秒)")
+    p.add_argument("--disk-warn-gb", type=float, default=20.0,
+                   help="空き容量がこれを下回ったら警告・GB(既定20=安全側。0=警告しない)。"
+                        "警告のみでランは止めない")
+    p.add_argument("--disk-crit-gb", type=float, default=5.0,
+                   help="空き容量がこれを下回ったら致命警告・GB(既定5)。世代バックアップを"
+                        "書く直前にも強調して出す(0=致命段を使わない)")
+    p.add_argument("--disk-check-min", type=float, default=5.0,
+                   help="残量の点検・記録の間隔・分(既定5。最小30秒。0=監視しない)")
     p.add_argument("--cmd", default=None,
                    help="テスト用フック: 起動する基底コマンドを上書き"
                         "(既定は `python scripts/run.py`)")
