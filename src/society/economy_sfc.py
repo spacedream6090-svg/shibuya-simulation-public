@@ -184,6 +184,12 @@ CHANNELS_OUT: tuple[str, ...] = (
     # 東京消防庁 = 都**であって街の中に運行主体の org は 1 つも存在しない(計画書 §7 の
     # 「管轄混同」への回答)。したがって受け手は街の外 = 本チャネルへ落とす。
     "ems_operation",
+    # 所有権レイヤー O3(相続。src/society/assets.py): **相続人が 1 人も居ない**死者の遺産は
+    # 民法 959 条により国庫へ帰属する。国は街の中に居ない(区でも都でもない)ので、
+    # 新部門を作らず**名前のある RoW チャネル**として正直に開示する(insurance_reimbursement /
+    # ems_operation と同じ流儀)。★これが無いと「死者の財布」に凍結されていた金が
+    # 相続を入れた瞬間に世界から消え、閉じた不変量 city + RoW + K5 が破れる。
+    "inheritance_escheat",
 )
 CHANNELS: tuple[str, ...] = CHANNELS_IN + CHANNELS_OUT
 
@@ -209,6 +215,13 @@ COVERED_KINDS: frozenset[str] = frozenset({
     # ---- H2 医療(身体と事件のレイヤー。既定 OFF)----
     "ems_transport",  # 救急搬送の公費 = 区(ward)の歳出 → RoW(ems_operation)
     "medical_bill",   # 保険給付 7 割 = RoW(insurance_reimbursement)→ 医療機関 org
+    # ---- H3 遺失物(第109バッチ D2 で解析側の分類器へ接続。既定 OFF)----
+    # 4 種とも ``on_lost_hold`` / ``on_lost_release`` / ``on_lost_lapse`` で本 module の
+    # ``lost`` バケツを経由済み(= 残高に接続されている)。街の外(RoW)は 1 度も通らない。
+    "lost_drop",      # 落下 = 財布の中の現金が所持金から遺失物バケツへ(``on_lost_hold``)
+    "lost_return",    # 返還 = 遺失物バケツ → 落とし主 + 報労金(落とし主 → 拾得者)
+    "lost_keep",      # 着服 = 遺失物バケツ → 拾得者(受け手が特定できるので K5 ではない)
+    "lost_expire",    # 時効取得 = バケツ → 拾得者 / 失効 = K5(``on_lost_lapse``)
 })
 #: **接続できていない**金額運搬種と、その理由(ゼロと偽らない)。IF-E の監視装置と対で持つ。
 #: ★第98バッチで**空になった**。辞書と ``summary.org_accounting.uncovered_kinds_declared`` は
@@ -805,6 +818,24 @@ def on_theft(sim, amount: float) -> str | None:
     if not enabled(sim):
         return None
     return k5_out(sim, "theft", float(amount))     # 0 でもトークンは返す(row_* と同じ流儀)
+
+
+def on_inheritance_escheat(sim, amount: float) -> str | None:
+    """★相続人不存在の遺産 = **国庫へ帰属**(民法 959 条)。所有権レイヤー O3 の唯一の口。
+
+    ``on_theft`` と違って**取引である**(法定の移転であって、相互合意の欠如ではない)ので
+    K5 ではなく RoW へ落とす。受け手の国は街の中に居ないため ``inheritance_escheat`` チャネル。
+    相続人が居る回は家計 → 家計の内部移転で街の総額が 1 円も動かないので、ここは呼ばれない。
+
+    ``amount`` は**丸める前の実移動額**(現金 + 口座残高)を渡すこと。IF-E2 が OFF のランでは
+    即 return して ``sim._sfc_state`` を生やさない(相手の「OFF ではキー自体を作らない」規約を
+    こちらから壊さない = ``on_lost_lapse`` と同じ作法)。"""
+    if not enabled(sim):
+        return None
+    amt = float(amount)
+    if amt <= 0.0:
+        return None
+    return row_out(sim, "inheritance_escheat", amt)
 
 
 def on_chance(sim, kind: str, amount: float) -> str | None:

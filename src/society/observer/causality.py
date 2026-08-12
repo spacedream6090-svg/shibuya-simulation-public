@@ -434,6 +434,15 @@ CAUSE_OF_KIND: dict[str, str] = {
     # ★schedule: 3 か月時効(遺失物法 7 条)も路上の物の失効も、**暦が来たから**起きる
     #   (``crowd_surge`` / ``annual_event`` と同じ族)。誰も何も選んでいない。
     "lost_expire":   SCHEDULE,
+    # ---- 所有権レイヤー O1+O3(材料側 registration = src/society/assets.py)---- #
+    # ★device: 相続も売買による登記の書換も、**制度(民法・登記)が世界状態に反応して**発火する
+    #   (分類の原則 2)。死んだ本人は相続を選んでいないし、転居した本人が選んだのは転居であって
+    #   所有権の移転ではない。``rule_expired`` / ``shelter_move`` と同じ族。
+    # ★device_id は与えない: 登記所という装置を世界に実体化していないので、id を作れば
+    #   無い制度を捏造することになる(``ems_dispatch`` の判断と同じ)。本 module は
+    #   ``devices.cause_scope`` の外で発火するので、DEVICE でも device_id は原理的に付かない。
+    "inheritance":    DEVICE,        # agent_id = 故人(相続人は payload の件数のみ)
+    "asset_transfer": DEVICE,        # agent_id = 当事者(from / to は payload の party id)
     # ---- 都市運営 = 見えない労働力(Wave 4 III-4。材料側 registration = src/society/city_ops.py)---- #
     # ★boundary: 起動時 1 回の束ね統計(``workplace_bound`` / ``transit_staff_bound`` と同型)。
     "city_ops_bound":     BOUNDARY,

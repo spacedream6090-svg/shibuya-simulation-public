@@ -130,6 +130,87 @@ def test_registry_declares_every_toggle():
     assert feats["incidents_env.traffic.signalized_only"].off_value is False
 
 
+def test_responder_vocabulary_moved_from_src_to_conf_without_changing_it():
+    """★第109バッチ D2: 担い手の語を src ハードコードから conf キーへ。**前後同値**。
+
+    (a) 既定(conf 無指定)= module 定数と 1 語も違わない
+    (b) conf/config.yaml の宣言値 = module 定数と 1 語も違わない(基底を動かしていない)
+    (c) src には**ハードコードした frozenset が 1 つも残っていない**
+    """
+    empty = IE.build_cfg(None)
+    assert empty["fire"]["occupations"] == IE.FIRE_OCCS
+    assert empty["crowd"]["guard_occupations"] == IE.GUARD_OCCS
+    shipped = IE.build_cfg(load_config().incidents_env)
+    assert shipped["fire"]["occupations"] == IE.FIRE_OCCS
+    assert shipped["crowd"]["guard_occupations"] == IE.GUARD_OCCS
+    text = MODULE.read_text(encoding="utf-8")
+    assert "frozenset(FIRE_OCCS)" not in text and "frozenset(GUARD_OCCS)" not in text, \
+        "src のハードコードが残っている(conf で差し替えられない)"
+
+
+def test_responder_vocabulary_is_canonicalised_like_the_other_word_lists():
+    """語リストの正準化は既存の作法どおり(空 → 既定へ戻す・str 1 個 → 1 要素・宣言順保存)。"""
+    got = IE.build_cfg({"fire": {"occupations": []},
+                        "crowd": {"guard_occupations": ""}})
+    assert got["fire"]["occupations"] == IE.FIRE_OCCS          # 空は既定へ戻す
+    assert got["crowd"]["guard_occupations"] == IE.GUARD_OCCS
+    got = IE.build_cfg({"fire": {"occupations": "消防隊員"},
+                        "crowd": {"guard_occupations": ["常駐警備", "警備員", "警察官"]}})
+    assert got["fire"]["occupations"] == ("消防隊員",)
+    assert got["crowd"]["guard_occupations"] == ("常駐警備", "警備員", "警察官")  # 宣言順
+
+
+def test_fire_crew_is_selected_by_the_conf_vocabulary(tmp_path):
+    """★conf の語が実際に出場者の選抜へ届く(既定は名簿に居ない = 正直な unstaffed)。"""
+    common = {"incidents_env.fire.max_per_day": "1",
+              "incidents_env.fire.discover_radius_m": "1e9"}
+
+    def _one(name, occupation, **ov):
+        sim = _fire_sim(tmp_path, name, **{**common, **ov})
+        finder, crew = sim.agents[0], sim.agents[1]
+        _exile(sim, keep=(finder, crew))
+        node = sim.city.station_node or sorted(sim.city.graph.nodes)[0]
+        _place(sim, finder, node)
+        _place(sim, crew, node)
+        crew.occupation = occupation
+        crew.work_start_min, crew.work_end_min = 0, 1440
+        crew.sick = False
+        IE.phase(sim, 0, 0)
+        return sim, _kind(sim, "fire_dispatch")
+
+    # (a) 名簿に「消防士」が居ない世界 = 既定のままでは出場者ゼロ(黙って埋めない)
+    sim_a, disp_a = _one("ie_occ_default", "設備巡回")
+    assert len(disp_a) == 1 and disp_a[0].payload["unstaffed"] is True
+    assert sim_a._incenv_state["fire_unstaffed"] == 1
+    # (b) conf で名簿に実在する語を指すと、**同じ世界**で出場者が立つ
+    sim_b, disp_b = _one("ie_occ_conf", "設備巡回",
+                         **{"incidents_env.fire.occupations": "[設備巡回]"})
+    assert len(disp_b) == 1 and disp_b[0].payload["unstaffed"] is False
+    assert disp_b[0].agent_id == sim_b.agents[1].id
+
+
+def test_guard_count_is_read_through_the_conf_vocabulary(tmp_path):
+    """雑踏警備の頭数も conf の語から数える(**読むだけ** = 世界は 1 バイトも動かない)。"""
+    sim = _sim(tmp_path, "ie_guard_occ", n_steps=1, **ON)
+    for agent in sim.agents[:3]:
+        agent.occupation = "常駐警備"
+    assert IE._roster_n(sim, IE.GUARD_OCCS) == 0        # 既定の語は名簿に居ない
+    assert IE._roster_n(sim, ("常駐警備",)) == 3
+    assert IE.build_cfg({"crowd": {"guard_occupations": ["常駐警備"]}})[
+        "crowd"]["guard_occupations"] == ("常駐警備",)
+
+
+def test_provenance_declares_the_responder_vocabulary_and_its_roster(tmp_path):
+    """★第108 縦煙の教訓: 「較正が外れた」のか「名簿に居ない」のかを成果物が申告する。"""
+    sim = _sim(tmp_path, "ie_roster", n_steps=1, n_agents=15, **ON)
+    prov = IE.provenance(sim)
+    assert prov["fire_occupations"] == list(IE.FIRE_OCCS)
+    assert prov["guard_occupations"] == list(IE.GUARD_OCCS)
+    assert prov["fire_roster"] == 0, "既定名簿に消防士が居る(テストの前提が変わった)"
+    sim.agents[0].occupation = "消防士"
+    assert IE.provenance(sim)["fire_roster"] == 1
+
+
 def test_every_new_kind_is_registered_and_classified():
     for kind in NEW_KINDS:
         assert kind in EVENT_KINDS, kind

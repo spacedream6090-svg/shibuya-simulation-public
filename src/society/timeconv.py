@@ -331,6 +331,11 @@ TABLE: tuple[tuple[str, str, str], ...] = (
      "1 step に出す遺失物イベントの上限 [件/step](1日あたりの総量を保つ安全弁)"),
     ("lost_property.base_daily.*", INVARIANT,
      "落下率は **件/人日**(Δt 非依存)。per-step 化は module 側で steps_per_day で割る"),
+    # 所有権レイヤー O1+O3。L1 の安全弁だけが「件/step」= 1 日あたりの総量を保つ。
+    # ★これ以外の world.assets のキーは Δt 非依存: 持ち家率・法人家主比率は**割合**、
+    #   家主 org 数と台帳行数の上限は**個数**で、いずれも実時間の単位を持たない。
+    ("world.assets.max_events_per_step", RATE,
+     "1 step に出す所有権イベント(相続・権利移転)の上限 [件/step](1日あたりの総量を保つ安全弁)"),
     # H4(対人 = RAT収束)。酩酊の残存と勾留の長さは**実時間で同じ長さ**を保つ。
     # ★これ以外の incidents_interpersonal のキーは Δt 非依存(ペア条件付き確率・重み・
     #   閾値・分 of day の時刻帯)なので TABLE に載せない。

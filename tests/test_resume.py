@@ -553,3 +553,212 @@ def test_worldview_checkpoint_state_is_pure_read(tmp_path):
     # OFF のランでは None(既定 OFF=挙動不変)
     off = Simulation(_cfg("wvp_off", 1), out_dir=tmp_path / "wvp_off")
     assert _wv.checkpoint_state(off) is None
+
+
+# ======================================================= レーン D1(第109: 縦煙 +106 行の根治)
+# 第108 の全ON縦煙(relations + friend_graph + joint + party + pool を同時 ON)で L1 が
+# +106 行(+0.89%)食い違った。原因は 2 系統あり、どちらも第98 の監査の**網の外**だった:
+#
+#   (系統1)**起動時 1 回の発火体**が resume した 2 つ目のプロセスの __init__ でもう一度
+#           走り、step=0 のイベントを同一 payload で二重に積む。第98 W4-A は spark_roster
+#           **1 種だけ**を名指しで塞いでいたので、friend_graph_built(+1)と
+#           party の joint_activity(+97)は素通りしていた。
+#           → checkpoint が「__init__ が出し終えた時点のバッファ長」を運び、load 側が
+#             その本数を先頭から捨てる(種を名指ししない = 将来の発火体も自動で守る)。
+#
+#   (系統2)**「1 日 1 件」/「走査済み」ガードの未保存**(第80 W2 と同型)。
+#           signal_summary(+1)・viral_cascade(+3)・misinfo(+2)+その副作用の
+#           state_update(+1)。特に情報環境の watermark は **sim.net の投稿 id 空間**由来
+#           なので「load で 0 に戻す」流儀が通用せず、既に処理済みの投稿を全部走査し直して
+#           reshares を二重加算していた(観測だけでなく世界状態が壊れる)。
+def test_resume_startup_segment_recorded_once(tmp_path):
+    """★系統1: friend_graph ON の resume で friend_graph_built が **1 件のまま**。
+
+    friends.build_friend_graph は Simulation.__init__ から呼ばれ step=0 のイベントを 1 件
+    出す(spark.apply と同型)。従来は resume した 2 つ目のプロセスが同じ 1 件を出し直し、
+    結合後の L1 に 2 件並んでいた。全層一致も併せて固定する。
+    """
+    ov = {"relations.enabled": "true", "friend_graph.enabled": "true"}
+    straight = _run_straight(tmp_path, "fg_straight", 40, **ov)
+    resumed = _run_resume(tmp_path, "fg_resumed", 20, 40, **ov)
+    n_st = sum(1 for r in _rows(straight, "l1_events") if r["kind"] == "friend_graph_built")
+    n_rs = sum(1 for r in _rows(resumed, "l1_events") if r["kind"] == "friend_graph_built")
+    assert n_st == 1, "straight で friend_graph_built が 1 件でない(テスト前提が崩れた)"
+    assert n_rs == 1, f"resume で friend_graph_built が二重記録されている: {n_rs} 件"
+    for stem in ("l1_events", "l2_metrics", "l3_snapshots"):
+        assert _rows(straight, stem) == _rows(resumed, stem), f"{stem} 不一致(friend_graph)"
+
+
+def test_init_event_mark_counts_the_startup_segment(tmp_path):
+    """`_init_event_mark` が「__init__ が出したイベント本数」そのものである(空回り防止)。
+
+    起動時セグメントが**実在する**構成(friend_graph ON)で > 0 になり、バッファの中身と
+    本数が一致すること・OFF 相当の素の構成では 0 になることを直接押さえる。ここが空だと
+    上のテストは「たまたま一致しているだけ」になりうる。
+    """
+    on = Simulation(_cfg("mark_on", 1, **{"relations.enabled": "true",
+                                          "friend_graph.enabled": "true"}),
+                    out_dir=tmp_path / "mark_on")
+    assert on._init_event_mark == len(on.logger.events) > 0
+    assert any(e.kind == "friend_graph_built" for e in on.logger.events)
+    off = Simulation(_cfg("mark_off", 1), out_dir=tmp_path / "mark_off")
+    assert off._init_event_mark == len(off.logger.events) == 0
+
+
+def test_resume_infoenv_watermark_no_rescan(tmp_path):
+    """★系統2: info_env ON の resume で走査済み投稿を**引き直さない**(全層一致)。
+
+    `_infoenv_watermark` は他の watermark と違い **sim.net の絶対投稿 id** 由来なので、
+    「load で 0 に戻す」流儀では既処理の投稿を全部走査し直す。`_viral_done`(1 投稿 1 回の
+    加重)も同時に空へ戻るため、viral_cascade を再発火して reshares を二重加算し、
+    misinfo は別 step キーで引き直されて炎上が捏造されていた。
+
+    第109 縦煙の viral_cascade +3 / misinfo +2 / state_update +1 はこの 1 本の穴で説明できる
+    (state_update は `flame_grievance>0` のときの炎上 → 発信者の不満更新 = misinfo の副作用。
+    既定 0.0 なので finals_observe が 0.02 を置いている構成でしか出ない → ここでも置く)。
+    """
+    ov = {"info_env.enabled": "true", "info_env.influence.enabled": "true",
+          "info_env.misinfo.enabled": "true", "info_env.misinfo.rate": "0.9",
+          "info_env.misinfo.flame_grievance": "0.02",     # finals_observe と同値
+          "net.reshare_prob": "0.9"}
+    straight = _run_straight(tmp_path, "ie_straight", 40, **ov)
+    resumed = _run_resume(tmp_path, "ie_resumed", 20, 40, **ov)
+    rows_st = _rows(straight, "l1_events")
+    assert sum(1 for r in rows_st if r["kind"] == "misinfo") > 0, \
+        "misinfo が 1 件も出ていない(テスト前提が崩れた=rate の再調整が要る)"
+    assert sum(1 for r in rows_st if r["kind"] == "viral_cascade") > 0, \
+        "viral_cascade が 1 件も出ていない(テスト前提が崩れた=reshare_prob の再調整)"
+    for stem in ("l1_events", "l2_metrics", "l3_snapshots"):
+        assert _rows(straight, stem) == _rows(resumed, stem), f"{stem} 不一致(info_env)"
+
+
+_SIGNAL_SPEC = {"crossing_id": 291758776, "cycle_s": 140.0, "green_s": 37.0,
+                "flash_s": 10.0, "offset_s": 0.0}
+
+
+def _sim_with_signal(tmp_path, name: str):
+    """装置層 ON + 信号 1 台を名簿へ直に据えた sim(zones テーブル無しで機構だけ試す)。
+
+    実ランで信号装置が生えるのは `physics.zones` の signal 宣言経由(= v8 地図 + zones
+    テーブルが要る)。ここで検査したいのは**日ガードが checkpoint を跨ぐか**だけなので、
+    名簿へ 1 台足して機構を直接呼ぶ(第109 縦煙の実測は finals 相当の統合テスト側で押さえる)。
+    """
+    from society import devices as D
+    sim = Simulation(_cfg(name, 1, **{"world.devices.enabled": "true",
+                                      "world.devices.signal_events": "true"}),
+                     out_dir=tmp_path / name)
+    reg = D.registry_of(sim)
+    if reg.get(D.signal_device_id(_SIGNAL_SPEC["crossing_id"])) is None:
+        reg.add(D.SignalDevice(D.signal_device_id(_SIGNAL_SPEC["crossing_id"]),
+                               _SIGNAL_SPEC))
+    return sim, reg
+
+
+def _n_signal(sim) -> int:
+    return sum(1 for e in sim.logger.events if e.kind == "signal_summary")
+
+
+def test_resume_signal_summary_day_guard_survives_checkpoint(tmp_path):
+    """★系統2: `_dev_signal_day`(1 交差点 1 日 1 件)が checkpoint を跨いで効く。
+
+    このガードが checkpoint に無かったため、resume 直後にその日の信号要約をもう一度
+    出していた(第109 縦煙の signal_summary +1)。負の対照(ガードを捨てた sim)が
+    必ず二重に出すことも併せて固定する(= この検査が実際に何かを守っている証拠)。
+    """
+    from society import devices as D
+
+    src, reg_src = _sim_with_signal(tmp_path, "sig_src")
+    D._signal_summaries(src, reg_src, 3, 30)
+    assert _n_signal(src) == 1, "信号要約が 1 件出ていない(テスト前提が崩れた)"
+    assert src._dev_signal_day, "_dev_signal_day が立っていない"
+    D._signal_summaries(src, reg_src, 4, 40)                 # 同じ日 = もう出ない
+    assert _n_signal(src) == 1
+
+    p = checkpoint.save(src, 5, tmp_path / "sig_src" / "checkpoint" / "ckpt-000005.pkl.gz")
+
+    dst, reg_dst = _sim_with_signal(tmp_path, "sig_dst")
+    checkpoint.load(dst, p)
+    D._signal_summaries(dst, reg_dst, 5, 50)                 # 同じ暦日 = 1 件も出さない
+    assert _n_signal(dst) == 0, "resume 後に signal_summary が二重記録されている"
+    D._signal_summaries(dst, reg_dst, 200, 1500)             # 翌日 = ちゃんと出る
+    assert _n_signal(dst) == 1, "翌日の信号要約まで抑止されている(過剰抑止)"
+
+    # 負の対照: ガードを捨てると必ず二重に出る(検査が空回りしていない)
+    naive, reg_naive = _sim_with_signal(tmp_path, "sig_naive")
+    checkpoint.load(naive, p)
+    naive._dev_signal_day = {}
+    D._signal_summaries(naive, reg_naive, 5, 50)
+    assert _n_signal(naive) == 1
+
+
+def test_resume_family_dinner_logged_once(tmp_path):
+    """★系統2: 夕食帯(18:00-21:00)の途中で resume しても family_dinner が二重に出ない。
+
+    `_dinner_logged`((household_id, day) の記録済み印)が checkpoint に無く、帯の途中で
+    resume すると同じ世帯の joint_activity{family_dinner} がもう 1 件出た。start_tod を
+    17:00 に置き、split=12(=18:00 ちょうど。帯に入った直後)→ 40 で跨がせる。
+    """
+    ov = {"household.enabled": "true", "household.family_dinner.enabled": "true",
+          "household.family_dinner.prob": "1.0", "run.start_tod": "17:00"}
+    straight = _run_straight(tmp_path, "fd_straight", 40, **ov)
+    resumed = _run_resume(tmp_path, "fd_resumed", 12, 40, **ov)
+    dinners = [r for r in _rows(straight, "l1_events")
+               if r["kind"] == "joint_activity" and "family_dinner" in str(r["payload"])]
+    assert dinners, "family_dinner が 1 件も出ていない(テスト前提が崩れた=帯/split の再調整)"
+    for stem in ("l1_events", "l2_metrics", "l3_snapshots"):
+        assert _rows(straight, stem) == _rows(resumed, stem), f"{stem} 不一致(family_dinner)"
+
+
+_D1_ROUNDTRIP = {                          # レーン D1 で checkpoint に足した状態の往復表
+    "_init_event_mark": 5,
+    "_dev_signal_day": {"signal:1": 3, "signal:2": 4},
+    "_infoenv_watermark": 41,
+    "_viral_done": {7, 11, 13},
+    "_dinner_logged": {("hh-1", 2), ("hh-2", 3)},
+}
+
+
+def test_checkpoint_roundtrips_the_d1_guards(tmp_path):
+    """レーン D1 で足した 5 つの状態が checkpoint 往復で **1 件残らず**戻る。"""
+    src = _fresh(tmp_path, "d1_src")
+    for attr, val in _D1_ROUNDTRIP.items():
+        setattr(src, attr, val)
+    p = checkpoint.save(src, 9, tmp_path / "d1_src" / "checkpoint" / "ckpt-000009.pkl.gz")
+
+    dst = _fresh(tmp_path, "d1_dst")
+    # 起動時セグメントの相当分をバッファへ積んでおく(load が先頭 5 件を捨てるはず)
+    for i in range(5):
+        dst.logger.log(Event(step=0, sim_min=0, agent_id=-1, kind="friend_graph_built",
+                             x=0.0, y=0.0, payload={"n_edges": i, "mean_degree": 0.0}))
+    assert checkpoint.load(dst, p) == 9
+    assert dst.logger.events == [], "起動時セグメントが捨てられていない(二重記録が残る)"
+    for attr, val in _D1_ROUNDTRIP.items():
+        if attr == "_init_event_mark":     # これは「捨てる本数」で sim へは戻さない
+            continue
+        assert getattr(dst, attr, None) == val, f"{attr} が checkpoint で復元されていない"
+
+
+def test_d1_keys_absent_in_old_checkpoint_keep_legacy_behaviour(tmp_path):
+    """D1 の新キーを 1 つも持たない旧 checkpoint でも落ちず、従来の既定へ落ちる。"""
+    import gzip
+    import pickle
+
+    src = _fresh(tmp_path, "d1_old_src")
+    src._infoenv_watermark = 41
+    src._dev_signal_day = {"signal:1": 3}
+    p = checkpoint.save(src, 4, tmp_path / "d1_old_src" / "checkpoint" / "ckpt-000004.pkl.gz")
+    with gzip.open(p, "rb") as f:
+        blob = pickle.loads(f.read())
+    for k in ("init_events", "dev_signal_day", "infoenv_watermark", "viral_done",
+              "dinner_logged"):
+        blob["runtime"].pop(k, None)
+    with gzip.open(p, "wb") as f:
+        f.write(pickle.dumps(blob, protocol=pickle.HIGHEST_PROTOCOL))
+
+    dst = _fresh(tmp_path, "d1_old_dst")
+    dst.logger.log(Event(step=0, sim_min=0, agent_id=-1, kind="friend_graph_built",
+                         x=0.0, y=0.0, payload={"n_edges": 1, "mean_degree": 0.0}))
+    assert checkpoint.load(dst, p) == 4
+    assert len(dst.logger.events) == 1          # 旧 ckpt = 捨てない(従来挙動そのまま)
+    assert dst._infoenv_watermark == 0
+    assert getattr(dst, "_dev_signal_day", None) is None

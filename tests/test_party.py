@@ -111,6 +111,47 @@ def test_party_shared_roaming_dest(tmp_path):
     assert party.party_dest(mate, sim, step=5, sim_min=300) is None, "回遊帯外で寄せている"
 
 
+# --------------------------------------------------------------- 旅を畳む(第109 レーン FIX)
+def test_pulling_members_folds_their_trip(tmp_path):
+    """★本選ブロッカーの回帰固定: 寄せた個体に**存在しない辺**の route が残らない。
+
+    第109バッチ実測: pool の日次ローテーション(_phase_pool_rotation)から呼ばれると、
+    連れには「前日から移動中」の route が残っていることがある。node だけ書き換えると
+    次の _phase_move が (新 node, 旧 route[0]) を引いて KeyError で落ちた(step 144=day 1)。
+    """
+    sim = _sim(tmp_path, "fold", n=20, **_ON)
+    _make_party_visitors(sim, [0, 1, 2], party_size=3)
+    for i in (0, 1, 2):                                # 全員を「移動中」にする(別ノード行き)
+        a = sim.agent_by_id[i]
+        a.route = [d for d in sim.dests if d != a.node][:2]
+        a.dest = a.route[-1]
+        a.edge_offset = 3.5
+        a.exit_intent = True
+        a.homing = True
+        a._ride_pending = {"mode": "train", "fare": 200}
+    party.form_parties(sim, step=0, sim_min=0)
+    for i in (0, 1, 2):
+        a = sim.agent_by_id[i]
+        assert a.route == [], f"連れ {i} の route が畳まれていない(存在しない辺が残る)"
+        assert a.dest is None and a.edge_offset == 0.0, f"連れ {i} の旅が中途半端に残っている"
+        assert not a.exit_intent and not a.homing, f"連れ {i} に移動しない退出意図が残っている"
+        assert a._ride_pending is None, f"連れ {i} に到着しない乗車予約が残っている"
+
+
+def test_folded_members_survive_a_move_phase(tmp_path):
+    """寄せた直後に _phase_move を回しても例外が出ない(KeyError の直接再現→解消)。"""
+    from society.engine import scheduler
+    sim = _sim(tmp_path, "moveok", n=20, **_ON)
+    _make_party_visitors(sim, [0, 1, 2], party_size=3)
+    for i in (0, 1, 2):
+        a = sim.agent_by_id[i]
+        a.route = [d for d in sim.dests if d != a.node][:2]
+        a.loc = "street"
+        a.sleeping = False
+    party.form_parties(sim, step=0, sim_min=0)
+    scheduler._phase_move(sim, 1, 10)                  # ここで落ちていた
+
+
 # --------------------------------------------------------------------- 決定論
 def test_form_parties_deterministic(tmp_path):
     """同一設定で form_parties 2 回のグループ化(メンバ・共有 POI・寄せノード)が完全一致。"""

@@ -672,7 +672,13 @@ def _state(sim) -> dict:
 
 
 def provenance(sim) -> dict | None:
-    """重症度層の観測タリー(既定 OFF は None)。★較正の突き合わせをここで正直に出す。"""
+    """重症度層の観測タリー(既定 OFF は None)。★較正の突き合わせをここで正直に出す。
+
+    第109バッチ D2 で ``summary.json`` の ``health`` キーへ配線した(OFF = キー自体を
+    出さないので既存ラン・golden は無風)。★None を返す条件は ``severity_on`` なので、
+    ``health.enabled=true`` でも ``health.severity.enabled=false`` のランはキーが出ない
+    (重症度層が回っていない = 出す観測量が無い、という正直な区別)。
+    """
     if not severity_on(sim):
         return None
     st = getattr(sim, "_h1_state", None)
@@ -1214,12 +1220,20 @@ def on_injury(sim, agent, severity_hint: int, source: str = "",
 # =========================================================================== #
 #: 退避に載せる身体の欄。★``sick`` / ``sick_until`` は**これまで 1 つも載っていなかった**ため、
 #  住民がプール回転(退場 → 再来街)のたびに病気を忘れていた(監査発見)。severity 一式と塞ぐ。
+#  ★レーン D1(2026-08-12)の総点検で、身体の欄なのに載っていなかった 4 つを足した:
+#    - ``sev_collapse_step`` … sev_* 族で唯一の非搭載だった(救急の引き金の刻印)。
+#    - ``chronic_days`` / ``withdrawn`` … 慢性高 grievance → 引きこもり(自由時間の外出抑制)。
+#      **行動を変える持続状態**なのに回転のたびに「治って」いた。
+#    - ``fatigue`` … 疲労ゲージ(発火閾値の乗数 fatigue_threshold_delta の入力)。
+#  既定値と等しい欄はキーを作らないので、健康な個体の退避 dict は 1 バイトも変わらない。
 _SLIM_FIELDS = (("sick", bool, False), ("sick_until", int, -1),
                 ("severity", int, 0), ("sev_channel", str, ""),
                 ("sev_until", int, -1), ("sev_outcome_step", int, -1),
                 ("sev_fatal", bool, False), ("sev_presentee", bool, False),
                 ("sev_cared", bool, False), ("sev_confirmed", int, -1),
-                ("sev_frailty", float, 1.0), ("dead", bool, False))
+                ("sev_frailty", float, 1.0), ("dead", bool, False),
+                ("sev_collapse_step", int, -1), ("chronic_days", int, 0),
+                ("withdrawn", bool, False), ("fatigue", float, 0.0))
 
 
 def slim_state(agent) -> dict:

@@ -12,6 +12,7 @@ import math
 
 from .. import ablate as ablate_mod
 from .. import annual as annual_mod
+from .. import assets as assets_mod
 from .. import chance as chance_mod
 from .. import commerce as commerce_mod
 from .. import conversation as conversation_mod
@@ -5274,6 +5275,11 @@ def run_step(sim, step: int) -> None:
     _work_idx = len(sim.logger.events) if _work_service_on(sim) else -1
     _ensure_orgs(sim)                              # 組織台帳の遅延初期化(既定OFF=no-op)
     _sfc_arm(sim, step, sim_min)                   # IF-E2: org 預金の期首配賦(既定OFF=no-op・乱数ゼロ)
+    # 所有権レイヤー O1(登記簿の初期配賦。既定OFF=即 return=バイト一致)。**_ensure_orgs の後**に
+    # 置く: 賃貸住戸の家主を「域内の不動産 org」から選ぶ(ユーザー決定 §5-1)ので、組織台帳が
+    # 載ってからでないと家主が 1 社も見つからない。_sfc_arm と同じ「起動時 1 回・L1 ゼロ件・
+    # 世界状態を 1 バイトも変えない」規約で、乱数は新 stream "asset_alloc" 1 本だけ。
+    assets_mod.arm(sim, step, sim_min)
     sfc_mod.day_roll(sim, step, sim_min)           # IF-E2: 日次境界に前日の域外収支を締める(既定OFF=no-op)
     _phase_org_ledger_roll(sim, step, sim_min)     # 会社観測データ層 B4: 日次境界に前日の org_output/ledger を締める(既定OFF=no-op)。
                                                    # 当日の産出/接客/在席より前に置く=当日分は新しい日へ積む(オフバイワン回避)
@@ -5446,6 +5452,13 @@ def run_step(sim, step: int) -> None:
     # incidents_env の**後**に置く: 利用(δ_ext)は L1 の floor_move / enter_building を
     # 自前の watermark で走査するので、この step の階移動を同 step で摩耗に反映できる。
     facilities_mod.phase(sim, step, sim_min)
+    # 所有権レイヤー(既存イベントの台帳写像。既定OFF=即 return=バイト一致)。
+    # **step 末・_apply の後**に置く理由: (a) 相続の引き金である death は日境界とこの step の
+    # severity 両方から出る (b) 持ち家者の転居 move_home は _apply の中で起きるので、ここより
+    # 前だと 1 step 遅れる (c) 動かすのは現金と台帳の行だけで位置・関係・記憶を 1 つも触らない
+    # ので、この step の L3 スナップショット(下)に相続後の残高が正しく載る。
+    # traces / facilities と同じ **L1 の watermark 走査**(死亡・転居があった step だけ働く)。
+    assets_mod.phase(sim, step, sim_min)
 
     _bl = (sim.cfg.get("engine", {}) or {}).get("batch_llm", {}) or {}
     if ablate_mod.llm_off(sim):

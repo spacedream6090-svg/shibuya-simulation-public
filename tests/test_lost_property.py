@@ -754,3 +754,38 @@ def test_summary_publishes_the_return_rate_with_its_denominator(tmp_path):
     for item, rate in prov["return_rate"].items():
         assert 0.0 <= rate <= 1.0
         assert prov["turnins"].get(item, 0) > 0, "分母ゼロの率が出ている"
+
+
+# =========================================================================== #
+# (I) 会計側との接続(第109バッチ D2)
+#
+# module docstring の「解析側の分類はまだ入れていない」を閉じた。守るもの:
+#   ① 監視装置(unclassified_money_kinds)が鳴り止む
+#   ② 家計の貨幣保存(検査①)と分類器の自己整合が実ランで成り立つ
+#   ③ 失効した現金は **K5(非取引の資産変動)**へ着地し、その額が provenance の
+#      cash_lapsed と 1 円まで一致する(economy_sfc.on_lost_lapse と同じ勘定)
+#   ④ 遺失物の金が void(相手方なし)へ 1 円も落ちない
+# =========================================================================== #
+def test_accounting_classifier_covers_the_whole_lost_property_loop(tmp_path):
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import analyze_accounting as aa
+
+    ov = dict(LOUD, **{"lost_property.abandon_steps": "12",
+                       "lost_property.statute_steps": "30",
+                       "economy.accounts.enabled": "true"})
+    sim = Simulation(_cfg("lp_acct", 144, 30, **ov), out_dir=tmp_path / "lp_acct")
+    sim.run()
+    js = json.loads((tmp_path / "lp_acct" / "summary.json").read_text(encoding="utf-8"))
+    kinds = js["event_kinds"]
+    assert kinds.get("lost_drop", 0) > 0 and kinds.get("lost_expire", 0) > 0, \
+        "遺失物のイベントが出ていない(検査の前提が崩れた)"
+
+    rep = aa.analyze(aa.load_run(tmp_path / "lp_acct"))
+    assert rep["unclassified_money_kinds"] == {}, rep["unclassified_money_kinds"]   # ①
+    assert rep["checks"][aa.HOUSEHOLD]["pass"], rep["checks"][aa.HOUSEHOLD]         # ②
+    assert rep["classifier_consistency"]["pass"], rep["classifier_consistency"]     # ②
+    lapsed = float(js["lost_property"]["cash_lapsed"])
+    assert lapsed > 0.0, "失効が 1 件も起きていない(K5 の照合ができない)"
+    assert rep["sector_sums"][aa.OTHER]["inflow"] == pytest.approx(lapsed, abs=0.5)  # ③
+    assert not [t for t in rep["leaks"] if t.startswith("lost")], rep["leaks"]      # ④

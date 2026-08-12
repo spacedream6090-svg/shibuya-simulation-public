@@ -279,6 +279,39 @@ def test_on_resume_byte_matches_straight(small_pool, tmp_path):
     assert rows(st) == rows(rs), "pool ON の resume が straight と byte 不一致"
 
 
+# ============================================================ pool 経路の org 配属(第109 レーン ORG)
+_ORGS_BOOK = "data/organizations_shibuya_wide11k.json"     # small_pool fixture の母体と同一
+
+
+def test_pool_route_attaches_org_from_record(small_pool, tmp_path):
+    """★第108 縦煙「organizations.attach 0 件」の解消: pool record の org_id で配属される。
+
+    organizations.attach は「名簿ファイル → 配属ファイル」でしか引けず、pool ラン
+    (agents.personas_file=null)では構造的に 0 件だった。プール record は台帳から逆算して
+    作られていて org_id/role を持つので、build_pool_agent がそれで配属する。"""
+    sim = Simulation(_pool_cfg("orgon", small_pool, n_steps=1,
+                               **{"organizations.enabled": "true",
+                                  f"organizations.book": _ORGS_BOOK}),
+                     out_dir=tmp_path / "orgon")
+    attached = [a for a in sim.agents if getattr(a, "org_id", None)]
+    assert attached, "pool 経路で org_id が 1 件も付いていない(第108 の 0 件が残っている)"
+    assert sim._pool_org_stat["n_attached"] == len(attached)
+    for a in attached:                                     # attach と同じ 3 属性が揃う
+        assert a.org_id in sim.orgs
+        assert isinstance(getattr(a, "org_role", None), str)
+        assert getattr(a, "org_line", "")                  # プロンプトの所属行(falsy=注入なし)
+    # 配属された org は実在の複数社(n_orgs=3 のような縮退でない)
+    assert len({a.org_id for a in attached}) > 1
+
+
+def test_pool_org_attach_is_off_when_organizations_off(small_pool, tmp_path):
+    """organizations OFF(既定)では 1 件も付かない = 従来と完全同一。"""
+    sim = Simulation(_pool_cfg("orgoff", small_pool, n_steps=1),
+                     out_dir=tmp_path / "orgoff")
+    assert sim._pool_org_book is None
+    assert not [a for a in sim.agents if getattr(a, "org_id", None)]
+
+
 def test_on_dehydrate_saves_departed(small_pool, tmp_path):
     """退場者(day0 present → day1 不在)は dehydrate されドーマントストアに残る(記憶保持)。"""
     s0, s1 = _presence_sets(small_pool)
@@ -782,3 +815,191 @@ def test_dehydrate_does_not_carry_zone_ownership():
     b = _bare_agent(14)
     pool_mod.hydrate(b, state)
     assert getattr(b, "_phys_zone", None) is None
+
+
+# ================================================ レーン D1(第109): 退避フィールドの総点検
+# 第107 の `sick` / `sick_until` 修正(= 回転のたびに病気を忘れていた)と**まったく同じ型**の
+# 取りこぼしを、agent 属性の全数走査(AST)と pool の搬送リストの突合で洗い出して塞いだ。
+# 判定基準は「① 個体固有 ② 日を跨いで持続 ③ 行動 or L1 の発火可否を変える」の 3 つ全部。
+#
+#   H2 医療     … 在院/搬送の印(med_*)。運ばないと入院中の個体が回転で即退院する。
+#   H4 酩酊     … `_inc_intox_until`。当該 module が「正直な限界 4」として自己申告していた。
+#   第61 悪評   … `_gossip_known` / `_gossip_heard`(`_rumors` と同型の「街を出ると忘れる」)。
+#   第73 信念   … `_fact_beliefs`(`beliefs` は運ぶのに fact 信念だけ落ちていた)。
+#   評判/所持   … `_reputation`(合成地位 T6 の 1 項)/ `_goods_belongings`(有界リスト)。
+#   H1 の残り   … `sev_collapse_step` / `chronic_days` / `withdrawn` / `fatigue`
+#                 (health._SLIM_FIELDS へ追加 = pool 側の写しと同期)。
+def test_med_field_list_mirrors_medical_clear():
+    """`_MED_FIELDS` が `medical._clear` の**全数と既定値**に一致する(写しの機械固定)。"""
+    from society import medical as medical_mod
+    a = _bare_agent(21)
+    medical_mod._clear(a)                       # 正典が「印を落とす」= 既定値そのもの
+    expect = {k: v for k, v in vars(a).items() if k.startswith("med_")}
+    got = {name: default for name, _cast, default in pool_mod._MED_FIELDS}
+    assert got == expect, "pool の med 写しが medical._clear と食い違っている"
+
+
+def test_intox_key_matches_incidents_module():
+    """`_INTOX_KEY` は society.incidents_interpersonal.INTOX_KEY と同一(写しの固定)。"""
+    from society import incidents_interpersonal as inc_mod
+    assert pool_mod._INTOX_KEY == inc_mod.INTOX_KEY
+
+
+def test_dehydrate_without_the_d1_fields_is_unchanged():
+    """D1 で足した族を 1 つも持たない個体の退避 dict に新キーが生えない(既定ラン不変)。
+
+    「属性が在って**非既定**のときだけ入れる」設計の受入条件そのもの。空 dict / 空リスト /
+    0 でもキーを作らないこと(機構 ON だが未経験のランで退避のバイト列が割れないこと)。
+    """
+    a = _bare_agent()
+    base = pool_mod.dehydrate(a)
+    assert not (set(base) & {"med", "intox_until", "gossip_known", "gossip_heard",
+                             "fact_beliefs", "reputation", "belongings",
+                             "controllability"})
+
+    from society import medical as medical_mod
+    medical_mod._clear(a)                       # 医療 ON だが 1 度も搬送されていない
+    setattr(a, pool_mod._INTOX_KEY, 0)          # 酩酊 ON だが素面
+    a._gossip_known, a._gossip_heard = {}, {}   # 悪評 ON だが何も知らない
+    a._fact_beliefs = {}
+    a._reputation = 0.0
+    a._goods_belongings = []
+    assert pool_mod.dehydrate(a) == base, "既定値だけの状態で退避 dict が変わっている"
+
+
+def test_dehydrate_hydrate_carries_the_d1_fields():
+    """D1 で足した族が往復で同値に戻る(JSON 安全・実体非共有つき)。"""
+    import json
+
+    a = _bare_agent()
+    a.med_admitted, a.med_until, a.med_since = True, 900, 700
+    a.med_node, a.med_poi, a.med_confirmed = "n42", "病院", 3
+    setattr(a, pool_mod._INTOX_KEY, 123)
+    a._gossip_known = {5: 2, 9: 3}
+    a._gossip_heard = {7: {1, 4, 2}}
+    a._fact_beliefs = {"f-1": {"value": 3, "conf": 0.8, "verified": False}}
+    a._reputation = 2.5
+    a._goods_belongings = ["傘", "弁当"]
+    a.controllability = 0.73
+    state = pool_mod.dehydrate(a)
+    json.dumps(state)                            # JSON 安全(集合を残していない)
+    assert state["gossip_heard"] == {7: [1, 2, 4]}, "集合を sorted list へ正規化していない"
+
+    b = _bare_agent(22)
+    pool_mod.hydrate(b, state)
+    assert (b.med_admitted, b.med_until, b.med_since) == (True, 900, 700)
+    assert (b.med_node, b.med_poi, b.med_confirmed) == ("n42", "病院", 3)
+    assert getattr(b, pool_mod._INTOX_KEY) == 123
+    assert b._gossip_known == {5: 2, 9: 3}
+    assert b._gossip_heard == {7: {1, 2, 4}}     # 集合へ戻る(membership/len で使われる)
+    assert b._fact_beliefs == a._fact_beliefs
+    assert b._reputation == 2.5
+    assert b._goods_belongings == ["傘", "弁当"]
+    assert b.controllability == 0.73             # C2: 再来街で「学習前」に戻らない
+    # 退避辞書を書き換えても復元後の個体に波及しない(実体を共有しない)
+    state["fact_beliefs"]["f-1"]["conf"] = 0.1
+    state["belongings"].append("鍵")
+    assert b._fact_beliefs["f-1"]["conf"] == 0.8
+    assert b._goods_belongings == ["傘", "弁当"]
+
+
+def test_d1_hydrate_tolerates_old_state_without_new_keys():
+    """旧 退避辞書(D1 の新キー無し)からの復元で属性を 1 つも生やさない(前方互換)。"""
+    a = _bare_agent()
+    old = pool_mod.dehydrate(a)
+    b = _bare_agent(23)
+    pool_mod.hydrate(b, old)
+    for attr in ("med_admitted", pool_mod._INTOX_KEY, "_gossip_known", "_gossip_heard",
+                 "_fact_beliefs", "_reputation", "_goods_belongings", pool_mod._CTRL_KEY):
+        assert not hasattr(b, attr), f"{attr} が旧辞書から生えている"
+
+
+def test_health_slim_fields_now_cover_the_whole_body_family():
+    """H1 の残り 4 欄(collapse / chronic / withdrawn / fatigue)が退避に載る。"""
+    from society import health as health_mod
+    assert pool_mod._HEALTH_FIELDS == health_mod._SLIM_FIELDS
+    names = {n for n, _c, _d in pool_mod._HEALTH_FIELDS}
+    assert {"sev_collapse_step", "chronic_days", "withdrawn", "fatigue"} <= names
+    a = _bare_agent()
+    a.withdrawn, a.chronic_days, a.fatigue = True, 7, 0.625
+    a.sev_collapse_step = 88
+    st = pool_mod.dehydrate(a)
+    b = _bare_agent(24)
+    pool_mod.hydrate(b, st)
+    assert (b.withdrawn, b.chronic_days, b.fatigue, b.sev_collapse_step) \
+        == (True, 7, 0.625, 88)
+
+
+# ---------------------------------------------------------------- 縦煙相当の統合(mock・48step)
+# 第108 の全ON縦煙で L1 が +106 行(+0.89%)食い違った構成を**縮小して**固定する。
+# relations + friend_graph + joint + party + household + gossip + info_env を pool ON の上で
+# 同時に立てるのがこの組み合わせの肝で(第98/第101 の resume 監査はこの同時 ON を通って
+# いなかった)、conf/finals_observe.yaml のどのブロックが効いていたかを dotlist で写している
+# (プロファイル本体には依存させない = 他レーンの conf 編集でこのテストが揺れない)。
+_FINALS_LIKE_ON = {
+    # ★層別クォータ ON は必須(finals_observe と同じ)。OFF だと平日は上位層が cap を
+    #   食い切って来街層が 0 人になり(第91 破綻)、party が 1 件も成立しない = 縦煙の
+    #   主因(party の joint_activity +97)を通らないテストになる。
+    "pool.tier_quota.enabled": "true",
+    "relations.enabled": "true",
+    "relations.dunbar.enabled": "true",
+    "relations.endogenous_accept.enabled": "true",
+    "relations.endogenous_invite.enabled": "true",
+    "relations.endogenous_quality.enabled": "true",
+    "friend_graph.enabled": "true",
+    "joint.enabled": "true",
+    "party.enabled": "true",
+    "household.enabled": "true",
+    "household.family_dinner.enabled": "true",
+    "gossip.enabled": "true",
+    "info_env.enabled": "true",
+    "info_env.influence.enabled": "true",
+    "info_env.misinfo.enabled": "true",
+}
+
+
+def test_finals_like_all_on_resume_matches_straight(small_pool, tmp_path):
+    """★第109 縦煙の縮小再現: 全ON相当 48step の「一気 vs 24+24」が L1 バイト一致。
+
+    修正前の実測(本テストと同じ組み合わせ・実プール縮小):
+        straight 3,066 行 / resume 3,079 行(+13)
+        friend_graph_built +1(起動時 1 回の発火体の二重発火)
+        joint_activity     +11(party の実体化が __init__ でもう一度走る)
+        signal_summary     +1(1 交差点 1 日 1 件のガードが checkpoint に無い)
+    修正後は 3,066 == 3,066(全行一致)。
+    """
+    import pyarrow.parquet as pq
+    from society.engine import checkpoint, scheduler
+
+    def rows(d, stem="l1_events"):
+        return pq.read_table(Path(d) / f"{stem}.parquet").to_pylist()
+
+    st = tmp_path / "fin_st"
+    Simulation(_pool_cfg("fin_st", small_pool, n_steps=48, cap=150, **_FINALS_LIKE_ON),
+               out_dir=st).run()
+
+    rs = tmp_path / "fin_rs"
+    s1 = Simulation(_pool_cfg("fin_rs", small_pool, n_steps=24, cap=150,
+                              **{"observer.checkpoint_every": 24}, **_FINALS_LIKE_ON),
+                    out_dir=rs)
+    for step in range(24):
+        scheduler.run_step(s1, step)
+    checkpoint.save(s1, 24, rs / "checkpoint" / "ckpt-000024.pkl.gz")
+    s1._save_pool_sidecar(24)
+    s1.logger.flush_segment()
+    s2 = Simulation(_pool_cfg("fin_rs", small_pool, n_steps=48, cap=150,
+                              **{"observer.checkpoint_every": 24}, **_FINALS_LIKE_ON),
+                    out_dir=rs)
+    s2.run(resume_from=rs)
+
+    a, b = rows(st), rows(rs)
+    # 空回り防止: 起動時 1 回の発火体が**実在する**構成であること
+    kinds = Counter(r["kind"] for r in a)
+    assert kinds["friend_graph_built"] == 1, "friend_graph_built が出ていない(前提が崩れた)"
+    assert sum(1 for r in a if r["kind"] == "joint_activity"
+               and "party" in str(r["payload"])) > 0, \
+        "party の joint_activity が出ていない(前提が崩れた=cap/プールの再調整)"
+    assert len(a) == len(b), (
+        f"L1 行数不一致: straight={len(a)} resume={len(b)} / 差分 kind="
+        f"{Counter(r['kind'] for r in b) - kinds}")
+    assert a == b, "全ON相当の resume が straight と byte 不一致"

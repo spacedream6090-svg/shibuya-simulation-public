@@ -122,10 +122,10 @@ sim 側の ``_train_state`` は**観測タリーと到着表キャッシュだ�
    確率的な規則性から生まれるので、ここは規則性が強すぎる。日ごとの揺らぎを
    入れる余地は ``car_choice`` にあるが、**入れていない**(車両選択の習慣性は
    実測でも高く、揺らぎの大きさに根拠が無いため。入れるなら較正が要る)。
-5. **``summary.json`` に鍵を出さない**。観測タリーは ``provenance(sim)`` として
-   読める形にしてあるが、``engine/simulation.py`` の summary 組み立ては本レーンの
-   所有外なので配線していない(1 日の総量は L1 の ``train_ride`` /
-   ``train_copresence`` / ``train_patrol`` を数えれば出る)。
+5. ~~``summary.json`` に鍵を出さない~~ → **第109バッチ D2 で配線した**。ON のランは
+   ``summary.json`` の ``transit_interior`` キーに ``provenance(sim)`` がそのまま載る
+   (OFF はキー自体を出さないので既存ランはバイト不変)。L1 の ``train_ride`` /
+   ``train_copresence`` / ``train_patrol`` を数える経路も従来どおり使える。
 """
 from __future__ import annotations
 
@@ -1185,7 +1185,7 @@ def phase(sim, step: int, sim_min: int) -> None:
 
 
 # =========================================================================== #
-# 観測(読むだけ。``summary.json`` への配線は本レーンの所有外 = 正直な限界 5)
+# 観測(読むだけ。第109バッチ D2 で ``summary.json`` の ``transit_interior`` キーへ配線)
 # =========================================================================== #
 def provenance(sim) -> dict | None:
     """車内層の観測タリー(既定 OFF は None = 何も出さない)。

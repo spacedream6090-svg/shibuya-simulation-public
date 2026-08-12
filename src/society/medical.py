@@ -742,7 +742,16 @@ def _agent_by_id(sim, agent_id: int):
 
 
 def _clear(agent) -> None:
-    """搬送・在院の印を落とす(冪等)。**身体状態は 1 バイトも触らない**。"""
+    """搬送・在院の印を落とす(冪等)。**身体状態は 1 バイトも触らない**。
+
+    ★この関数が据える欄と既定値が「在院/搬送の印の全数」の**正典**である。
+      ``world/pool.py`` の ``_MED_FIELDS`` はその写しで(world/ は下層なので
+      society 直下を import できない = ``_RUMOR_KEY`` と同じ作法)、一致は
+      ``tests/test_pool_rotation.py::test_med_field_list_mirrors_medical_clear``
+      が機械固定する。欄を増やすときは両方を同時に直すこと。
+      第109 レーン D1 以前は退避に 1 欄も載っておらず、**入院中の個体がプール回転で
+      即退院して病院から消えていた**(在院日数の較正が静かに壊れる)。
+    """
     agent.med_admitted = False
     agent.med_transport_until = -1
     agent.med_until = -1

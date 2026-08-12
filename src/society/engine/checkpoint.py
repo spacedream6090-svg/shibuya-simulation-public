@@ -243,6 +243,19 @@ def save(sim, step: int, path: str | Path) -> Path:
             # (第96 IF-D の trace_state と同じ理由)。★酩酊の印(agent._inc_intox_until)は
             # agents pickle に自然同梱される。既定 OFF では state 自体が生えない → None=挙動不変。
             "incident_state": getattr(sim, "_inc_state", None),
+            # 所有権レイヤー O1+O3(登記簿そのもの): 資産レコード・権利行・双方向索引・初期
+            # ストック・移転タリー・相続済みの故人 id・国庫へ出た現金。★**状態の本体が sim 側に
+            # ある**(所有は場所でも個体でもなく世界の登記簿なので agents pickle には載らない)=
+            # 保存しないと resume 直後に街の所有関係が全部消え、しかも初期配賦が**もう一度**
+            # 走って新 stream "asset_alloc" を二重に引く(= 資産保存則も決定論も同時に破れる)。
+            # 第96 traces / H3 遺失物 / 第97 IF-E2 と同じ型の中央管理。watermark(_asset_watermark)
+            # はプロセス内 logger カウンタ由来なので**保存しない**(load で 0 に戻る = rumors 流儀。
+            # 相続の二重適用は heired 集合が state 側で防ぐので、戻っても無害)。
+            # 既定 OFF では state 自体が生えない → None=挙動不変(load は .get で旧 ckpt 互換)。
+            # ★キー名/属性名を "asset_ledger" / "_ledger_state" にしてあるのは、第59 の資産
+            #   **レンズ**(observer/assets.py)が既に "assets_state" / sim._assets_state を
+            #   使っているため(所有の台帳と資産分布の観測レンズは別物)。
+            "asset_ledger": getattr(sim, "_ledger_state", None),
             # 第88バッチ 心モデル固定: L1 `mind_assign` を出し終えた agent_id。
             # **割当そのものは保存しない** — 誕生時固定は (master_seed, agent_id) の純関数
             # (専用 stream mind_model / mind_tier)なので resume でも pool 再入場でも同じ
@@ -450,6 +463,38 @@ def save(sim, step: int, path: str | Path) -> Path:
             # 同じ spark_roster を二重に記録していた(load 側でこのフラグを見て抑止する)。
             # spark OFF では False=挙動不変(load は .get で旧 checkpoint 互換)。
             "spark_reported": bool(getattr(sim, "_spark_reported", False)),
+            # ------------------------------------------------------------------
+            # レーン D1(第109): resume 二重発火の**総括的**な根治。
+            # 第98 W4-A は spark_roster を**1 種だけ**名指しで塞いだが、
+            # Simulation.__init__ が L1 へ出す「起動時 1 回」の発火体は他にもあり
+            # (friend_graph_built / party の joint_activity{type:party} / icebreak …)、
+            # relations+friend_graph+joint+party+pool を同時 ON にした第109 縦煙で
+            # 初めて表に出た(+106 行 = +0.89%。joint_activity が +97)。
+            # ★種の名指しを止め、「__init__ が出し終えた時点のバッファ長」を運ぶ。
+            #   load 側はその本数を先頭から捨てる(= 前のプロセスが part へ確定済み)。
+            #   将来 __init__ に発火体が増えても自動的に守られる。
+            # 旧 checkpoint(キー無し)= 0 = 従来挙動(spark の名指しフィルタだけが効く)。
+            "init_events": int(getattr(sim, "_init_event_mark", 0)),
+            # 装置層: ``signal_summary`` の「1 交差点 1 日 1 件」ガード。第80 W2(weather の
+            # 二重記録)と同型の未保存で、resume 直後にその日の要約をもう一度出していた
+            # (第109 縦煙の実測 +1 件)。dict のみ = 集合反復順非保存の影響なし。
+            # 既定 OFF(装置層 OFF)では属性自体が生えない → None=挙動不変。
+            "dev_signal_day": getattr(sim, "_dev_signal_day", None),
+            # 情報環境(バイラル / 誤情報): 走査済み投稿の**絶対 id** watermark と
+            # 加重済みの元投稿 id。★他の watermark と違いこれは logger ではなく
+            # **sim.net の投稿 id 空間**由来なので「load で 0 に戻す」流儀が通用しない
+            # (net は pickle で丸ごと戻るのに watermark だけ 0 に戻ると、既に処理済みの
+            # 投稿を全部走査し直す)。実測: viral_cascade を再発火して reshares を
+            # **二重加算**し、misinfo を別 step キーで引き直して炎上を捏造していた
+            # (第109 縦煙の viral_cascade +3 / misinfo +2 / state_update +1)。
+            # 集合は sorted list で保存する(反復順は pickle 間で保証されない = 決定論の作法)。
+            "infoenv_watermark": int(getattr(sim, "_infoenv_watermark", 0)),
+            "viral_done": sorted(getattr(sim, "_viral_done", None) or ()),
+            # 世帯の夕食共食(S-R1): 記録済みの (household_id, day)。第109 縦煙の 48 step
+            # では夕食帯(18:00-21:00)に届かず露見しなかったが、**同じ型**の未保存である
+            # (帯の途中で resume すると同じ世帯の joint_activity{family_dinner} が
+            # もう 1 件出る)。household.family_dinner OFF では空集合 = 挙動不変。
+            "dinner_logged": sorted(getattr(sim, "_dinner_logged", None) or ()),
             # 第71バッチ: LLM 入出力ジャーナルの確定点(ファイル名 → {records, bytes})。
             # mark() が flush してから採るので、この時点のファイル末尾は必ず gzip メンバ境界
             # = 安全な切り詰め点。resume(load)がここまで巻き戻すことで、「checkpoint 後に
@@ -589,6 +634,10 @@ def load(sim, path: str | Path) -> int:
     ics = rt.get("incident_state")              # H4 対人事件(旧 ckpt 互換=無ければ素通り)
     if ics is not None:
         sim._inc_state = ics
+    alg = rt.get("asset_ledger")                # 所有権 O1+O3(旧 ckpt 互換=無ければ素通り)
+    if alg is not None:
+        # init=True が戻るので arm は二度と走らない(= "asset_alloc" の二重消費が起きない)
+        sim._ledger_state = alg
     sfc = rt.get("sfc_state")                   # 第97 IF-E2(旧 ckpt 互換=無ければ素通り)
     if sfc is not None:
         sim._sfc_state = sfc
@@ -731,6 +780,22 @@ def load(sim, path: str | Path) -> int:
     sim._dev_processed = 0
     # 世界観 C2/C6 の未走査区間(有界射影)。OFF / 旧 ckpt では no-op=従来挙動。
     _wv_ckpt.restore_checkpoint(sim, rt.get("wv_carry"))
+    # ---- レーン D1(第109): 「起動時セグメント」を丸ごと捨てる ------------------------
+    # ここに来た時点で sim.logger.events は **__init__ が出したイベントだけ**である
+    # (run() は load の後で初めて step を回す)。それらは前のプロセスが同じ config で
+    # 同じ順に出し、checkpoint と対で flush 済み = part に確定している。よって
+    # 「前のプロセスが出した本数」だけ先頭から捨てるのが正しい(捨てる本数を保存値から
+    # 採るので、万一 __init__ の出力が食い違えば残差として現れる = トリップワイヤーも兼ねる)。
+    # ★これで friend_graph_built / party の joint_activity / spark_roster / icebreak …
+    #   を**種ごとに名指しせず**に塞げる(第109 縦煙 +106 行の主因)。
+    # ★副次効果: logger 増分走査の watermark(_dev_watermark / _facility_watermark /
+    #   _rumor_watermark / _trace_watermark / lens 4 本 / worldview)は load で 0 に
+    #   戻る設計なので、起動時セグメントが残っていると resume 直後にそれを**もう一度**
+    #   走査していた。捨てることでこの経路も同時に閉じる。
+    # 旧 checkpoint(キー無し)= 0 = 従来どおり(下の spark 名指しフィルタだけが効く)。
+    _n_init = int(rt.get("init_events", 0) or 0)
+    if _n_init > 0 and getattr(sim, "logger", None) is not None:
+        del sim.logger.events[:min(_n_init, len(sim.logger.events))]
     # ---- 第98バッチ W4-A: 火種介入 spark_roster の resume 二重記録を塞ぐ --------------
     # spark.apply は **Simulation.__init__ から**呼ばれ、t=0 の名簿イベント spark_roster を
     # 1 件記録する。resume した 2 つ目のプロセスでも __init__ は丸ごと走るので、同じイベントが
@@ -746,6 +811,20 @@ def load(sim, path: str | Path) -> int:
         if getattr(sim, "logger", None) is not None:
             sim.logger.events = [e for e in sim.logger.events
                                  if e.kind != "spark_roster"]
+    # ---- レーン D1(第109): 起動時 1 回ではない「1 日 1 件 / 走査済み」ガードの復元 ----
+    # どれも第80 W2 と同型の未保存(= resume 直後に同じ判定をやり直す)。
+    # 旧 checkpoint / OFF ランでは None・0 = 従来挙動(getattr 既定と同値)。
+    _dsd = rt.get("dev_signal_day")             # signal_summary の 1 交差点 1 日 1 件
+    if _dsd is not None:
+        sim._dev_signal_day = {str(k): int(v) for k, v in _dsd.items()}
+    if "infoenv_watermark" in rt:               # バイラル / 誤情報の走査済み投稿(絶対 id)
+        sim._infoenv_watermark = int(rt["infoenv_watermark"])
+    _vdn = rt.get("viral_done")
+    if _vdn:
+        sim._viral_done = {int(x) for x in _vdn}
+    _dnl = rt.get("dinner_logged")              # 世帯の夕食共食 (household_id, day)
+    if _dnl:
+        sim._dinner_logged = {tuple(x) for x in _dnl}
     if hasattr(sim, "_journal_rewind"):         # 第71: LLM ジャーナルを確定点まで巻き戻す
         sim._journal_rewind(rt.get("llm_journal"))
 

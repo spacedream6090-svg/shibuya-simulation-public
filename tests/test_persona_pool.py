@@ -242,3 +242,103 @@ def test_llm_targets_within_range(pool):
     assert 0.015 <= frac <= 0.06, frac
     # 一意 id・重複なし
     assert len(doc["ids"]) == len(set(doc["ids"])) == doc["count"]
+
+
+# ================================================ レーン D1(第109): stale shard の掃除
+# 第108 の発見: ビルダは part を**上書きするだけ**で古い part を消さない。層が縮む再生成
+# (L2 が減る等)を掛けると前回の末尾 part が残り、ディレクトリを直に舐める外部ツールが
+# 幽霊レコードを数える(PoolStore は meta.shards しか読まないのでプールの中身は汚れない)。
+# 既定は**破壊的でない**(警告 + meta へ非参照の明示)。--clean のときだけ削除する。
+def _stale_setup(out_dir: Path) -> Path:
+    """既存プールへ「今回は書き直されない」古い part を仕込む。"""
+    ghost = out_dir / "L2" / "part-9999.jsonl"
+    ghost.write_text('{"id": "GHOST", "layer": "L2"}\n', encoding="utf-8")
+    return ghost
+
+
+def test_stale_part_is_detected_and_left_in_place_by_default(tmp_path):
+    """既定(--clean なし)は**消さずに**検出し、meta へ非参照として列挙する。"""
+    out = tmp_path / "stale_warn"
+    _build(out)
+    ghost = _stale_setup(out)
+    meta, _c, _o = _build(out)                       # 同じ出力先へ再生成
+
+    assert meta["stale_shards"] == ["L2/part-9999.jsonl"]
+    assert meta["stale_shards_removed"] == []
+    assert ghost.exists(), "既定で古い part を消してしまっている(破壊的)"
+    # 幽霊は meta.shards から参照されない = PoolStore の索引に載らない
+    assert "L2/part-9999.jsonl" not in {s["file"] for s in meta["shards"]}
+
+
+def test_stale_part_is_removed_with_clean(tmp_path):
+    """--clean 相当(build_pool(clean=True))で古い part を削除し、meta へ記録する。"""
+    out = tmp_path / "stale_clean"
+    _build(out)
+    ghost = _stale_setup(out)
+    orgs = json.loads((_ROOT / "data" / "organizations_shibuya_wide11k.json")
+                      .read_text(encoding="utf-8"))
+    pop = json.loads((_ROOT / "data" / "shibuya_population.json").read_text(encoding="utf-8"))
+    meta, _councilors = bpp.build_pool(out, 42, _FRACTION, orgs, pop,
+                                       total_target=1_000_000, clean=True)
+
+    assert meta["stale_shards"] == []
+    assert meta["stale_shards_removed"] == ["L2/part-9999.jsonl"]
+    assert not ghost.exists(), "--clean で古い part が消えていない"
+
+
+def test_clean_never_touches_the_parts_written_this_run(tmp_path):
+    """--clean は**今回書いた part を 1 つも消さない**(scan は生成の前に採る)。"""
+    out = tmp_path / "stale_safe"
+    meta1, _c, _o = _build(out)
+    orgs = json.loads((_ROOT / "data" / "organizations_shibuya_wide11k.json")
+                      .read_text(encoding="utf-8"))
+    pop = json.loads((_ROOT / "data" / "shibuya_population.json").read_text(encoding="utf-8"))
+    meta2, _councilors = bpp.build_pool(out, 42, _FRACTION, orgs, pop,
+                                        total_target=1_000_000, clean=True)
+    assert meta2["stale_shards_removed"] == [] == meta2["stale_shards"]
+    assert {s["file"] for s in meta1["shards"]} == {s["file"] for s in meta2["shards"]}
+    for s in meta2["shards"]:
+        assert (out / s["file"]).exists(), f"今回書いた part が消えている: {s['file']}"
+
+
+def test_stale_part_leaks_into_llm_targets_until_cleaned(tmp_path):
+    """★影響の切り分け: 名簿(meta.shards)は汚れないが llm_targets.json は汚れる。
+
+    `_collect_llm_targets` は層ディレクトリを **glob する**ので、幽霊 part の id が
+    深いペルソナ化の対象名簿へ入り込む。--clean はその手前で消すので混ざらない
+    (= stale の始末を `_collect_llm_targets` の**前**に置いていることの機械固定)。
+    """
+    orgs = json.loads((_ROOT / "data" / "organizations_shibuya_wide11k.json")
+                      .read_text(encoding="utf-8"))
+    pop = json.loads((_ROOT / "data" / "shibuya_population.json").read_text(encoding="utf-8"))
+
+    def ghost_in_targets(out: Path) -> bool:
+        doc = json.loads((out / "llm_targets.json").read_text(encoding="utf-8"))
+        return "GHOST_L5" in set(doc["ids"])
+
+    def seed_ghost(out: Path) -> None:
+        # L5 は「全員が対象」なので、幽霊が混ざるかどうかが一番はっきり出る層
+        (out / "L5" / "part-9999.jsonl").write_text(
+            '{"id": "GHOST_L5", "layer": "L5"}\n', encoding="utf-8")
+
+    dirty = tmp_path / "leak_warn"
+    _build(dirty)
+    seed_ghost(dirty)
+    bpp.build_pool(dirty, 42, _FRACTION, orgs, pop, total_target=1_000_000)
+    assert ghost_in_targets(dirty), "幽霊が llm_targets に混ざらない(前提が崩れた)"
+
+    clean = tmp_path / "leak_clean"
+    _build(clean)
+    seed_ghost(clean)
+    bpp.build_pool(clean, 42, _FRACTION, orgs, pop, total_target=1_000_000, clean=True)
+    assert not ghost_in_targets(clean), "--clean でも llm_targets に幽霊が残っている"
+
+
+def test_cli_declares_the_clean_flag():
+    """--clean が CLI に生えている(既定 False = 破壊的でない)。"""
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.suppress(SystemExit):
+        bpp.main(["--help"])
+    assert "--clean" in buf.getvalue()

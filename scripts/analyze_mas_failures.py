@@ -62,6 +62,10 @@ NGRAM_N = 2                      # 文字 2-gram(語彙リテラルを置かな�
 USED_KINDS = ("speak", "hear", "dm", "day_plan", "arrive", "enter_building",
               "group_found", "group_join", "joint_invite", "venture_open",
               "venture_close", "proposal")
+# W4-D': `l1_stream` へ渡す kind 集合の**唯一の宣言**(中身は USED_KINDS と同一)。
+# `tests/test_l1_stream_migration.py` が AST でモジュール内の kind リテラルとの
+# 網羅を機械検査する = 様式を 1 つ足して kind を増やしたときの取りこぼしを防ぐ。
+WANT_KINDS: frozenset = frozenset(USED_KINDS)
 
 # 14 様式のうち **判定しないもの** と、その理由(理由を書くことが本スクリプトの本体である)
 NOT_IMPLEMENTED = {
@@ -393,20 +397,21 @@ def fm31_premature_termination(events: list[dict],
 # 解析本体
 # --------------------------------------------------------------------------- #
 def _load_events(run_dir: str) -> list[dict]:
-    import pyarrow.parquet as pq
-    path = os.path.join(run_dir, "l1_events.parquet")
-    if not os.path.exists(path):
+    """`USED_KINDS` だけを読む(W4-D': 共有の `l1_stream` 経由)。
+
+    旧実装は `to_pydict()` で *全行* を Python の list にしてから捨てていた。
+    `l1_stream` は **kind を Arrow 上で絞ってから**実体化するので、捨てる行の
+    Python オブジェクト生成費が 0 になる。あわせて **part 群の透過連結**と
+    **Windows の共有フラグ付き open**(第77バッチの規約)も手に入る。
+    実体化ループと**最後の並べ替えは旧実装の逐語**(返り値は 1 バイトも変わらない)。
+    """
+    import l1_stream as ls
+    if not ls.l1_paths(run_dir):
         return []
-    want = set(USED_KINDS)
-    pf = pq.ParquetFile(path)
-    avail = set(pf.schema_arrow.names)
-    cols = [c for c in ("step", "agent_id", "kind", "payload") if c in avail]
     out: list[dict] = []
-    for batch in pf.iter_batches(columns=cols):
-        d = batch.to_pydict()
+    for d in ls.iter_columns(run_dir, ["step", "agent_id", "kind", "payload"],
+                             kinds=WANT_KINDS):
         for st, aid, kind, raw in zip(d["step"], d["agent_id"], d["kind"], d["payload"]):
-            if kind not in want:
-                continue
             try:
                 payload = json.loads(raw) if raw else {}
             except (json.JSONDecodeError, TypeError):

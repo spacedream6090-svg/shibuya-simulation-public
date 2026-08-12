@@ -76,8 +76,6 @@ import math
 import sys
 from pathlib import Path
 
-import pyarrow.parquet as pq
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 if str(REPO_ROOT / "scripts") not in sys.path:      # l1_stream(共有の逐次読み)用
@@ -331,18 +329,35 @@ def load_run_meta(run_dir: Path) -> dict:
 
 
 def load_g(run_dir: Path) -> dict:
-    """`{(step, agent_id): {channel_id: g}}`。サイドカーが無ければ空。"""
+    """`{(step, agent_id): {channel_id: g}}`。サイドカーが無ければ空。
+
+    W4-D': 旧実装は `pq.read_table(path).to_pylist()` で **全列 × 全行**を dict の
+    list にしていた。`cognition_g` は `log_every_steps` ごとに **在場人数ぶんの行**が
+    出るサイドカーで、在場 25万 × 10 日では 49 GB 級になる(第101 E の実測)。
+    そこを `l1_stream.iter_table_columns` の逐次読み + **要る列だけの射影**へ移す:
+
+      - 読むのは `step` / `agent_id` / `g_*` **だけ**。同居する `g0_*`(初期値)や
+        θ 軌跡の列は 1 バイトも復号しない(列指向なので本当に読まない)。
+      - 行の dict を **1 行も作らない**(列 dict を zip で回す)。メモリは
+        batch 分で有界になり、残るのは返り値そのもの(= 指標の定義が要求する分)。
+
+    列名の走査は footer(`table_schema`)だけで済ませる = **1 行も読まずに**
+    `g_*` を決める。返り値・キー順・同一キーの上書き規則は旧実装と同一である。
+    """
+    import l1_stream as ls
     path = Path(run_dir) / "cognition_g.parquet"
     if not path.exists():
         return {}
-    table = pq.read_table(path)
-    names = list(table.column_names)
+    names = list(ls.table_schema(path).names)
     g_cols = [c for c in names if c.startswith("g_") and not c.startswith("g0_")]
     col_to_id = {ch.column: ch.id for ch in CH.CHANNELS}
+    ids = [col_to_id.get(c[2:], c[2:]) for c in g_cols]
     out: dict[tuple[int, int], dict[str, float]] = {}
-    for row in table.to_pylist():
-        key = (int(row["step"]), int(row["agent_id"]))
-        out[key] = {col_to_id.get(c[2:], c[2:]): float(row[c]) for c in g_cols}
+    for d in ls.iter_table_columns(path, ["step", "agent_id"] + g_cols):
+        gcols = [d[c] for c in g_cols]
+        for i, (st, aid) in enumerate(zip(d["step"], d["agent_id"])):
+            out[(int(st), int(aid))] = {cid: float(col[i])
+                                        for cid, col in zip(ids, gcols)}
     return out
 
 

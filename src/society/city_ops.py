@@ -1375,11 +1375,11 @@ def phase(sim, step: int, sim_min: int) -> None:
 # --------------------------------------------------------------------------- #
 # 観測タリー(**OFF では None = 何も出さない**)
 #
-# ★正直な現状: ``summary.json`` / ``run_manifest.json`` の書き出しは別レーンの所有で、
-#   本 module を呼ぶ 1 行はまだ入っていない(``street_life.provenance`` /
-#   ``transit_interior`` と同じ状況)。したがってこれは**テストと解析から直接呼ぶ**
-#   観測口であって、今の時点でランの成果物に自動で載るわけではない。
-#   載せるなら observer/manifest.py 側に 1 行足すだけで足りる(本波では触らない)。
+# ★第109バッチ D2 で **``summary.json`` の ``city_ops`` キーへ配線済み**
+#   (``engine/simulation.py`` の finalize 末尾。Wave 4 の観測タリー群と一括で入れた)。
+#   OFF では本関数が None を返し、summary はキー自体を持たない = 既存ラン無風。
+#   ``run_manifest.json``(ラン開始時に書かれる)へは今も載せていない: 本タリーは
+#   走り切ってからでないと値が確定しないため(``ablate`` の provenance と同じ線引き)。
 # --------------------------------------------------------------------------- #
 def provenance(sim) -> dict | None:
     """都市運営の観測タリー(既定 OFF は None = 何も返さない)。

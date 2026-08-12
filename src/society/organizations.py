@@ -167,6 +167,36 @@ def attach(agents, book: dict[str, dict], personas_file: str | None, *,
     return attached
 
 
+def attach_record(agent, record: dict, book: dict[str, dict], *,
+                  city=None, commute_to_poi: bool = False) -> bool:
+    """**プール record 由来**の配属を 1 体に与える(``attach`` と同じ意味論)。戻り値=配属したか。
+
+    なぜ要るか(第109バッチ レーン ORG): ``attach`` は「名簿ファイル(agents.personas_file)→
+    対応する配属ファイル(data/org_assignments_*.json)」でしか配属を引けない。ところが
+    100万プールのランは ``agents.personas_file`` が **null**(名簿はプールが供給する)なので
+    ``assignments_for`` が None を返し、**配属数が構造的に 0 件**だった(第108 縦煙の実測:
+    organizations.attach 0 件 / org_accounting の n_orgs=3)。
+
+    一方でプールの record は ``scripts/build_persona_pool.py`` が**組織台帳の employees から
+    逆算**して作ったものなので、``org_id``(所属会社/学校)と ``role``(役割)を最初から
+    持っている。ここはその 2 つを読んで ``_attach`` に渡すだけで、付ける属性
+    (org_id / org_role / org_line)も ``commute_to_poi`` の束縛も **``attach`` と 1 バイトも
+    変わらない**(career の lay_off / rehire / switch_org、org_output、org 会計の受け手解決は
+    すべて agent.org_id だけを見るので、経路が違っても以降の意味論は同一)。
+
+    org_id を持たない層(L1 住民・L4 来街者・L5 役割ペルソナ)と、台帳に載っていない org_id
+    (プールと台帳の世代がずれたラン)は**何も付けない** = 従来と完全同一。
+    """
+    oid = record.get("org_id")
+    if not oid:
+        return False
+    org = book.get(str(oid))
+    if org is None:
+        return False
+    _attach(agent, org, str(record.get("role", "") or ""), city, commute_to_poi)
+    return True
+
+
 # ---------------------------------------------------------------- キャリア転換(Wave G5。既定 OFF)
 # 失業/求職/転職/起業転換の台帳操作。src/society 直下=engine の no-fingerprint 契約の外(ただし本
 # モジュールは因子語を扱わない=grievance は scheduler が factors hook 経由で処理する)。決定論・

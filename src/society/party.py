@@ -87,6 +87,32 @@ def _inject(a, b, tier: int, closeness: float) -> None:
     rel["tier"] = int(tier)
 
 
+def _fold_trip(agent) -> None:
+    """移動中の旅を畳む(= 位置を据え替える前の整合クリア)。冪等・L1 を 1 件も出さない。
+
+    ★第109バッチで判明した**本選ブロッカーの本体**: 寄せるときに ``node`` だけ書き換えて
+      ``route`` を残すと、次の ``_phase_move`` が (新 node, 旧 route[0]) という**存在しない辺**を
+      引いて ``KeyError: The edge (...) is not in the graph`` で死ぬ。起動時(day0)の実体化直後は
+      全員 route が空なので露見せず、**日次ローテーション**(``_phase_pool_rotation``)で
+      「前日から在場していて今まさに移動中の来街者」が連れになった瞬間に落ちる(実測 step 144=day 1)。
+
+    表現は既存の「旅を畳む」前例に揃える(``health._exit_world`` の despawn / 執行の勾留
+    ``route/dest/exit_intent/homing/activity`` クリア / ``_maybe_lodge`` の
+    ``_pending_stay/_pending_activity/_ride_pending`` クリア)。新しい語彙は 1 つも作らない。
+    ``edge_offset`` を 0 に戻すのは「ノードちょうどに立っている」ことの表明(経路再付与の
+    各サイトが 0 を書く既存作法と同じ)。"""
+    agent.route = []
+    agent.dest = None
+    agent.edge_offset = 0.0
+    agent.trip_mode = "walk"
+    agent.exit_intent = False          # 退出途中の旅も畳む(移動をやめた個体が意図だけ持ち続けない)
+    agent.homing = False
+    agent.activity = ""
+    agent._pending_activity = ""       # 到着時に消費するはずだった予約(到着はもう来ない)
+    agent._pending_stay = 0
+    agent._ride_pending = None         # 未到着の乗車=運賃を取り損ねない(到着課金の前提を残さない)
+
+
 # ---------------------------------------------------------------- 実体化(present 判定の後)
 def form_parties(sim, step: int, sim_min: int) -> None:
     """その日 present な来街者を party_size でグループ化し「同席の連れ」にする(既定 OFF=no-op)。
@@ -123,11 +149,19 @@ def form_parties(sim, step: int, sim_min: int) -> None:
         if len(members) < 2:                          # 連れが確保できなければ不成立
             continue
         node = leader.node
+        # 寄せ先の座標。旅を畳んだ以上「ノードちょうどに立っている」のが正直な位置なので
+        # node_xy を採る(day0 の実体化直後は leader.x/y と一致=従来と同値)。地図に無いノード
+        # (テストが node だけ差し替える等)は代表の座標へフォールバック(medical と同じ保険)。
+        try:
+            lx, ly = sim.city.node_xy(node)
+        except Exception:                             # noqa: BLE001(未知ノードの保険)
+            lx, ly = leader.x, leader.y
         poi = _shared_poi(sim, leader.id, day)
         for m in members:                             # 同一初期ノードへ寄せる(同席の連れ)
+            _fold_trip(m)                             # ★寄せる前に旅を畳む(存在しない辺を残さない)
             m.node = node
-            m.x = leader.x
-            m.y = leader.y
+            m.x = lx
+            m.y = ly
             m.party_today = {"poi": poi, "band": band}
             assigned.add(m.id)
         for i, m in enumerate(members):               # 連れ相互に relations 注入

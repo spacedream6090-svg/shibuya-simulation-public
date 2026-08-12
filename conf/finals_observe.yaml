@@ -20,7 +20,9 @@
 #        → data/organizations_shibuya_census.json (9,872社 / 従業者 222,849 / 夜勤枠 3,370社)
 #   ③ ペルソナプール(②から再生成=夜勤者と新職業が載る)
 #        python scripts/build_persona_pool.py --orgs data/organizations_shibuya_census.json
-#        → data/persona_pool (100万件 / L2 224,240 / L5 1,247)
+#        → data/persona_pool (100万件 / L2 224,240 / L5 1,292)
+#          ★L5 は第109バッチ レーン FIX の消防士 45 人ぶんで 1,247 → 1,292。**プールを
+#            再生成していないと消防士が 0 人**のままで fire_dispatch が恒久 unstaffed になる
 #   ②③ を飛ばすと night_economy の夜勤者・street_life/city_ops の担い手が名簿に居らず、
 #   「ONにしたのに1件も出ない」族が大量に出る(第107縦煙の実測)。
 #
@@ -58,6 +60,8 @@ model:
 pool:
   enabled: true
   dir: data/persona_pool   # ②③ で再生成したプール(L2 224,240 = センサス従業者 222,849 + 教職員)
+                           # ★L2 の record は台帳の org_id/role を持つ = organizations の
+                           #   pool 配属(attach_record)と work.bind_workplace の入力そのもの
   present_cap: 250000      # 在場 = 25万(DP-U3 本線)
   dormant_cap: 50000       # ★既定 0(無制限)は日次ローテーションで際限なく膨れる。LRU で有界化
   # ---- 層別クォータ(第98 小粒G・DP-U3 案A)----
@@ -114,6 +118,24 @@ world:
     #   を**両方**並べている前例と同型に、台帳ロール名を足す。src は 1 行も触っていない。
     responder_occupations: ["設備保守員", "警備員", "設備巡回", "常駐警備"]
     # escalator.traps は **false のまま**(「エスカレータで閉じ込め」は現実に反する対照条件)
+
+  # ---- 所有権レイヤー O1(登記簿)+ O3(相続)----
+  # ON の理由:
+  #  ① **観測層に完全に閉じている**(fingerprint_risk=none・LLM 呼数増分ゼロ・プロンプトの
+  #     行も節も 1 つも増えない)。ON にしても生きている個体の行動は 1 バイトも変わらない。
+  #  ② 本選の観測価値が大きい: 総資産 Gini(現金だけ見ると住宅資産を落とす = 資産格差の
+  #     観測が原理的に歪む)・所有ネットワーク(創業者が何を持って始めたか)・空き住戸率。
+  #  ③ **第107 の観測盲点の解消**(死者の財布に凍結された金が相続で流通へ戻る)。
+  #     health.severity + medical が ON の本セットでは死が実際に起きるので、O3 が実働する。
+  # コスト: 起動時 1 回の初期配賦だけ(地図 v8 = 延べ 11,948 戸 + has_car の車両)で、
+  #   毎 step の走査はゼロ(死亡・転居があった step だけ L1 の watermark を見る)。
+  # 前提: organizations が ON でセンサス台帳(9,872社)が載っていること
+  #   = 賃貸住戸の家主に**域内の不動産 org**(RE × 賃貸仲介/管理・開発/PM = 487 社)が入る。
+  #   organizations OFF だと賃貸は全部 RoW(不在家主)へ落ちる(= 現行と同じ絵)。
+  assets:
+    enabled: true
+    # 既定値(持ち家率 0.32 / 法人家主 0.20 / RE × 賃貸仲介-管理・開発/PM)をそのまま使う。
+    # ★較正を動かす提案は無い(住宅・土地統計調査と国交省調査の実測アンカーが源)。
 
   # ---- 都市リアリズム(production 由来)----
   floor_clamp:
@@ -256,6 +278,31 @@ incidents_interpersonal:
 
 incidents_env:
   enabled: true            # 火災 / 設備 / 群集 / 交通(全焼0既定・群集は生成しない=既存混雑を読む)
+  # ---- 担い手の語(第109バッチ D2 で src ハードコードから conf キーへ)----
+  # ★名簿の実測(data/persona_pool。上の ②③ で再生成したもの):
+  #     消防士      45 人  … ★第109バッチ レーン FIX で _L5_ROLES へ**末尾追加**(本署の
+  #                          消火部隊 3 隊 × 5 人 × 3 部制)。これ以前は 0 人だった
+  #     救急隊員     6 人  … L5 役割(city_ops.ems が消防士と併せて 3 直で束ねる)
+  #     警備員       0 人  … 「警備員」という語は名簿のどこにも無い(足していない=下記)
+  #     警察官     140 人  … L5 役割(交番8箇所へ city_ops が 3 直で束ねる)
+  #     常駐警備  3,875 人 … ★センサス較正台帳(build_orgs --census --night-shifts)の
+  #                          ビル常駐警備ロール。L2 = この街で実際に働いている警備の実数。
+  #                          L5 に「警備員」を別に立てると**同じ職の二重計上**になるので
+  #                          名簿は増やさず、この語を conf 側で引く(下の guard_occupations)
+  crowd:
+    # 雑踏警備の頭数(payload の guards)は**読み取り専用**で密度も行動も動かさないので、
+    # 名簿に実在する語を足して「警備が何人居合わせたか」を実測できる形にする。
+    # ★正直な限界: 常駐警備はビル常駐の警備であって**雑踏警備(群集整理)ではない**。
+    #   したがってこの数字は「その場に居合わせた警備の人数」であって「群集整理の配置人数」
+    #   ではない。解釈するときは必ずこの区別を添えること。
+    guard_occupations: [常駐警備, 警備員, 警察官]
+  # ★fire.occupations は **既定のまま**(= ["消防士"])。第108 の時点では名簿に 0 人で
+  #   fire_dispatch が恒久 unstaffed だったが、第109バッチ レーン FIX が
+  #   scripts/build_persona_pool.py の _L5_ROLES へ消防士 45 人を末尾追加したので、
+  #   **名簿を直す**ことで解消してある(救急隊員や警察官を conf で代用して「消防が居る街」の
+  #   偽像を作る、という当時の禁じ手は採っていない)。
+  #   summary.json の incidents_env.fire_roster が 0 でないことがその証拠になる
+  #   (0 に戻っていたら = プールを再生成し忘れている、と読む)。
 
 # ============================================================================
 # (8) 情報・認知・計画(IF-A〜E)
@@ -320,9 +367,13 @@ organizations:
   enabled: true
   commute_to_poi: true
   book: data/organizations_shibuya_census.json   # ★v8 + センサス較正 + 夜勤の台帳
-  # ★正直な限界: pool ラン(agents.personas_file=null)では organizations.attach が 0 件を返す
-  #   = agent.org_id は付かない。これは PENDING §3「pool 経路の agent.org_id 付与」= 判断待ち。
-  #   台帳自体は career の再配属先・commerce.inventory.b2b の卸先として読まれる。
+  # ★第109バッチ レーン ORG(ユーザー承認 2026-08-12「両方実装してON」)で解消済み:
+  #   pool ラン(agents.personas_file=null)は organizations.attach が構造的に 0 件を返していたが、
+  #   プールの record は台帳から逆算して作られていて org_id/role を持っているので、
+  #   build_pool_agent が **その org_id で配属する**(organizations.attach_record)。
+  #   意味論は名簿経路の attach と同一(org_id / org_role / org_line + commute_to_poi の束縛)で、
+  #   career の解雇・転職、org_output、org 会計の受け手解決がそのまま pool ランでも効く。
+  #   台帳自体は career の再配属先・commerce.inventory.b2b の卸先としても読まれる。
 
 government:
   enabled: true
@@ -401,12 +452,45 @@ work:
   service:
     enabled: true
     indoor_fields: true
+    # ★接客写像に service 行を足す(第109バッチ D2)。
+    #   services.spend_cat の既定は "service" で、受給の _spend は cat="service" で出る。
+    #   ところが基底 conf/config.yaml の work.service.serve_by_cat は food/cafe/nightlife/shop の
+    #   4 行しか持たない(work.py の DEFAULT_SERVE_BY_CAT には第106で service 行が入ったが、
+    #   conf が serve_by_cat を書いている以上そちらが丸ごと勝つ = 既定は使われない)。
+    #   その結果、センサス較正台帳の **service 職場 1,972 社が構造的に無人接客**になり、
+    #   services.enabled=true(上で ON)の来店が 1 件も serve に帰属しない。
+    #   ここは OmegaConf の深いマージなので、この 1 行だけで 4 行 → 5 行になる
+    #   (基底の 4 行は上書きされない)。値は work.py の DEFAULT_SERVE_BY_CAT と同一語。
+    # ★挙動は ONセット承認(OBS-U1/U3)に同梱。基底 conf/config.yaml は触っていない。
+    serve_by_cat:
+      service: 窓口・施術の接客
     office:
       by_org: true
     ledger:
       enabled: true
-  # ★bind_workplace は **入れない**(PENDING §3 = ユーザー判断待ち)。ON にすると spend/economy
-  #   統計が激変し(serve 1259→301)、ON/OFF 跨ぎの比較が原理的に不可能になる。
+  # ---- 職場束ね直し(第109バッチ レーン ORG。★ユーザー承認 2026-08-12「両方実装してON」)----
+  # ON の理由:
+  #  ① **pool ランでは work_node を持てない層が構造的に生まれる**。プールの L2(域内従業者
+  #     224,240 人)は occupation が persona._WORK_CAT に載らない台帳ロール名(「常駐警備」
+  #     「設備巡回」等)なので _pick_workplace が None を返し、勤務地が無いまま街に立つ。
+  #     その結果 street_life の客引き(夜の持ち場 = work_node)も serve も org_output も
+  #     原理的に成立しない。第108 縦煙の「客引き 0 件」はこの一点が原因だった。
+  #  ② organizations 側の pool 配属(同承認)と**対**である。organizations の束縛は台帳 node を
+  #     無条件に採るが、bind_workplace は「その node が実際にその業種の POI を持つか」まで見て
+  #     実在の店舗へ着地させる(第100 の是正)。両方 ON で「台帳 → 実在 POI」が繋がる。
+  # ★rebind_bound: true を**必ず同伴**する(第102 の記録 = org 帰属の意味論でこれが正)。
+  #   false だと organizations.commute_to_poi が先に置いた台帳 node(POI 実体と食い違いうる)を
+  #   「既に束ね済み」と見なして触らないので、①の是正が効かない個体が残る。
+  # ★book は **センサス較正台帳**を明示する(既定は wide11k)。プールは
+  #   build_persona_pool --orgs data/organizations_shibuya_census.json で再生成してあり、
+  #   record の org_id は census 側の id 体系。wide11k と重なるのは 9,882 中 4,383 だけなので、
+  #   既定のままだと半数以上が台帳直束ねに失敗して POI マッチへ落ちる(黙って劣化する)。
+  # 正直な限界: ON で serve/spend の統計は大きく動く(第102 実測 serve 1259→301)。
+  #   したがって **ON/OFF を跨いだ経済統計の比較はしない**(本選は ON セット内で完結させる)。
+  bind_workplace:
+    enabled: true
+    rebind_bound: true
+    book: data/organizations_shibuya_census.json
 
 career:
   enabled: true
@@ -608,7 +692,6 @@ observer:
 # (14) 意図的に入れなかったもの(全部ここに理由を残す=「忘れていた」と区別する)
 # ============================================================================
 # ● ユーザー/台帳の判断待ち
-#   work.bind_workplace.enabled(+ rebind_bound) … PENDING §3。ON で serve 84%→66%・spend が激変
 #   cognition.fire / watch / g_update / engaged  … OBS-U3「認知 ON の 8/14 留保」
 #   cognition.policy_cache.enabled               … PENDING §3(resume で空になる問題が未決)
 #   model.mind.enabled                           … DP-U2 案C の最終判定が 8/15(vLLM 同居性能の実測)

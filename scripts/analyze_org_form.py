@@ -74,6 +74,12 @@ QUANTILES = (0.10, 0.25, 0.50, 0.75, 0.90)
 # build_window_graph が読む kind だけをパースする(全 payload を触らない)
 GRAPH_KINDS = ("speak", "hear", "dm", "sns_like", "sns_reshare",
                "event_attend", "event_host")
+# W4-D': `l1_stream` へ渡す kind 集合の**唯一の宣言**(中身は GRAPH_KINDS と同一)。
+# ★正典は再利用先 `analyze_communities.build_window_graph` の分岐であり、
+#   本スクリプトはそれ以外の kind を 1 行も読まない(`detect` / `track_lifecycle` は
+#   イベントではなくグラフを受け取る)。`tests/test_l1_stream_migration.py` が
+#   AST でモジュール内の kind リテラルとの網羅を機械検査する。
+WANT_KINDS: frozenset = frozenset(GRAPH_KINDS)
 
 
 # --------------------------------------------------------------------------- #
@@ -229,21 +235,21 @@ def ga_role_counts(z: dict, P: dict, z_thr: float = GA_Z_THRESHOLD,
 # 解析本体
 # --------------------------------------------------------------------------- #
 def _load_events(run_dir: str) -> list[dict]:
-    """`analyze_communities.build_window_graph` が読める形で、必要 kind だけを読む。"""
-    import pyarrow.parquet as pq
-    path = os.path.join(run_dir, "l1_events.parquet")
-    if not os.path.exists(path):
+    """`analyze_communities.build_window_graph` が読める形で、必要 kind だけを読む。
+
+    W4-D': 自前の `pq.ParquetFile` 直読みを **共有の `l1_stream`** へ移した
+    (`analyze_communities.load_events` が第101で移った先と同じ経路)。
+    旧実装との差は 3 点だけで、返り値は 1 バイトも変わらない:
+    **kind を Arrow 上で絞ってから実体化する**(捨てる行の Python オブジェクトを
+    作らない)/ **part 群の透過連結** / **Windows の共有フラグ付き open**。
+    """
+    import l1_stream as ls
+    if not ls.l1_paths(run_dir):
         return []
-    want = set(GRAPH_KINDS)
-    pf = pq.ParquetFile(path)
-    avail = set(pf.schema_arrow.names)
-    cols = [c for c in ("step", "agent_id", "kind", "payload") if c in avail]
     out: list[dict] = []
-    for batch in pf.iter_batches(columns=cols):
-        d = batch.to_pydict()
+    for d in ls.iter_columns(run_dir, ["step", "agent_id", "kind", "payload"],
+                             kinds=WANT_KINDS):
         for st, aid, kind, raw in zip(d["step"], d["agent_id"], d["kind"], d["payload"]):
-            if kind not in want:
-                continue
             try:
                 payload = json.loads(raw) if raw else {}
             except (json.JSONDecodeError, TypeError):

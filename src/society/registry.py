@@ -581,6 +581,36 @@ FEATURES: tuple[Feature, ...] = (
        "着服は crime を出さず payload の offense / guardians(RAT の監視者数)で宣言する"
        "(diversity の較正済み窃盗系列と混線させないため)。"
        "既定 OFF は lost_* 0 件・state なし・所持金不変・プロンプト不変(L1 バイト一致)"),
+    # 所有権レイヤー O1(登記簿)+ O3(相続)(設計 src/society/assets.py /
+    # docs/plans/ownership-layer-plan.md §1・§2・§5)。
+    # strict の根拠: 新 stream は "asset_alloc" 1 本だけ(**起動時 1 回の初期配賦**で、住戸
+    #   1 戸に 1 draw)。家主 org の選定・相続の分配・売却の買い手は **乱数を 1 粒も引かない**
+    #   (sha256 の純関数ジッタと id 昇順の決定論)。LLM の自由文を 1 バイトも読まない。
+    # ★affects_k=False: generate() の呼び出しサイトを 1 つも足さず、プロンプトの**節**も
+    #   **行**も 1 つも増やさない(第 1 段は観測層に閉じる = 当事者の記憶にも 1 行も入らない)。
+    # fingerprint_risk=none: エージェント側から観測できる差分が原理的に無い。ON で動く世界状態は
+    #   **死者の遺産が相続人へ移る現金だけ**で、生きている個体の残高・位置・記憶・プロンプトは
+    #   1 バイトも変わらない(所有は完全に台帳の中に閉じている)。
+    _f("world.assets.enabled", "strict", False, "none",
+       "計画書 §1「所有されるもの」を世界の第一級オブジェクトにする層。**タグ付きレコードを"
+       "登記簿に置く**ハイブリッド(ユーザーの「物にタグ」案 × Torrens/LADM の中央台帳)= "
+       "権利行 (asset_id, party_id, right_kind, since) + 双方向索引(by_owner / by_asset)。"
+       "O1 の対象は不動産(住戸 =(建物, 階))と車両(has_car の個体昇格)で、権利種は own 1 種"
+       "(lease / permit / lien / custody は conf 宣言だけの将来枠 = O4)。"
+       "初期配賦は**渋谷区の持ち家住宅率 ≈32%**(住宅・土地統計調査)で居住者 own、賃貸住戸は"
+       "**域内の不動産 org**(組織台帳の industry_key=RE × sector_detail 賃貸仲介/管理・開発/PM)"
+       "と RoW(域外家主)のミックス(法人所有 ≈2 割 = ユーザー決定 §5-1)。"
+       "★O3 相続 = 死亡時に故人の現金 + 資産行を世帯(housemates)へ移す。相続人不存在の遺産は"
+       "民法 959 条どおり国庫 = RoW の inheritance_escheat チャネルへ出す(第107 の観測盲点"
+       "「死者の財布に凍結」の解消)。検証は**資産保存則**"
+       "(Σ 所有者別保有数 + K5 − RoW 生成 = 初期ストック)+ 未分類移転種ゼロ。"
+       "既定 OFF は台帳オブジェクトを作らず inheritance / asset_transfer 0 件・"
+       "死者の財布は凍結のまま・プロンプト不変(L1 バイト一致)"),
+    _f("world.assets.dwellings", "strict", False, "none",
+       "住戸(=(住宅系建物, 階))だけを個別に切る子トグル(親 world.assets.enabled 配下)。"
+       "false にすると台帳は車両だけになる(不動産の寄与を切る対照条件)", off_value=True),
+    _f("world.assets.vehicles", "strict", False, "none",
+       "車両(has_car の個体昇格)だけを個別に切る子トグル(親配下)", off_value=True),
     # Wave 4 III-3: 街の顔 = 路上の生業と条例(設計 src/society/street_life.py)。
     # strict の根拠: **乱数 stream を 1 本も引かない**(持ち場は地図の純関数・受諾は id の
     #   剰余・パトロールは同ノード判定)。LLM の自由文を 1 バイトも読まない。

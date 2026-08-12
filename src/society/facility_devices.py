@@ -819,7 +819,11 @@ def audit_report(sim) -> dict:
 
 
 def provenance(sim) -> dict | None:
-    """観測タリー(既定 OFF は None)。**実測 vs アンカー**を並べて出す。"""
+    """観測タリー(既定 OFF は None)。**実測 vs アンカー**を並べて出す。
+
+    第109バッチ D2 で ``summary.json`` の ``facilities`` キーへ配線した(conf のキーが
+    ``world.facilities`` なのでキー名もそちらへ合わせる。OFF はキー自体を出さない)。
+    """
     if not enabled(sim):
         return None
     cfg = cfg_of(sim)

@@ -221,6 +221,39 @@ _L5_ROLES = [
     ("救急隊員", "救急隊員", 6,
      ["消防出張所", "救急待機所", "巡回ユニット"],
      {"days": "all", "rotates": True, "shift_hours": 8}, False),
+    # ---- 消防(第109バッチ レーン FIX。★**名簿と conf の食い違いの修復**)------------ #
+    # 監査事実(第108 縦煙の実測): ``incidents_env.fire.occupations`` の既定は「消防士」なのに、
+    #   名簿に「消防士」が **1 人も居なかった**(_L5_ROLES に行が無い)。その結果、火災が起きても
+    #   出場者が原理的に見つからず ``fire_dispatch`` は毎回 ``unstaffed=true`` になる。
+    #   ``city_ops.ems.crew_occupations``(= 救急隊員 + 消防士)も片肺で回っていた
+    #   (現実の東京消防庁では救急隊員も消防吏員 = 同じ署の人員である)。
+    #   ここは新機能ではなく、車掌のときと同型の**設定と名簿の食い違いの修復**である。
+    # ★**必ず末尾に足す**(上の 3 か所と同じ理由): L5 の id は _L5_ROLES の並び順に振られる
+    #   ので、途中に挿すと既存 L5 の id が全部ずれる。末尾追加なら既存 id と rng 消費は不変。
+    # ★人数の根拠(現実の実数 vs 名簿。過大に盛らない方針で**この地図の範囲**に絞った):
+    #   消防士 45 …
+    #     ① 渋谷消防署は本署 + 出張所 5(恵比寿・代々木・原宿・富ヶ谷・松濤)から成るが、
+    #        **地図 v8 に載っている消防施設は「渋谷消防署」1 件だけ**(POI 実測)。出張所は
+    #        bbox の外なので数えない(= 区全体の消防吏員数ではなく、この地図を守る本署の
+    #        消火部隊だけを名簿に立てる。清掃作業員 12 と同じ「この範囲を回る班」の流儀)。
+    #     ② 本署の消火部隊をポンプ隊 2 + はしご隊 1 = 3 隊、1 隊 5 人 = **15 人/当番**と置く。
+    #     ③ 東京消防庁の消防署は**当番・非番・週休の 3 部制**なので 15 × 3 = 45。
+    #     ★区全体の消防吏員は 200 人超の桁だが、それを名簿に載せると「地図の数百 m 四方に
+    #       区全体の消防が常駐している街」という現実に無い像になるので採らない。
+    #     ★救急隊員(上の 6 人)とは**別建て**にして二重計上しない。ただし
+    #       ``city_ops.ems.crew_occupations`` は両方を引くので、救急の当直は実質両者が担う
+    #       (現実の消防吏員の運用と一致する)。``incidents_env._fire_crew`` は救急出動中の
+    #       個体を除くので、同じ人が同時に 2 つの現場へ行くことはない。
+    # ★「警備員」は**足さない**(意図的な不作為): センサス較正台帳(build_orgs --census
+    #   --night-shifts)が L2 に **常駐警備 3,875 人**を生やしていて、それがこの街で実際に
+    #   働いている警備の実数である。L5 に「警備員」を別に立てると同じ職を二重に数えることに
+    #   なる。conf 側は ``incidents_env.crowd.guard_occupations`` /
+    #   ``world.facilities.responder_occupations`` に台帳ロール名(常駐警備・設備巡回)を
+    #   並べて解決済みなので、名簿を増やす必要が無い。
+    # ★visitor=False(この街で暮らしている)。
+    ("消防士", "消防士", 45,
+     ["渋谷消防署", "ポンプ隊", "はしご隊", "指揮隊"],
+     {"days": "all", "rotates": True, "shift_hours": 8}, False),
 ]
 
 # 役割ごとの persona 文の中核(既定は「{post}で{role}として働いている」)。
@@ -755,11 +788,38 @@ def gen_L5(writer: ShardWriter, seed: int, fraction: float):
 
 
 # ------------------------------------------------------------------ メイン
+def scan_existing_parts(out_dir: Path) -> set:
+    """出力先に**いま在る** part-*.jsonl の相対名(``<layer>/part-XXXX.jsonl``)を集める。
+
+    第109 レーン D1 の発見: ビルダは part を**上書きするだけ**で古い part を消さない。
+    層が縮む再生成(例: L2 が 224,240 → 180,000 に減る)を掛けると、前回の末尾 part が
+    ディレクトリに残る。影響の切り分け:
+
+      - シム本体(``world/pool.py`` の ``PoolStore``)は ``meta.json`` の ``shards`` しか
+        読まない = **名簿は汚れない**(幽霊 id は present 判定にも id_of にも入らない)。
+      - ところが同じビルダの ``_collect_llm_targets`` は層ディレクトリを **glob する**ので、
+        ``llm_targets.json`` には幽霊 id が**入り込む**(深いペルソナ化の対象名簿が汚れる)。
+      - ディレクトリを直に舐める外部ツール(集計スクリプト・人間の ``wc -l``)も同じ。
+
+    生成の**前**に採るのが要点で、そうすれば「今回書いたもの」との差が管理外 part そのもの
+    になる(今回書いた part を巻き添えで消す事故が原理的に起きない)。
+    """
+    out: set = set()
+    if not out_dir.is_dir():
+        return out
+    for layer_dir in sorted(p for p in out_dir.iterdir() if p.is_dir()):
+        for f in sorted(layer_dir.glob("part-*.jsonl")):
+            out.add(f"{layer_dir.name}/{f.name}")
+    return out
+
+
 def build_pool(out_dir: Path, seed: int, fraction: float,
                orgs: dict, pop: dict, total_target: int,
-               orgs_file: str = DEFAULT_ORGS_FILE):
+               orgs_file: str = DEFAULT_ORGS_FILE, clean: bool = False):
+    """プールを生成する。``clean=True`` で**管理外の古い part を削除**する(既定は警告のみ)。"""
     t0 = time.time()
     out_dir.mkdir(parents=True, exist_ok=True)
+    pre_parts = scan_existing_parts(out_dir)      # ★書き込み前に採る(D1)
 
     # 層別目標
     n_L1 = int(round(30_000 * fraction))
@@ -803,6 +863,27 @@ def build_pool(out_dir: Path, seed: int, fraction: float,
     total = sum(layer_counts.values())
     shards = [s for w in writers.values() for s in w.shards]
 
+    # ---- 管理外(stale)part の始末(第109 レーン D1)------------------------------
+    # 既定は**破壊的でない**: 消さずに警告し、meta へ「meta.shards から参照していない」
+    # 事実を明示して残す(再生成のたびに黙って消すと、取り違えた --out を指定した事故が
+    # 復旧不能になる)。--clean を明示したときだけ削除する。
+    # ★ここに置くのは `_collect_llm_targets`(層ディレクトリを glob する)の**前**でなければ
+    #   ならない。後ろに置くと --clean を付けても llm_targets.json に幽霊 id が残る。
+    produced = {s["file"] for s in shards}
+    stale = sorted(pre_parts - produced)
+    removed: list = []
+    if stale and clean:
+        for rel in stale:
+            (out_dir / rel).unlink()
+        removed, stale = stale, []
+    elif stale:
+        print(f"[warn] 管理外の古い part が {len(stale)} 個残っている。"
+              f" 名簿(meta.shards → PoolStore)は汚れないが、"
+              f" llm_targets.json は層ディレクトリを glob するので幽霊 id が混ざる。"
+              f" 消すには --clean を付けて再実行する:", file=sys.stderr)
+        for rel in stale:
+            print(f"[warn]   {rel}", file=sys.stderr)
+
     # ---- llm_targets(深いペルソナ化=LLM上塗り対象: L5 全員 + L1/L3常連の一部)----
     llm_targets = _collect_llm_targets(out_dir, seed)
 
@@ -831,6 +912,10 @@ def build_pool(out_dir: Path, seed: int, fraction: float,
         "elapsed_sec": round(time.time() - t0, 2),
         "layer_elapsed_sec": {k: round(v, 2) for k, v in timings.items()},
         "shards": shards,
+        # 第109 レーン D1: 前回の生成が残した管理外 part(**shards からは参照しない**)と、
+        # --clean で実際に消したもの。どちらも空リストが既定 = 通常の再生成では出ない。
+        "stale_shards": stale,
+        "stale_shards_removed": removed,
     }
     (out_dir / "meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -900,6 +985,10 @@ def main(argv=None):
                     help="L2/L3学生の需要源になる組織台帳 JSON(既定=正準 11k 台帳)。"
                          "センサス較正台帳を使うなら "
                          "--orgs data/organizations_shibuya_census.json")
+    ap.add_argument("--clean", action="store_true",
+                    help="出力先に残った**管理外の古い part**(前回の生成物で今回は"
+                         "書き直されなかったもの)を削除する。既定は削除せず警告のみ"
+                         "(meta.shards から参照されないので中身は汚れない)。")
     args = ap.parse_args(argv)
 
     out_dir = Path(args.out)
@@ -914,7 +1003,8 @@ def main(argv=None):
                      .read_text(encoding="utf-8"))
 
     meta, councilors = build_pool(out_dir, args.seed, args.fraction, orgs, pop, args.total,
-                                  orgs_file=str(args.orgs).replace("\\", "/"))
+                                  orgs_file=str(args.orgs).replace("\\", "/"),
+                                  clean=args.clean)
 
     if not args.no_councilors_json:
         cpath = _write_councilors_json(councilors, args.seed)
@@ -927,6 +1017,11 @@ def main(argv=None):
         c = meta["layer_counts"].get(ly, 0)
         print(f"  {ly}: {c:,}  ({meta['layer_elapsed_sec'].get(ly, 0)}s)")
     print(f"  councilors={meta['councilors']}  llm_targets={meta['llm_targets_count']:,}")
+    if meta["stale_shards_removed"]:
+        print(f"  stale parts removed (--clean): {len(meta['stale_shards_removed'])}")
+    elif meta["stale_shards"]:
+        print(f"  stale parts left in place: {len(meta['stale_shards'])}"
+              f"  (meta.shards 非参照。--clean で削除)")
 
 
 if __name__ == "__main__":

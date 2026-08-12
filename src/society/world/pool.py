@@ -159,24 +159,92 @@ _RUMOR_KEY = "_rumors"
 # 上の `_RUMOR_KEY` と同じ理由(world/ は下層なので society 直下の機構 module を import すると
 # 依存の向きが逆流する)で写しを持つ。一致は tests/test_health_severity.py が機械固定する。
 # 各要素 = (属性名, 型, 既定値)。**既定値と等しい欄はキーを作らない**(退避 dict のバイト列不変)。
+# ★レーン D1(2026-08-12)の総点検で末尾 4 欄(sev_collapse_step / chronic_days /
+#   withdrawn / fatigue)を追加した。正典側 `health._SLIM_FIELDS` と必ず同じ並びで持つ。
 _HEALTH_FIELDS = (("sick", bool, False), ("sick_until", int, -1),
                   ("severity", int, 0), ("sev_channel", str, ""),
                   ("sev_until", int, -1), ("sev_outcome_step", int, -1),
                   ("sev_fatal", bool, False), ("sev_presentee", bool, False),
                   ("sev_cared", bool, False), ("sev_confirmed", int, -1),
-                  ("sev_frailty", float, 1.0), ("dead", bool, False))
+                  ("sev_frailty", float, 1.0), ("dead", bool, False),
+                  ("sev_collapse_step", int, -1), ("chronic_days", int, 0),
+                  ("withdrawn", bool, False), ("fatigue", float, 0.0))
 
 _HEALTH_PENDING = "sev_pending"
 
+# ---- レーン D1(第109): 退避フィールドの**総点検**で見つかった未搭載 ----------------
+# 判定基準(この 3 つを全部満たすものだけ運ぶ):
+#   ① 個体に固有で ② 日を跨いで持続し ③ その値が行動判断 or L1 の発火可否を変える。
+# 逆に「決定論で組み直せる静的属性」「その日 / その旅に固有の段取り」「プロセス内の
+# 観測カウンタ」は運ばない(ゾーン所有を運ばないのと同じ理由。下の注記に列挙)。
 
-def _health_slim(agent) -> dict:
-    """身体状態の退避辞書(健康な個体・健康 OFF のランでは **空 dict** = 現行と完全同一)。"""
+#: H2 医療(搬送中 / 在院中の印)。**`society.medical._clear` の全数と同一**でなければ
+#  ならない(`_RUMOR_KEY` と同じ理由で写しを持つ。一致は tests/test_pool_rotation.py の
+#  `test_med_field_list_mirrors_medical_clear` が機械固定する)。
+#  ★運ばないと「入院中の個体が回転で即退院して病院から消える」= 在院日数の較正が壊れる。
+_MED_FIELDS = (("med_admitted", bool, False), ("med_transport_until", int, -1),
+               ("med_until", int, -1), ("med_since", int, -1),
+               ("med_crew", int, -1), ("med_confirmed", int, -1),
+               ("med_node", str, ""), ("med_poi", str, ""),
+               ("med_dest_node", str, ""), ("med_dest_poi", str, ""),
+               ("med_dest_building", str, ""), ("med_from_node", str, ""))
+
+#: H4 酩酊の印(減衰する ttl)。**`society.incidents_interpersonal.INTOX_KEY` と同一**。
+#  当該 module が「正直な限界 4: プール退場で酩酊の印を失う」と自己申告していたもの。
+_INTOX_KEY = "_inc_intox_until"
+
+#: 負の評判(第61)の知識。`_rumors`(IF-C 残②)と**まったく同型**の「街を出ると忘れる」。
+#  known = target_id → 学習日 / heard = target_id → 聞いた相異なる知人の集合
+#  (集合は membership と len でしか使われない = sorted list で運んで良い。JSON 安全)。
+_GOSSIP_KNOWN_KEY = "_gossip_known"
+_GOSSIP_HEARD_KEY = "_gossip_heard"
+
+#: 真偽台帳(第73 Part B)の信念。`agent.beliefs`(内省の文字列)は運んでいるのに
+#  fact 信念だけ落ちるのは非対称で、checkpoint 側が `_tl_facts` を保存して
+#  「信念の参照先が迷子にならない」ようにしている配慮とも食い違っていた。
+#  ★`truth_ledger.py` は凍結 SPEC_FILES なので**あちらは 1 バイトも触らない**
+#  (属性名の写しをここに置くのは `_RUMOR_KEY` と同じ作法)。
+_FACT_BELIEFS_KEY = "_fact_beliefs"
+
+#: 評判スカラー(relations.gain_reputation / reputation_decay が育てる)。
+#  合成地位 T6(status.py)の 1 項でもあるので、落とすと再来街で地位が下がる。
+_REPUTATION_KEY = "_reputation"
+
+#: 所持品(goods の直近購入・conf で有界)。所持金は運んでいるのに買った物だけ消えていた。
+_BELONGINGS_KEY = "_goods_belongings"
+
+#: 世界観 C2 の可制御性(``worldview._ctrl_apply`` が日次で育てる Bandura の outcome
+#  expectancy)。★``worldview.ctrl_line`` がプロンプト 1 行を出し分けるので**行動に効く**。
+#  起点は ontology 群の決定論値なので、運ばないと再来街で「学習前」に戻る
+#  (``theta_drift`` を運んでいるのと同じ理由。属性が在るときだけ運ぶ = OFF は無風)。
+_CTRL_KEY = "controllability"
+
+
+def _fields_slim(agent, fields: tuple) -> dict:
+    """(属性名, 型, 既定値)表 → 退避辞書。**既定値と等しい欄はキーを作らない**。
+
+    これが「健康な個体 / 機構 OFF のランでは退避 dict のバイト列が現行と完全同一」を
+    成立させている芯である(tests/test_pool_rotation.py が dict 等値で機械固定)。
+    """
     out: dict = {}
-    for name, cast, default in _HEALTH_FIELDS:
+    for name, cast, default in fields:
         got = getattr(agent, name, default)
         got = str(got or "") if cast is str else cast(got)
         if got != default:
             out[name] = got
+    return out
+
+
+def _fields_apply(agent, state: dict, fields: tuple) -> None:
+    """退避辞書 → 再来街エージェント(**キー欠落を許容** = 旧 退避辞書からは何も生やさない)。"""
+    for name, cast, _default in fields:
+        if name in state:
+            setattr(agent, name, cast(state[name]))
+
+
+def _health_slim(agent) -> dict:
+    """身体状態の退避辞書(健康な個体・健康 OFF のランでは **空 dict** = 現行と完全同一)。"""
+    out = _fields_slim(agent, _HEALTH_FIELDS)
     pending = getattr(agent, _HEALTH_PENDING, None)
     if pending:
         out[_HEALTH_PENDING] = dict(pending)       # プリミティブのみ(JSON 安全・実体非共有)
@@ -185,9 +253,7 @@ def _health_slim(agent) -> dict:
 
 def _health_apply(agent, state: dict) -> None:
     """退避辞書 → 再来街エージェント(**キー欠落を許容** = 旧 退避辞書からは何も生やさない)。"""
-    for name, cast, _default in _HEALTH_FIELDS:
-        if name in state:
-            setattr(agent, name, cast(state[name]))
+    _fields_apply(agent, state, _HEALTH_FIELDS)
     pending = state.get(_HEALTH_PENDING)
     if pending:
         setattr(agent, _HEALTH_PENDING, dict(pending))
@@ -271,6 +337,38 @@ def dehydrate(agent, *, ep_cap: int | None = None, rel_cap: int | None = None) -
     health = _health_slim(agent)
     if health:
         state["health"] = health
+    # --- レーン D1(2026-08-12): 退避フィールドの**総点検**(H1 の横展開)------------------
+    # 以下はどれも「① 個体固有 ② 日を跨いで持続 ③ 行動 or 発火可否を変える」を満たすのに
+    # 1 つも載っていなかった = 回転のたびに黙って忘れていた。上と同じ「非既定のときだけ
+    # キーを足す」設計なので、当該機構 OFF のランでは退避 dict が 1 バイトも変わらない。
+    med = _fields_slim(agent, _MED_FIELDS)        # H2: 搬送中 / 在院中の印(即退院を防ぐ)
+    if med:
+        state["med"] = med
+    intox = int(getattr(agent, _INTOX_KEY, 0) or 0)   # H4: 酩酊(RAT の酒項)
+    if intox:
+        state["intox_until"] = intox
+    known = getattr(agent, _GOSSIP_KNOWN_KEY, None)   # 第61: 悪評を知っている対象 → 学習日
+    if known:
+        state["gossip_known"] = {int(k): int(v) for k, v in known.items()}
+    heard = getattr(agent, _GOSSIP_HEARD_KEY, None)   # 第61: 対象 → 聞いた相異なる知人
+    if heard:
+        # 値は集合だが membership / len でしか使われない(gossip.py 明記)= sorted list で
+        # 運ぶ(JSON 安全 + 反復順の非決定を持ち込まない)。空集合の欄は落とす。
+        _hd = {int(k): sorted(int(x) for x in v) for k, v in heard.items() if v}
+        if _hd:
+            state["gossip_heard"] = _hd
+    facts = getattr(agent, _FACT_BELIEFS_KEY, None)   # 第73 Part B: fact_id → 信念レコード
+    if facts:
+        state["fact_beliefs"] = {str(k): dict(v) for k, v in facts.items()}
+    rep = float(getattr(agent, _REPUTATION_KEY, 0.0) or 0.0)   # 評判スカラー(T6 の 1 項)
+    if rep:
+        state["reputation"] = rep
+    belongings = getattr(agent, _BELONGINGS_KEY, None)         # 所持品(有界リスト)
+    if belongings:
+        state["belongings"] = [str(x) for x in belongings]
+    ctrl = getattr(agent, _CTRL_KEY, None)        # C2 可制御性(ontology/worldview ON のみ)
+    if ctrl is not None:
+        state["controllability"] = float(ctrl)
     # ★**ゾーン所有(_phys_zone と _FIELDS の走行レコード)は意図的に運ばない**。あれは
     #   「いま歩いている経路 agent.route の途中」という**その旅に固有の**状態で、再来街時は
     #   build_pool_agent が別の node / route で個体を組み直すため、復元すると physics._run_zone が
@@ -312,3 +410,30 @@ def hydrate(agent, state: dict) -> None:
     health = state.get("health")                  # H1: 病気/重症度を持ち越す(キー欠落は許容)
     if health:
         _health_apply(agent, health)
+    # --- レーン D1(2026-08-12): 総点検で足した族。**キー欠落を許容**する(旧 退避辞書 /
+    #     機構 OFF のラン)= その場合は属性を 1 つも生やさない = 現行と完全同一。
+    med = state.get("med")                        # H2: 搬送 / 在院の印
+    if med:
+        _fields_apply(agent, med, _MED_FIELDS)
+    intox = state.get("intox_until")              # H4: 酩酊の ttl
+    if intox:
+        setattr(agent, _INTOX_KEY, int(intox))
+    known = state.get("gossip_known")             # 第61: 悪評の知識
+    if known:
+        setattr(agent, _GOSSIP_KNOWN_KEY, {int(k): int(v) for k, v in known.items()})
+    heard = state.get("gossip_heard")             # 第61: 聞いた相異なる知人(list → set へ戻す)
+    if heard:
+        setattr(agent, _GOSSIP_HEARD_KEY,
+                {int(k): {int(x) for x in v} for k, v in heard.items()})
+    facts = state.get("fact_beliefs")             # 第73 Part B: fact 信念
+    if facts:
+        setattr(agent, _FACT_BELIEFS_KEY, {str(k): dict(v) for k, v in facts.items()})
+    rep = state.get("reputation")                 # 評判スカラー
+    if rep:
+        setattr(agent, _REPUTATION_KEY, float(rep))
+    belongings = state.get("belongings")          # 所持品(有界リスト)
+    if belongings:
+        setattr(agent, _BELONGINGS_KEY, [str(x) for x in belongings])
+    ctrl = state.get("controllability")           # C2 可制御性(キー欠落は許容)
+    if ctrl is not None:
+        setattr(agent, _CTRL_KEY, float(ctrl))

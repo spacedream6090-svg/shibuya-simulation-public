@@ -234,10 +234,19 @@ INJURY_HINT: dict[str, int] = {
 #: 6 = 群集事故が起こりうる水準 / 13 = 群集雪崩の水準。
 CROWD_LEVELS: tuple[float, ...] = (4.0, 6.0, 13.0)
 
-#: 雑踏警備の担い手(**読み取りだけ**。密度を下げる作用は書かない)。
+#: 雑踏警備の担い手の**既定値**(**読み取りだけ**。密度を下げる作用は書かない)。
+#: ★第109バッチ D2: conf キー ``incidents_env.crowd.guard_occupations`` の既定として使う
+#:   (src のハードコードをやめた)。値を変えていないので既定ランは完全同値。
 GUARD_OCCS: tuple[str, ...] = ("警備員", "警察官")
 
-#: 消防の担い手(既存名簿の職。新設しない)。
+#: 消防の担い手の**既定値**(既存名簿の職。新設しない)。
+#: ★第109バッチ D2: conf キー ``incidents_env.fire.occupations`` の既定として使う。
+#: ★正直な現状(第108 縦煙の実測): ペルソナプール(``data/persona_pool``)の名簿に
+#:   「消防士」は **1 人も居ない**(``scripts/build_persona_pool.py`` の ``_L5_ROLES`` に
+#:   行が無い)。したがって既定のままでは出場者が見つからず ``fire_unstaffed`` が立つ。
+#:   これは**不具合ではなく正直なマーカー**である(居ない職を別の職で埋めない)。
+#:   救急の担い手だけは ``city_ops.ems.crew_occupations`` が「救急隊員 + 消防士」の
+#:   2 語を引くので、救急隊員(L5 に 6 人)側で連鎖が成立する。
 FIRE_OCCS: tuple[str, ...] = ("消防士",)
 
 #: 渋谷区の面積[km²](公表値)。規模比 ③ の分母。
@@ -254,6 +263,10 @@ DEFAULTS: dict = {
     # ---- ① 火災 ----
     "fire": {
         "enabled": True,
+        # 出場する当直を名簿から探すときの職の語(**conf で差し替え可**)。
+        # 既定 = FIRE_OCCS。★名簿に居ない語しか無いランでは fire_unstaffed が立つ
+        #(居ない職を別の職で埋めない = 正直な無人マーカー)。
+        "occupations": FIRE_OCCS,
         "jurisdiction_per_day": 0.66,   # ★アンカー(消防署管轄スケールの実測)
         "jurisdiction_to_ward": 1.0,    # ★管轄 → 区。既定 1.0 = 少なく見積もる向き
         # 重度分布のアンカー: ぼや 175 : 全焼 0(残余 66 を部分焼:半焼 = 3:1 と仮定)
@@ -297,6 +310,9 @@ DEFAULTS: dict = {
         "enabled": True,
         "levels": list(CROWD_LEVELS),   # 4 / 6 / 13 人/m²
         "hysteresis": 0.85,             # 閾値 × この係数を下回ったら「跨ぎ」を再武装
+        # 雑踏警備として数える職の語(**conf で差し替え可**)。既定 = GUARD_OCCS。
+        # ★payload の guards に出るだけ = 密度も行動も 1 ミリも動かさない(読み取り専用)。
+        "guard_occupations": GUARD_OCCS,
         "guard_radius_m": 50.0,         # 雑踏警備の頭数を数える半径(**読むだけ**)
         "max_per_day": 24,              # 1 日に出す群集 incident の上限(安全弁)
     },
@@ -387,8 +403,11 @@ def build_cfg(raw) -> dict:
                    "response_reference_min", "speed_m_per_min"),
                   ("enabled",),
                   skip=("severity_weights", "appliance_weights", "use_weights",
-                        "burn_steps", "injury_severities"))
+                        "burn_steps", "injury_severities", "occupations"))
     got = dict(_to_plain(raw.get("fire")) or {})
+    # 職の語は**許可語の表を持たない**(名簿の語彙は conf/台帳の側にあるので、ここで
+    # 有限表に閉じると新しい名簿の語を書けなくなる)。空なら既定へ戻す = _words の規約。
+    fire["occupations"] = _words(got.get("occupations"), fdef["occupations"])
     fire["severity_weights"] = _weights(got.get("severity_weights"),
                                         fdef["severity_weights"], FIRE_SEVERITIES)
     fire["appliance_weights"] = _weights(got.get("appliance_weights"),
@@ -426,8 +445,10 @@ def build_cfg(raw) -> dict:
     # ---- ③ 群集 ----
     cdef = DEFAULTS["crowd"]
     crowd = _block(raw.get("crowd"), cdef, ("hysteresis", "guard_radius_m"),
-                   ("enabled",), skip=("levels",))
+                   ("enabled",), skip=("levels", "guard_occupations"))
     got = dict(_to_plain(raw.get("crowd")) or {})
+    crowd["guard_occupations"] = _words(got.get("guard_occupations"),
+                                        cdef["guard_occupations"])
     levels = []
     for val in (_to_plain(got.get("levels")) or cdef["levels"]):
         try:
@@ -826,7 +847,9 @@ def _fire_crew(sim, node: str, sim_min: int):
     """
     from .cognition import routine as _routine
     cal = getattr(sim, "calendarcfg", None)
-    occs = frozenset(FIRE_OCCS)
+    # ★第109バッチ D2: src のハードコードをやめて conf キーから引く
+    #(既定 = FIRE_OCCS なので無指定のランは 1 バイトも変わらない)。
+    occs = frozenset(cfg_of(sim)["fire"]["occupations"])
     try:
         tx, ty = sim.city.node_xy(str(node))
     except Exception:                              # noqa: BLE001(未知ノードの保険)
@@ -1187,7 +1210,8 @@ def _guards_near(sim, zone_id: str, radius_m: float) -> int:
     cx = sum(float(p[0]) for p in poly) / len(poly)
     cy = sum(float(p[1]) for p in poly) / len(poly)
     r2 = float(radius_m) * float(radius_m)
-    occs = frozenset(GUARD_OCCS)
+    # ★第109バッチ D2: conf キー(既定 = GUARD_OCCS)。無指定は従来と完全同値。
+    occs = frozenset(cfg_of(sim)["crowd"]["guard_occupations"])
     n = 0
     for agent in sim.agents:
         if not _in_area(agent):
@@ -1284,11 +1308,28 @@ def phase(sim, step: int, sim_min: int) -> None:
 # --------------------------------------------------------------------------- #
 # 観測タリー(**OFF では None = 何も出さない**)
 # --------------------------------------------------------------------------- #
+def _roster_n(sim, occupations) -> int:
+    """名簿にその職が何人居るか(**読むだけ**・在場/勤務は問わない純粋な頭数)。
+
+    ``fire_unstaffed`` が「較正の話」なのか「名簿にその職が居ない話」なのかを
+    ランの成果物だけで切り分けるための分母(``city_ops._roster`` の数え上げ版)。
+    """
+    occs = frozenset(occupations)
+    return sum(1 for a in getattr(sim, "agents", ()) or ()
+               if str(getattr(a, "occupation", "")) in occs
+               or str(getattr(a, "role", "")) in occs)
+
+
 def provenance(sim) -> dict | None:
     """観測タリー(既定 OFF は None)。**実測 vs アンカー**を必ず並べて出す。
 
     ★``city_ops.provenance`` の ``ems_reference_per_day`` と同じ流儀: 較正が合っている
       かどうかを、ランの成果物そのものが自己申告する(黙って外れたまま通り過ぎない)。
+    ★第109バッチ D2: ``summary.json`` の ``incidents_env`` キーへ配線した。同時に
+      **担い手の語と名簿の実人数**(``fire_occupations`` / ``fire_roster`` /
+      ``guard_occupations`` / ``guard_roster``)を出す。``fire_unstaffed`` が立ったとき
+      「較正が外れたのか、名簿にその職が 1 人も居ないのか」を成果物だけで判別できる
+      ようにするため(第108 縦煙で消防士 0 人が L1 経由でしか判らなかったことへの対応)。
     """
     if not enabled(sim):
         return None
@@ -1297,6 +1338,10 @@ def provenance(sim) -> dict | None:
     out: dict = {"schema": SCHEMA, "area_share": round(share, 5),
                  "ward_area_km2": WARD_AREA_KM2}
     fcfg, tcfg = cfg["fire"], cfg["traffic"]
+    out["fire_occupations"] = list(fcfg["occupations"])
+    out["guard_occupations"] = list(cfg["crowd"]["guard_occupations"])
+    out["fire_roster"] = _roster_n(sim, fcfg["occupations"])
+    out["guard_roster"] = _roster_n(sim, cfg["crowd"]["guard_occupations"])
     out["fire_reference_per_day"] = round(
         float(fcfg["jurisdiction_per_day"]) * float(fcfg["jurisdiction_to_ward"])
         * share, 4)

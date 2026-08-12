@@ -56,6 +56,7 @@ import json
 import os
 import sys
 from collections import defaultdict
+from typing import Iterable, Iterator
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
@@ -79,6 +80,22 @@ MAX_PAIR_AGENTS = 200          # 個体間 TVD の全ペア計算に使う個体
 MAX_KINDS = 96                 # 特徴次元の上限(超過分は "_other" へ集約。凍結側と同じ流儀)
 MIN_DAYS = 2                   # 個体内比較に必要な最小在籍日数
 RNG_SEED = 0
+
+# --------------------------------------------------------------------------- #
+# W4-D': ★**この解析だけは kind で絞れない**(絞らないことの宣言)
+#
+# 特徴ベクトルが「個体 × 日 の **kind ヒストグラム**」そのものなので、どの kind を
+# 落としても次元が 1 本消えて TVD が動く。すなわち「WANT_KINDS 以外の行は下流が
+# 必ず読み飛ばす」という絞り読みの前提が、本解析では**原理的に成立しない**
+# (`build_panel` の資産追跡が kind 非依存だったのと同族の事情)。
+# したがって `None` = 全 kind を宣言し、`l1_stream` へ `kinds=` を渡さない。
+# 本解析で効くのは代わりに次の 4 点である:
+#   (a) **3 列射影**(payload を 1 バイトも読まない)  (b) **逐次生成**(全件 list を
+#   作らない)  (c) **part 群の透過連結**  (d) **Windows の共有フラグ付き open**
+# ★ここを「EVENT_KINDS 全部」と書いてはならない。未登録 kind を持つランで
+#   その行が黙って落ち、次元が減って出力が変わる(欠測を偽の値で埋めない)。
+# --------------------------------------------------------------------------- #
+WANT_KINDS = None
 
 
 # --------------------------------------------------------------------------- #
@@ -106,9 +123,11 @@ def _even_subsample(items: list, cap: int) -> list:
     return out
 
 
-def build_profiles(events: list[dict], steps_per_day: int = STEPS_PER_DAY,
+def build_profiles(events: Iterable[dict], steps_per_day: int = STEPS_PER_DAY,
                    max_kinds: int = MAX_KINDS) -> dict:
     """イベント列から個体 × 日 × kind の確率ベクトルを作る。
+
+    `events` は **1 回だけ舐める**(list でも generator でも同じ結果になる)。
 
     返り値 {"P": ndarray(agent, day, dim), "agents": [id...], "days": [d...],
             "dims": [kind...], "present": ndarray(agent, day) bool}
@@ -217,21 +236,21 @@ def per_agent_signflip(prof: dict, mc: int = 2000, seed: int = RNG_SEED) -> list
 # --------------------------------------------------------------------------- #
 # 解析本体
 # --------------------------------------------------------------------------- #
-def _load_events(run_dir: str) -> list[dict]:
-    """l1_events.parquet を [step, agent_id, kind] のみで読む(payload に触らない = 最安)。"""
-    import pyarrow.parquet as pq
-    path = os.path.join(run_dir, "l1_events.parquet")
-    if not os.path.exists(path):
-        return []
-    pf = pq.ParquetFile(path)
-    avail = set(pf.schema_arrow.names)
-    cols = [c for c in ("step", "agent_id", "kind") if c in avail]
-    out: list[dict] = []
-    for batch in pf.iter_batches(columns=cols):
-        d = batch.to_pydict()
+def _load_events(run_dir: str) -> Iterator[dict]:
+    """l1_events を [step, agent_id, kind] のみで読む(payload に触らない = 最安)。
+
+    W4-D': 共有の `l1_stream` 経由へ移した。**kind では絞らない**(理由は上の
+    `WANT_KINDS = None` の宣言)。旧実装との差は
+    (a) 全件 list ではなく**逐次 yield**(`build_profiles` は 1 回舐めるだけなので
+    ここが唯一の全件 RAM 展開だった)、(b) part 群の透過連結、(c) Windows の
+    共有フラグ付き open、の 3 点。**yield する dict は旧実装の逐語**である。
+    """
+    import l1_stream as ls
+    if not ls.l1_paths(run_dir):
+        return
+    for d in ls.iter_columns(run_dir, ["step", "agent_id", "kind"]):
         for st, aid, kind in zip(d["step"], d["agent_id"], d["kind"]):
-            out.append({"step": int(st), "agent": int(aid), "kind": kind})
-    return out
+            yield {"step": int(st), "agent": int(aid), "kind": kind}
 
 
 def analyze(run_dir: str, *, cap: int = MAX_PAIR_AGENTS, mc: int = 2000,

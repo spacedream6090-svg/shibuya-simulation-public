@@ -80,6 +80,11 @@ UNMAPPED = "unmapped"
 # (A) 相互作用グラフの材料(payload をパースする kind はこれだけ)
 INTERACTION_KINDS = ("speak", "dm", "sns_read", "sns_like", "sns_reshare",
                      "news_read", "transmission")
+# W4-D': `l1_stream` へ渡す kind 集合の**唯一の宣言**。中身は INTERACTION_KINDS と同一で
+# あり(本スクリプトはこれ以外の kind を 1 行も読まない)、
+# `tests/test_l1_stream_migration.py` が AST でモジュール内の kind リテラルとの
+# 網羅を機械検査する。
+WANT_KINDS: frozenset = frozenset(INTERACTION_KINDS)
 CCDF_POINTS = (1, 2, 5, 10, 20, 50, 100)
 
 
@@ -275,21 +280,30 @@ def edge_overlap(Wa: dict, Wb: dict) -> dict:
 # 解析本体
 # --------------------------------------------------------------------------- #
 def _load_events(run_dir: str) -> list[dict]:
-    """必要 kind の payload だけをパースするストリーム読み(全件 RAM 展開しない)。"""
-    import pyarrow.parquet as pq
-    path = os.path.join(run_dir, "l1_events.parquet")
-    if not os.path.exists(path):
+    """必要 kind の payload だけをパースするストリーム読み(全件 RAM 展開しない)。
+
+    W4-D': 自前の `pq.ParquetFile` 直読みを **共有の `l1_stream`** へ移した。
+    旧実装は「有界メモリで読む」までは出来ていたが、次の 3 点が無かった:
+
+      1. **kind の Arrow レベル絞り込み** — 旧実装は `to_pydict()` で *全行* を
+         Python の list にしてから `if kind not in want: continue` で捨てていた。
+         捨てる行のオブジェクト生成費が 0 になる(在場 25万 × 10 日の L1 は
+         40.6 億行で、本解析が要るのはその 4% 程度)。
+      2. **part 群**(`l1_events.part-NNNN.parquet`)の透過連結。旧実装は canonical
+         (`l1_events.parquet`)しか見ないので、finalize 前のランでは **0 件**になる。
+      3. **Windows の共有フラグ付き open**(走行中のランの part を読んでも
+         finalize の unlink を弾かない。第77バッチの規約)。
+
+    実体化ループ(`int` / `json.loads` / キー順)は**旧実装の逐語**であり、
+    返り値は 1 バイトも変わらない。
+    """
+    import l1_stream as ls
+    if not ls.l1_paths(run_dir):
         return []
-    want = set(INTERACTION_KINDS)
-    pf = pq.ParquetFile(path)
-    avail = set(pf.schema_arrow.names)
-    cols = [c for c in ("step", "agent_id", "kind", "payload") if c in avail]
     out: list[dict] = []
-    for batch in pf.iter_batches(columns=cols):
-        d = batch.to_pydict()
+    for d in ls.iter_columns(run_dir, ["step", "agent_id", "kind", "payload"],
+                             kinds=WANT_KINDS):
         for st, aid, kind, raw in zip(d["step"], d["agent_id"], d["kind"], d["payload"]):
-            if kind not in want:
-                continue
             try:
                 payload = json.loads(raw) if raw else {}
             except (json.JSONDecodeError, TypeError):

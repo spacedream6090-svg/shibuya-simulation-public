@@ -350,6 +350,134 @@ def test_unclassified_detector_ignores_known_and_derived_kinds():
     assert aa.unclassified_money_kinds(known) == {}
 
 
+# ===========================================================================
+# A-9b. H3 遺失物ループの接続(第109バッチ D2)
+#
+# lost_property.py が「解析側の分類はまだ入れていない」と正直に書いていた 3 種
+# (lost_return / lost_keep / lost_expire)を分類器へ載せた。守るもの:
+#   ① 監視装置(unclassified_money_kinds)が鳴り止む
+#   ② 遺失物の生涯を通して**家計の貨幣が 1 円も湧かない/消えない**(失効を除く)
+#   ③ 失効(誰にも拾われず消える)は RoW ではなく **K5**(economy_sfc.on_lost_lapse と同勘定)
+#   ④ 落として**まだ拾われていない**現金があっても分類器の自己整合が壊れない
+#   ⑤ 既存の分類(遺失物以外の種)の出力が 1 バイトも動かない
+# ===========================================================================
+#: 遺失物の生涯 4 パターン(イベント列, L3 残高)。金額はすべて 0.1 円単位で丸め済み。
+_LOST_CASES = {
+    # 落とす → 届く → 返還(中の現金が戻り、報労金 15 が拾得者へ)
+    "return": ([_ev(1, 7, "lost_drop", {"item": "wallet", "cash": 100.0}),
+                _ev(2, 9, "lost_pickup", {"item": "wallet", "owner": 7}),
+                _ev(3, 9, "lost_turnin", {"item": "wallet", "owner": 7}),
+                _ev(4, 7, "lost_return", {"item": "wallet", "finder": 9,
+                                          "amount": 15.0, "cash": 100.0})],
+               {0: {7: 1000.0, 9: 500.0}, 6: {7: 985.0, 9: 515.0}}),
+    # 着服(占有離脱物横領)= 受け手が特定できる → K5 ではなく家計内部の移転
+    "keep":   ([_ev(1, 7, "lost_drop", {"item": "wallet", "cash": 100.0}),
+                _ev(3, 9, "lost_keep", {"item": "wallet", "owner": 7, "amount": 100.0,
+                                        "guardians": 0, "offense": "占有離脱物横領"})],
+               {0: {7: 1000.0, 9: 500.0}, 6: {7: 900.0, 9: 600.0}}),
+    # 時効取得(3 か月)= 拾得者のものになる
+    "expire": ([_ev(1, 7, "lost_drop", {"item": "wallet", "cash": 50.0}),
+                _ev(3, 9, "lost_expire", {"item": "wallet", "owner": 7,
+                                          "to": "finder", "amount": 50.0})],
+               {0: {7: 1000.0, 9: 500.0}, 6: {7: 950.0, 9: 550.0}}),
+    # 失効 = 誰にも拾われないまま世界から消える(agent_id=-1)
+    "lapse":  ([_ev(1, 7, "lost_drop", {"item": "wallet", "cash": 40.0}),
+                _ev(3, -1, "lost_expire", {"item": "wallet", "owner": 7,
+                                           "to": "void", "amount": 40.0})],
+               {0: {7: 1000.0}, 6: {7: 960.0}}),
+    # まだ拾われていない(バケツに現金が残ったままランが終わる)
+    "in_transit": ([_ev(1, 7, "lost_drop", {"item": "wallet", "cash": 30.0})],
+                   {0: {7: 1000.0}, 6: {7: 970.0}}),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_LOST_CASES))
+def test_lost_property_kinds_are_no_longer_unclassified(case):
+    """①監視装置が鳴り止む(3 種が MONEY_KINDS に入った)。"""
+    events, stock = _LOST_CASES[case]
+    rep = aa.analyze(_run(events, stock, other=[e for e in events]))
+    assert rep["unclassified_money_kinds"] == {}, rep["unclassified_money_kinds"]
+
+
+@pytest.mark.parametrize("case", sorted(_LOST_CASES))
+def test_lost_property_lifecycle_conserves_household_money(case):
+    """②③④ 検査①(個体残高)・分類器の自己整合・漏れ 0 が全パターンで成り立つ。"""
+    events, stock = _LOST_CASES[case]
+    rep = aa.analyze(_run(events, stock))
+    assert rep["checks"][aa.HOUSEHOLD]["pass"], rep["checks"][aa.HOUSEHOLD]
+    assert rep["checks"][aa.HOUSEHOLD]["total_residual"] == 0.0
+    assert rep["classifier_consistency"]["pass"], rep["classifier_consistency"]
+    assert rep["leaks"] == {}, "遺失物の金が void(相手方なし)へ落ちている"
+
+
+def test_lost_lapse_lands_in_k5_not_in_rest_of_world():
+    """③ 失効は**取引ではない**(SNA K.5)。街の外(RoW)へ落としたら誤り。"""
+    flows = aa.flows_for("lost_expire",
+                         {"item": "wallet", "owner": 7, "to": "void", "amount": 40.0}, {})
+    assert [(f.src, f.dst, f.amount, f.tag) for f in flows] == \
+        [(aa.HOUSEHOLD, aa.OTHER, 40.0, "lost:lapse")]
+    # 時効取得(受け手が居る)は K5 ではなく家計内部
+    got = aa.flows_for("lost_expire",
+                       {"item": "wallet", "owner": 7, "to": "finder", "amount": 40.0}, {})
+    assert [(f.src, f.dst) for f in got] == [(aa.HOUSEHOLD, aa.HOUSEHOLD)]
+
+
+def test_lost_keep_is_a_household_transfer_not_a_theft_style_k5():
+    """着服は窃盗と違い**受け手が特定できている**ので K5 へ落とさない(分類の線引き)。"""
+    got = aa.flows_for("lost_keep", {"item": "wallet", "owner": 7, "amount": 100.0,
+                                     "guardians": 0, "offense": "占有離脱物横領"}, {})
+    assert [(f.src, f.dst, f.tag) for f in got] == \
+        [(aa.HOUSEHOLD, aa.HOUSEHOLD, "lost:keep")]
+    theft = aa.flows_for("crime", {"kind": "theft", "amount": 100.0,
+                                   "victim": 7, "payee": "k5:theft"}, {})
+    assert theft[0].dst == aa.OTHER, "窃盗側の分類が変わっている(比較の前提が崩れた)"
+
+
+def test_lost_return_carries_both_the_cash_and_the_reward():
+    """返還は 1 行に 2 本(バケツ → 落とし主の現金 / 落とし主 → 拾得者の報労金)。"""
+    got = aa.flows_for("lost_return", {"item": "wallet", "finder": 9,
+                                       "amount": 15.0, "cash": 100.0}, {})
+    assert [(f.amount, f.tag) for f in got] == \
+        [(100.0, "lost:return_cash"), (15.0, "lost:reward")]
+    assert all(f.src == aa.HOUSEHOLD and f.dst == aa.HOUSEHOLD for f in got)
+
+
+def test_lost_property_addition_leaves_the_other_sector_flows_untouched():
+    """⑤ 遺失物の行を足しても、既存の種の分類は 1 円も動かない。"""
+    base = [_ev(1, 7, "wage", {"amount": 1000.0}),
+            _ev(2, 7, "spend", {"amount": 300.0, "cat": "food"}),
+            _ev(3, 8, "crime", {"kind": "theft", "amount": 50.0, "victim": 7}),
+            _ev(4, 7, "rent", {"paid": 200.0})]
+    lost = _LOST_CASES["return"][0]
+
+    def _matrix(events):
+        flows = [f for e in events
+                 for f in aa.flows_for(e["kind"], e["payload"], {"government_on": False})]
+        return aa.build_matrix(flows)
+
+    m0, m1 = _matrix(base), _matrix(base + lost)
+    for cell, amount in m0.items():
+        assert m1[cell] == pytest.approx(amount), f"既存セル {cell} が動いた"
+    # 増えたのは家計内部のセルだけ(部門をまたぐ新しい経路を作っていない)
+    assert set(m1) - set(m0) <= {(aa.HOUSEHOLD, aa.HOUSEHOLD)}
+
+
+def test_lost_bucket_is_declared_as_a_household_sub_account():
+    """バケツの置き場所の宣言が 1 箇所にある(新部門を作っていない = SECTORS 不変)。"""
+    assert aa.LOST_BUCKET_SECTOR == aa.HOUSEHOLD
+    assert aa.LOST_BUCKET_ID == -1, "L1 の『世界イベント』と同じセンチネル"
+    assert aa.SECTORS == (aa.HOUSEHOLD, aa.ORG, aa.VENTURE, aa.BANK,
+                          aa.GOVERNMENT, aa.EXTERNAL, aa.OTHER, aa.VOID), \
+        "部門が増減している(既存ランの sector_sums の形が変わる)"
+    # バケツの受け払いは L3 の個体集合に居ないので検査①からは自動的に外れる
+    mv = aa.move_for("lost_drop", 7, {"item": "wallet", "cash": 100.0}, False)
+    assert sorted((m.agent_id, m.total) for m in mv) == [(-1, 100.0), (7, -100.0)]
+    # 落下は withdraw(現金⇄口座の家計内部振替)と同じ形 = 部門フローを 1 本も立てない
+    assert aa.flows_for("lost_drop", {"item": "wallet", "cash": 100.0}, {}) == []
+    assert "lost_drop" in aa.MONEY_KINDS and "lost_drop" not in aa.DERIVED_MONEY_KINDS
+    assert "lost_drop" in aa.HOUSEHOLD_KINDS
+
+
 def test_missing_snapshots_reports_unobservable_instead_of_crashing():
     """L3 が無いランでも落ちず、「残高観測 不可」と正直に出す(ゼロ残差と偽らない)。"""
     rep = aa.analyze(_run([_ev(1, 7, "wage", {"amount": 1000.0})], {}))

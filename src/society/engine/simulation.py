@@ -1087,6 +1087,18 @@ class Simulation:
         self._pool_day = 0                  # 日境界ローテーションの進行管理(day0 は init で着席済み)
         self._pool_nodes = nodes            # rotation の build_pool_agent が使う出発ノード候補
         poolcfg = cfg.get("pool", {}) or {}
+        # ---- pool 経路の org 配属(第109 レーン ORG。既定 OFF=None=完全 no-op)------------
+        # organizations.attach は「名簿ファイル → 配属ファイル」でしか配属を引けないので、
+        # プールのラン(agents.personas_file=null)では配属が構造的に 0 件だった(第108 縦煙)。
+        # プール record は台帳から逆算して作られていて org_id/role を持っているので、それを
+        # 読んで attach と同じ意味論を与える(organizations.attach_record)。
+        # ★台帳をここで先に読むのは **day0 の着席が build_pool_agent を通る**ため
+        #   (scheduler._ensure_orgs の遅延初期化は step0 = 着席より後)。読み込むのは
+        #   pool ON かつ organizations ON のときだけで、同じ dict を self.orgs に置くので
+        #   _ensure_orgs は再読み込みしない(台帳を二重にメモリへ載せない)。
+        self._pool_org_book = None          # org_id → org(pool ON かつ orgs ON のときだけ)
+        self._pool_org_commute = False      # 配属時に workplace_poi へ通わせるか(台帳と同義)
+        self._pool_org_stat = {"n_present": 0, "n_attached": 0}   # 検収用の実行時カウンタ
         if bool(poolcfg.get("enabled", False)):
             pool_dir = Path(str(poolcfg.get("dir", "data/persona_pool")))
             if not pool_dir.is_absolute():
@@ -1097,6 +1109,14 @@ class Simulation:
             self._pool_tier_quota = bool(
                 (poolcfg.get("tier_quota", {}) or {}).get("enabled", False))
             self._dormant = pool_mod.DormantStore(cap=int(poolcfg.get("dormant_cap", 0)))
+            from .. import organizations as _orgs_mod
+            _orgscfg = _orgs_mod.build_orgs_cfg(cfg.get("organizations", None))
+            if _orgscfg["enabled"]:
+                self.orgscfg = _orgscfg           # scheduler._orgs_on と同じ正準化物を共有
+                self.orgs = _orgs_mod.load_book(_orgscfg)
+                self.org_ledger = {}              # _ensure_orgs が入れるのと同じ初期値
+                self._pool_org_book = self.orgs
+                self._pool_org_commute = bool(_orgscfg.get("commute_to_poi", False))
             # 退避スリム状態の台帳幅(M-3。既定 = 現行の素値 = 挙動不変)。dunbar の休眠関係が
             # 「再会する前に台帳から落ちる」相互作用を観察ランで緩められるようにする口。
             pool_mod.configure(rel_cap=int(poolcfg.get("relations_cap",
@@ -1297,6 +1317,21 @@ class Simulation:
                     self.channels_sc, self.cognition_g_sc):
             if _sc is not None:
                 _finalize_mod.apply_cfg(_sc, self._finalize_cfg)
+        # ---- レーン D1(第109): 「起動時セグメント」の終端印 ------------------------
+        # ★__init__ が L1 へ出したイベントの本数。step を 1 つも回していないこの時点の
+        #   バッファは**起動時 1 回の発火体の出力そのもの**である(friend_graph_built /
+        #   party の joint_activity / spark_roster / icebreak …)。resume した 2 つ目の
+        #   プロセスでも __init__ は丸ごと走るので、これらは全部もう一度積まれる
+        #   = 前のプロセスが part へ確定済みのぶんと**二重記録**になる(第109 縦煙の実測:
+        #   全ON構成で +106 行 / +0.89%)。checkpoint がこの本数を運び、load 側が
+        #   先頭からその本数を捨てることで、種を 1 つずつ名指しせずに根治する
+        #   (第98 W4-A は spark_roster **1 種だけ**を名指しで塞いだ = 網羅できていなかった)。
+        # ★fresh ラン(load を通らない)では 1 バイトも影響しない = straight は完全不変。
+        # ★★この行は **__init__ の最後の文でなければならない**(後ろに L1 を出す処理を
+        #   足すとその分が印から漏れる)。漏れは
+        #   tests/test_resume.py::test_init_event_mark_counts_the_startup_segment
+        #   が `_init_event_mark == len(logger.events)` で検出する = トリップワイヤー。
+        self._init_event_mark = len(self.logger.events)
 
     # ------------------------------------------------------ LLM ジャーナル(第71)
     # ObserverLogger の flush_segment / checkpoint と同じ「checkpoint が真の境界」流儀で、
@@ -1697,9 +1732,32 @@ class Simulation:
         # 割当は (master_seed, agent.id) の純関数なので、pool の再入場(hydrate)でも同一。
         from .. import mind as _mind_mod
         _mind_mod.assign(self, agent)
+        # 組織への配属(第109 レーン ORG。既定 OFF=_pool_org_book is None=no-op)。
+        # ★職場束ね直しの**前**に置く: organizations の束縛は台帳 node をそのまま採るが、
+        #   work.bind_workplace は「その node が実際にその業種の POI を持つか」まで見て
+        #   実在の職場へ着地させる(work.py §_resolve_node ①②)ので、後勝ちが正しい。
+        self._attach_pool_org(agent, record)
         # 職場束ね直し(work.bind_workplace。既定 OFF は no-op=work_node の付与状況とも不変)。
         self._bind_pool_workplace(agent, record)
         return agent
+
+    def _attach_pool_org(self, agent, record: dict) -> None:
+        """pool record の org_id/role で org へ配属する(ON 時のみ・決定論・乱数ゼロ)。
+
+        既定 OFF(_pool_org_book is None = pool OFF または organizations OFF)は一切触らない
+        =org_id は付かない=従来と完全同一。ON 時は day0 着席・日境界ローテーション・hydrate
+        再入の各実体化で同一 pool_pid が同一 org へ配属される(run.seed 非依存=resume 不変)。
+        career の解雇/転職(lay_off / switch_org)がその後に org_id を書き換えるのは
+        名簿経路と同じで、**再入場のたびに元の配属へ戻る**点も hydrate の既存仕様どおり
+        (dehydrate/hydrate は org_id を運ばない=名簿由来の属性は record から作り直す)。"""
+        book = self._pool_org_book
+        if book is None:
+            return
+        from .. import organizations as _orgs_mod
+        self._pool_org_stat["n_present"] += 1
+        if _orgs_mod.attach_record(agent, record, book, city=self.city,
+                                   commute_to_poi=self._pool_org_commute):
+            self._pool_org_stat["n_attached"] += 1
 
     def _bind_pool_workplace(self, agent, record: dict) -> None:
         """pool 個体の work_node を台帳 workplace_poi へ束ね直す(ON 時のみ・決定論・乱数ゼロ)。
@@ -1967,6 +2025,12 @@ class Simulation:
         # beliefs OFF のランでは 1 ファイルも作らない=既存ランの出力一式とバイト一致。
         from .. import truth_ledger as _truth_ledger
         _truth_ledger.dump(self)
+        # 所有権レイヤー O1: 登記簿のスナップショットをサイドカー(assets_ledger.json)へ。
+        # scripts/analyze_assets.py が Gini・保有期間・所有ネットワークを計算する材料で、
+        # **シム本体に走査を足さない**ための唯一の出口(観測がシムに触らない = 研究文書 §6-3)。
+        # world.assets.enabled=false のランでは 1 ファイルも作らない=既存ランの出力一式と同形。
+        from .. import assets as _assets_mod
+        _assets_mod.dump(self)
         kinds = self.logger.total_event_kinds()
         summary = {
             "n_agents": len(self.agents),
@@ -2076,6 +2140,17 @@ class Simulation:
         _lpprov = _lost_prov.provenance(self)
         if _lpprov is not None:
             summary["lost_property"] = _lpprov
+        # ---- 所有権レイヤー O1+O3(world.assets.enabled=false = 既定はキーなし)----
+        # 計画書 §1-2 の検証ターゲット = **資産保存則**(Σ 所有者別保有数 + K5 − RoW 生成 =
+        # 初期ストック)の残差と、**未分類の移転種**(IF-E の監視装置の双対)。
+        # 初期配賦の内訳(持ち家 / 域内不動産 org / 域外 RoW)と域内 org の特定方法も残すので、
+        # 較正のどこが実測でどこが仮定なのかが 1 枚で判る(ユーザー決定 §5-1 の検収材料)。
+        # 相続(O3)は deaths / inherited_* / escheat_*(相続人不存在 = 国庫)を分けて出す
+        # = 第107 の観測盲点「死者の財布に凍結」が解消したことを事後に機械検証できる。
+        from .. import assets as _assets_prov
+        _asprov = _assets_prov.provenance(self)
+        if _asprov is not None:
+            summary["assets"] = _asprov
         # ---- 医療の受け皿 H2(medical.enabled=false = 既定はキーなし)----
         # 計画書 §2 の検証ターゲット: **搬送先が地図に在るか**(n_hospitals。subcat を持たない
         # 地図では 0 = 搬送が起きないことが数字で判る)・確定重症度別の入院件数(東京実測の
@@ -2135,6 +2210,45 @@ class Simulation:
                                     self.clock.step_minutes)
             if _if is not None:
                 summary["initial_frame"] = _if
+        # ---- Wave 4 現実被覆レーンの観測タリー(第109バッチ D2)------------------------
+        # 第105〜108 で入った層は ``provenance(sim)`` を持ちながら **summary.json へ配線
+        # されていなかった**(各 module が「書き出しは別レーンの所有」と正直に書いていた
+        # 状態)。そのため縦煙では「機能が動いたか」を L1 の kind 経由でしか判定できず、
+        # **0 件のときに『OFF だった』のか『ON だが起きなかった』のかが区別できない**。
+        # ここで一括配線して、上の 15 ブロックと**同じ規約**に揃える:
+        #   ・OFF(= provenance が None)では **キー自体を出さない**(既存ラン・golden 無風)
+        #   ・provenance を持たない module には作らない(配線だけ・観測量を発明しない)
+        # ★末尾にまとめて足すのは**キー順の保存**のため: 途中へ挿すと既に ON で回している
+        #   ラン(medical / lost_property など)の summary.json のキー順が動く。
+        # ★import は各ブロックと同じ関数内 import(循環 import の回避 = 既存の流儀)。
+        # ★ループで畳まず 1 層 1 ブロックで書くのは上の 15 ブロックと同じ形にするため
+        #   (``<module>.provenance(self)`` という呼び出しの形が、配線されているかを
+        #   静的に走査する tests/test_summary_provenance.py の唯一の手がかりになる)。
+        from .. import health as _health_prov          # H1 重症度 S0-S4 と死
+        _hlprov = _health_prov.provenance(self)
+        if _hlprov is not None:
+            summary["health"] = _hlprov
+        from .. import city_ops as _city_ops_prov      # 交番/ごみ/納品/夜間清掃/救急
+        _coprov = _city_ops_prov.provenance(self)
+        if _coprov is not None:
+            summary["city_ops"] = _coprov
+        from .. import incidents_env as _incenv_prov   # H5 火災 / 交通 / 群集
+        _ieprov = _incenv_prov.provenance(self)
+        if _ieprov is not None:
+            summary["incidents_env"] = _ieprov
+        # conf のキーが world.facilities なので summary のキー名もそちらへ揃える。
+        from .. import facility_devices as _facil_prov  # 昇降設備の DEVS 摩耗
+        _fdprov = _facil_prov.provenance(self)
+        if _fdprov is not None:
+            summary["facilities"] = _fdprov
+        from .. import street_life as _street_prov     # 街路の生業
+        _slprov = _street_prov.provenance(self)
+        if _slprov is not None:
+            summary["street_life"] = _slprov
+        from .. import transit_interior as _train_prov  # 車内空間
+        _tiprov = _train_prov.provenance(self)
+        if _tiprov is not None:
+            summary["transit_interior"] = _tiprov
         (self.out_dir / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         return summary

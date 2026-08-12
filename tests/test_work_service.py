@@ -12,12 +12,15 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from society import work as work_mod
 from society.config import load_config
 from society.engine import scheduler
 from society.engine.simulation import Simulation
 from society.observer.schema import EVENT_KINDS, Event
+
+_REPO = Path(__file__).resolve().parents[1]
 
 _ON = {"work.service.enabled": "true"}
 _OFF = {"work.service.enabled": "false"}
@@ -261,3 +264,29 @@ def test_serve_digest_line():
     assert line is not None and "飲食の接客" in line and "2件" in line
     work_mod.clear_digest(a)
     assert work_mod.digest_line(a) is None            # 発火後は仕切り直し
+
+
+# ------------------------------------------------------ (h) conf の接客写像に service 行があるか
+# 第109バッチ D2 の小粒: services.spend_cat の既定は "service" で、受給の _spend は
+# cat="service" で出る(conf/config.yaml が「work.serve_by_cat と対の seam」と明記)。
+# ところが build_cfg は「conf が serve_by_cat を書いていればそちらが**丸ごと**勝つ」
+# (`serve = dict(serve) if serve else dict(DEFAULT_SERVE_BY_CAT)`)ので、基底 conf に
+# service 行が無いかぎり DEFAULT_SERVE_BY_CAT の service 行は 1 度も使われない。
+# その結果、センサス較正台帳の service 職場 1,972 社が**構造的に無人接客**になる。
+def test_default_map_has_the_service_row_but_the_base_conf_overrides_it():
+    """既定写像には service 行がある / 基底 conf はそれを上書きして 4 行にする(現状の固定)。"""
+    assert work_mod.DEFAULT_SERVE_BY_CAT["service"] == "窓口・施術の接客"
+    base = work_mod.build_cfg(load_config().work)
+    assert set(base["serve_by_cat"]) == {"food", "cafe", "nightlife", "shop"}, \
+        "基底 conf の serve_by_cat が変わった(既定を触らない約束の確認)"
+    # 受給側の cat(services.spend_cat)と対になる語がこれである、という seam の宣言
+    assert str(load_config().services.spend_cat) == "service"
+
+
+def test_finals_profile_restores_the_service_row():
+    """本選 ONセット候補(conf/finals_observe.yaml)では service 行が復活している。"""
+    cfg = load_config(profile=str(_REPO / "conf" / "finals_observe.yaml"))
+    got = work_mod.build_cfg(cfg.work)["serve_by_cat"]
+    assert got == work_mod.DEFAULT_SERVE_BY_CAT, \
+        "finals プロファイルの serve_by_cat が work.py の既定写像と一致しない"
+    assert got["service"] == "窓口・施術の接客"

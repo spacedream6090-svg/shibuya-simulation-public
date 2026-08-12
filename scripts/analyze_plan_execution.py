@@ -125,6 +125,8 @@ if hasattr(sys.stdout, "reconfigure"):
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))          # 正典 = 実装側 day_plan.py
+if str(REPO_ROOT / "scripts") not in sys.path:      # l1_stream(共有の逐次読み)用
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from society.cognition import day_plan as DP        # noqa: E402
 
@@ -167,37 +169,62 @@ UNRESOLVED_REASONS: tuple[str, ...] = (
 # 読み込み(すべて読み取り専用)
 # --------------------------------------------------------------------------- #
 def load_events(run_dir: str) -> list[dict]:
-    """l1_events.parquet から本解析に要る種だけを **記録順のまま** 取り出す。
+    """l1_events から本解析に要る種だけを **記録順のまま** 取り出す。
 
     ★並べ替えない: 同 step 内の並び(sweep → contingency → block_start)がそのまま
       台帳再生の順序契約になっている。
+
+    W4-D': 旧実装は `pq.read_table(...).to_pydict()` で **6 列 × 全行**を Python の
+    list にしてから `if kind not in WANT_KINDS: continue` で捨てていた
+    (在場 25万 × 10 日の L1 は 40.6 億行。本解析が要るのは計画イベントだけで、
+    残りは丸ごと捨てるのに Python オブジェクトの生成費だけ払っていた)。
+    共有の `l1_stream.iter_record_batches` による逐次読みへ移し、**kind の判定を
+    Arrow 上で**済ませる。あわせて **part 群の透過連結**と **Windows の共有フラグ付き
+    open**(第77バッチの規約)も手に入る。
+
+    ★`seq` は **絞る前のファイル全体での行番号**である(絞り込み後の連番ではない)。
+      `tests/test_plan_execution.py::test_load_events_preserves_file_order_and_filters_kinds`
+      がこの定義を固定しているので、batch の先頭オフセットを足して**絞る前の位置**を
+      数え続ける(この 1 点だけが `l1_stream` の既製の絞り読みでは表現できない)。
+    実体化(`int` / `json.loads` / キー順)は**旧実装の逐語**であり、`json.loads` の
+    例外も従来どおり素通しする(壊れた JSON を黙って `{}` にしない)。
     """
-    import pyarrow.parquet as pq
-    path = os.path.join(run_dir, "l1_events.parquet")
-    if not os.path.isfile(path):
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import l1_stream as ls
+    if not ls.l1_paths(run_dir):
         raise SystemExit(f"[plan_execution] l1_events.parquet が無い: {run_dir}")
     cols = ["step", "sim_min", "agent_id", "kind", "payload", "llm_call_id"]
-    have = set(pq.read_schema(path).names)
-    table = pq.read_table(path, columns=[c for c in cols if c in have])
-    d = table.to_pydict()
-    n = len(d["kind"])
+    kinds_arr = pa.array(sorted(WANT_KINDS), pa.string())
     out: list[dict] = []
-    for i in range(n):
-        kind = d["kind"][i]
-        if kind not in WANT_KINDS:
+    offset = 0
+    for batch in ls.iter_record_batches(run_dir, cols):
+        n_rows = batch.num_rows
+        if "kind" not in batch.schema.names:
+            offset += n_rows
             continue
-        raw = d["payload"][i]
-        payload = json.loads(raw) if isinstance(raw, str) else (raw or {})
-        out.append({
-            "seq": i,
-            "step": int(d["step"][i] or 0),
-            "sim_min": int(d["sim_min"][i] or 0),
-            "agent_id": int(d["agent_id"][i] if d["agent_id"][i] is not None else -1),
-            "kind": str(kind),
-            "payload": payload if isinstance(payload, dict) else {},
-            "llm_call_id": (str(d["llm_call_id"][i])
-                            if d.get("llm_call_id") and d["llm_call_id"][i] else None),
-        })
+        mask = pc.fill_null(pc.is_in(batch.column("kind"), value_set=kinds_arr), False)
+        seqs = pa.array(range(offset, offset + n_rows), pa.int64()) \
+                 .filter(mask).to_pylist()
+        offset += n_rows
+        if not seqs:
+            continue
+        d = batch.filter(mask).to_pydict()
+        for j, seq in enumerate(seqs):
+            raw = d["payload"][j]
+            payload = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            out.append({
+                "seq": int(seq),
+                "step": int(d["step"][j] or 0),
+                "sim_min": int(d["sim_min"][j] or 0),
+                "agent_id": int(d["agent_id"][j]
+                                if d["agent_id"][j] is not None else -1),
+                "kind": str(d["kind"][j]),
+                "payload": payload if isinstance(payload, dict) else {},
+                "llm_call_id": (str(d["llm_call_id"][j])
+                                if d.get("llm_call_id") and d["llm_call_id"][j]
+                                else None),
+            })
     return out
 
 

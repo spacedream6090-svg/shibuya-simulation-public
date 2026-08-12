@@ -223,6 +223,12 @@ def _want_of(name: str) -> set:
         return set(mod.WANTED)
     if name == "panel_stats":
         return set(ls.AGENT_FEATURES_KINDS)
+    if name == "analyze_persona_consistency":
+        # ★**絞れない**解析(WANT_KINDS = None を宣言している)。特徴ベクトルが
+        # kind ヒストグラムそのものなので、どの kind を落としても次元が消えて
+        # TVD が動く。網羅ガードとしては「全 kind」= 常に満たす、が正しい。
+        assert mod.WANT_KINDS is None, "絞れない宣言(None)が外れている"
+        return set(EVENT_KINDS)
     return set(mod.WANT_KINDS)
 
 
@@ -235,6 +241,14 @@ _NOT_A_KIND = {
     # 持つ(第64バッチ以来)。第107で L1 kind "death"(個人の死)が誕生して名前が
     # 衝突したが、共同体の「消滅」は L1 の death イベントを 1 行も読まない。
     "analyze_communities": {"death"},
+    # analyze_layers の "search" は **transmission.payload.channel の値**(検索経由で
+    # 語を知った)であって L1 の kind ではない。事前登録 §1.5 の channel→層の写像
+    # `CHANNEL_LAYER` に現れるだけで、search イベントは 1 行も読まない。
+    "analyze_layers": {"search"},
+    # analyze_plan_execution の "day_plan" は **conf のキー**(`planning.day_plan`)と
+    # 実装モジュール名(`society.cognition.day_plan`)である。本解析が読む計画イベントは
+    # `plan_created` 以下の 8 種 + 移動 2 種で、L1 kind の day_plan は 1 行も読まない。
+    "analyze_plan_execution": {"day_plan"},
 }
 
 _MIGRATED = ["analyze_founders", "audit_uncertainty", "detect_emergence",
@@ -243,7 +257,10 @@ _MIGRATED = ["analyze_founders", "audit_uncertainty", "detect_emergence",
              "analyze_structure", "build_panel", "judge", "observe",
              "observe_flows", "commercial_report", "panel_stats",
              "analyze_endo_treatment", "analyze_luck",
-             "analyze_rumor_contamination"]
+             "analyze_rumor_contamination",
+             # W4-D'(第109): 自前 loader の残り 5 本 + analyze_firing.load_g。
+             "analyze_layers", "analyze_mas_failures", "analyze_org_form",
+             "analyze_persona_consistency", "analyze_plan_execution"]
 
 
 @pytest.mark.parametrize("name", [n for n in _MIGRATED
@@ -816,3 +833,251 @@ def test_narrow_loader_is_exact_subsequence(run_dir, full_events, name):
     loader = getattr(mod, "load_events", None) or mod._load_events
     want = _want_of(name)
     assert loader(str(run_dir)) == [e for e in full_events if e["kind"] in want]
+
+
+# --------------------------------------------------------------------------- #
+# F. W4-D'(第109)= 自前 loader の残り 5 本 + `analyze_firing.load_g`
+#
+#    D/E と同じ 2 段で固定する:
+#      (F-1) **部分列** — 各スクリプトの絞り読みローダが「全 kind 読みを WANT_KINDS で
+#            filter したもの」と**キー名・キー順・値まで**一致すること。
+#            自前ローダは `agent` / `seq` など独自の形を持つので、`_want_of` に頼らず
+#            **そのスクリプトの形**へ写して比べる。
+#      (F-2) **出力同値** — 入口を絞り読み / 全件読みの 2 回叩いて結果が一致すること
+#            (= 「WANT_KINDS 以外の行は下流に効かない」の直接証明)。
+#    絞れない 1 本(analyze_persona_consistency)は同値比較の対象が無いので、
+#    「全件を 1 行も落とさず読む」側と「逐次生成であること」を固定する。
+# --------------------------------------------------------------------------- #
+def _shape_agent(rows: list[dict]) -> list[dict]:
+    """analyze_layers / analyze_mas_failures の形(`agent` キー・payload あり)。"""
+    return [{"step": e["step"], "agent": e["agent_id"], "kind": e["kind"],
+             "payload": e["payload"]} for e in rows]
+
+
+def _shape_agent_id(rows: list[dict]) -> list[dict]:
+    """analyze_org_form の形(`agent_id` キー・payload あり)。"""
+    return [{"step": e["step"], "agent_id": e["agent_id"], "kind": e["kind"],
+             "payload": e["payload"]} for e in rows]
+
+
+def _shape_plan_exec(rows: list[dict], want=None) -> list[dict]:
+    """analyze_plan_execution の形。★`seq` は **絞る前の行番号**(enumerate の位置)。"""
+    out = []
+    for i, e in enumerate(rows):
+        if want is not None and e["kind"] not in want:
+            continue
+        out.append({"seq": i, "step": int(e["step"] or 0),
+                    "sim_min": int(e["sim_min"] or 0),
+                    "agent_id": int(e["agent_id"]
+                                    if e["agent_id"] is not None else -1),
+                    "kind": str(e["kind"]), "payload": e["payload"],
+                    "llm_call_id": (str(e["llm_call_id"])
+                                    if e["llm_call_id"] else None)})
+    return out
+
+
+def _no_cardinality(out: dict) -> dict:
+    """`n_events_used` を落とす。
+
+    これは指標ではなく「**ローダが何行返したか**」そのもの(= 絞り読みの成果を
+    そのまま書き出した来歴欄)なので、全件読みへ差し替えれば必ず変わる。
+    既存の同値テストが `paths` / `out_dir` / `report` を pop しているのと同じ扱い。
+    絞り読み側の値が正しいこと(> 0 であること)は呼び出し側で別に見る。
+    """
+    out.pop("n_events_used", None)
+    return out
+
+
+@pytest.fixture(scope="module")
+def run_dir_int_ids(tmp_path_factory) -> Path:
+    """`group_id` を **整数**にした合成ラン(analyze_mas_failures 用)。
+
+    共用フィクスチャの payload は `group_id="g0"` の文字列だが、
+    `analyze_mas_failures` は `int(group_id)` を要求する。これは合成ランと
+    スクリプトの都合の食い違いであって**移行とは無関係**なので、
+    共用フィクスチャを動かさずにここだけ整数の別ランを作る。
+    """
+    rd = tmp_path_factory.mktemp("w4d_int") / "run"
+    ev = _events()
+    for e in ev:
+        e["payload"]["group_id"] = (e["agent_id"] if e["agent_id"] >= 0 else 0) % 3
+    _write_run(rd, ev)
+    return rd
+
+
+def test_analyze_layers_narrow_loader_is_exact_subsequence(run_dir, full_events):
+    import analyze_layers as mod
+    want = set(mod.WANT_KINDS)
+    assert mod._load_events(str(run_dir)) == _shape_agent(
+        [e for e in full_events if e["kind"] in want])
+
+
+def test_analyze_layers_equivalence(run_dir, monkeypatch):
+    import analyze_layers as mod
+    assert mod.analyze(str(run_dir))["n_events_used"] > 0     # 絞り読みで実際に読めた
+    out = _equal_out(monkeypatch, mod, "_load_events",
+                     lambda: _no_cardinality(mod.analyze(str(run_dir))),
+                     wide=lambda rd, *a, **kw: _shape_agent(_all_events(rd)))
+    assert out["status"] == "OK"
+
+
+def test_analyze_mas_failures_narrow_loader_is_exact_subsequence(run_dir,
+                                                                 full_events):
+    """★このローダは**最後に並べ替える**。部分列 + 同じ鍵での整列まで一致すること。"""
+    import analyze_mas_failures as mod
+    want = set(mod.WANT_KINDS)
+    ref = sorted(_shape_agent([e for e in full_events if e["kind"] in want]),
+                 key=lambda e: (e["step"], e["agent"], e["kind"]))
+    assert mod._load_events(str(run_dir)) == ref
+
+
+def test_analyze_mas_failures_equivalence(run_dir_int_ids, monkeypatch):
+    import analyze_mas_failures as mod
+    rd = run_dir_int_ids
+
+    def _wide(run_dir, *a, **kw):
+        return sorted(_shape_agent(_all_events(run_dir)),
+                      key=lambda e: (e["step"], e["agent"], e["kind"]))
+    assert mod.analyze(str(rd))["n_events_used"] > 0
+    out = _equal_out(monkeypatch, mod, "_load_events",
+                     lambda: _no_cardinality(mod.analyze(str(rd))), wide=_wide)
+    assert out["status"] == "OK" and out["modes"]
+
+
+def test_analyze_org_form_narrow_loader_is_exact_subsequence(run_dir, full_events):
+    import analyze_org_form as mod
+    want = set(mod.WANT_KINDS)
+    assert mod._load_events(str(run_dir)) == _shape_agent_id(
+        [e for e in full_events if e["kind"] in want])
+
+
+def test_analyze_org_form_equivalence(run_dir, monkeypatch):
+    import analyze_org_form as mod
+    out = _equal_out(monkeypatch, mod, "_load_events",
+                     lambda: mod.analyze(str(run_dir), window_days=1),
+                     wide=lambda rd, *a, **kw: _shape_agent_id(_all_events(rd)))
+    assert out["status"] == "OK" and out["windows"]
+
+
+def test_analyze_org_form_kind_set_matches_the_reused_graph_builder():
+    """WANT_KINDS は再利用先 `analyze_communities.build_window_graph` の分岐と同値。
+
+    ★ここが本スクリプトの絞り読みの**根拠**である(自分では kind を 1 つも解釈せず、
+      借りてきた関数が読む kind を宣言しているだけ)。借り先が kind を増やしたら落ちる。
+    """
+    import analyze_communities as ac
+    import analyze_org_form as mod
+    tree = ast.parse((_ROOT / "scripts" / "analyze_communities.py").read_text(
+        encoding="utf-8"))
+    lits: set = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "build_window_graph":
+            lits |= {n.value for n in ast.walk(node)
+                     if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    assert (lits & set(EVENT_KINDS)) == set(mod.WANT_KINDS)
+    assert set(mod.WANT_KINDS) <= set(ac._want_kinds())      # 借り先の部分集合
+
+
+def test_analyze_persona_consistency_reads_every_row(run_dir, full_events):
+    """★絞れない解析。**1 行も落とさない**ことと逐次生成であることを固定する。"""
+    import analyze_persona_consistency as mod
+    assert mod.WANT_KINDS is None, "kind で絞ってはならない(kind ヒストグラムが特徴量)"
+    gen = mod._load_events(str(run_dir))
+    assert not isinstance(gen, list), "全件 list を作らない(逐次生成であること)"
+    assert list(gen) == [{"step": e["step"], "agent": e["agent_id"],
+                          "kind": e["kind"]} for e in full_events]
+
+
+def test_analyze_persona_consistency_profiles_are_identical_to_a_list_read(run_dir):
+    """逐次生成でも全件 list でも `build_profiles` の出力が 1 ビットも変わらないこと。"""
+    import analyze_persona_consistency as mod
+    rows = [{"step": e["step"], "agent": e["agent_id"], "kind": e["kind"]}
+            for e in _all_events(run_dir)]
+    a = mod.build_profiles(mod._load_events(str(run_dir)), steps_per_day=SPD)
+    b = mod.build_profiles(rows, steps_per_day=SPD)
+    assert a["agents"] == b["agents"] and a["days"] == b["days"]
+    assert a["dims"] == b["dims"]
+    assert (a["P"] == b["P"]).all() and (a["present"] == b["present"]).all()
+
+
+def test_analyze_plan_execution_narrow_loader_is_exact_subsequence(run_dir,
+                                                                   full_events):
+    """★`seq` が **絞る前の行番号**のままであること(台帳再生の順序契約)。"""
+    import analyze_plan_execution as mod
+    got = mod.load_events(str(run_dir))
+    assert got == _shape_plan_exec(full_events, set(mod.WANT_KINDS))
+    assert [r["seq"] for r in got] == sorted(r["seq"] for r in got)   # 記録順のまま
+
+
+def test_analyze_plan_execution_equivalence(run_dir):
+    import analyze_plan_execution as mod
+    from society.cognition import day_plan as DP
+    cfg = DP.build_cfg(None)
+    narrow = mod.summarize(str(run_dir), mod.load_events(str(run_dir)), cfg, None, {})
+    wide = mod.summarize(str(run_dir), _shape_plan_exec(_all_events(run_dir)),
+                         cfg, None, {})
+    assert narrow == wide
+
+
+def test_analyze_plan_execution_seq_spans_part_files(tmp_path):
+    """part 群では `seq` が **連結後の通し番号**であること(旧実装は part を読めない)。
+
+    旧実装は canonical しか見なかったので、走行中のラン(part のみ)では 0 件だった。
+    part 対応で新しく決まる量はこの `seq` の起点だけなので、そこを機械固定する。
+    """
+    import analyze_plan_execution as mod
+    rd = tmp_path / "parts"
+    rd.mkdir()
+    kinds = [["speak", "plan_created", "speak"],            # part-0000(行 0..2)
+             ["route_start", "speak", "plan_block_start"]]  # part-0001(行 3..5)
+    for i, ks in enumerate(kinds):
+        pq.write_table(pa.table({
+            "step": pa.array([i * 10 + j for j in range(len(ks))], pa.int64()),
+            "sim_min": pa.array([0] * len(ks), pa.int64()),
+            "agent_id": pa.array([1] * len(ks), pa.int64()),
+            "kind": pa.array(ks, pa.string()),
+            "payload": pa.array(["{}"] * len(ks), pa.string()),
+            "llm_call_id": pa.array([None] * len(ks), pa.string()),
+        }), rd / f"l1_events.part-{i:04d}.parquet")
+    ev = mod.load_events(str(rd))
+    assert [e["kind"] for e in ev] == ["plan_created", "route_start",
+                                       "plan_block_start"]
+    assert [e["seq"] for e in ev] == [1, 3, 5]
+
+
+def test_analyze_firing_load_g_matches_the_full_read(tmp_path):
+    """`load_g` の列射影 + 逐次読み == 「全列全行を to_pylist する」旧実装(逐語)。"""
+    import analyze_firing as mod
+    from society.cognition import channels as CH
+    cols = [ch.column for ch in CH.CHANNELS][:4]
+    n = 7
+    tbl = {"step": pa.array(list(range(n)), pa.int64()),
+           "sim_min": pa.array([10 * i for i in range(n)], pa.int64()),
+           "agent_id": pa.array([i % 3 for i in range(n)], pa.int64())}
+    for j, c in enumerate(cols):
+        tbl[f"g_{c}"] = pa.array([1.0 + 0.25 * j + i for i in range(n)], pa.float64())
+        tbl[f"g0_{c}"] = pa.array([9.0] * n, pa.float64())      # 読んではいけない列
+    tbl["theta_mult"] = pa.array([0.5] * n, pa.float64())
+    tbl["fired_today"] = pa.array([1] * n, pa.int64())
+    pq.write_table(pa.table(tbl), tmp_path / "cognition_g.parquet",
+                   row_group_size=2)                            # 複数 row-group
+
+    def _legacy(run_dir):
+        table = pq.read_table(Path(run_dir) / "cognition_g.parquet")
+        names = list(table.column_names)
+        g_cols = [c for c in names
+                  if c.startswith("g_") and not c.startswith("g0_")]
+        col_to_id = {ch.column: ch.id for ch in CH.CHANNELS}
+        out: dict = {}
+        for row in table.to_pylist():
+            key = (int(row["step"]), int(row["agent_id"]))
+            out[key] = {col_to_id.get(c[2:], c[2:]): float(row[c]) for c in g_cols}
+        return out
+
+    got = mod.load_g(tmp_path)
+    assert got == _legacy(tmp_path)
+    assert list(got) == list(_legacy(tmp_path))          # キーの挿入順も同じ
+    # ★チャンネル id へ変換されている(列名 g_ext_heard → id ext.heard)
+    assert set(next(iter(got.values()))) == {ch.id for ch in CH.CHANNELS
+                                             if ch.column in cols}
+    assert mod.load_g(tmp_path / "missing") == {}        # サイドカー無しは空

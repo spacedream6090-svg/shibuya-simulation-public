@@ -71,6 +71,11 @@ Caiani et al. の行列も**部門別**(家計・消費財企業・資本財企�
 25万体でエージェント別 N×N 行列は不可能。本シムは以下の 6 部門 + 未接続枠 1 で足りる。
 
   household  家計   = エージェント(住民+来街者)。現金 money + 口座 account。
+                      ★第109バッチ D2: **遺失物バケツ**(H3 lost_property の hold = 落とした
+                      財布の中の現金。街の中に在るが誰の残高でもない)もこの部門の内訳
+                      (通過勘定)として扱う。供託金 escrow を行政の内訳に置くのと同じ流儀で、
+                      **新しい部門は作らない**(SECTORS を増やすと全ランの sector_sums の
+                      形が変わる)。詳細は LOST_BUCKET_SECTOR / LOST_BUCKET_ID の宣言。
   org        企業   = 組織台帳(organizations / org_ledger)。
   venture    個人事業 = 屋台(tools.ventures)。売上は店主(家計)へ抜ける通過部門。
   bank       銀行   = 預金利息・融資・VC ファンド。
@@ -252,6 +257,19 @@ MONEY_KINDS: frozenset[str] = frozenset({
     #                 (保険者も医療機関も街の外 = 街の残高は 1 円も動かない)。
     #                 自己負担 3 割は spend(cat="medical")側で会計済み = ここでは数えない。
     "ems_transport", "medical_bill",
+    # ---- H3 遺失物ループ(lost_property.enabled。既定 OFF のランには 1 件も出ない)----
+    # lost_return = 返還。payload の cash(遺失物バケツ → 落とし主)と amount(報労金 =
+    #               落とし主 → 拾得者)の**2 本**が同じ 1 行に載る。
+    # lost_keep   = 着服(占有離脱物横領)。amount = 財布の中の現金が拾得者の手に渡った額。
+    # lost_expire = 時効取得(to="finder")または失効(to="void")。前者は拾得者の手に渡り、
+    #               後者は受け取り手が世界に居ない = **取引ではない**(SNA K.5)。
+    # lost_drop   = 入口。財布の中の現金が落とした本人の所持金から分離され、遺失物バケツへ
+    #               移る(payload の cash)。**部門をまたがない**ので flows_for は 1 本も
+    #               立てないが、家計個体の残高は実際に減る = withdraw(現金⇄口座の家計内部
+    #               振替)と同じ形。よって DERIVED(二重計上の禁止リスト)ではなくここに置く。
+    # ★どれも「街の中に在るが誰の残高でもない現金」(lost_property の hold バケツ)の
+    #   出入口である。
+    "lost_drop", "lost_return", "lost_keep", "lost_expire",
 })
 
 #: 金額は payload に出るが**別のイベントで既に会計済み**の種(二重計上の禁止リスト)。
@@ -272,6 +290,28 @@ DERIVED_MONEY_KINDS: frozenset[str] = frozenset({
     "hospital_admit",     # 入院の開始(在院という状態。金額キーを持たない)
     "hospital_discharge",  # 退院。入院費は同じ step の spend / medical_bill 側で会計済み
 })
+
+#: 遺失物バケツ(``lost_property`` の hold)を**どの部門の内訳とみなすか**の宣言。
+#:
+#: 落とした財布の中の現金は「街の中に在るが誰の残高でもない」= 供託金(escrow)と同じ
+#: 「主体を持たない域内残高」で、``economy_sfc.city_total`` には算入されるが
+#: ``household_balance`` には入らない。部門行列には**新しい部門を作らない**:
+#:   - 新部門を足すと ``SECTORS`` が変わり、全ランの ``sector_sums`` の形が変わる
+#:     (既存の解析出力の互換を壊す)。
+#:   - 経済的な実体としても、この金は「家計が落とし、家計へ戻る(または K5 へ消える)」
+#:     だけで、街の外や企業を 1 度も経由しない。
+#: したがって **escrow を行政の内訳として扱うのと同じ流儀**で、遺失物バケツを家計部門の
+#: 内訳(通過勘定)として扱う。結果:
+#:   - 落下(lost_drop)= 家計内部の資産振替 → **フローを立てない**(withdraw と同型)
+#:   - 返還 / 着服 / 時効取得 = 家計 → 家計(部門内の移転。行と列で相殺される)
+#:   - 失効(誰にも拾われず消える)= 家計 → K5(``economy_sfc.on_lost_lapse`` と同じ勘定)
+LOST_BUCKET_SECTOR: str = HOUSEHOLD
+
+#: 遺失物バケツを家計部門の**擬似メンバー**として表すときの agent_id(L1 の
+#: 「世界イベント」と同じ -1 のセンチネル)。``move_for`` がこの id で受け払いを記録する。
+#: L3 スナップショットには当然この id が居ないので ``conserve_household``(検査①)は
+#: 自動的に無視し、全 move を足す ``classifier_consistency`` だけがこれを見る。
+LOST_BUCKET_ID: int = -1
 
 
 # --------------------------------------------------------------------------- #
@@ -532,6 +572,37 @@ def flows_for(kind: str, payload: dict, ctx: dict) -> list[Flow]:
         if amt and dst is not None:
             out.append(Flow(party_sector(p.get("payer")) or EXTERNAL, dst, amt,
                             "medical:insurance"))
+    elif kind == "lost_return":
+        # H3 遺失物①: 返還。1 行に**2 本のフロー**が載る。
+        #   cash   … 遺失物バケツ(家計の通過勘定)→ 落とし主の財布 = **家計内部**
+        #   amount … 報労金(遺失物法 28 条)。落とし主 → 拾得者 = **家計内部**
+        # どちらも部門内の移転なので行と列で相殺される(街の総マネーは 1 円も動かない)。
+        # ★それでも**フローとして立てる**のは、遺失物の金が「どこからどこへ」動いたかを
+        #   行列に残すため(0 本にすると『金が消えた/湧いた』のか『部門内で動いた』のかが
+        #   事後に区別できない)。
+        cash, paid = _f(p, "cash"), _f(p, "amount")
+        if cash:
+            out.append(Flow(LOST_BUCKET_SECTOR, HOUSEHOLD, cash, "lost:return_cash"))
+        if paid:
+            out.append(Flow(HOUSEHOLD, HOUSEHOLD, paid, "lost:reward"))
+    elif kind == "lost_keep":
+        # H3 遺失物②: 着服(占有離脱物横領)。財布の中の現金が拾得者の手に渡る。
+        # ★``crime``(窃盗)と**同じ K5 へは落とさない**: 窃盗が K5 なのは「受け取り側が
+        #   世界に記録されていない」からで、着服は**受け取った個体が特定できている**
+        #   (拾得者の残高が実際に増える)。よって取引ではなく家計内部の移転として扱う。
+        amt = _f(p, "amount")
+        if amt:
+            out.append(Flow(LOST_BUCKET_SECTOR, HOUSEHOLD, amt, "lost:keep"))
+    elif kind == "lost_expire":
+        # H3 遺失物③: 時効取得(to="finder")= 家計内部 /
+        #             失効(to="void")= 受け取り手が世界に居ない = **取引ではない**
+        #             → K5(SNA 2008 第12章。``economy_sfc.on_lost_lapse`` と同じ勘定)。
+        amt = _f(p, "amount")
+        if amt:
+            if str(p.get("to") or "") == "finder":
+                out.append(Flow(LOST_BUCKET_SECTOR, HOUSEHOLD, amt, "lost:expire_finder"))
+            else:
+                out.append(Flow(LOST_BUCKET_SECTOR, OTHER, amt, "lost:lapse"))
     elif kind == "production":
         # IF-E2 案B: 域内に客が居ない org(全 org の 36.5%・従業者の 51.5%)の**輸出代金**。
         # 地域会計では観光サテライト勘定(非居住者の域内消費=輸出)の逆向き適用にあたる。
@@ -610,6 +681,53 @@ def move_for(kind: str, agent_id: int, payload: dict, accounts_on: bool) -> list
         return [Move(a, cash=-_f(p, "seized"), kind=kind)]
     if kind == "move_home":
         return [Move(a, cash=-_f(p, "deposit"), kind=kind)]
+    # ---- H3 遺失物(lost_property。既定 OFF のランには 1 件も出ない)----
+    # ★2 本立てで記録する。片方だけでは 2 つの検査が両立しない:
+    #   (a) 個体側 … 落とし主/拾得者の財布が実際に動いた分。**検査①(L3 の個体残高)**の材料。
+    #   (b) バケツ側 … 遺失物バケツ(``LOST_BUCKET_ID``)の受け払い。**分類器の自己整合**
+    #       (classifier_consistency)の材料。バケツは家計部門の内訳(通過勘定)なので、
+    #       部門行列の家計純額は落下でも返還でも動かない。個体側だけを数えると
+    #       「行列は動いていないのに家計の合計は減った」という**見かけの不整合**が出る。
+    #   ★(b) は L3 に残高を持たないので conserve_household からは自動的に外れる
+    #     (agent_id=-1 は L3 スナップショットの個体集合に居ない)= 検査①は無風。
+    if kind == "lost_drop":
+        # agent_id = 落とした本人。財布の中の現金だけが所持金から分離される
+        #(cash キーが無い落とし物 = 傘・携帯などは金が 1 円も動かない)。
+        cash = _f(p, "cash")
+        if not cash:
+            return []
+        return [Move(a, cash=-cash, kind=kind),
+                Move(LOST_BUCKET_ID, cash=cash, kind=kind)]
+    if kind == "lost_return":
+        # agent_id = 落とし主。中の現金がバケツから戻り(+cash)、報労金(遺失物法 28 条)を
+        # 拾得者へ払う(-amount)。**実際に動いた額**が payload に載っている
+        #(払い手の手持ちを超えた分は lost_property._pay が床クリップ済み)。
+        cash, paid = _f(p, "cash"), _f(p, "amount")
+        mv: list[Move] = []
+        if cash or paid:
+            mv.append(Move(a, cash=cash - paid, kind=kind))
+        f = p.get("finder")
+        if f is not None and paid:
+            mv.append(Move(int(f), cash=paid, kind=kind))
+        if cash:
+            mv.append(Move(LOST_BUCKET_ID, cash=-cash, kind=kind))
+        return mv
+    if kind == "lost_keep":                          # agent_id = 拾得者(着服)
+        amt = _f(p, "amount")
+        if not amt:
+            return []
+        return [Move(a, cash=amt, kind=kind),
+                Move(LOST_BUCKET_ID, cash=-amt, kind=kind)]
+    if kind == "lost_expire":
+        # agent_id = 時効取得した拾得者。**誰にも拾われず失効した回は agent_id=-1**
+        # (= 受け取り手が世界に居ない。バケツ側の払い出しだけが立ち、行列では K5 へ出る)。
+        amt = _f(p, "amount")
+        if not amt:
+            return []
+        mv = [Move(LOST_BUCKET_ID, cash=-amt, kind=kind)]
+        if a != LOST_BUCKET_ID:
+            mv.append(Move(a, cash=amt, kind=kind))
+        return mv
     return []
 
 
@@ -619,6 +737,8 @@ HOUSEHOLD_KINDS: frozenset[str] = frozenset({
     "vc_investment", "venture_sale", "venture_open", "candidacy", "deposit", "reward",
     "rule_bonus", "civic_service", "chance_event", "crime", "enforcement", "bankruptcy",
     "move_home",
+    # H3 遺失物: 落下で減り、返還 / 着服 / 時効取得で増える(lost_property。既定 OFF)。
+    "lost_drop", "lost_return", "lost_keep", "lost_expire",
 })
 
 #: 検査に読み込むイベント種(フロー用 ∪ 家計残高用)。
@@ -885,13 +1005,23 @@ def conserve_government(budget_rows: list[dict], flows: list[Flow],
 #:   bank       Bank.capital + VCFund.balance(どちらも金融部門)
 #:   external   RoW が**正味で吸収した**額 = row_out − row_in(街の外に残高は無い = SNA §26.6)
 #:   other_volume  非取引の資産変動(SNA K.5)の累積 = k5_other(第98バッチ)
+#:   household   家計の預金+現金 + 遺失物バケツ(``LOST_BUCKET_SECTOR`` の宣言どおり
+#:               家計の通過勘定として扱う)。
+#:               ★正直な限界: ``lost_property_held`` は **finance.parquet の列に無い**
+#:                 (``economy_sfc.COLUMNS`` は 15 列で、この値は provenance にしか出ない)。
+#:                 列を足すのは L2 サイドカーのスキーマ変更 = 経済レーンの所有なので本レーンでは
+#:                 やらない。よって今日のランでは常に 0.0 が読まれ、遺失物が ON のあいだは
+#:                 「まだバケツに残っている現金」のぶんだけ本検査(検査①の finance 版)に
+#:                 残差が出る。**L3 由来の ``conserve_household`` は完全に閉じている**
+#:                 (move_for が lost_drop / lost_return / lost_keep / lost_expire を数えるため)。
+#:                 列が生えた日にこの行がそのまま効く = 先に正しい式を書いておく。
 FINANCE_BALANCE = {
     ORG:        lambda r: _f(r, "org_balance"),
     BANK:       lambda r: _f(r, "bank_capital") + _f(r, "vc_balance"),
     EXTERNAL:   lambda r: _f(r, "row_out") - _f(r, "row_in"),
     OTHER:      lambda r: _f(r, "k5_other"),
     GOVERNMENT: lambda r: _f(r, "gov_balance") + _f(r, "escrow"),
-    HOUSEHOLD:  lambda r: _f(r, "household_balance"),
+    HOUSEHOLD:  lambda r: _f(r, "household_balance") + _f(r, "lost_property_held"),
 }
 
 
@@ -957,7 +1087,12 @@ def classifier_consistency(flows: list[Flow], moves: list[Move]) -> dict:
 
     flows_for()(検査②側)と move_for()(検査①側)は別々に書かれた2つの写像なので、
     片方に経路の書き漏れがあれば必ずここで差が出る。**分類器のバグ検出器**であって
-    シムのバグ検出器ではない(シム側の漏れは void 列に出る)。"""
+    シムのバグ検出器ではない(シム側の漏れは void 列に出る)。
+
+    ★moves には家計個体だけでなく **遺失物バケツの擬似メンバー**(``LOST_BUCKET_ID``)が
+      混じりうる。バケツは家計部門の内訳(通過勘定)なので、部門の純額を作るこの検査では
+      家計の一員として足すのが正しい(足さないと「落としてまだ拾われていない現金」の
+      ぶんだけ見かけの不整合が出る)。個体残高の検査①はこの id を持たない。"""
     net_matrix = (sum(f.amount for f in flows if f.dst == HOUSEHOLD and f.src != HOUSEHOLD)
                   - sum(f.amount for f in flows if f.src == HOUSEHOLD and f.dst != HOUSEHOLD))
     net_moves = sum(m.total for m in moves)
