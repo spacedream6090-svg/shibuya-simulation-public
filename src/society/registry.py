@@ -241,6 +241,14 @@ FEATURES: tuple[Feature, ...] = (
        "駅員・乗務員を駅ノードの持ち場へ束ねる(決定論・冪等・resume 安全)。合成当直表は"
        "名簿順(agent id 昇順)index の純関数で、既に勤務窓を持つ個体の窓は上書きしない。"
        "false にすると『判断だけ動かして束ねない』対照が作れる"),
+    _f("transit_staff.bind.rebind_daily", "strict", False, "none",
+       "束ねの**日次追随**(親 transit_staff.bind.enabled 配下)。既定 false は従来どおり"
+       "起動時 1 回きり = 駅員・乗務員は名簿(L5)の duty 層なので 100万プールの在場"
+       "ローテーションで毎日入れ替わり、途中入場した個体が駅に立たないまま日が進む"
+       "(= ドア閉判断 on_duty_crew が unstaffed へ倒れていく)。true にすると日境界に"
+       "bind を通し直す(既に駅へ立っている個体は n_kept として素通し = 冪等・"
+       "L1 の transit_staff_bound は宣言どおり step0 の 1 件のまま・乱数ゼロ)。"
+       "street_life.rebind_daily / city_ops.rebind_daily と同型(第110 レーン PRES-C)"),
     _f("transit_staff.dwell.enabled", "strict", False, "none",
        "車掌のドア閉判断(ホーム負荷 → 停車時間延長 → delay_min)。ON のとき "
        "env.feedback 規則1 は**評価されない** = 同じ物理(停車時間 → 遅延)の二重計上を"
@@ -631,6 +639,14 @@ FEATURES: tuple[Feature, ...] = (
        "★路上生活者には尊厳規約が掛かる: 中立語のみ・犯罪/迷惑機構から完全除外・"
        "権利は他と同一・区の支援事業(巡回相談→住居移行)が世界に存在する。"
        "既定 OFF は新 12 種の L1 0 件・state なし・プロンプト不変(L1 バイト一致)"),
+    _f("street_life.rebind_daily", "strict", False, "none",
+       "役割バインドの**日次追随**(親 street_life.enabled 配下)。既定 false は従来どおり"
+       "起動時 1 回きり = 100万プールの在場ローテーションで途中入場した個体が担い手に"
+       "ならず、**担い手が日を追って痩せる**(第109 の実測発見。10日ランで顕著)。"
+       "true にすると日境界(_phase_pool_rotation の後)に bind を通し直し、退場者が"
+       "空けた**枠**を当日の在場者で埋める(選抜規則は起動時と同一の決定論=乱数ゼロ・"
+       "generate() 増分ゼロ・既に束ねた在場者は 1 バイトも触らない=冪等)。"
+       "L1 の新種は 1 つも増えず、日ごとの担い手数は summary.street_life.bind_by_day に出る"),
     # Wave 4 III-1: 夜間開放 = 夜(00:00-05:00)を表現可能にする(設計 src/society/night.py)。
     # strict の根拠: **乱数 stream を 1 本も引かない**(避難先は (距離, node id, poi id) の
     #   純関数・営業時間は時刻の純関数・勤務窓は台帳値の読み替え)。LLM の自由文を 1 バイトも
@@ -680,6 +696,13 @@ FEATURES: tuple[Feature, ...] = (
        "近くに居合わせた誰かが通報する ems_call → 当直が応える ems_dispatch)。"
        "★自販機の補充は作らない(地図 v7 に自販機 POI が無く、無い行き先を捏造しないため)。"
        "既定 OFF は新 6 種の L1 0 件・state なし・プロンプト不変(L1 バイト一致)"),
+    _f("city_ops.rebind_daily", "strict", False, "none",
+       "役割バインドの**日次追随**(親 city_ops.enabled 配下)。street_life.rebind_daily と"
+       "同型・同じ理由(第109 の実測発見「10日ランで担い手が痩せる」)。対象は交番の警官・"
+       "収集班・納品ドライバー・夜間清掃員・**救急隊**の 5 群で、痩せると ems_dispatch が"
+       "unstaffed へ倒れる。★既に枠を持つ在場者を触らないのは最適化ではなく正しさ"
+       "(出動中の救急隊を日境界に待機拠点へ引き戻さない)。L1 の city_ops_bound は"
+       "宣言どおり step0 の 1 件のままで、日次の数字は summary.city_ops.bind_by_day に出る"),
     _f("city_ops.police.enabled", "strict", False, "none",
        "交番配置だけを個別に切る子トグル(親 city_ops.enabled 配下)。false では警察官の"
        "持ち場を従来どおり work.bind_workplace の結果のままにする"),
@@ -882,6 +905,26 @@ FEATURES: tuple[Feature, ...] = (
        "ため pool.enabled と同じ扱いにする。pool.enabled が OFF なら 1 バイトも効かない子トグル"
        "だが、ON 時は在場の層構成を作り替えるので独立に宣言する。"
        "既定 OFF では quota 経路を 1 度も通らない=現行の層優先と選抜集合が完全一致"),
+    _f("pool.presence.mode", "strict", True, "none",
+       "在場の内生化 A2(PRES)。quota(既定)= 現行の present_cap 充足経路 / emergent = "
+       "**cap を一切見ない**(quota_by_ratio も通らない)= 当日の資格者がそのまま在場者。"
+       "ユーザー原理『世界のアルゴリズムでエージェントの量が決まらない』の実装であり、"
+       "縮退線は cap ではなく build_persona_pool --fraction(標本設計)側へ移る。"
+       "★affects_k=true: 在場集合そのものが変わる(= 誰が LLM を呼ぶかが変わる)。"
+       "★乱数は**減る**(溢れた層の presence_rank draw が 1 本も出ない)。"
+       "pool.enabled が OFF なら 1 バイトも効かない子トグル",
+       off_value="quota"),
+    _f("pool.presence.habit.enabled", "strict", True, "none",
+       "在場の内生化 A1(PRES)。stochastic 層の『visit_rate × 当日乱数』(= 今日来るかを"
+       "世界のコインが決める)を、個体固定の位相 θ を持つ**習慣カレンダー**(Bresenham 列: "
+       "present ⟺ floor(θ+r·(d+1)) > floor(θ+r·d))へ置き換える。"
+       "★1 日あたりの在場確率は Bernoulli(visit_rate) と**厳密に一致**する(θ~U[0,1) より"
+       "区間長 = r。period=round(1/r) のような丸め誤差が入らない)= 既存の visit_rate 較正は"
+       "1 人も動かない。個人の長期レートも floor(θ+D·r)−floor(θ) で厳密保存。"
+       "★乱数は**減る**: 当日 draw(stream 'presence')が消え、個体固定 stream "
+       "'presence_habit' の 2 draw(位相・天候耐性)になる。k 非依存・trait 非依存・"
+       "resume 不変は不変。子トグル weekday / weather は ALLOWLIST(本トグルが親)。"
+       "pool.enabled が OFF なら 1 バイトも効かない子トグル"),
     _f("engine.batch_llm.enabled", "journal", False, "none",
        "LLM 一括発行(未命中のみ並行発行→id 順 apply)。LLM 発行経路そのものを差し替える"),
     _f("cognition.policy_cache.enabled", "journal", True, "none",
@@ -1489,6 +1532,15 @@ ALLOWLIST: dict[str, str] = {
     "observer.regression.exclude_template":
         "定型応答を語彙エントロピー/n-gram から除外するかの指定"
         "(observer.regression.enabled が親トグル。観測列の定義であって世界の機能ではない)",
+    # 第109バッチ PRES-A1: 習慣カレンダー**内部**の共変量の on/off であって独立した機能
+    # トグルではない(pool.presence.habit.enabled が OFF なら 1 バイトも効かない)。
+    # 「曜日/天候の共変量を切ったらどうなるか」を見るための解析用の内部レバー。
+    "pool.presence.habit.weekday":
+        "目的別の曜日プロファイルを掛けるかの指定(pool.presence.habit.enabled が親トグル。"
+        "プロファイルは週平均 1.0 に正規化済み = 週次の総来街量は ON/OFF で不変)",
+    "pool.presence.habit.weather":
+        "雨/雪の目的別弾性を掛けるかの指定(pool.presence.habit.enabled が親トグル。"
+        "weather.mode=generated 以外では ON でも不活性)",
 }
 
 

@@ -316,6 +316,46 @@ def weather_for(sim, day_index: int) -> dict:
     return _sample(rng, month, wcfg["monthly"], wcfg["neutral"])
 
 
+def peek_bad_day(sim, day_index: int) -> bool | None:
+    """その日が悪天候(雨/雪)かを **副作用ゼロ**で覗く(PRES-A1② の在場共変量)。
+
+    なぜ `weather_for` を呼べないか
+    -------------------------------
+    在場ローテーション(`scheduler._phase_pool_rotation`)は run_step の**先頭**で走り、
+    当日の天気を確定する `_phase_calendar_weather` は**その後**である。素直に
+    `sim.today_weather` を読むと**前日の天気**を掴む(オフバイワン)。かといって
+    `weather_for` を先に呼ぶと `_remember` / `_stats` が二重に加算され、summary の
+    `weather.days.generated` と `series` が実際より 1 日ぶん多く見える(観測の汚染)。
+    そこで**同じ系列から読むだけ**の関数を分けた。
+
+    契約(H1 の熱中症=WBGT と同型の「generated 限定・それ以外は正直に何もしない」)
+      - `mode=generated` かつ weather ON かつ暦 ON かつ基準月の日 … True/False を返す
+      - それ以外(synthetic / table / OFF / 較正外の月 / 系列外の日)… **None = 不活性**
+      - 乱数: 生成系列は `weather_gen` stream 1 本のメモ化で、`_generated_series` は
+        (master_seed, params, anchor_dom) の純関数(prefix 安定)。**呼ぶ順番を早めても
+        同一系列**になるので R1(共通乱数)も resume 決定論も壊れない。
+    """
+    wcfg = getattr(sim, "weathercfg", None) or {}
+    if not wcfg.get("enabled") or str(wcfg.get("mode", "synthetic")) != "generated":
+        return None
+    cal = getattr(sim, "calendarcfg", None)
+    if not (cal and cal.get("enabled")):
+        return None
+    try:
+        anchor = _wg_anchor_month(sim)
+        if str(anchor) not in ((wcfg.get("params") or {}).get("months") or {}):
+            return None
+        if _calendar.date_of(cal, int(day_index) * 1440).month != anchor:
+            return None      # 較正は月ごと(_nonsynthetic_for と同じ線引き)
+        anchor_dom = _calendar.date_of(cal, 0).day
+        ser = _generated_series(sim, wcfg, anchor_dom, int(day_index) + 1)
+        if int(day_index) >= len(ser):
+            return None
+        return str(ser[int(day_index)].get("cond")) in _BAD_CONDS
+    except Exception:                            # noqa: BLE001(素の sim スタブ・欠測)
+        return None
+
+
 def weather_line(weather_dict: dict | None, cfg: dict | None = None) -> str | None:
     """プロンプトへ注入する天気1行。無ければ None(=注入しない=不変)。
 

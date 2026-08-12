@@ -82,6 +82,12 @@ R1 ドクトリン
 - **resume でセッション/クールダウンが切れる**: 状態は agent の動的属性なので
   checkpoint の対象外(第59 assets / 第96 traces と同じ流儀)。持ち場の割当は
   地図からの決定論なので resume 後も同じ(``bind`` は冪等)。
+- **役割バインドは既定で起動時 1 回きり**(``rebind_daily: false``)。100万プールの
+  在場ローテーションが回るランでは、途中入場した個体が担い手にならないまま日が進むので
+  **担い手が日を追って痩せる**(第109 の実測発見)。``street_life.rebind_daily: true``
+  にすると日境界に ``bind`` を通し直し、退場者が空けた**枠**を当日の在場者で埋める
+  (選抜規則は起動時と同一の決定論・既に束ねた在場者は 1 バイトも触らない)。
+  追随の効き目は ``summary.street_life.bind_by_day`` に日ごとの担い手数として出る。
 - **客引きの受け手に「店へ行く」強制はしない**。受諾は記憶 1 行 + L1 の計数までで、
   行き先の書き換えはしない(LLM の自然な反応に委ねる = 街頭広告 ``ad_exposure`` と同じ線引き)。
 - **キッチンカーの売上は agent 間の移転**で閉じる(買い手 → 売り手)。org 会計
@@ -226,6 +232,11 @@ SHELTER_TEXT = "支援を受けて住まいが決まった。"
 
 DEFAULTS = {
     "enabled": False,
+    # ★役割バインドの**日次追随**(既定 false = 従来どおり起動時 1 回きり)。
+    #   true にすると日境界(pool の在場ローテーションの後)に ``bind`` をもう一度通し、
+    #   退場者が空けた枠を当日の在場者で埋める(選抜規則は起動時と同一の決定論)。
+    #   既に束ねた在場者は 1 バイトも触らない(= 冪等・出動中の救急隊を引き戻さない)。
+    "rebind_daily": False,
     # ---- 持ち場(地図からの決定論導出)----
     "posts_per_role": 4,          # 1 役割に用意する持ち場ノード数(id 昇順で循環割当)
     "notice_radius_m": 25.0,      # 路上の出来事に気づく距離(既存 knowledge radius と別系統)
@@ -296,6 +307,8 @@ def build_cfg(raw) -> dict:
     for k, v in raw.items():
         if k == "enabled":
             cfg["enabled"] = bool(v)
+        elif k == "rebind_daily":
+            cfg["rebind_daily"] = bool(v)
         elif k == "tout_bands":
             got = [int(x) for x in (_to_plain(v) or [])]
             if len(got) == 2:
@@ -460,7 +473,51 @@ def _is_tout(sim, agent, cfg: dict) -> bool:
     return int(agent.id) % max(1, int(cfg["tout_every"])) == 0
 
 
-def bind(sim) -> dict:
+def _slot_of(agent) -> int:
+    """その個体が占めている**名簿の枠**(未束ねなら -1)。
+
+    ★``street_post_idx`` とは**別の欄**である: あちらは「いま立っている持ち場」で、
+      警察官の接近(``_disperse``)のたびに次の持ち場へ回る。こちらは「役割の何番目の
+      担い手か」であって一度決まったら動かない = 日次追随の枠の同一性そのもの。
+    """
+    got = getattr(agent, "street_slot", None)
+    return int(got) if got is not None else -1
+
+
+def _take_post(sim, cfg: dict, agent, occ: str, spec: dict, node: str,
+               idx: int) -> None:
+    """1 人を役割の枠へ着ける(**新しく枠を得た個体にだけ**当てる。冪等の実体)。"""
+    agent.street_slot = int(idx)
+    if occ == ROUGH:
+        # 尊厳規約 5: 夜の居場所 = 公園のそば / 地下通路。雨天は屋根のある場所。
+        agent.street_sleep_node = str(node)
+        agent.home_node = str(node)
+        agent.home_building = ""
+        agent.home_floor = 0
+        agent.money = min(float(agent.money), float(cfg["rough_money_cap"]))
+        agent.outreach_count = int(getattr(agent, "outreach_count", 0))
+        return
+    agent.street_post = str(node)
+    agent.street_post_idx = int(idx)
+    if str(getattr(agent, "work_node", "") or "") != str(node):
+        agent.work_node = str(node)
+    agent.work_building = ""                       # 路上の生業(建物内勤務にしない)
+    agent.work_floor = 0
+    # ★勤務窓は**必ず**役割の帯で上書きする(``transit_staff.bind`` が既存窓を残すのとは
+    #   逆の判断)。理由: 路上の生業は**職業そのものが時間帯**であって、名簿側の一般的な
+    #   勤務窓(9〜17 時)を残すと夜の演奏者が昼に持ち場へ立つ。名簿(L5 pool)経由の
+    #   個体は職場 POI を持たない = work_start_min が -1 なので、上書きしても実害は無い。
+    # ★2 帯以上の役割(朝夕のティッシュ配り・朝夕の街頭演説・昼夜の巡回相談)は
+    #   **union の範囲**を勤務窓にする。既存の勤務窓は 1 本しか持てないので、
+    #   bands[0] だけを使うと夕方の帯が一度も立たない(実測で確認した)。
+    #   正直な近似: 帯と帯のあいだも持ち場に居ることになるが、その時間は
+    #   ``_in_band`` が外すので**出来事は 1 件も出ない**(居るだけ)。
+    if spec["bands"]:
+        agent.work_start_min = int(spec["bands"][0][0])
+        agent.work_end_min = int(min(1440, max(b[1] for b in spec["bands"])))
+
+
+def bind(sim, report: dict | None = None) -> dict:
     """路上の役割を持ち場へ束ねる(決定論・乱数ゼロ・**冪等**・resume 安全)。
 
     - 並びは **agent id 昇順**(持ち場の循環割当もこの並びで決まる)。
@@ -473,63 +530,71 @@ def bind(sim) -> dict:
       手持ちは ``rough_money_cap`` で丸める(名簿の既定レンジは住民向けのため)。
     - **客引き**(夜間店舗の従業者の決定論部分集合)は職場を路面に落とす
       = 店の前の路上に立つ(現実の客引きの位置)。勤務窓は既存のまま触らない。
+
+    ★**枠(スロット)方式**(第110 レーン PRES-C)。起動時に呼んでも日境界に呼び直しても
+      同じ関数で成立するように、役割ごとの担い手を「0 番から詰める枠」として持つ:
+        ① 既に枠を持つ**在場者**は 1 バイトも触らない(冪等 = 出動中の隊も動かさない)
+        ② 枠を持たない在場者(= プールの日次ローテーションで途中入場した個体)には
+           **空いている最小の枠**を配る = 退場者が空けた枠がそのまま埋まる
+      起動時(誰も枠を持たない世界)では ① が空集合なので、配られる枠は 0,1,2,… と
+      なり **従来の enumerate と 1 バイトも変わらない**(golden を守る)。
+    ★戻り値は「いま何人が担っているか」= 呼ぶたびに同じ(``report`` を渡すとその回に
+      新しく束ねた人数 ``n_new`` だけが別途返る)。
     """
     out = {"n_role": 0, "n_rough": 0, "n_tout": 0, "posts": {}}
     if not enabled(sim):
         return out
     cfg = cfg_of(sim)
     agents = sorted(sim.agents, key=lambda a: int(a.id))
-    per_role: dict[str, int] = {}
+    n_new = 0
+    used: dict[str, set] = {}                      # 役割 → 在場者が占めている枠
+    waiting: dict[str, list] = {}                  # 役割 → 枠を持たない在場者(id 昇順)
     for a in agents:
         occ = str(getattr(a, "occupation", ""))
-        spec = ROLE_SPECS.get(occ)
-        if spec is None:
+        if occ not in ROLE_SPECS:
             continue
+        slot = _slot_of(a)
+        if slot >= 0:
+            used.setdefault(occ, set()).add(slot)
+            out["n_rough" if occ == ROUGH else "n_role"] += 1
+        else:
+            waiting.setdefault(occ, []).append(a)
+    for occ, queue in waiting.items():
+        spec = ROLE_SPECS[occ]
         pool = posts(sim, spec["post"])
         if not pool:
-            continue
-        idx = per_role.get(occ, 0)
-        per_role[occ] = idx + 1
-        node = pool[idx % len(pool)]
-        if occ == ROUGH:
-            # 尊厳規約 5: 夜の居場所 = 公園のそば / 地下通路。雨天は屋根のある場所。
-            a.street_sleep_node = str(node)
-            a.home_node = str(node)
-            a.home_building = ""
-            a.home_floor = 0
-            a.money = min(float(a.money), float(cfg["rough_money_cap"]))
-            a.outreach_count = int(getattr(a, "outreach_count", 0))
-            out["n_rough"] += 1
-            continue
-        a.street_post = str(node)
-        a.street_post_idx = int(idx)
-        if str(getattr(a, "work_node", "") or "") != str(node):
-            a.work_node = str(node)
-        a.work_building = ""                       # 路上の生業(建物内勤務にしない)
-        a.work_floor = 0
-        # ★勤務窓は**必ず**役割の帯で上書きする(``transit_staff.bind`` が既存窓を残すのとは
-        #   逆の判断)。理由: 路上の生業は**職業そのものが時間帯**であって、名簿側の一般的な
-        #   勤務窓(9〜17 時)を残すと夜の演奏者が昼に持ち場へ立つ。名簿(L5 pool)経由の
-        #   個体は職場 POI を持たない = work_start_min が -1 なので、上書きしても実害は無い。
-        # ★2 帯以上の役割(朝夕のティッシュ配り・朝夕の街頭演説・昼夜の巡回相談)は
-        #   **union の範囲**を勤務窓にする。既存の勤務窓は 1 本しか持てないので、
-        #   bands[0] だけを使うと夕方の帯が一度も立たない(実測で確認した)。
-        #   正直な近似: 帯と帯のあいだも持ち場に居ることになるが、その時間は
-        #   ``_in_band`` が外すので**出来事は 1 件も出ない**(居るだけ)。
-        if spec["bands"]:
-            a.work_start_min = int(spec["bands"][0][0])
-            a.work_end_min = int(min(1440, max(b[1] for b in spec["bands"])))
-        out["n_role"] += 1
-    # 客引き = 夜間店舗の従業者の決定論部分集合(独立した職業を作らない)
+            continue                               # 持ち場の候補が無い地図 = その役割は立たない
+        taken = used.setdefault(occ, set())
+        nxt = 0
+        for a in queue:
+            while nxt in taken:
+                nxt += 1
+            taken.add(nxt)
+            _take_post(sim, cfg, a, occ, spec, pool[nxt % len(pool)], nxt)
+            out["n_rough" if occ == ROUGH else "n_role"] += 1
+            n_new += 1
+    # 客引き = 夜間店舗の従業者の決定論部分集合(独立した職業を作らない)。
+    # ★枠を持たない(= id と職場だけで決まる)ので、日次追随では**毎回引き直す**だけでよい。
     for a in agents:
+        if getattr(a, "street_tout", False):
+            out["n_tout"] += 1                     # 既に立っている = 触らない(冪等)
+            continue
         if _is_tout(sim, a, cfg):
             a.street_tout = True
             a.work_building = ""                   # 店の前の路上に立つ
             a.work_floor = 0
             out["n_tout"] += 1
+            n_new += 1
     out["posts"] = {k: len(posts(sim, k))
                     for k in (P_STATION, P_PLAZA, P_NIGHT, P_SIDE, P_REST, P_COVERED)}
+    if report is not None:
+        report["n_new"] = int(n_new)
     return out
+
+
+def _bind_counts(stat: dict) -> dict:
+    """束ねの返り値から**件数だけ**を取り出す(provenance の日次欄。dict/list は落とす)。"""
+    return {k: int(v) for k, v in stat.items() if isinstance(v, int)}
 
 
 def rough_sleeper_ids(sim) -> frozenset:
@@ -577,7 +642,9 @@ def _state(sim) -> dict:
     if st is None:
         st = {"schema": SCHEMA, "bound": False, "sessions": 0, "by_kind": {},
               "notices": 0, "warnings": 0, "fines": 0, "fine_total": 0.0,
-              "disperses": 0, "contacts": 0, "shelters": 0, "dropped": 0}
+              "disperses": 0, "contacts": 0, "shelters": 0, "dropped": 0,
+              # ---- 日次追随(rebind_daily。OFF では day だけが動かないまま残る)----
+              "day": -1, "rebinds": 0, "refilled": 0, "bind_by_day": {}}
         sim._sl_state = st
     return st
 
@@ -950,9 +1017,25 @@ def phase(sim, step: int, sim_min: int) -> None:
         return
     cfg = cfg_of(sim)
     st = _state(sim)
+    day = int(sim_min) // 1440
     if not st["bound"]:
         st["bound"] = True
+        st["day"] = int(day)
         st["bind"] = bind(sim)
+        st["bind_by_day"][str(day)] = _bind_counts(st["bind"])
+    elif cfg["rebind_daily"] and int(day) != int(st["day"]):
+        # ★日次追随(既定 OFF)。``scheduler.run_step`` は ``_phase_pool_rotation`` を
+        #   先頭で回すので、本 phase に来た時点で **当日の在場者がもう確定している**
+        #   (= 途中入場した個体をその日のうちに担い手へ加えられる)。
+        st["day"] = int(day)
+        # 尊厳規約 2 の除外集合は在場者から作った**キャッシュ**なので、在場が入れ替わったら
+        # 引き直す(引き直さないと途中入場した路上生活者が犯罪機構から除外されない)。
+        sim._sl_rough_ids = None
+        rep: dict = {}
+        st["bind"] = bind(sim, rep)
+        st["rebinds"] += 1
+        st["refilled"] += int(rep.get("n_new", 0))
+        st["bind_by_day"][str(day)] = _bind_counts(st["bind"])
     _weather_shift(sim, cfg)
     bud = _Budget(sim, st, int(cfg["max_events_per_step"]))
 
@@ -1015,12 +1098,15 @@ def provenance(sim) -> dict | None:
     cfg = cfg_of(sim)
     out: dict = {"schema": SCHEMA, "roles": list(STREET_OCCS),
                  "zone_radius_m": float(cfg["zone_radius_m"]),
-                 "fine_amount": float(cfg["fine_amount"])}
+                 "fine_amount": float(cfg["fine_amount"]),
+                 # ★役割バインドの日次追随(false = 起動時 1 回きり = 従来)
+                 "rebind_daily": bool(cfg["rebind_daily"])}
     st = getattr(sim, "_sl_state", None)
     if st is None:
         out.update({"sessions": 0, "notices": 0, "warnings": 0, "fines": 0,
                     "disperses": 0, "contacts": 0, "shelters": 0,
-                    "dropped": 0, "by_kind": {}})
+                    "dropped": 0, "by_kind": {}, "rebinds": 0, "refilled": 0,
+                    "bind_by_day": {}})
         return out
     out.update({"sessions": int(st["sessions"]), "notices": int(st["notices"]),
                 "warnings": int(st["warnings"]), "fines": int(st["fines"]),
@@ -1028,5 +1114,11 @@ def provenance(sim) -> dict | None:
                 "disperses": int(st["disperses"]), "contacts": int(st["contacts"]),
                 "shelters": int(st["shelters"]), "dropped": int(st["dropped"]),
                 "by_kind": {k: int(v) for k, v in sorted(st["by_kind"].items())},
-                "bind": dict(st.get("bind") or {})})
+                "bind": dict(st.get("bind") or {}),
+                # ★担い手が痩せていないかを**日ごとに**読めるようにする(第110 PRES-C)。
+                #   起動時 1 回のままのランでは day0 の 1 行だけが載る = 差が一目で判る。
+                "rebinds": int(st["rebinds"]), "refilled": int(st["refilled"]),
+                "bind_by_day": {k: dict(v) for k, v in
+                                sorted(st["bind_by_day"].items(),
+                                       key=lambda kv: int(kv[0]))}})
     return out

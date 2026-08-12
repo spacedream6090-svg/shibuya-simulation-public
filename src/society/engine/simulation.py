@@ -1108,6 +1108,10 @@ class Simulation:
             # 層別クォータ(DP-U3 案A。既定 OFF=従来の層優先 break=選抜集合が現行と完全一致)。
             self._pool_tier_quota = bool(
                 (poolcfg.get("tier_quota", {}) or {}).get("enabled", False))
+            # 在場の内生化(PRES-A1/A2。既定 = mode:quota + habit OFF = 現行と完全一致)。
+            # ★正準化は presence.build_presence_cfg の 1 箇所だけ(mode の妥当性検査もそこ)。
+            self._pool_presence = presence_mod.build_presence_cfg(
+                poolcfg.get("presence", None))
             self._dormant = pool_mod.DormantStore(cap=int(poolcfg.get("dormant_cap", 0)))
             from .. import organizations as _orgs_mod
             _orgscfg = _orgs_mod.build_orgs_cfg(cfg.get("organizations", None))
@@ -1126,7 +1130,10 @@ class Simulation:
             weekday = self._pool_weekday(0)
             day0 = presence_mod.present_for_day(
                 self._pool.presence_records(), 0, self._pool_present_cap, self.hub, weekday,
-                self._pool_tier_quota)
+                self._pool_tier_quota,
+                habit=self._pool_presence["habit"],
+                emergent=self._pool_presence["emergent"],
+                rain=self._pool_rain(0))
             for pid in day0:
                 self.agents.append(self.build_pool_agent(pid, self._pool.get(pid)))
             # 職場束ね直しの day0 coverage 統計を控える(起動時 1 件で記録=run_step step0)。
@@ -1698,6 +1705,20 @@ class Simulation:
         """当日の曜日(0=Mon..6=Sun)。presence を暦 config に結合させず day のみの純関数に保つ
         ため day % 7(day0=Monday)で決める(k 非依存・resume 不変)。"""
         return int(day) % 7
+
+    def _pool_rain(self, day: int) -> bool | None:
+        """在場の天候共変量(PRES-A1②)。**generated 以外は None = 不活性**。
+
+        - habit.weather が OFF / habit そのものが OFF なら覗きにも行かない(no-op)。
+        - 覗くのは `weather.peek_bad_day`(副作用ゼロ。summary の generated 件数を汚さない)。
+        ★暦は使うが presence の weekday は使わない(weekday は day%7 の純関数のまま)=
+          「暦の曜日」と「presence の曜日」は別物という現行の割り切りを 1 行も変えない。
+        """
+        habit = getattr(self, "_pool_presence", None)
+        if not habit or not habit["habit"]["enabled"] or not habit["habit"]["weather"]:
+            return None
+        from .. import weather as _weather_mod2
+        return _weather_mod2.peek_bad_day(self, int(day))
 
     def build_pool_agent(self, pid: str, record: dict):
         """P5 の full record から present エージェントを1体構築する(id はペルソナ id 安定)。

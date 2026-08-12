@@ -1245,6 +1245,12 @@ transit_staff:
   # ---- 持ち場への束ね(駅員・乗務員 → 駅ノード)----
   bind:
     enabled: true               # 親 enabled も要 true。false=判断だけ動かして束ねない実験用
+    # ---- 束ねの日次追随(第110 レーン PRES-C。既定 false=従来の起動時1回きり)----
+    # 駅員・乗務員は名簿(L5)の duty 層なので、100万プールの在場ローテーションで毎日
+    # 入れ替わる。起動時1回きりだと途中入場した個体が駅に立たないまま日が進み、ドア閉判断
+    # (on_duty_crew)が unstaffed へ倒れていく。true にすると日境界に bind を通し直す
+    # (既に駅へ立っている個体は n_kept として素通し=冪等・乱数ゼロ・L1 は 1 件も増えない)。
+    rebind_daily: false
     station_occupations: ["駅員"]              # 駅係員(改札・ホーム・案内)= 在席するだけ
     crew_occupations: ["車掌", "電車運転士"]    # 乗務員 = ドア閉を判断する層
     # 合成当直表(ペルソナ pool の duty_pattern は record 側にあり agent へ届かないため、
@@ -1415,6 +1421,36 @@ pool:
   # ★ON では resident も比率で切られる(「上位層は毎日不変」は ON では成り立たない)。
   tier_quota:
     enabled: false
+  # ---- 在場の内生化(PRES-A1/A2。既定=現行と 1 バイト一致)----------------------------
+  # 正典: docs/plans/presence-endogenization-plan.md §4(ユーザー決定 2026-08-12)/
+  #       docs/research/presence-endogenization.md §4.2 / src/society/world/presence.py の docstring。
+  # ユーザー原理「範囲内にいる人の数もこちらが指定するものではない…世界のアルゴリズムに
+  # よって…エージェントの量が決まったりすることはなく」。現行機構に残っていた違反は 2 点で、
+  # それぞれ下の 2 つのトグルが担当する(どちらも既定 OFF=現行経路)。
+  presence:
+    # (a) present_cap の当日ランキング切り = 落ちる理由が本人の行動に帰属しない。
+    #   quota   (既定) … 現行のまま。present_cap を tier_quota の規則で充足する。
+    #   emergent       … cap を**一切見ない**(quota_by_ratio も通らない)。当日の資格者が
+    #                    そのまま在場者 = 総在場が個人の予定の合算として創発する。
+    #   ★縮退線は cap ではなく **プール規模**(scripts/build_persona_pool.py --fraction)側で
+    #     取る(MATSim 系は「cap で切る」でなく「標本率を下げて容量をスケール」する。
+    #     リサーチ §3.4)。emergent のまま人数を減らしたいときはプールを作り直すこと。
+    #   ★非常弁として cap を使う(mode を quota に戻す)ことは禁じないが、それは
+    #     「原理から一時離脱している」状態である(リサーチ §5-2)。
+    mode: quota
+    habit:
+      # (b) stochastic 層の `visit_rate × 当日乱数` = レートは個人属性だが今日来るかは世界のコイン。
+      #   true で「個体固定の位相 θ を持つ習慣カレンダー」(Bresenham 列)へ置き換える。
+      #   ★1 日あたりの在場確率は Bernoulli(visit_rate) と**厳密に一致**する(丸めない)ので
+      #     既存の visit_rate 較正は 1 人も動かない。乱数は当日 draw が消えて**減る**。
+      enabled: false
+      # 目的(visit_purpose)別の曜日プロファイル。**週平均 1.0 に機械正規化**されるので
+      # 週次の総来街量は不変で、週内の配分(週末の娯楽・平日の業務)だけが動く。
+      weekday: true
+      # 雨/雪の日の目的別弾性(観光 −27%・買物 −10%…・週末は 1.5 倍で上限 29%)。
+      # ★weather.mode=generated のときだけ効く。synthetic / table / weather OFF では
+      #   **不活性**(H1 の熱中症=WBGT と同型の正直な宣言)。
+      weather: true
 
 # ---- LLM一括発行(P2-S6b・既定OFF=バイト一致)----
 # 個体間で独立なLLMフェーズ(朝計画。夜内省は次段)を「build id順→未命中のみ並行発行→
@@ -3817,6 +3853,14 @@ physics:
 #   不変・L1 バイト一致(golden_baseline_l1.json)。
 street_life:
   enabled: false                # ★false=完全 no-op(バイト一致)。true で路上の生業・条例が動く
+  # ---- 役割バインドの日次追随(第110 レーン PRES-C。既定 false=従来の起動時1回きり)----
+  # 100万プールの在場ローテーションが回るランでは、日を跨いで途中入場した個体が担い手に
+  # ならないまま進むので**担い手が日を追って痩せる**(第109の実測発見。10日ランで顕著)。
+  # true にすると日境界(_phase_pool_rotation の後)に bind を通し直し、退場者が空けた
+  # **枠**を当日の在場者で埋める(選抜規則は起動時と同一の決定論=乱数ゼロ・LLM呼数不変)。
+  # 既に束ねた在場者は 1 バイトも触らない(冪等)。日ごとの担い手数は
+  # summary.street_life.bind_by_day に出る(= 痩せていないことを実測で読む口)。
+  rebind_daily: false
   # ---- 持ち場(地図からの決定論導出)----
   posts_per_role: 4             # 1 役割に用意する持ち場ノード数(id 昇順で循環割当)
   notice_radius_m: 25.0         # 路上の出来事に気づく距離[m](知覚半径とは別系統)
@@ -3869,6 +3913,14 @@ street_life:
 #   後続で設計するときの受け皿になる。
 city_ops:
   enabled: false                # ★false=完全 no-op(バイト一致)。true で見えない労働力が動く
+  # ---- 役割バインドの日次追随(第110 レーン PRES-C。既定 false=従来の起動時1回きり)----
+  # street_life.rebind_daily と同型・同じ理由(第109の実測発見「10日ランで担い手が痩せる」)。
+  # true にすると日境界に 5 群(交番/収集/納品/夜間清掃/救急)の枠を当日の在場者で埋め直す。
+  # ★既に束ねた在場者を触らないのは最適化ではなく**正しさ**である: 出動中の救急隊
+  # (work_node が現場を指している)を日境界に待機拠点へ引き戻さない。
+  # L1 の city_ops_bound は宣言どおり step0 の 1 件のまま(日次の数字は
+  # summary.city_ops.bind_by_day に出す=イベント種の意味を変えない)。
+  rebind_daily: false
   max_events_per_step: 24       # 1 step に出す本機構の L1 件数の上限(超過分は捨てる)
   # ---- ① 交番配置(名簿の警察官 140 人は今までどこにも束ねられていなかった)----
   police:

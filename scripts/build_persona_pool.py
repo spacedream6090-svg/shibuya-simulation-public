@@ -103,6 +103,181 @@ _RESIDENCE_LINES = ["世田谷方面", "二子玉川・田園都市線沿線", "
                     "下北沢・井の頭線沿線", "新宿・山手線沿線", "杉並方面",
                     "目黒方面", "川崎・多摩方面"]
 
+# =========================================================================== #
+# 職業名対応表(PRES-B。第109バッチ レーン PRES-Pool)
+# =========================================================================== #
+# 問題(計画書 §0-4): L2 域内従業者の `occupation` は**台帳のロール名そのまま**だった。
+# ロール名は「社の中でどの機能を担うか」(販売スタッフ / 医療スタッフ / オペレーション /
+# スタイリスト …)であって**職業名ではない**。台帳は industry_key と sector_detail を実在の
+# 産業分類で持っているのに、生成器がそれを読んでいなかった。
+#
+# ここで (industry_key, sector_detail) × ロール → **現実の職業名**へ写像する。
+#
+# 規律:
+#  ① **一般名詞のみ**(実在ブランド・実在企業・実在人物を想起させる語を 1 つも使わない)。
+#  ② 台帳に**無い業種の職業は作らない**。センサス較正台帳 v8 には宿泊業・保育所・理容室・
+#     自動車整備業の org が 1 社も無いので、「ホテルフロント」「保育士」「理容師」「整備士」は
+#     **名簿に生えない**(計画の例示にあっても、居ない業種の職業を発明しない)。
+#     → 生やしたければ台帳側(scripts/build_orgs.py)に業種を足すのが筋。
+#  ③ **オフィス系(IT)の現行 5 種は残す**(エンジニア/デザイナー/プロダクトマネージャー/
+#     営業/コーポレート)。情報通信業の実在の職種名なので置き換える理由が無い。
+#  ④ **夜勤スロットのロールは触らない**(下の `_night_occupation` を参照)。夜勤ロール名は
+#     conf(city_ops.night_cleaning.occupations / incidents_env.crowd.guard_occupations /
+#     world.facilities.responder_occupations)が名指しで引いている語なので、ここで書き換えると
+#     設定と名簿の対応が黙って切れる。
+#  ⑤ 写像に無い (業種, ロール) は**ロール名のまま**(推測で埋めない)。
+#
+# ★挙動への影響(正直な申告): 新しい職業名のうち
+#   「美容師」「カフェ店員」「アパレル店員」は persona._WORK_CAT / economy.WAGE_CAT に**既に
+#   在る語**なので、その個体は職場 POI と本業日給を持つようになる(それ以外の新職業名は
+#   従来どおり両表に無く日給 0 のまま)。L2 の賃金結線そのものは本レーンの範囲外
+#   (= 台帳 wage_tier を個体の日給へ繋ぐかはユーザー判断)なので、この非対称は
+#   **検収報告に実数つきで残す**。
+#   「警備員」「設備保守員」は逆に、conf が名指ししているのに**名簿に 1 人も居なかった**語
+#   (第108/109 の監査事実)で、警備業・施設管理業の実在従業者がここで初めて生える。
+
+#: 業種横断の既定(sector_detail を見ない層)。キー = industry_key。
+_OCC_BY_INDUSTRY: dict[str, dict[str, str]] = {
+    # 情報通信業 = 現行 5 種を維持(規律 ③)。
+    "IT": {},
+    # 卸売業・小売業
+    "WR": {"販売スタッフ": "販売員", "バイヤー": "仕入担当",
+           "EC運営": "通信販売運営担当", "VMD": "売場装飾担当",
+           "在庫管理": "在庫管理担当"},
+    # 飲食業・宿泊サービス業(台帳の実体は飲食のみ)
+    "FB": {"キッチン": "調理師", "ホール": "接客係"},
+    # 生活関連サービス業
+    "LS": {"スタイリスト": "施術スタッフ", "アシスタント": "施術アシスタント"},
+    # 医療・福祉
+    "MW": {"医療スタッフ": "看護師", "介護スタッフ": "介護士",
+           "受付": "医療事務", "事務": "医療事務"},
+    # 教育・学習支援業
+    "ED": {"事務": "事務員"},
+    # 娯楽業
+    "AM": {"フロア": "接客係", "音響": "音響技術者"},
+    # 学術研究・専門・技術サービス業(職種名が既に実在なので最小限)
+    "PS": {},
+    # 不動産業・物品賃貸業
+    "RE": {"営業": "不動産営業", "物件管理": "不動産管理員", "事務": "不動産事務"},
+    # 建設業
+    "CN": {"施工管理": "施工管理技士", "設計": "建築設計士", "事務": "事務員"},
+    # 金融業・保険業
+    "FI": {"コンサルタント": "金融コンサルタント", "営業": "金融営業", "事務": "金融事務"},
+    # 製造業
+    "MF": {"企画": "商品企画担当", "生産管理": "生産管理担当", "事務": "事務員"},
+    # サービス業(他に分類されないもの)
+    "SV": {"オペレーション": "オペレーター", "スタッフ": "サービススタッフ",
+           "事務": "事務員"},
+    # 運輸業・郵便業
+    "TR": {"ドライバー": "トラック運転手", "倉庫管理": "倉庫作業員",
+           "オペレーション": "配車オペレーター", "事務": "事務員"},
+    # 複合サービス事業
+    "CS": {"窓口": "窓口係", "スタッフ": "窓口スタッフ", "事務": "事務員"},
+}
+
+#: 業種 × 細分類(sector_detail)で上書きする層。キー = (industry_key, sector_detail)。
+_OCC_BY_SECTOR: dict[tuple[str, str], dict[str, str]] = {
+    # ---- 小売(WR)。売る物で店員の呼び名が変わる ----
+    ("WR", "アパレル小売"): {"販売スタッフ": "アパレル店員"},
+    ("WR", "セレクトショップ"): {"販売スタッフ": "衣料品販売員"},
+    ("WR", "コスメ物販"): {"販売スタッフ": "美容部員"},
+    ("WR", "食品小売"): {"販売スタッフ": "食品販売員"},
+    ("WR", "雑貨・ライフスタイル"): {"販売スタッフ": "雑貨販売員"},
+    ("WR", "生活雑貨卸"): {"販売スタッフ": "卸売営業担当", "バイヤー": "仕入担当"},
+    # ---- 飲食(FB)----
+    ("FB", "カフェ"): {"キッチン": "調理補助", "ホール": "カフェ店員"},
+    ("FB", "ベーカリー"): {"キッチン": "パン職人", "バリスタ": "製造補助",
+                           "ホール": "販売員"},
+    ("FB", "バー"): {"バリスタ": "バーテンダー"},
+    ("FB", "テイクアウト"): {"ホール": "販売員", "バリスタ": "調理補助"},
+    # ---- 生活関連サービス(LS)。ここが最も「職業名でないロール名」が目立っていた層 ----
+    ("LS", "美容室"): {"スタイリスト": "美容師", "アシスタント": "美容アシスタント"},
+    ("LS", "ネイル/エステ"): {"スタイリスト": "エステティシャン"},
+    ("LS", "リラクゼーション"): {"スタイリスト": "セラピスト"},
+    # ★「写真家」にはしない: economy.WAGE_CAT が「写真家 = 自営」と宣言していて、
+    #   スタジオの被用者に出来高(gig)収入が付いてしまう。雇われの撮影者は「カメラマン」。
+    ("LS", "写真スタジオ"): {"スタイリスト": "カメラマン", "アシスタント": "撮影アシスタント"},
+    ("LS", "クリーニング"): {"スタイリスト": "クリーニング師", "アシスタント": "仕上げ担当"},
+    ("LS", "フィットネス"): {"スタイリスト": "インストラクター",
+                             "アシスタント": "トレーニング補助", "受付": "フロント係"},
+    # ---- 医療・福祉(MW)。国家資格名は業態で決まる ----
+    ("MW", "クリニック"): {"医療スタッフ": "看護師", "介護スタッフ": "看護助手"},
+    ("MW", "歯科"): {"医療スタッフ": "歯科衛生士", "介護スタッフ": "歯科助手"},
+    ("MW", "調剤薬局"): {"医療スタッフ": "薬剤師", "介護スタッフ": "登録販売者",
+                         "受付": "調剤事務", "事務": "調剤事務"},
+    ("MW", "介護/福祉"): {"医療スタッフ": "看護師", "介護スタッフ": "介護士",
+                          "受付": "生活相談員", "事務": "事務員"},
+    ("MW", "治療院"): {"医療スタッフ": "柔道整復師", "介護スタッフ": "鍼灸師",
+                       "受付": "受付", "事務": "事務員"},
+    # ---- 教育(ED)----
+    ("ED", "音楽教室"): {"講師": "音楽講師"},
+    ("ED", "英会話"): {"講師": "語学講師"},
+    ("ED", "学習塾"): {"講師": "塾講師"},
+    ("ED", "予備校"): {"講師": "塾講師"},
+    # ---- 娯楽(AM)----
+    ("AM", "ゲームセンター"): {"フロア": "ゲームセンター店員"},
+    ("AM", "カラオケ"): {"フロア": "カラオケ店員"},
+    ("AM", "劇場・興行"): {"フロア": "劇場スタッフ", "受付": "劇場受付"},
+    ("AM", "ライブハウス"): {"フロア": "ライブハウススタッフ"},
+    ("AM", "スポーツ施設"): {"フロア": "スポーツ施設スタッフ", "受付": "フロント係"},
+    # ---- 専門サービス(PS)。士業は業態で決まる ----
+    ("PS", "税務・会計"): {"コンサルタント": "税理士", "ディレクター": "会計士",
+                           "制作進行": "会計事務", "プランナー": "財務プランナー"},
+    ("PS", "法務"): {"コンサルタント": "弁護士", "制作進行": "パラリーガル",
+                     "ディレクター": "法務担当", "プランナー": "法務担当"},
+    ("PS", "人材紹介"): {"コンサルタント": "キャリアアドバイザー", "営業": "人材営業",
+                         "制作進行": "採用事務"},
+    ("PS", "デザイン/ブランディング"): {"デザイナー": "グラフィックデザイナー",
+                                        "ディレクター": "アートディレクター"},
+    ("PS", "広告運用/制作"): {"プランナー": "広告プランナー",
+                              "ディレクター": "広告ディレクター"},
+    ("PS", "経営/ITコンサル"): {"コンサルタント": "経営コンサルタント"},
+    # ---- 不動産(RE)----
+    ("RE", "物品賃貸"): {"営業": "リース営業", "物件管理": "レンタル管理担当",
+                         "事務": "事務員"},
+    ("RE", "開発/PM"): {"物件管理": "開発プロジェクト担当"},
+    # ---- 建設(CN)----
+    ("CN", "土木"): {"設計": "土木設計士", "施工管理": "土木施工管理技士"},
+    ("CN", "設備工事"): {"設計": "設備設計士", "施工管理": "設備施工管理技士"},
+    ("CN", "内装/リフォーム"): {"設計": "内装設計士", "施工管理": "内装施工管理者"},
+    # ---- 金融(FI)----
+    ("FI", "証券"): {"アナリスト": "証券アナリスト", "営業": "証券営業"},
+    ("FI", "投資/ファンド"): {"アナリスト": "運用アナリスト"},
+    ("FI", "保険代理"): {"コンサルタント": "保険外交員", "営業": "保険外交員"},
+    ("FI", "決済/フィンテック"): {"アナリスト": "データアナリスト"},
+    # ---- 製造(MF)----
+    ("MF", "印刷"): {"生産管理": "印刷オペレーター", "企画": "制作企画担当"},
+    ("MF", "食品加工"): {"生産管理": "食品製造工"},
+    ("MF", "アパレル生産管理"): {"生産管理": "アパレル生産管理担当"},
+    # ---- サービス(SV)。★conf が名指ししていたのに名簿に 0 人だった語がここで生える ----
+    ("SV", "警備"): {"オペレーション": "警備司令", "スタッフ": "警備員"},
+    ("SV", "施設管理/メンテ"): {"オペレーション": "設備管理員", "スタッフ": "設備保守員"},
+    ("SV", "BPO/事務代行"): {"オペレーション": "事務オペレーター", "スタッフ": "事務スタッフ"},
+    ("SV", "人材派遣"): {"オペレーション": "派遣コーディネーター", "スタッフ": "派遣スタッフ"},
+    ("SV", "各種代行"): {"オペレーション": "受託オペレーター", "スタッフ": "代行スタッフ"},
+    # ---- 運輸(TR)----
+    ("TR", "宅配拠点"): {"ドライバー": "宅配ドライバー", "倉庫管理": "仕分け作業員"},
+    ("TR", "倉庫"): {"オペレーション": "荷役オペレーター"},
+    # ---- 複合サービス(CS)----
+    ("CS", "郵便局窓口"): {"窓口": "郵便窓口係"},
+}
+
+#: 学校の職員ロール → 職業名(教員はそのまま = 実在の職業名)。
+_OCC_SCHOOL: dict[str, str] = {"職員": "学校事務職員"}
+
+
+def occupation_for(industry_key: str, sector_detail: str, role: str) -> str:
+    """台帳の (業種, 細分類, ロール) → 職業名。写像に無ければ**ロール名のまま**。"""
+    role = str(role or "")
+    sector = _OCC_BY_SECTOR.get((str(industry_key or ""), str(sector_detail or "")))
+    if sector and role in sector:
+        return sector[role]
+    industry = _OCC_BY_INDUSTRY.get(str(industry_key or ""))
+    if industry and role in industry:
+        return industry[role]
+    return role
+
+
 # ---- L4 来訪セグメント(匿名合成: 目的×属性。実個人は入れない)----
 _VISIT_PURPOSES = [
     ("観光・見物", 0.24), ("買い物", 0.26), ("飲食", 0.18), ("エンタメ・イベント", 0.12),
@@ -350,10 +525,14 @@ class ShardWriter:
         self.buf: list[str] = []
         self.count = 0
         self.shards: list[dict] = []
+        # 職業分布(PRES-B の検収用。meta.json へ出すだけでファイル本体は 1 バイトも変わらない)。
+        self.occ: dict[str, int] = {}
 
     def add(self, rec: dict) -> None:
         self.buf.append(json.dumps(rec, ensure_ascii=False))
         self.count += 1
+        o = str(rec.get("occupation", ""))
+        self.occ[o] = self.occ.get(o, 0) + 1
         if len(self.buf) >= PART_SIZE:
             self._flush()
 
@@ -479,8 +658,14 @@ def night_bedtime_min(sp: dict, i: int) -> int:
 
 
 # ------------------------------------------------------------------ L2 域内従業者(需要駆動)
-def _build_L2_slots(orgs: dict, fraction: float):
-    """組織台帳の employees / 教職員数から従業者スロット(org_id/role/occupation/shift/days)を展開。"""
+def _build_L2_slots(orgs: dict, fraction: float, occupations: bool = True):
+    """組織台帳の employees / 教職員数から従業者スロット(org_id/role/occupation/shift/days)を展開。
+
+    `occupations=True`(既定)で **職業名対応表**(PRES-B)を通し、台帳の
+    (industry_key, sector_detail, role) から現実の職業名を付ける。False にすると
+    従来どおり occupation = role(= 第108 までの名簿と 1 バイト一致)。
+    ★夜勤スロットのロールは**写像を通さない**(conf が名指しで引く語なので。規律 ④)。
+    """
     slots = []  # (org_id, role, occupation, shift_pattern_dict, days)
     for c in orgs["companies"]:
         emp = c["size"]["employees"]
@@ -490,6 +675,7 @@ def _build_L2_slots(orgs: dict, fraction: float):
         roles = c.get("roles") or ["スタッフ"]
         sp = c.get("shift_pattern", {})
         days = sp.get("days", "mon-fri")
+        ikey, sector = c.get("industry_key", ""), c.get("sector_detail", "")
         # 夜勤枠は**末尾から**確保する(日勤側の role 巡回を 1 バイトも動かさないため)。
         # 台帳に night_shift が無ければ n_night=0 = 従来と完全に同一のスロット列。
         n_night = night_slot_count(c, k)
@@ -501,7 +687,8 @@ def _build_L2_slots(orgs: dict, fraction: float):
                 slots.append((c["id"], nrole, nrole, nsp, nsp.get("days", days)))
                 continue
             role = roles[i % len(roles)]
-            slots.append((c["id"], role, role, sp, days))
+            occ = occupation_for(ikey, sector, role) if occupations else role
+            slots.append((c["id"], role, occ, sp, days))
     # 学校の教職員(capacity から逆算: おおむね生徒12人に1人)
     for s in orgs["schools"]:
         staff = max(3, int(round(s["capacity"] / 12.0)))
@@ -514,7 +701,8 @@ def _build_L2_slots(orgs: dict, fraction: float):
               "days": "mon-fri", "rotates": False}
         for i in range(k):
             role = st_roles[i % len(st_roles)]
-            slots.append((s["id"], role, role, sp, "mon-fri"))
+            occ = (_OCC_SCHOOL.get(role, role) if occupations else role)
+            slots.append((s["id"], role, occ, sp, "mon-fri"))
     return slots
 
 
@@ -815,15 +1003,20 @@ def scan_existing_parts(out_dir: Path) -> set:
 
 def build_pool(out_dir: Path, seed: int, fraction: float,
                orgs: dict, pop: dict, total_target: int,
-               orgs_file: str = DEFAULT_ORGS_FILE, clean: bool = False):
-    """プールを生成する。``clean=True`` で**管理外の古い part を削除**する(既定は警告のみ)。"""
+               orgs_file: str = DEFAULT_ORGS_FILE, clean: bool = False,
+               occupations: bool = True):
+    """プールを生成する。``clean=True`` で**管理外の古い part を削除**する(既定は警告のみ)。
+
+    ``occupations=False`` で職業名対応表(PRES-B)を通さない = 第108 までの名簿と
+    1 バイト一致(occupation = 台帳ロール名)。回帰比較用の口。
+    """
     t0 = time.time()
     out_dir.mkdir(parents=True, exist_ok=True)
     pre_parts = scan_existing_parts(out_dir)      # ★書き込み前に採る(D1)
 
     # 層別目標
     n_L1 = int(round(30_000 * fraction))
-    L2_slots = _build_L2_slots(orgs, fraction)
+    L2_slots = _build_L2_slots(orgs, fraction, occupations=occupations)
     n_L2 = len(L2_slots)
     L3_student_slots = _build_L3_student_slots(orgs, fraction)
     n_L3s = len(L3_student_slots)
@@ -862,6 +1055,12 @@ def build_pool(out_dir: Path, seed: int, fraction: float,
     layer_counts = {ly: w.count for ly, w in writers.items()}
     total = sum(layer_counts.values())
     shards = [s for w in writers.values() for s in w.shards]
+    # 職業分布(PRES-B の検収用。多い順・全数)。名簿本体は 1 バイトも変わらない。
+    occ_all: dict[str, int] = {}
+    for w in writers.values():
+        for k, v in w.occ.items():
+            occ_all[k] = occ_all.get(k, 0) + v
+    occ_sorted = dict(sorted(occ_all.items(), key=lambda kv: (-kv[1], kv[0])))
 
     # ---- 管理外(stale)part の始末(第109 レーン D1)------------------------------
     # 既定は**破壊的でない**: 消さずに警告し、meta へ「meta.shards から参照していない」
@@ -908,6 +1107,11 @@ def build_pool(out_dir: Path, seed: int, fraction: float,
         "organizations_meta": {k: orgs.get("meta", {}).get(k)
                                for k in ("map", "mode", "night_shifts", "seed")},
         "employees_ledger_total": sum(c["size"]["employees"] for c in orgs["companies"]),
+        # ---- 職業多様性(PRES-B。第109バッチ レーン PRES-Pool)----------------------
+        # occupation_map=false は「台帳ロール名をそのまま職業名にする」第108 までの形。
+        "occupation_map": bool(occupations),
+        "occupations_distinct": len(occ_sorted),
+        "occupations": occ_sorted,
         "llm_targets_count": len(llm_targets),
         "elapsed_sec": round(time.time() - t0, 2),
         "layer_elapsed_sec": {k: round(v, 2) for k, v in timings.items()},
@@ -989,6 +1193,9 @@ def main(argv=None):
                     help="出力先に残った**管理外の古い part**(前回の生成物で今回は"
                          "書き直されなかったもの)を削除する。既定は削除せず警告のみ"
                          "(meta.shards から参照されないので中身は汚れない)。")
+    ap.add_argument("--no-occupation-map", action="store_true",
+                    help="職業名対応表(PRES-B)を通さず occupation = 台帳ロール名にする"
+                         "(第108 までの名簿と 1 バイト一致。回帰比較用)。")
     args = ap.parse_args(argv)
 
     out_dir = Path(args.out)
@@ -1004,7 +1211,8 @@ def main(argv=None):
 
     meta, councilors = build_pool(out_dir, args.seed, args.fraction, orgs, pop, args.total,
                                   orgs_file=str(args.orgs).replace("\\", "/"),
-                                  clean=args.clean)
+                                  clean=args.clean,
+                                  occupations=not args.no_occupation_map)
 
     if not args.no_councilors_json:
         cpath = _write_councilors_json(councilors, args.seed)
@@ -1017,6 +1225,10 @@ def main(argv=None):
         c = meta["layer_counts"].get(ly, 0)
         print(f"  {ly}: {c:,}  ({meta['layer_elapsed_sec'].get(ly, 0)}s)")
     print(f"  councilors={meta['councilors']}  llm_targets={meta['llm_targets_count']:,}")
+    print(f"  occupations={meta['occupations_distinct']} 種"
+          f"  (occupation_map={meta['occupation_map']})")
+    for occ, n in list(meta["occupations"].items())[:10]:
+        print(f"    {occ}: {n:,}")
     if meta["stale_shards_removed"]:
         print(f"  stale parts removed (--clean): {len(meta['stale_shards_removed'])}")
     elif meta["stale_shards"]:

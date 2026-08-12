@@ -81,6 +81,13 @@ Wave 4 III-3 と同じ轍)。そこで救急は **3 段の因果連鎖**とし�
 8. **resume で巡回・清掃・倒れの印が切れる**: 状態は agent の動的属性なので checkpoint の
    対象外(第59 assets / 第96 traces / Wave 4 III-3 と同じ流儀)。持ち場の割当は地図と
    名簿順からの決定論なので resume 後も同じ(``bind`` は冪等)。
+9. **役割バインドは既定で起動時 1 回きり**(``rebind_daily: false``)。100万プールの
+   在場ローテーションが回るランでは、途中入場した個体が担い手にならないまま日が進むので
+   **担い手が日を追って痩せる**(第109 の実測発見)。``city_ops.rebind_daily: true``
+   にすると日境界に ``bind`` を通し直し、退場者が空けた**枠**を当日の在場者で埋める
+   (選抜規則は起動時と同一の決定論・既に束ねた在場者は 1 バイトも触らない =
+   出動中の救急隊を待機拠点へ引き戻さない)。追随の効き目は
+   ``summary.city_ops.bind_by_day`` に日ごとの担い手数として出る。
 
 制度的背景(実装が参照した現実の構造。ブランド名・実在個人名は 1 つも書かない)
 --------------------------------------------------------------------------------
@@ -203,6 +210,11 @@ _WEEKDAY_PAIRS = ((0, 3), (1, 4), (2, 5))
 
 DEFAULTS: dict = {
     "enabled": False,
+    # ★役割バインドの**日次追随**(既定 false = 従来どおり起動時 1 回きり)。
+    #   true にすると日境界(pool の在場ローテーションの後)に ``bind`` をもう一度通し、
+    #   退場者が空けた枠を当日の在場者で埋める(選抜規則は起動時と同一の決定論)。
+    #   既に束ねた在場者は 1 バイトも触らない(= 冪等・出動中の救急隊を引き戻さない)。
+    "rebind_daily": False,
     "max_events_per_step": 24,     # 1 step に出す本 module の L1 件数の上限(暴走の安全弁)
     # ---- ① 交番配置 ----
     "police": {
@@ -342,7 +354,9 @@ def _block(raw, defaults: dict, words_keys: tuple, floats: tuple,
 def build_cfg(raw) -> dict:
     """conf の ``city_ops`` ブロックを型強制つきで正準化(既定 OFF=現行挙動と完全同一)。"""
     raw = dict(_to_plain(raw) or {})
-    cfg: dict = {"enabled": bool(raw.get("enabled", False))}
+    cfg: dict = {"enabled": bool(raw.get("enabled", False)),
+                 "rebind_daily": bool(raw.get("rebind_daily",
+                                              DEFAULTS["rebind_daily"]))}
     for key in _TOP_INT:
         cfg[key] = max(0, int(raw.get(key, DEFAULTS[key])))
     cfg["police"] = _block(raw.get("police"), DEFAULTS["police"],
@@ -598,6 +612,8 @@ def _state(sim) -> dict:
               "dispatch_unstaffed": 0,
               "trips_staffed": 0, "trips_unstaffed": 0, "rounds_by_kind": {},
               "ems_arrived": 0, "calls_by_day": {}, "cleaned_night": {},
+              # ---- 日次追随(rebind_daily。OFF では day だけが動かないまま残る)----
+              "day": -1, "rebinds": 0, "refilled": 0, "bind_by_day": {},
               "notes": []}
         sim._co_state = st
     return st
@@ -645,7 +661,40 @@ def _stand_on_street(agent, node: str, open_min: int, close_min: int) -> None:
     agent.work_end_min = int(close_min)
 
 
-def bind(sim) -> dict:
+def _slots(sim, occupations, attr: str) -> tuple[list, list, set]:
+    """役割の名簿を「既に枠を持つ在場者 / 枠を持たない在場者 / 使用中の枠」に割る。
+
+    ★**枠(スロット)**は「その役割の何番目の担い手か」であって、当直表・地区割当・
+      持ち場の循環割当のすべてがこの整数から決まる(乱数ゼロ)。起動時は誰も枠を
+      持たないので配られる枠は 0,1,2,… = 従来の ``enumerate`` と 1 バイトも変わらない。
+    戻り値の 1 番目は ``(枠, agent)`` の列(id 昇順)、2 番目は補充待ちの列(id 昇順)。
+    """
+    kept: list = []
+    waiting: list = []
+    used: set = set()
+    for agent in _roster(sim, occupations):
+        got = getattr(agent, attr, None)
+        if got is None:
+            waiting.append(agent)
+        else:
+            kept.append((int(got), agent))
+            used.add(int(got))
+    return kept, waiting, used
+
+
+def _fill(waiting: list, used: set) -> list:
+    """補充待ちへ**空いている最小の枠**を配る(退場者の枠がそのまま埋まる。決定論)。"""
+    out: list = []
+    nxt = 0
+    for agent in waiting:
+        while nxt in used:
+            nxt += 1
+        used.add(nxt)
+        out.append((nxt, agent))
+    return out
+
+
+def bind(sim, report: dict | None = None) -> dict:
     """都市運営の担い手を持ち場へ束ねる(決定論・乱数ゼロ・**冪等**・resume 安全)。
 
     ``work.bind_workplace``(別レーン所有)は地図に対応 POI カテゴリが無い職業を
@@ -658,6 +707,17 @@ def bind(sim) -> dict:
       残すと深夜の収集班が昼に出勤する。
     - 交番の警察官だけは**既存の窓を尊重しない代わりに持ち場を全員には与えない**
       (``patrol_every`` 人に 1 人は名簿の「巡回ユニット」のまま街を回る)。
+
+    ★**枠(スロット)方式**(第110 レーン PRES-C)。起動時に呼んでも日境界に呼び直しても
+      同じ関数で成立するように、5 群それぞれの担い手を「0 番から詰める枠」として持つ:
+        ① 既に枠を持つ**在場者**は 1 バイトも触らない(冪等)。★これは単なる最適化では
+           なく**正しさ**である: 出動中の救急隊(``work_node`` が現場を指している)を
+           日境界に待機拠点へ引き戻さない。
+        ② 枠を持たない在場者(= プールの日次ローテーションで途中入場した個体)には
+           空いている最小の枠を配る = 退場者が空けた枠がそのまま埋まる。
+      起動時(誰も枠を持たない世界)では ① が空集合なので従来と完全同一。
+    ★戻り値は「いま何人が担っているか」= 呼ぶたびに同じ(``report`` を渡すとその回に
+      新しく束ねた人数 ``n_new`` だけが別途返る)。
     """
     out = {"police": 0, "patrol": 0, "waste": 0, "waste_night": 0, "driver": 0,
            "cleaner": 0, "ems": 0, "posts": 0, "districts": 0, "notes": []}
@@ -665,6 +725,7 @@ def bind(sim) -> dict:
         return out
     cfg = cfg_of(sim)
     notes: list[str] = out["notes"]
+    n_new = 0
 
     # ---- ① 交番配置 ------------------------------------------------------- #
     pcfg = cfg["police"]
@@ -675,17 +736,25 @@ def bind(sim) -> dict:
             notes.append("no_police_poi")
         else:
             every = max(1, int(pcfg["patrol_every"]))
-            for index, agent in enumerate(_roster(sim, pcfg["occupations"])):
+            kept, waiting, used = _slots(sim, pcfg["occupations"],
+                                         "city_ops_slot_police")
+            filled = _fill(waiting, used)
+            for index, agent in filled:
+                agent.city_ops_slot_police = int(index)
                 if index % every == every - 1:
                     # 巡回ユニット(名簿 L5 の post に実在する): 持ち場を与えない。
                     agent.city_ops_patrol = True
-                    out["patrol"] += 1
                     continue
                 open_min, close_min = duty_window(
                     pcfg["first_open"], pcfg["shift_hours"], pcfg["n_shifts"], index)
                 _stand_on_street(agent, posts[index % len(posts)], open_min, close_min)
                 agent.city_ops_post = str(posts[index % len(posts)])
-                out["police"] += 1
+            n_new += len(filled)
+            for index, _agent in kept + filled:    # 枠の剰余だけで配置/巡回が決まる
+                if index % every == every - 1:
+                    out["patrol"] += 1
+                else:
+                    out["police"] += 1
 
     # ---- ② ごみ収集 ------------------------------------------------------- #
     wcfg = cfg["waste"]
@@ -697,26 +766,31 @@ def bind(sim) -> dict:
         if wcfg["commercial_enabled"] and not night_ok:
             # ★正直な依存関係: 深夜に起きている作業員が世界に居ないので束ねない。
             notes.append("commercial_waste_needs_night_economy")
-        for index, agent in enumerate(_roster(sim, wcfg["occupations"])):
-            if not groups:
-                break
+        every = max(1, int(wcfg["commercial_every"]))
+        kept, waiting, used = _slots(sim, wcfg["occupations"], "city_ops_slot_waste")
+        filled = _fill(waiting, used) if groups else []
+        for index, agent in filled:
+            agent.city_ops_slot_waste = int(index)
             group = groups[index % len(groups)]
             agent.city_ops_district = str(group["name"])
             agent.city_ops_district_idx = int(index % len(groups))
-            night = night_ok and (index % max(1, int(wcfg["commercial_every"]))
-                                  == max(1, int(wcfg["commercial_every"])) - 1)
+            night = night_ok and (index % every == every - 1)
             agent.city_ops_waste_night = bool(night)
             if night:
                 start, end = wcfg["commercial_start_min"], wcfg["commercial_end_min"]
                 stops = group["night_stops"] or group["ward_stops"]
-                out["waste_night"] += 1
             else:
                 start, end = wcfg["ward_start_min"], wcfg["ward_deadline_min"]
                 stops = group["ward_stops"]
-                out["waste"] += 1
             if not stops:
                 continue
             _stand_on_street(agent, stops[0], start, end)
+        n_new += len(filled)
+        for index, _agent in kept + filled:
+            if night_ok and index % every == every - 1:
+                out["waste_night"] += 1
+            else:
+                out["waste"] += 1
 
     # ---- ③ 納品の運転手化 -------------------------------------------------- #
     dcfg = cfg["driver"]
@@ -725,13 +799,15 @@ def bind(sim) -> dict:
                                   int(dcfg["stops_per_round"]))
         if not stops:
             notes.append("no_commercial_node")
-        for index, agent in enumerate(_roster(sim, dcfg["occupations"])):
-            if not stops:
-                break
+        kept, waiting, used = _slots(sim, dcfg["occupations"], "city_ops_slot_driver")
+        filled = _fill(waiting, used) if stops else []
+        for index, agent in filled:
+            agent.city_ops_slot_driver = int(index)
             agent.city_ops_driver = True
             _stand_on_street(agent, stops[index % len(stops)],
                              dcfg["start_min"], dcfg["end_min"])
-            out["driver"] += 1
+        n_new += len(filled)
+        out["driver"] = len(kept) + len(filled)
 
     # ---- ④ ビル夜間清掃 ---------------------------------------------------- #
     ncfg = cfg["night_cleaning"]
@@ -744,9 +820,10 @@ def bind(sim) -> dict:
             # ★日跨ぎ勤務窓は夜間開放 ON でしか表現できない(work._window の丸め)。
             #   OFF では 22:00〜24:00 へ畳む = 夜の前半だけ働く正直な縮退。
             notes.append("night_cleaning_window_clamped")
-        for index, agent in enumerate(_roster(sim, ncfg["occupations"])):
-            if not blds:
-                break
+        kept, waiting, used = _slots(sim, ncfg["occupations"], "city_ops_slot_clean")
+        filled = _fill(waiting, used) if blds else []
+        for index, agent in filled:
+            agent.city_ops_slot_clean = int(index)
             bld = blds[index % len(blds)]
             agent.work_building = str(bld["id"])
             agent.work_node = str(bld["entrance"])
@@ -756,7 +833,8 @@ def bind(sim) -> dict:
             if wraps:
                 agent.work_wraps = True
             agent.city_ops_clean_building = str(bld["id"])
-            out["cleaner"] += 1
+        n_new += len(filled)
+        out["cleaner"] = len(kept) + len(filled)
 
     # ---- ⑤ 救急 ------------------------------------------------------------ #
     ecfg = cfg["ems"]
@@ -764,15 +842,25 @@ def bind(sim) -> dict:
         base = _ems_base(sim)
         if not base:
             notes.append("no_ems_base")
-        for index, agent in enumerate(_roster(sim, ecfg["crew_occupations"])):
-            if not base:
-                break
+        kept, waiting, used = _slots(sim, ecfg["crew_occupations"],
+                                     "city_ops_slot_ems")
+        filled = _fill(waiting, used) if base else []
+        for index, agent in filled:
+            agent.city_ops_slot_ems = int(index)
             open_min, close_min = duty_window(
                 ecfg["first_open"], ecfg["shift_hours"], ecfg["n_shifts"], index)
             _stand_on_street(agent, base, open_min, close_min)
             agent.city_ops_ems_base = str(base)
-            out["ems"] += 1
+        n_new += len(filled)
+        out["ems"] = len(kept) + len(filled)
+    if report is not None:
+        report["n_new"] = int(n_new)
     return out
+
+
+def _bind_counts(stat: dict) -> dict:
+    """束ねの返り値から**件数だけ**を取り出す(provenance の日次欄。list は落とす)。"""
+    return {k: int(v) for k, v in stat.items() if isinstance(v, int)}
 
 
 def _ensure_bound(sim, step: int = -1, sim_min: int = 0) -> None:
@@ -781,18 +869,34 @@ def _ensure_bound(sim, step: int = -1, sim_min: int = 0) -> None:
     ★``goods.review_and_order``(``_phase_goods``)は本 module の ``phase`` より**前**に
       走るので、納品ドライバーの問い合わせが先に来ることがある。そこで束ねは
       「最初に必要になった側」が行う(どちらから来ても同じ結果 = 冪等)。
+    ★``rebind_daily`` が ON のときだけ、日境界でもう一度通す(**日次追随**)。
+      ``scheduler.run_step`` は ``_phase_pool_rotation`` を先頭で回すので、どちらの
+      呼び出し口から来ても**当日の在場者が確定した後**である。
+      L1 の ``city_ops_bound`` は宣言どおり **step 0 の 1 件のまま**(日次の数字は
+      ``summary.city_ops.bind_by_day`` に出す = イベント種の意味を変えない)。
     """
     st = _state(sim)
-    if st["bound"]:
+    day = int(sim_min) // 1440
+    if not st["bound"]:
+        st["bound"] = True
+        st["day"] = int(day)
+        st["bind"] = bind(sim)
+        st["bind_by_day"][str(day)] = _bind_counts(st["bind"])
+        if int(step) == 0:
+            stat = dict(st["bind"])
+            stat["notes"] = list(stat.get("notes") or [])
+            sim.logger.log(Event(step=int(step), sim_min=int(sim_min), agent_id=-1,
+                                 kind="city_ops_bound", x=0.0, y=0.0, payload=stat))
+            _bump(st["by_kind"], "city_ops_bound")
         return
-    st["bound"] = True
-    st["bind"] = bind(sim)
-    if int(step) == 0:
-        stat = dict(st["bind"])
-        stat["notes"] = list(stat.get("notes") or [])
-        sim.logger.log(Event(step=int(step), sim_min=int(sim_min), agent_id=-1,
-                             kind="city_ops_bound", x=0.0, y=0.0, payload=stat))
-        _bump(st["by_kind"], "city_ops_bound")
+    if not cfg_of(sim)["rebind_daily"] or int(day) == int(st["day"]):
+        return                                     # 既定 = 起動時 1 回きり(従来と同一)
+    st["day"] = int(day)
+    rep: dict = {}
+    st["bind"] = bind(sim, rep)
+    st["rebinds"] += 1
+    st["refilled"] += int(rep.get("n_new", 0))
+    st["bind_by_day"][str(day)] = _bind_counts(st["bind"])
 
 
 # =========================================================================== #
@@ -1393,11 +1497,14 @@ def provenance(sim) -> dict | None:
     cfg = cfg_of(sim)
     out: dict = {"schema": SCHEMA, "roles": list(CITY_OPS_OCCS),
                  "police_posts": len(police_posts(sim)),
-                 "districts": len(districts(sim))}
+                 "districts": len(districts(sim)),
+                 # ★役割バインドの日次追随(false = 起動時 1 回きり = 従来)
+                 "rebind_daily": bool(cfg["rebind_daily"])}
     st = getattr(sim, "_co_state", None)
     if st is None:
         out.update({"rounds": 0, "cleanings": 0, "collapses": 0, "calls": 0,
-                    "dispatches": 0, "by_kind": {}, "dropped": 0})
+                    "dispatches": 0, "by_kind": {}, "dropped": 0,
+                    "rebinds": 0, "refilled": 0, "bind_by_day": {}})
         return out
     days = max(1, len(st["calls_by_day"]))
     out.update({"bind": dict(st.get("bind") or {}),
@@ -1419,7 +1526,13 @@ def provenance(sim) -> dict | None:
                 "trips_unstaffed": int(st["trips_unstaffed"]),
                 "calls_per_day": round(float(st["calls"]) / days, 2),
                 "dropped": int(st["dropped"]),
-                "by_kind": {k: int(v) for k, v in sorted(st["by_kind"].items())}})
+                "by_kind": {k: int(v) for k, v in sorted(st["by_kind"].items())},
+                # ★担い手が痩せていないかを**日ごとに**読めるようにする(第110 PRES-C)。
+                #   起動時 1 回のままのランでは day0 の 1 行だけが載る = 差が一目で判る。
+                "rebinds": int(st["rebinds"]), "refilled": int(st["refilled"]),
+                "bind_by_day": {k: dict(v) for k, v in
+                                sorted(st["bind_by_day"].items(),
+                                       key=lambda kv: int(kv[0]))}})
     n_agents = len(getattr(sim, "agents", ()) or ())
     if n_agents > 0:
         # 区の実測 65 件/日 は区の全人口(約 23 万人)に対する数字。本ランの規模へ

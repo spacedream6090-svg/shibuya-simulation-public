@@ -135,6 +135,12 @@ DEFAULTS = {
     "enabled": False,
     "bind": {
         "enabled": True,
+        # ★束ねの**日次追随**(既定 false = 従来どおり起動時 1 回きり)。第110 レーン PRES-C。
+        #   駅員・乗務員は名簿(L5)の duty 層なので、100万プールの在場ローテーションで
+        #   毎日入れ替わる。起動時 1 回きりだと途中入場した個体が駅に立たないまま日が進み、
+        #   ドア閉判断(on_duty_crew)が unstaffed へ倒れていく。true にすると日境界に
+        #   ``bind`` を通し直す(**既に駅へ立っている個体は 1 バイトも触らない**= 冪等)。
+        "rebind_daily": False,
         "station_occupations": ("駅員",),
         "crew_occupations": ("車掌", "電車運転士"),
         "first_open": "05:00",           # 最初の直の始まり(初電の帯)
@@ -183,6 +189,8 @@ def build_cfg(raw) -> dict:
     bind = cfg["bind"]
     if "enabled" in got:
         bind["enabled"] = bool(got["enabled"])
+    if "rebind_daily" in got:
+        bind["rebind_daily"] = bool(got["rebind_daily"])
     if "station_occupations" in got:
         bind["station_occupations"] = _occ_tuple(
             got["station_occupations"], DEFAULTS["bind"]["station_occupations"])
@@ -510,11 +518,23 @@ def phase(sim, step: int, sim_min: int, since_idx: int = -1) -> None:
     """
     if not enabled(sim):
         return
+    day = int(sim_min) // 1440
     if not getattr(sim, "_transit_staff_bound", False):
         stat = bind(sim)
         sim._transit_staff_bound = True
+        sim._transit_staff_day = int(day)
+        sim._transit_staff_stat = dict(stat)
         if stat["node"] and int(step) == 0:
             sim.logger.log(Event(step=int(step), sim_min=int(sim_min), agent_id=-1,
                                  kind="transit_staff_bound", x=0.0, y=0.0,
                                  payload=dict(stat)))
+    elif (cfg_of(sim)["bind"]["rebind_daily"]
+            and int(day) != int(getattr(sim, "_transit_staff_day", -1))):
+        # ★日次追随(既定 OFF)。``scheduler.run_step`` は ``_phase_pool_rotation`` を先頭で
+        #   回すので、ここへ来た時点で**当日の在場者が確定している**。``bind`` は既に駅へ
+        #   立っている個体を ``n_kept`` として素通しするので、実際に書かれるのは
+        #   **途中入場して持ち場を持たない個体**だけ(= 冪等・出力は L1 に 1 件も増えない)。
+        sim._transit_staff_day = int(day)
+        sim._transit_staff_stat = dict(bind(sim))
+        sim._transit_staff_rebinds = int(getattr(sim, "_transit_staff_rebinds", 0)) + 1
     _dwell(sim, step, sim_min, since_idx)

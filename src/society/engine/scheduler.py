@@ -4823,6 +4823,12 @@ def _phase_pool_rotation(sim, step: int, sim_min: int) -> None:
     - presence は stream("presence", pid, day) の純関数(k/trait 非依存・resume 不変)。
       cap の充足規則は pool.tier_quota.enabled で切替(既定 OFF=層優先 break=現行と完全一致。
       ON=層別クォータ=DP-U3 案A。どちらも乱数の引き方は同じ=追加乱数ゼロ)。
+    - 在場の内生化(PRES-A1/A2。conf pool.presence。既定=現行と完全一致):
+      habit ON で stochastic 層が個体固定の習慣カレンダー(+目的×曜日×天候)へ、
+      mode=emergent で cap を一切見ない(資格者=在場者)。天候は **generated 限定**で
+      `weather.peek_bad_day`(副作用ゼロ)から覗く — 本フェーズは run_step の先頭で走り
+      `_phase_calendar_weather`(当日の天気確定)は**後**なので、`sim.today_weather` を
+      読むと前日の天気を掴むオフバイワンになる。
     - 退場者(present→absent): dehydrate してスリム状態を DormantStore へ退避し sim.agents から除去。
     - 入場者(absent→present): P5 record から build_pool_agent で実体化。退避済み状態があれば hydrate
       (再来街=同一実体の記憶・信念・所持金・関係が続く)。agent.id はペルソナ id で安定。
@@ -4837,9 +4843,12 @@ def _phase_pool_rotation(sim, step: int, sim_min: int) -> None:
         return
     sim._pool_day = day
     weekday = sim._pool_weekday(day)
+    pres = getattr(sim, "_pool_presence", None) or presence_mod.build_presence_cfg(None)
     new_ids = set(presence_mod.present_for_day(
         pool.presence_records(), day, sim._pool_present_cap, sim.hub, weekday,
-        getattr(sim, "_pool_tier_quota", False)))
+        getattr(sim, "_pool_tier_quota", False),
+        habit=pres["habit"], emergent=pres["emergent"],
+        rain=sim._pool_rain(day)))
     cur = {getattr(a, "pool_pid", None): a for a in sim.agents}
     cur.pop(None, None)
     old_ids = set(cur)

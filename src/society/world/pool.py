@@ -17,6 +17,7 @@ RAM 方針(persona-pool §9): 「present = LLM コスト源」と「プール = 
 from __future__ import annotations
 
 import json
+import sys
 from collections import Counter, OrderedDict
 from pathlib import Path
 
@@ -35,6 +36,10 @@ def _slim(rec: dict) -> PresenceRec:
         visit_rate=float(rec.get("visit_rate") or 0.0),
         revisit=bool(rec.get("revisit", False)),
         duty_days=str(dp.get("days") or "all"),
+        # PRES-A1②: 来街目的(曜日・天候の共変量キー)。json.loads は行ごとに**別の str
+        # オブジェクト**を作るので、100 万件では同じ 7 語が 70 万個の実体になる。
+        # `sys.intern` で 7 個へ畳む(索引の常駐 RAM を増やさないための唯一の細工)。
+        visit_purpose=sys.intern(str(rec.get("visit_purpose") or "")),
     )
 
 
