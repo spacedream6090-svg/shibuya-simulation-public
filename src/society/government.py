@@ -138,11 +138,21 @@ class Government:
         return out
 
     # ------------------------------------------------------------------ 税額
-    def income_tax(self, gross: float) -> float:
-        """所得税(国税)の源泉控除額。日給 gross を年換算しレンジ別実効税率を掛ける。"""
+    def income_tax(self, gross: float, annual: float | None = None) -> float:
+        """所得税(国税)の源泉控除額。gross を年換算しレンジ別実効税率を掛ける。
+
+        annual=None(既定・既存の全呼び出し)は従来どおり「日給 × annual_workdays」で
+        年換算する = 1 バイトも変わらない。
+
+        ★annual を渡す口(賃金多様性 WAGE で新設): 年換算の分母は**支給周期で違う**。
+          日給を 245 倍するのは日給者にだけ正しく、月給まとめ(例 24 万)をそのまま 245 倍
+          すると年収 5,880 万円扱いになって最高税率が掛かる(既存の欠陥)。月給・賞与は
+          「その人の年収」を呼び出し側が渡し、税率だけをそこから引く(税額は gross×率)。
+        """
         if gross <= 0:
             return 0.0
-        annual = gross * float(self.cfg["annual_workdays"])
+        annual = (gross * float(self.cfg["annual_workdays"])
+                  if annual is None else float(annual))
         rate = self.cfg["income_brackets"][-1]["rate"]
         for b in self.cfg["income_brackets"]:
             if b["up_to"] is None or annual <= b["up_to"]:

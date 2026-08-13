@@ -127,6 +127,15 @@ def assign_attributes(sim) -> None:
     if not enabled(sim):
         return
     cfg = sim.diversitycfg
+    # ★レーン乙 A10: プール ON のランでは「day0 の列挙順の**前方切り**」が二重に壊れる:
+    #   (a) day0 に居た個体しか観光客になれない(day1 以降の 20.9 万人は永久に非該当)
+    #   (b) 前方切りは id の小さい側に系統的に偏る(名簿の並び = 層の並び)。
+    #   個体ハッシュの決定論割当へ置き換える(比率は保存。乱数 stream はゼロ)。
+    #   pool OFF のランは**従来の前方切りのまま**= 既存の全ランとバイト一致。
+    if getattr(sim, "_pool", None) is not None:
+        for a in sorted(sim.agents, key=lambda a: a.id):
+            assign_for_entry(sim, a)
+        return
     agents = sorted(sim.agents, key=lambda a: a.id)
     # 観光客: visitor の一部を回遊型に(名簿/決定論)
     visitors = [a for a in agents if a.visitor]
@@ -140,6 +149,30 @@ def assign_attributes(sim) -> None:
         for i, a in enumerate(agents):
             if i < n_for:
                 a.language = langs[i % len(langs)]
+
+
+def _u01(*parts) -> float:
+    """安定ハッシュ → [0,1)(プロセス非依存・run.seed 非依存・乱数 stream ゼロ)。"""
+    import hashlib
+    key = ":".join(str(p) for p in parts).encode("utf-8")
+    return int.from_bytes(hashlib.blake2b(key, digest_size=8).digest(), "big") / 2.0 ** 64
+
+
+def assign_for_entry(sim, agent) -> None:
+    """1 個体ぶんの観光客/言語割当(入場駆動・冪等・決定論・乱数ゼロ。レーン乙 A10)。
+
+    比率は ``tourist_ratio``(visitor 母集団に対して)/ ``foreign_ratio``(全体に対して)を
+    ハッシュ一様値の閾値判定で保存する(大数の法則。前方切りと違い母集団の並びに依存しない)。
+    OFF は完全 no-op(属性を 1 つも生やさない)。"""
+    if not enabled(sim):
+        return
+    cfg = sim.diversitycfg
+    key = str(getattr(agent, "pool_pid", None) or agent.id)
+    if getattr(agent, "visitor", False):
+        agent.tourist = bool(_u01("tourist", key) < float(cfg["tourist_ratio"]))
+    langs = cfg["languages"]
+    if langs and _u01("lang", key) < float(cfg["foreign_ratio"]):
+        agent.language = langs[int(_u01("langpick", key) * len(langs)) % len(langs)]
 
 
 def context_line(agent, place_name: str = "この街") -> str | None:

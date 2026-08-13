@@ -47,6 +47,19 @@ def build_cfg(raw: dict | None) -> dict:
     }
 
 
+def ensure_collective(agent, rng) -> bool:
+    """集団効力感の state を**まだ持っていなければ**据える(冪等。レーン乙 A5)。
+
+    ★因子名を知ってよいのは factors 層だけなので、「もう据わっているか」の判定も
+      engine ではなくここに置く(engine 側は真偽しか受け取らない = 指紋の禁止を守る)。
+      プール回転で途中入場する個体にも配るために要る(起動時 1 回では届かない)。
+    戻り値 = 新たに据えたか。"""
+    if "collective_efficacy" in agent.states:
+        return False
+    enable_collective(agent, rng)
+    return True
+
+
 def enable_collective(agent, rng) -> None:
     """集団効力感プラグイン ON 時のみ、agent に新 state を1つ追加する。
 

@@ -50,6 +50,13 @@ def weekday_jp(cfg: dict, sim_min: int) -> str:
     return _WEEKDAY_JP[weekday_of(cfg, sim_min)]
 
 
+def days_in_month(cfg: dict, sim_min: int) -> int:
+    """その日が属する月の日数(28..31)。「月末払い」の給料日判定に使う。"""
+    d = date_of(cfg, sim_min)
+    nxt = (d.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
+    return (nxt - datetime.timedelta(days=1)).day
+
+
 def is_holiday(cfg: dict, sim_min: int) -> bool:
     """休日か(土日、または holidays に含まれる YYYY-MM-DD)。"""
     d = date_of(cfg, sim_min)

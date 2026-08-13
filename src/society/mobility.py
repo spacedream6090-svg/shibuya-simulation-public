@@ -102,14 +102,21 @@ def _household_members(sim, agent) -> list:
     """agent の世帯メンバ(自分を先頭に含む)。housemates を名簿から解決(来街者は除外)。"""
     members = [agent]
     for oid in getattr(agent, "housemates", None) or []:
-        m = sim.agent_by_id.get(oid)
+        # ★レーン乙 ブロック3(c): 在場述語。街に居ない同居人へ home を書いても次の
+        #   hydrate で捨てられる(= 転居が片側だけ成立して世帯の住居が割れる)。
+        m = sim.present_agent(oid)
         if m is not None and not m.visitor and m.id != agent.id:
             members.append(m)
     return members
 
 
 def _set_home(members, bld, floor: int) -> None:
-    """世帯メンバ全員の home(建物/ノード/階)を bld へ寄せる(_share_home 整合=世帯単位で共有)。"""
+    """世帯メンバ全員の home(建物/ノード/階)を bld へ寄せる(_share_home 整合=世帯単位で共有)。
+
+    ★レーン乙 ブロック3: ここは「シミュレーション中に**実際に引っ越した**」唯一の経路なので、
+      印(``_home_moved``)を残す。pool の退避はこの印が立っている個体だけ home を運ぶ
+      (印が無い個体の home は名簿 + 世帯から決定論で組み直されるので運ぶ必要がなく、
+      運ぶと二重の真実源になる)。印が無ければ属性も生えない=既定ランはバイト一致。"""
     node = bld["entrance"]
     levels = int(bld.get("levels", 1) or 1)
     fl = max(1, min(int(floor), levels))
@@ -117,6 +124,7 @@ def _set_home(members, bld, floor: int) -> None:
         m.home_building = bld["id"]
         m.home_node = node
         m.home_floor = fl
+        m._home_moved = True
 
 
 def _pick_building_near(sim, target_xy, exclude_bld: str, k: int, rng):
@@ -295,7 +303,7 @@ def _merge_households(sim, keeper, mover) -> None:
     members = [keeper, mover]
     for x in (keeper, mover):
         for oid in getattr(x, "housemates", None) or []:
-            m = sim.agent_by_id.get(oid)
+            m = sim.present_agent(oid)     # ★レーン乙 ブロック3(c): 在場述語(幽霊へ書かない)
             if m is not None and m.id not in ids:
                 ids.add(m.id)
                 members.append(m)
@@ -351,16 +359,21 @@ def _split_household(sim, mover) -> None:
     正直な簡略化: 併合前に mover が連れていた同居人の再分割はしない(残留メンバ扱い)。同棲は主に
     独身パートナー2人=このケースは実務上ほぼ発生しない。"""
     for oid in list(getattr(mover, "housemates", None) or []):
-        m = sim.agent_by_id.get(oid)
+        m = sim.present_agent(oid)         # ★レーン乙 ブロック3(c): 在場述語(幽霊へ書かない)
         if m is None:
             continue
         m.housemates = [i for i in (m.housemates or []) if i != mover.id]
         if not m.housemates:
             m.household_id = None
             m.household_kind = ""
+            m._hh_detached = True
     mover.household_id = None
     mover.household_kind = ""
     mover.housemates = []
+    # ★レーン乙 ブロック3: 「世帯を抜けた」という事実の印。pool の再入場で名簿由来の世帯へ
+    #   自動で座り直されてしまう(分離が忘れられる)のを防ぐ唯一の手段。既定ランでは
+    #   この関数自体が呼ばれない(cohabit OFF)ので属性は 1 つも生えない=バイト一致。
+    mover._hh_detached = True
 
 
 def _clear_cohabit(mover, keeper) -> None:

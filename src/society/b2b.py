@@ -60,6 +60,9 @@ def build_cfg(raw_commerce) -> dict:
         "supply_kind": supply,                                       # 小売 cat → 卸 output_kind
         "production_units": max(1, int(raw.get("production_units", 8))),  # 勤務完遂1回で卸在庫が増える量
         "initial_stock": max(0, int(raw.get("initial_stock", 0))),  # 卸の起動時在庫(0=生産で立ち上げ)
+        # レーン乙 D2: 起動時在庫を「その卸が供給を受け持つ小売の**上限在庫 S の合計 × 日数**」で
+        # 与える(0=OFF=現行と完全同一)。initial_stock(定額)より上位で、指定されたらこちらを使う。
+        "initial_stock_days": max(0, int(raw.get("initial_stock_days", 0))),
         # 卸値(1単位あたりの仕入単価。cat 別に上書き可。既定=小売の下代近似)。
         "wholesale_price": wprice,
         "default_wholesale_price": float(raw.get("default_wholesale_price", 300.0)),
@@ -104,6 +107,17 @@ def wholesale_for(sim, node: str, cat: str) -> dict | None:
     kind = sim.b2bcfg["supply_kind"].get(str(cat))
     if not kind:
         return None
+    # ★レーン乙 D2(純粋な最適化。選ばれる org は 1 件も変わらない): この関数は 1 注文につき
+    #   2 回(発注時の origin_node と到着時の fulfill)呼ばれ、そのたびに台帳 9,872 社を
+    #   全走査していた。写像は (node, cat) → org の**静的な純関数**(台帳も地図も走行中に
+    #   変わらない)なので 1 度だけ引いて控える。
+    memo = getattr(sim, "_b2b_supplier_memo", None)
+    if memo is None:
+        memo = {}
+        sim._b2b_supplier_memo = memo
+    ck = (str(node), str(cat))
+    if ck in memo:
+        return memo[ck]
     p = sim.city.node_xy(node)
     best = None
     best_key = None
@@ -120,6 +134,7 @@ def wholesale_for(sim, node: str, cat: str) -> dict | None:
         if best_key is None or key < best_key:
             best_key = key
             best = org
+    memo[ck] = best
     return best
 
 
@@ -140,6 +155,41 @@ def on_production(sim, org: dict, step: int, sim_min: int) -> None:
     oid = str(org["id"])
     b = _state(sim)
     b["stock"][oid] = b["stock"].get(oid, 0) + int(sim.b2bcfg["production_units"])
+
+
+def _served_capacity(sim) -> dict:
+    """卸 org → 「供給を受け持つ小売の上限在庫 S の合計」(1 回だけ構築・決定論・乱数ゼロ)。
+
+    レーン乙 D2: ``wholesale_for`` は小売 1 件につき**最寄り 1 社**を指名するので、供給の
+    受け持ちは台帳と地図だけで決まる静的な写像である。その「1 日で起こりうる最大の補充要求」
+    (= Σ 上限在庫 S)が分かれば、起動時在庫を**日数**で指定できる(初期条件として正当な形)。
+    地図上の小売 POI を 1 周するだけ(メモ化された ``wholesale_for`` を使う)。"""
+    got = getattr(sim, "_b2b_served_cap", None)
+    if got is not None:
+        return got
+    from . import goods as _goods
+    gcfg = sim.goodscfg
+    out: dict[str, int] = {}
+    cats = tuple(sorted(sim.b2bcfg["supply_kind"]))
+    for node in sorted(sim.city.graph):
+        for poi in (sim.city.pois_at_node(node) or []):
+            cat = str(poi.get("cat") or "")
+            if cat not in cats:
+                continue
+            org = wholesale_for(sim, node, cat)
+            if org is None:
+                continue
+            out[str(org["id"])] = out.get(str(org["id"]), 0) + _goods._capacity(gcfg, cat)
+    sim._b2b_served_cap = out
+    return out
+
+
+def _initial_stock_for(sim, oid: str) -> int:
+    """卸 1 社ぶんの起動時在庫(既定 0 = 現行と完全同一 = キーも生えない)。"""
+    days = int(sim.b2bcfg["initial_stock_days"])
+    if days > 0:
+        return days * int(_served_capacity(sim).get(str(oid), 0))
+    return int(sim.b2bcfg["initial_stock"])
 
 
 def fulfill(sim, node: str, cat: str, qty: int, step: int, sim_min: int) -> bool:
@@ -163,8 +213,10 @@ def fulfill(sim, node: str, cat: str, qty: int, step: int, sim_min: int) -> bool
         return True
     oid = str(org["id"])
     b = _state(sim)
-    if int(sim.b2bcfg["initial_stock"]) and oid not in b["stock"]:
-        b["stock"][oid] = int(sim.b2bcfg["initial_stock"])   # 起動時在庫(遅延初期化)
+    if oid not in b["stock"]:
+        seed = _initial_stock_for(sim, oid)
+        if seed:
+            b["stock"][oid] = int(seed)                # 起動時在庫(遅延初期化)
     have = int(b["stock"].get(oid, 0))
     if have < qty:                                    # 卸在庫不足=仕入れ失敗(欠品波及・翌レビューで再発注)
         return False

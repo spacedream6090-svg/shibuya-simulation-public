@@ -268,7 +268,10 @@ def _companions(sim, agent, cfg: dict, assigned: set,
     def _add(oid, src: str = ""):
         if oid == agent.id or oid in assigned or oid in seen:
             return
-        o = sim.agent_by_id.get(oid)
+        # ★候補は**在場者に限る**(``agent_by_id`` は退場者も返す = 幽霊)。幽霊が
+        #   max_group の枠を食うと、実在の友人が誘われず joint_fulfill_rate が機構的に
+        #   単調低下する(= 観測の汚染)。
+        o = sim.present_agent(oid)
         if o is None or o.visitor:
             return
         out.append(oid)
@@ -396,7 +399,7 @@ def plan_day(sim, step: int, sim_min: int) -> None:
         for cid in cands:
             if len(group) >= max_g:
                 break
-            other = sim.agent_by_id.get(cid)
+            other = sim.present_agent(cid)         # 在場者のみ(_companions で濾過済み・二重の帯)
             age_gap = abs(a_age - int(getattr(other, "age", 0) or 0)) if other else 0
             p_calib = accept_prob(cfg, _tier(sim, a, cid), hier, age_gap)  # S-R4: 階層依存
             gp = _gossip.joint_penalty(sim, a, cid)   # 負の評判(第61 c): 悪評を知る相手は誘いにくい(既定 OFF=0)
@@ -438,7 +441,7 @@ def plan_day(sim, step: int, sim_min: int) -> None:
         tag = cfg["activities"][act]["activity_tag"]
         grp_tier = max((_tier(sim, a, gid) for gid in group[1:]), default=0)
         for gid in group:
-            g = sim.agent_by_id.get(gid)
+            g = sim.present_agent(gid)             # 幽霊に joint_today を書いても hydrate で消える
             if g is not None:
                 g.joint_today = {"poi": poi, "band": band, "activity": act,
                                  "activity_tag": tag, "tier": grp_tier}
@@ -497,15 +500,17 @@ def observe(sim, step: int, sim_min: int) -> None:
         if grp["logged"]:
             continue
         poi = grp["poi"]
+        # ★同席は**在場者だけ**で数える。退場者は脱水時点の古い node を持ったままなので、
+        #   ``agent_by_id`` で引くと「街に居ないのに待ち合わせ場所に居る」幽霊の同席になる。
         present = [gid for gid in grp["members"]
-                   if (o := sim.agent_by_id.get(gid)) is not None and o.node == poi]
+                   if (o := sim.present_agent(gid)) is not None and o.node == poi]
         if len(present) >= 2:
             grp["logged"] = True
             # 第75バッチ(ダンバー認知枠。既定 OFF=即 return=バイト一致): 同席は関係の**維持**
             # 行為=活性関係の last_step を進め、休眠中の相手なら再会させる(relation_rekindle)。
             # 1グループ1日1回のこの地点だけで呼ぶ(毎 step の全ペア走査をしない)。
             _dunbar.touch_group(sim, present, step, sim_min)
-            leader = sim.agent_by_id.get(min(present))
+            leader = sim.present_agent(min(present))
             lx = leader.x if leader is not None else 0.0
             ly = leader.y if leader is not None else 0.0
             sim.logger.log(Event(step=step, sim_min=sim_min,

@@ -211,7 +211,7 @@ def _seed_knowers(sim, target, day: int, contact_days: int) -> list:
         rel = rels[oid]
         last = int(rel.get("last_step", 0))
         if (day - sim.clock.day(last)) <= contact_days:
-            kn = sim.agent_by_id.get(oid)
+            kn = sim.present_agent(oid)            # 街に居ない相手は知る者に含めない(幽霊)
             if kn is not None and not getattr(kn, "visitor", False) and kn.id != target.id:
                 out.append(kn)
     return out
@@ -230,7 +230,9 @@ def _spread_for(sim, L, prev_day: int, thr: int, step: int, sim_min: int, st: di
     if not contacts:
         return
     for oid in contacts:
-        src = sim.agent_by_id.get(oid)
+        # ★伝播源も在場者のみ。退場者の ``_gossip_known`` は脱水時点の古い集合で、
+        #   街に居ない人から「昨日聞いた」ことにはできない。
+        src = sim.present_agent(oid)
         if src is None:
             continue
         src_known = getattr(src, "_gossip_known", None)
@@ -300,12 +302,23 @@ def _roll_day(sim, cfg: dict, day: int, prev_day: int, step: int, sim_min: int) 
     # ---- 忘却(fade): 知る各対象を decay_prob で忘れる。RNG=stream("gossip","fade",..)(seed と独立)----
     if decay_prob > 0.0:
         for a in sim.agents:                        # id 昇順=決定論
+            # ---- レーン乙 F3: 「不在中は忘れない」バイアスを塞ぐ ----------------------
+            # 忘却は日境界の Bernoulli 1 回。プール回転で街を出ていた個体はその日境界を
+            # 一度も通らないので、悪評の生存確率が (1-p)^在場日数 になっていた(正しくは
+            # (1-p)^経過日数)。またいだ本数 n を個体側の印から数え、**1 回の draw の
+            # 閾値**を 1-(1-p)^n に上げる。★draw の本数は 1 本も増減しない = 消費列不変。
+            # ★毎日在場(既定プロファイル)では n=1 = 閾値も decay_prob そのもの
+            #   = 浮動小数のビットまで同一(下の n<=1 分岐)。
+            last_tick = int(getattr(a, "_gossip_fade_day", -1))
+            n = 1 if last_tick < 0 else max(1, int(day) - last_tick)
+            a._gossip_fade_day = int(day)
             known = getattr(a, "_gossip_known", None)
             if not known:
                 continue
+            p_eff = decay_prob if n <= 1 else 1.0 - (1.0 - decay_prob) ** n
             rng = sim.hub.stream("gossip", "fade", int(a.id), int(step))
             for t in sorted(known):                 # sorted=pickle の dict 反復順非保存に非依存
-                if rng.random() < decay_prob:
+                if rng.random() < p_eff:
                     del known[t]
                     st["fade"] += 1
                     logger.log(Event(step=step, sim_min=sim_min, agent_id=a.id,

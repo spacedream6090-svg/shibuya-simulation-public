@@ -371,6 +371,32 @@ FEATURES: tuple[Feature, ...] = (
        "来街者が帰宅から戻るたび手持ちを補充(長期ランの恒久破綻対策)"),
     _f("economy.accounts.enabled", "strict", False, "none",
        "口座(銀行)概念。月給・家賃引落・カード/現金・ATM・立退き/破産サイクル"),
+    # ---- 賃金多様性 WAGE(第112バッチ 2026-08-13。ユーザー要求)----
+    # strict の根拠: 金額・支給形態・給料日・賞与のすべてが (台帳, 安定キー) の blake2b 純関数で、
+    #   **乱数 stream を 1 本も引かない**。LLM の自由文は 1 バイトも読まない。
+    # affects_k=False: generate() の呼び出しサイトを 1 つも足さず・減らさず、プロンプトの節も
+    #   1 つも増やさない(賃金額は観測層と会計にしか現れない)。
+    # fingerprint_risk=none: プロンプトを 1 バイトも変えない。所持金は元々世界の観測量で、
+    #   ON/OFF の別が当人に見える経路は存在しない。
+    _f("economy.wage_profile.enabled", "strict", False, "none",
+       "L2(域内従業者 224,240 人のうち 198,264 人)の本業日給が構造的に 0 円だった穴を塞ぐ。"
+       "月額 = 産業(14種)× 職種群 × 規模帯(8区分)× 個体差(±15%・安定ハッシュ)で決め、"
+       "日額 = 月額/所定労働日数 を既存 agent.wage に載せ替える。支給は新設の日次清算フェーズが"
+       "唯一の点になり(_settle_work の建物退館依存を外す=路面の職場・夜勤でも賃金が出る)、"
+       "月給者は給料日にまとめ・日給者は働いた日に受け取る。給料日は職場ごとに "
+       "{10,15,20,25,月末} へ分散(25 日が最頻)。不在中に過ぎた給料日は再来街時に遡って支給。"
+       "既定 OFF はプランを 1 つも作らず支給点も勤務日カウントも通らない(ゴールデン L1 バイト一致)"),
+    _f("economy.wage_profile.calendar", "strict", False, "none",
+       "給料日・賞与月を**実暦**(world.calendar の日付)で判定する。false は口座 E5 と同じ"
+       "「run 開始日=1日」の 30 日周期。★実暦にしないと block_day%30+1 では 8/16 開始・"
+       "10 日ランで 25 日に永遠に到達せず、月給者が 1 円も受け取れない(第111 で発見した既存バグ"
+       "と同型)。既存 _phase_accounts_day の式は 1 バイトも触らずこの新経路の中だけで切り替える"),
+    _f("economy.wage_profile.bonus.enabled", "strict", False, "none",
+       "賞与(夏 6-7月 / 冬 12月)。支給する職場の割合も支給月数も**規模帯**で決まる"
+       "(毎月勤労統計の実態)。支給日は給料日と重ならない日を選ぶ(同一 step に賃金を 2 本"
+       "重ねない=源泉税の帰属突合が壊れない)。★本選の窓 8/16-8/26 では発火しない(8月に"
+       "賞与は出ない=現実どおり)。機構とテストだけ本番投入可能にしておく"),
+
     # ---- IF-E2 案B: org の会計主体化 + rest-of-world(設計 src/society/economy_sfc.py /
     # docs/research/ifE2-org-accounting-research.md §4-3)----
     # strict の根拠: 初期残高(配属者の日給合計 × month_days × σ)も受け手解決(台帳の静的索引)も
@@ -396,6 +422,13 @@ FEATURES: tuple[Feature, ...] = (
        "全 org の 36.5%・従業者の 51.5%)へ、既存 revenue_est(日給×revenue_margin)を"
        "**RoW からの輸出代金**として入金する(式も発火点も 1 つも変えず相手方だけ void→RoW へ)。"
        "地域会計で標準の扱い(観光サテライト勘定の逆向き)。false=輸出なし=当座借越へ沈む"),
+    _f("economy.org_accounting.seed_from_pool_roster", "strict", False, "none",
+       "org の期首預金を **day0 在場者**でなく **束ねられた名簿全体**(record に org_id を持つ"
+       "全ペルソナ)の日給合計から与える(レーン乙 D1)。pool ON では在場 cap が名簿の 1/4 なので、"
+       "現行は『たまたま初日に街に居た人数』が会社の運転資金を決めており、期首から構造的に過少で"
+       "初日の給与支払いで当座借越に落ちる org が出る。日給は economy.wage_plan(record と pid だけの"
+       "純関数)で在場個体に付く agent.wage と同値。走査はシャードのストリーム読み 1 周・乱数ゼロ。"
+       "pool OFF では母集団が一致するので値は変わらない"),
     _f("economy.org_accounting.sidecar", "strict", False, "none",
        "部門別残高の日次サイドカー finance.parquet(org/bank/VC/行政/供託/家計/RoW)を書く。"
        "analyze_accounting.py の検査①が org・銀行・行政・RoW でも成立するための観測点。"
@@ -1215,6 +1248,18 @@ FEATURES: tuple[Feature, ...] = (
     _f("observer.state_hash.enabled", "strict", False, "none",
        "各 step の world state を正準シリアライズ→sha256→前 step と連鎖させて "
        "state_hash.jsonl に書く(記録専用・シムは読まない・T1/T6 の判定装置)"),
+    # ---- A13 日次入場者名簿サイドカー(レーン丙 2026-08-13)----
+    # strict の根拠: 観測側だけで閉じる追記(sim.agents の既存属性を読むだけ)。
+    # affects_k=False: generate() の呼び出し点を 1 つも足さない。
+    # fingerprint_risk=none: プロンプトを 1 バイトも変えない(当人から観測できる差分ゼロ)。
+    _f("observer.roster_daily.enabled", "strict", False, "none",
+       "日境界に「まだ名簿に載せていない在場者」を roster.parquet へ 1 行ずつ追記する"
+       "(A13)。traits.json は day0 の在場者・agents.json はその瞬間の在場者しか写さないため、"
+       "プール回転で day1 以降に入場する個体(finals 構成で 20.9 万人)の素性がどこにも残らず、"
+       "事後解析(measure の R² 回帰・deviation・復元実験)の分母から丸ごと落ちていた。"
+       "1 個体は生涯 1 行(入場した日)= 再来街で 2 行目は作らない。trait 名はコードに書かず"
+       "traits_json の 1 列に丸ごと入れる(no-fingerprint 契約)。既定 OFF ではオブジェクトを"
+       "作らず 1 ファイルも書かない。★規模: 在場25万×10日で約46万行 = +100MB 前後"),
 
     # ---- ablate(第78バッチ: アブレーション 4 種。対照条件のスイッチだけ)----
     # 全て既定 OFF。repro_tier=strict の根拠は「機構を**外す**方向の決定論ゲート」で
@@ -1444,6 +1489,14 @@ FEATURES: tuple[Feature, ...] = (
        "家族の夕食共食"),
     _f("household.cohabit.enabled", "strict", False, "none",
        "同棲=世帯の物理再編"),
+    _f("household.pool_bind.enabled", "strict", False, "none",
+       "世帯を **pool 名簿の決定論的な分割**として持ち、入場のたびに冪等に着席させる"
+       "(レーン乙 ブロック3)。build_households は起動時 1 回しか走らないため、プール回転で"
+       "day1 以降に入場する個体は世帯を永久に持てず、housemates/household_id が退避にも"
+       "載っていなかったので『同居しているという事実』が回転のたびに壊れていた。"
+       "ON では住居も世帯 id から決定論で決まる(メンバは在場日が違っても同じ家に住む)。"
+       "乱数 stream は 1 本も引かない(全て安定ハッシュ・run.seed 非依存)。"
+       "既定 OFF=1 行も通らない=home 割当も属性も完全に不変"),
     _f("housing.relocation.enabled", "strict", False, "none",
        "内生的な転居(構造固着を運営者介入なしに動かす)"),
 

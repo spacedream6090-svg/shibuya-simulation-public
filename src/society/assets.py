@@ -152,6 +152,10 @@ R1 ドクトリン
    ``summary.assets.heirs_absent`` に**必ず載せる**(縦煙の実測: 300 体・在場のみの構成で
    死 3 件のうち 2 件が absent=1 で国庫行き)。受け皿を広げるには pool の再入場と
    相続を結ぶ必要があり、それは pool レーンの設計判断なのでここでは踏み込まない。
+   ★レーン甲(2026-08-13): この「居ない」の**判定そのものが壊れていた**。``agent_by_id`` は
+   退場者を消さない索引なので ``get() is None`` は決して真にならず、実際には**不在の相続人の
+   幽霊オブジェクトへ残高を書いていた**(hydrate で捨てられ、故人の側だけ 0 になる = 現金消失)。
+   いまは ``sim.present_agent``(在場述語)で解決するので、上の記述が初めて実装と一致する。
 """
 from __future__ import annotations
 
@@ -409,6 +413,12 @@ def _state(sim) -> dict:
             "stock0": {},
             "born": {},
             "k5": {},
+            # ★境界流入(A12)= プール回転で**街に入ってきた既存資産**の累積。
+            #   「後日判明した初期条件」として stock0 に足すと保存則の右辺が走行中に動く
+            #   (= 検査が「あとから辻褄を合わせる装置」に堕ちる)ので、恒等式の**流入側**に
+            #   独立の項として立てる(analyze_accounting の rot_in / rot_out と同型の帳尻項)。
+            "rot_in": {},
+            "veh_day": 0,             # 車両の日次追随を最後に走らせた day(冪等ガード)
             "transfers": {},
             "unclassified": {},
             "alloc": {},              # 初期配賦の所有者内訳(resident / org / row)
@@ -517,29 +527,39 @@ def transfer(sim, asset_id: str, to_party: str, kind: str, step: int,
 # 資産保存則(貨幣保存則 IF-E の完全な双対)
 # --------------------------------------------------------------------------- #
 def conservation(sim) -> dict:
-    """カテゴリ別 Σ 検査 ``Σ(所有者別保有数) + K5 累積 − RoW 生成累積 = 初期ストック``。
+    """カテゴリ別 Σ 検査 ``Σ(所有者別保有数) + K5 累積 − RoW 生成累積 − 境界流入 = 初期ストック``。
 
-    戻り値 ``{cat: {"live", "born", "k5", "stock0", "residual"}}``。``residual`` が 0 でない
-    カテゴリは「無から生まれた資産」か「行方不明の資産」がある(= 台帳を通さない書き込みが
-    どこかに在る)。``economy_sfc.total_money`` と同じ「閉じた不変量」の作法。
+    戻り値 ``{cat: {"live", "born", "k5", "rot_in", "stock0", "residual"}}``。``residual`` が
+    0 でないカテゴリは「無から生まれた資産」か「行方不明の資産」がある(= 台帳を通さない
+    書き込みがどこかに在る)。``economy_sfc.total_money`` と同じ「閉じた不変量」の作法。
+
+    ★``rot_in``(境界流入 = A12)は SNA 2008 の資産変動三分法のうち**境界フロー**にあたる。
+      プール回転で day1 以降に街へ入ってきた個体の車両は「初期ストックの数え漏れ」ではなく
+      **域外から域内へ入ってきた実在の資産**なので、``stock0`` を後から書き足すのではなく
+      恒等式の流入側に立てる(そうしないと保存則の右辺が走行中に動き、検査が「あとから
+      辻褄を合わせる装置」になる)。``born``(製造・輸入 = O2)とは別項に分けてあるので、
+      「回転で入ってきた」のか「街の中で作られた」のかが事後に必ず区別できる。
     """
     st = state_of(sim)
     out: dict = {}
     if st is None:
         return out
+    rot = st.get("rot_in") or {}                   # 旧 checkpoint 互換(キー欠落は 0 扱い)
     live: dict[str, int] = {}
     for holds in st["by_owner"].values():          # ★**所有者別**に数える(台帳の左辺そのもの)
         for aid in holds:
             rec = st["assets"].get(aid)
             if rec is not None:
                 live[rec["cat"]] = live.get(rec["cat"], 0) + 1
-    for cat in sorted(set(live) | set(st["stock0"]) | set(st["born"]) | set(st["k5"])):
+    for cat in sorted(set(live) | set(st["stock0"]) | set(st["born"]) | set(st["k5"])
+                      | set(rot)):
         n = int(live.get(cat, 0))
         born = int(st["born"].get(cat, 0))
         k5 = int(st["k5"].get(cat, 0))
+        rin = int(rot.get(cat, 0))
         s0 = int(st["stock0"].get(cat, 0))
-        out[cat] = {"live": n, "born": born, "k5": k5, "stock0": s0,
-                    "residual": n + k5 - born - s0}
+        out[cat] = {"live": n, "born": born, "k5": k5, "rot_in": rin, "stock0": s0,
+                    "residual": n + k5 - born - rin - s0}
     return out
 
 
@@ -691,25 +711,64 @@ def _alloc_dwellings(sim, cfg: dict, st: dict, rng, step: int) -> None:
             _bump(st["alloc"], label)
 
 
-def _alloc_vehicles(sim, cfg: dict, st: dict, step: int) -> None:
-    """車両の初期配賦 = ``has_car`` の**個体昇格**(bool タグ → 台帳の行)。乱数ゼロ。
+def _alloc_vehicles(sim, cfg: dict, st: dict, step: int, *, inflow: bool = False) -> int:
+    """車両の登記 = ``has_car`` の**個体昇格**(bool タグ → 台帳の行)。乱数ゼロ・冪等。
 
     ``has_car`` は既にペルソナ生成時に決まっている(= 抽選済み)ので、ここで引き直すと
     同じ事実を 2 回抽選することになる。所有者は必ず本人(車の所有者が世界に居ないという
     穴は最初から無い)。
+
+    ``inflow=False``(:func:`arm` からの初期配賦)= 登記した行はそのまま ``stock0`` に入る。
+    ``inflow=True``(:func:`_follow_vehicles` からの日次追随)= **境界流入**として
+    ``rot_in`` に計上する(:func:`conservation` の docstring)。戻り値 = 登記した行数。
     """
     cap = int(cfg["max_assets"])
+    n = 0
     for a in sim.agents:                           # id 昇順 = 決定論
         if not bool(getattr(a, "has_car", False)) or bool(getattr(a, "dead", False)):
             continue
+        aid = vehicle_id(a.id)
+        if aid in st["assets"]:
+            continue                               # 既に登記済み(再来街・二度目の走査)= 冪等
         if len(st["assets"]) >= cap:
             st["capped"] = True
-            return
-        _register(st, vehicle_id(a.id), VEHICLE, agent_party(a.id), step,
+            return n
+        _register(st, aid, VEHICLE, agent_party(a.id), step,
                   {"building": "", "floor": 0,
                    "node": str(getattr(a, "home_node", "") or ""),
                    "x": float(getattr(a, "x", 0.0)), "y": float(getattr(a, "y", 0.0)),
                    "agent": int(a.id)})
+        if inflow:
+            _bump(st.setdefault("rot_in", {}), VEHICLE)
+        n += 1
+    return n
+
+
+def _follow_vehicles(sim, cfg: dict, st: dict, step: int, sim_min: int) -> int:
+    """A12 車両資産の**日次追随**(日境界に 1 回・乱数ゼロ・冪等・登記済みはスキップ)。
+
+    なぜ要るか(現物の穴): :func:`_alloc_vehicles` は :func:`arm` からしか呼ばれず、
+    登記されるのは **day0 の在場者の車だけ**である。プール回転で day1 以降に入場する個体
+    (finals 構成で 20.9 万人)の ``has_car`` は永久に bool タグのままで、台帳にも
+    ``holder_gini`` にも所有ネットワークにも 1 行も現れない = 資産分布が day0 在場者という
+    「たまたま初日に街に居た人」の標本に痩せていた。
+
+    なぜ ``stock0`` に足さないか: ``stock0`` は保存則の**右辺**(初期ストック)である。
+    後から登記した行をそこへ入れると右辺が走行中に動き、Σ 残差 0 は「常に辻褄が合う」
+    という無内容な恒等式になる。ここでは流入側の独立項 ``rot_in`` に計上するので、
+    保存則は ``live + k5 − born − rot_in = stock0`` の強い形のまま生き残る
+    (``city_ops._ensure_bound`` の日次追随と同型 = 枠方式・乱数ゼロ・L1 増ゼロ)。
+
+    既定プロファイル(pool OFF)では day1 以降に新規入場が無いので、走査しても登記は
+    1 行も増えない = **バイト不変**。
+    """
+    if not cfg["vehicles"] or not st["init"]:
+        return 0
+    day = int(sim_min) // 1440
+    if int(st.get("veh_day", 0)) == day:
+        return 0                                   # 同一日に 2 度走らない(冪等ガード)
+    st["veh_day"] = day
+    return _alloc_vehicles(sim, cfg, st, int(step), inflow=True)
 
 
 def arm(sim, step: int, sim_min: int) -> None:
@@ -767,19 +826,28 @@ def _heirs(sim, agent) -> tuple[list, int]:
     ★``household.enabled=false`` の世界では ``housemates`` が空なので相続人は 0 人になる
       (= 世帯という受け皿が世界に無い)。そのとき遺産は国庫へ出る(:func:`_escheat`)。
       「世帯が無いから相続が起きない」ことを隠さないのが本実装の立場。
-    ★プール回転で**いま街に居ない**世帯員は ``sim.agent_by_id`` に居ないので相続人に数えられない
-      (退場中の個体は脱水されていて残高を書けない)。黙って落とすと「配偶者が居るのに国庫へ
-      行った」が観測から消えるので、その人数を第 2 戻り値として返し L1 の ``absent`` に載せる。
+    ★プール回転で**いま街に居ない**世帯員は相続人に数えられない(退場中の個体は脱水されて
+      いて残高を書けない)。黙って落とすと「配偶者が居るのに国庫へ行った」が観測から消えるので、
+      その人数を第 2 戻り値として返し L1 の ``absent`` に載せる。
+    ★★レーン甲(2026-08-13)の訂正: 以前ここは ``sim.agent_by_id.get(hid) is None`` を
+      「街に居ない」の判定に使っていたが、``agent_by_id`` は**これまで実体化した全個体**の索引で
+      退場者を消さない = **None は決して返らない**。つまり不在の相続人へ ``money +=`` を書いて
+      いて、その書き込みは次の hydrate(退場時スナップショット)で捨てられ、故人の残高だけが
+      0 になっていた = **現金が世界から消える**。判定は ``sim.present_agent``(在場述語)で行う。
     """
     out = []
+    absent = 0
     mates = sorted({int(i) for i in (getattr(agent, "housemates", None) or ())
                     if int(i) != int(agent.id)})
     for hid in mates:
-        h = sim.agent_by_id.get(hid)
-        if h is None or bool(getattr(h, "dead", False)):
+        h = sim.present_agent(hid)
+        if h is None:                              # プール回転で街に居ない = 手が届かない
+            absent += 1
+            continue
+        if bool(getattr(h, "dead", False)):        # 故人は相続人にならない(absent とは別)
             continue
         out.append(h)
-    return out, len(mates) - len(out)
+    return out, absent
 
 
 def _cash_of(agent) -> tuple[float, float]:
@@ -909,10 +977,14 @@ def phase(sim, step: int, sim_min: int) -> None:
     if not enabled(sim):
         return
     st = _state(sim)
+    cfg = cfg_of(sim)
+    # A12: 車両資産の日次追随(日境界の 1 回だけ・登記済みはスキップ・L1 を 1 件も出さない)。
+    # ★``_new_events`` の**前**に置く: watermark は「新しい L1 を 1 度だけ見る」ための
+    #   カウンタなので、途中 return する経路の後ろに置くと日次追随が飛ぶ日が出る。
+    _follow_vehicles(sim, cfg, st, int(step), int(sim_min))
     events = _new_events(sim)
     if not events:
         return
-    cfg = cfg_of(sim)
     budget = int(cfg["max_events_per_step"])
     heired = set(st["heired"])
     for e in events:
@@ -920,7 +992,10 @@ def phase(sim, step: int, sim_min: int) -> None:
             break
         if e.kind not in _WATCH_KINDS:
             continue
-        agent = sim.agent_by_id.get(int(e.agent_id))
+        # ★当事者(故人 / 転居者)も**在場者に限る**。退場者の幽霊で相続を回すと、故人側の
+        #   ``money = 0`` が hydrate で捨てられる一方で相続人には着金する = **現金が湧く**。
+        #   居ない回は何もしない(遺産は退避 record に凍ったまま = 総額は保存される)。
+        agent = sim.present_agent(int(e.agent_id))
         if agent is None:
             continue
         if e.kind == "death":
@@ -985,7 +1060,8 @@ def provenance(sim) -> dict | None:
                  "org_landlord_share": float(cfg["org_landlord_share"])}
     st = state_of(sim)
     if st is None:                                 # ON だが arm 前(1 行も登記していない)
-        out.update({"n_assets": 0, "stock0": {}, "alloc": {}, "conservation": {},
+        out.update({"n_assets": 0, "stock0": {}, "rot_in": {}, "alloc": {},
+                    "conservation": {},
                     "transfers": {}, "unclassified": {}, "org_source": "none",
                     "n_landlord_orgs": 0, "by_party_kind": {}, "holder_gini": 0.0,
                     "deaths": 0, "heirs_absent": 0,
@@ -1000,6 +1076,9 @@ def provenance(sim) -> dict | None:
     out.update({
         "n_assets": len(st["assets"]),
         "stock0": {k: int(v) for k, v in sorted(st["stock0"].items())},
+        # ★境界流入(A12)= プール回転で街に入ってきた既存資産の累積。0 でないランは
+        #   「初期ストックだけでは資産分布が痩せていた」ことの実測そのもの。
+        "rot_in": {k: int(v) for k, v in sorted((st.get("rot_in") or {}).items())},
         "alloc": {k: int(v) for k, v in sorted(st["alloc"].items())},
         "conservation": conservation(sim),
         "transfers": {k: int(v) for k, v in sorted(st["transfers"].items())},
@@ -1062,6 +1141,12 @@ def dump(sim) -> None:
                          "node": str(rec.get("node", ""))})
     payload = {"schema": SCHEMA, "n_rows": len(rows),
                "stock0": {k: int(v) for k, v in sorted(st["stock0"].items())},
+               # ★保存則の 3 つの帳尻項を**サイドカーにも**載せる: 解析側
+               #   (scripts/analyze_assets.py)がシム側の申告を見ずに残差を数え直せるように
+               #   するため。これが無いと A12(境界流入)のあるランで解析だけが FAIL になる。
+               "born": {k: int(v) for k, v in sorted(st["born"].items())},
+               "k5": {k: int(v) for k, v in sorted(st["k5"].items())},
+               "rot_in": {k: int(v) for k, v in sorted((st.get("rot_in") or {}).items())},
                "conservation": conservation(sim),
                "landlords": list(st["landlords"]),
                "org_source": str(st["org_source"]),

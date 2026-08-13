@@ -192,7 +192,8 @@ _MED_FIELDS = (("med_admitted", bool, False), ("med_transport_until", int, -1),
                ("med_crew", int, -1), ("med_confirmed", int, -1),
                ("med_node", str, ""), ("med_poi", str, ""),
                ("med_dest_node", str, ""), ("med_dest_poi", str, ""),
-               ("med_dest_building", str, ""), ("med_from_node", str, ""))
+               ("med_dest_building", str, ""), ("med_from_node", str, ""),
+               ("med_last_tick", int, -1))
 
 #: H4 酩酊の印(減衰する ttl)。**`society.incidents_interpersonal.INTOX_KEY` と同一**。
 #  当該 module が「正直な限界 4: プール退場で酩酊の印を失う」と自己申告していたもの。
@@ -223,6 +224,139 @@ _BELONGINGS_KEY = "_goods_belongings"
 #  起点は ontology 群の決定論値なので、運ばないと再来街で「学習前」に戻る
 #  (``theta_drift`` を運んでいるのと同じ理由。属性が在るときだけ運ぶ = OFF は無風)。
 _CTRL_KEY = "controllability"
+
+
+#: 家計の月次会計(口座 E5)+ 賃金多様性 WAGE の未清算実績。
+#  ★これらはどれも「① 個体固有 ② 日を跨いで持続 ③ 金の受け取りを変える」を満たすのに
+#    1 つも退避辞書に載っていなかった = **プール回転のたびに毎回 0 へ戻っていた**。
+#    その結果、月給・家賃・滞納・立退き・破産のどれも「回転する層(= 在場者の大半)」では
+#    原理的に成立しなかった(月給の元になる勤務日数が翌日には消えるため)。
+#  ★口座 OFF / WAGE OFF のランでは全欄が既定値なので**キーが 1 つも足されない**
+#    (tests/test_pool_rotation.py の dict 等値がそのまま守られる)。
+_ECON_FIELDS = (("period_income", float, 0.0), ("work_days", int, 0),
+                ("rent_due", float, 0.0), ("arrears_days", int, 0),
+                ("last_salary", float, 0.0), ("evicted", bool, False),
+                ("bankrupt_until", int, 0),
+                # WAGE(第112): 未清算の勤務実績・最後に清算した日・持ち越した賞与。
+                # ★プラン本体(`_wage_plan`)は運ばない —— 再来街時に台帳と安定ハッシュから
+                #   同じものが**決定論で組み直される**ので、運ぶと二重の真実源になる。
+                ("wp_days", int, 0), ("wp_settled_day", int, -1),
+                ("wp_bonus_pending", bool, False))
+
+
+# ---- レーン乙(第113): 搬送族の**第2弾**(B クラス)-----------------------------------
+# 判定基準は D1 と同じ 3 つ(① 個体固有 ② 日を跨いで持続 ③ 行動 or L1 の発火可否を変える)。
+# 設計も同じ「**非既定値のときだけキーを足す**」= 当該機構 OFF のランでは退避 dict が
+# 1 バイトも変わらない(tests/test_pool_rotation.py の dict 等値がそのまま守られる)。
+
+#: 単純スカラーで運べる族。既定値は「その属性を持たない個体で getattr が返す値」と
+#  厳密に一致させる(でないと機構 OFF のランでキーが生えて既存の dict 等値が割れる)。
+_MISC_FIELDS = (
+    # 退屈ゲージ(cognition/drive.py が日々育てる探索の駆動源)。
+    ("_boredom", float, 0.0),
+    # 勾留(制度深化2)。運ばないと回転で即釈放される。
+    ("detained_until", int, 0),
+    # 宿泊 Wave L。★連泊数を運ばないと「checkin だけ増えて checkout が出ない」
+    #   単調乖離になり、max_nights の上限も回転のたびに 0 へ戻る。
+    ("lodging_nights", int, 0), ("lodging_node", str, ""), ("lodging_poi", str, ""),
+    # 出動中の印(救急 / 設備 / 消防)。運ばないと「出動したまま帰署しない」担い手が出る。
+    # ★既定値は各 module の getattr 既定(-1 / "")と同一。
+    ("city_ops_ems_until", int, -1), ("city_ops_ems_home", str, ""),
+    ("facility_call_until", int, -1), ("facility_call_home", str, ""),
+    ("incenv_fire_until", int, -1), ("incenv_fire_home", str, ""),
+    # 多様性 H5(観光客型 / 非日本語話者)。起動時 1 回の配布なので運ばないと再来街で消える。
+    ("tourist", bool, False), ("language", str, ""),
+    # 内面 inner_life の長期目標(趣味は list なので下の専用経路)。
+    ("life_goal", str, ""),
+    # 世界観 C2 の予測誤差の累計(wv_expect と対で意味を持つ)。
+    ("_wv_err_sum", float, 0.0), ("_wv_err_n", int, 0),
+    # ★レーン乙 ブロック6(不在中に時間が進まないバイアス)の**要**: 日境界の減衰/忘却を
+    #   最後に適用した日。これを運ばないと帰街のたびに「経過 0 日」へ戻り、街を出るだけで
+    #   関係も評判も悪評も一切風化しない個体ができる(= 居続けた個体より有利)。
+    ("_rel_decay_day", int, -1), ("_gossip_fade_day", int, -1),
+)
+
+#: 世帯(H2)。★レーン乙 ブロック3: 世帯の静的部分は pool record から決定論で組み直すが、
+#  **動的に生じた変化**(同棲 merge / 別離 split / partner 形成)は record に無いので運ぶ。
+#  partner_id / housemates は None・list なので下の専用経路で扱う。
+_HH_FIELDS = (("household_id", str, ""), ("household_kind", str, ""),
+              ("household_role", str, ""),
+              # ★「世帯を抜けた」印(mobility._split_household)。これが無いと、分離した個体が
+              #   再来街のたびに名簿由来の世帯へ座り直されて**別離が忘れられる**
+              #   (household_id=None は「元から単身」と区別がつかないため)。
+              ("_hh_detached", bool, False),
+              # ★「シミュレーション中に実際に引っ越した」印(mobility._set_home)。
+              #   立っている個体だけ home を運ぶ(下の _HOME_FIELDS)。
+              ("_home_moved", bool, False))
+
+#: 転居後の住居。**``_home_moved`` が立っているときだけ**運ぶ(それ以外の個体の home は
+#  名簿 + 世帯から決定論で組み直されるので運ぶと二重の真実源になる = dehydrate 冒頭の
+#  「静的なペルソナ属性は保存しない」規約と整合する)。
+_HOME_FIELDS = (("home_building", str, ""), ("home_node", str, ""),
+                ("home_floor", int, 1))
+
+_VISITS_KEY = "visits"            # EPR preferential return(node -> 訪問回数)
+_SELF_DEV_KEY = "self_dev"        # T4 自助努力(skill/fitness の累積ストック)
+_SCHEDULE_KEY = "schedule"        # 14 日先まで持てる約束帳
+_HOBBIES_KEY = "hobbies"          # inner_life の趣味(list[str])
+_DIALOG_KEY = "_dialog_hist"      # 相手別リングバッファ(挿入順 = LRU の意味を持つ)
+_TL_PENDING_KEY = "_tl_pending"   # 真偽台帳の検証待ち(★truth_ledger.py は凍結=不触)
+_WV_EXPECT_KEY = "wv_expect"      # 世界観 C2 の混雑予測 {(place, band): 期待値}
+_HOUSEMATES_KEY = "housemates"
+_PARTNER_KEY = "partner_id"
+
+
+def _plast_slim(agent) -> dict | None:
+    """可塑性(g_update)の学習状態を丸ごと 1 つの nested dict へ(OFF は None=キー無し)。
+
+    ★なぜ「非既定値の欄だけ」ではなく丸ごとか: ``plasticity.ensure`` は
+      ``_fire_g is not None`` で早期 return するので、g を復元すると **eta/lam/g0/θ倍率が
+      二度と作り直されない**。欄ごとに既定値で間引くと、たまたま既定と等しくなった欄だけが
+      復元されずに素の値へ落ちる。族としては「g_update ON で ensure を通った個体」か
+      「そうでないか」の 2 値しかないので、``_fire_g`` の有無を唯一の門にして丸ごと運ぶ。
+    ★``ensure`` が早期 return して ``hub.stream(NOISE_STREAM, id)`` を引かなくなるが、
+      ``RngHub.stream`` は呼ぶたびに**新しい Generator を派生する**(共有状態を持たない)
+      ので、引かないことで他の draw 列が 1 粒も動かない。
+    """
+    g = getattr(agent, "_fire_g", None)
+    if not g:
+        return None
+
+    def _d(name):
+        return {str(k): float(v) for k, v in (getattr(agent, name, None) or {}).items()}
+
+    return {
+        "g": _d("_fire_g"), "g0": _d("_fire_g0"), "g_init": _d("_fire_g_init"),
+        "ebar": _d("_fire_ebar"), "credit": _d("_fire_credit"),
+        "pending": [{"at": int(r["at"]), "base": float(r["base"]),
+                     "shares": {str(k): float(v) for k, v in r["shares"].items()}}
+                    for r in (getattr(agent, "_fire_pending", None) or [])],
+        "eta": float(getattr(agent, "_fire_eta", 0.0)),
+        "lam": float(getattr(agent, "_fire_lam", 0.0)),
+        "theta_m": float(getattr(agent, "_fire_theta_m", 1.0)),
+        "day_n": int(getattr(agent, "_fire_day_n", 0)),
+        "fbar": float(getattr(agent, "_fire_fbar", 0.0)),
+    }
+
+
+def _plast_apply(agent, st: dict) -> None:
+    """可塑性の学習状態を戻す(チャンネル位置 idx を int へ復号)。"""
+    def _d(key):
+        return {int(k): float(v) for k, v in (st.get(key) or {}).items()}
+
+    agent._fire_g = _d("g")
+    agent._fire_g0 = _d("g0")
+    agent._fire_g_init = _d("g_init")
+    agent._fire_ebar = _d("ebar")
+    agent._fire_credit = _d("credit")
+    agent._fire_pending = [{"at": int(r["at"]), "base": float(r["base"]),
+                            "shares": {int(k): float(v) for k, v in r["shares"].items()}}
+                           for r in (st.get("pending") or [])]
+    agent._fire_eta = float(st.get("eta", 0.0))
+    agent._fire_lam = float(st.get("lam", 0.0))
+    agent._fire_theta_m = float(st.get("theta_m", 1.0))
+    agent._fire_day_n = int(st.get("day_n", 0))
+    agent._fire_fbar = float(st.get("fbar", 0.0))
 
 
 def _fields_slim(agent, fields: tuple) -> dict:
@@ -300,8 +434,19 @@ def dehydrate(agent, *, ep_cap: int | None = None, rel_cap: int | None = None) -
     ep_cap = _caps["ep"] if ep_cap is None else int(ep_cap)
     rel_cap = _caps["rel"] if rel_cap is None else int(rel_cap)
     mem = agent.mem
+    # ★レーン乙 A3: 上位 rel_cap 件の切り方。従来は「接触回数 count の多い順、同数は
+    #   相手 id 昇順」だったが、これには 2 つの系統的な偏りがあった:
+    #   (a) friend_graph が注入した辺は **count=1**(会話の実績ではなく初期条件)なので、
+    #       台帳が埋まると**友人関係から先に捨てられる**(親友であるほど落ちやすい)。
+    #   (b) 同数のタイを常に id 昇順で解くので、若い id の相手が系統的に生き残る。
+    #   closeness(= 実際に育った親密度。relations OFF のランでは 1 件も存在しない)を
+    #   第一キーに、最終接触を第三キーに足す。**relations OFF では全員 closeness も
+    #   last_step も持たないので並びは従来と完全に同一**(= 既存ランはバイト一致)。
     rels = sorted(mem.relations.items(),
-                  key=lambda kv: (-int(kv[1].get("count", 0)), kv[0]))[:rel_cap]
+                  key=lambda kv: (-float(kv[1].get("closeness", 0.0) or 0.0),
+                                  -int(kv[1].get("count", 0)),
+                                  -int(kv[1].get("last_step", 0) or 0),
+                                  kv[0]))[:rel_cap]
     state = {
         "beliefs": list(agent.beliefs),
         "day_summaries": list(mem.day_summaries),
@@ -374,6 +519,62 @@ def dehydrate(agent, *, ep_cap: int | None = None, rel_cap: int | None = None) -
     ctrl = getattr(agent, _CTRL_KEY, None)        # C2 可制御性(ontology/worldview ON のみ)
     if ctrl is not None:
         state["controllability"] = float(ctrl)
+    econ = _fields_slim(agent, _ECON_FIELDS)      # 口座 E5 の月次会計 + WAGE の未清算実績
+    if econ:
+        state["econ"] = econ
+    # --- レーン乙(第113) ブロック1: 搬送族の第2弾。上と同じ「非既定のときだけキーを足す」 ---
+    misc = _fields_slim(agent, _MISC_FIELDS)
+    if misc:
+        state["misc"] = misc
+    hh = _fields_slim(agent, _HH_FIELDS)          # 世帯(動的変化ぶん。ブロック3 と対)
+    if hh:
+        state["hh"] = hh
+    if getattr(agent, "_home_moved", False):      # 実際に引っ越した個体だけ home を運ぶ
+        state["home"] = {"home_building": str(getattr(agent, "home_building", "") or ""),
+                         "home_node": str(getattr(agent, "home_node", "") or ""),
+                         "home_floor": int(getattr(agent, "home_floor", 1) or 1)}
+    mates = getattr(agent, _HOUSEMATES_KEY, None)
+    if mates:
+        state["housemates"] = [int(x) for x in mates]
+    partner = getattr(agent, _PARTNER_KEY, None)
+    if partner is not None:
+        state["partner_id"] = int(partner)
+    visits = getattr(agent, _VISITS_KEY, None)    # ★B1 EPR: 「よく行く場所」の唯一の源
+    if visits:
+        # node id は市街地図のノード集合で有界(episodes/relations のような切りは要らない)。
+        state["visits"] = {str(k): int(v) for k, v in visits.items() if int(v)}
+        if not state["visits"]:
+            del state["visits"]
+    self_dev = getattr(agent, _SELF_DEV_KEY, None)             # T4 熟達ストック
+    if self_dev:
+        state["self_dev"] = {str(k): float(v) for k, v in self_dev.items()}
+    sched = getattr(agent, _SCHEDULE_KEY, None)                # 約束帳(14 日先まで)
+    if sched:
+        state["schedule"] = [{"day": int(e["day"]), "when": str(e.get("when", "")),
+                              "what": str(e.get("what", "")),
+                              "place": str(e.get("place", "")),
+                              "with": [int(i) for i in e.get("with", [])],
+                              "src_step": int(e.get("src_step", 0))} for e in sched]
+    hobbies = getattr(agent, _HOBBIES_KEY, None)               # inner_life の趣味
+    if hobbies:
+        state["hobbies"] = [str(x) for x in hobbies]
+    dhist = getattr(agent, _DIALOG_KEY, None)                  # 相手別の直近対話
+    if dhist:
+        # ★dict の**挿入順が LRU の意味**(先頭 = 最古)。list of pairs で順序ごと運ぶ。
+        state["dialog_hist"] = [[int(pid), [[str(n), str(t)] for (n, t) in turns]]
+                                for pid, turns in dhist.items() if turns]
+        if not state["dialog_hist"]:
+            del state["dialog_hist"]
+    pend = getattr(agent, _TL_PENDING_KEY, None)               # 真偽台帳の検証待ち
+    if pend:
+        state["tl_pending"] = {"fact": str(pend["fact"]), "until": int(pend["until"])}
+    wv = getattr(agent, _WV_EXPECT_KEY, None)                  # C2 混雑予測(tuple キー)
+    if wv:
+        # キーは (place_key, band) のタプル = JSON 非安全。3 つ組の list へ正規化する。
+        state["wv_expect"] = [[str(k[0]), int(k[1]), float(v)] for k, v in wv.items()]
+    plast = _plast_slim(agent)                    # 可塑性 g_update の学習状態(OFF は None)
+    if plast:
+        state["plast"] = plast
     # ★**ゾーン所有(_phys_zone と _FIELDS の走行レコード)は意図的に運ばない**。あれは
     #   「いま歩いている経路 agent.route の途中」という**その旅に固有の**状態で、再来街時は
     #   build_pool_agent が別の node / route で個体を組み直すため、復元すると physics._run_zone が
@@ -442,3 +643,61 @@ def hydrate(agent, state: dict) -> None:
     ctrl = state.get("controllability")           # C2 可制御性(キー欠落は許容)
     if ctrl is not None:
         setattr(agent, _CTRL_KEY, float(ctrl))
+    econ = state.get("econ")                      # 口座 E5 の月次会計 + WAGE の未清算実績
+    if econ:
+        _fields_apply(agent, econ, _ECON_FIELDS)
+    # --- レーン乙(第113) ブロック1: 搬送族の第2弾。**キー欠落を許容**(旧 退避辞書 /
+    #     機構 OFF のラン)= その場合は属性を 1 つも生やさない = 現行と完全同一。
+    misc = state.get("misc")
+    if misc:
+        _fields_apply(agent, misc, _MISC_FIELDS)
+    hh = state.get("hh")                          # 世帯(動的変化ぶん)
+    if hh:
+        _fields_apply(agent, hh, _HH_FIELDS)
+        if hh.get("_hh_detached"):
+            # ★入場時の世帯着席(household.bind_pool_household)は hydrate の**前**に走るので、
+            #   分離済みの個体はここで明示的に席を外す(順序に依存しない打ち消し)。
+            agent.household_id = None
+            agent.household_kind = ""
+            agent.household_role = ""
+            agent.housemates = []
+    home = state.get("home")                      # 転居後の住居(_home_moved の個体のみ)
+    if home:
+        _fields_apply(agent, home, _HOME_FIELDS)
+    mates = state.get("housemates")
+    if mates:
+        setattr(agent, _HOUSEMATES_KEY, [int(x) for x in mates])
+    partner = state.get("partner_id")
+    if partner is not None:
+        setattr(agent, _PARTNER_KEY, int(partner))
+    visits = state.get("visits")                  # ★B1 EPR:「いつもの場所」を持ち越す
+    if visits:
+        setattr(agent, _VISITS_KEY, Counter({str(k): int(v) for k, v in visits.items()}))
+    self_dev = state.get("self_dev")
+    if self_dev:
+        setattr(agent, _SELF_DEV_KEY, {str(k): float(v) for k, v in self_dev.items()})
+    sched = state.get("schedule")
+    if sched:
+        setattr(agent, _SCHEDULE_KEY,
+                [{"day": int(e["day"]), "when": str(e.get("when", "")),
+                  "what": str(e.get("what", "")), "place": str(e.get("place", "")),
+                  "with": [int(i) for i in e.get("with", [])],
+                  "src_step": int(e.get("src_step", 0))} for e in sched])
+    hobbies = state.get("hobbies")
+    if hobbies:
+        setattr(agent, _HOBBIES_KEY, [str(x) for x in hobbies])
+    dhist = state.get("dialog_hist")              # 挿入順(LRU)ごと戻す
+    if dhist:
+        setattr(agent, _DIALOG_KEY,
+                {int(pid): [(str(n), str(t)) for (n, t) in turns] for pid, turns in dhist})
+    pend = state.get("tl_pending")
+    if pend:
+        setattr(agent, _TL_PENDING_KEY,
+                {"fact": str(pend["fact"]), "until": int(pend["until"])})
+    wv = state.get("wv_expect")                   # 3 つ組の list → (place, band) キーへ戻す
+    if wv:
+        setattr(agent, _WV_EXPECT_KEY,
+                {(str(p), int(b)): float(v) for (p, b, v) in wv})
+    plast = state.get("plast")                    # 可塑性 g_update の学習状態
+    if plast:
+        _plast_apply(agent, plast)

@@ -258,6 +258,23 @@ def precompute(sim, step: int, sim_min: int) -> None:
                                  payload={"goal": g}))
 
 
+def assign_for_entry(sim, agent) -> None:
+    """1 個体ぶんの長期目標・趣味の付与(入場駆動・冪等・決定論・乱数ゼロ。レーン乙 A11)。
+
+    ★``precompute`` は**起動時 1 回**しか走らないので、プール回転で day1 以降に入場する
+      個体は長期目標も趣味も持たないまま暮らしていた(``_inner_life_init`` の意味を
+      「全員済み」から「入場時に済ませる」へ広げるのが本関数)。
+    ★L1 は 1 件も増やさない: ``precompute`` が出す ``long_goal`` は「起動時セグメント」の
+      構成要素(resume の ``_init_event_mark`` が本数を数えている)で、入場のたびに足すと
+      その契約と ON/OFF のイベント本数の宣言が崩れる。値は pool の退避で運ばれるので、
+      再来街でも同じ目標を持ち続ける。OFF の機構は付与しない(getattr 既定でバイト一致)。"""
+    cfg = cfg_of(sim)
+    if cfg["hobbies"]["enabled"] and not getattr(agent, "hobbies", None):
+        agent.hobbies = hobbies(agent)
+    if cfg["goals"]["enabled"] and not getattr(agent, "life_goal", ""):
+        agent.life_goal = long_goal(agent)
+
+
 # ---------------------------------------------------------------- プロンプト注入(内容のみ=R1 呼数不変)
 def emotion_line(agent, cfg: dict, *, affect_on: bool) -> str | None:
     """発火プロンプト用: 今の離散感情1行(affect ON が前提)。既定 OFF/非該当は None=不変。"""

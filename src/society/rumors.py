@@ -346,7 +346,7 @@ def _initial_knowers(sim, actor, payload: dict, extra_keys) -> list:
     for key in extra_keys:
         oid = payload.get(key)
         if isinstance(oid, int) and oid >= 0 and oid not in seen:
-            other = sim.agent_by_id.get(oid)
+            other = sim.present_agent(oid)         # 街に居ない当事者は目撃者に数えない(幽霊)
             if other is not None:
                 seen[oid] = other
     radius = float(sim.cfg.world.perception_radius_m)

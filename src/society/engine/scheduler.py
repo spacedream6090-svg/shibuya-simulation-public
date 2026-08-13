@@ -345,7 +345,11 @@ def _phase_bank_day(sim, step: int, sim_min: int) -> None:
     bcfg = sim.economy["bank"]
     for aid in sorted(bank.loans):                      # id 昇順=決定論(sorted は snapshot=途中 pop 安全)
         loan = bank.loans[aid]
-        agent = sim.agent_by_id.get(aid)
+        # ★取り立ては**在場者にだけ**行う(``agent_by_id`` は退場者も返す = 幽霊)。退場中の
+        #   個体は脱水済みで、``account -= paid`` を書いても hydrate で捨てられる = 銀行だけが
+        #   受け取って街の総額が湧く。街に居ない間は**猶予**(next_due_day を進めず延滞も刻まない)
+        #   = 翌日以降、再来街したその日に自動で再開する。
+        agent = sim.present_agent(aid)
         if agent is None or not economy_mod.loan_due(loan, day):
             continue
         paid, status = economy_mod.repay_installment(loan, agent.account, day)
@@ -543,13 +547,17 @@ def _log_tax(sim, agent, tax: str, amount: float, to: str, base: float,
         devices_mod.DEV_GOV_TAX)
 
 
-def _withhold_wage(sim, agent, gross: float, step: int, sim_min: int) -> tuple[float, float]:
+def _withhold_wage(sim, agent, gross: float, step: int, sim_min: int,
+                   annual_income: float | None = None) -> tuple[float, float]:
     """賃金の源泉徴収: 所得税(→nation)+住民税(→ward6:metro4)を控除し (手取り, 税合計) を返す。
 
     税は該当予算に歳入計上し、tax イベントで記録。手取り = 名目 − 税(engine 側で口座/現金に入金)。
+    annual_income(既定 None=既存の全呼び出し)は所得税の**年換算の分母**を支給周期に合わせて
+    渡す口(賃金多様性 WAGE)。None のときは従来どおり「日給 × annual_workdays」= バイト一致。
+    住民税は所得割の定率なので年換算に依存しない(掛け率は gross のまま)。
     """
     gov = sim.government
-    it = gov.income_tax(gross)
+    it = gov.income_tax(gross, annual=annual_income)
     rw, rm = gov.resident_tax(gross)
     if it > 0:
         gov.collect("nation", it)
@@ -578,7 +586,8 @@ def _record_consumption_tax(sim, agent, price: float, cat: str,
 
 def _pay_wage(sim, agent, amount: float, step: int, sim_min: int,
               source: str | None = None, fund_level: str | None = None,
-              payer_org: str | None = None) -> None:
+              payer_org: str | None = None,
+              annual_income: float | None = None) -> None:
     """賃金の支給(本業の勤務完遂・バイトのシフト完遂・自営の日銭・月給まとめ・公務員給与)。
 
     source を渡すと payload に載せる(自営の日銭は "gig"、月給は "salary"、公務員は "civil")。
@@ -591,7 +600,10 @@ def _pay_wage(sim, agent, amount: float, step: int, sim_min: int,
     IF-E2 案B(economy.org_accounting。既定 OFF=完全 no-op=payload バイト一致): payer_org を
       渡すと**その org の預金 gross を引き落とす**(不足は自動当座借越)。渡されない/台帳に無い
       ときは rest-of-world(域外の雇用主・域外クライアント)が払う。どちらの場合も payload に
-      支払側を示す payer キーが 1 つ増える(= 個人→会社→個人 の追跡が org_id で繋がる)。"""
+      支払側を示す payer キーが 1 つ増える(= 個人→会社→個人 の追跡が org_id で繋がる)。
+    annual_income(賃金多様性 WAGE。既定 None=既存の全呼び出しはバイト一致): 所得税の年換算を
+      支給周期に合わせる口。月給まとめ・賞与は「その人の年収」を渡す(渡さないと日給前提の
+      ×245 が掛かって最高税率になる)。日給・バイト・日銭は None のままが正しい。"""
     if amount <= 0:
         return
     # T4 自助努力(第52バッチ): 自力累積(skill)の賃金乗数を1箇所だけ適用。全 wage 源(本業/バイト/
@@ -606,7 +618,8 @@ def _pay_wage(sim, agent, amount: float, step: int, sim_min: int,
     if _government_on(sim):
         if fund_level is not None:                     # 公務員給与は予算が出所(歳出)
             sim.government.expense(fund_level, gross)
-        amount, tax_total = _withhold_wage(sim, agent, gross, step, sim_min)  # 手取り
+        amount, tax_total = _withhold_wage(sim, agent, gross, step, sim_min,
+                                           annual_income=annual_income)  # 手取り
     if fund_level is not None:                         # 公務員給与=行政が払う(既に歳出計上済み)
         payer = "government" if sfc_mod.enabled(sim) else None
     else:                                              # IF-E2: org / RoW が払う(既定 OFF=None)
@@ -757,9 +770,15 @@ def _settle_work(sim, agent, step: int, sim_min: int) -> None:
     if delta:
         drive.add(agent, "state_change", sim.drivecfg, scale=abs(delta))
     if _economy_on(sim):
+        # 賃金多様性 WAGE(既定 OFF=`_wage_covered` が常に False=以下は現行と 1 バイトも
+        #   変わらない): プランを持つ被用者の**本業の賃金は日次清算フェーズが唯一の支給点**
+        #   なので、ここでは 1 円も払わず勤務日も積まない(二重支給の禁止)。バイト
+        #   (part_time)の支給は WAGE の対象外なので従来どおり下の経路を通る。
         # 口座 ON(E5): 月給者(本業日給を持つ会社員・店員)は日割り支給をやめ、勤務日数を
         #   積んで給料日にまとめ支給する。バイト・日銭は従来どおり都度(口座へ)入金。
-        if main_done and _accounts_on(sim) and agent.wage > 0:
+        if main_done and _wage_covered(sim, agent):
+            pass
+        elif main_done and _accounts_on(sim) and agent.wage > 0:
             agent.work_days += 1
         else:
             # IF-E2(既定 OFF=引数は無視される): 本業の賃金は配属 org の預金から出る。
@@ -1388,7 +1407,11 @@ def _hear_words(sim, listener, words: list[str], from_id: int, channel: str,
     for w in unknown:
         if w in listener.adopted:                  # このやり取りで採用に至った
             item = sim.labels.text_to_item.get(w)
-            creator = sim.agent_by_id.get(item.creator) if item else None
+            # ★レーン乙 ブロック7: 造語の作者は「任意に古い」= 退場済みである確率が高い。
+            #   ``agent_by_id`` は退場者も保持するので ``is None`` が真にならず、
+            #   factors/drive/評判の更新が捨てられる実体へ書かれ、D9 ablation の
+            #   ``creator.money +=``(下)は **SFC 側の行だけ実在して現金が消える**。
+            creator = sim.present_agent(item.creator) if item else None
             if creator is not None and creator.id != listener.id:
                 delta = factor_update.on_own_adopted(
                     creator, mags=sim.mags, step=step, sim_min=sim_min,
@@ -1487,7 +1510,8 @@ def _record_appointments(sim, speaker, text: str, party_ids: list[int],
                              place_hints=sim.envpackcfg["lexicon"]["place_hints"])
     if not appts:
         return
-    hearers = [sim.agent_by_id[i] for i in party_ids if i in sim.agent_by_id]
+    # ★レーン乙 ブロック7: 在場者だけが予定を書き留められる(不在者への record は捨てられる)。
+    hearers = [h for h in (sim.present_agent(i) for i in party_ids) if h is not None]
     for appt in appts:
         others = sorted(set(party_ids))
         schedule.gc(speaker, day)
@@ -1918,7 +1942,11 @@ def _work_office_output(sim, step: int, sim_min: int, cfg: dict) -> None:
     org_output として1件記録(会社が『何かを作っている』の最小観測形)。決定論・乱数なし・非LLM。
 
     出勤者=work_node がオフィス系(poi_cats)かつ在職(work_start_min>=0)の present 個体。職場単位=
-    work_building(無ければ work_node)。pool ローテーションで present が変われば出勤者数=産出が変わる。"""
+    work_building(無ければ work_node)。pool ローテーションで present が変われば出勤者数=産出が変わる。
+
+    ★在場・生存の規約は ``commerce.occupancy`` / ``delivery`` の ``loc != "outside"`` 方式に
+      統一する(レーン甲 2026-08-13)。以前はここだけ loc も dead も見ておらず、**街の外に居る人**と
+      **死者**が会社の産出に永久に計上され続けていた(死者は sim.agents から消えないため)。"""
     ocfg = cfg["office"]
     if not ocfg["enabled"]:
         return
@@ -1928,6 +1956,8 @@ def _work_office_output(sim, step: int, sim_min: int, cfg: dict) -> None:
     sim._work_day = day
     units: dict[str, list] = {}
     for a in sim.agents:
+        if a.loc == "outside" or getattr(a, "dead", False):
+            continue                               # 街に居ない / 亡くなった人は出勤していない
         wn = getattr(a, "work_node", "")
         if not wn or getattr(a, "work_start_min", -1) < 0:
             continue
@@ -1967,6 +1997,10 @@ def _phase_work_service(sim, step: int, sim_min: int, since_idx: int) -> None:
     cal = getattr(sim, "calendarcfg", None)
     staff_by_node: dict[str, list] = {}
     for a in sim.agents:
+        # ★_work_office_output と同じ規約(commerce.occupancy 方式)。死者・街の外に居る人を
+        #   接客スタッフに数えない(node は死んだ場所のまま残るので職場と一致しうる)。
+        if a.loc == "outside" or getattr(a, "dead", False):
+            continue
         wn = getattr(a, "work_node", "")
         if not wn or a.node != wn:
             continue
@@ -2733,7 +2767,9 @@ def _sns_react(sim, agent, post: dict, kind: str, log_kind: str,
     や不在 id はスキップ。リシェアは "RT @元著者名: 本文" を net が新規投稿として追記し、
     フォロワーへの再配信は既存 timeline 配信+_hear_words("sns")に自動で乗る。
     """
-    author_meta = sim.agent_by_id.get(post["author"])
+    # ★レーン乙 ブロック7: 「メディア/不在はスキップ」を実際に成立させる(在場述語)。
+    #   ``agent_by_id`` では退場した著者にも drive が積まれ、次の hydrate で捨てられる。
+    author_meta = sim.present_agent(post["author"])
     author_name = "公式" if post["author"] == -1 or author_meta is None \
         else author_meta.name
     author = sim.net.react(agent.id, post["id"], kind, step,
@@ -3127,7 +3163,11 @@ def _apply_action(sim, agent, action: dict, step: int, sim_min: int) -> None:
 
     if kind == "dm":                               # 1対1メッセージ
         to = action.get("to")
-        recipient = sim.agent_by_id.get(to) if to is not None else None
+        # ★レーン乙 ブロック7: 在場述語。相手が街を出ていると ``loc``/``sleeping`` は
+        #   脱水時のスナップショットのままなので下の物理述語を素通りし、受信側の
+        #   記憶・関係・drive・覚醒が丸ごと捨てられる(送信側の _contact だけ実在=
+        #   関係台帳が片側だけ育つ)。
+        recipient = sim.present_agent(to) if to is not None else None
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                              kind="dm", x=agent.x, y=agent.y,
                              payload={"to": to, "text": action["text"]}))
@@ -3473,6 +3513,170 @@ def _eviction_bankruptcy_day(sim, agent, acc: dict, step: int, sim_min: int) -> 
         factor_update.on_evicted(agent, float(acc["eviction_grievance"]),
                                  step=step, sim_min=sim_min, logger=sim.logger)
         agent.remember("家賃の滞納で部屋を立ち退かされた", importance_bonus=0.5)
+
+
+# -------------------------------------------------- 賃金多様性 WAGE(第112・既定 OFF)
+# 設計の要点(なぜ既存の 2 経路に足さず、新しい日次清算フェーズを 1 本立てるのか):
+#   ① 既存の支給点 `_settle_work` は **建物からの退館イベント**に吊られている。路面の職場
+#      (work_building 空)・日跨ぎシフトの個体は退館を出さないので、そこに月給を吊ると
+#      構造的に無給のままになる。だから勤務日は「在場 × 勤務窓 × 暦の平日ゲート」という
+#      routine.in_work_window と同基準の決定論カウントで数える。
+#   ② 既存の月給まとめ `_phase_accounts_day` は `if agent.visitor: continue` の内側にある。
+#      これは**家賃・立退き・破産のための門**であって賃金のための門ではない(域外に住む
+#      通勤者にこの街の家賃は発生しないが、給料は出る)。家賃側の門は 1 バイトも触らず、
+#      賃金だけがこの新経路を通る = L2(域内従業者 224,240 人)に給料が届く。
+#   ③ 給料日は `block_day % 30 + 1` では**実暦の 25 日に永遠に到達しない**(10 日ランの
+#      実測)。実暦判定は新トグル(wage_profile.calendar)の配下にだけ置き、OFF のときは
+#      口座 E5 と同じ 30 日周期の式をそのまま使う(既存経路を 1 行も動かさない)。
+#: 不在中に過ぎた給料日を遡って探す上限(日)。プールの回転で数日抜ける層を拾えれば十分で、
+#  ここを無限にすると長期ランの日次コストが線形に伸びる。
+_WAGE_CATCHUP_MAX = 45
+
+
+def _wage_cfg(sim) -> dict | None:
+    """economy.wage_profile(ON のときだけ dict)。OFF・経済 OFF は None=以降を 1 行も通らない。"""
+    if not _economy_on(sim):
+        return None
+    cfg = (getattr(sim, "economy", {}) or {}).get("wage_profile")
+    return cfg if cfg and cfg.get("enabled") else None
+
+
+def wage_assign(sim, agent, record: dict | None = None) -> dict | None:
+    """1 体へ賃金プランを与える(ON 時のみ・冪等・決定論・乱数ゼロ)。OFF は常に None。
+
+    simulation.build_pool_agent(日次ローテーションの再実体化)と `_ensure_wage_profile`
+    (名簿経路の起動時 1 回)の両方から呼ばれる唯一の入口。"""
+    cfg = _wage_cfg(sim)
+    if cfg is None:
+        return None
+    return economy_mod.assign_wage_plan(agent, getattr(sim, "orgs", None), cfg,
+                                        record=record)
+
+
+def _wage_covered(sim, agent) -> bool:
+    """本業の賃金を WAGE の日次清算が持っている個体か(`_settle_work` の二重支給ガード)。
+
+    既定 OFF では `_wage_cfg` が None を返して即 False = 既存の分岐と完全同一。"""
+    return wage_assign(sim, agent) is not None
+
+
+def _wage_dom(sim, cfg: dict, day: int) -> tuple[int, int, int]:
+    """暦日インデックス → (月の何日, その月の日数, 月)。
+
+    calendar=true かつ world.calendar 有効なら**実暦**。それ以外は口座 E5 と同じ
+    「run 開始日=1 日」の 30 日周期(短いランでも給料日が必ず来る近似)。"""
+    cal = getattr(sim, "calendarcfg", None) or {}
+    if cfg["calendar"] and cal.get("enabled"):
+        sm = int(day) * 1440
+        d = calendar.date_of(cal, sm)
+        return int(d.day), int(calendar.days_in_month(cal, sm)), int(d.month)
+    return int(day) % 30 + 1, 30, int(day) // 30 + 1
+
+
+def _wage_fires(sim, cfg: dict, last_day: int, today: int, dom_target: int,
+                months: tuple | None = None) -> bool:
+    """(last_day, today] に指定の支給日が 1 度でも来たか。
+
+    「来たか」を区間で見るのが**不在時キャッチアップ**の実体である: 給料日に街を出て
+    いた個体(プール回転で退場中)は、戻った最初の清算日にその給料日を拾う。振込は在不在に
+    関わらず着金するという現実の意味論を、L1 イベントは本人が実在する日に出す形で満たす。
+    dom_target=0 は「月末」。"""
+    start = max(int(last_day) + 1, int(today) - _WAGE_CATCHUP_MAX)
+    for d in range(start, int(today) + 1):
+        dom, ndays, month = _wage_dom(sim, cfg, d)
+        if months is not None and month not in months:
+            continue
+        if dom == int(dom_target) or (int(dom_target) == 0 and dom == ndays):
+            return True
+    return False
+
+
+def _wage_worked_today(sim, agent, sim_min: int) -> bool:
+    """今日この個体が働いたか。`routine.in_work_window` と**同じ基準**(時刻の条件だけ外す)。
+
+    病欠・勤務窓なし(未就業/失職)・暦の休日は働かない。在場していること自体は
+    呼び出し側(sim.agents の走査)が保証している = 在場が勤務日の資格そのもの。"""
+    if getattr(agent, "sick", False):
+        return False
+    if int(getattr(agent, "work_start_min", -1)) < 0:
+        return False
+    cal = getattr(sim, "calendarcfg", None) or {}
+    if cal.get("enabled") and cal.get("weekday_work") \
+            and not calendar.is_workday(cal, sim_min):
+        return False
+    return True
+
+
+def _wage_settle(sim, agent, plan: dict, cfg: dict, day: int,
+                 step: int, sim_min: int) -> None:
+    """1 体ぶんの日次清算(勤務日カウント → 給料日 → 賞与)。決定論・乱数ゼロ。"""
+    last = int(getattr(agent, "wp_settled_day", -1))
+    if day <= last:                                    # 同じ日を二度清算しない
+        return
+    worked = _wage_worked_today(sim, agent, sim_min)
+    org = plan["org"]
+    if plan["period"] == "daily":                      # 日給者: 働いた日にその日ぶんを受け取る
+        if worked:
+            _pay_wage(sim, agent, plan["daily"], step, sim_min,
+                      source="daily", payer_org=org)   # 年換算は既存式(日給×245)が正しい
+        agent.wp_settled_day = day
+        return
+    if worked:
+        agent.wp_days = int(getattr(agent, "wp_days", 0)) + 1
+    pay_due = _wage_fires(sim, cfg, last, day, plan["payday"])
+    bonus = plan["bonus"]
+    bonus_due = bool(getattr(agent, "wp_bonus_pending", False)) or (
+        bonus is not None
+        and _wage_fires(sim, cfg, last, day, bonus["dom"],
+                        months=tuple(bonus["months"])))
+    if pay_due:
+        amount = economy_mod.salary_amount(plan, getattr(agent, "wp_days", 0), cfg)
+        agent.wp_days = 0
+        if amount > 0.0:
+            agent.last_salary = amount
+            _pay_wage(sim, agent, amount, step, sim_min, source="salary",
+                      payer_org=org, annual_income=plan["annual"])
+        # ★同一 agent・同一 step に賃金を 2 本重ねない: analyze_accounting の源泉税の帰属
+        #   突合は |gross−tax.base| の**最初の一致で break** するので、重ねると誤帰属する。
+        #   賞与は翌清算日へ持ち越す(支給日は元々給料日と重ならないよう選んである)。
+        agent.wp_bonus_pending = bool(bonus_due)
+    elif bonus_due:
+        amount = economy_mod.bonus_amount(plan)
+        agent.wp_bonus_pending = False
+        if amount > 0.0:
+            _pay_wage(sim, agent, amount, step, sim_min, source="bonus",
+                      payer_org=org, annual_income=plan["annual"])
+    agent.wp_settled_day = day
+
+
+def _ensure_wage_profile(sim) -> None:
+    """賃金プランの初回割当(step 先頭で 1 回)。OFF は完全 no-op。
+
+    ★`_sfc_arm` の**前**に置くこと: IF-E2 の org 初期預金は「配属者の日給合計 ×
+      month_days × σ」なので、agent.wage が WAGE の値に載る前に配ると初期預金だけが
+      旧 3 値のまま取り残される。pool 経路は build_pool_agent が既に配っているので、
+      ここは名簿経路(agents.personas_file 指定)のための後追い 1 回。"""
+    if _wage_cfg(sim) is None or getattr(sim, "_wage_armed", False):
+        return
+    sim._wage_armed = True
+    for agent in sim.agents:
+        wage_assign(sim, agent)
+
+
+def _phase_wage_profile(sim, step: int, sim_min: int) -> None:
+    """日次境界: 在場している被用者の賃金を清算する(既定 OFF=即 return=バイト一致)。"""
+    cfg = _wage_cfg(sim)
+    if cfg is None:
+        return
+    day = sim_min // 1440
+    if day == getattr(sim, "_wage_day", -1):
+        return
+    sim._wage_day = day
+    for agent in sim.agents:                           # id 昇順(sim.agents の順)= 決定論
+        plan = wage_assign(sim, agent)
+        if plan is None:
+            continue
+        _wage_settle(sim, agent, plan, cfg, day, step, sim_min)
 
 
 # ---------------------------------------------------------------- 日次境界(経済)
@@ -4024,7 +4228,10 @@ def _enforce_ventures(sim, officer_at, step: int, sim_min: int) -> None:
         for v in list(tools.ventures_by_node.get(node, [])):   # 閉店で index が縮むので複製を走査
             if v.get("permitted", True):               # 許可済みは対象外(既定 True=不変)
                 continue
-            owner = sim.agent_by_id.get(v["owner"])
+            # ★店主が街に居ない屋台は摘発しない(本人不在で罰金は取れない)。``agent_by_id`` は
+            #   退場者も返すので、以前は幽霊の財布から罰金を引き(hydrate で消える)区の歳入だけが
+            #   増えていた = **現金が湧く**。在場述語で解決する。
+            owner = sim.present_agent(v["owner"])
             if owner is None or owner.id == officer.id:
                 continue
             penalty = min(owner.money, fine)           # 罰金(所持金の範囲で)
@@ -4857,18 +5064,26 @@ def _phase_pool_rotation(sim, step: int, sim_min: int) -> None:
     for pid in sorted(exits):                       # 退場者 → ドーマント化(コストゼロ・記憶保持)
         sim._dormant.save(pid, pool_mod.dehydrate(cur[pid]))
     kept = [a for a in sim.agents if getattr(a, "pool_pid", None) in new_ids]
+    entered = []
     for pid in sorted(enters):                      # 入場者 → 実体化(+ 退避済みなら hydrate)
         agent = sim.build_pool_agent(pid, pool.get(pid))
         saved = sim._dormant.pop(pid)
         if saved is not None:
             pool_mod.hydrate(agent, saved)
         kept.append(agent)
+        entered.append(agent)
     sim.agents = kept
+    sim.invalidate_present_index()   # 在場索引を作り直す(enters==exits でも取りこぼさない)
     # agent_by_id は「これまで実体化した全個体」の id→参照(退場者を消さない)。造語の作者名・
     # DM 送信者名・関係台帳など**過去の参照**が退場後も解決できるようにする(present 個体は
     # hydrate 済みの最新実体で上書き)。tick(計算)対象は sim.agents(present)だけ=コストは在場分。
     for a in kept:
         sim.agent_by_id[a.id] = a
+    # 片側パートナーの清算(レーン丙 5。household.pool_bind 配下=既定 OFF は 1 行も通らない)。
+    # ★**hydrate と在場索引の作り直しの後**でなければならない: 退避辞書の partner_id が戻るのは
+    #   hydrate で、相手の在場は present_agent(= 索引)でしか引けないから。入場者だけを見る。
+    for agent in entered:
+        household_mod.reconcile_partner(sim, agent)
     sim._pool_update_budget()                       # S6a: N=当日の在場数(1行の接続)
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
                          kind="presence_change", x=0.0, y=0.0,
@@ -5283,6 +5498,8 @@ def run_step(sim, step: int) -> None:
     # L2 業務の実体(work.service。既定OFF=-1でこの step の接客帰属を完全スキップ=バイト一致)。
     _work_idx = len(sim.logger.events) if _work_service_on(sim) else -1
     _ensure_orgs(sim)                              # 組織台帳の遅延初期化(既定OFF=no-op)
+    _ensure_wage_profile(sim)                      # WAGE: 賃金プランの初回割当(既定OFF=no-op・乱数ゼロ)。
+                                                   # ★_sfc_arm の前=org 初期預金が新しい日給を読む
     _sfc_arm(sim, step, sim_min)                   # IF-E2: org 預金の期首配賦(既定OFF=no-op・乱数ゼロ)
     # 所有権レイヤー O1(登記簿の初期配賦。既定OFF=即 return=バイト一致)。**_ensure_orgs の後**に
     # 置く: 賃貸住戸の家主を「域内の不動産 org」から選ぶ(ユーザー決定 §5-1)ので、組織台帳が
@@ -5305,6 +5522,9 @@ def run_step(sim, step: int) -> None:
 
     sim.scenario.on_step(sim, step)                # 摂動シナリオ(baseline=即 return)
     _phase_government(sim, step, sim_min)          # 日次境界: 行政会計・公務員給与・給付(既定OFF)
+    _phase_wage_profile(sim, step, sim_min)        # 日次境界: 賃金多様性 WAGE の清算(既定OFF=no-op)。
+                                                   # ★_phase_daily の前=給料日の入金がその日の家賃
+                                                   #   (月収相当×share)と逼迫判定に間に合う
     _phase_daily(sim, step, sim_min)               # 日次境界: 経済的逼迫の心理圧
     _phase_bank_day(sim, step, sim_min)            # 日次境界: 融資の定期返済・延滞→破産接続(既定OFF=no-op。E-W1)
     _phase_career(sim, step, sim_min)              # 日次境界: 失業/求職/転職(既定OFF=no-op。Wave G5)
@@ -5468,6 +5688,13 @@ def run_step(sim, step: int) -> None:
     # ので、この step の L3 スナップショット(下)に相続後の残高が正しく載る。
     # traces / facilities と同じ **L1 の watermark 走査**(死亡・転居があった step だけ働く)。
     assets_mod.phase(sim, step, sim_min)
+    # A13 日次入場者名簿(レーン丙 2。既定 OFF=sim.roster_sc is None=分岐 1 回だけ)。
+    # **step 末**に置く理由: 当日の入場者は _phase_pool_rotation(step 先頭)で実体化されるが、
+    # 賃金プラン・org 配属・世帯・観光といった日境界の割当がその後の各フェーズで載るので、
+    # 先頭で撮ると「まだ何も持っていない個体」が名簿に残る。観測しかしない(世界を触らない)。
+    _roster = getattr(sim, "roster_sc", None)
+    if _roster is not None:
+        _roster.on_step(sim, step, sim_min)
 
     _bl = (sim.cfg.get("engine", {}) or {}).get("batch_llm", {}) or {}
     if ablate_mod.llm_off(sim):

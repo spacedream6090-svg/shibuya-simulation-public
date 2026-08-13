@@ -85,8 +85,17 @@ def pick_home(sim, agent, area, rng):
 
     候補=誰の home_building にもなっていない住宅系建物。area 指定があれば名前が部分一致する
     ものを優先(=近傍/地域優先の近似)、その中で現在地からの距離昇順+id。近い上位から新 stream
-    "move_home" で1つ引く(=新たな確率は新 stream のみ)。候補が無ければ None。"""
-    occupied = {getattr(a, "home_building", "") for a in sim.agents
+    "move_home" で1つ引く(=新たな確率は新 stream のみ)。候補が無ければ None。
+
+    ★占有判定は ``sim.agents``(在場)ではなく ``sim.agent_by_id``(**これまで実体化した全個体**)
+      で行う(レーン甲 2026-08-13)。家はプール回転で街を出ても空き家にはならないので、在場だけを
+      見ると「脱水中の住人の家」が空きに見え、**二重入居が単調に増える**。
+      ★正直な限界: 一度も実体化していないペルソナの家は ``agent_by_id`` にも居ないので、
+      pool ON の初日ほど「まだ誰も来ていない住戸」を空きと見なす余地が残る(将来は
+      pool の record 側 home を索引する必要があるが、それは pool レーンの設計判断)。"""
+    roster = getattr(sim, "agent_by_id", None)
+    everyone = roster.values() if roster else sim.agents
+    occupied = {getattr(a, "home_building", "") for a in everyone
                 if getattr(a, "home_building", "")}
     cands = [b for b in sim.city.residential_buildings
              if b["id"] not in occupied and b["id"] != agent.home_building]

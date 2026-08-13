@@ -323,6 +323,25 @@ class VCFund:
         self.equity: dict[int, float] = {}                # owner_id -> 累計持分
         self.invested_total = 0.0
         self.dividends_total = 0.0
+        self.equity_written_off = 0.0                     # 閉店で失効した持分の累計(Bank.write_offs と同型)
+
+    def release(self, owner_id: int) -> float:
+        """出資先が**消えた**(屋台の閉店・所有者の長期退場)ときに持分を落とす。戻り: 失効した持分。
+
+        ★なぜ要るか(レーン甲 2026-08-13): ``equity`` には pop する経路が 1 つも無かったので、
+          プール回転で街を出た所有者の持分が永久に残り (a) その owner は「出資済み」として
+          再審査から外れ続け、(b) 売上ゼロ = 配当ゼロなので ``balance`` は単調減少するだけ
+          になり、数日で原資が枯れて出資が止まっていた。閉店は「その持分の裏付けが世界から
+          消えた」ことなので、Bank の貸倒(``write_off``)と同じ作法で損金計上して落とす。
+          ★金は動かさない(出資額は既に所有者の口座へ渡っている)= 保存則に触らない。
+        """
+        eq = float(self.equity.pop(int(owner_id), 0.0))
+        if eq > 0.0:
+            # getattr 経由 = 本欄より前に pickle された checkpoint(VCFund は checkpoint に
+            # 載る)から復元した実体にも安全に足せる。
+            self.equity_written_off = float(
+                getattr(self, "equity_written_off", 0.0)) + eq
+        return eq
 
     def can_invest(self) -> bool:
         return self.balance >= float(self.cfg["ticket"])

@@ -600,7 +600,16 @@ def phase(sim, step: int, sim_min: int, spend=None) -> None:
                 _clear(agent)
             continue
         if getattr(agent, "med_admitted", False):
-            st["bed_steps"] += 1
+            # ---- レーン乙 F4: 在院日数の「不在中は数えない」ズレを塞ぐ ----------------
+            # このフェーズは present な個体しか通らないので、入院中の個体がプール回転で
+            # 街を出ると `bed_steps` がその間 1 も積まれない。一方 `_discharge` の
+            # 請求日数は壁時計(step - med_since)で数えるため、**同じ入院について
+            # 占有(観測)は過少・請求は過大**という食い違いが構造的に生まれていた。
+            # 個体側に「最後に在院を計上した step」を置き、空いた step 数を埋める。
+            # ★毎 step 在場(既定プロファイル)なら step - last == 1 = 現行と完全同一。
+            last_tick = int(getattr(agent, "med_last_tick", -1))
+            st["bed_steps"] += 1 if last_tick < 0 else max(1, int(step) - last_tick)
+            agent.med_last_tick = int(step)
             if int(step) >= int(getattr(agent, "med_until", 0)):
                 _discharge(sim, cfg, st, bud, agent, step, sim_min, spend)
             continue
@@ -711,6 +720,20 @@ def _discharge(sim, cfg: dict, st: dict, bud, agent, step: int, sim_min: int,
         agent.floor = 0
         agent.node = building["entrance"]
         agent.x, agent.y = sim.city.node_xy(agent.node)
+    elif node and str(agent.node) != node:
+        # ---- レーン丙 4: 回転を跨いだ在院者の**退院位置の整合** ----------------------
+        # プール回転で街を出て戻った在院者は `build_pool_agent` が record から作り直すので
+        # `agent.building` が None・(node, x, y) は**再入場地点**になっている。上の分岐を
+        # 通らないため、`hospital_discharge` の payload は node=病院・x/y=再入場地点という
+        # **食い違った 1 行**になり、退院直後の行動も病院ではない場所から始まっていた。
+        # 在院の事実(med_node)を位置の正とする(在場者のみ・幽霊は phase が弾く・乱数ゼロ)。
+        # ★毎日在場のラン(既定プロファイル)では `agent.node == node` なので 1 行も通らない
+        #   = バイト不変(在院中は sleeping=True で 1 歩も動かないため)。
+        agent.node = node
+        try:
+            agent.x, agent.y = sim.city.node_xy(node)
+        except Exception:                          # noqa: BLE001(未知ノードの保険。_arrive と同型)
+            pass
     agent.activity = ""
     agent.stay_until = int(step) + 1
     _clear(agent)
@@ -733,9 +756,17 @@ def _discharge(sim, cfg: dict, st: dict, bud, agent, step: int, sim_min: int,
 
 
 def _agent_by_id(sim, agent_id: int):
+    """在場なら Agent・不在なら None(``sim.present_agent`` の O(1) 索引へ委譲)。
+
+    ★以前はここが ``sim.agents`` の線形走査だった(挙動は同一・25万体で O(N))。
+      ``sim.agent_by_id.get`` は退場者も返す = 幽霊への書き込みになるので使わない。
+    """
     if int(agent_id) < 0:
         return None
-    for agent in sim.agents:
+    fn = getattr(sim, "present_agent", None)
+    if fn is not None:
+        return fn(int(agent_id))
+    for agent in sim.agents:                       # 最小面のスタブ sim 用の後退経路
         if int(agent.id) == int(agent_id):
             return agent
     return None
@@ -764,6 +795,8 @@ def _clear(agent) -> None:
     agent.med_dest_poi = ""
     agent.med_dest_building = ""
     agent.med_from_node = ""
+    # レーン乙 F4: 在院計上の最終 step(-1=未計上)。退院/搬送解除で必ず落ちる。
+    agent.med_last_tick = -1
 
 
 def in_care(agent) -> bool:

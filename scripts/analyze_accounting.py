@@ -404,6 +404,11 @@ WAGE_SOURCE_SECTOR: dict[str, tuple[str, str]] = {
     "gig":         (VOID,       "wage:gig"),          # 自営の日銭。客が居ない
     "salary":      (VOID,       "wage:salary"),       # 月給。org の残高は減らない
     "severance":   (VOID,       "wage:severance"),    # 退職金。org の残高は減らない
+    # ---- 賃金多様性 WAGE(第112)。org_accounting ON では payer が上書きするので実質 org 払い ----
+    # ★漏れタグの**族**は "wage" のままなので、監視テストが見ている族の集合は増えない
+    #   (leak_family("wage:bonus") == "wage")。新しい金の経路ではなく既存 wage 経路の内訳。
+    "daily":       (VOID,       "wage:daily"),        # 日給者の 1 日ぶん
+    "bonus":       (VOID,       "wage:bonus"),        # 賞与(夏・冬)
 }
 _WAGE_DEFAULT = (VOID, "wage:work")                   # source なし = 本業/バイトの勤務完遂
 

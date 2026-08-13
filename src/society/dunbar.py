@@ -400,7 +400,9 @@ def touch_group(sim, member_ids, step: int, sim_min: int) -> None:
         return
     ids = sorted(int(i) for i in member_ids)
     for a_id in ids:
-        agent = sim.agent_by_id.get(a_id)
+        # ★在場者のみ。退場者(脱水済み)の台帳に last_step を書いても hydrate で捨てられる
+        #   = 「維持したはずの関係が休眠する」= 認知枠の観測が汚れる。
+        agent = sim.present_agent(a_id)
         if agent is None:
             continue
         for b_id in ids:

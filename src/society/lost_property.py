@@ -143,6 +143,12 @@ R1 ドクトリン
   ない(最短で次 step)。
 - **3 か月時効はほぼ発火しない**: 10 日ランでは ``statute_steps`` に届かないので、
   時効取得は既定では観測されない(テストは短い時効値で機構を固定する)。
+- **街を出た当事者には金が動かない**(レーン甲 2026-08-13 で塞いだ保存則の穴): 返還も
+  報労金も時効取得も**在場者にしか**起こらない。``sim.agent_by_id`` は退場者(プール回転で
+  脱水された個体)も返すので、以前はそこへ ``money +=`` していた = 書いた値が hydrate で
+  捨てられ ``hold`` からだけ引かれて**現金が世界から消えていた**。いまは
+  ``sim.present_agent`` で解決し、持ち主 / 拾得者が街に居ない間は物を交番に留め置く
+  (時効の瞬間に拾得者が不在なら**失効**= 遺失物法 36 条)。総額はどの分岐でも不変。
 
 **絶対に触らない範囲(明文規約)**
 --------------------------------
@@ -754,7 +760,8 @@ def _phase_notice(sim, cfg: dict, st: dict, step: int, sim_min: int, budget: int
         if int(step) - int(rec["step"]) < int(cfg["notice_delay"].get(item, 6)):
             continue
         rec["noticed"] = True                      # 「判定は 1 回だけ」= 遅延到達の時点で確定
-        owner = sim.agent_by_id.get(int(rec["owner"]))
+        # ★在場述語で解決する(``agent_by_id`` は退場者も返す = 幽霊の記憶に書いてしまう)。
+        owner = sim.present_agent(int(rec["owner"]))
         if owner is None:                          # プール回転で街から居なくなった
             continue
         if _jitter(seed, "notice", int(owner.id), iid) >= notice_p(cfg, owner, item):
@@ -779,6 +786,10 @@ def _pay(src, dst, amount: float) -> float:
 
     払い手の手持ちを超える額は払えない(床クリップ)。返すのは**実際に動いた額**なので、
     payload と残高の増減が必ず一致する(``chance._apply_money`` と同じ正直さの作法)。
+
+    ★**呼ぶ側の責務**: src / dst はどちらも**在場者**(``sim.present_agent`` で解決した実体)
+      でなければならない。退場者(脱水済み)を渡すとその側の書き込みが hydrate で捨てられ、
+      片側だけ動いた分だけ街の総額がずれる。
     """
     amt = min(max(0.0, float(amount)), max(0.0, float(getattr(src, "money", 0.0) or 0.0)))
     if amt <= 0.0:
@@ -896,6 +907,9 @@ def _return(sim, cfg: dict, st: dict, rec: dict, owner, finder,
 
     金は 1 円も湧かない: 中の現金は世界の「遺失物」バケツ(``hold``)から持ち主の財布へ
     戻るだけ、報労金は持ち主の財布から拾得者の財布へ動くだけ(IF-E のゼロ和検査と整合)。
+
+    ★``owner`` / ``finder`` は**在場者に限る**(``_phase_resolve`` が ``sim.present_agent``
+      で解決してから呼ぶ)。どちらかが街を出ている間、物は交番に留め置かれ時効まで待つ。
     """
     item = str(rec["item"])
     cash = float(rec["cash"])
@@ -924,6 +938,10 @@ def _expire(sim, cfg: dict, st: dict, rec: dict, to_finder, step: int,
 
     後者の現金は**取引ではない資産変動**(SNA 2008 第12章 K.5)として記帳する:
     受け取り手が世界に存在しないので RoW(取引の相手方)へ落としてはならない。
+
+    ★``to_finder`` は**在場者か None** のいずれか(呼び出し側が ``sim.present_agent`` で
+      解決する)。時効の瞬間に拾得者が街に居ない回は None = 失効側へ倒す(遺失物法 36 条:
+      引き取らなければ所有権を失う)。退場者の財布へ書くと hold からだけ引かれて現金が消える。
     """
     item = str(rec["item"])
     cash = float(rec["cash"])
@@ -970,8 +988,11 @@ def _phase_resolve(sim, cfg: dict, st: dict, step: int, sim_min: int,
         if budget <= 0:
             continue
         if status == TURNED_IN:
-            owner = sim.agent_by_id.get(int(rec["owner"]))
-            finder = sim.agent_by_id.get(int(rec["finder"]))
+            # ★**在場者にしか金は動かせない**: ``agent_by_id`` は退場者(脱水済み)も返すので、
+            #   そこへ ``money +=`` すると次の hydrate で書いた値が捨てられ、hold からは
+            #   引かれたまま = **現金が世界から消える**。在場述語で解決する。
+            owner = sim.present_agent(int(rec["owner"]))
+            finder = sim.present_agent(int(rec["finder"]))
             item = str(rec["item"])
             if (owner is not None and finder is not None and rec["noticed"]
                     and rec.get("reported")
@@ -981,6 +1002,10 @@ def _phase_resolve(sim, cfg: dict, st: dict, step: int, sim_min: int,
                 budget -= 1
                 done.append(iid)
             elif int(step) - int(rec["turn_step"]) >= int(cfg["statute_steps"]):
+                # 時効。拾得者が街に居なければ**誰にも渡さず失効**(= to_finder=None)。
+                # 遺失物法 36 条(拾得者が所有権取得後 2 か月以内に物件を引き取らないときは
+                # 所有権を失い、物件は都道府県に帰属する)= 街の外へ出るのと同じ扱い。
+                # 中の現金は lapsed バケツへ落ちるので**総額は 1 円も動かない**。
                 _expire(sim, cfg, st, rec, finder, step, sim_min)
                 budget -= 1
                 done.append(iid)

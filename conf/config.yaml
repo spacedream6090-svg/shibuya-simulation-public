@@ -853,6 +853,53 @@ economy:
     eviction_grievance: 0.10      # 立退きの生活不安(factors 経由の不透明 magnitude)
     bankruptcy_grievance: 0.15    # 破産の生活不安(同上)
 
+  # ---- 賃金多様性 WAGE(第112バッチ 2026-08-13。ユーザー要求。既定 OFF)----------------
+  # 「L2 の本業日給 0 の穴を実装で塞ぐ。ただし月給なのか日給か・給料が振り込まれるタイミング・
+  #  ボーナスの有無・職種に見合った金額か —— 給料にも多様性がある実装に」
+  # 塞ぐ穴(実測): プールの L2(域内従業者 224,240 人)のうち 198,264 人は職業名が economy.py の
+  #   WAGE_CAT(25 語)に無いため wage_amount が 0 を返し、本業の日給が構造的に 0 円だった。
+  #   残る層も「会社員12,000 / 店員9,000 / 自営10,000」の実質 3 値で、台帳が持つ産業(14種)・
+  #   規模帯(8区分)・役割(40種)・職業名(146種)が 1 つも賃金に反映されていなかった。
+  # ON 時の額: 月額 = 産業基準 × 職種群係数 × 規模帯係数 × 個体差(±spread)。日額 = 月額/20 を
+  #   既存 agent.wage に載せ替える(org 初期預金・退職金・産出見積りが同じ 1 欄を読む)。
+  #   最低賃金の床(economy.min_wage_hourly)は月額にも張る(対象は全員「雇用される労働者」)。
+  # 決定論: 個体差・支給形態・給料日・賞与はすべて blake2b の安定ハッシュ(乱数 stream を
+  #   1 本も足さない・run.seed 非依存・resume / 回転再入で不変)。LLM 呼数も不変。
+  # false(既定)= プランを 1 つも作らず、支給点も勤務日カウントも 1 行も通らない(バイト一致)。
+  # ★ON 推奨(本番): true(conf/finals_observe.yaml で ON。理由はそちらに記す)
+  wage_profile:
+    enabled: false
+    calendar: false             # true = 給料日・賞与月を**実暦**(world.calendar)で判定。
+                                # false = 口座 E5 と同じ「run 開始日=1日」の 30 日周期。
+                                # ★実暦にしないと block_day%30+1 では 8/16 開始・10 日ランで
+                                #   25 日に永遠に到達しない(= 月給者が 1 円も受け取らない)
+    month_workdays: 20          # 所定労働日数/月(日額換算の分母・欠勤月の日割りの分母)
+    day_hours: 8                # 1 日の所定労働時間(最低賃金の床を月額へ換算するのに使う)
+    spread: 0.15                # 個体差の幅(±15%。安定ハッシュ=乱数ゼロ)
+    default_monthly: 330000     # 組織台帳に載らない層(L1 住民など)の月額基準
+    default_band: "10-19"       # 規模帯を持たない組織(学校)の既定帯
+    school_industry: ED         # 学校の産業キー(教育・学習支援業)
+    daily_share: 0.15           # 接客/現業/清掃の小規模職場のうち日給制になる割合。
+                                # ★週給は入れない: 米英の慣行であり、労基法24条
+                                #   「毎月1回以上・一定期日払い」の下では月給が既定
+    # 給料日の分布 [暦の何日, 重み](0 = 月末)。25 日が最頻という民間の慣行。
+    # 職場ごとに割り当てる(同じ会社の人は同じ給料日)。重みは合計 1 に正規化される。
+    # ★dict でなく**リスト**で持つ: registry.flatten_bools は dict のキーを sorted() する
+    #   ので、数値キーの dict をここに置くと dotlist 上書き(int キー)と YAML(str キー)が
+    #   混ざった瞬間に走査ごと落ちる。ペアのリストなら走査対象にならない。
+    payday_weights: [[10, 0.15], [15, 0.18], [20, 0.12], [25, 0.40], [0, 0.15]]
+    bonus:
+      enabled: true             # 賞与の機構(支給有無・月数は規模帯で決まる)
+      summer_months: [6, 7]     # 夏季賞与の支給月(職場ごとにどちらか)
+      winter_month: 12          # 冬季賞与の支給月
+      doms: [5, 10, 15]         # 支給日の候補(給料日と重ならないものを選ぶ)
+      months_min: 1.0           # 支給月数(最小規模帯)
+      months_max: 2.5           # 支給月数(最大規模帯)
+      share_min: 0.35           # 支給する職場の割合(最小規模帯)
+      share_max: 0.95           # 同(最大規模帯)
+      # ★本選の窓(8/16-8/26)では夏季賞与(6-7月)も冬季(12月)も**発火しない**。
+      #   8 月に賞与が出ないのは現実そのものなので、それでよい(機構だけ本番投入可能にする)。
+
   # ---- IF-E2 案B: org の会計主体化 + rest-of-world(渋谷域外)部門(既定 OFF)----
   # 設計: docs/research/ifE2-org-accounting-research.md §4-3 / 実装: src/society/economy_sfc.py
   # ON にすると org が**スカラー預金 1 本**を持ち、賃金をそこから払い・消費をそこへ入れる。
@@ -869,6 +916,12 @@ economy:
                                   # 輸出代金を RoW から入金(既存 revenue_est の式・発火点は不変で
                                   # 相手方を void → RoW に付け替えるだけ)。false=輸出なし=当座借越へ
     sidecar: true                 # finance.parquet(部門別残高の日次1行)を書く
+    # レーン乙 D1: org の期首預金を day0 在場者でなく「束ねられた名簿全体」から与える。
+    # pool ON では在場 cap が名簿の 1/4 なので、現行は「たまたま初日に街に居た人数」が会社の
+    # 運転資金を決めていた(期首から構造的に過少=初日の給与支払いで当座借越に落ちる)。
+    # 日給は economy.wage_plan(record と pid だけの純関数)= 在場個体の agent.wage と同値。
+    # pool OFF では母集団が一致するので値は変わらない。既定 false=現行と完全同一。
+    seed_from_pool_roster: false  # ★ON 推奨(本番): true(要 pool.enabled=true)
 
 # ---- 「世界を変える」ツール群(4軸を最小で覆う affordance。中立提示・自然使用の観察)----
 # モノ=open_venture / 制度=propose / 人=host_event(勉強会) / 虚構=host_event・flyer・group。
@@ -2225,6 +2278,21 @@ observer:
     streaming: false
     row_group_rows: 1048576     # 書き出す row-group の行数(= ON 時のピークメモリの単位。
                                 # pyarrow の write_table 既定と同じ 2**20)。streaming=false では未使用。
+  # ---- A13 日次入場者名簿サイドカー roster.parquet(レーン丙 2026-08-13・**既定 OFF**)----
+  # 塞ぐ穴: 名簿は traits.json(day0 の在場者)と agents.json(その瞬間の在場者)の 2 枚しか
+  # 無く、プール回転で day1 以降に入場する個体(finals 構成で **20.9 万人**)の素性が
+  # **どこにも残らない**。事後解析(observer/measure の R² 回帰・deviation のペルソナ逸脱・
+  # 復元実験)は名簿を traits.json > agents.json の順に引くので、その 20.9 万人は
+  # 「観測されているのに素性が不明」= 分母から丸ごと落ちていた。
+  # ON にすると日境界に「まだ名簿に載せていない在場者」を 1 行ずつ roster.parquet へ追記する
+  # (1 個体は生涯 1 行 = 入場した日。再来街で 2 行目は作らない)。
+  # ★観測側だけで閉じる: 世界状態を 1 バイトも書かず・L1 を 1 件も出さず・乱数を 1 粒も引かず・
+  #   LLM 呼数を 1 も変えない(動力学は本サイドカーのバッファを 1 度も読まない)。
+  # ★規模: 在場 25万 × 10 日で約 46 万行 = zstd 後で **+100 MB 前後**。走行中の費用は日境界の
+  #   在場者 1 周だけ(毎 step の走査はゼロ)。
+  # 実装 src/society/observer/roster.py(凍結 14 ファイルには含まれない)。
+  roster_daily:
+    enabled: false              # ★ON 推奨(本番): true(復元実験の名簿保全 + 痩せ A13)
   # ---- 第71バッチ 2026-07-31: ラン来歴 run_manifest.json(既定 ON=新規別ファイル)----
   # ラン開始時に runs/<name>/run_manifest.json を書く: git SHA/branch/dirty・resolved config の
   # 正準 JSON sha256・run_seed・モデル ID・cache_mode・**真偽値スイッチ全状態**(機械採取)・
@@ -3102,6 +3170,15 @@ household:
     enabled: false              # ★ON 推奨(本番): true(同棲=世帯の物理再編を有効化。要 household.enabled=true + 恋愛)
     days: 14                    # 同棲判定の最短 bond 継続日数(初観測日から起算)
     closeness: 0.0              # 維持すべき相互 closeness(0=household.partner_closeness を採用)
+  # ---- プール名簿からの世帯再構築(レーン乙 ブロック3。既定 OFF=完全 no-op=バイト一致)----
+  # build_households は起動時1回しか走らないので、プール回転で day1 以降に入場する個体は世帯を
+  # 永久に持てない(finals 構成で 20.9 万人)。さらに housemates/household_id は退避に載っておらず、
+  # build_pool_agent が home_* を素の record から作り直すため「同居している事実」が回転のたびに壊れる。
+  # ON=世帯を pool 名簿の決定論的な分割として持ち、入場のたびに冪等に着席(org_id 方式と同型)。
+  # 住居も世帯 id から決定論で決まる=メンバの在場日が違っても同じ家に住む。乱数 stream ゼロ。
+  pool_bind:
+    enabled: false              # ★ON 推奨(本番): true(要 pool.enabled=true + household.enabled=true)
+    seed: 20260813              # 安定ハッシュ種(run.seed と独立=別ランでも同じ人が同じ世帯)
 
 # ---- 転居(内部可動性 第60バッチ b 2026-07-24。既定 OFF=現行挙動と完全同一)----
 # 閉じた世界の構造固着を「運営者の介入なし」に内生的に動かす転居機構(devlog Entry 50)。トリガーは

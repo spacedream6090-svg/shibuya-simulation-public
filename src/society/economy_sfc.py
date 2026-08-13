@@ -253,6 +253,14 @@ DEFAULTS = {
     "sigma": 1.0,
     "month_days": 30,          # 「月次賃金支払」を日給の何日ぶんとみなすか(暦は day%30)
     "min_initial": 0.0,        # 初期残高の下限(配属 0 の org を守る。0=下限なし)
+    # ---- レーン乙 D1: 初期預金の母集団(既定 False = 現行と完全同一)----------------
+    #  False = day0 の**在場者だけ**の日給合計(pool ON では 100 万人中 25 万人 = 1/4 の
+    #          さらに一部しか数えず、org の期首預金が構造的に過少 → 初日から当座借越)。
+    #  True  = **束ねられた名簿全体**(attach_record 宇宙 = record に org_id を持つ全ペルソナ)の
+    #          日給合計。台帳と wage_plan だけで決まる純関数なので在場に依存しない
+    #          (= 世界のアルゴリズムが org の体力を決めない)。pool OFF では
+    #          sim.agents が名簿そのものなので True でも False でも同じ値になる。
+    "seed_from_pool_roster": False,
     # office/education 系 org の輸出代金(既存 revenue_est の式・発火点は 1 つも変えず、
     # 相手方を void → RoW に付け替えるだけ)。研究文書 §3-c の (ii)。
     "export_production": True,
@@ -282,7 +290,7 @@ def build_cfg(raw) -> dict:
     raw = dict(_to_plain(raw) or {})
     cfg = dict(DEFAULTS)
     for k, v in raw.items():
-        if k in ("enabled", "export_production", "sidecar"):
+        if k in ("enabled", "export_production", "sidecar", "seed_from_pool_roster"):
             cfg[k] = (v if isinstance(v, bool) else str(v).strip().lower() == "true")
         elif k == "month_days":
             cfg[k] = max(1, int(v))
@@ -462,14 +470,18 @@ def arm(sim, step: int, sim_min: int) -> None:
     if not book:
         return
     cfg = cfg_of(sim)
-    daily: dict[str, float] = {}
-    for a in sim.agents:                               # id 昇順(sim.agents の生成順)= 決定論
-        oid = getattr(a, "org_id", None)
-        if not oid or str(oid) not in book:
-            continue
-        if getattr(a, "org_role", "") == "学生":       # 学生は賃金の受け手でない
-            continue
-        daily[str(oid)] = daily.get(str(oid), 0.0) + float(getattr(a, "wage", 0.0) or 0.0)
+    daily = (_daily_wage_by_org_from_roster(sim, book)
+             if (cfg["seed_from_pool_roster"] and getattr(sim, "_pool", None) is not None)
+             else None)
+    if daily is None:
+        daily = {}
+        for a in sim.agents:                           # id 昇順(sim.agents の生成順)= 決定論
+            oid = getattr(a, "org_id", None)
+            if not oid or str(oid) not in book:
+                continue
+            if getattr(a, "org_role", "") == "学生":   # 学生は賃金の受け手でない
+                continue
+            daily[str(oid)] = daily.get(str(oid), 0.0) + float(getattr(a, "wage", 0.0) or 0.0)
     factor = float(cfg["sigma"]) * int(cfg["month_days"])
     floor = float(cfg["min_initial"])
     total = 0.0
@@ -481,6 +493,51 @@ def arm(sim, step: int, sim_min: int) -> None:
         total += bal
     if total:
         row_in(sim, "initial_capital", total)
+
+
+def _daily_wage_by_org_from_roster(sim, book: dict) -> dict:
+    """org → 日給合計を**名簿全体**(pool の全 record)から組む(レーン乙 D1)。決定論・乱数ゼロ。
+
+    ★なぜ在場者ではいけないか: 初期預金は「創業時にその会社が用意した運転資金」であって、
+      **たまたま day0 に街に居た人数**で決まってよいものではない(ユーザー原理:
+      世界のアルゴリズムがエージェント量を決めない)。pool ON では在場 cap が 1/4 なので、
+      現状は期首から構造的に過少 = 初日の給与支払いで当座借越に落ちる org が出る。
+    ★母集団 = ``organizations.attach_record`` が配属を認める record(= ``org_id`` が台帳に
+      在る)そのもの。日給は ``economy.wage_plan``(record の occupation/role/org と
+      **pool の pid** だけで決まる純関数)で、在場個体に付く ``agent.wage`` と**同じ値**に
+      なる(``assign_wage_plan`` が使うキーが ``agent.pool_pid`` = record["id"] だから)。
+    ★走査は ``PoolStore._build_index`` と同じシャードのストリーム読み 1 周(全 record を
+      RAM に載せない)。step 0 の先頭で 1 度だけ。"""
+    from . import economy as _econ
+    pool = sim._pool
+    wcfg = (getattr(sim, "economy", None) or {}).get("wage_profile") or {}
+    wage_on = bool(wcfg.get("enabled"))
+    econ = getattr(sim, "economy", None) or {}
+    daily: dict[str, float] = {}
+    for sh in pool.meta.get("shards", []):
+        with open(pool.dir / sh["file"], "rb") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                oid = rec.get("org_id")
+                if not oid or str(oid) not in book:
+                    continue
+                role = str(rec.get("role", "") or "")
+                if role == "学生":                     # 学生は賃金の受け手でない(現行と同判定)
+                    continue
+                occ = str(rec.get("occupation", "") or "")
+                if wage_on:
+                    if not _econ.wage_eligible(occ, role):
+                        continue
+                    w = _econ.wage_plan(occupation=occ, role=role,
+                                        org=book[str(oid)], org_id=oid,
+                                        key=str(rec["id"]), cfg=wcfg)["daily"]
+                else:
+                    w = _econ.wage_amount(occ, True, econ)
+                daily[str(oid)] = daily.get(str(oid), 0.0) + float(w or 0.0)
+    return daily
 
 
 # --------------------------------------------------------------------------- #

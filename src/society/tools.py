@@ -228,17 +228,24 @@ def _seat_from_roster(sim, step, sim_min, asm) -> bool:
     """名簿制議会(ユーザー決定 2026-07-19)= 選挙をせず persona の occupation が議員(COUNCILOR_OCCS)の
     住民をそのまま議会に据える。決定論・非LLM・乱数なし。
 
-    - 議員は id 昇順・size 超過分は切り捨て・不足でもそのまま(補充選挙はしない)。
+    - 議員は id 昇順・size 超過分は切り捨て。
     - from_roster ON の間は一度組成したら**改選しない**(term_days を無視して任期継続=議員として生活)。
+    - ★レーン乙 E1(定員割れの補充): 組成は「その日 present だった議員職の住民」から作られる。
+      プール回転のランでは day0 に present な議員が定数に満たないことがあり、以後**一度も
+      補充されない**ため議会が定数割れのまま固定していた(10 日で議会が空く)。既に着席
+      していても定員割れなら名簿から決定論(id 昇順)で補充する。**既に着いている議席は
+      触らない**(退場中でも議席は維持=改選は term_days の守備範囲のまま)。
+      補充が 0 件なら state も L1 も 1 バイトも変わらない(= pool OFF のランは完全不変)。
     - council_elected は互換のため出す(payload に from_roster:true)。
     戻り値: 組成した or 既に名簿制で着席済みなら True(呼び出し側はここで return=以後改選なし)。
     名簿に議員が0人なら一度だけ警告 print し False を返す(呼び出し側で従来の選挙へフォールバック)。"""
     cur = getattr(sim, "council", None)
-    if cur is not None and cur.get("from_roster"):
-        return True                                     # 既に名簿制で着席=改選しない(任期継続)
     council_ids = sorted(a.id for a in sim.agents
                          if not a.visitor
                          and str(getattr(a, "occupation", "")) in COUNCILOR_OCCS)
+    if cur is not None and cur.get("from_roster"):       # 既に名簿制で着席=改選しない(任期継続)
+        _backfill_roster_seats(sim, step, sim_min, asm, cur, council_ids)
+        return True
     if not council_ids:                                 # 名簿に議員0人 → 従来の選挙へフォールバック
         if not getattr(sim, "_roster_warned", False):
             print("[assembly] from_roster が ON ですが persona に occupation=議員 の住民が0人のため、"
@@ -261,6 +268,36 @@ def _seat_from_roster(sim, step, sim_min, asm) -> bool:
             a.remember("区議会議員として街で暮らしている", importance_bonus=0.4)
     return True
 
+
+def _backfill_roster_seats(sim, step, sim_min, asm, cur, council_ids) -> None:
+    """名簿制議会の**定員割れ補充**(レーン乙 E1)。決定論・非LLM・乱数ゼロ・冪等。
+
+    既に着いている議席は 1 つも動かさない(退場中の議員も議席を維持する)。空いている枠だけを
+    「議員職で在場している住民のうち、まだ議席を持たない者」から id 昇順で埋める。補充 0 件なら
+    ``sim.council`` も L1 も 1 バイトも変わらない = pool OFF のランでは構造的に完全不変
+    (毎日同じ ``council_ids`` が出るので定数に達した時点で二度と発火しない)。"""
+    size = max(1, int(asm["size"]))
+    members = list(cur.get("members", []))
+    vacancy = size - len(members)
+    if vacancy <= 0:
+        return
+    seated = set(members)
+    add = [aid for aid in council_ids if aid not in seated][:vacancy]
+    if not add:
+        return
+    members.extend(add)
+    cur["members"] = members
+    day = sim_min // 1440
+    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
+                         kind="council_elected", x=0.0, y=0.0,
+                         payload={"term": int(cur.get("term", 1)), "day": day,
+                                  "members": list(members), "from_roster": True,
+                                  "backfill": len(add),
+                                  "n_candidates": len(council_ids)}))
+    for aid in add:
+        a = sim.present_agent(aid)
+        if a is not None:
+            a.remember("区議会議員として街で暮らしている", importance_bonus=0.4)
 
 # ================================================================ 議会選挙の現実化(batch37・realism ON)
 # 渋谷区議会準拠: 告示→自発的立候補(供託金)→SNTV開票→予算承認/条例議決/住民署名。すべて決定論・
@@ -357,10 +394,16 @@ def _council_budget(sim, step, sim_min, asm, cur) -> None:
     if not members:
         return
     thr = float(realism["grievance_threshold"])
-    yes = no = 0
+    yes = no = absent = 0
     for aid in members:                                 # 各議員 yes/no(決定論・_vote_yes 同型)
-        a = sim.agent_by_id.get(aid)
+        # ★レーン乙 E1(ゾンビ議会): ``agent_by_id`` は退場者も保持するので ``is None`` は
+        #   真にならず、**街に居ない議員が凍結された grievance のまま永久に投票し続けて**
+        #   いた(脱水時のスナップショット値は二度と動かない)。在場述語で引き、不在は
+        #   その日の欠席として数える(現実の議会と同じ定足数意味論)。議席は維持する
+        #   (改選は term_days の守備範囲のまま)。
+        a = sim.present_agent(aid)
         if a is None:
+            absent += 1
             continue
         approve = float(a.states.get("grievance", 0.0)) < thr   # 高不満の議員は執行減額へ
         yes += 1 if approve else 0
@@ -374,7 +417,7 @@ def _council_budget(sim, step, sim_min, asm, cur) -> None:
                                   "approved": approved,
                                   "amount": round(float(gov.balance.get("ward", 0.0)), 1),
                                   "ratio": round(gov.exec_ratio, 3),
-                                  "yes": yes, "no": no}))
+                                  "yes": yes, "no": no, "absent": absent}))
 
 
 def _run_sntv(sim, step, sim_min, asm, day) -> None:
@@ -390,7 +433,9 @@ def _run_sntv(sim, step, sim_min, asm, day) -> None:
     cur = getattr(sim, "council", None)
     term = (int(cur["term"]) + 1) if cur else 1
     cand_ids = sorted(deposits)                         # 候補(id 昇順=決定論の同点解決基準)
-    cand_agents = [(cid, sim.agent_by_id.get(cid)) for cid in cand_ids]
+    # ★レーン乙 ブロック7: 在場述語。開票日に街に居ない候補は当選させない(当選させると
+    #   供託金の返還が脱水済みの実体へ落ちて**現金が消える** = _settle_candidacy_deposit)。
+    cand_agents = [(cid, sim.present_agent(cid)) for cid in cand_ids]
     cand_agents = [(cid, a) for cid, a in cand_agents if a is not None]
     if not cand_agents:                                 # 候補0 → 現行の全住民方式へフォールバック
         elected = _nn_ranked(sim)[:size]
@@ -701,7 +746,11 @@ class Tools:
 
     def _announce_dm(self, sim, host, recipients, text, event_id, step, sim_min):
         for rid in recipients:
-            rec = sim.agent_by_id.get(rid)
+            # ★レーン乙 ブロック7: 招待先は relations 台帳の上位=**退場した相手が最有力**。
+            #   ``loc``/``sleeping`` は脱水時のスナップショットなので物理述語では素通りし、
+            #   記憶・関係・drive・招待名簿が丸ごと捨てられる実体へ書かれていた(host 側の
+            #   record_contact だけが実在=台帳が片側だけ育つ)。在場述語を先に置く。
+            rec = sim.present_agent(rid)
             if rec is None or rec.loc == "outside" or rec.sleeping:
                 continue
             # ablate.propagation_off(第78): 告知 DM の**本文**は受信者の文脈へ入れない
@@ -1103,7 +1152,7 @@ class Tools:
         for aid in sorted(ev["attendees"]):
             if aid == host.id:
                 continue
-            learner = sim.agent_by_id.get(aid)
+            learner = sim.present_agent(aid)   # ★レーン乙: 在場者だけが学ぶ(不在は捨てられる)
             if learner is None:
                 continue
             for w in words:
@@ -1139,6 +1188,18 @@ class Tools:
             self.ventures_by_node[v["node"]] = [
                 x for x in self.ventures_by_node.get(v["node"], []) if x is not v]
             del self.ventures[owner]
+            self._release_equity(sim, owner)       # VC 持分の失効(VC OFF なら no-op)
+
+    def _release_equity(self, sim, owner_id: int) -> None:
+        """閉店した屋台の VC 持分を落とす(``commerce.VCFund.release``)。VC 未構築なら no-op。
+
+        ★持分が残ったままだと (a) その owner は「出資済み」として再審査から永久に外れ、
+          (b) 閉店で配当も入らないので ``fund.balance`` が単調減少して出資が止まる
+          (レーン甲 2026-08-13 で塞いだ「pop 系が無い」欄)。金は 1 円も動かさない。
+        """
+        fund = getattr(sim, "vc_fund", None)
+        if fund is not None:
+            fund.release(int(owner_id))
 
     def force_close_venture(self, sim, agent, step, sim_min, *, reason: str) -> bool:
         """屋台の強制閉店(制度深化3: 破産の清算)。閉店したら True、持っていなければ False。
@@ -1152,6 +1213,7 @@ class Tools:
         self.ventures_by_node[v["node"]] = [
             x for x in self.ventures_by_node.get(v["node"], []) if x is not v]
         del self.ventures[agent.id]
+        self._release_equity(sim, agent.id)        # VC 持分の失効(VC OFF なら no-op)
         return True
 
     def _ventures_fulltime(self, sim, step, sim_min) -> None:
@@ -1179,7 +1241,7 @@ class Tools:
             # (start_tod 起因で境界が動き Δt=10 の挙動が変わる)。Δt=10 で厳密同値。
             if (step - v["opened_step"]) // sim.clock.steps_per_day < min_days:
                 continue
-            agent = sim.agent_by_id.get(owner)
+            agent = sim.present_agent(owner)             # ★在場者のみ(幽霊の本業を書き換えない)
             if agent is None or agent.visitor:
                 continue
             v["fulltime"] = True
@@ -1221,7 +1283,7 @@ class Tools:
                 continue
             if owner in fund.equity:                    # 既に出資済み=対象外(1店1回)
                 continue
-            agent = sim.agent_by_id.get(owner)
+            agent = sim.present_agent(owner)            # ★店主が街に居ない屋台は審査しない
             if agent is None:
                 continue
             occ = commerce_mod.occupancy(sim, v["node"])           # market 代理(在館数)
@@ -1231,7 +1293,7 @@ class Tools:
         for owner, s in commerce_mod.vc_candidates(scored, vccfg):
             if not fund.can_invest():
                 break                                   # 原資枯渇=出資停止(§4 希少性=競争)
-            agent = sim.agent_by_id.get(owner)
+            agent = sim.present_agent(owner)            # ★入金先は在場者のみ(幽霊の口座は消える)
             v = self.ventures.get(owner)
             if agent is None or v is None:
                 continue
@@ -1382,7 +1444,10 @@ class Tools:
         if dep <= 0.0 or pr.get("deposit_settled"):
             return
         pr["deposit_settled"] = True
-        author = sim.agent_by_id.get(pr["author"])
+        # ★レーン乙 ブロック7(保存則系): 提案は起案者の滞在より長く生き残る(供託は提出時・
+        #   清算は採決/失効時)。脱水済みの起案者へ返すと現金が**消える**(escrow は実際に
+        #   減るのに受け手側の加算は次の hydrate で捨てられる)。在場述語で引く。
+        author = sim.present_agent(pr["author"])
         ax, ay = (author.x, author.y) if author is not None else (0.0, 0.0)
         if refund and author is not None:
             author.money += dep
@@ -1456,10 +1521,13 @@ class Tools:
                           and council.get("members"))
         electorate = list(council["members"]) if by_council \
             else sorted(pr["supporters"])              # id 昇順=決定論(議会は得票順のまま)
-        yes = no = 0
+        yes = no = absent = 0
         for aid in electorate:
-            agent = sim.agent_by_id.get(aid)
+            # ★レーン乙 E1: 在場者のみが票を投じる(不在=欠席)。``agent_by_id`` だと
+            #   脱水済みの実体の**凍結された grievance / opinion** で票が入り続ける。
+            agent = sim.present_agent(aid)
             if agent is None:
+                absent += 1
                 continue
             v = self._vote_yes(agent, pr, vcfg)
             yes += 1 if v else 0
@@ -1472,9 +1540,11 @@ class Tools:
                                  payload=payload))
         total = yes + no
         passed = bool(total > 0 and (yes / total) > vcfg["majority"])
-        author = sim.agent_by_id.get(pr["author"])
+        author = sim.agent_by_id.get(pr["author"])       # 座標のみ(書き込みなし)
         ax, ay = (author.x, author.y) if author else (0.0, 0.0)
         res = {"proposal_id": pr["id"], "yes": yes, "no": no, "passed": passed}
+        if absent:                                       # E1: 欠席の痕跡(新 kind を作らない)
+            res["absent"] = absent
         if by_council:
             res["by"] = "council"
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=pr["author"],
@@ -1591,7 +1661,7 @@ class Tools:
             if not g:
                 continue
             for mid in sorted(g["members"]):
-                m = sim.agent_by_id.get(mid)
+                m = sim.present_agent(mid)     # ★レーン乙: 在場メンバーのみ(不在は捨てられる)
                 if m is not None:
                     factor_update.on_group_success(m, mag, step=step,
                                                    sim_min=sim_min, logger=sim.logger)
@@ -1612,7 +1682,7 @@ class Tools:
             member_attendees = sorted(g["members"] & attendees)
             if len(member_attendees) >= thr:
                 for mid in member_attendees:
-                    m = sim.agent_by_id.get(mid)
+                    m = sim.present_agent(mid)  # ★レーン乙: 在場メンバーのみ
                     if m is not None:
                         factor_update.on_group_success(m, mag, step=step,
                                                        sim_min=sim_min,
@@ -1667,33 +1737,39 @@ class Tools:
             p = min(1.0, self.cfg["buy_prob"] * mult) if mult != 1.0 else self.cfg["buy_prob"]
             if rng.random() >= p:
                 continue
+            # ★店主が街に居ない屋台では**買えない**(店は開いていない)。``agent_by_id`` は
+            #   退場者も返すので、以前はここで買い手から ``_spend`` した金が幽霊の財布へ
+            #   入り、hydrate で捨てられて**現金が世界から消えて**いた(貨幣保存の破れ)。
+            #   判定は draw の**後**に置く = 乱数の消費列は 1 粒も変わらない(旧コードも
+            #   この draw に当たった時点でこの到着の購入枠を使い切って return していた)。
+            owner = sim.present_agent(v["owner"])
+            if owner is None:
+                return
             # E-W3 消費行動(既定 OFF): 買い手の支払額を予算制約で置換(venture は budget_shares 外=
             # 既定/consumption ON とも不変=会計保存)。買い手の払った額=店主の売上に一致させる。
             sale = scheduler._budget_amount(sim, agent, "venture", v["price"])
             scheduler._spend(sim, agent, sale, "venture", step, sim_min)
-            owner = sim.agent_by_id.get(v["owner"])
-            if owner is not None:
-                # E-W2 VC(既定 OFF): 出資先なら売上から配当を回収し、店主の取り分から差し引く。
-                div = 0.0
-                fund = getattr(sim, "vc_fund", None)
-                if fund is not None:
-                    div = fund.collect_dividend(v["owner"], sale)
-                net = sale - div
-                # 売上は口座へ入金(口座 E5 ON 時)。OFF 時は現金=従来と完全一致。
-                if scheduler._accounts_on(sim):
-                    owner.account += net
-                    owner.period_income += net
-                else:
-                    owner.money += net
-                v["last_sale_step"] = step
-                v["sales_total"] = v.get("sales_total", 0.0) + sale  # 起業転換(G5)/VC の traction 累計
-                sale_payload = {"amount": round(sale, 1),
-                                "balance": round(owner.money, 1), "buyer": agent.id}
-                if div > 0.0:                            # VC 出資先のみ配当を明記(既定 OFF=payload 不変)
-                    sale_payload["dividend"] = round(div, 1)
-                self._log_node(sim, step, sim_min, owner.id, v["node"],
-                               "venture_sale", sale_payload)
-                owner.remember(f"「{v['name']}」が売れた")
+            # E-W2 VC(既定 OFF): 出資先なら売上から配当を回収し、店主の取り分から差し引く。
+            div = 0.0
+            fund = getattr(sim, "vc_fund", None)
+            if fund is not None:
+                div = fund.collect_dividend(v["owner"], sale)
+            net = sale - div
+            # 売上は口座へ入金(口座 E5 ON 時)。OFF 時は現金=従来と完全一致。
+            if scheduler._accounts_on(sim):
+                owner.account += net
+                owner.period_income += net
+            else:
+                owner.money += net
+            v["last_sale_step"] = step
+            v["sales_total"] = v.get("sales_total", 0.0) + sale  # 起業転換(G5)/VC の traction 累計
+            sale_payload = {"amount": round(sale, 1),
+                            "balance": round(owner.money, 1), "buyer": agent.id}
+            if div > 0.0:                            # VC 出資先のみ配当を明記(既定 OFF=payload 不変)
+                sale_payload["dividend"] = round(div, 1)
+            self._log_node(sim, step, sim_min, owner.id, v["node"],
+                           "venture_sale", sale_payload)
+            owner.remember(f"「{v['name']}」が売れた")
             agent.remember(f"「{v['name']}」で買い物した")
             return                                     # 1 到着につき1 購入
 

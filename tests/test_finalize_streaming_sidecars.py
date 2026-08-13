@@ -357,6 +357,7 @@ _ALL_SIDECARS_ON = [
     "economy.org_accounting.enabled=true", "economy.org_accounting.sidecar=true",
     "cognition.channels.enabled=true",
     "cognition.fire.enabled=true", "cognition.g_update.enabled=true",
+    "observer.roster_daily.enabled=true",       # A13 日次入場者名簿(レーン丙 2)
 ]
 
 
@@ -379,7 +380,8 @@ def test_conf_reaches_logger_and_every_sidecar(tmp_path):
                "observer.finalize.streaming=true", "observer.finalize.row_group_rows=7")
     sinks = _sinks_of(sim)
     assert set(sinks) == {"logger", "indoor_tracks", "org_ledger_sc",
-                          "finance_sc", "channels_sc", "cognition_g_sc"}, \
+                          "finance_sc", "channels_sc", "cognition_g_sc",
+                          "roster_sc"}, \
         f"finalize する層の顔ぶれが変わった: {sorted(sinks)}"
     for name, sink in sinks.items():
         assert sink.streaming_finalize is True, f"{name} に streaming が届いていない"
@@ -390,7 +392,7 @@ def test_default_leaves_every_sidecar_on_the_legacy_path(tmp_path):
     """既定(conf 未指定)では 1 つも streaming にならない = 既存ランとバイト一致。"""
     sim = _sim(tmp_path, "wire_off", *_ALL_SIDECARS_ON)
     sinks = _sinks_of(sim)
-    assert len(sinks) == 6
+    assert len(sinks) == 7
     for name, sink in sinks.items():
         assert sink.streaming_finalize is False, f"{name} が既定で streaming になっている"
         assert sink.finalize_row_group_rows == finalize_mod.FINALIZE_ROW_GROUP_ROWS

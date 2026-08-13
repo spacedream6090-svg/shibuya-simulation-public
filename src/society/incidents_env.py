@@ -1006,7 +1006,10 @@ def _fire_restore(sim, cfg: dict, st: dict, bud: _Budget, step: int,
             continue
         node = str(rec["node"])
         crew_id = int(rec["crew"])
-        crew = sim.agent_by_id.get(crew_id) if crew_id >= 0 else None
+        # ★出場隊員は**在場者に限る**(``agent_by_id`` は退場者も返す = 幽霊)。退場者を掴むと
+        #   fire_out の座標が脱水時点の**古い位置**になり、記憶の 1 行も hydrate で捨てられる。
+        #   居ない回は crew=None = ノード座標で記録し agent_id=-1(= 誰が消したか名乗れない)。
+        crew = sim.present_agent(crew_id) if crew_id >= 0 else None
         try:
             fx, fy = sim.city.node_xy(node)
         except Exception:                          # noqa: BLE001

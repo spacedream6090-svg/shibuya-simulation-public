@@ -394,8 +394,10 @@ def mark_fulfilled(sim, grp: dict, st: dict) -> None:
     加える(joint.observe が band 内で毎 step 呼ぶ。読むだけ・乱数ゼロ)。1人で来ただけ
     (他は不履行)は同席でない=履行に数えない(最も正直な形)。"""
     poi = grp.get("poi")
+    # ★``joint.observe`` と同じ規約: 同席は**在場者だけ**(``agent_by_id`` は退場者も返し、
+    #   その node は脱水時点の古い値なので幽霊の同席が履行率を水増しする)。
     present = [gid for gid in grp["members"]
-               if (o := sim.agent_by_id.get(gid)) is not None and o.node == poi]
+               if (o := sim.present_agent(gid)) is not None and o.node == poi]
     if len(present) < 2:
         return
     for gid in present:
@@ -496,7 +498,7 @@ def invite_cue_partners(sim, inviter) -> list:
     for oid, rel in (getattr(inviter.mem, "relations", {}) or {}).items():
         if oid == inviter.id:
             continue
-        o = sim.agent_by_id.get(oid)
+        o = sim.present_agent(oid)                  # 街に居ない相手は誘えない(幽霊を候補にしない)
         if o is None:
             continue
         if _has_positive_cue(sim, inviter, o, cfg):
@@ -527,7 +529,7 @@ def weak_tie_candidates(sim, agent, day: int, slots: int, exclude) -> list:
     for oid in sorted((getattr(agent.mem, "relations", {}) or {})):
         if oid == agent.id or oid in exclude:
             continue
-        o = sim.agent_by_id.get(oid)
+        o = sim.present_agent(oid)                  # 探索枠も在場者のみ(幽霊が枠を食わない)
         if o is None or o.visitor:
             continue
         rel = agent.mem.relations[oid]

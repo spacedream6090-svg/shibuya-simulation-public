@@ -195,7 +195,7 @@ def _misinfo(sim, post: dict, step: int, sim_min: int, mcfg: dict) -> None:
                          kind="misinfo", payload={"post_id": pid, "kind": "flame"}))
     mag = float(mcfg["flame_grievance"])
     if mag > 0.0 and author != MEDIA_ID:          # 炎上→発信者の不満(任意・factors 経由・R9)
-        who = sim.agent_by_id.get(author)
+        who = sim.present_agent(author)   # ★レーン乙: 在場者のみ(不在への grievance は捨てられる)
         if who is not None:
             _factor_update.on_misinfo(who, mag, step=step, sim_min=sim_min,
                                       logger=sim.logger)

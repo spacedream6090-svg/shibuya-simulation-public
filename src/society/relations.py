@@ -149,12 +149,19 @@ def gain_reputation(agent, amount: float, cause: str, step: int, sim_min: int,
                               "cause": cause}))
 
 
-def reputation_decay(agent, cfg: dict, step: int, sim_min: int, logger) -> None:
-    """評判の日次風化(0 で床止め)。既に 0 なら何もしない(記録もしない)。"""
+def reputation_decay(agent, cfg: dict, step: int, sim_min: int, logger,
+                     days: int = 1) -> None:
+    """評判の日次風化(0 で床止め)。既に 0 なら何もしない(記録もしない)。
+
+    ``days`` = この個体がまたいだ日境界の本数(レーン乙 F2)。プール回転で街を出ていた
+    個体は日境界のフェーズを一度も通らないため、**不在中だけ評判が風化しない**
+    (= 居続けた個体より有利になる)バイアスがあった。既定 ``days=1`` は現行と
+    1 バイトも変わらない(単調減少+床止めなので N 回の逐次適用と 1 回の N 倍適用は同値)。"""
     old = float(getattr(agent, "_reputation", 0.0))
     if old <= 0.0:
         return
-    new = max(0.0, old - cfg["rep_decay_per_day"])
+    new = (max(0.0, old - cfg["rep_decay_per_day"]) if days <= 1
+           else max(0.0, old - cfg["rep_decay_per_day"] * int(days)))
     if new == old:
         return
     agent._reputation = new
@@ -175,7 +182,16 @@ def decay_day(sim, cfg: dict, step: int, sim_min: int) -> None:
     logger = sim.logger
     grace = int(cfg["decay_after_days"])
     for agent in sim.agents:
-        reputation_decay(agent, cfg, step, sim_min, logger)
+        # ---- レーン乙 F1/F2: 「不在中は時間が進まない」バイアスを塞ぐ ----------------
+        # このフェーズは present な個体しか通らない(sim.agents)。プール回転で街を出て
+        # いた個体は日境界を何本またいでも減衰を 1 度も受けず、帰ってきた日に 1 回だけ
+        # 受ける = 居続けた個体より関係も評判も減らない。個体側に「最後に減衰を適用した
+        # 日」の印を置き、またいだ本数ぶんまとめて効かせる(印は pool の退避で運ぶ)。
+        # ★毎日在場のラン(既定プロファイル)では常に n=1 = 現行と完全に同一の式を通る。
+        last_tick = int(getattr(agent, "_rel_decay_day", -1))
+        gone = 1 if last_tick < 0 else max(1, int(today) - last_tick)
+        agent._rel_decay_day = int(today)
+        reputation_decay(agent, cfg, step, sim_min, logger, days=gone)
         for other_id, rel in agent.mem.relations.items():
             if "closeness" not in rel:
                 continue
@@ -188,7 +204,15 @@ def decay_day(sim, cfg: dict, step: int, sim_min: int) -> None:
             if (today - last_day) <= grace:        # 今日(や猶予内)接触した相手は減衰しない
                 continue
             old_tier = int(rel.get("tier", 0))
-            rel["closeness"] = float(rel["closeness"]) - cfg["decay_per_day"]
+            # F1: **またいだ日境界の本数**ぶん減衰する。猶予(grace)内だった日は数え
+            # ないので、効く日数 = today - max(最後に減衰した日, last_day + grace)。
+            # 毎日在場なら last_tick == today-1 かつ ここへ来た時点で
+            # last_day + grace <= today-1 が成り立つので **必ず 1** = 下の n<=1 分岐に
+            # 落ちて現行の式が一字一句そのまま残る(バイト一致)。
+            n = (1 if last_tick < 0
+                 else max(1, int(today) - max(last_tick, last_day + grace)))
+            rel["closeness"] = (float(rel["closeness"]) - cfg["decay_per_day"] if n <= 1
+                                else float(rel["closeness"]) - cfg["decay_per_day"] * n)
             new_tier = tier_of(float(rel["closeness"]), cfg)
             if new_tier != old_tier:
                 rel["tier"] = new_tier

@@ -377,6 +377,16 @@ def _resolve_node(record: dict, city, book: dict, bcfg: dict, key: str):
     return poi["node"], bld, fl, entry, "poi_match"
 
 
+def has_workplace(agent) -> bool:
+    """その個体が「通う職場」を持っているか(``bind_workplace`` の had/has と**同一の述語**)。
+
+    定義を 1 箇所に置くための小関数。:func:`provenance` の coverage もこれで数えるので、
+    「束ねが数えた基準」と「最終日に観測した基準」が構造的にずれない。
+    """
+    return bool(getattr(agent, "work_node", "")) \
+        and int(getattr(agent, "work_start_min", -1)) >= 0
+
+
 def bind_workplace(agent, record: dict, city, book: dict, bcfg: dict) -> tuple[bool, bool, str]:
     """勤務中に通う職場 POI を work_node へ束ねる(決定論・乱数ゼロ・LLM ゼロ)。
 
@@ -385,14 +395,13 @@ def bind_workplace(agent, record: dict, city, book: dict, bcfg: dict) -> tuple[b
     =正直に数えるためのタグ)。既に work_node を持つ個体は rebind_bound=false なら不変。
     work_start_min<0 のときだけ勤務窓を補う(既存の勤務窓・出勤 routine は壊さない)。付与規則は
     (pool_pid, 固定属性)の純関数=run.seed 非依存=hydrate 再入で同一 work_node。"""
-    had = bool(getattr(agent, "work_node", "")) and int(getattr(agent, "work_start_min", -1)) >= 0
+    had = has_workplace(agent)
     if had and not bcfg["rebind_bound"]:
         return True, True, "kept"
     key = str(getattr(agent, "pool_pid", "") or record.get("id", ""))
     node, bld, floor, entry, how = _resolve_node(record, city, book, bcfg, key)
     if node is None:
-        has = bool(getattr(agent, "work_node", "")) and int(getattr(agent, "work_start_min", -1)) >= 0
-        return had, has, how
+        return had, has_workplace(agent), how
     agent.work_node = node
     if bld is not None:                                    # 建物内の職場: 入館して勤務
         agent.work_building = bld
@@ -427,3 +436,74 @@ def _fix_night_commute(agent, record: dict, o: int, c: int) -> None:
     m = int(getattr(agent, "bedtime_min", 0)) % 1440
     if m >= int(o) or m < int(c):                          # 帰宅トリガが勤務窓の中
         agent.bedtime_min = (int(c) + 30) % 1440
+
+
+# =========================================================================== #
+# E5 職場束ね coverage の観測(レーン丙 3。summary.json の "workplace_coverage")
+#
+# 何を解く問題か: 現行の検収量は
+#   ・``sim._pool_org_stat``     … build_pool_agent を通った**累計**と配属できた累計
+#   ・``sim._workbind_agg``      … bind_workplace を通った**累計**
+# の 2 つで、どちらも「実体化のたびに +1」される**累計**である。プール回転のランでは
+# 同じ個体が入退場のたびに数え直されるので、**担い手が痩せていても数字は増え続ける**
+# (第109 の申し送り「bind 起動時 1 回 = 10 日で担い手が痩せる」を、この累計では検出できない)。
+#
+# ここで出すのは **最終日時点の在場者を分母にした保持率**である。累計と保持率を同じキーに
+# 並べて置くので、「通した回数」と「いま実際に持っている人の割合」の乖離がそのまま読める。
+# 新 kind は作らず・L2 列も足さず(aggregate.py 凍結)・summary の 1 キーだけで閉じる。
+# =========================================================================== #
+#: summary スキーマ版(列を足したら上げる)。
+COVERAGE_SCHEMA = 1
+
+
+def _rate(n: int, d: int) -> float:
+    return round(float(n) / float(d), 6) if d else 0.0
+
+
+def provenance(sim) -> dict | None:
+    """``summary.json`` の ``workplace_coverage`` キー(**該当しないランは None**)。
+
+    None を返す条件 = プール名簿のランでない、または org 配属も職場束ねも 1 つも ON でない
+    (= 既定ラン・名簿ランでは summary にキー自体が生えない = 既存ラン/golden 無風)。
+
+    出す量:
+      - ``n_present``        … 最終日時点の在場者(この節の分母)
+      - ``org_id``/``work``  … その在場者のうち org_id / 通う職場を**いま持っている**人数と率
+      - ``builds``           … 実体化を通った累計(痩せていても増えて見える量。対比のため併置)
+    ★``work`` の述語は :func:`has_workplace` = ``bind_workplace`` が had/has を数えた述語
+      そのものなので、束ねの申告と最終日の観測が同じ物差しで比べられる。
+    ★読むだけ(乱数ゼロ・L1 ゼロ・LLM ゼロ)。sim.agents を 1 周する finalize 時の 1 回だけ。
+    """
+    if getattr(sim, "_pool", None) is None:
+        return None
+    org_book = getattr(sim, "_pool_org_book", None)
+    bind_book = getattr(sim, "_workbind_book", None)
+    if org_book is None and bind_book is None:
+        return None
+    agents = list(getattr(sim, "agents", ()) or ())
+    n = len(agents)
+    n_org = sum(1 for a in agents if getattr(a, "org_id", None))
+    n_work = sum(1 for a in agents if has_workplace(a))
+    n_bld = sum(1 for a in agents if str(getattr(a, "work_building", "") or ""))
+    stat = dict(getattr(sim, "_pool_org_stat", None) or {})
+    agg = dict(getattr(sim, "_workbind_agg", None) or {})
+    return {
+        "schema": COVERAGE_SCHEMA,
+        "n_present": int(n),
+        "org_attach_on": bool(org_book is not None),
+        "bind_workplace_on": bool(bind_book is not None),
+        "n_org_id": int(n_org),
+        "org_id_rate": _rate(n_org, n),
+        "n_work_node": int(n_work),
+        "work_node_rate": _rate(n_work, n),
+        "n_work_building": int(n_bld),
+        # ★累計(= 実体化を通った回数)。回転ランでは同じ個体が何度も数えられるので、
+        #   上の保持率と桁が合わないのが正常。合わないこと自体が「痩せ」の観測量である。
+        "builds": {
+            "org_seen": int(stat.get("n_present", 0)),
+            "org_attached": int(stat.get("n_attached", 0)),
+            "bind_total": int(agg.get("n_total", 0)),
+            "bind_bound": int(agg.get("n_bound", 0)),
+            "bind_unbound_after": int(agg.get("n_unbound_after", 0)),
+        },
+    }

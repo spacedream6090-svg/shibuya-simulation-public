@@ -46,6 +46,38 @@ class Internet:
             self.follows[aid] = {others[int(i)] for i in picks}
             self.contacts[aid] = set()
 
+    def ensure(self, aid: int, rng, k: int = 6, candidates: list | None = None) -> None:
+        """まだ SNS を持たない個体に初期フォローと空の contacts を据える(冪等・レーン乙 A1)。
+
+        ★なぜ要るか: ``init_follows`` は**起動時 1 回**しか呼ばれないので、プール回転で
+          day1 以降に入場する個体は ``follows`` にも ``contacts`` にも載らない。すると
+          ``add_contact`` の「双方が contacts に居るときだけ」という条件(下)が永久に
+          満たされず、**対面で会話しても DM の相手として登録されない**(= 途中入場者は
+          原理的に DM を受け取れない)。タイムラインもフォロー 0 のまま固定される。
+        ★分布は ``init_follows`` と同じ「候補から重複なし k 人」。乱数は個体キーの
+          **新 named stream** から引く(``RngHub.stream`` は呼ぶたびに新しい Generator を
+          派生するので、既存の draw 列は 1 粒も動かない)。
+        ★冪等: 既に居る個体には一切触れない(day0 の ``init_follows`` の結果を壊さない)。
+        """
+        aid = int(aid)
+        if aid in self.follows:
+            return
+        others = candidates or []
+        got: set = set()
+        if others and int(k) > 0:
+            # ★``init_follows`` は ``rng.choice(..., replace=False)`` を使うが、あれは母集団
+            #   全体の置換を作るので 25 万人 × 2 万入場では現実的でない。ここは
+            #   「整数を引いて重複を捨てる」= 同じ「重複なし k 人の一様抽出」を O(k) で行う
+            #   (専用 stream なので他の draw 列には一切影響しない)。
+            for _ in range(int(k) * 4):
+                if len(got) >= min(int(k), len(others)):
+                    break
+                cand = int(others[int(rng.integers(len(others)))])
+                if cand != aid:
+                    got.add(cand)
+        self.follows[aid] = got
+        self.contacts[aid] = set()
+
     def add_contact(self, a: int, b: int) -> None:
         if a in self.contacts and b in self.contacts:
             self.contacts[a].add(b)

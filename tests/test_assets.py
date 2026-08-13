@@ -558,10 +558,19 @@ def test_inheritance_moves_money_and_assets_to_the_household(tmp_path):
 
 
 def test_absent_household_members_are_not_silently_lost(tmp_path):
-    """★街に居ない世帯員(プール退場中)は相続人になれないが、**人数を必ず残す**。"""
+    """★街に居ない世帯員(プール退場中)は相続人になれないが、**人数を必ず残す**。
+
+    ★退場の再現は**本物と同じ形**にしてある(レーン甲 2026-08-13): ``_phase_pool_rotation`` は
+      ``sim.agents`` を present だけに差し替え、``agent_by_id`` からは**消さない**。以前この
+      テストは ``agent_by_id.pop`` で退場を模しており、名簿が退場者を保持するという実装の
+      事実(= 幽霊書き込みの温床)を回避してしまっていた。
+    """
     sim = _armed(tmp_path, "as_absent", n_agents=24)
     victim = _household_victim(sim)
-    gone = sim.agent_by_id.pop(victim.housemates[0])   # プール退場を再現(脱水されて居ない)
+    gone = sim.agent_by_id[victim.housemates[0]]
+    sim.agents = [a for a in sim.agents if a.id != gone.id]   # プール退場を再現
+    sim.invalidate_present_index()
+    assert sim.agent_by_id.get(gone.id) is gone, "名簿は退場者を保持する(実装の事実)"
     victim.money = 4_000.0
     _die(sim, victim)
     A.phase(sim, 1, 10)

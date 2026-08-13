@@ -1158,6 +1158,7 @@ class Simulation:
                 _mind_mod.assign(self, agent)
                 self.agents.append(agent)
         self.agent_by_id = {a.id: a for a in self.agents}
+        self._present_ids = None                  # 在場索引(present predicate)は遅延構築
         # 第89: ペルソナ対合(A↔B の相互交換)を名簿が出揃った時点で 1 回だけ組む。
         # 専用 stream からのみ引く=既存 draw 順に干渉しない。既定 OFF は no-op。
         _ablate_mod.finish_placebo(self)
@@ -1315,13 +1316,21 @@ class Simulation:
                                            interval=_shcfg["interval"],
                                            float_digits=_shcfg["float_digits"])
             if _shcfg["enabled"] else None)
+        # ---- A13 日次入場者名簿サイドカー(レーン丙 2。observer.roster_daily・既定 OFF)----
+        # traits.json は day0 の名簿・agents.json はその瞬間の在場者しか写さないので、プール
+        # 回転で day1 以降に入場する個体(finals 構成で 20.9 万人)の素性がどこにも残らない。
+        # 観測側だけで閉じる 1 枚のサイドカーで塞ぐ(動力学は本層のバッファを 1 度も読まない)。
+        from ..observer import roster as _roster_mod
+        _rostercfg = _roster_mod.cfg_of_config(cfg)
+        self.roster_sc = (_roster_mod.RosterDaily(self.out_dir)
+                          if _rostercfg["enabled"] else None)
         # ---- W4-E: finalize のメモリ有界化をサイドカーへも配る(同一 conf キー)----
         # サイドカーは生成条件がばらばら(indoor.tracks / work.ledger / economy.sidecar /
-        # cognition.channels / g_update)で __init__ の各所で作られるので、**全部そろった
-        # ここで 1 度だけ**配る。既定 OFF では apply_cfg が何も触らない = バイト一致。
-        # 配り漏れ(新サイドカー追加時)は tests が Simulation の属性を走査して検出する。
+        # cognition.channels / g_update / observer.roster_daily)で __init__ の各所で作られる
+        # ので、**全部そろったここで 1 度だけ**配る。既定 OFF では apply_cfg が何も触らない
+        # = バイト一致。配り漏れ(新サイドカー追加時)は tests が Simulation の属性を走査して検出する。
         for _sc in (self.indoor_tracks, self.org_ledger_sc, self.finance_sc,
-                    self.channels_sc, self.cognition_g_sc):
+                    self.channels_sc, self.cognition_g_sc, self.roster_sc):
             if _sc is not None:
                 _finalize_mod.apply_cfg(_sc, self._finalize_cfg)
         # ---- レーン D1(第109): 「起動時セグメント」の終端印 ------------------------
@@ -1339,6 +1348,45 @@ class Simulation:
         #   tests/test_resume.py::test_init_event_mark_counts_the_startup_segment
         #   が `_init_event_mark == len(logger.events)` で検出する = トリップワイヤー。
         self._init_event_mark = len(self.logger.events)
+
+    # ------------------------------------------------- 在場述語(present predicate)
+    # ★なぜ要るか: ``agent_by_id`` は「これまで実体化した**全**個体」の索引で、プール回転で
+    #   街を出た個体を**意図的に消さない**(過去の参照 = 造語の作者名・DM 送信者名・関係台帳が
+    #   退場後も解決できるように)。したがって ``agent_by_id.get(aid) is None`` は
+    #   **決して真にならない**。「街から居なくなった」の判定にそれを使っていた分岐は全て死んで
+    #   おり、脱水済み(detached)のオブジェクトへ書き込んでいた = 書いた値は次の hydrate
+    #   (退場時スナップショット)で捨てられる。金を動かす経路ではこれが**保存則の破れ**になる。
+    # ★正典の参照実装は ``medical._agent_by_id``(sim.agents 走査)だが O(N) なので、
+    #   ここでは id 集合を持って O(1) にする(25万体で毎 step 引かれる)。
+    # ★索引の維持: ``self.agents`` を差し替える地点は 4 つしかない(構築 / プール回転 /
+    #   checkpoint.load / resume 復元)。回転と resume では明示的に無効化し、それ以外は
+    #   「要素数が変わったら作り直す」遅延検査で拾う(checkpoint.load は本体不触の掟がある)。
+    def invalidate_present_index(self) -> None:
+        """在場索引を捨てる(``self.agents`` を差し替えた直後に呼ぶ)。"""
+        self._present_ids = None
+        self._follow_cands = None        # A1 の初期フォロー母集団(同じ寿命)
+
+    def _present_ids_view(self) -> set:
+        ids = getattr(self, "_present_ids", None)
+        if ids is None or len(ids) != len(self.agents):
+            ids = {int(a.id) for a in self.agents}
+            self._present_ids = ids
+        return ids
+
+    def is_present(self, agent_id) -> bool:
+        """その id の個体が**いま街に居る**(= ``sim.agents`` に居る)か。O(1)。"""
+        return int(agent_id) in self._present_ids_view()
+
+    def present_agent(self, agent_id):
+        """在場なら Agent、不在(退場 / 未実体化)なら None。O(1)。
+
+        ★``agent_by_id.get`` の**正しい置き換え**。返るのは常に present な実体なので、
+          ここに書いた値は次の dehydrate で退避され、再来街時に持ち越される。
+        """
+        aid = int(agent_id)
+        if aid < 0 or aid not in self._present_ids_view():
+            return None
+        return self.agent_by_id.get(aid)
 
     # ------------------------------------------------------ LLM ジャーナル(第71)
     # ObserverLogger の flush_segment / checkpoint と同じ「checkpoint が真の境界」流儀で、
@@ -1760,7 +1808,128 @@ class Simulation:
         self._attach_pool_org(agent, record)
         # 職場束ね直し(work.bind_workplace。既定 OFF は no-op=work_node の付与状況とも不変)。
         self._bind_pool_workplace(agent, record)
+        # 賃金多様性 WAGE(第112。既定 OFF=no-op=agent.wage も属性も 1 つも動かない)。
+        # ★**職場束ね直しの後**に置く: 判定条件の 1 つが「勤務窓を持つか」で、pool の L2 は
+        #   occupation が persona._WORK_CAT に載らないため勤務窓を持つのは bind の後だけ
+        #   (前に置くと 224,240 人が丸ごと対象外になる)。org 配属(industry/規模帯の出所)も
+        #   既に済んでいるので、ここが台帳情報の揃う唯一の点になる。
+        scheduler.wage_assign(self, agent, record)
+        # 起動時 1 回の配布を「入場駆動」へ(レーン乙 ブロック2。既定 OFF の機構は no-op)。
+        self._init_pool_agent_extras(agent, record)
         return agent
+
+    # ---------------------------------------------- 起動時1回の配布 → 入場駆動(ブロック2)
+    # ★なぜ要るか: 下の族はどれも ``__init__`` の一本道で「その瞬間 sim.agents に居た個体」
+    #   にだけ配られる。プール回転で day1 以降に入場する個体(finals 構成で 20.9 万人)は
+    #   **一度も配布を受けない** = SNS を持たない・顔なじみが 0・SDT/needs/価値/入力解像度の
+    #   個人差が無い・観光客にならない・長期目標を持たない、という別種の住民になっていた。
+    # ★規律: (a) 冪等(同じ個体を二度通しても値が動かない) (b) 既存の draw 列を 1 粒も
+    #   動かさない(新規抽選は**個体キーの新 named stream**か純関数ハッシュのみ。RngHub.stream
+    #   は呼ぶたびに新しい Generator を派生するので、引いても他の列に影響しない)
+    #   (c) 当該機構が OFF なら 1 行も通らない = 既定プロファイルはバイト一致。
+    def _init_pool_agent_extras(self, agent, record: dict) -> None:
+        from .. import diversity as _diversity_mod
+        from .. import household as _household_mod
+        from .. import inner_life as _inner_life_mod
+        from ..factors import psych as psych_mod
+        # ★day0 の着席では 1 行も通さない: ``__init__`` はこの後で**同じ配布を名簿全体へ**
+        #   一括で行う(SNS init_follows / 顔なじみ / SDT / needs / 価値 / LOD / 世帯 /
+        #   観光 / inner_life)。ここで先回りすると二重配布になるうえ、まだ ``agent_by_id``
+        #   すら組まれていない(在場述語が引けない)。``_init_event_mark`` は __init__ の
+        #   **最後の文**で据わる印なので、これが在る = 構築が終わっている、と読める。
+        if getattr(self, "_init_event_mark", None) is None:
+            return
+        aid = int(agent.id)
+        # A1 SNS: フォローと DM 可能リストを持たせる。``Internet.add_contact`` は
+        #   「双方が contacts に居る」ときしか効かない無言 no-op なので、これが無いと
+        #   途中入場者は**永久に DM を受け取れない**(会話しても contacts に載らない)。
+        self.net.ensure(aid, self.hub.stream("follows_entry", aid),
+                        k=int(self.cfg.get("net", {}).get("follow_k", 6)),
+                        candidates=self._pool_follow_candidates())
+        # A2 顔なじみ: 同じ住居/職場の現行グループへ接続(起動時ブロックと同じ「1人あたり最大3人」)。
+        self._link_colocated(agent)
+        # A4 SDT / A5 集団効力感 / A6 欲求プロファイル / A7 価値の充足 / A8 入力解像度LOD
+        if self.psychcfg["sdt"]["enabled"] and not agent.drive_mods:
+            from ..factors.registry import sdt_params
+            agent.drive_mods = sdt_params(agent.traits, self.hub.stream("sdt", aid),
+                                          self.psychcfg["sdt"])
+        if self.psychcfg["collective"]["enabled"]:
+            # ★冪等判定は factors 層(ensure_collective)に置く: 因子名を engine に
+            #   書くのは no-fingerprint 契約(tests/test_contracts.py)違反。
+            psych_mod.ensure_collective(agent, self.hub.stream("collective", aid))
+        needscfg = getattr(self, "needscfg", None)
+        if needscfg and needscfg["enabled"] and not getattr(agent, "needs_mods", None):
+            from ..needs import build_mods as _needs_build_mods
+            agent.needs_mods = _needs_build_mods(agent, self.hub.stream("needs", aid),
+                                                 needscfg)
+        freedomcfg = getattr(self, "freedomcfg", None)
+        if freedomcfg and freedomcfg["open_actions"] and not getattr(agent, "sat", None):
+            from .. import values as _values_mod
+            agent.sat = {t: 0.5 for t in _values_mod.TAGS}
+            _values_mod._refresh_mods(agent, freedomcfg)
+        if getattr(self, "inputrescfg", None) and not getattr(agent, "input_res", None):
+            from ..cognition import lod as _lod_mod
+            lv = _lod_mod.assign_axis([aid], self.hub.stream("lod_input_res", aid),
+                                      self.inputrescfg["levels"])[aid]
+            spec = self.inputrescfg["levels"][lv]
+            agent.input_res = {"level": lv,
+                               **{k: v for k, v in spec.items() if k != "share"}}
+        # A9 世帯: pool 名簿由来の世帯へ冪等に着席(既定 OFF=no-op。household.pool_bind)。
+        _household_mod.bind_pool_household(self, agent, record)
+        # A10 観光・多言語: 個体ハッシュの決定論割当(day0 列挙順の前方切りではない)。
+        _diversity_mod.assign_for_entry(self, agent)
+        # A11 内面: 長期目標・趣味(起動時 precompute と同じ純関数。L1 は増やさない)。
+        _inner_life_mod.assign_for_entry(self, agent)
+
+    def _pool_follow_candidates(self) -> list:
+        """A1 の初期フォロー母集団(いま街に居る個体の id 昇順)。決定論。
+
+        ``init_follows`` が起動時に使う母集団(= その時点の全個体)と同じ意味。回転の途中で
+        呼ばれるので「前日の在場者」を見るが、それも決定論なので resume で同一に再現される。
+        ★1 回の回転で 2 万人が入場するので、**1 回の回転につき 1 度だけ**組んで使い回す
+          (毎回 25 万件を並べ直すと O(入場者 × 在場者)になる)。在場索引と同じ寿命なので
+          ``invalidate_present_index`` で一緒に捨てる。"""
+        cands = getattr(self, "_follow_cands", None)
+        if cands is None:
+            cands = sorted(int(a.id) for a in self.agents)
+            self._follow_cands = cands
+        return cands
+
+    def _link_colocated(self, agent) -> None:
+        """A2: 同じ住居建物 / 職場建物の**在場**メンバへ顔なじみを張る(1 人あたり最大 3 人)。
+
+        起動時の「顔なじみ」ブロックと同じ規則。索引は building → 参入順の id 列で持ち、
+        入場のたびに末尾へ足す(参入順 = 決定論)。相手は在場述語で絞る(退場者へ書かない)。"""
+        idx = getattr(self, "_acq_index", None)
+        if idx is None:
+            from collections import defaultdict as _dd
+            idx = _dd(list)
+            for a in self.agents:
+                if a.home_building:
+                    idx[("home", a.home_building)].append(int(a.id))
+                if a.work_building:
+                    idx[("work", a.work_building)].append(int(a.id))
+            self._acq_index = idx
+        aid = int(agent.id)
+        for kind, bld in (("home", agent.home_building), ("work", agent.work_building)):
+            if not bld:
+                continue
+            bucket = idx[(kind, bld)]
+            n = 0
+            for oid in reversed(bucket):           # 直近に入った同建物の面々から 3 人まで
+                if n >= 3:
+                    break
+                if oid == aid:
+                    continue
+                b = self.present_agent(oid)
+                if b is None:
+                    continue
+                n += 1
+                self.net.add_contact(aid, oid)
+                agent.mem.record_contact(oid, b.name, 0, "顔なじみ")
+                b.mem.record_contact(aid, agent.name, 0, "顔なじみ")
+            if aid not in bucket:
+                bucket.append(aid)
 
     def _attach_pool_org(self, agent, record: dict) -> None:
         """pool record の org_id/role で org へ配属する(ON 時のみ・決定論・乱数ゼロ)。
@@ -1865,6 +2034,7 @@ class Simulation:
             return
         from collections import OrderedDict
         self.agent_by_id = {a.id: a for a in self.agents}
+        self.invalidate_present_index()           # 在場 = checkpoint が復元した present 個体
         prev_min = self.clock.sim_min(max(0, int(start) - 1))
         self._pool_day = prev_min // 1440 if start > 0 else 0
         path = self._pool_sidecar_path(start)
@@ -1898,6 +2068,7 @@ class Simulation:
                 raise FileNotFoundError(
                     f"resume 元に checkpoint が無い: {Path(resume_from) / 'checkpoint'}")
             start = checkpoint.load(self, ckpt)
+            self.invalidate_present_index()       # 在場索引は load 済みの sim.agents から引き直す
             self._restore_pool_resume(start)      # pool ON 時のみ: ドーマント/日境界の復元
             # 第57バッチ タスクC: 分割実行で clean finalize しても前チャンクの canonical を失わない
             # (logger._finalize_stream が resume 時のみ既存 canonical を先頭に結合する)。fresh ラン不変。
@@ -1912,6 +2083,8 @@ class Simulation:
                 self.channels_sc._resumed = True
             if self.cognition_g_sc is not None:   # 第82: g/θ 軌跡サイドカーも同様
                 self.cognition_g_sc._resumed = True
+            if self.roster_sc is not None:        # A13: 日次入場者名簿も canonical を先頭結合
+                self.roster_sc._resumed = True
         if every > 0:
             save_config(self.cfg, self.out_dir)   # 途中再開に備え config を先出しする
         for step in range(start, int(self.cfg.run.n_steps)):
@@ -1939,6 +2112,8 @@ class Simulation:
                     self.channels_sc.flush_segment()
                 if self.cognition_g_sc is not None:  # 第82: g/θ 軌跡も対でセグメント化
                     self.cognition_g_sc.flush_segment()
+                if self.roster_sc is not None:      # A13: 日次入場者名簿も対でセグメント化
+                    self.roster_sc.flush_segment()
                 did_flush = True
             if flush_every > 0 and not did_flush \
                     and (step + 1) % flush_every == 0:
@@ -1958,6 +2133,8 @@ class Simulation:
                     self.channels_sc.flush_segment()
                 if self.cognition_g_sc is not None:
                     self.cognition_g_sc.flush_segment()
+                if self.roster_sc is not None:
+                    self.roster_sc.flush_segment()
         return self.finalize()
 
     def _agents_json_records(self) -> list:
@@ -2031,6 +2208,8 @@ class Simulation:
             self.channels_sc.finalize()
         if self.cognition_g_sc is not None:       # 第82: g/θ 軌跡を結合(part→canonical)
             self.cognition_g_sc.finalize()
+        if self.roster_sc is not None:            # A13: 日次入場者名簿を結合(part→canonical)
+            self.roster_sc.finalize()
         # B4 item#4: 会社観測(indoor_fields/ledger)ON かつ org 配属があるランは agents.json を再出力し
         # org_id/org_role を載せる(org 配属は run 中の遅延初期化=__init__ 時点では未付与のため)。
         # OFF は再出力しない=既存 agents.json とバイト一致(ゴールデン非該当)。
@@ -2270,6 +2449,15 @@ class Simulation:
         _tiprov = _train_prov.provenance(self)
         if _tiprov is not None:
             summary["transit_interior"] = _tiprov
+        # ---- E5 職場束ね coverage(レーン丙 3。pool ランで org/束ねが ON のときだけ)------
+        # 既存の検収量(_pool_org_stat / _workbind_agg)は**累計**で、回転のたびに +1 される
+        # ため「担い手が痩せていても増えて見える」。ここでは**最終日の在場者を分母にした
+        # 保持率**を同じキーに並べて置き、累計との乖離をそのまま観測量にする。
+        # 該当しないラン(pool OFF / org も束ねも OFF)は None = キー自体を出さない。
+        from .. import work as _work_prov
+        _wkprov = _work_prov.provenance(self)
+        if _wkprov is not None:
+            summary["workplace_coverage"] = _wkprov
         (self.out_dir / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         return summary

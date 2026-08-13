@@ -401,7 +401,7 @@ def observe_end(sim, step: int, sim_min: int, since_idx: int) -> None:
     if since_idx < 0:
         return
     for row in _channels.observe(sim, step, sim_min, since_idx):
-        agent = sim.agent_by_id.get(int(row[2]))
+        agent = sim.present_agent(int(row[2]))     # ★レーン乙: 在場述語(脱水済みへ書かない)
         if agent is not None:
             agent._fire_obs = tuple(row[len(_channels.KEY_COLUMNS):])
 
@@ -556,7 +556,10 @@ def due_events(sim, step: int, sim_min: int, active) -> dict[int, dict]:
     # ---- 4) 期限の来たイベントを取り出す(全順序)----
     out: dict[int, dict] = {}
     for at, aid, reason in q.pop_due(int(sim_min)):
-        agent = sim.agent_by_id.get(aid)
+        # ★レーン乙 ブロック7: 発火キューの id は日を跨いで残るので、街を出た個体が
+        #   永久に pop され続け、_fire_pred / 可塑性の更新が捨てられる実体へ書かれ、
+        #   さらに次周期へ再スケジュールされて「幽霊が考え続ける」状態になっていた。
+        agent = sim.present_agent(aid)
         if agent is None:
             continue
         ctx = ctx_of.get(aid, WALKING)

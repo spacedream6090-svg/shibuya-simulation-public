@@ -33,7 +33,10 @@
   ★「創業者が何を所有して始めたか」(MEMORY: org-emergence-goal)の軸がここに載る。
 
 **(D) 資産保存則の検査**(研究文書 §4-3)。
-  `Σ 所有者別保有数 + K5 − RoW 生成 = 初期ストック` をカテゴリ別に再計算して残差を出す。
+  `Σ 所有者別保有数 + K5 − RoW 生成 − 境界流入 = 初期ストック` をカテゴリ別に再計算して
+  残差を出す。**境界流入**(`rot_in`)はプール回転で day1 以降に街へ入ってきた個体の車両で、
+  「初期ストックの数え漏れ」ではなく域外→域内の実在フロー(SNA 2008 の境界フロー)。
+  3 項とも 0 の旧ラン(サイドカーに欄が無い)では式が `live − stock0` へ退化する。
   シム側(`summary.assets.conservation`)と**独立に**台帳の行から数え直すので、
   台帳の書き手にバグがあれば必ず食い違う。
 
@@ -284,12 +287,24 @@ def summarize(ledger: dict, transfers: list, cash: dict, *,
     }
 
     # ---- (D) 資産保存則(台帳の行から**独立に**数え直す)----
+    # 恒等式は `live + k5 − born − rot_in = stock0`(カテゴリ別)。
+    # ★`born`(製造・輸入)/`k5`(廃棄・滅失)/`rot_in`(**境界流入** = プール回転で街に
+    #   入ってきた既存資産 = A12)はサイドカーの累積カウンタで、**旧ランには存在しない**。
+    #   欠落は 0 として扱う(= 3 項とも 0 だった第109 のランでは式が `live − stock0` に
+    #   退化して従来と 1 文字も違わない結果になる)。
     stock0 = {k: int(v) for k, v in (ledger.get("stock0") or {}).items()}
+    born_t = {k: int(v) for k, v in (ledger.get("born") or {}).items()}
+    k5_t = {k: int(v) for k, v in (ledger.get("k5") or {}).items()}
+    rot_t = {k: int(v) for k, v in (ledger.get("rot_in") or {}).items()}
     conservation = {}
-    for cat in sorted(set(by_cat) | set(stock0)):
+    for cat in sorted(set(by_cat) | set(stock0) | set(born_t) | set(k5_t) | set(rot_t)):
         live = int(by_cat.get(cat, 0))
         s0 = int(stock0.get(cat, 0))
-        conservation[cat] = {"live": live, "stock0": s0, "residual": live - s0}
+        born = int(born_t.get(cat, 0))
+        k5 = int(k5_t.get(cat, 0))
+        rin = int(rot_t.get(cat, 0))
+        conservation[cat] = {"live": live, "born": born, "k5": k5, "rot_in": rin,
+                             "stock0": s0, "residual": live + k5 - born - rin - s0}
     sim_side = ledger.get("conservation") or {}
 
     return {
@@ -358,10 +373,12 @@ def render(res: dict) -> str:
          f"| 組織だけの Gini | {nw['org_holding_gini']} |", "",
          "## (D) 資産保存則(台帳の行から独立に数え直す)", ""]
     ok = True
-    L += ["| カテゴリ | 生存行 | 初期ストック | 残差 |", "|---|---|---|---|"]
+    L += ["| カテゴリ | 生存行 | 製造 | 廃棄 | 境界流入 | 初期ストック | 残差 |",
+          "|---|---|---|---|---|---|---|"]
     for cat, c in sorted(res["conservation"].items()):
         ok = ok and c["residual"] == 0
-        L.append(f"| {cat} | {c['live']} | {c['stock0']} | {c['residual']} |")
+        L.append(f"| {cat} | {c['live']} | {c.get('born', 0)} | {c.get('k5', 0)} | "
+                 f"{c.get('rot_in', 0)} | {c['stock0']} | {c['residual']} |")
     L += ["", f"- 判定: **{'PASS' if ok else 'FAIL'}**"
           f"(シム側の申告と一致: {res['conservation_agrees']})", "",
           "## 相続(O3)", "",

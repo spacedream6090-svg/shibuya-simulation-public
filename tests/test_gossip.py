@@ -65,6 +65,14 @@ class _Sim:
         self.logger = ObserverLogger(Path(tmp_path))
         self.gossipcfg = gossip.build_cfg({"enabled": True, **(cfg_over or {})})
         self.cfg = {}          # cfg_of は gossipcfg キャッシュを優先=ここは未使用
+        self._present = {a.id for a in agents}
+
+    # 在場述語(Simulation.present_agent と同じ契約)。このスタブでは全員が在場。
+    def is_present(self, agent_id) -> bool:
+        return int(agent_id) in self._present
+
+    def present_agent(self, agent_id):
+        return self.agent_by_id.get(int(agent_id)) if self.is_present(agent_id) else None
 
 
 def _contact(agent, other_id, last_step):

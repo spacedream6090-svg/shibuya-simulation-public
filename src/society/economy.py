@@ -12,8 +12,11 @@
 - initial_money: 職業・来街者フラグ → 手持ち初期値(rng)。
 - assign_part_time: 学生・フリーター等に実在 POI(shop/food)のバイトを割当。
 - price_of: 消費カテゴリ → 価格(食事/買い物/nightlife)。
+- 賃金多様性 WAGE(既定 OFF): 職種適合額・支給周期・給料日・賞与の純関数群(末尾 §WAGE)。
 """
 from __future__ import annotations
+
+import hashlib
 
 import numpy as np
 
@@ -179,6 +182,11 @@ def build_economy(raw: dict | None) -> dict:
         "payment": build_payment_cfg(raw.get("payment")),
         "bank": build_bank_cfg(raw.get("bank")),
         "vc": build_vc_cfg(raw.get("vc")),
+        # ---- 賃金多様性 WAGE(既定 OFF=誰も読まない=バイト一致)。末尾 §WAGE を参照 ----
+        # ★最低賃金の床は wage_profile にも渡す(対象は全員「雇用される労働者」= 最低賃金法の
+        #   適用対象)。min_wage_hourly=0.0(既定)なら床なし=従来と完全同一。
+        "wage_profile": build_wage_profile_cfg(raw.get("wage_profile"),
+                                               min_wage_hourly=min_wage),
     }
 
 
@@ -681,3 +689,462 @@ def build_vc_cfg(raw) -> dict:
         "market_ref": float(raw.get("market_ref", 6.0)),      # 在館数の基準(commerce 混雑近傍)
         "network_ref": float(raw.get("network_ref", 10.0)),   # 関係次数の基準
     }
+
+
+# =============================================================== §WAGE 賃金多様性
+# ユーザー要求(2026-08-13):「L2 の本業日給 0 の穴を実装で塞ぐ。ただし月給なのか日給か・
+# 給料が振り込まれるタイミング・ボーナスの有無・職種に見合った金額か —— 給料にも多様性がある
+# 実装に」。
+#
+# 何が穴だったか(実測):
+#   ① プールの L2(域内従業者 224,240 人)のうち 198,264 人は職業名が WAGE_CAT(25 語)に
+#      無いので `wage_amount` が 0 を返す = **本業の日給が構造的に 0 円**。
+#   ② 残る層も wage は「会社員 12,000 / 店員 9,000 / 自営 10,000」の**実質 3 値**で、
+#      台帳が持っている産業(14 種)・規模帯(8 区分)・役割(40 種)・職業名(146 種)の
+#      情報が 1 つも賃金に反映されていなかった。
+#   ③ 支給周期は「勤務完遂ごとの日割り」か「口座 ON の月給まとめ」の 2 択で、給料日は
+#      全員同一(payday_dom=25)・賞与は存在しない。
+#
+# ここが持つのは**純関数だけ**(ログしない・sim を触らない・乱数を 1 粒も引かない)。
+# 個体差・給料日・賞与の割当はすべて blake2b の安定ハッシュ(= プロセス跨ぎ・seed 非依存・
+# resume 不変)で決める = **新しい乱数 stream を 1 本も足さない**。
+# エンジン側の配線(日次清算・支給・搬送)は engine/scheduler.py の `_phase_wage_profile`。
+#
+# 金額の根拠(公表統計の水準に寄せた実額。圧縮スケールは掛けない):
+#   産業別「きまって支給する現金給与額」(賃金構造基本統計調査・一般労働者)
+#   企業規模別賃金格差(同上。小規模ほど低い)
+#   賞与: 支給事業所割合は規模が大きいほど高く、支給月数も大きい(毎月勤労統計)
+#   給料日: 25 日が最頻、次いで 15 日 / 10 日 / 月末 / 20 日(民間の一般的な慣行)
+#   支給形態: 日本の常用労働者は圧倒的に月給制。**週給は作らない** — 週給制は米英の慣行で、
+#     労働基準法 24 条「毎月 1 回以上・一定期日払い」の下では月給が既定。ここで週給を足すと
+#     「多様性」ではなく非実在の制度を世界に置くことになる。
+
+#: 産業キー(組織台帳 industry_key)→ 月額の基準(円)。所定内給与の水準。
+INDUSTRY_MONTHLY: dict[str, float] = {
+    "IT": 380000.0,     # 情報通信業
+    "FI": 395000.0,     # 金融業・保険業
+    "PS": 390000.0,     # 学術研究・専門・技術サービス業
+    "CN": 355000.0,     # 建設業
+    "RE": 345000.0,     # 不動産業・物品賃貸業
+    "ED": 330000.0,     # 教育・学習支援業
+    "MF": 320000.0,     # 製造業
+    "WR": 310000.0,     # 卸売業・小売業
+    "TR": 310000.0,     # 運輸業・郵便業
+    "CS": 305000.0,     # 複合サービス事業
+    "MW": 300000.0,     # 医療・福祉
+    "SV": 285000.0,     # サービス業(他に分類されないもの)
+    "AM": 280000.0,     # 娯楽業
+    "LS": 275000.0,     # 生活関連サービス業
+    "FB": 260000.0,     # 宿泊業・飲食サービス業
+}
+
+#: 規模帯(組織台帳 size.band)→ 月額の係数(企業規模間賃金格差)。
+BAND_MULT: dict[str, float] = {
+    "1-4": 0.84, "5-9": 0.88, "10-19": 0.92, "20-29": 0.95,
+    "30-49": 0.98, "50-99": 1.00, "100-299": 1.06, "300+": 1.16,
+}
+_BAND_ORDER: tuple[str, ...] = ("1-4", "5-9", "10-19", "20-29",
+                                "30-49", "50-99", "100-299", "300+")
+
+#: 職種群 → 月額の係数(産業基準に対する相対)。役割・職業名の**内容**で決まる。
+GROUP_MULT: dict[str, float] = {
+    "exec": 1.30,          # 経営層
+    "expert": 1.10,        # 有資格・高度専門(士業・医療専門職・技術者・設計/施工管理)
+    "manager": 1.05,       # 現場の長(店長・教室長・司令)
+    "general": 1.00,       # 総合職・企画・担当(区分の既定)
+    "sales": 0.98,         # 営業・仕入・渉外
+    "professional": 0.95,  # 専門職(意匠・制作・教員・調理・施術)
+    "instructor": 0.78,    # 講師(学習塾・語学・音楽。教員より低い実態)
+    "manual": 0.75,        # 現業(警備・保守・運搬・製造・仕分)
+    "clerical": 0.72,      # 事務・受付・管理事務
+    "service": 0.68,       # 接客・販売・補助
+    "cleaning": 0.66,      # 清掃(現業のうち最も低い層)
+}
+_GROUP_DEFAULT = "general"
+
+#: 職業名 / 役割名 → 職種群の判定表。**先頭から部分一致**(具体的な語ほど先に置く)。
+#: ここに無い語は "general"。台帳に無い職業を発明しないのと同じ規律で、語は
+#: data/organizations_shibuya_census.json の roles と persona プールの occupation にある語だけ。
+OCC_GROUP_RULES: tuple[tuple[str, str], ...] = (
+    # ---- 経営層 ----
+    ("経営者", "exec"), ("支配人", "exec"), ("所長", "exec"),
+    # ---- 現場の長(「店長」は「店員」より先に判定する)----
+    ("店長", "manager"), ("教室長", "manager"), ("司令", "manager"),
+    ("責任者", "manager"),
+    # ---- 清掃(現業より先。「夜間清掃」「清掃作業員」を拾う)----
+    ("清掃", "cleaning"),
+    # ---- 有資格・高度専門 ----
+    ("弁護士", "expert"), ("税理士", "expert"), ("会計士", "expert"),
+    ("薬剤師", "expert"), ("看護師", "expert"), ("エンジニア", "expert"),
+    ("開発", "expert"), ("設計", "expert"), ("施工管理", "expert"),
+    ("技士", "expert"), ("アナリスト", "expert"), ("コンサルタント", "expert"),
+    ("プロダクトマネージャー", "expert"),
+    # ---- 講師(教員より先。塾/語学/音楽の講師は教員と水準が違う)----
+    ("講師", "instructor"),
+    # ---- 専門職 ----
+    ("教員", "professional"), ("デザイナー", "professional"),
+    ("ディレクター", "professional"), ("プランナー", "professional"),
+    ("調理師", "professional"), ("職人", "professional"),
+    ("美容師", "professional"), ("セラピスト", "professional"),
+    ("整復師", "professional"), ("鍼灸師", "professional"),
+    ("衛生士", "professional"), ("エステティシャン", "professional"),
+    ("カメラマン", "professional"), ("技術者", "professional"),
+    ("インストラクター", "professional"), ("登録販売者", "professional"),
+    ("相談員", "professional"), ("スタイリスト", "professional"),
+    ("クリーニング師", "professional"), ("プロデューサー", "professional"),
+    # ---- 現業(「販売員」より先に「作業員」等を判定)----
+    ("警備", "manual"), ("巡回", "manual"), ("保守", "manual"),
+    ("運転手", "manual"), ("ドライバー", "manual"), ("配送", "manual"),
+    ("配車", "manual"), ("倉庫", "manual"), ("作業員", "manual"),
+    ("仕分", "manual"), ("荷役", "manual"), ("回収", "manual"),
+    ("製造", "manual"), ("印刷", "manual"), ("仕上げ", "manual"),
+    ("生産管理", "manual"), ("設備", "manual"),
+    # ---- 営業・仕入 ----
+    ("営業", "sales"), ("外交員", "sales"), ("バイヤー", "sales"),
+    ("仕入", "sales"), ("販売運営", "sales"),
+    ("コーディネーター", "sales"), ("アドバイザー", "sales"),
+    # ---- 事務(「事務」は「金融事務」「医療事務」等も拾う)----
+    ("事務", "clerical"), ("受付", "clerical"), ("オペレーター", "clerical"),
+    ("管理員", "clerical"), ("在庫管理", "clerical"), ("レンタル管理", "clerical"),
+    ("制作進行", "clerical"), ("パラリーガル", "clerical"),
+    ("フロント", "clerical"), ("窓口", "clerical"), ("法務", "clerical"),
+    ("財務", "clerical"), ("採用", "clerical"), ("コーポレート", "clerical"),
+    # ---- 接客・販売・補助 ----
+    ("販売員", "service"), ("店員", "service"), ("接客", "service"),
+    ("ホール", "service"), ("キッチン", "service"), ("バリスタ", "service"),
+    ("バーテンダー", "service"), ("フロア", "service"), ("音響", "service"),
+    ("スタッフ", "service"), ("アシスタント", "service"),
+    ("補助", "service"), ("助手", "service"), ("介護士", "service"),
+    ("部員", "service"), ("係", "service"),
+)
+
+#: 支給形態が日給になりうる職種群(日雇い・日払いの慣行がある層)。
+#: それ以外は必ず月給(労基法 24 条の「毎月 1 回以上・一定期日払い」の下では月給が既定)。
+DAILY_GROUPS: frozenset[str] = frozenset({"service", "manual", "cleaning"})
+
+#: 給料日(暦の何日)の分布。0 = 月末。25 日が最頻という民間の慣行に寄せた重み。
+PAYDAY_WEIGHTS: tuple[tuple[int, float], ...] = (
+    (10, 0.15), (15, 0.18), (20, 0.12), (25, 0.40), (0, 0.15),
+)
+
+#: 賞与の支給日候補(夏・冬とも上旬〜中旬が慣行)。給料日と重ならない日を選ぶ。
+BONUS_DOMS: tuple[int, ...] = (5, 10, 15)
+
+
+def build_wage_profile_cfg(raw, min_wage_hourly: float = 0.0) -> dict:
+    """賃金多様性 WAGE の設定を正準化(既定 OFF=現行挙動と完全同一)。
+
+    ON 時に効くもの(すべて決定論・乱数ゼロ・LLM 呼数不変):
+      月額 = 産業基準 × 職種群係数 × 規模帯係数 × 個体差(±spread)
+      日額 = 月額 / month_workdays(既存 `agent.wage` の意味=1 日ぶんの賃金 に載せる)
+      支給周期 = 月給(既定)/ 日給(日雇い慣行のある職種群のうち daily_share)
+      給料日 = 職場(org)ごとに {10,15,20,25,月末} へ分散(同じ会社の人は同じ給料日)
+      賞与   = 職場ごとに支給有無・支給月・支給日・月数を割当(規模が大きいほど手厚い)
+
+    calendar=true のときだけ「暦の実日付」で給料日・賞与月を判定する(要
+    world.calendar.enabled)。false のときは口座 E5 と同じ「run 開始日=1 日」の
+    30 日周期で判定する(= 短いランでも給料日が必ず来る)。
+
+    min_wage_hourly(economy.min_wage_hourly の実効値。既定 0.0=床なし): 対象は全員
+    「雇用される労働者」なので**最低賃金法の適用対象**。月額の床 = 時給床 × 8h ×
+    month_workdays を張る(これが無いと零細飲食店の接客が法定水準を割る=実測で発見)。
+    """
+    raw = _to_container(raw)
+    industry = dict(INDUSTRY_MONTHLY)
+    industry.update({str(k): float(v)
+                     for k, v in dict(raw.get("industry_monthly", {})).items()})
+    group = dict(GROUP_MULT)
+    group.update({str(k): float(v)
+                  for k, v in dict(raw.get("group_mult", {})).items()})
+    band = dict(BAND_MULT)
+    band.update({str(k): float(v) for k, v in dict(raw.get("band_mult", {})).items()})
+    bonus_raw = _to_container(raw.get("bonus"))
+    month_workdays = max(1, int(raw.get("month_workdays", 20)))
+    hours = float(raw.get("day_hours", 8.0))
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "calendar": bool(raw.get("calendar", False)),
+        "month_workdays": month_workdays,
+        "day_hours": hours,
+        "min_monthly": max(0.0, float(min_wage_hourly)) * hours * month_workdays,
+        "spread": max(0.0, float(raw.get("spread", 0.15))),
+        "default_monthly": float(raw.get("default_monthly", 330000.0)),
+        "school_industry": str(raw.get("school_industry", "ED")),
+        "default_band": str(raw.get("default_band", "10-19")),
+        "daily_share": _clip01(float(raw.get("daily_share", 0.15))),
+        "industry_monthly": industry,
+        "group_mult": group,
+        "band_mult": band,
+        "payday_weights": _payday_weights(raw.get("payday_weights")),
+        "bonus": {
+            "enabled": bool(bonus_raw.get("enabled", True)),
+            "summer_months": [int(m) for m in
+                              (bonus_raw.get("summer_months") or (6, 7))],
+            "winter_month": int(bonus_raw.get("winter_month", 12)),
+            "doms": [int(d) for d in (bonus_raw.get("doms") or BONUS_DOMS)],
+            "months_min": float(bonus_raw.get("months_min", 1.0)),
+            "months_max": float(bonus_raw.get("months_max", 2.5)),
+            "share_min": _clip01(float(bonus_raw.get("share_min", 0.35))),
+            "share_max": _clip01(float(bonus_raw.get("share_max", 0.95))),
+        },
+    }
+
+
+def _payday_weights(raw) -> tuple[tuple[int, float], ...]:
+    """給料日の分布を正準化。dict {"25": 0.4, ...} / list [[25, 0.4], ...] のどちらも受ける。
+
+    未指定なら PAYDAY_WEIGHTS(民間の慣行)。重みは合計 1 に正規化する(設定の書き間違いで
+    「どの給料日にも当たらない個体」が出ないようにする)。日の昇順で畳むので決定論。"""
+    if not raw:
+        return PAYDAY_WEIGHTS
+    if isinstance(raw, dict):
+        pairs = [(int(k), float(v)) for k, v in raw.items()]
+    else:
+        pairs = [(int(p[0]), float(p[1])) for p in raw]
+    pairs = [(d, w) for d, w in sorted(pairs) if w > 0.0]
+    if not pairs:
+        return PAYDAY_WEIGHTS
+    total = sum(w for _d, w in pairs)
+    return tuple((d, w / total) for d, w in pairs)
+
+
+def stable_unit(salt: str, key: str) -> float:
+    """(用途 salt, 安定キー)→ [0,1) の一様値。blake2b=決定論・RngHub 無風・プロセス跨ぎ安定。
+
+    work._stable_uniform / ontology._stable_uniform と同流儀。**乱数 stream を 1 本も引かない**
+    ので、ON にしても既存の draw 順・golden は一切動かない(R1)。"""
+    h = hashlib.blake2b(f"{salt}\x1f{key}".encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(h, "big") / float(1 << 64)
+
+
+def occupation_group(occupation: str, role: str = "") -> str:
+    """職業名・役割名 → 職種群(GROUP_MULT のキー)。表に無ければ "general"。
+
+    職業名を先に見る(台帳の role より具体的=第111 レーン B の職業対応表が入っている)。
+    判定は**部分一致の先頭優先**なので、表の並び順が意味論そのものである
+    (例: 「店長」を「店員」より先に置く / 「清掃」を現業より先に置く)。"""
+    for text in (str(occupation or ""), str(role or "")):
+        if not text:
+            continue
+        for word, grp in OCC_GROUP_RULES:
+            if word in text:
+                return grp
+    return _GROUP_DEFAULT
+
+
+def band_of(org: dict | None, cfg: dict) -> str:
+    """組織 → 規模帯。学校・帯を持たない組織は cfg の既定帯。"""
+    band = str(((org or {}).get("size") or {}).get("band") or "")
+    return band if band in cfg["band_mult"] else str(cfg["default_band"])
+
+
+def industry_of(org: dict | None, cfg: dict) -> str | None:
+    """組織 → 産業キー。学校(school_type)は school_industry(既定 ED)。無所属は None。"""
+    if not org:
+        return None
+    key = str(org.get("industry_key") or "")
+    if key:
+        return key
+    if org.get("school_type"):
+        return str(cfg["school_industry"])
+    return None
+
+
+def monthly_wage(industry_key, group: str, band: str, key: str, cfg: dict) -> float:
+    """月額(円)= 産業基準 × 職種群係数 × 規模帯係数 × 個体差(1±spread)。
+
+    個体差は安定ハッシュのみ(乱数ゼロ)。10 円単位へ丸める(給与明細の粒度)。
+    最後に最低賃金の床(min_monthly。既定 0=床なし)で持ち上げる。"""
+    base = float(cfg["industry_monthly"].get(str(industry_key or ""),
+                                             cfg["default_monthly"]))
+    m = base * float(cfg["group_mult"].get(group, GROUP_MULT[_GROUP_DEFAULT]))
+    m *= float(cfg["band_mult"].get(str(band), 1.0))
+    spread = float(cfg["spread"])
+    if spread > 0.0:
+        m *= 1.0 + spread * (2.0 * stable_unit("wage_indiv", key) - 1.0)
+    return float(round(max(m, float(cfg.get("min_monthly", 0.0)), 0.0), -1))
+
+
+def pay_period_of(group: str, band: str, key: str, cfg: dict) -> str:
+    """支給形態 "monthly" / "daily"。日給になりうるのは DAILY_GROUPS かつ小規模職場のみ。
+
+    日本の常用労働者は圧倒的に月給制なので、日給は**少数派**として置く
+    (daily_share=0.15 = 対象群の 15%)。週給は日本の慣行に無いので作らない。"""
+    if group not in DAILY_GROUPS:
+        return "monthly"
+    if str(band) not in ("1-4", "5-9"):          # 日払いの慣行は小規模職場に偏る
+        return "monthly"
+    return "daily" if stable_unit("wage_period", key) < float(cfg["daily_share"]) \
+        else "monthly"
+
+
+def payday_dom_of(key: str, cfg: dict | None = None) -> int:
+    """給料日(暦の何日。0=月末)。同じ職場の人が同じ給料日になるよう key は org id を渡す。
+
+    cfg を渡すと economy.wage_profile.payday_weights の分布を使う(未指定=民間の慣行)。"""
+    weights = (cfg or {}).get("payday_weights") or PAYDAY_WEIGHTS
+    u = stable_unit("wage_payday", str(key))
+    acc = 0.0
+    for dom, w in weights:
+        acc += w
+        if u < acc:
+            return int(dom)
+    return int(weights[-1][0])
+
+
+def _band_rank(band: str) -> float:
+    """規模帯 → [0,1] の位置(賞与の手厚さの補間に使う)。"""
+    try:
+        i = _BAND_ORDER.index(str(band))
+    except ValueError:
+        return 0.5
+    return i / float(len(_BAND_ORDER) - 1)
+
+
+def bonus_plan_of(key: str, band: str, payday: int, cfg: dict) -> dict | None:
+    """賞与の計画(支給しない職場は None)。同じ職場の人は同じ支給月・支給日になる。
+
+    支給の有無・月数は**規模帯**で決まる(規模が大きいほど支給割合も月数も高い実態)。
+    支給日は給料日と重ならないものを選ぶ(同一 step に 2 本の賃金を重ねない設計)。"""
+    bcfg = cfg["bonus"]
+    if not bcfg["enabled"]:
+        return None
+    rank = _band_rank(band)
+    share = float(bcfg["share_min"]) + (float(bcfg["share_max"])
+                                        - float(bcfg["share_min"])) * rank
+    if stable_unit("wage_bonus_on", str(key)) >= share:
+        return None
+    months = sorted(int(m) for m in bcfg["summer_months"]) or [6]
+    summer = months[int(stable_unit("wage_bonus_mon", str(key))
+                        * len(months)) % len(months)]
+    doms = [int(d) for d in bcfg["doms"] if int(d) != int(payday)] \
+        or [int(d) for d in bcfg["doms"]]
+    dom = doms[int(stable_unit("wage_bonus_dom", str(key)) * len(doms)) % len(doms)]
+    mult = float(bcfg["months_min"]) + (float(bcfg["months_max"])
+                                        - float(bcfg["months_min"])) * rank
+    return {"months": sorted({int(summer), int(bcfg["winter_month"])}),
+            "dom": int(dom), "mult": float(round(mult, 3))}
+
+
+def wage_plan(*, occupation: str, role: str, org: dict | None, org_id,
+              key: str, cfg: dict) -> dict:
+    """1 人ぶんの賃金プラン(決定論・乱数ゼロ)。engine はこの dict しか読まない。
+
+    key = 個体の安定キー(pool の pid か agent.id)。同じ key・同じ台帳なら
+    run.seed が変わっても同じプランになる(= resume / ローテーション再入で不変)。"""
+    group = occupation_group(occupation, role)
+    band = band_of(org, cfg)
+    industry = industry_of(org, cfg)
+    monthly = monthly_wage(industry, group, band, key, cfg)
+    period = pay_period_of(group, band, key, cfg)
+    org_key = str(org_id or "") or f"occ:{group}"       # 無所属は職種群で束ねる
+    payday = payday_dom_of(org_key, cfg)
+    bonus = bonus_plan_of(org_key, band, payday, cfg) if period == "monthly" else None
+    workdays = int(cfg["month_workdays"])
+    daily = float(round(monthly / workdays, 1))
+    n_bonus = len(bonus["months"]) if bonus else 0
+    annual = monthly * 12.0 + (monthly * bonus["mult"] * n_bonus if bonus else 0.0)
+    return {"monthly": float(monthly), "daily": daily, "period": period,
+            "payday": int(payday), "bonus": bonus, "group": group,
+            "band": str(band), "industry": industry,
+            "org": (str(org_id) if org_id else None),
+            "annual": float(annual)}
+
+
+def wage_eligible(occupation: str, role: str) -> bool:
+    """賃金プランの対象か(**支給経路の二重化を避けるための排他判定**)。
+
+    対象外にするもの:
+      学生            … 賃金の受け手でない(organizations の役割名)
+      公務員          … government の日次ペイロール(予算+源泉徴収)が既に払っている
+      自営(WAGE_CAT) … `gig_profile` の日銭(出来高)が既に払っている
+      明示的な無給    … WAGE_CAT が None(学業・政治活動・路上生活者)
+    それ以外(WAGE_CAT に無い 198,264 人の台帳ロール名を含む)は対象。"""
+    occ = str(occupation or "")
+    if str(role or "") == "学生":
+        return False
+    if occ in CIVIL_SERVANTS:
+        return False
+    if occ in WAGE_CAT and WAGE_CAT[occ] is None:
+        return False
+    if WAGE_CAT.get(occ) == "自営":
+        return False
+    return True
+
+
+#: `agent._wage_plan` の「未計算」を表す番人(None = 計算済みだが対象外)。
+_WAGE_UNSET = "__unset__"
+
+
+def wage_target(agent, record: dict | None = None) -> bool:
+    """この個体に賃金プランを与えるか(= この街で雇われて働いているか)。
+
+    条件は 3 つとも**観測可能な素性のみ**(k・内面構成概念を一切読まない):
+      ① 職種が対象(`wage_eligible`。学生・公務員・自営・無給を除く)
+      ② 勤務窓を持つ(work_start_min>=0。職場を持たない層は賃金が発生しない)
+      ③ **この街で働いている**: 居住者 / org 配属 / 通勤者 のいずれか
+    ③ が要るのは L4(非定期来街 707,778 人)を弾くため。彼らは `persona._pick_workplace`
+    が職業名から勤務窓を与えてしまう(会社員 240,661 人)が、勤務先は渋谷ではない
+    (record が visitor かつ commute=false かつ org_id 無し)。"""
+    role = str(getattr(agent, "org_role", "") or (record or {}).get("role", "") or "")
+    if not wage_eligible(getattr(agent, "occupation", ""), role):
+        return False
+    if int(getattr(agent, "work_start_min", -1)) < 0:
+        return False
+    if getattr(agent, "org_id", None):
+        return True
+    if not getattr(agent, "visitor", False):
+        return True
+    return bool(getattr(agent, "commute", False))
+
+
+def assign_wage_plan(agent, orgs: dict | None, cfg: dict,
+                     record: dict | None = None) -> dict | None:
+    """賃金プランを 1 体へ与える(冪等・決定論・乱数ゼロ)。対象外は None。
+
+    副作用は 2 つだけ: `agent._wage_plan`(プラン or None)と `agent.wage`
+    (= 1 日ぶんの賃金。既存の意味にそのまま載せ替える)。**再来街(hydrate)や resume で
+    何度呼んでも同じ値**になる(キーは pool の pid、無ければ agent.id)。
+
+    `agent.wage` を書き換えるのは意図的で、IF-E2 の org 初期預金(配属者の日給合計 ×
+    month_days × σ)・退職金(日給 × severance_days)・org の産出見積り(日給 ×
+    revenue_margin)が全部この 1 欄を読んでいるため = 賃金の多様性がそこまで一貫して届く。"""
+    # ★**肯定だけを記憶する**: 一度プランが付いた個体は同じものを返し続ける(冪等)。
+    #   対象外の判定は毎回やり直す —— 対象外の理由の 1 つ「勤務窓が無い」は career の
+    #   求職・再就職で**後から解消しうる**ので、否定をキャッシュすると「途中で職に就いた人が
+    #   永久に無給」という静かなバグになる。再判定は文字列の辞書引き数回で済む。
+    cached = getattr(agent, "_wage_plan", _WAGE_UNSET)
+    if cached is not _WAGE_UNSET and cached is not None:
+        return cached
+    if not wage_target(agent, record):
+        agent._wage_plan = None
+        return None
+    role = str(getattr(agent, "org_role", "") or (record or {}).get("role", "") or "")
+    org_id = getattr(agent, "org_id", None)
+    org = (orgs or {}).get(str(org_id)) if org_id else None
+    key = str(getattr(agent, "pool_pid", "") or getattr(agent, "id", 0))
+    plan = wage_plan(occupation=getattr(agent, "occupation", ""), role=role,
+                     org=org, org_id=org_id, key=key, cfg=cfg)
+    agent._wage_plan = plan
+    agent.wage = float(plan["daily"])
+    return plan
+
+
+def salary_amount(plan: dict, worked_days: int, cfg: dict) -> float:
+    """給料日に支給する月給(円)。所定労働日数に満たない月は**日割り**(実務どおり)。
+
+    満勤(worked_days >= month_workdays)なら月額そのもの。残業・皆勤手当は持たない
+    (この機構が主張するのは所定内給与の水準だけ)。"""
+    n = max(0, int(worked_days))
+    if n <= 0:
+        return 0.0
+    ratio = min(1.0, n / float(cfg["month_workdays"]))
+    return float(round(float(plan["monthly"]) * ratio, 1))
+
+
+def bonus_amount(plan: dict) -> float:
+    """賞与 1 回ぶんの支給額(月額 × 支給月数)。賞与の無い職場は 0。"""
+    b = plan.get("bonus")
+    if not b:
+        return 0.0
+    return float(round(float(plan["monthly"]) * float(b["mult"]), 1))

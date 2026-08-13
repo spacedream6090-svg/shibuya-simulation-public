@@ -337,7 +337,11 @@ def dispatch(sim, step: int, sim_min: int) -> None:
         cid = int(o["courier"])
         if cid < 0:
             continue                                      # 抽象トリップ=物理配車なし
-        courier = sim.agent_by_id.get(cid)
+        # ★レーン乙 ブロック7: 在場述語で引く。``agent_by_id`` は「これまで実体化した全個体」の
+        #   索引なので ``is None`` は**決して真にならない**(プール回転で街を出た個体も残る)。
+        #   脱水済みの実体へ route/gig を書いても次の hydrate で捨てられ、配達員は永久に
+        #   幽霊 gig を抱えたまま戻ってくる(_select_courier が二度と選ばない)。
+        courier = sim.present_agent(cid)
         if courier is None or courier.sleeping or courier.loc == "outside" or courier.building:
             continue                                      # 配車不能=物理移動なし(受給は eta で成立)
         store_node, to_node = o["store_node"], o["to_node"]
@@ -376,8 +380,12 @@ def deliver_arrivals(sim, step: int, sim_min: int, spend, pay_wage) -> None:
     due.sort(key=lambda o: (int(o["arrive"]), int(o["orderer"]), str(o["store_node"])))
     for o in due:
         pend.remove(o)
-        orderer = sim.agent_by_id.get(int(o["orderer"]))
-        if orderer is None:                               # 注文者が消えた(退場等)=課金せず破棄
+        # ★レーン乙 ブロック7(**保存則系・最優先**): 在場述語で引く。脱水済みの注文者へ
+        #   spend すると「家計の現金は次の hydrate で戻るのに店の売上・SFC 行は実在する」
+        #   = 現金が湧く。配達員側の pay_wage は逆に現金が消える。どちらも保存則の破れ。
+        #   注文は最大 max_eta_steps 先に着地するので日境界(=回転)を跨ぐことが実際にある。
+        orderer = sim.present_agent(int(o["orderer"]))
+        if orderer is None:                               # 注文者が街に居ない=課金せず破棄
             continue
         cat = str(o["cat"])
         spend(sim, orderer, float(o["item_price"]), cat, step, sim_min, item=str(o["item"]))  # 食事
@@ -385,7 +393,7 @@ def deliver_arrivals(sim, step: int, sim_min: int, spend, pay_wage) -> None:
         orderer._delivery_await = False
         orderer.remember(f"頼んだ{o['item']}が届いた")
         cid = int(o["courier"])
-        courier = sim.agent_by_id.get(cid) if cid >= 0 else None
+        courier = sim.present_agent(cid) if cid >= 0 else None
         fare = 0.0
         cx, cy = orderer.x, orderer.y
         if courier is not None:
