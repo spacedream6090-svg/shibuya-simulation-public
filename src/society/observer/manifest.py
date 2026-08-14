@@ -97,6 +97,106 @@ def metrics_spec() -> dict:
     return _spec.compute()
 
 
+# ------------------------------------------------------- G1 入力データの来歴(sha256)
+# 塞ぐ穴(docs/plans/metaverse-projection-plan.md §1「運用の穴」): weather / cognition の
+# 凍結入力には sha256 が残るのに、**ラン最大の入力**である
+#   ① ペルソナプール(data/persona_pool。100 万人の素性・agent_id → ペルソナの逆引きの源)
+#   ② 市街地図(world.map)
+#   ③ 組織台帳(organizations.file)
+# の来歴は 1 バイトも残っていなかった。事後(復元実験・再現)に「どのプールで回したのか」を
+# 確定できないと、agent_id からペルソナへ戻る決定論の逆引きが**原理的に検証不能**になる。
+#
+# 設計:
+#   - **ストリーミング**(64 KB チャンク)で読む。プールは 733 MB あるので全読み込みは不可。
+#   - ディレクトリはシャード構成なので、**ファイル 1 枚ごとの sha256** と、
+#     `<相対パス>:<sha256>\n` を連ねた正準文字列の sha256(= 結合ハッシュ)の両方を出す。
+#     並びは相対パスの昇順で固定(OS の走査順が結果に漏れない)。相対パスは posix 表記に
+#     揃える(Windows の `\` が結合ハッシュに出ないようにする)。
+#   - **読むだけ・書く経路なし**。値は run_manifest.json にしか現れない。
+#   - 既定 OFF(`observer.input_provenance.enabled`)。ON でも起動が数秒延びるだけだが、
+#     「既存ランの manifest と同形」を守るためキー自体を出さない側に倒す。
+_HASH_CHUNK = 1 << 16
+#: ディレクトリを走査するとき無視するもの(生成物・キャッシュ = 入力ではない)。
+_SKIP_DIR_PARTS = ("__pycache__", ".git")
+
+
+def file_sha256(path: str | Path) -> str:
+    """ファイルの生バイト列の SHA-256(ストリーミング。巨大ファイルでも定数メモリ)。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(_HASH_CHUNK), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def path_sha256(path: str | Path) -> dict | None:
+    """ファイル 1 枚 / ディレクトリ 1 本の来歴 dict(存在しなければ None)。
+
+    ディレクトリは ``{"kind": "dir", "sha256": 結合ハッシュ, "n_files", "bytes", "files": {...}}``、
+    ファイルは ``{"kind": "file", "sha256", "bytes"}``。**欠測は None**(偽の値で埋めない)。
+    """
+    p = Path(path)
+    if p.is_file():
+        return {"kind": "file", "sha256": file_sha256(p), "bytes": p.stat().st_size}
+    if not p.is_dir():
+        return None
+    files: dict[str, str] = {}
+    total = 0
+    for child in sorted(p.rglob("*"), key=lambda q: q.as_posix()):
+        if not child.is_file():
+            continue
+        rel = child.relative_to(p).as_posix()
+        if any(part in _SKIP_DIR_PARTS for part in child.relative_to(p).parts):
+            continue
+        files[rel] = file_sha256(child)
+        total += child.stat().st_size
+    blob = "".join(f"{rel}:{sha}\n" for rel, sha in sorted(files.items()))
+    return {"kind": "dir",
+            "sha256": hashlib.sha256(blob.encode("utf-8")).hexdigest(),
+            "n_files": len(files), "bytes": total, "files": files}
+
+
+def input_provenance(sim) -> dict | None:
+    """G1: プール / 地図 / 組織台帳の sha256(既定 OFF では **None** = キー自体を出さない)。"""
+    cfg = sim.cfg
+    obs = (cfg.get("observer", {}) or {})
+    raw = obs.get("input_provenance", None)
+    if not (raw is not None and hasattr(raw, "get") and bool(raw.get("enabled", False))):
+        return None
+    from ..config import REPO_ROOT
+
+    def _resolve(value) -> Path | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        p = Path(text)
+        return p if p.is_absolute() else Path(REPO_ROOT) / p
+
+    world = cfg.get("world", {}) or {}
+    pool = cfg.get("pool", {}) or {}
+    orgs = cfg.get("organizations", {}) or {}
+    sources = {
+        # ★プールは pool.enabled のときだけハッシュする(実プールは 733MB あり、1 バイトも
+        #   使われないランで数秒を払う理由が無い)。OFF のランは path だけを "unused" として
+        #   残す = 「採らなかった」と「実体が無かった」を事後に区別できる。
+        "persona_pool": (_resolve(pool.get("dir", ""))
+                         if bool(pool.get("enabled", False)) else None),
+        "map": _resolve(world.get("map", "")),
+        "org_ledger": _resolve(orgs.get("book", "")),
+    }
+    out: dict = {"schema": 1}
+    if sources["persona_pool"] is None and str(pool.get("dir", "") or ""):
+        out["persona_pool"] = {"kind": "unused", "path": str(pool.get("dir"))}
+    for name, path in sources.items():
+        if path is None:
+            continue
+        got = path_sha256(path)
+        # 欠測(config が指すのに実体が無い)は "absent" と判る形で残す。
+        out[name] = got if got is not None else {"kind": "absent"}
+        out[name]["path"] = str(path)
+    return out if len(out) > 1 else None
+
+
 def collect_toggles(cfg) -> dict:
     """resolved config の**真偽値リーフを全部**ドット記法で平坦化する。
 
@@ -208,6 +308,9 @@ def build(sim) -> dict:
         # 「fire OFF のランには発火率 5 列が無い」を事後に判別できるようにするため。
         **({"regression": _reg}
            if (_reg := _regression_mod.provenance(sim)) else {}),
+        # G1(第114 GT ロガー): ラン最大の入力 3 件(ペルソナプール / 地図 / 組織台帳)の
+        # sha256。既定 OFF ではキー自体を出さない(天候・認知来歴と同じ流儀)。
+        **({"inputs": _inp} if (_inp := input_provenance(sim)) else {}),
         "code": {
             "python": sys.version.split()[0],
             "platform": platform.platform(),

@@ -247,16 +247,23 @@ def _on_day(sim, day: int, step: int, sim_min: int, cfg: dict) -> None:
                          kind="worldview", x=0.0, y=0.0,
                          payload={"norm_rate": round(rate, 5),
                                   "pioneer_1d": pioneer}))
+    # G7-⑤(observer.gt_extras。既定 OFF ではキー自体を生やさない=L1 バイト一致)。
+    # 期待表は**件数**しか出ておらず、「その人が何を予期しているか」の中身が落ちていた。
+    from .observer import gt_extras as _gt
+    _gt_on = _gt.enabled(sim)
+    _gt_k = _gt.top_k(sim) if _gt_on else 0
     for a in sim.agents:                              # id 昇順=決定論
         err_n = getattr(a, "_wv_err_n", 0)
         err = (getattr(a, "_wv_err_sum", 0.0) / err_n) if err_n else None
+        payload = {"ctrl": round(getattr(a, "controllability", 0.5), 4),
+                   "expect_n": len(getattr(a, "wv_expect", {}) or {}),
+                   "err_mean": (round(err, 3) if err is not None else None),
+                   "err_n": err_n}
+        if _gt_on:
+            payload.update(_gt.expect_extras(a, _gt_k))
         sim.logger.log(Event(
             step=step, sim_min=sim_min, agent_id=a.id, kind="worldview",
-            x=a.x, y=a.y,
-            payload={"ctrl": round(getattr(a, "controllability", 0.5), 4),
-                     "expect_n": len(getattr(a, "wv_expect", {}) or {}),
-                     "err_mean": (round(err, 3) if err is not None else None),
-                     "err_n": err_n}))
+            x=a.x, y=a.y, payload=payload))
     _reset_err(sim)
 
 

@@ -36,6 +36,70 @@ from .finalize import FinalizeStreamMixin
 STEM = "channels"
 
 
+# --------------------------------------------------------------------------- #
+# G6(第114 GT ロガー): 価値 4 軸の**充足** sat を channels.parquet の追加列にする
+#
+# 塞ぐ穴: `values.py` の `agent.sat`(4 軸の充足度 0-1)は「その人がいま何を欲しているか」の
+# **直接ラベル**でありながら writer が 1 本も無く、ランの成果物のどこにも残らない
+# (checkpoint にしか無く、世代を剪定すると消える)。needs / 内部状態は既に channels に
+# 全時系列が載っているので、同じ 1 枚に 4 列足すのが最も安い。
+#
+# ★`cognition/channels.py` の `CHANNELS` には**足さない**。あちらは驚き S の入力の定義で、
+#   `spec_sha256()` が σ_c 凍結ファイルを縛っている = 1 本足すと既存の較正が全部無効になる。
+#   sat は S の入力ではない(発火式に入らない)ので、**観測側の追加列**として観測層に閉じる。
+# ★列は既定 OFF(`cognition.channels.sat_columns`)。OFF では列自体が生えないので、
+#   既存ランの channels.parquet とスキーマ・バイトが同一である。
+# ★`values.py` は**読むだけ**(sat を 1 バイトも書き換えない)。
+_SAT_PREFIX = "sat_"
+
+
+def sat_columns() -> tuple[str, ...]:
+    """sat 追加列の名前(`values.TAGS` の並びが唯一の源。ここに軸名を綴らない)。"""
+    from ..values import TAGS
+    return tuple(f"{_SAT_PREFIX}{t}" for t in TAGS)
+
+
+def sat_values(agent) -> list:
+    """個体 1 体ぶんの sat 値(`agent.sat` が無い = 機構 OFF なら **null**。0 で埋めない)。"""
+    from ..values import TAGS
+    sat = getattr(agent, "sat", None)
+    if not isinstance(sat, dict):
+        return [None] * len(TAGS)
+    out = []
+    for tag in TAGS:
+        got = sat.get(tag)
+        try:
+            out.append(None if got is None else float(got))
+        except (TypeError, ValueError):
+            out.append(None)
+    return out
+
+
+def append_sat(sim, rows: list) -> list:
+    """`cognition.channels.observe()` の行へ sat 4 列を継ぎ足す(**副作用なし**)。
+
+    `observe()` は `sim.agents` を 1 周して 1 体 1 行を返すので、行と個体は**同じ並び**に
+    なっている(行の 3 列目が agent_id という位置は `cognition/channels.KEY_COLUMNS` が固定)。
+    その対応を id で 1 件ずつ検算し、崩れていたら辞書を作って引き直す(25 万体で毎 step
+    辞書を作らないための最適化であって、正しさは id 検算の側が持つ)。
+    """
+    if not rows:
+        return rows
+    agents = list(getattr(sim, "agents", ()) or ())
+    nulls = [None] * len(sat_columns())
+    by_id = None
+    out = []
+    for i, row in enumerate(rows):
+        aid = int(row[2])
+        agent = agents[i] if i < len(agents) else None
+        if agent is None or int(agent.id) != aid:
+            if by_id is None:
+                by_id = {int(a.id): a for a in agents}
+            agent = by_id.get(aid)
+        out.append((*row, *(sat_values(agent) if agent is not None else nulls)))
+    return out
+
+
 class ChannelsSidecar(FinalizeStreamMixin):
     """観測チャンネル行の追記バッファ + セグメント/finalize(IndoorTracks と対の設計)。
 

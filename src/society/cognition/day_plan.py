@@ -988,16 +988,22 @@ def apply(sim, agent, step: int, sim_min: int, response: str,
     st["blocks"] += len(blocks)
     row["plans"] += 1
     row["blocks"] += len(blocks)
+    _payload = {"n": len(blocks), "version": 1, "src": plan["src"],
+                "model": mid, "n_cont": len(conts),
+                "blocks": [{"start": b["start"], "end": b["end"],
+                            "place": b["place"], "act": b["act"],
+                            "aim": b["purpose"],
+                            "priority": b["priority"],
+                            "flex": b["flex"]} for b in blocks]}
+    # G7-①(observer.gt_extras。既定 OFF ではキー自体を生やさない = L1 バイト一致)。
+    # 射影で落ちていた「計画の気分 mood / 持ち越し carry / ブロック毎の同行者 with」を足す。
+    # 記録だけ = 世界も乱数もプロンプトも 1 バイト触らない。
+    from ..observer import gt_extras as _gt
+    if _gt.enabled(sim):
+        _payload.update(_gt.plan_extras(plan, blocks))
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                          kind="plan_created", x=agent.x, y=agent.y,
-                         llm_call_id=call_id,
-                         payload={"n": len(blocks), "version": 1, "src": plan["src"],
-                                  "model": mid, "n_cont": len(conts),
-                                  "blocks": [{"start": b["start"], "end": b["end"],
-                                              "place": b["place"], "act": b["act"],
-                                              "aim": b["purpose"],
-                                              "priority": b["priority"],
-                                              "flex": b["flex"]} for b in blocks]}))
+                         llm_call_id=call_id, payload=_payload))
     # 第87(engaged)脱出条件 (1) 解消: 「**検証を通る計画が生成されたとき**」(設計 §8)。
     # 後退(fallback)した計画は解消ではない — 世界を止めないための応急処置であって、
     # 例外を解決したわけではないから。既定 OFF は完全 no-op。

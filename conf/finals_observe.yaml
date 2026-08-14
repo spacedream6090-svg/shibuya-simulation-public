@@ -369,15 +369,32 @@ information:
 cognition:
   channels:
     enabled: true          # 読み取り専用・L1 バイト不変(σ 較正の観測点)
+    # G6(第114 GT ロガー): 価値 4 軸の充足 sat を末尾 4 列として足す。
+    # ON の理由: sat(「いま何が満たされていないか」)は復元実験の**直接の正解ラベル**なのに
+    # writer が 1 本も無く、checkpoint にしか残らない = 世代を剪定すると消える。
+    # needs / 内部状態が既に載っている channels.parquet に相乗りさせるのが最も安い(+0.6GB)。
+    # cognition/channels.py の CHANNELS は 1 本も動かないので σ_c 凍結ファイルは無効化されない。
+    sat_columns: true
   # ---- 拒否通知(IF-B)----
   # ★engaged 水準は cognition.engaged.enabled が OFF のとき memory へ**縮退**する(仕様)。
-  #   認知スタック本体(fire / watch / g_update / engaged)は **OBS-U3 で 8/14 に判断**する留保項目
-  #   なのでここでは開けない。承認が出たら下の4行を外す(縦煙で共存は確認済み)。
   rejection_notify: engaged
-  # fire:      { enabled: true }
-  # watch:     { enabled: true }
-  # g_update:  { enabled: true }
-  # engaged:   { enabled: true }
+  # ---- 認知スタック本体(OBS-U3)------------------------------------------------------
+  # g_update = **OBS-U3 で 2026-08-14 にユーザー承認**。根拠: 第112 レーン乙 B7 が可塑性の
+  # 学習状態 11 欄(g / g0 / g_init / ē / credit / pending / η / λ / θ倍率 / day_n / f̄)を
+  # プール回転の搬送集合へ入れたので、在場ローテーションで感度が毎日リセットされる問題
+  # (= 役割分化が原理的に観測できない)は解消済み。第114 の棚卸しでも g 族に漏れは無い。
+  #
+  # ★★正直な申告(第114 実測): `cognition.g_update` は **`cognition.fire` が ON でなければ
+  #    1 行も走らない**(plasticity.enabled() が fire.enabled() を前提にしている)。したがって
+  #    下の 1 行だけでは cognition_g.parquet は生えない = 現状では無効な宣言である。
+  #    fire は affects_k=True(LLM 呼の発生点そのものが変わる)の別項目で、OBS-U3 の承認は
+  #    g_update に対してしか出ていないため**ここでは開けない**。fire を開ける判断が出たら
+  #    下の fire 行のコメントを外すこと(そのとき初めて g_update が実効になる)。
+  g_update:
+    enabled: true
+  # watch:     { enabled: true }   # ← ô を LLM が出す層(fire ON が前提・未承認)
+  # fire:      { enabled: true }   # ← ★affects_k=True。開けると g_update が実効になる(未承認)
+  # engaged:   { enabled: true }   # ← エピソード層(fire ON が前提・未承認)
 
 planning:
   day_plan:
@@ -534,6 +551,14 @@ commerce:
       # すべて空の卸に当たり、all-or-nothing の仕入れ(b2b.py の have<qty)で全店品切れが
       # 波及する。初期条件として正当な「開業時の手持ち在庫」を置いて立ち上がりを渡す。
       initial_stock_days: 3
+      # 第114 レーン乙: 初期在庫 3 日ぶんは**立ち上がり**しか渡さない。恒常的な需給ギャップ
+      # (第113 実測: 生産 42,408 / 需要 44,604 = わずか 5%)に対して all-or-nothing の
+      # 仕入れは「あと 1 個足りない」だけで補充を丸ごと失敗させ、翌日も同じ量を要求して
+      # また失敗する自己再生産の詰まりを作る。★生産量(production_units)は**実勢**なので
+      # 触らない —— 直すのは配分の規則の側である、というのがこの 2 行の判断。
+      partial_fulfillment: true   # 在庫の範囲で納め、残りは翌日の (s,S) レビューが再発注
+      multi_source: true          # 指名卸が空なら近傍の同業卸へ(決定論・距離昇順)
+      max_sources: 3
 services:
   enabled: true
   self_dev:
@@ -789,6 +814,27 @@ observer:
   # 観測側だけで閉じる(L1・乱数・LLM 呼数・プロンプトはいずれも 1 バイト不変)。
   roster_daily:
     enabled: true
+  # ---- GT ロガー(第114。docs/plans/metaverse-projection-plan.md §4)------------------
+  # ON の共通の理由: **本選前に入れないと復元実験の正解ラベルが二度と取れない**もの。
+  # 「観測痕跡だけから内部状態をどこまで復元できるか」という問いは、真値(= 内部状態の
+  # 時系列)が残っていて初めて成立する。以下はいずれも checkpoint にしか無く、世代の剪定・
+  # dormant の LRU 溢れ・日々の忘却で**ランの成果物からは消える**ものばかりである。
+  # 全て observer 側で閉じる(世界も乱数も LLM 呼数もプロンプトも 1 バイト変わらない)。
+  # 追加ディスク合計 ≈ +3.4GB(現行 67GB の +5%)。
+  input_provenance:
+    enabled: true          # G1: プール/地図/組織台帳の sha256。agent_id → ペルソナの決定論
+                           #     逆引きの来歴保証(これが無いと逆引きが原理的に検証不能)
+  memory_daily:
+    enabled: true          # G4: 記憶ストリームの本文。★+1.5-1.8GB = 本ランで最大の 1 枚
+                           #     (睡眠時の buffer 切り・store_cap 超過で日々消えるので、
+                           #      日境界のスナップショットでしか捕まえられない)
+  relations_daily:
+    enabled: true          # G5: closeness の連続値軌跡(差分)+ C3 すれ違い集計。
+                           #     「共在 → 関係」の復元実験は説明変数と被説明変数が
+                           #     両方ともここにしか残らない。+0.4GB
+  gt_extras:
+    enabled: true          # G7: 計画の mood/carry/同行者・自己像本文・感情句・needs 5 軸・
+                           #     期待表の上位 k。既存 payload にキーを足すだけ。+0.5GB
 
 # ============================================================================
 # (14) 意図的に入れなかったもの(全部ここに理由を残す=「忘れていた」と区別する)

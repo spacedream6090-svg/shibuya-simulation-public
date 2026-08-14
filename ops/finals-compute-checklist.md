@@ -13,6 +13,33 @@ E1-1〜E1-4 / 起動スクリプト [launch-vllm-finals.ps1](launch-vllm-finals.
 
 ---
 
+## E0 ★checkpoint / dormant 世代の剪定禁止(第114 G2・2026-08-14 確定)
+
+**本選ランの `checkpoint/` は 1 世代も消さない。** `ckpt-NNNNNN.pkl.gz` と同 step の
+`dormant-NNNNNN.pkl.gz` は**必ず対で**残す(片方だけでは在場者しか復元できない)。
+
+理由: **ペルソナ文の本文・記憶ストリーム・関係台帳の全対**は、checkpoint と dormant
+サイドカーが**唯一の複製**である。第114 の GT ロガー(memory.parquet / relations.parquet)は
+**日境界の粒度**しか持たず、**半日粒度の完全状態は checkpoint にしか無い**。
+これが消えると「観測痕跡から内部状態をどこまで復元できるか」という問い自体が
+真値を失って成立しなくなる(復元実験の中止に直結する)。詳細と剪定順序は
+[finals-reliability-plan.md §1.1](../docs/plans/finals-reliability-plan.md)。
+
+運用の具体:
+
+1. バックアップは **`python scripts/backup_run.py <run_dir> <dest> --ckpt-generations 999`**
+   で回す。★既定は `--ckpt-generations 2` = **直近 2 世代しか転送しない**。
+   既定のままだと「20 世代のうち 18 世代が手元に無い」という事故になる。
+2. ディスク逼迫時に落とす順序は ① `indoor_tracks_*`(ON なら)② `llm_journal`
+   ③ それでもだめならユーザー判断。**checkpoint と dormant は最後**。
+   `rm checkpoint/ckpt-*` を「容量が足りないから」で実行しない。
+3. watchdog の「3 世代バックアップ」はノード内のローリング複製であって**世代保全ではない**。
+   世代保全は上の 1. のバックアップだけが担う。
+4. ラン終了後の撤収でも checkpoint ディレクトリは丸ごと持ち帰る(容量は 8/15 に実測。
+   計画値 8.4GB+)。
+
+---
+
 ## E1-1 speculative decoding(無損失・文献値 最大 ~2.8x)
 
 **狙い**: 目標モデルと同一分布のまま decode を速くする(出力の意味は変えない)。

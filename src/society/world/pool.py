@@ -274,6 +274,12 @@ _MISC_FIELDS = (
     #   最後に適用した日。これを運ばないと帰街のたびに「経過 0 日」へ戻り、街を出るだけで
     #   関係も評判も悪評も一切風化しない個体ができる(= 居続けた個体より有利)。
     ("_rel_decay_day", int, -1), ("_gossip_fade_day", int, -1),
+    # ★第114 OBS(認知スタックの搬送棚卸し): 深い内省の**日スケールの予約と不応期**。
+    #   どちらも「日内衝撃ゲージの閾値超え」が予約する量で、既定値は Agent の -1 と同一。
+    #   運ばないと (a) 予約したまま街を出た個体の深い内省が黙って取り消され
+    #   (b) 不応期(既定 3 日)が帰街のたびに 0 へ戻る = 街を出入りする個体だけ
+    #   「侵入的 → 熟慮的の遅延」という設計が成立しない。判定基準 3 つを全て満たす。
+    ("deep_due_day", int, -1), ("deep_cooldown_until_day", int, -1),
 )
 
 #: 世帯(H2)。★レーン乙 ブロック3: 世帯の静的部分は pool record から決定論で組み直すが、
@@ -357,6 +363,42 @@ def _plast_apply(agent, st: dict) -> None:
     agent._fire_theta_m = float(st.get("theta_m", 1.0))
     agent._fire_day_n = int(st.get("day_n", 0))
     agent._fire_fbar = float(st.get("fbar", 0.0))
+
+
+def _watch_slim(agent) -> dict | None:
+    """監視仕様(watch spec)= 「この人がいま何を注視すると宣言したか」(OFF は None)。
+
+    第114 の認知スタック棚卸しで見つかった B7 の残り: 可塑性 11 欄は運ぶのに、**同じ
+    発火式 S に入るもう 1 つの個体状態**である監視仕様が 1 つも運ばれていなかった。
+    判定基準は D1/B7 と同じ 3 つを全て満たす:
+      ① 個体固有(LLM がその人の言葉で出した ô とトリガ)
+      ② 日を跨いで持続 —— 設計 §2.2 は「**有効期限は持たせない**(時間で失効させると
+         時間軸が裏口から入る)」と明記していて、上書きされるまで前回仕様が生きる
+      ③ 発火可否を変える(ô は S の予測項、トリガは Σ_j w_ij の項そのもの)
+    運ばないと、再来街した個体は「何も注視していない素の状態」に戻り、次に監視仕様を
+    出す LLM 呼が来るまで**驚きの基準が persistence 予測へ後退する**。
+
+    ★正規化(JSON 安全 + 往復同値): expect はチャンネル位置 idx → 値の dict、triggers は
+      (名前, idx, 演算子, 値) の 4 つ組列。watch OFF のランでは属性が無いので None =
+      退避 dict が 1 バイトも変わらない(tests/test_pool_rotation.py の dict 等値を守る)。
+    """
+    spec = getattr(agent, "_fire_watch", None)
+    if not spec:
+        return None
+    return {
+        "expect": {str(k): float(v) for k, v in (spec.get("expect") or {}).items()},
+        "triggers": [[str(nm), int(idx), str(op), float(val)]
+                     for (nm, idx, op, val) in (spec.get("triggers") or [])],
+    }
+
+
+def _watch_apply(agent, st: dict) -> None:
+    """監視仕様を戻す(チャンネル位置 idx を int へ復号)。"""
+    agent._fire_watch = {
+        "expect": {int(k): float(v) for k, v in (st.get("expect") or {}).items()},
+        "triggers": [(str(nm), int(idx), str(op), float(val))
+                     for (nm, idx, op, val) in (st.get("triggers") or [])],
+    }
 
 
 def _fields_slim(agent, fields: tuple) -> dict:
@@ -575,6 +617,29 @@ def dehydrate(agent, *, ep_cap: int | None = None, rel_cap: int | None = None) -
     plast = _plast_slim(agent)                    # 可塑性 g_update の学習状態(OFF は None)
     if plast:
         state["plast"] = plast
+    # --- 第114 OBS: 認知スタックの搬送棚卸し(B7 の横展開)---------------------------------
+    # 監視仕様(watch spec)= 発火式 S のもう一方の個体状態。設計 §2.2 が「有効期限を
+    # 持たせない」と決めている以上、街を出ただけで消えるのは仕様との食い違いである。
+    watch = _watch_slim(agent)                    # watch OFF は None(退避 dict はバイト不変)
+    if watch:
+        state["watch"] = watch
+    # 行動ベースライン(無意識層の EMA)= 「いつもの自分」。**何日もかけて育つ量**なので、
+    # 運ばないと再来街した個体は base=today に落ちて逸脱が原理的に検出されなくなる
+    # (= 街を出入りする個体だけ「最近の自分」の 1 行が永久に空になる系統バイアス)。
+    # ★対の ``implicit_self``(その 1 行の本文)は**運ばない**: あちらは reflection.py が
+    #   「揮発的な作動自己 = 日次上書き」と設計宣言している派生テキストで、ここ(EMA)から
+    #   翌日の日境界に決定論で作り直される。持続する状態だけを運ぶ、が D1/B7 の基準。
+    ema = getattr(agent, "behav_ema", None)
+    if ema:
+        state["behav_ema"] = {str(k): float(v) for k, v in ema.items()}
+    # 価値 4 軸の充足 sat。**多日スケールの量**(日次 15% しか中立へ戻らないので、
+    # 満たされない状態は何日も尾を引く)なのに、再来街時は _init_pool_agent_extras が
+    # 一律 0.5(完全に中立)へ据え直していた = 街を出るだけで「渇き」が消える。
+    # ★sat_mods は運ばない: sat の純関数で、同じ日境界の values.decay_daily が
+    #   復元後の sat から作り直す(二重の真実源を作らない)。
+    sat = getattr(agent, "sat", None)
+    if sat:
+        state["sat"] = {str(k): float(v) for k, v in sorted(sat.items())}
     # ★**ゾーン所有(_phys_zone と _FIELDS の走行レコード)は意図的に運ばない**。あれは
     #   「いま歩いている経路 agent.route の途中」という**その旅に固有の**状態で、再来街時は
     #   build_pool_agent が別の node / route で個体を組み直すため、復元すると physics._run_zone が
@@ -701,3 +766,12 @@ def hydrate(agent, state: dict) -> None:
     plast = state.get("plast")                    # 可塑性 g_update の学習状態
     if plast:
         _plast_apply(agent, plast)
+    watch = state.get("watch")                    # 第114 OBS: 監視仕様(ô + トリガ)
+    if watch:
+        _watch_apply(agent, watch)
+    ema = state.get("behav_ema")                  # 第114 OBS: 行動ベースライン(無意識層)
+    if ema:
+        agent.behav_ema = {str(k): float(v) for k, v in ema.items()}
+    sat = state.get("sat")                        # 第114 OBS: 価値 4 軸の充足(多日スケール)
+    if sat:
+        agent.sat = {str(k): float(v) for k, v in sat.items()}

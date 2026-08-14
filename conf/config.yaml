@@ -1537,6 +1537,15 @@ cognition:
     every_steps: 1        # 観測の採取間隔(1=毎 step。位相は step=0 を含む=L3 と揃う)
     sigma_file: ""        # 空=data/calib/sigma_c.json(無くてもランは落とさない=来歴に absent と残す)
     calib_file: ""        # 空=conf/cognition/calib_default.yaml(壊れていたら即エラー)
+    # ---- G6(第114 GT ロガー・**既定 OFF**): 価値 4 軸の充足 sat を末尾 4 列として足す ----
+    # 塞ぐ穴: values.py の agent.sat(「いま何が満たされていないか」)は writer が 1 本も無く、
+    # checkpoint にしか残らない = 世代を剪定すると消える。復元実験の**直接の正解ラベル**なので
+    # needs / 内部状態が既に載っている channels.parquet に 4 列だけ相乗りさせる。
+    # ★cognition/channels.py の CHANNELS には**足さない**(足すと spec_sha256 が変わり、
+    #   既に測った σ_c 凍結ファイルが全部無効になる)。sat は発火式 S の入力ではない。
+    # ★OFF では列自体が生えない = 既存 channels.parquet とスキーマ・バイトが同一。
+    # ★規模: 在場 25万 × 10日 で +0.6GB 前後(float32 × 4 列)。
+    sat_columns: false
   # ---- 閾値発火 + 認知イベントキュー + 同期バリア(第81バッチ 2026-08-01・**既定 OFF**)----
   # 「1 step = 10 分」が兼ねている『世界の進行』と『思考の頻度』を分離する層
   # (physics-instructions.md Part P0 / cognition-design-record.md §2.3・§3.3)。
@@ -2293,6 +2302,58 @@ observer:
   # 実装 src/society/observer/roster.py(凍結 14 ファイルには含まれない)。
   roster_daily:
     enabled: false              # ★ON 推奨(本番): true(復元実験の名簿保全 + 痩せ A13)
+  # ==========================================================================
+  # GT ロガー(第114 2026-08-14。docs/plans/metaverse-projection-plan.md §4)
+  # 「本選前に入れないと **正解ラベルが二度と取れない**」もの。全て observer 側・既定 OFF・
+  # finals conf で ON・動力学非接触(世界も乱数も LLM 呼数もプロンプトも 1 バイト不変)。
+  # ==========================================================================
+  # ---- G1 入力データの来歴 sha256(プール / 地図 / 組織台帳)------------------------------
+  # 塞ぐ穴: 天候と認知の凍結入力には sha256 が残るのに、**ラン最大の入力**である
+  # ペルソナプール(100 万人の素性 = agent_id → ペルソナ逆引きの源)・市街地図・組織台帳の
+  # 来歴は 1 バイトも残っていなかった。事後に「どのプールで回したのか」を確定できないと、
+  # 復元実験の逆引きが原理的に検証不能になる。
+  # ON にすると run_manifest.json に inputs 節が生える(ディレクトリはシャード毎 sha256 +
+  # `<相対パス>:<sha256>` を連ねた結合ハッシュ)。読むだけ・書く経路なし。
+  # ★費用: 起動時に入力を 1 度ストリーミング読みする(実プール 733MB で数秒)。
+  #   OFF ではキー自体が生えない = 既存 run_manifest.json と同形。
+  input_provenance:
+    enabled: false              # ★ON 推奨(本番): true
+  # ---- G4 記憶ストリーム サイドカー memory.parquet ---------------------------------------
+  # 塞ぐ穴: 記憶の**本文**(episodes/buffer の text・importance)は L1 に出ず、checkpoint に
+  # しか無い = 世代を剪定した瞬間に消える。しかも記憶自体が日々消える(就寝時の buffer 切り・
+  # store_cap 超過の切り捨て・ACT-R 忘却)ので、「その人が何を覚えていたか」はその日のうちに
+  # しか存在しない。復元実験の正解ラベルとして最重要級。
+  # ON にすると日境界に在場者の episodes/buffer を 1 記憶 1 行で追記する(全量スナップショット
+  # = 行の消失として「いつ忘れたか」が読める。差分方式だと忘却が観測できない)。
+  # ★規模: 在場 25万 × 10日 で **1.5-1.8GB**(本サイドカー群で最大の 1 枚。容量計画に必ず数える)。
+  memory_daily:
+    enabled: false              # ★ON 推奨(本番): true
+    text_chars: 0               # 本文の切り詰め(0=切らない)。ディスクが逼迫したときの唯一のレバー
+  # ---- G5 関係台帳の日次差分 サイドカー relations.parquet --------------------------------
+  # 塞ぐ穴: 関係の連続値 closeness の軌跡は、L1 には tier を跨いだ瞬間しか出ず(段の内側は無音)、
+  # checkpoint 剪定と dormant の LRU 溢れで消える。「共在(すれ違い)→ 関係」の復元実験は
+  # まさにこの連続値を正解ラベルに要求するのに、すれ違いの側(C3 日次カウンタ)も L1 に無い
+  # = **説明変数と被説明変数が両方とも残らない**状態だった。
+  # ON にすると日境界に (a) 前日から値が変わった対だけ(差分方式)と
+  # (b) 個体ごとの C3 集計行(other_id=-1・c3_pass/c3_greet)を追記する。
+  # ★撮る位置は step の**先頭**(在場ローテーションより前)= C3 カウンタが空へ戻る前・
+  #   退場者の関係が dormant へ移る前。したがって「day D の行 = day D-1 の終わりの状態」。
+  # ★規模: 差分方式で +0.4GB 前後(全量だと 1 桁大きい)。
+  relations_daily:
+    enabled: false              # ★ON 推奨(本番): true
+    passing: true               # C3 すれ違い行(other_id=-1)も出すか
+  # ---- G7 小物束(射影で落ちている 5 件を既存の出力へ足すだけ)----------------------------
+  # ① plan_created に mood / carry / ブロック毎の同行者 with
+  # ② reflect に自己像の本文 self / ties(生成時点で 80 字上限済み)
+  # ③ emotion_label にプロンプトへ入る感情句 phrase(ラベルは 6 象限の粗い離散値でしかない)
+  # ④ traits.json に needs の 5 軸プロファイル + needs_mods(reason→倍率)
+  # ⑤ 日次 worldview に期待表 wv_expect の上位 k 件(いまは件数しか出ていない)
+  # ★足すのは既存イベントの payload キーと traits.json の欄だけ。新イベント種も新ファイルも
+  #   作らない。OFF では payload に一時キーすら積まれない = ゴールデン L1 バイト一致。
+  # ★規模: +500MB 前後(大半は ⑤)。
+  gt_extras:
+    enabled: false              # ★ON 推奨(本番): true
+    expect_top_k: 8             # ⑤ で載せる期待表の件数(期待人数の降順・同値は決定論で解く)
   # ---- 第71バッチ 2026-07-31: ラン来歴 run_manifest.json(既定 ON=新規別ファイル)----
   # ラン開始時に runs/<name>/run_manifest.json を書く: git SHA/branch/dirty・resolved config の
   # 正準 JSON sha256・run_seed・モデル ID・cache_mode・**真偽値スイッチ全状態**(機械採取)・
@@ -3443,6 +3504,20 @@ commerce:
       initial_stock: 0          # 卸の起動時在庫(0=生産で立ち上げ。>0 で即出荷可能)
       default_wholesale_price: 300  # 1単位あたりの仕入単価(卸値。cat 別に wholesale_price で上書き可)
       wholesale_price: {}       # 例: { food: 250, shop: 800 }(未掲載は default_wholesale_price)
+      # ---- 第114 レーン乙: 供給の詰まりを解く 2 件(どちらも既定 OFF=現行とバイト一致)----
+      # 塞ぐ問題(第113 実測): 生産 42,408 / 需要 44,604 という**わずかな**恒常ギャップに対し、
+      # 従来の仕入れは all-or-nothing(在庫が要求量に 1 個でも足りなければ 0 本も納めない)
+      # だったため、翌日も同じ量を要求してまた失敗する自己再生産の詰まり(全店品切れの波及)を
+      # 起こしていた。★恒常ギャップ自体は生産・需要の**実勢**なので production_units には
+      #   触らない(数字をいじって供給を作るのは実勢の改竄)。直すのは配分の規則の側。
+      partial_fulfillment: false  # ★ON 推奨(本番): true。在庫の範囲で納め、残りは在庫水準が
+                                  #   発注点を下回ったままになるので**翌日の (s,S) レビューが
+                                  #   自動的に再発注**する(= バックオーダーを既存機構が担う)。
+                                  #   数量保存: 納品は卸在庫からしか引かず、在庫は生産と起動時
+                                  #   在庫からしか増えない = Σ納品 ≤ Σ生産 + Σ起動時在庫。
+      multi_source: false         # ★ON 推奨(本番): true。指名卸(最寄り 1 社)の在庫が尽きたら
+                                  #   近傍の同業卸へフォールバックする(決定論・距離昇順・乱数ゼロ)。
+      max_sources: 3              # 分散調達で当たる卸の総数(指名卸を含む)。1=分散しないのと同じ
 
 # ---- サービスの実体化 スライス③(実装 src/society/services.py。設計 docs/research/economy-goods-services.md §7 ③)----
 # service/education カテゴリの POI で「滞在して効果を受ける」最小形。来店=自由時間の行き先バイアス(routine の

@@ -829,11 +829,19 @@ class Simulation:
         self._g_day = -1                       # θ 恒常性の日境界(OFF は使われない)
         self.cognition_g_sc = None
         self.channels_sc = None
+        self.channels_sat = False              # G6: sat 追加列(既定 OFF=列が生えない)
         self.cognition_calib = None
         self.cognition_sigma = None
         if self.channelscfg["enabled"]:
-            from ..observer.channels import ChannelsSidecar
-            self.channels_sc = ChannelsSidecar(self.out_dir, _channels_mod.COLUMNS)
+            from ..observer import channels as _obs_channels
+            # G6(第114): 価値 4 軸の充足 sat を**観測側の追加列**として足す(既定 OFF)。
+            # OFF では列自体が生えない = 既存 channels.parquet とスキーマ・バイトが同一。
+            # ★cognition 側の CHANNELS には足さない(σ_c 凍結ファイルの spec hash が動くため)。
+            self.channels_sat = bool(self.channelscfg["sat_columns"])
+            _cols = tuple(_channels_mod.COLUMNS)
+            if self.channels_sat:
+                _cols += _obs_channels.sat_columns()
+            self.channels_sc = _obs_channels.ChannelsSidecar(self.out_dir, _cols)
         # 較正テーブル(壊れていたら即エラー)と σ_c 凍結の来歴は、観測チャンネルか発火の
         # どちらかが ON なら 1 回だけ採る(発火は σ_c を S の分母として実際に消費する)。
         if self.channelscfg["enabled"] or self.firecfg["enabled"]:
@@ -1279,6 +1287,12 @@ class Simulation:
                 encoding="utf-8")
         # 研究者frame用の静的データ(R² 回帰の入力。エージェントには見せない)。
         # SDT プラグイン ON 時は倍率 dict を nested "sdt" で併記(数値でない=trait 名を汚さない)。
+        # G7-④(observer.gt_extras・既定 OFF): 5 軸の潜在プロファイルと reason 倍率を
+        # 名簿へ足す(「何を欲しやすい個体か」という静的ラベルがどこにも無かった)。
+        # OFF ではキーを 1 つも足さない = 既存 traits.json とバイト一致。
+        from ..observer import gt_extras as _gt_mod
+        self.gt_extras = _gt_mod.cfg_of_config(cfg)
+        _gt_on = bool(self.gt_extras["enabled"])
         (self.out_dir / "traits.json").write_text(json.dumps(
             {str(a.id): {**a.traits,
                          "drive_threshold": round(a.drive_threshold, 4),
@@ -1287,7 +1301,8 @@ class Simulation:
                          "money": round(a.money, 1),
                          "wage": round(a.wage, 1),
                          "part_time": bool(a.part_time),
-                         **({"sdt": a.drive_mods} if a.drive_mods else {})}
+                         **({"sdt": a.drive_mods} if a.drive_mods else {}),
+                         **(_gt_mod.needs_extras(a) if _gt_on else {})}
              for a in self.agents},
             ensure_ascii=False), encoding="utf-8")
         # ビューア用の名簿(L1 には出ない静的情報)
@@ -1324,13 +1339,29 @@ class Simulation:
         _rostercfg = _roster_mod.cfg_of_config(cfg)
         self.roster_sc = (_roster_mod.RosterDaily(self.out_dir)
                           if _rostercfg["enabled"] else None)
+        # ---- G4/G5(第114 GT ロガー): 記憶ストリーム / 関係台帳の日次サイドカー ----------
+        # どちらも観測側だけで閉じる(世界を 1 バイトも書かず・L1 を 1 件も出さず・乱数ゼロ・
+        # LLM 呼数不変)。既定 OFF ではオブジェクトを作らず 1 ファイルも書かない。
+        # 塞ぐ穴: 記憶の本文と関係の連続値 closeness は **checkpoint にしか無く**、世代を
+        # 剪定した瞬間に消える = 復元実験の正解ラベルが本選ランで失われる。
+        from ..observer import memory as _memsc_mod
+        from ..observer import relations as _relsc_mod
+        _memcfg = _memsc_mod.cfg_of_config(cfg)
+        self.memory_sc = (_memsc_mod.MemoryDaily(self.out_dir,
+                                                 text_chars=_memcfg["text_chars"])
+                          if _memcfg["enabled"] else None)
+        _relcfg = _relsc_mod.cfg_of_config(cfg)
+        self.relations_sc = (_relsc_mod.RelationsDaily(self.out_dir,
+                                                       passing=_relcfg["passing"])
+                             if _relcfg["enabled"] else None)
         # ---- W4-E: finalize のメモリ有界化をサイドカーへも配る(同一 conf キー)----
         # サイドカーは生成条件がばらばら(indoor.tracks / work.ledger / economy.sidecar /
         # cognition.channels / g_update / observer.roster_daily)で __init__ の各所で作られる
         # ので、**全部そろったここで 1 度だけ**配る。既定 OFF では apply_cfg が何も触らない
         # = バイト一致。配り漏れ(新サイドカー追加時)は tests が Simulation の属性を走査して検出する。
         for _sc in (self.indoor_tracks, self.org_ledger_sc, self.finance_sc,
-                    self.channels_sc, self.cognition_g_sc, self.roster_sc):
+                    self.channels_sc, self.cognition_g_sc, self.roster_sc,
+                    self.memory_sc, self.relations_sc):
             if _sc is not None:
                 _finalize_mod.apply_cfg(_sc, self._finalize_cfg)
         # ---- レーン D1(第109): 「起動時セグメント」の終端印 ------------------------
@@ -2085,6 +2116,19 @@ class Simulation:
                 self.cognition_g_sc._resumed = True
             if self.roster_sc is not None:        # A13: 日次入場者名簿も canonical を先頭結合
                 self.roster_sc._resumed = True
+            # ---- G4/G5: 日次サイドカーの「最後に撮った日」を据える(resume==straight の要)----
+            # 前チャンクは step `start-1` まで実行済みなので、その step の日までは撮り終えて
+            # いる。ここを据えないと再開直後の step で同じ日をもう一度撮り、一気通しのランと
+            # 行集合が食い違う(名簿 A13 は `_seen` 集合で冪等なのでこの手当てが要らなかった)。
+            # ★「既存 part の最大 day から復元する」方式は採らない: **行が 1 つも無い日**
+            #   (day0 の朝はまだ誰も何も覚えていない)を撮り直してしまうため。
+            # ★変数名に `sc` を含めない(tests/test_indoor_invariance.py の静的検査が
+            #   局所変数名の部分一致でサイドカー参照を拾うため)。
+            _prev_day = int(self.clock.sim_min(max(0, start - 1))) // 1440
+            for _daily_log in (self.memory_sc, self.relations_sc):
+                if _daily_log is not None:
+                    _daily_log._resumed = True
+                    _daily_log._day = _prev_day
         if every > 0:
             save_config(self.cfg, self.out_dir)   # 途中再開に備え config を先出しする
         for step in range(start, int(self.cfg.run.n_steps)):
@@ -2114,6 +2158,10 @@ class Simulation:
                     self.cognition_g_sc.flush_segment()
                 if self.roster_sc is not None:      # A13: 日次入場者名簿も対でセグメント化
                     self.roster_sc.flush_segment()
+                if self.memory_sc is not None:      # G4: 記憶ストリームも対でセグメント化
+                    self.memory_sc.flush_segment()
+                if self.relations_sc is not None:   # G5: 関係台帳の日次差分も同様
+                    self.relations_sc.flush_segment()
                 did_flush = True
             if flush_every > 0 and not did_flush \
                     and (step + 1) % flush_every == 0:
@@ -2135,6 +2183,10 @@ class Simulation:
                     self.cognition_g_sc.flush_segment()
                 if self.roster_sc is not None:
                     self.roster_sc.flush_segment()
+                if self.memory_sc is not None:
+                    self.memory_sc.flush_segment()
+                if self.relations_sc is not None:
+                    self.relations_sc.flush_segment()
         return self.finalize()
 
     def _agents_json_records(self) -> list:
@@ -2210,6 +2262,10 @@ class Simulation:
             self.cognition_g_sc.finalize()
         if self.roster_sc is not None:            # A13: 日次入場者名簿を結合(part→canonical)
             self.roster_sc.finalize()
+        if self.memory_sc is not None:            # G4: 記憶ストリームを結合(part→canonical)
+            self.memory_sc.finalize()
+        if self.relations_sc is not None:         # G5: 関係台帳の日次差分を結合
+            self.relations_sc.finalize()
         # B4 item#4: 会社観測(indoor_fields/ledger)ON かつ org 配属があるランは agents.json を再出力し
         # org_id/org_role を載せる(org 配属は run 中の遅延初期化=__init__ 時点では未付与のため)。
         # OFF は再出力しない=既存 agents.json とバイト一致(ゴールデン非該当)。

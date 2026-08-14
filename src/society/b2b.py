@@ -66,6 +66,13 @@ def build_cfg(raw_commerce) -> dict:
         # 卸値(1単位あたりの仕入単価。cat 別に上書き可。既定=小売の下代近似)。
         "wholesale_price": wprice,
         "default_wholesale_price": float(raw.get("default_wholesale_price", 300.0)),
+        # ---- 第114 レーン乙(供給の詰まりを解く 2 件。既定 OFF=現行と 1 バイト一致)----
+        # ① 部分納品: 在庫の範囲で納め、残りは翌日以降へ持ち越す(バックオーダー)。
+        # ② 分散調達: 指名卸に在庫が無いとき近傍の同業卸へ決定論でフォールバックする。
+        "partial_fulfillment": bool(raw.get("partial_fulfillment", False)),
+        "multi_source": bool(raw.get("multi_source", False)),
+        # 分散調達で当たる卸の総数(指名卸を含む)。距離昇順・同距離は org id 昇順。
+        "max_sources": max(1, int(raw.get("max_sources", 3))),
     }
 
 
@@ -78,7 +85,11 @@ def enabled(sim) -> bool:
 
 def _state(sim) -> dict:
     """B2B の会計・在庫台帳(遅延構築)。stock=卸在庫 / revenue=卸売上 / procurement=小売仕入費合計 /
-    sold_qty=卸出荷数 / trades=取引件数。org_ledger の会計流儀=買い側支出=売り側売上で保存する。"""
+    sold_qty=卸出荷数 / trades=取引件数。org_ledger の会計流儀=買い側支出=売り側売上で保存する。
+
+    ★部分納品 ON のときだけ 3 欄が増える(``req_qty`` = 要求総量 / ``short_qty`` = 納めきれ
+      なかった総量 / ``partial`` = 部分納品になった件数)。**遅延構築のときにキーを作らない**
+      ので、OFF のランでは台帳 dict のキー集合が現行と 1 バイトも変わらない。"""
     b = getattr(sim, "_b2b", None)
     if not b:                                        # None または未構築の空 dict(simulation の初期値)
         b = {"stock": {}, "revenue": {}, "procurement": 0.0, "sold_qty": {}, "trades": 0}
@@ -136,6 +147,44 @@ def wholesale_for(sim, node: str, cat: str) -> dict | None:
             best = org
     memo[ck] = best
     return best
+
+
+def suppliers_for(sim, node: str, cat: str) -> tuple:
+    """小売(node, cat)から見た**近い順の卸 org 列**(先頭 = ``wholesale_for`` と同一社)。
+
+    分散調達(``multi_source``)ON のときだけ呼ばれる。順序は (2乗距離, org id) の昇順で
+    完全に決定論(乱数を 1 粒も引かない)。長さは ``max_sources`` まで。
+    ``wholesale_for`` と同じく (node, cat) の**静的な純関数**(台帳も地図も走行中に
+    変わらない)なので 1 度だけ引いて控える。
+    """
+    book = getattr(sim, "orgs", None)
+    if not book:
+        return ()
+    kind = sim.b2bcfg["supply_kind"].get(str(cat))
+    if not kind:
+        return ()
+    memo = getattr(sim, "_b2b_suppliers_memo", None)
+    if memo is None:
+        memo = {}
+        sim._b2b_suppliers_memo = memo
+    ck = (str(node), str(cat))
+    if ck in memo:
+        return memo[ck]
+    p = sim.city.node_xy(node)
+    ranked = []
+    for oid in sorted(book):
+        org = book[oid]
+        if kind not in (org.get("output_kinds") or []):
+            continue
+        wn = (org.get("workplace_poi") or {}).get("node")
+        if not wn or wn not in sim.city.graph:
+            continue
+        q = sim.city.node_xy(wn)
+        ranked.append((((q[0] - p[0]) ** 2 + (q[1] - p[1]) ** 2), oid, org))
+    ranked.sort(key=lambda t: (t[0], t[1]))
+    out = tuple(org for _d2, _oid, org in ranked[:int(sim.b2bcfg["max_sources"])])
+    memo[ck] = out
+    return out
 
 
 def origin_node(sim, node: str, cat: str) -> str | None:
@@ -220,10 +269,33 @@ def fulfill(sim, node: str, cat: str, qty: int, step: int, sim_min: int) -> bool
     have = int(b["stock"].get(oid, 0))
     if have < qty:                                    # 卸在庫不足=仕入れ失敗(欠品波及・翌レビューで再発注)
         return False
+    _ship(sim, org, node, cat, qty, step, sim_min)
+    return True
+
+
+def _stock_of(sim, b: dict, org: dict) -> int:
+    """卸 1 社の現在庫(起動時在庫の遅延初期化つき。``fulfill`` の該当部分と同一の規則)。"""
+    oid = str(org["id"])
+    if oid not in b["stock"]:
+        seed = _initial_stock_for(sim, oid)
+        if seed:
+            b["stock"][oid] = int(seed)
+    return int(b["stock"].get(oid, 0))
+
+
+def _ship(sim, org: dict, node: str, cat: str, qty: int, step: int, sim_min: int,
+          req: int = 0) -> None:
+    """卸 org → 小売(node, cat)へ qty 単位を出荷する(金と物の移転 + b2b_trade 1 件)。
+
+    ``fulfill`` の成立枝をそのまま関数へ括り出したもので、**既定経路では payload も
+    台帳の更新順も 1 バイト変わらない**(``req`` を渡すのは部分納品 ON のときだけ)。
+    """
+    oid = str(org["id"])
+    b = _state(sim)
     price = _wholesale_price(sim.b2bcfg, cat)
     amount = float(qty) * price
-    b["stock"][oid] = have - qty                      # 物: 卸在庫が減る
-    b["revenue"][oid] = b["revenue"].get(oid, 0.0) + amount   # 金: 売り側=売上
+    b["stock"][oid] = int(b["stock"].get(oid, 0)) - int(qty)   # 物: 卸在庫が減る
+    b["revenue"][oid] = b["revenue"].get(oid, 0.0) + amount    # 金: 売り側=売上
     b["procurement"] += amount                        # 金: 買い側=仕入費(合計)
     b["sold_qty"][oid] = b["sold_qty"].get(oid, 0) + int(qty)
     b["trades"] += 1
@@ -232,9 +304,68 @@ def fulfill(sim, node: str, cat: str, qty: int, step: int, sim_min: int) -> bool
     payload = {"from_org": oid, "to_poi": node, "cat": str(cat),
                "qty": int(qty), "amount": round(amount, 1),
                "from_node": org_node}
+    if req:                                           # 部分納品 ON のときだけ生える 1 キー
+        payload["req"] = int(req)
     parties = sfc_mod.on_b2b_trade(sim, node, cat, oid, amount, step, sim_min)
     if parties is not None:                           # IF-E2(既定 OFF=None=キーなし)
         payload["payer"], payload["payee"] = parties
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
                          kind="b2b_trade", x=0.0, y=0.0, payload=payload))
-    return True
+
+
+def fulfill_qty(sim, node: str, cat: str, qty: int, step: int, sim_min: int) -> int:
+    """**実際に納品できた数量**を返す(第114 レーン乙: 部分納品 + 分散調達)。
+
+    塞ぐ問題(第113 実測): 生産 42,408 / 需要 44,604 という**わずかな**恒常ギャップに対して、
+    従来の ``fulfill`` は all-or-nothing(``have < qty`` なら 0 本も納めず False)だったため、
+    「あと 1 個足りない」だけで補充が丸ごと失敗し、翌日も同じ量を要求してまた失敗する
+    ——という自己再生産する詰まりを起こしていた(全店品切れの波及)。人為的に生産量を
+    増やすのは**実勢の改竄**なので、直すのは配分の規則の側である。
+
+      ① 部分納品(``partial_fulfillment``): 在庫の範囲で納める。残りは在庫水準が発注点を
+         下回ったままになるので、**翌日の (s,S) レビューが自動的に再発注する**
+         = バックオーダーは既存機構がそのまま担う(新しい待ち行列を作らない)。
+      ② 分散調達(``multi_source``): 指名卸の在庫が尽きたら、近い順に最大
+         ``max_sources`` 社まで当たる(決定論・乱数ゼロ)。
+
+    **数量保存**: 納品量は各卸の在庫からしか引かず、在庫は ``on_production`` の生産と
+    起動時在庫からしか増えない = Σ納品 ≤ Σ生産 + Σ起動時在庫 が構造的に成立する
+    (「作った以上に納める」経路が 1 本も無い)。
+
+    どちらも OFF のときは ``fulfill`` と**完全に同値**(成立なら qty・不成立なら 0)。
+    """
+    if qty <= 0:
+        return 0
+    cfg = sim.b2bcfg
+    partial = bool(cfg["partial_fulfillment"])
+    multi = bool(cfg["multi_source"])
+    if not (partial or multi):                        # 既定 = 従来経路(1 行も新しく通らない)
+        return int(qty) if fulfill(sim, node, cat, qty, step, sim_min) else 0
+    orgs = suppliers_for(sim, node, cat) if multi else ()
+    if not orgs:
+        org = wholesale_for(sim, node, cat)
+        if org is None:                               # 卸不在=外生 depot 扱い(従来補充)
+            return int(qty)
+        orgs = (org,)
+    b = _state(sim)
+    want = int(qty)
+    got = 0
+    for org in orgs:
+        if want <= 0:
+            break
+        have = _stock_of(sim, b, org)
+        take = have if partial else (want if have >= want else 0)
+        if take > want:
+            take = want
+        if take <= 0:
+            continue
+        _ship(sim, org, node, cat, take, step, sim_min,
+              req=(int(qty) if partial else 0))
+        got += take
+        want -= take
+    if partial:                                       # 観測: 要求 / 不足 / 部分納品の件数
+        b["req_qty"] = int(b.get("req_qty", 0)) + int(qty)
+        b["short_qty"] = int(b.get("short_qty", 0)) + int(qty - got)
+        if 0 < got < int(qty):
+            b["partial"] = int(b.get("partial", 0)) + 1
+    return int(got)

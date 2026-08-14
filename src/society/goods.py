@@ -270,12 +270,17 @@ def _delivery_origin(sim, node: str, cat: str) -> str | None:
     return _nearest_gateway(sim, node)
 
 
-def _b2b_fulfill(sim, node: str, cat: str, qty: int, step: int, sim_min: int) -> bool:
-    """B2B ⑤ ON なら小売の仕入れを卸 org 在庫から満たす(不足=補充失敗=欠品波及)。OFF/卸不在は常に True。"""
+def _b2b_fulfill(sim, node: str, cat: str, qty: int, step: int, sim_min: int) -> int:
+    """B2B ⑤ ON なら小売の仕入れを卸 org 在庫から満たし、**実際に納品できた数量**を返す。
+
+    b2b OFF / 卸不在では常に qty(=満額。従来の外生 depot 補充と完全に同じ)。
+    b2b ON でサブトグル(partial_fulfillment / multi_source)が両方 OFF なら、返り値は
+    **qty か 0 のどちらか**しか取らない = 従来の all-or-nothing とバイト一致で同値。
+    """
     from . import b2b as _b2b
     if not _b2b.enabled(sim):
-        return True
-    return _b2b.fulfill(sim, node, cat, qty, step, sim_min)
+        return int(qty)
+    return _b2b.fulfill_qty(sim, node, cat, qty, step, sim_min)
 
 
 def _delivery_blocked(sim, node: str) -> bool:
@@ -361,12 +366,17 @@ def deliver_arrivals(sim, step: int, sim_min: int) -> None:
         cap = _capacity(cfg, cat)
         level = st.get(key, cap)
         qty = max(0, cap - level)
-        if not _b2b_fulfill(sim, node, cat, qty, step, sim_min):   # ⑤ 卸在庫不足→仕入れ失敗=欠品波及
-            continue                                      # (b2b OFF/卸不在は常に True=挙動不変)
-        st[key] = cap
+        got = _b2b_fulfill(sim, node, cat, qty, step, sim_min)   # ⑤ 卸在庫から仕入れる
+        if got <= 0:                                      # 全く納品できない=欠品が川上へ波及
+            continue                                      # (b2b OFF/卸不在は常に満額=挙動不変)
+        # ★部分納品(b2b.partial_fulfillment)ON のときだけ got < qty がありうる。その場合は
+        #   届いた分だけ在庫が戻り、水準は発注点を下回ったままなので**翌日の (s,S) レビューが
+        #   自動的に残りを再発注する**(= バックオーダーを既存機構が担う。新しい待ち行列を
+        #   1 本も作らない)。OFF では got は必ず qty なので下の 1 行は st[key] = cap と同値。
+        st[key] = level + got
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
                              kind="restock", x=0.0, y=0.0,
-                             payload={"poi": node, "cat": str(cat), "qty": int(qty),
+                             payload={"poi": node, "cat": str(cat), "qty": int(got),
                                       "from": _nearest_gateway(sim, node)}))
 
 

@@ -199,7 +199,8 @@ def emotion_label(valence: float, arousal: float, ecfg: dict) -> tuple[str, str]
     return _EMOTION[(band, sign)]
 
 
-def update_emotion(agent, cfg: dict, step: int, sim_min: int, logger) -> None:
+def update_emotion(agent, cfg: dict, step: int, sim_min: int, logger,
+                   gt_extras: bool = False) -> None:
     """毎step(affect の decay と同居): 現在の core affect から離散感情ラベルを再計算する。
 
     ラベルが変わったときだけ emotion_label を記録(sparse)+ プロンプト句を agent に保持する。
@@ -212,9 +213,15 @@ def update_emotion(agent, cfg: dict, step: int, sim_min: int, logger) -> None:
     agent._emotion_phrase = phrase
     if getattr(agent, "_emotion_label", None) != label:
         agent._emotion_label = label
+        payload = {"label": label}
+        # G7-③(observer.gt_extras。既定 False ではキー自体を生やさない=L1 バイト一致)。
+        # ラベルは 6 象限の粗い離散値でしかなく、**プロンプトへ実際に入る感情句**は落ちていた。
+        if gt_extras:
+            from .observer import gt_extras as _gt
+            payload.update(_gt.emotion_extras(phrase))
         logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                          kind="emotion_label", x=agent.x, y=agent.y,
-                         payload={"label": label}))
+                         payload=payload))
 
 
 # ---------------------------------------------------------------- 長期目標・趣味の付与

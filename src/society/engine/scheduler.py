@@ -40,6 +40,7 @@ from .. import party as party_mod
 from .. import physics as physics_mod
 from .. import provlink as provlink_mod
 from ..observer import causality as causality_mod
+from ..observer import gt_extras as gt_extras_mod
 from .. import reject as reject_mod
 from .. import relations as relations_mod
 from .. import relations_endo as relations_endo_mod
@@ -1071,7 +1072,8 @@ def _phase_reflect_batched(sim, step: int, sim_min: int, workers: int) -> None:
             d["agent"], step=step, sim_min=sim_min, writeback=wb, alpha=alpha,
             rng=d["rng"], logger=sim.logger, controls=controls, req=req,
             response=response, call_id=call_id, cached=cached,
-            discard=d["discard"])
+            discard=d["discard"],
+            gt_extras=gt_extras_mod.enabled(sim))   # G7-②(既定 OFF=キーなし)
 
 
 def _phase_wake_and_returns(sim, step: int, sim_min: int) -> None:
@@ -2483,13 +2485,15 @@ def _phase_drive(sim, step: int, sim_min: int) -> None:
     # なら完全 no-op(ラベル更新なし・イベント 0 件=バイト一致)。drive(発火系)には接続しない(R1)。
     emotion_on = affect_on and inner_life_mod.enabled(sim) \
         and inner_life_mod.cfg_of(sim)["emotion"]["enabled"]
+    _gt_extras_on = gt_extras_mod.enabled(sim)   # G7(既定 OFF=payload にキーを足さない)
     for agent in active:
         drive.step_tick(agent, cfg, step)
         if affect_on:                       # 覚醒度を毎step baseline へ漏れ減衰(drive と並列)
             affect.decay(agent, sim.affectcfg)
             if emotion_on:                  # core affect → 離散感情ラベル(決定論・drive 非接続)
                 inner_life_mod.update_emotion(agent, sim.innerlifecfg, step,
-                                              sim_min, sim.logger)
+                                              sim_min, sim.logger,
+                                              gt_extras=_gt_extras_on)
 
     def _eff_thr(a):
         """実効閾値(E2 ドリフト + 覚醒の逆U字変調 + 疲労)。affect/health OFF or gain=0 で恒等=バイト一致。"""
@@ -5480,6 +5484,20 @@ def run_step(sim, step: int) -> None:
     sim.budget.reset()
     sim.freedom_stats = {"choice_points": 0, "exercised": 0}  # 自由度観測(P2)の step 境界。OFF は L2 で列不在
     sim_min = sim.clock.sim_min(step)
+    # G4/G5 日次サイドカー(記憶ストリーム / 関係台帳の差分。既定 OFF=属性 None=分岐 1 回だけ)。
+    # ★**step の先頭・在場ローテーションより前**に置く 3 つの理由(観測しかしない):
+    #   (a) C3 すれ違いカウンタは conversation._roll_day が日境界に空へ戻すので、後ろで撮ると
+    #       前日ぶんが取れない(常に 0 になる)。
+    #   (b) 退場する個体の記憶と関係が、dormant へ退避される前にここで 1 度だけ残る。
+    #   (c) 「day D の行」= day D-1 の終わりの状態、という 1 つの意味に揃う。
+    # ★変数名に `sc` を含めない: tests/test_indoor_invariance.py の静的検査は
+    #   `sc = getattr(sim, "…_sc")` で束ねた**局所変数名の部分一致**でサイドカー参照を
+    #   拾うので、`_dsc.on_step` は `sc.on_step` として誤検出される(A13 roster が
+    #   `_roster` と名付けているのと同じ理由)。
+    for _daily_log in (getattr(sim, "memory_sc", None),
+                       getattr(sim, "relations_sc", None)):
+        if _daily_log is not None:
+            _daily_log.on_step(sim, step, sim_min)
     _phase_pool_rotation(sim, step, sim_min)       # 日次境界: 在場ローテーション(既定OFF=no-op。W2 P3)
     _phase_workplace_bound_report(sim, step, sim_min)  # 起動時1回: 職場束ね直しの coverage 統計(既定OFF=no-op)
     _phase_mind_report(sim, step, sim_min)         # 誕生時1回/個体: 心のモデル固定の記録(既定OFF=no-op。第88)
@@ -5722,7 +5740,9 @@ def run_step(sim, step: int) -> None:
                               reflect_variety=bool(getattr(sim, "promptscfg", {})
                                                    .get("reflect_variety", False)),
                               interstitial=_interstitial_on(sim),
-                              interstitial_digest=_isl_take(sim, agent))
+                              interstitial_digest=_isl_take(sim, agent),
+                              # G7-②(既定 OFF=payload にキーを 1 つも足さない)
+                              gt_extras=gt_extras_mod.enabled(sim))
 
     # 行間補間(P2 S2): この step で新規に記録されたイベントを各個体のバッファへ振り分ける
     # (OFF は _isl_idx=-1 で完全 no-op=バッファも作らない=バイト一致)。発火時の _isl_take が
@@ -5757,7 +5777,11 @@ def run_step(sim, step: int) -> None:
     # LLM 呼数のいずれも触らない。L3 スナップショットの直前=同じ step 終了時の世界を見る。
     if _ch_idx >= 0:
         from ..cognition import channels as _channels_mod
-        sim.channels_sc.add_rows(_channels_mod.observe(sim, step, sim_min, _ch_idx))
+        _rows = _channels_mod.observe(sim, step, sim_min, _ch_idx)
+        if getattr(sim, "channels_sat", False):   # G6: 価値 4 軸の充足 sat(既定 OFF=列なし)
+            from ..observer import channels as _obs_channels_mod
+            _rows = _obs_channels_mod.append_sat(sim, _rows)
+        sim.channels_sc.add_rows(_rows)
 
     # 閾値発火(第81。既定 OFF は _fire_idx=-1 で完全 no-op)。この step 末の o_c(t) を
     # 各個体へ凍結し、次 tick の S 判定の唯一の入力にする(全員が同じ state(t) を読む)。

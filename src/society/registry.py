@@ -1261,6 +1261,49 @@ FEATURES: tuple[Feature, ...] = (
        "traits_json の 1 列に丸ごと入れる(no-fingerprint 契約)。既定 OFF ではオブジェクトを"
        "作らず 1 ファイルも書かない。★規模: 在場25万×10日で約46万行 = +100MB 前後"),
 
+    # ---- GT ロガー(第114 2026-08-14。metaverse-projection-plan.md §4)----
+    # 共通の根拠: 全て観測側だけで閉じる(世界状態を 1 バイトも書かず・L1 を 1 件も出さず・
+    # 乱数を 1 粒も引かず・LLM 呼数を 1 も変えず・プロンプトを 1 バイトも変えない)。
+    #   repro_tier=strict / affects_k=False / fingerprint_risk=none。
+    _f("observer.input_provenance.enabled", "strict", False, "none",
+       "ラン最大の入力 3 件(ペルソナプール / 市街地図 / 組織台帳)の sha256 を "
+       "run_manifest.json の inputs 節へ書く(G1)。天候・認知の凍結入力には来歴が残るのに、"
+       "100 万人の素性を持つプール(= agent_id → ペルソナの決定論逆引きの源)の来歴は"
+       "1 バイトも残っていなかった = 事後に「どのプールで回したのか」が確定できない。"
+       "ディレクトリはシャード毎 sha256 + `<相対パス>:<sha256>` を連ねた結合ハッシュ。"
+       "ストリーミング読み(定数メモリ)。既定 OFF ではキー自体を出さない"),
+    _f("observer.memory_daily.enabled", "strict", False, "none",
+       "日境界に在場者の記憶ストリーム(episodes/buffer の text/kind/importance/step)を "
+       "memory.parquet へ 1 記憶 1 行で追記する(G4)。記憶の本文は L1 に出ず checkpoint に"
+       "しか無い = 世代を剪定すると消える。しかも記憶自体が日々消える(就寝時の buffer 切り・"
+       "store_cap 超過の切り捨て・ACT-R 忘却)ので、事後には二度と取れない。全量スナップショット"
+       "方式なので「いつ忘れたか」が行の消失として読める。agents/memory.py は読むだけ。"
+       "★規模: 在場25万×10日で約5,000万行 = **1.5-1.8GB**(サイドカー群で最大)"),
+    _f("observer.relations_daily.enabled", "strict", False, "none",
+       "日境界に関係台帳の**変化した対だけ**(closeness/tier/count/dormant の差分)と "
+       "C3 すれ違い集計(other_id=-1 の行に c3_pass/c3_greet)を relations.parquet へ"
+       "追記する(G5)。closeness の連続値は L1 では tier 跨ぎしか出ず(段の内側は無音)、"
+       "checkpoint 剪定と dormant の LRU 溢れで消える。C3 も L1 に無いので、"
+       "「共在 → 関係」の復元実験は説明変数と被説明変数が**両方とも**残らなかった。"
+       "撮る位置は step の先頭(在場ローテーションより前)= C3 が空に戻る前・退場者が"
+       "dormant へ移る前。★規模: 差分方式で +0.4GB 前後"),
+    _f("observer.gt_extras.enabled", "strict", False, "none",
+       "既存の出力へ「射影で落ちている 5 件」を足す小物束(G7): ① plan_created に "
+       "mood/carry/ブロック毎の同行者 with ② reflect に自己像の本文 self/ties ③ "
+       "emotion_label にプロンプトへ入る感情句 phrase ④ traits.json に needs の 5 軸"
+       "プロファイル + needs_mods ⑤ 日次 worldview に期待表の上位 k 件。"
+       "新イベント種も新ファイルも作らず、既存 payload にキーを足すだけ。"
+       "OFF では payload に一時キーすら積まれない = ゴールデン L1 バイト一致。"
+       "★規模: +500MB 前後(大半は ⑤)"),
+    _f("cognition.channels.sat_columns", "strict", False, "none",
+       "channels.parquet の末尾に価値 4 軸の充足 sat を 4 列足す(G6)。values.py の "
+       "agent.sat(「いま何が満たされていないか」= 復元実験の直接の正解ラベル)は writer が"
+       "1 本も無く checkpoint にしか残らなかった。★cognition/channels.py の CHANNELS には"
+       "**足さない**(足すと spec_sha256 が変わり、測り直し済みの σ_c 凍結ファイルが全部"
+       "無効になる)。sat は発火式 S の入力ではないので観測列としてだけ持つ。"
+       "OFF では列自体が生えない = 既存 channels.parquet とスキーマ・バイトが同一。"
+       "★規模: +0.6GB 前後"),
+
     # ---- ablate(第78バッチ: アブレーション 4 種。対照条件のスイッチだけ)----
     # 全て既定 OFF。repro_tier=strict の根拠は「機構を**外す**方向の決定論ゲート」で
     # あること(LLM の自由文を新たに読む経路を 1 つも足さない)。
@@ -1507,6 +1550,19 @@ FEATURES: tuple[Feature, ...] = (
        "実在庫・日次補充トリップ・商品実体"),
     _f("commerce.inventory.b2b.enabled", "strict", False, "none",
        "供給網の内生化(組織間の B2B 取引)"),
+    # ---- 第114 レーン乙: 供給の詰まりを解く 2 件(決定論・乱数ゼロ・LLM 呼数不変)----
+    _f("commerce.inventory.b2b.partial_fulfillment", "strict", False, "none",
+       "卸の在庫の**範囲で**納品する(部分納品)。従来は all-or-nothing で、在庫が要求量に"
+       "1 個でも足りなければ 0 本も納めず、翌日も同じ量を要求してまた失敗する自己再生産の"
+       "詰まり(全店品切れの波及)を起こしていた。残量は在庫水準が発注点を下回ったままに"
+       "なるので**翌日の (s,S) レビューが自動的に再発注**する(= バックオーダーは既存機構が"
+       "担い、新しい待ち行列を 1 本も作らない)。数量保存: 納品は卸在庫からしか引かず、"
+       "在庫は生産と起動時在庫からしか増えない = Σ納品 ≤ Σ生産 + Σ起動時在庫"),
+    _f("commerce.inventory.b2b.multi_source", "strict", False, "none",
+       "指名卸(最寄り 1 社)の在庫が尽きたとき、近傍の同業卸へフォールバックする(分散調達)。"
+       "順序は (2乗距離, org id) の昇順で完全に決定論・乱数ゼロ。当たる社数は "
+       "commerce.inventory.b2b.max_sources まで。卸の選定規則(供給の受け持ち)は台帳と地図"
+       "だけで決まる静的な写像なので、1 度引いて控える(挙動は毎回引くのと同一)"),
     _f("services.enabled", "strict", False, "possible",
        "サービスの実体化(service/education POI を経済的に起こす)"),
     _f("services.self_dev.enabled", "strict", False, "none",
@@ -1594,6 +1650,11 @@ ALLOWLIST: dict[str, str] = {
     "pool.presence.habit.weather":
         "雨/雪の目的別弾性を掛けるかの指定(pool.presence.habit.enabled が親トグル。"
         "weather.mode=generated 以外では ON でも不活性)",
+    # 第114 GT ロガー G5: 関係サイドカー**内部**の行の種類の指定であって独立した機能
+    # トグルではない(observer.relations_daily.enabled が OFF なら 1 行も書かれない)。
+    "observer.relations_daily.passing":
+        "C3 すれ違い行(other_id=-1)を出すかの指定"
+        "(observer.relations_daily.enabled が親トグル。世界の機能ではなく出力の内訳)",
 }
 
 

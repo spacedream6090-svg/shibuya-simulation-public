@@ -320,7 +320,8 @@ def maybe_reflect(agent, *, step: int, sim_min: int, writeback: str, alpha: floa
                   reflect_variety: bool = False,
                   interstitial_digest: str | None = None,
                   interstitial: bool = False,
-                  city_name: str = "") -> None:
+                  city_name: str = "",
+                  gt_extras: bool = False) -> None:
     """就寝中で reflect_step に達していれば内省(1睡眠につき1回)。
 
     v2(Phase B): 同じ1回の呼び出しで**記憶の統合**(日次要約+顕著エピソード
@@ -370,7 +371,7 @@ def maybe_reflect(agent, *, step: int, sim_min: int, writeback: str, alpha: floa
                            writeback=writeback, alpha=alpha, rng=rng,
                            logger=logger, controls=controls, req=req,
                            response=response, call_id=call_id, cached=cached,
-                           discard=discard)
+                           discard=discard, gt_extras=gt_extras)
 
 
 def begin_reflect(agent, *, step: int, writeback: str,
@@ -423,8 +424,12 @@ def apply_reflect_response(agent, *, step: int, sim_min: int, writeback: str,
                            alpha: float, rng, logger: ObserverLogger,
                            controls: str, req: dict, response: str,
                            call_id: str | None, cached: bool,
-                           discard: bool) -> None:
-    """内省応答の適用(build_reflect_request と対・P2 S6b)。"""
+                           discard: bool, gt_extras: bool = False) -> None:
+    """内省応答の適用(build_reflect_request と対・P2 S6b)。
+
+    ``gt_extras``(G7-②・既定 False)= ``reflect`` payload へ自己像の本文 self / ties を
+    足すか。既定では**キー自体を生やさない** = 従来の L1 とバイト一致。
+    """
     deep, deep_event = req["deep"], req["deep_event"]
     day, rcfg = req["day"], req["rcfg"]
     logger.log_llm_call({"llm_call_id": call_id, "agent_id": agent.id,
@@ -479,5 +484,11 @@ def apply_reflect_response(agent, *, step: int, sim_min: int, writeback: str,
         payload["deep"] = True
         payload["cause"] = "event" if deep_event else "period"
         payload["self_model_updated"] = sm_updated
+        # G7-②(observer.gt_extras。既定 OFF ではキー自体を生やさない = L1 バイト一致)。
+        # 「更新した/しない」の bool しか残らなかった自己像の**本文**(self / ties。
+        # どちらも生成時点で 80 字に切られている)を足す。記録だけ = 世界も乱数も不変。
+        if gt_extras and sm_updated:
+            from ..observer import gt_extras as _gt
+            payload.update(_gt.reflect_extras(getattr(agent, "self_model", None)))
     logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id, kind="reflect",
                      x=agent.x, y=agent.y, llm_call_id=call_id, payload=payload))

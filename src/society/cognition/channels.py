@@ -205,6 +205,11 @@ def build_cfg(raw: dict | None) -> dict:
         # 凍結ファイルのパス。空文字 = 既定パス(cognition/calib.py の定数)。
         "sigma_file": str(raw.get("sigma_file", "") or ""),
         "calib_file": str(raw.get("calib_file", "") or ""),
+        # G6(第114 GT ロガー・既定 OFF): 価値 4 軸の充足 sat を **observer 側の追加列**として
+        # channels.parquet の末尾へ足すか。★本 module の `CHANNELS` は 1 本も動かさない
+        # (動かすと `spec_sha256()` が変わり、既に測った σ_c 凍結ファイルが全部無効になる)。
+        # sat は驚き S の入力ではないので、観測列としてだけ持つのが正しい置き場所である。
+        "sat_columns": bool(raw.get("sat_columns", False)),
     }
 
 
