@@ -93,6 +93,48 @@ def test_no_undeclared_toggles_in_shipped_config():
     assert R.undeclared_toggles(load_config()) == []
 
 
+def test_no_undeclared_toggles_in_any_shipped_profile():
+    """★第114 レーン 1d: **同梱の全プロファイル**の bool リーフが宣言済みである。
+
+    第109 の発見: 上の `test_no_undeclared_toggles_in_shipped_config` は
+    conf/config.yaml しか見ないので、**基底 conf に姿が無く finals_observe.yaml だけが
+    触るトグル**は網に掛からなかった(実測 8 件: economy の bank/consumption/payment/vc・
+    institution_routes.assembly.from_roster/.realism.enabled・memory.actr.enabled・
+    prompts.dialog_history)。「本選で ON にするものほど宣言が漏れる」という最悪の
+    向きの穴だったので、走査を conf/*.yaml 全体へ広げて再発を止める。
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    known = {f.id for f in R.FEATURES} | set(R.ALLOWLIST)
+    missing: dict[str, list[str]] = {}
+    for path in sorted((root / "conf").glob("*.yaml")):
+        leaves = R.flatten_bools(OmegaConf.load(path))
+        dead = [k for k in sorted(leaves) if k not in known]
+        if dead:
+            missing[path.name] = dead
+    assert missing == {}, f"未宣言トグルを含むプロファイル: {missing}"
+
+
+def test_finals_profile_declares_the_eight_recovered_toggles():
+    """第114 レーン 1d で拾い上げた 8 件が、基底 conf にもレジストリにも在る。"""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    recovered = ("economy.bank.enabled", "economy.consumption.enabled",
+                 "economy.payment.enabled", "economy.vc.enabled",
+                 "institution_routes.assembly.from_roster",
+                 "institution_routes.assembly.realism.enabled",
+                 "memory.actr.enabled", "prompts.dialog_history")
+    ids = {f.id for f in R.FEATURES}
+    base = OmegaConf.to_container(load_config(), resolve=True)
+    fin = R.flatten_bools(OmegaConf.load(root / "conf" / "finals_observe.yaml"))
+    for fid in recovered:
+        assert fid in ids, f"{fid} がレジストリに無い"
+        assert R._select(base, fid) is not None, f"{fid} が基底 conf に無い"
+        assert fid in fin, f"{fid} が本選 conf から消えた(検査の前提が崩れている)"
+
+
 def test_fake_unregistered_toggle_is_detected():
     """わざと未登録の偽キーを足すと検出される(= 宣言忘れが CI で落ちる)。"""
     cfg = OmegaConf.to_container(load_config(), resolve=True)

@@ -241,7 +241,12 @@ _ECON_FIELDS = (("period_income", float, 0.0), ("work_days", int, 0),
                 # ★プラン本体(`_wage_plan`)は運ばない —— 再来街時に台帳と安定ハッシュから
                 #   同じものが**決定論で組み直される**ので、運ぶと二重の真実源になる。
                 ("wp_days", int, 0), ("wp_settled_day", int, -1),
-                ("wp_bonus_pending", bool, False))
+                ("wp_bonus_pending", bool, False),
+                # §ROLE(第114 1a): L5 役割職(タクシー/配信者/議員)の最終清算日。
+                # ★これが無いと回転のたびに -1 へ戻り、議員報酬の給料日探索
+                #   (`_wage_fires` の (last, today] 区間)が毎回 45 日ぶん遡って
+                #   **同じ月の給料日を何度も払う**(歩合側は当日 1 回なので無害)。
+                ("rp_settled_day", int, -1))
 
 
 # ---- レーン乙(第113): 搬送族の**第2弾**(B クラス)-----------------------------------
@@ -280,6 +285,21 @@ _MISC_FIELDS = (
     #   (b) 不応期(既定 3 日)が帰街のたびに 0 へ戻る = 街を出入りする個体だけ
     #   「侵入的 → 熟慮的の遅延」という設計が成立しない。判定基準 3 つを全て満たす。
     ("deep_due_day", int, -1), ("deep_cooldown_until_day", int, -1),
+    # ★存在の内生化 POP(``society/population.py``): 名簿そのものの増減に効く**多日スケールの
+    #   個体状態**。判定基準 3 つ(① 個体固有 ② 日を跨いで持続 ③ 行動 or 発火可否を変える)を
+    #   全て満たす —— これらを運ばないと、
+    #     - ``pop_stress`` … 居住ストレスの蓄積(Wolpert 閾値の左辺)が回転のたびに 0 へ戻り、
+    #       **街を出入りする個体は原理的に転出できない**(居続けた個体だけが転出する系統偏り)。
+    #     - ``pop_days``   … 「この街で過ごした日数」= 定着(転入)の唯一の来街履歴。
+    #       運ばないと L4 は永遠に 1 日目のままで、定着が構造的に発火しない。
+    #     - ``pop_settled`` / ``pop_emigrated`` … 台帳(``sim._pop_state``)が真実源だが、
+    #       入場フックと退避の**両方**で同じ事実に着地することを機械固定するために運ぶ。
+    #     - ``pop_pair_since`` … 出生のパートナー継続日数の起点。
+    #   既定値は各所の getattr 既定と厳密に一致させてある = POP OFF のランではキーが 1 つも
+    #   生えない(tests/test_pool_rotation.py の dict 等値がそのまま守られる)。
+    ("pop_stress", float, 0.0), ("pop_days", int, 0),
+    ("pop_settled", bool, False), ("pop_emigrated", bool, False),
+    ("pop_pair_since", int, -1),
 )
 
 #: 世帯(H2)。★レーン乙 ブロック3: 世帯の静的部分は pool record から決定論で組み直すが、

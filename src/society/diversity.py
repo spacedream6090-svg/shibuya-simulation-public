@@ -63,6 +63,13 @@ DEFAULTS = {
     "landmark_top": 8,           # 回遊先候補にする上位ランドマーク数
     # ---- 多言語・文化の多様性 ----
     "foreign_ratio": 0.0,        # ★ON 推奨: 例 0.2(非日本語話者にする割合。決定論・id 順)
+    # ★台帳駆動(第114 レーン 1b。既定 false = 従来のハッシュ割当のまま)。
+    #   true にすると観光客/非日本語話者を **名簿 record の欄から決定論で導く**:
+    #     is_foreign      → 非日本語話者(言語ラベルは languages から安定ハッシュで 1 つ)
+    #     visit_purpose   → 観光客(「観光…」で始まる目的の来街者だけ)
+    #   このとき tourist_ratio / foreign_ratio は **record を持つ個体には効かない**
+    #   (record の無い層 = 手続き生成の直接ランは従来どおりハッシュ割当へ後退する)。
+    "record_driven": False,
     "languages": ["英語", "中国語", "韓国語"],   # 割り当てる言語ラベル(循環)
     "cross_lang_barrier": 2,     # 異言語間の語採用に必要な追加聴取回数(伝播障壁)
     # ---- 犯罪・迷惑行為 ----
@@ -77,7 +84,7 @@ DEFAULTS = {
     "avoid_danger": True,        # 危険地帯を自由時間の行き先から避ける(enabled 時のみ効く)
 }
 
-_BOOL_KEYS = ("enabled", "avoid_danger")
+_BOOL_KEYS = ("enabled", "avoid_danger", "record_driven")
 _INT_KEYS = ("landmark_top", "cross_lang_barrier", "danger_threshold")
 _FLOAT_KEYS = ("tourist_ratio", "tourist_bias", "foreign_ratio", "crime_prob",
                "nuisance_prob", "theft_amount", "crime_grievance", "nuisance_grievance")
@@ -132,7 +139,9 @@ def assign_attributes(sim) -> None:
     #   (b) 前方切りは id の小さい側に系統的に偏る(名簿の並び = 層の並び)。
     #   個体ハッシュの決定論割当へ置き換える(比率は保存。乱数 stream はゼロ)。
     #   pool OFF のランは**従来の前方切りのまま**= 既存の全ランとバイト一致。
-    if getattr(sim, "_pool", None) is not None:
+    # ★台帳駆動(1b)のときは pool でない名簿ラン(agents.personas_file)も同じ入口を通す:
+    #   record の is_foreign / visit_purpose を持つのは pool だけではない。
+    if cfg["record_driven"] or getattr(sim, "_pool", None) is not None:
         for a in sorted(sim.agents, key=lambda a: a.id):
             assign_for_entry(sim, a)
         return
@@ -158,19 +167,70 @@ def _u01(*parts) -> float:
     return int.from_bytes(hashlib.blake2b(key, digest_size=8).digest(), "big") / 2.0 ** 64
 
 
-def assign_for_entry(sim, agent) -> None:
+# ---------------------------------------------------------------- 台帳駆動(第114 レーン 1b)
+# 何が壊れていたか(第113 ペルソナ全数調査の実測): 名簿には `is_foreign`(L4 の 15% =
+# 149,895 人)が在り、その 14.9 万人の persona 文には**「訪日外国人」と書いてある**。
+# ところが engine の `agent.language` は上の `foreign_ratio` から**別のハッシュで**決まる
+# ので、両者は一致しない —— 「日本語で不自由しない訪日外国人」と「persona 文は日本人
+# なのに主に中国語を話す人」が同時に生まれる**内部矛盾**だった(`is_foreign` の読み手は
+# ゼロ = 完全な死に項目)。org_id の解決と同じ規律で **台帳を真実**に据えて解く。
+#
+# ★同じ理由で観光客も台帳から導く: L4 record の `visit_purpose` は persona 文に
+#   「観光・見物のため渋谷を訪れる」と書かれている当の語なので、`tourist_ratio` の
+#   独立抽選で観光客を選ぶと「買い物のため訪れた観光客」が出る。
+#
+# ★なぜ record を個体へ控えるのか(直接 assign_for_entry へ渡さないのか): day0 の着席は
+#   `build_pool_agent` → (`_init_pool_agent_extras` は `_init_event_mark` が無く早期 return)
+#   → `assign_attributes` という順で、**属性割当の時点では record が手元に無い**。
+#   day1 以降の入場は record を持つ。両方の入口を 1 本にするため、record を見た時点で
+#   2 欄だけを個体に控える(OFF では 1 つも生やさない = 属性不在の慣用)。
+_REC_FOREIGN = "_persona_foreign"
+_REC_PURPOSE = "_persona_purpose"
+
+#: 観光目的の来街を表す `visit_purpose` の接頭辞(名簿の目的語彙 7 種のうちの 1 つ)。
+TOURIST_PURPOSE_PREFIX = "観光"
+
+
+def note_record(sim, agent, record) -> None:
+    """名簿 record の観光/言語の素性 2 欄を個体へ控える(``record_driven`` ON のときだけ)。
+
+    冪等(同じ record を二度通しても値が動かない)・決定論・乱数ゼロ。OFF / 非 record_driven /
+    record なし では**属性を 1 つも生やさない**(= 従来のランとバイト一致)。"""
+    if not record or not enabled(sim) or not sim.diversitycfg["record_driven"]:
+        return
+    if "is_foreign" in record:
+        setattr(agent, _REC_FOREIGN, bool(record.get("is_foreign")))
+    purpose = str(record.get("visit_purpose") or "")
+    if purpose:
+        setattr(agent, _REC_PURPOSE, purpose)
+
+
+def assign_for_entry(sim, agent, record=None) -> None:
     """1 個体ぶんの観光客/言語割当(入場駆動・冪等・決定論・乱数ゼロ。レーン乙 A10)。
 
     比率は ``tourist_ratio``(visitor 母集団に対して)/ ``foreign_ratio``(全体に対して)を
     ハッシュ一様値の閾値判定で保存する(大数の法則。前方切りと違い母集団の並びに依存しない)。
+    ``record_driven`` ON かつ名簿にその欄が在る個体だけは**台帳の値が比率に優先する**
+    (欄の無い個体は比率へ後退する = 手続き生成の直接ランは従来どおり)。
     OFF は完全 no-op(属性を 1 つも生やさない)。"""
     if not enabled(sim):
         return
     cfg = sim.diversitycfg
+    note_record(sim, agent, record)
     key = str(getattr(agent, "pool_pid", None) or agent.id)
-    if getattr(agent, "visitor", False):
-        agent.tourist = bool(_u01("tourist", key) < float(cfg["tourist_ratio"]))
     langs = cfg["languages"]
+    driven = bool(cfg["record_driven"])
+    purpose = getattr(agent, _REC_PURPOSE, None) if driven else None
+    foreign = getattr(agent, _REC_FOREIGN, None) if driven else None
+    if getattr(agent, "visitor", False):
+        agent.tourist = (str(purpose).startswith(TOURIST_PURPOSE_PREFIX)
+                         if purpose is not None
+                         else bool(_u01("tourist", key) < float(cfg["tourist_ratio"])))
+    if foreign is not None:
+        # 台帳が「訪日外国人でない」と言っているなら言語は付けない(属性不在=日本語話者)。
+        if foreign and langs:
+            agent.language = langs[int(_u01("langpick", key) * len(langs)) % len(langs)]
+        return
     if langs and _u01("lang", key) < float(cfg["foreign_ratio"]):
         agent.language = langs[int(_u01("langpick", key) * len(langs)) % len(langs)]
 

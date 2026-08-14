@@ -230,6 +230,18 @@ FEATURES: tuple[Feature, ...] = (
     # affects_k=False: generate() の呼び出しサイトを 1 つも足さず・減らさない。
     # fingerprint_risk=none: **プロンプトへ 1 バイトも足さない**(遅延は従来どおり
     #   「動けない」という世界の事実としてしか個体に届く経路が無い)。
+    _f("transit.real_departures", "strict", False, "none",
+       "ダイヤの分解能を『1 本ごとの実発車時刻』へ上げる(第114 レーン 3b)。これまで"
+       "ダイヤは路線ごとの (始発, 終電, 中央値間隔) の 3 値しか持たず、ODPT 駅時刻表や"
+       "静的 GTFS から実時刻を読んだ**後で**その 3 値へ畳んでいた = 『実ダイヤに差し替え済み』"
+       "と言いながらシムが見ていたのは**等間隔の再構成**だった。true は departures 列を持つ"
+       "路線(渋谷では 6/9 路線・1,810 本)の到着表を実時刻そのものにする。★実測で効いたのは"
+       "**時刻帯プロファイル**であって塊(platoon)ではなかった(期待と逆なので正直に記す): "
+       "中央値間隔 3〜4 分に対し実測の朝 7:30-9:00 は 2〜3 分・日中は 4〜5 分で、渋谷駅の"
+       "朝の到着は 228→269 本(+18.0%)・1 日の総数は 2,911→2,601 本(-10.6%)。"
+       "到着のない分は 95→73 分に**減った**(9 路線の合併は実ダイヤでもほぼ毎分に立つ)。"
+       "列を持たない路線は従来の再構成へ後退する(混在は source 欄で事後に区別できる)。"
+       "乱数は 1 粒も引かない(到着表は読み取り専用の純関数)"),
     _f("transit_staff.enabled", "strict", False, "none",
        "駅員・車掌アクター層の親トグル。監査事実『電車は実体ではなく(has_service は"
        "時刻表の述語)、遅延を作っていたのは主体なしの近似(env.feedback 規則1)と"
@@ -371,6 +383,30 @@ FEATURES: tuple[Feature, ...] = (
        "来街者が帰宅から戻るたび手持ちを補充(長期ランの恒久破綻対策)"),
     _f("economy.accounts.enabled", "strict", False, "none",
        "口座(銀行)概念。月給・家賃引落・カード/現金・ATM・立退き/破産サイクル"),
+    # ---- 経済の追加層 E-W1/E-W2/E-W3(第114 レーン 1d で**宣言だけ**を足した)----
+    # ★4 件とも conf/config.yaml に 1 行も書かれておらず、コード側の既定(build_*_cfg の
+    #   enabled=False)だけで OFF になっていた = finals_observe.yaml が true にしているのに
+    #   未宣言トグル検出(tests/test_registry_modes.py)の網に掛からなかった(第109 の発見)。
+    #   宣言と conf の既定値を足しただけで、挙動は 1 バイトも変わらない。
+    # strict の根拠: どれも決定論 + 用途別の named stream("payment" / commerce 側)だけで
+    #   挙動が決まり、LLM の自由文をデータとして読まない。
+    _f("economy.consumption.enabled", "strict", False, "none",
+       "E-W3 消費行動。家計調査2024 の費目シェア(食料 28.4% 等)と可処分所得の予算制約で"
+       "消費額を圧縮する。個体差は traits からの決定論導出(エンゲル則)。"
+       "既定 OFF=budget 圧縮なし=消費額が現行と完全同一"),
+    _f("economy.payment.enabled", "strict", False, "possible",
+       "E-W3 決済手段。キャッシュレス比率 42.8%(経産省2024)を基準に、金額帯と個体嗜好で"
+       "cashless / cash を専用 stream『payment』の 1 draw で選び spend payload に method を"
+       "1 欄足す。fingerprint_risk=possible の根拠は payload に欄が増えること(プロンプトは不変)。"
+       "既定 OFF=method を足さない=spend payload が現行とバイト一致"),
+    _f("economy.bank.enabled", "strict", False, "none",
+       "E-W1 銀行。預金利息(年利 0.2% の日割)・与信スコア(income/assets/repayment/arrears の"
+       "4 項)・融資・定期返済・延滞から既存 accounts の破産サイクルへの接続。"
+       "要 economy.accounts.enabled=true。既定 OFF=利息も融資も 0 件(L1 バイト一致)"),
+    _f("economy.vc.enabled", "strict", False, "none",
+       "E-W2 VC/出資。審査は観測可能な代理変数のみ(traction=売上履歴 / market=在館数 / "
+       "network=関係次数)で、efficacy 等の内部構成概念は**使わない**(k 非依存)。"
+       "既定 OFF=vc_investment 0 件(L1 バイト一致)"),
     # ---- 賃金多様性 WAGE(第112バッチ 2026-08-13。ユーザー要求)----
     # strict の根拠: 金額・支給形態・給料日・賞与のすべてが (台帳, 安定キー) の blake2b 純関数で、
     #   **乱数 stream を 1 本も引かない**。LLM の自由文は 1 バイトも読まない。
@@ -396,6 +432,16 @@ FEATURES: tuple[Feature, ...] = (
        "(毎月勤労統計の実態)。支給日は給料日と重ならない日を選ぶ(同一 step に賃金を 2 本"
        "重ねない=源泉税の帰属突合が壊れない)。★本選の窓 8/16-8/26 では発火しない(8月に"
        "賞与は出ない=現実どおり)。機構とテストだけ本番投入可能にしておく"),
+    _f("economy.wage_profile.role_pay.enabled", "strict", False, "none",
+       "L5 役割職(タクシー運転手 350・配信者 16・議員 34)の賃金。3 職とも WAGE_CAT にも "
+       "CIVIL_SERVANTS にも組織台帳にも載らず persona._WORK_CAT にも無いので**勤務窓を"
+       "与える経路が 1 本も無く**、wage_profile を ON にしても日給 0 円のまま残っていた。"
+       "歩合(タクシー・配信者)= 日額 × 稼働係数(安定ハッシュ・乱数ゼロ)、議員報酬 = "
+       "勤務日数に依らない月額(自治法 203 条)を給料日に満額・出所は区の一般会計。"
+       "★行動は 1 バイトも変えない(勤務窓も職場 POI も与えず支給だけを在場に吊る)。"
+       "★このキーだけ既定 true: 親の economy.wage_profile.enabled が既定 false なので"
+       "既定プロファイルは 1 行も通らず、本選 conf の 1 行がこのブロックも拾う",
+       off_value=True),
 
     # ---- IF-E2 案B: org の会計主体化 + rest-of-world(設計 src/society/economy_sfc.py /
     # docs/research/ifE2-org-accounting-research.md §4-3)----
@@ -652,6 +698,15 @@ FEATURES: tuple[Feature, ...] = (
        "false にすると台帳は車両だけになる(不動産の寄与を切る対照条件)", off_value=True),
     _f("world.assets.vehicles", "strict", False, "none",
        "車両(has_car の個体昇格)だけを個別に切る子トグル(親配下)", off_value=True),
+    _f("world.assets.lease.enabled", "strict", False, "none",
+       "O4 賃借の権利行(第114 レーン 優先2。親 world.assets.enabled 配下)。①賃貸中の住戸に "
+       "lease 行(住戸 × 借主。借主は世帯の代表=最小 id)を own 行と並べて立て、②**家賃の"
+       "受け手を own 行の家主へ**解決する(域内不動産 org の預金 / 個人家主の口座 / 解決"
+       "できなければ従来どおり RoW)。これまで家賃は受け手が誰であっても一律に域外(RoW)へ"
+       "出ていた = 街の賃料が 1 円も域内に循環しなかった。★お金は増えない(引落は従来どおりで"
+       "同額の着金先が変わるだけ)= economy_sfc.total_money の不変量は保たれる。★保有数"
+       "(資産 Gini・資産保存則)は own 行だけを数える = 借主の部屋は借主の資産ではない。"
+       "既定 OFF は lease 行ゼロ・payee も従来のまま(L1 バイト一致)"),
     # Wave 4 III-3: 街の顔 = 路上の生業と条例(設計 src/society/street_life.py)。
     # strict の根拠: **乱数 stream を 1 本も引かない**(持ち場は地図の純関数・受諾は id の
     #   剰余・パトロールは同ノード判定)。LLM の自由文を 1 バイトも読まない。
@@ -908,6 +963,13 @@ FEATURES: tuple[Feature, ...] = (
        "内省プロンプトの belief 説明を個体×日で決定論ローテーションする"),
     _f("prompts.interstitial.enabled", "strict", False, "possible",
        "前回発火以降の客観的な出来事の機械ダイジェストを1行注入(ナラティブ補間)"),
+    # ★第114 レーン 1d で**宣言だけ**を足した(conf/config.yaml に姿が無く
+    #   finals_observe.yaml だけが true にしていたので未宣言トグル検出の網に掛からなかった)。
+    _f("prompts.dialog_history", "strict", False, "possible",
+       "social / reply の発火プロンプトに、その相手との直近 2 往復(最大 4 発話)を注入する。"
+       "会話が『毎回はじめまして』にならないための最小の文脈。保持は個体側のリングバッファ"
+       "(相手 8 人の LRU)で、追加 LLM 呼はゼロ・乱数ゼロ(呼数不変=R1)。"
+       "既定 OFF は状態も増やさずプロンプトが 1 行も変わらない"),
 
     # ---- transit_ride(live のみ外部プロセス=none)----
     _f("transit_ride.taxi.enabled", "strict", False, "none",
@@ -1101,6 +1163,13 @@ FEATURES: tuple[Feature, ...] = (
        "造語が採用されるたび創作者に金銭報酬(D9。既定 off=過正当化の交絡排除)"),
     _f("memory.agentic_pull", "journal", True, "possible",
        "発火・内省で能動的に記憶検索する。**LLM 呼を1本足す**(recall ラウンド)"),
+    # ★第114 レーン 1d で**宣言だけ**を足した(conf/config.yaml に姿が無く
+    #   finals_observe.yaml だけが true にしていたので未宣言トグル検出の網に掛からなかった)。
+    _f("memory.actr.enabled", "strict", False, "possible",
+       "ACT-R 活性化記憶 M-W(第37バッチ)。想起を『最近性(べき則減衰)× 頻度 × 文脈類似』の"
+       "活性化式へ置き換える(現行の固定重み 0.5:2:3 の代替)。想起失敗・部分想起が起きうる"
+       "=プロンプトに載る記憶が変わる(fingerprint_risk=possible)。乱数は actr.seed 由来の"
+       "専用 stream 1 本のみ=既存 draw 順は不変。既定 OFF は agent.mem.actr が None のまま"),
 
     # ---- relations / friend_graph / hierarchy / gossip / joint / party ----
     _f("relations.enabled", "strict", False, "possible",
@@ -1442,6 +1511,19 @@ FEATURES: tuple[Feature, ...] = (
     # ---- institution_routes / career / annual_events ----
     _f("institution_routes.assembly.enabled", "strict", False, "possible",
        "制度改変ルート: 議会(名簿制の議員)"),
+    # ★下 2 件は第114 レーン 1d で**宣言だけ**を足した(conf/config.yaml に姿が無く
+    #   finals_observe.yaml だけが触っていたので未宣言トグル検出の網に掛からなかった)。
+    _f("institution_routes.assembly.from_roster", "strict", False, "possible",
+       "名簿制議会(ユーザー決定 2026-07-19: 本番シミュ内で選挙は行わない)。persona の "
+       "occupation が議員の住民を id 昇順で size 人まで議席に据え、term_days を無視して"
+       "**改選しない**(任期継続=議員として街で暮らす)。名簿に議員が 0 人なら警告のうえ"
+       "従来の選挙へ後退する(正直な縮退)。★レーン乙 E1 で定員割れの日次補充が付いた"
+       "(退場中の議員の議席は動かさず、空き枠だけを在場議員で埋める)。決定論・乱数ゼロ"),
+    _f("institution_routes.assembly.realism.enabled", "strict", False, "possible",
+       "議会選挙の現実化(batch37・渋谷区議会準拠。設計 docs/research/council-vs-reality.md)。"
+       "告示 → 自発的立候補(供託金 30 万円・被選挙権 25 歳)→ SNTV 開票(効用=意見距離 × "
+       "親密度 × 評判)→ 予算承認/条例議決/住民署名。すべて決定論で新規乱数 stream を引かない。"
+       "★from_roster が ON のときは組成がそちらで済むのでこの枝は評価されない"),
     _f("institution_routes.vote.enabled", "strict", False, "possible",
        "制度改変ルート: 署名モードを投票モードに置換"),
     _f("institution_routes.deliberation.enabled", "strict", False, "possible",
@@ -1543,6 +1625,45 @@ FEATURES: tuple[Feature, ...] = (
     _f("housing.relocation.enabled", "strict", False, "none",
        "内生的な転居(構造固着を運営者介入なしに動かす)"),
 
+    # ---- 存在の内生化 POP(名簿そのものが増減する 3 イベント。2026-08-14 承認)----------
+    # strict の根拠(3 つとも共通): 発火は**既存の持続状態の純関数**(金・住居・職・身体・
+    #   relations の closeness・暦・年齢)で、閾値・性向はすべて blake2b の**安定ハッシュ**
+    #   (run.seed 非依存)から作る = 乱数 stream を 1 本も引かず、LLM の自由文を 1 バイトも
+    #   読まない。したがって seed と config から世界の因果を完全に再構成できる。
+    # affects_k=False の根拠: generate() の**呼び出し点を 1 つも足さない/減らさない**。
+    #   転出は在場者を減らすが、これは第107 の死(health.enabled も affects_k=False)と
+    #   まったく同じ「個体の状態の帰結として在場者が変わる」型であり、pool.presence.mode の
+    #   ような**選抜アルゴリズムそのものの差し替え**ではない(レジストリ docstring の
+    #   「間接効果は compute_matched 対照でしか切り分けられない」に該当する)。
+    _f("population.emigration.enabled", "strict", False, "none",
+       "恒久転出(POP-1)= Wolpert 1965 の stress-threshold。居住ストレス(家賃滞納・立退き・"
+       "失職・破産・引きこもり・縁の喪失)が日々**蓄積**し、**個体固定の閾値**を跨いだ日に"
+       "『この街を出る』と決まる。縁(closeness の高い関係・パートナー)は蓄積を押し戻す"
+       "(Speare の residential satisfaction を単一スカラーでなく構造化状態の和で書く = "
+       "Landale & Guest 1985 の批判に沿う形)。物理表現は**死と同型の永続退場**"
+       "(loc=outside + 帰還予定を実質無限)で、新しい退場機構を 1 つも作らない。"
+       "後始末は既存機構の流用のみ(住戸解放・organizations.lay_off・世帯離脱・"
+       "パートナー清算・relation_dormant・現金/口座の IF-E 境界フロー row_out)。"
+       "★org 会計 OFF のランでは残高は**凍結**する(第107 の死と同じ規約 = 勘定の無い所へ"
+       "金を捨てない)。既定 OFF では台帳オブジェクトすら作らない"),
+    _f("population.immigration.enabled", "strict", False, "none",
+       "転入(POP-2)= **案A「L4 来街者の定着昇格」**(ユーザー決定 2026-08-14)。"
+       "★正直な限界: 域外の決断はシミュレートしていないので転入は**原理的に閉じない**"
+       "(ILUTE も SVERIGE も in-migration は外生)。本実装は妥協を最小化し、**到着レートと"
+       "いう世界のノブを持たず**、既にプールに居る非定期来街者が『通ううちに住むことにした』"
+       "という本人の来街履歴と域内状態への応答としてのみ発生させる(来街日数 × 縁の本数 × "
+       "空き住戸 × 求人の空き定員)。**pool の record は 1 バイトも書き換えない**(名簿 = "
+       "決定論の礎)。昇格は台帳が持ち、入場のたびに冪等に着せ直す(household.pool_bind と同型)。"
+       "pool.enabled が OFF なら 1 バイトも効かない"),
+    _f("population.births.enabled", "strict", False, "none",
+       "出生(POP-3)= 世帯状態からの決定論。form_partners(Billari の Wedding Ring 系譜 = "
+       "レート表なしの内生的な結婚)で成立したパートナーが N 日続き、両者が年齢帯にあり、"
+       "世帯の子が上限未満のとき、**個体固定の性向**(安定ハッシュ)を持つ夫婦にだけ子が生まれる。"
+       "新生児は**世帯メンバの最小エージェント**(戸籍 = 台帳の 1 行 + 親の housemates の "
+       "1 要素)で sim.agents には入らない = LLM 呼数・在場数・発火母集団を 1 も変えない。"
+       "★プールの L1 に子どもが 1 人も居ない(既知ギャップ)ので、深いペルソナ文を持つ子は"
+       "発明しない(名簿に無い人格を世界が捏造しない)。成長は長期ランの別レーンへ送る"),
+
     # ---- commerce / services / delivery / disaster / chance / lodging / diversity ----
     _f("commerce.enabled", "strict", False, "possible",
        "商業のダイナミクス(営業時間・動的価格・品切れ)"),
@@ -1581,6 +1702,15 @@ FEATURES: tuple[Feature, ...] = (
        "観光・多言語・犯罪・治安"),
     _f("society_diversity.avoid_danger", "strict", False, "none",
        "危険地帯を自由時間の行き先から避ける"),
+    _f("society_diversity.record_driven", "strict", False, "possible",
+       "観光客・非日本語話者を**名簿 record から**決める(第114 レーン 1b)。第113 の実測: "
+       "名簿の is_foreign(L4 の 15%=149,895 人)は persona 文に『訪日外国人』と書いてあるのに"
+       "読み手がゼロで、agent.language は foreign_ratio の**別ハッシュ**で決まっていた"
+       "= 「日本語で不自由しない訪日外国人」と「persona 文は日本人なのに主に中国語を話す人」が"
+       "同時に生まれる内部矛盾だった。true は org_id 解決と同じ規律で台帳を真実に据える"
+       "(is_foreign→言語 / visit_purpose『観光…』→観光客)。欄を持たない個体は従来の"
+       "比率抽選へ後退する。fingerprint_risk=possible の根拠は親と同じ(プロンプトの"
+       "文脈行が増減する)。乱数は 1 粒も引かない(安定ハッシュのみ)"),
     # ---- 環境フィードバック(エージェント → 環境。第84バッチ・設計 §4)----
     _f("env.feedback.enabled", "strict", False, "possible",
        "環境フィードバック最小 3 規則(第84バッチ。設計 §4)。これまで一方向だった"
@@ -1655,6 +1785,16 @@ ALLOWLIST: dict[str, str] = {
     "observer.relations_daily.passing":
         "C3 すれ違い行(other_id=-1)を出すかの指定"
         "(observer.relations_daily.enabled が親トグル。世界の機能ではなく出力の内訳)",
+    # 存在の内生化 POP: 転入(定着昇格)**内部**の受け皿条件の on/off であって独立した機能
+    # トグルではない(population.immigration.enabled が OFF なら 1 バイトも効かない)。
+    # 「求人という域内の受け皿を条件に入れるか」を切って影響を見るための解析用レバー。
+    "population.immigration.require_job":
+        "街に空き定員のある職場が在ることを定着の条件にするかの指定"
+        "(population.immigration.enabled が親トグル。organizations が OFF なら ON でも定着 0 件)",
+    "population.births.household_spouses":
+        "世帯の続柄(household.realistic の夫/妻)も夫婦として数えるかの指定"
+        "(population.births.enabled が親トグル。false にすると夫婦の源が partner_id だけになり、"
+        "短いランでは夫婦が原理的にほぼ存在しない = 出生が構造的に 0 件になる対照条件)",
 }
 
 

@@ -876,6 +876,9 @@ def build_wage_profile_cfg(raw, min_wage_hourly: float = 0.0) -> dict:
         "group_mult": group,
         "band_mult": band,
         "payday_weights": _payday_weights(raw.get("payday_weights")),
+        # 第114 レーン 1a: L5 役割職(タクシー/配信者/議員)の賃金。**この dict の
+        # 中では既定 ON**(親の wage_profile.enabled が既定 false なので全体は OFF)。
+        "role_pay": build_role_pay_cfg(raw.get("role_pay")),
         "bonus": {
             "enabled": bool(bonus_raw.get("enabled", True)),
             "summer_months": [int(m) for m in
@@ -1026,6 +1029,103 @@ def bonus_plan_of(key: str, band: str, payday: int, cfg: dict) -> dict | None:
             "dom": int(dom), "mult": float(round(mult, 3))}
 
 
+# ------------------------------------------------- §ROLE L5 役割職の賃金(第114 レーン 1a)
+# 何が穴だったか(第113 ペルソナ全数調査の実測): L5 の 3 職は `WAGE_CAT` にも
+# `CIVIL_SERVANTS` にも組織台帳にも載らず、`persona._WORK_CAT` にも無いので**勤務窓を
+# 与える経路が 1 本も無い**。第112 WAGE の日次清算は「勤務窓を持つこと」を対象条件の
+# ② に置いているため、この 3 職は WAGE を ON にしても 1 円も受け取らないまま残った:
+#   タクシー運転手 350 人 / 配信者 16 人 / 議員 34 人(= 議員報酬が 0 円の議会)
+#
+# ★なぜ「勤務窓が無い」まま塞ぐのか: 3 職とも**建物に出勤して退館する働き方ではない**。
+#   タクシーは車内が職場(流し)、配信者は路上が職場、議員は議場と街を行き来する。
+#   勤務窓を後付けするのは行動(位置・日課)を変える改変であり、賃金の穴を塞ぐのに
+#   必要な範囲を超える。ここは**支給だけ**を在場に吊る(行動は 1 バイトも変えない)。
+#
+# 支給形態の分け方(現実の制度に従う):
+#   歩合(gig)… タクシー・配信者。日額の元手 × その日の稼働係数。既存の自営日銭
+#     (`gig_profile`)と**同型**だが、係数は乱数でなく安定ハッシュ(= 決定論・R1)。
+#   月額(stipend)… 議員。地方自治法 203 条の議員報酬は**勤務日数に依らない月額**なので
+#     日割りしない(`salary_amount` の worked_days 比例は使わない)。出所は区の一般会計。
+#
+# 金額の根拠:
+#   タクシー運転手 … 賃金構造基本統計調査「営業用乗用自動車運転者」の東京の年収水準
+#     (おおむね 450 万円台)を月額へ均した値。歩合給の比重が高く月ごとの振れが大きい。
+#   配信者 … 公的統計が存在しない職種。専業配信者の収入は極端に裾が重い(少数が大半を
+#     取る)ので、**中位を低く・振れ幅を広く**置く。ここは実額の主張ではなく分布形の主張。
+#   議員 … 区議会議員の議員報酬は条例で定める月額(23 区の一般的な水準で 60 万円台)。
+#     期末手当は本波では扱わない(WAGE の賞与機構と二重に組むと支給日が競合するため)。
+#
+# ★支給日を**表に書く**(民間の payday_weights を借りない)理由: 議員報酬は特定の 1 つの
+#   支給主体(区)が条例で定める一定期日払いであって、職場ごとに散らばる民間の慣行分布
+#   とは別物である。借りると「安定ハッシュがたまたま月末を引いた ⇒ 10 日ランでは 1 円も
+#   出ない」という、第112 が塞いだのと同型の穴が復活する(実測でそうなった)。
+ROLE_PAY: dict[str, dict] = {
+    "タクシー運転手": {"kind": "gig", "monthly": 380000.0,
+                       "duty_min": 0.55, "duty_max": 1.45, "payday_dom": 0},
+    "配信者":       {"kind": "gig", "monthly": 240000.0,
+                     "duty_min": 0.05, "duty_max": 2.35, "payday_dom": 0},
+    "議員":         {"kind": "stipend", "monthly": 610000.0,
+                     "duty_min": 1.0, "duty_max": 1.0, "payday_dom": 21},
+}
+_ROLE_KEYS = ("kind", "monthly", "duty_min", "duty_max", "payday_dom")
+
+
+def build_role_pay_cfg(raw) -> dict:
+    """L5 役割職の賃金の設定を正準化。**既定は enabled=true**(親の wage_profile が既定 OFF)。
+
+    ★この既定が true なのは意図的である: 上位の `economy.wage_profile.enabled` が false の
+      間は `_wage_cfg` が None を返して 1 行も通らないので、既定プロファイルは無風のまま。
+      本選 conf は `wage_profile.enabled: true` の 1 行だけを持つので、そこがこのブロックも
+      拾う(= 「既定 OFF / finals ON は既存ブロックが拾う形」)。"""
+    raw = _to_container(raw)
+    table = {occ: dict(spec) for occ, spec in ROLE_PAY.items()}
+    for occ, spec in dict(raw.get("occupations", {}) or {}).items():
+        base = dict(table.get(str(occ)) or ROLE_PAY["議員"])
+        for k, v in dict(spec).items():
+            if k not in _ROLE_KEYS:
+                continue
+            if k == "kind":
+                base[k] = str(v)
+            elif k == "payday_dom":
+                base[k] = int(v)
+            else:
+                base[k] = float(v)
+        table[str(occ)] = base
+    return {"enabled": bool(raw.get("enabled", True)), "occupations": table}
+
+
+def role_pay_of(occupation: str, cfg: dict) -> dict | None:
+    """職業 → L5 役割職の賃金プラン(該当しなければ None)。決定論・乱数ゼロ。
+
+    返す dict は engine が読む唯一の形: kind("gig"/"stipend")・monthly・daily・
+    duty_min/duty_max・payday・annual。日額は月額 / 所定労働日数(WAGE と同じ分母)。"""
+    rcfg = (cfg or {}).get("role_pay") or {}
+    if not rcfg.get("enabled"):
+        return None
+    spec = (rcfg.get("occupations") or {}).get(str(occupation or ""))
+    if not spec:
+        return None
+    monthly = float(spec["monthly"])
+    workdays = max(1, int(cfg.get("month_workdays", 20)))
+    return {"kind": str(spec["kind"]), "monthly": monthly,
+            "daily": float(round(monthly / workdays, 1)),
+            "duty_min": float(spec["duty_min"]), "duty_max": float(spec["duty_max"]),
+            "payday": int(spec.get("payday_dom", 0)),
+            "annual": float(monthly * 12.0), "occupation": str(occupation)}
+
+
+def role_gig_amount(plan: dict, key: str, day: int) -> float:
+    """歩合(タクシー・配信者)のその日の稼ぎ = 日額 × 稼働係数。**決定論**(乱数ゼロ)。
+
+    係数は (個体キー, 暦日) の安定ハッシュを [duty_min, duty_max] へ線形に写す。既存の
+    自営日銭 `gig_profile` は stream "gig" から U(0.2,1.4) を引くが、ここは**新しい乱数を
+    1 粒も足さない**という R1 の規律に従って同じ形を安定ハッシュで作る(日ごとに振れ、
+    個体ごとに違い、resume / 回転再入で同じ値になる)。"""
+    lo, hi = float(plan["duty_min"]), float(plan["duty_max"])
+    u = stable_unit("role_duty", f"{key}\x1f{int(day)}")
+    return float(round(float(plan["daily"]) * (lo + (hi - lo) * u), 1))
+
+
 def wage_plan(*, occupation: str, role: str, org: dict | None, org_id,
               key: str, cfg: dict) -> dict:
     """1 人ぶんの賃金プラン(決定論・乱数ゼロ)。engine はこの dict しか読まない。
@@ -1116,6 +1216,11 @@ def assign_wage_plan(agent, orgs: dict | None, cfg: dict,
     cached = getattr(agent, "_wage_plan", _WAGE_UNSET)
     if cached is not _WAGE_UNSET and cached is not None:
         return cached
+    # ★二重支給ガード(第114 レーン 1a): L5 役割職は §ROLE の専用経路が払うので、
+    #   通常のプランは**作らない**。cfg 側の役割表が空/OFF なら従来どおり通す。
+    if role_pay_of(getattr(agent, "occupation", ""), cfg) is not None:
+        agent._wage_plan = None
+        return None
     if not wage_target(agent, record):
         agent._wage_plan = None
         return None

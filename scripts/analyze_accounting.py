@@ -377,6 +377,10 @@ def party_sector(token) -> str | None:
         return VENTURE
     if t in ("government", "escrow"):
         return GOVERNMENT
+    # ★O4 権利行(第114): 個人家主への家賃。受け手が**街の家計**なので household へ。
+    #   "household:<agent_id>" の形で、id は誰が受け取ったかの追跡用(部門は接頭辞で決まる)。
+    if t == "household" or t.startswith("household:"):
+        return HOUSEHOLD
     return ORG
 
 
@@ -409,8 +413,21 @@ WAGE_SOURCE_SECTOR: dict[str, tuple[str, str]] = {
     #   (leak_family("wage:bonus") == "wage")。新しい金の経路ではなく既存 wage 経路の内訳。
     "daily":       (VOID,       "wage:daily"),        # 日給者の 1 日ぶん
     "bonus":       (VOID,       "wage:bonus"),        # 賞与(夏・冬)
+    # ---- L5 役割職(第114 レーン 1a)----
+    # 議員報酬は区の一般会計から出る(`fund_level="ward"` で実際に gov.expense 済み)ので
+    # "civil" と同じ GOVERNMENT。タクシー・配信者の歩合は既存の "gig" をそのまま使う
+    # (自営の日銭と同じ会計上の意味 = 客が居ない VOID)ので、この表に足す行は 1 行だけ。
+    "stipend":     (GOVERNMENT, "wage:stipend"),      # 議員報酬(自治法 203 条の月額)
 }
 _WAGE_DEFAULT = (VOID, "wage:work")                   # source なし = 本業/バイトの勤務完遂
+
+#: 家賃の受け手部門 → 漏れタグ(第114 O4)。族は全部 "rent"(監視の族集合は増えない)。
+_RENT_TAG: dict[str, str] = {
+    EXTERNAL:  "rent:row_landlord",        # 域外の不在家主(IF-E2 の従来経路)
+    ORG:       "rent:org_landlord",        # 域内の不動産 org(O4)
+    HOUSEHOLD: "rent:household_landlord",  # 域内の個人家主(O4)
+    VOID:      "rent:no_landlord",         # ★受け手が世界に居ない = 本当の漏れ
+}
 
 
 def flows_for(kind: str, payload: dict, ctx: dict) -> list[Flow]:
@@ -441,7 +458,10 @@ def flows_for(kind: str, payload: dict, ctx: dict) -> list[Flow]:
         paid = _f(p, "paid")
         if paid:
             dst = party_sector(p.get("payee")) or VOID      # IF-E2: 不在家主 → RoW
-            out.append(Flow(HOUSEHOLD, dst, paid, "rent:no_landlord"))
+            # ★漏れタグは**受け手の種類**で分ける(第114 O4)。族はどれも "rent" のままなので
+            #   監視テストが見ている族の集合は増えない(leak_family("rent:org_landlord")=="rent")。
+            #   VOID のときだけが本当の漏れ = 受け手が世界に居ない状態である。
+            out.append(Flow(HOUSEHOLD, dst, paid, _RENT_TAG.get(dst, "rent:no_landlord")))
     elif kind == "interest_paid":
         amt = _f(p, "amount")
         if amt:

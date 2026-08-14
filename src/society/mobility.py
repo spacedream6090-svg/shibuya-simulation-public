@@ -376,6 +376,17 @@ def _split_household(sim, mover) -> None:
     mover._hh_detached = True
 
 
+def leave_household(sim, agent) -> None:
+    """**他レーンからの公開 API**: agent を世帯から抜く(残るメンバの housemates も更新)。
+
+    存在の内生化 POP(``population.py``)の恒久転出が使う。転出は「街から出る」であって
+    「別れて家を出る」(``on_breakup`` の move_out)ではないので、**新居を探さず・
+    move_out も出さず**、世帯の紐帯だけを外す(``_split_household`` そのもの)。
+    ★``_hh_detached`` の印が立つので、pool の再入場で名簿由来の世帯へ座り直されない。
+    """
+    _split_household(sim, agent)
+
+
 def _clear_cohabit(mover, keeper) -> None:
     for x in (mover, keeper):
         if x is None:

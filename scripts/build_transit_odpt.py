@@ -233,6 +233,11 @@ def main(argv: list[str] | None = None) -> None:
         old = (hit["first"], hit["last"], hit["headway_min"])
         hit.update({"first": stats["first"], "last": stats["last"],
                     "headway_min": stats["headway_min"],
+                    # 第114 レーン 3b: 1 本ごとの実発車時刻を**畳まずに**残す。
+                    #   これまでは (始発, 終電, 中央値間隔) の 3 値へ潰していたので、
+                    #   シム側は「等間隔の再構成」しか見られず、朝ラッシュの短縮間隔も
+                    #   列車ごとの塊(platoon)も原理的に再現できなかった。
+                    "departures": list(times),
                     "source": f"ODPT実ダイヤ({station_label}・平日の駅時刻表・{tier})"})
         n_real += 1
         print(f"  + {hit['name']}: {old[0]}-{old[1]} 間隔{old[2]}分(近似) → "
@@ -277,6 +282,7 @@ def main(argv: list[str] | None = None) -> None:
                     old = (hit["first"], hit["last"], hit["headway_min"])
                     hit.update({"first": stats["first"], "last": stats["last"],
                                 "headway_min": stats["headway_min"],
+                                "departures": list(g["times"]),   # 3b: 実発車時刻(畳まない)
                                 "source": f"ODPT実ダイヤ({station_label}・平日・静的GTFS・{tier})"})
                     n_real += 1
                     print(f"  + {hit['name']}: {old[0]}-{old[1]} 間隔{old[2]}分(近似) → "
@@ -285,13 +291,18 @@ def main(argv: list[str] | None = None) -> None:
 
     for ln in lines:
         ln.setdefault("source", "近似(公表の始発終電・間隔)")
+        # 実ダイヤの取れなかった路線には departures を**作らない**(空列を置くと
+        # 「実時刻を持っている」と読めてしまう)。シム側は列の有無で経路を分ける。
 
     out = {
         "meta": {
             "note": (f"{station_label}の定刻ダイヤ。source に「実ダイヤ」とある路線=ODPT の"
                      "駅時刻表(平日)から再構成(オープン枠 or チャレンジ限定データ)、"
                      "他路線=公表値の近似(駅時刻表が非提供のため)。"
-                     "ダイヤ乱れは disaster 層(H4)が担う。"),
+                     "ダイヤ乱れは disaster 層(H4)が担う。"
+                     "★departures = 1 本ごとの実発車時刻(サービス日の分。0-2 時台は +1440)。"
+                     "この列を持つ路線は transit.real_departures=true のとき等間隔の"
+                     "再構成ではなく実時刻そのものが到着表になる(第114 レーン 3b)。"),
             "station": base.get("meta", {}).get("station", station_label),
             "generated_by": "scripts/build_transit_odpt.py",
             "generated_at": datetime.date.today().isoformat(),

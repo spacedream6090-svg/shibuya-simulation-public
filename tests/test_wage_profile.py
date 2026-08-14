@@ -619,3 +619,186 @@ def test_pool_on_resume_byte_matches_straight(small_pool, tmp_path):
                     out_dir=rs)
     s2.run(resume_from=rs)
     assert rows(st) == rows(rs), "WAGE ON の resume が straight と byte 不一致"
+
+
+# ======================================================== §ROLE L5 役割職(第114 1a)
+# 第113 ペルソナ全数調査の実測: タクシー運転手 350・配信者 16・議員 34 は WAGE_CAT にも
+# CIVIL_SERVANTS にも組織台帳にも載らず、勤務窓を与える経路が 1 本も無いので、上の WAGE を
+# ON にしても**日給 0 円のまま**だった(議員報酬 0 円の議会)。
+_ROLE_OCCS = ("タクシー運転手", "配信者", "議員")
+
+
+def _role_agent(occ, aid=1, visitor=False, commute=False):
+    a = Agent(id=aid, name="甲", age=40, occupation=occ, persona="p",
+              traits={}, states={}, mem=MemoryStore())
+    a.visitor, a.commute = visitor, commute
+    return a
+
+
+def test_role_table_covers_exactly_the_three_holes(cfg):
+    """表に載るのは実測で名指しされた 3 職だけ(勝手に職業を増やさない)。"""
+    assert set(cfg["role_pay"]["occupations"]) == set(_ROLE_OCCS)
+    assert cfg["role_pay"]["enabled"] is True           # 親 wage_profile が既定 OFF
+    # 3 職とも既存のどの支給経路にも載っていない(= これが穴だった機械的証拠)
+    for occ in _ROLE_OCCS:
+        assert occ not in E.WAGE_CAT
+        assert occ not in E.CIVIL_SERVANTS
+        assert E.gig_profile(occ, {"wages": {"自営": 10000}}) is None
+
+
+def test_role_pay_of_is_a_pure_function(cfg):
+    assert E.role_pay_of("会社員", cfg) is None          # 非該当は None
+    taxi = E.role_pay_of("タクシー運転手", cfg)
+    assert taxi["kind"] == "gig"
+    assert taxi["daily"] == round(taxi["monthly"] / cfg["month_workdays"], 1)
+    gi = E.role_pay_of("議員", cfg)
+    assert gi["kind"] == "stipend" and gi["monthly"] == 610000.0
+    assert gi["payday"] == 21          # 表に書いた一定期日(民間の慣行分布を借りない)
+    assert gi["annual"] == 610000.0 * 12.0
+    # role_pay を切れば 3 職とも None(親トグルとは別に個別に切れる)
+    off = E.build_wage_profile_cfg({"role_pay": {"enabled": False}})
+    assert all(E.role_pay_of(o, off) is None for o in _ROLE_OCCS)
+
+
+def test_role_gig_amount_is_deterministic_and_in_range(cfg):
+    plan = E.role_pay_of("タクシー運転手", cfg)
+    lo, hi = plan["daily"] * plan["duty_min"], plan["daily"] * plan["duty_max"]
+    vals = [E.role_gig_amount(plan, "L5_00000042", d) for d in range(60)]
+    assert all(lo - 0.1 <= v <= hi + 0.1 for v in vals)
+    # 日ごとに振れる(定額ではない)/ 個体ごとに違う / 同じ (key, day) は常に同じ
+    assert len(set(vals)) > 40
+    assert vals != [E.role_gig_amount(plan, "L5_00000043", d) for d in range(60)]
+    assert vals == [E.role_gig_amount(plan, "L5_00000042", d) for d in range(60)]
+    # 配信者は裾が重い(タクシーより振れ幅が広い)= 分布形の主張
+    st = E.role_pay_of("配信者", cfg)
+    assert (st["duty_max"] - st["duty_min"]) > (plan["duty_max"] - plan["duty_min"])
+
+
+def test_role_occupations_never_get_an_ordinary_plan(cfg):
+    """★二重支給ガード①: 3 職には通常の賃金プランを作らない。"""
+    for occ in _ROLE_OCCS:
+        a = _role_agent(occ)
+        a.work_start_min = 540               # 勤務窓を持っていても(将来 bind されても)
+        assert E.assign_wage_plan(a, {}, cfg) is None
+        assert a.wage == 0.0                 # agent.wage も書き換えない
+    # role_pay を切れば従来どおり通常プランへ戻る(退路)
+    off = E.build_wage_profile_cfg({"role_pay": {"enabled": False}})
+    a = _role_agent("議員")
+    a.work_start_min = 540
+    assert E.assign_wage_plan(a, {}, off) is not None
+
+
+# ---------------------------------------------------------------- 統合(名簿ラン)
+#: 本選と同じ暦の窓(8/16 開始)。議員報酬の支給日 21 日が day5 に入る。
+_ROLE_CAL = {"world.calendar.enabled": "true",
+             "world.calendar.start_date": "2026-08-16",
+             "economy.wage_profile.calendar": "true"}
+
+
+def _role_roster(tmp_path):
+    """3 職 + 対照の会社員だけの名簿(実プールを待たずに支給経路を検査する)。"""
+    def rec(name, occ, visitor, commute):
+        return {"name": name, "age": 45, "gender": "男", "occupation": occ,
+                "visitor": visitor, "commute": commute,
+                "persona": f"あなたは{name}、45歳の{occ}(男性)。",
+                "traits": {"internal_locus": 0.5, "nfc": 0.5, "risk_tolerance": 0.5},
+                "drive_threshold": 0.7, "fire_weight": 0.5,
+                "bedtime_min": 40, "sleep_steps": 48,
+                "has_bicycle": False, "has_car": False}
+    # 名簿の実態に合わせる: タクシー/配信者は duty(通勤)・議員は住民
+    roster = [rec("甲", "タクシー運転手", True, True),
+              rec("乙", "配信者", True, True),
+              rec("丙", "議員", False, False),
+              rec("丁", "会社員", False, False)]
+    p = tmp_path / "role_roster.json"
+    p.write_text(json.dumps({"meta": {}, "personas": roster}, ensure_ascii=False),
+                 encoding="utf-8")
+    return p
+
+
+def _role_sim(tmp_path, name, days, **ov):
+    return _sim(tmp_path, name, steps=144 * days, n=4,
+                **{"agents.personas_file": _role_roster(tmp_path).as_posix(), **ov})
+
+
+def _wages_by_occ(sim):
+    who = {a.id: a.occupation for a in sim.agents}
+    out: dict[str, list] = {}
+    for e in sim.logger.events:
+        if e.kind == "wage":
+            out.setdefault(who.get(e.agent_id, "?"), []).append(e)
+    return out
+
+
+def test_off_grows_no_role_state(tmp_path):
+    """既定 OFF: 役割職の清算状態が 1 体も生えない(属性不在の慣用)。"""
+    sim = _role_sim(tmp_path, "rp_off", days=2)
+    sim.run()
+    assert all(not hasattr(a, "rp_settled_day") for a in sim.agents)
+    assert not [e for e in sim.logger.events
+                if e.kind == "wage" and e.payload.get("source") == "stipend"]
+
+
+def test_l5_role_jobs_finally_get_paid(tmp_path):
+    """★塞いだ穴そのもの: 3 職が実際に金を受け取る(OFF では 1 円も入らない)。"""
+    off = _role_sim(tmp_path, "rp_off2", days=7, **_ROLE_CAL)
+    off.run()
+    assert not any(_wages_by_occ(off).get(o) for o in _ROLE_OCCS), \
+        "OFF なのに役割職へ賃金が出ている"
+
+    on = _role_sim(tmp_path, "rp_on", days=7, **dict(_ON, **_ROLE_CAL))
+    on.run()
+    got = _wages_by_occ(on)
+    for occ in _ROLE_OCCS:
+        assert got.get(occ), f"{occ} に賃金イベントが 1 件も出ていない(穴が塞がっていない)"
+    # 歩合(タクシー・配信者)= 毎日・日ごとに額が違う
+    for occ in ("タクシー運転手", "配信者"):
+        rows = got[occ]
+        assert all(e.payload["source"] == "gig" for e in rows)
+        days = {e.sim_min // 1440 for e in rows}
+        assert len(days) >= 6, f"{occ} の歩合が毎日出ていない: {sorted(days)}"
+        assert len({round(float(e.payload.get("gross", e.payload["amount"])), 1)
+                    for e in rows}) > 3, f"{occ} の日銭が定額に潰れている"
+    # 議員報酬 = 支給日 1 回だけ・満額(勤務日数で日割りしない)
+    gi = got["議員"]
+    assert all(e.payload["source"] == "stipend" for e in gi)
+    assert len(gi) == 1, f"議員報酬が月内に {len(gi)} 回出ている"
+    assert float(gi[0].payload.get("gross", gi[0].payload["amount"])) == 610000.0
+    import datetime
+    fired = datetime.date(2026, 8, 16) + datetime.timedelta(
+        days=int(gi[0].sim_min // 1440))
+    assert fired.day == 21, f"議員報酬が 21 日以外({fired})に出ている"
+
+
+def test_role_pay_never_doubles_with_the_other_wage_routes(tmp_path):
+    """★二重支給ガード②③: 同じ日に 2 本の賃金が重ならない・他経路の source が出ない。"""
+    sim = _role_sim(tmp_path, "rp_dbl", days=7,
+                    **dict(_ON, **dict(_ROLE_CAL, **{"government.enabled": "true"})))
+    sim.run()
+    got = _wages_by_occ(sim)
+    for occ in _ROLE_OCCS:
+        per_day = Counter((e.agent_id, e.sim_min // 1440) for e in got[occ])
+        assert per_day and max(per_day.values()) == 1, f"{occ} が同じ日に 2 度受け取った"
+        assert {e.payload["source"] for e in got[occ]} <= {"gig", "stipend"}
+    # 議員報酬は区の一般会計から出ている(civic な出所を持つ = RoW の湧き水ではない)
+    stipends = [e for e in sim.logger.events
+                if e.kind == "wage" and e.payload.get("source") == "stipend"]
+    assert stipends and all("tax" in e.payload for e in stipends), \
+        "行政 ON なのに議員報酬から源泉徴収されていない"
+
+
+def test_role_settle_day_is_carried_across_rotation():
+    """回転(退場 → 再来街)で最終清算日が消えない(消えると議員報酬が二重に出る)。"""
+    a = Agent(id=7, name="丙", age=52, occupation="議員", persona="p",
+              traits={}, states={}, mem=MemoryStore())
+    a.rp_settled_day = 12
+    st = pool_mod.dehydrate(a)
+    assert st["econ"]["rp_settled_day"] == 12
+    b = Agent(id=7, name="丙", age=52, occupation="議員", persona="p",
+              traits={}, states={}, mem=MemoryStore())
+    pool_mod.hydrate(b, st)
+    assert int(b.rp_settled_day) == 12
+    # 既定値(-1)では退避辞書にキーを 1 つも足さない(OFF のランは dict 等値が守られる)
+    c = Agent(id=8, name="丁", age=30, occupation="会社員", persona="p",
+              traits={}, states={}, mem=MemoryStore())
+    assert "rp_settled_day" not in (pool_mod.dehydrate(c).get("econ") or {})

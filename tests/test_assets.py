@@ -835,3 +835,190 @@ def test_analyze_script_reports_missing_ledger(tmp_path):
     sys.path.insert(0, str(REPO / "scripts"))
     import analyze_assets as AA
     assert AA.load_ledger(tmp_path) is None
+
+
+# =========================================================================== #
+# (K) O4 権利行 = 家賃の受け手を own 行の家主へ(第114 レーン 優先2)
+#
+# 何が壊れていたか: 家賃は**誰が家主でも一律に域外(RoW)へ**出ていた。O1 で住戸 11,948 戸と
+# 域内不動産 org 487 社を登記したのに、賃料は 1 円も域内で循環していなかった。
+# O4 は登記簿に lease 行(住戸 × 借主)を並べ、引落の受け手を own 行の家主へ解決する。
+# =========================================================================== #
+LEASE_ON = dict(ON_HH, **{"world.assets.lease.enabled": "true",
+                          "economy.accounts.enabled": "true",
+                          "economy.org_accounting.enabled": "true",
+                          "economy.accounts.payday_dom": 1})
+#: 家賃日 = payday(1) の翌日 = dom 2 = block_day 1(step 144)。test_accounts と同じ形。
+_RENT_STEP = 144
+_RENT_MIN = 420 + 144 * 10
+
+
+def _leased(sim):
+    """(借主 agent, 住戸 id, 家主 party) の一覧(id 昇順)。"""
+    out = []
+    for party, aids in sorted(A.leases(sim).items()):
+        tenant = sim.present_agent(A.party_agent_id(party))
+        for aid in aids:
+            if tenant is not None:
+                out.append((tenant, aid, A.owner_of(sim, aid, A.OWN)))
+    return out
+
+
+def _charge_rent(sim, tenant, income=100000.0, balance=100000.0):
+    """その 1 人だけに家賃を発生させて日境界を 1 回回す(他は period_income=0 = 家賃 0)。"""
+    tenant.period_income, tenant.account, tenant.rent_due = income, balance, 0.0
+    sim._acct_day = 0
+    scheduler._phase_accounts_day(sim, step=_RENT_STEP, sim_min=_RENT_MIN)
+    return [e for e in sim.logger.events if e.kind == "rent"][-1]
+
+
+def test_lease_is_off_by_default(tmp_path):
+    """既定 OFF: lease 行が 1 本も立たず、right_kinds も own だけ(O1 と完全同一)。"""
+    sim = _armed(tmp_path, "o4_off", n_agents=30)
+    assert A.cfg_of(sim)["lease"]["enabled"] is False
+    assert A.lease_on(sim) is False
+    assert tuple(A.cfg_of(sim)["right_kinds"]) == (A.OWN,)
+    assert A.leases(sim) == {}
+    st = A.state_of(sim)
+    assert all(set(row) == {A.OWN} for row in st["rows"].values())
+    assert "lease" not in st["alloc"]
+    # 家主解決も走らない(呼んでも None = 呼び出し側は従来の RoW 経路へ落ちる)
+    assert all(A.landlord_of(sim, a) is None for a in sim.agents)
+
+
+def test_lease_rows_stand_beside_own_without_inflating_the_stock(tmp_path):
+    """ON: 賃貸中の住戸に lease 行が own と**並ぶ**。戸数は 1 も増えない(保存則が生きる)。"""
+    sim = _armed(tmp_path, "o4_rows", n_agents=40,
+                 **{"world.assets.lease.enabled": "true"})
+    st = A.state_of(sim)
+    lz = A.leases(sim)
+    assert lz, "賃貸中の住戸が 1 戸も無い(検査の前提が崩れている)"
+    assert A.LEASE in A.cfg_of(sim)["right_kinds"], "行を書くのに宣言に無い"
+    for party, aids in lz.items():
+        assert A.party_kind(party) == "agent"            # 借主は必ず個人
+        for aid in aids:
+            row = st["rows"][aid]
+            assert set(row) == {A.OWN, A.LEASE}
+            assert row[A.OWN]["party"] != party, "自分に貸している"
+            assert st["assets"][aid]["cat"] == A.DWELLING and \
+                st["assets"][aid]["occupied"] is True
+    # ★資産保存則: lease 行は**戸数に数えない**ので残差 0 のまま
+    for cat, c in A.conservation(sim).items():
+        assert c["residual"] == 0, (cat, c)
+    # ★保有数(Gini の材料)も own 行だけ = 借主の部屋は借主の資産ではない
+    hold = A.holdings(sim)
+    for party in lz:
+        assert party not in hold or all(
+            A.owner_of(sim, aid, A.OWN) == party for aid in A.assets_of(sim, party)
+            if st["rows"][aid].get(A.OWN, {}).get("party") == party)
+    assert sum(hold.values()) == sum(c["live"] for c in A.conservation(sim).values())
+
+
+def test_rent_reaches_an_org_landlord(tmp_path):
+    """★塞いだ穴そのもの: 域内不動産 org が家主なら家賃はその org の預金へ入る。"""
+    sim = _armed(tmp_path, "o4_org", n_agents=40, **LEASE_ON)
+    cands = [(t, aid, own) for t, aid, own in _leased(sim)
+             if A.party_kind(own) == "org"]
+    assert cands, "域内 org が家主の賃貸住戸が 1 戸も無い(前提崩れ)"
+    tenant, _aid, owner = cands[0]
+    oid = owner.split(":", 1)[1]
+    before = SFC.org_balance(sim, oid)
+    ev = _charge_rent(sim, tenant)
+    paid = float(ev.payload["paid"])
+    assert paid > 0.0
+    assert ev.payload["payee"] == oid, ev.payload
+    assert abs(SFC.org_balance(sim, oid) - (before + paid)) < 1e-6
+    prov = A.provenance(sim)
+    assert prov["rent_to"]["org"] == 1 and prov["rent_to"]["org_yen"] == round(paid, 1)
+
+
+def test_rent_reaches_an_individual_landlord(tmp_path):
+    """相続などで個人が家主になった住戸の家賃は、その人の口座へ入る。"""
+    sim = _armed(tmp_path, "o4_person", n_agents=40, **LEASE_ON)
+    tenant, aid, _own = _leased(sim)[0]
+    landlord = next(a for a in sim.agents
+                    if not a.visitor and a.id != tenant.id
+                    and sim.present_agent(a.id) is not None)
+    # 相続で own 行が個人へ移った状態を作る(移転の唯一の口を通す)
+    A.transfer(sim, aid, A.agent_party(landlord.id), A.INHERIT, 0)
+    landlord.account = 0.0
+    ev = _charge_rent(sim, tenant)
+    paid = float(ev.payload["paid"])
+    assert paid > 0.0
+    assert ev.payload["payee"] == f"household:{landlord.id}"
+    assert abs(landlord.account - paid) < 1e-6
+    assert A.provenance(sim)["rent_to"]["agent"] == 1
+
+
+def test_owner_occupier_keeps_the_old_route(tmp_path):
+    """持ち家(own 行が本人)は従来どおり = 既存の動力学を 1 バイトも変えない。"""
+    sim = _armed(tmp_path, "o4_owner", n_agents=40, **LEASE_ON)
+    st = A.state_of(sim)
+    owners = [a for a in sim.agents
+              if not a.visitor and A.dwelling_of(a) in st["rows"]
+              and A.owner_of(sim, A.dwelling_of(a), A.OWN) == A.agent_party(a.id)]
+    assert owners, "持ち家の居住者が 1 人も居ない(前提崩れ)"
+    a = owners[0]
+    assert A.landlord_of(sim, a) is None
+    ev = _charge_rent(sim, a)
+    assert ev.payload["payee"] == "row:rent_landlord"     # IF-E2 の従来経路のまま
+    assert "agent" not in (A.provenance(sim)["rent_to"] or {})
+
+
+def test_absent_landlord_falls_back_to_row(tmp_path):
+    """家主が街に居ないなら幽霊へは書かず RoW へ落とす(レーン甲の事故を繰り返さない)。"""
+    sim = _armed(tmp_path, "o4_absent", n_agents=40, **LEASE_ON)
+    tenant, aid, _own = _leased(sim)[0]
+    ghost = 10 ** 7                                      # 名簿に居ない id = 常に不在
+    A.transfer(sim, aid, A.agent_party(ghost), A.INHERIT, 0)
+    ev = _charge_rent(sim, tenant)
+    assert ev.payload["payee"] == "row:rent_landlord"
+    assert A.provenance(sim)["rent_to"]["absent"] == 1
+
+
+def test_rent_conserves_the_total_money(tmp_path):
+    """★お金は 1 円も増えない: 受け手が変わっても閉じた不変量は動かない。"""
+    sim = _armed(tmp_path, "o4_cons", n_agents=40, **LEASE_ON)
+    cands = [(t, aid, own) for t, aid, own in _leased(sim)
+             if A.party_kind(own) == "org"]
+    tenant = cands[0][0]
+    tenant.period_income, tenant.account, tenant.rent_due = 100000.0, 100000.0, 0.0
+    before = SFC.total_money(sim)
+    sim._acct_day = 0
+    scheduler._phase_accounts_day(sim, step=_RENT_STEP, sim_min=_RENT_MIN)
+    assert abs(SFC.total_money(sim) - before) < 1e-6
+
+
+def test_analyze_accounting_classifies_the_new_rent_destinations():
+    """部門行列: 家賃が org / 家計 / 域外 のどれに着いたかで分類される(族は rent のまま)。"""
+    import sys
+    sys.path.insert(0, str(REPO / "scripts"))
+    import analyze_accounting as AA
+    ctx = {"government_on": False, "tax_src": {}}
+
+    def one(payee):
+        got = AA.flows_for("rent", {"amount": 300.0, "paid": 300.0, "payee": payee}, ctx)
+        assert len(got) == 1
+        return got[0]
+
+    assert AA.party_sector("household:7") == AA.HOUSEHOLD
+    org = one("co_re_00001")
+    assert (org.src, org.dst, org.tag) == (AA.HOUSEHOLD, AA.ORG, "rent:org_landlord")
+    hh = one("household:7")
+    assert (hh.src, hh.dst, hh.tag) == (AA.HOUSEHOLD, AA.HOUSEHOLD,
+                                        "rent:household_landlord")
+    row = one("row:rent_landlord")
+    assert (row.src, row.dst, row.tag) == (AA.HOUSEHOLD, AA.EXTERNAL,
+                                           "rent:row_landlord")
+    none = one(None)
+    assert (none.src, none.dst, none.tag) == (AA.HOUSEHOLD, AA.VOID, "rent:no_landlord")
+    # ★漏れの**族**は 4 つとも "rent" のまま = 監視テストが見ている族集合は増えない
+    assert {AA.leak_family(f.tag) for f in
+            (org, hh, row, none)} == {"rent"}
+
+
+def test_finals_conf_turns_the_lease_layer_on():
+    """本選 conf が O4 を宣言している(第114 レーン 優先2 の決定を conf で固定)。"""
+    from omegaconf import OmegaConf
+    fin = OmegaConf.load(REPO / "conf" / "finals_observe.yaml")
+    assert bool(fin.world.assets.lease.enabled) is True

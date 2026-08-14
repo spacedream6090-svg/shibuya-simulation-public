@@ -87,11 +87,34 @@ def _load_gtfs(gtfs_dir: Path, station_filters: list[str]) -> list[dict] | None:
             lines.append({"name": name, "first": f"{first // 60}:{first % 60:02d}",
                           "last": f"{last // 60}:{last % 60:02d}",
                           "headway_min": headway,
+                          # 3b: 1 本ごとの実発車時刻を**畳まずに**持つ(transit.real_departures
+                          #     が ON のときだけ arrivals_between がこちらを使う)。
+                          "departures": list(times),
                           "_first": first, "_last": last % 2880,
                           "source": "GTFS(実ダイヤ)"})
         return lines or None
     except (OSError, KeyError, ValueError):
         return None
+
+
+def _canon_departures(raw) -> tuple[int, ...]:
+    """``departures``(1 本ごとの実発車時刻。サービス日の分)を正準化する純関数。
+
+    ★正準化の中身は 3 つだけ: int 化・重複除去・昇順。負値と 2 日ぶん(2880 分)を超える値は
+      捨てる(サービス日は「その日の始発〜翌 2 時台」= 最大でも 1440+180 なので、それを
+      超える値はデータの壊れ)。列が無い/空なら空タプル = 従来の等間隔再構成へ後退する。
+    """
+    if not raw:
+        return ()
+    out: set[int] = set()
+    for v in raw:
+        try:
+            m = int(v)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= m < 2880:
+            out.add(m)
+    return tuple(sorted(out))
 
 
 def snap_to_arrival_of_day(table, min_of_day: int):
@@ -120,9 +143,14 @@ def snap_to_arrival_of_day(table, min_of_day: int):
 
 class Transit:
     def __init__(self, path: str | Path, gtfs_dir: str | Path | None = None,
-                 station_filters: list[str] | None = None):
+                 station_filters: list[str] | None = None,
+                 real_departures: bool = False):
         # 対象駅名(GTFS 抽出用)は envpack=場所の値。既定なし=GTFS 実ダイヤ切替時のみ要る。
         self.station_filters = list(station_filters or [])
+        # 第114 レーン 3b(既定 False=従来の等間隔再構成のまま=バイト一致):
+        #   True かつ路線が `departures`(1 本ごとの実発車時刻)を持つなら、その列を
+        #   そのまま到着表に使う。持たない路線は従来どおり (始発, 間隔, 終電) の再構成。
+        self.real_departures = bool(real_departures)
         self.source = "approximation"
         # 運休フラグ(都市・環境ショック 後続波 H4。既定 False=通常運行)。災害/運休の日に
         # disaster 層が True にすると駅経由の退出/帰還が不可(交通麻痺)。disaster OFF では常に
@@ -142,6 +170,8 @@ class Transit:
             for line in lines:
                 line["_first"] = _to_min(line["first"])
                 line["_last"] = _to_min(line["last"])  # 24:30 → 1470(翌日 0:30)
+        for line in lines:                             # 3b: 実発車時刻列の正準化
+            line["_departures"] = _canon_departures(line.get("departures"))
         self.lines: list[dict] = lines
 
     def lines_in_service(self, sim_min: int) -> list[str]:
@@ -167,20 +197,20 @@ class Transit:
     def arrivals_between(self, min_a: int, min_b: int) -> list[tuple[int, str]]:
         """[min_a, min_b] (両端含む・**絶対** sim 分)の到着を (sim_min, 路線名) で返す。
 
-        ★分解能の正直な限界(ここを誤解すると解析が嘘になる)
-        --------------------------------------------------
-        本 class が持つダイヤは **路線ごとの (始発, 終電, 運転間隔) の 3 値だけ**で、
-        1 本 1 本の実発車時刻は**保持していない**。したがって本 helper が返すのは
-        「始発から運転間隔ぴったりで終電まで刻んだ**再構成**」であって実ダイヤの
-        コピーではない。
+        ★分解能(第114 レーン 3b で**路線ごとに**上がった。以下は正直な現状)
+        ------------------------------------------------------------------
+        路線が ``departures``(1 本ごとの実発車時刻の列)を持ち、かつ
+        ``transit.real_departures`` が ON なら**その列をそのまま**返す(実ダイヤのコピー)。
+        持たない路線は従来どおり (始発, 終電, 運転間隔) の 3 値からの**等間隔の再構成**で、
+        これは実ダイヤのコピーではない。混在するのが普通で、どちらなのかは路線の
+        ``source`` 欄で事後に判る:
 
-          - file 経路(data/transit_shibuya.json)= 公表の始発/終電/日中間隔からの近似
-            (ファイルの meta.note に明記済み)。朝ラッシュの短縮間隔は入っていない。
-          - gtfs 経路(_load_gtfs)も同じ: 実発車時刻を読んだ**後で** first / last /
-            **中央値** headway の 3 値へ畳んでいる。つまり GTFS を入れても本 helper の
-            分解能は「等間隔の再構成」から上がらない(実時刻列を保持する改修が要る)。
+          - 実ダイヤ … 事業者の駅時刻表 / 静的 GTFS が取れた路線(同梱の実ダイヤでは 6/9 路線)。
+            朝ラッシュの短縮間隔がそのまま入る。
+          - 近似 … 駅時刻表が非提供の路線(同 3 路線)。公表の始発/終電/日中間隔から
+            等間隔に刻む。朝ラッシュの短縮は入っていない。
 
-        再構成は完全な決定論(乱数ゼロ・呼ぶ順に依存しない)。並びは (時刻, 路線名) の
+        どちらも完全な決定論(乱数ゼロ・呼ぶ順に依存しない)。並びは (時刻, 路線名) の
         辞書順で、同一分に複数路線が着くときは**路線名の昇順**が先頭に来る。
 
         日跨ぎ: 終電は 24:36 のように 1440 を超える値で保持されている(サービス日の
@@ -193,9 +223,16 @@ class Transit:
         for day in range(a // 1440 - 1, b // 1440 + 1):
             base = day * 1440
             for line in self.lines:
+                name = str(line["name"])
+                deps = line.get("_departures") or ()
+                if self.real_departures and deps:      # 3b: 実発車時刻をそのまま使う
+                    for t in deps:
+                        s = base + int(t)
+                        if a <= s <= b:
+                            out.append((s, name))
+                    continue
                 first, last = int(line["_first"]), int(line["_last"])
                 headway = max(1, int(line.get("headway_min", 1) or 1))
-                name = str(line["name"])
                 t = first
                 while t <= last:
                     s = base + t

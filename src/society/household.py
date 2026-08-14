@@ -435,6 +435,37 @@ def reconcile_partner(sim, agent) -> bool:
     return True
 
 
+# ---------------------------------------------------------------- 配偶者(続柄由来)
+#: 夫婦を表す続柄ラベル(``_ROLE_SPOUSE`` の値そのもの)。**語彙はこの module に閉じる**
+#  (存在の内生化 POP など他レーンは :func:`spouse_of` を通して引く = 続柄の文字列を
+#   持ち出さない。no-fingerprint 契約と同じ「語彙は 1 箇所」の作法)。
+_SPOUSE_ROLES = frozenset(_ROLE_SPOUSE.values())
+
+
+def spouse_of(sim, agent):
+    """世帯の**続柄**から配偶者を引く(在場していなければ None)。決定論・乱数ゼロ。
+
+    なぜ要るか(存在の内生化 POP の出生が使う): ``partner_id`` は ``form_partners`` が
+    **ラン中に**張る恋愛関係で、10 日ランではほとんど成立しない。一方 ``realistic`` 束ね
+    (起動時 / pool 名簿)は家族世帯へ夫/妻の続柄を配っており、これは**初期条件として
+    与えられた「既にこの街に居る夫婦」**である(リサーチ §4.3 の R-c 契約)。出生の前段は
+    「世帯形成」であって「ラン中の交際成立」に限らないので、両方を夫婦として扱う。
+
+    ★正直な限界: 続柄は ``realistic=true`` の家族世帯にしか付かず、同性・性別不明の
+      2 人世帯は「同居人」になる(``_ROLE_SPOUSE`` の後退)。したがって本関数は
+      **異性の 2 人以上世帯の夫婦だけ**を返す = 名簿が持っている以上の家族像を発明しない。
+    """
+    if str(getattr(agent, "household_role", "") or "") not in _SPOUSE_ROLES:
+        return None
+    for oid in (getattr(agent, "housemates", None) or []):
+        other = sim.present_agent(int(oid))         # 在場述語(幽霊を夫婦にしない)
+        if other is None or int(other.id) == int(agent.id):
+            continue
+        if str(getattr(other, "household_role", "") or "") in _SPOUSE_ROLES:
+            return other
+    return None
+
+
 # ---------------------------------------------------------------- 家族/同居/恋人の文脈
 def context_line(actor, nearby_ids, agent_by_id) -> str | None:
     """発火プロンプト用: 同席する同居者・恋人の間柄行を組み立てる(決定論・k 非依存)。

@@ -320,7 +320,9 @@ class Simulation:
         gtfs_dir = cfg.transit.get("gtfs_dir")
         self.transit = Transit(
             transit_path, gtfs_dir=gtfs_dir or None,
-            station_filters=self.envpackcfg["transit"]["station_filters"])
+            station_filters=self.envpackcfg["transit"]["station_filters"],
+            # 第114 レーン 3b(既定 false=等間隔の再構成のまま=バイト一致)。
+            real_departures=bool(cfg.transit.get("real_departures", False)))
         # 朝の一日計画(既定 ON = 新しい標準挙動)。ユーザー要望 2026-07-06。
         pcfg = cfg.get("planning", {}) or {}
         self.planningcfg = {
@@ -612,6 +614,16 @@ class Simulation:
                        if OmegaConf.is_config(raw_housing) else raw_housing)
         self.housingcfg = _mobility_mod.build_relocation_cfg(raw_housing)
         self._housing_day = -1                      # 日境界(転居・同棲)の進行管理
+        # 存在の内生化 POP(転出・転入・出生。既定 OFF=現行挙動と完全同一)。名簿そのものが
+        # 増減する 3 イベントを、日次の抽選割当ではなく**個体状態の関数**として起こす層
+        # (転出=Wolpert 閾値 / 転入=案A「L4 定着昇格」/ 出生=世帯状態からの決定論)。
+        # 乱数 stream を 1 本も引かず(全て安定ハッシュ)・LLM 呼を 1 本も足さず・新しい L1
+        # kind を 1 つも作らない(既存 life_event の下位 kind)。OFF=台帳すら作らない=バイト一致。
+        from .. import population as _population_mod
+        raw_pop = cfg.get("population", None)
+        raw_pop = (OmegaConf.to_container(raw_pop, resolve=True)
+                   if OmegaConf.is_config(raw_pop) else raw_pop)
+        self.popcfg = _population_mod.build_cfg(raw_pop)
         # 商業・店舗のダイナミクス(現実ギャップ 後続波 H3 2026-07-07。既定 OFF=現行挙動と完全同一)。
         # 営業時間(時刻の純関数=閉店中は行き先から除外・shop_state)+ 動的価格(在館数=需要から係数を
         # 決定論で消費額に乗せる・price_change)+ 在庫/品切れ・行列(需要集中で購入抑制+不満・stock_out)。
@@ -1160,6 +1172,9 @@ class Simulation:
                                     flat=self.flatcfg,
                                     dt_min=self.dt_min)
                 self._init_agent_runtime(agent)
+                # 第114 レーン 1b: 名簿 entry の is_foreign / visit_purpose を控える
+                # (既定 OFF=属性を 1 つも生やさない)。pool でない名簿ランの入口。
+                _diversity_mod.note_record(self, agent, entry)
                 # 群のオントロジー(既定 OFF=no-op)。直接ランは tier=default(プール非使用)。
                 self._apply_ontology(agent, "default")
                 # 第88: 心のモデルと知能層を誕生時に固定(既定 OFF=属性を生やさない=no-op)。
@@ -1815,6 +1830,12 @@ class Simulation:
                             flat=self.flatcfg,
                             dt_min=self.dt_min)
         agent.pool_pid = pid
+        # 第114 レーン 1b: 名簿の is_foreign / visit_purpose を個体へ控える(既定 OFF=
+        # society_diversity.record_driven が false=属性を 1 つも生やさない)。★ここに置くのは
+        # day0 の着席では下の _init_pool_agent_extras が早期 return するため(あちらだけに
+        # 置くと day0 の在場者が台帳駆動から漏れる)。冪等なので再入場で二度通っても不変。
+        from .. import diversity as _diversity_rec
+        _diversity_rec.note_record(self, agent, record)
         # 駅到着のパルス量子化(既定 OFF=即 return=no-op)。★pool の日次ローテーションで
         # 途中入場する個体は _init_inflow_commuters(起動時 1 回)を通らないので、ここで
         # 同じ純関数を通す(通さないと pool ON のランだけ流入が平滑に戻る=素材の取りこぼし。
@@ -1847,6 +1868,11 @@ class Simulation:
         scheduler.wage_assign(self, agent, record)
         # 起動時 1 回の配布を「入場駆動」へ(レーン乙 ブロック2。既定 OFF の機構は no-op)。
         self._init_pool_agent_extras(agent, record)
+        # 存在の内生化 POP(既定 OFF=即 return=属性を 1 つも生やさない)。**名簿の record は
+        # 1 バイトも書き換えない**ので、「定着して住民になった」「転出して街を去った」という
+        # ラン内の事実は台帳側にあり、入場のたびにここで冪等に着せ直す(household.pool_bind と同型)。
+        from .. import population as _population_mod
+        _population_mod.apply_on_entry(self, agent, record)
         return agent
 
     # ---------------------------------------------- 起動時1回の配布 → 入場駆動(ブロック2)
@@ -1908,7 +1934,9 @@ class Simulation:
         # A9 世帯: pool 名簿由来の世帯へ冪等に着席(既定 OFF=no-op。household.pool_bind)。
         _household_mod.bind_pool_household(self, agent, record)
         # A10 観光・多言語: 個体ハッシュの決定論割当(day0 列挙順の前方切りではない)。
-        _diversity_mod.assign_for_entry(self, agent)
+        # 第114 レーン 1b: record を渡す(record_driven ON なら台帳の is_foreign /
+        # visit_purpose が比率抽選に優先する。OFF は record を 1 バイトも読まない)。
+        _diversity_mod.assign_for_entry(self, agent, record)
         # A11 内面: 長期目標・趣味(起動時 precompute と同じ純関数。L1 は増やさない)。
         _inner_life_mod.assign_for_entry(self, agent)
 
@@ -2514,6 +2542,14 @@ class Simulation:
         _wkprov = _work_prov.provenance(self)
         if _wkprov is not None:
             summary["workplace_coverage"] = _wkprov
+        # ---- 存在の内生化 POP(pop.* が全て OFF のランはキー自体を出さない)--------------
+        # 人口会計: 転出 / 定着(転入)/ 出生の件数と**台帳の行数が一致すること**、および
+        # 1 日あたりの発生数が実数アンカー(転入 8.4 / 転出 7.8 / 出生 0.59 人日)の帯に
+        # 入るか。レートは**駆動ではなく検証目標**なので、両方を並べて出す。
+        from .. import population as _pop_prov
+        _ppprov = _pop_prov.provenance(self)
+        if _ppprov is not None:
+            summary["population"] = _ppprov
         (self.out_dir / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         return summary

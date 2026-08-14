@@ -685,6 +685,20 @@ world:
     # 権利種(LADM の RRR)。**O1 が書くのは own 1 種だけ**。lease/permit/lien/custody は
     # 有限表に宣言はあるが O4 まで 1 行も書かれない(綴りを config で増やしても no-op)。
     right_kinds: ["own"]
+    # ---- O4 賃借(第114 レーン 優先2)。既定 false=lease 行を 1 つも書かない ----
+    # true で ①賃貸中の住戸に lease 行(住戸 × 借主。借主は世帯の代表=最小 id)が立ち
+    #        ②家賃の引落の**受け手**が own 行の家主になる:
+    #            域内の不動産 org → org の預金へ(要 economy.org_accounting.enabled=true)
+    #            個人家主(持ち家を貸している住民)→ その人の口座へ
+    #            own 行が本人自身(持ち家)/ 家主が不在 / 台帳外 → 従来どおり RoW(後退経路)
+    # ★お金は 1 円も増えない: 借主からの引落は従来どおりで、RoW へ出ていた同額が街の中に
+    #   留まるだけ(economy_sfc.total_money の不変量はそのまま)。
+    # ★保有数(資産 Gini・保存則)は **own 行だけ**を数える = 借主の部屋は借主の資産ではない。
+    # ★10 日の観察窓では家賃の引落日そのものが窓外に落ちることがある(第113 実測)。
+    #   機構とテストは本番投入可能にしてあり、発火の有無は暦とランの長さで決まる。
+    # ★ON 推奨(本番): true
+    lease:
+      enabled: false
     # ---- 初期配賦(起動時 1 回・新 stream "asset_alloc" を住戸 1 戸に 1 draw)----
     # 持ち家住宅率: 総務省統計局「住宅・土地統計調査」の渋谷区の値(都全体 ≈45% /
     # 特別区部 ≈43% に対し渋谷区は借家が多く 3 割台前半)。★調査年で ±3pt 揺れるので
@@ -899,6 +913,34 @@ economy:
       share_max: 0.95           # 同(最大規模帯)
       # ★本選の窓(8/16-8/26)では夏季賞与(6-7月)も冬季(12月)も**発火しない**。
       #   8 月に賞与が出ないのは現実そのものなので、それでよい(機構だけ本番投入可能にする)。
+    # ---- L5 役割職の賃金 §ROLE(第114 レーン 1a)----
+    # 第113 ペルソナ全数調査の実測: 名簿の L5 3 職(タクシー運転手 350・配信者 16・議員 34)は
+    # WAGE_CAT にも CIVIL_SERVANTS にも組織台帳にも載らず、persona._WORK_CAT にも無いので
+    # **勤務窓を与える経路が 1 本も無い** = 上の wage_profile を ON にしても 1 円も入らない。
+    # ★このブロックだけ enabled の既定が true。親(wage_profile.enabled)が既定 false なので
+    #   既定プロファイルは無風で、本選 conf の `wage_profile.enabled: true` 1 行がここも拾う。
+    # ★行動は変えない: 勤務窓も職場 POI も与えず、支給だけを在場に吊る(タクシーは車内、
+    #   配信者は路上、議員は議場と街 —— どれも「建物に出勤して退館する」働き方ではない)。
+    role_pay:
+      enabled: true
+      # occupations: 職業名 → {kind, monthly, duty_min, duty_max, payday_dom}
+      #   kind=gig     … 歩合。その日の支給 = monthly/month_workdays × 稼働係数
+      #                  (係数は [duty_min, duty_max] を安定ハッシュで写す=乱数ゼロ・決定論)
+      #                  payday_dom は使わない(毎日その日ぶんを受け取るため)
+      #   kind=stipend … 月額。payday_dom(暦の何日。0=月末)に monthly を満額。議員報酬は
+      #                  勤務日数に依らない(地方自治法 203 条)ので日割りしない。
+      #                  出所は区の一般会計(fund_level=ward で歳出に計上される)
+      # ★支給日を表に書く(民間の payday_weights を借りない)理由: 議員報酬は 1 つの支給
+      #   主体が条例で定める一定期日払いで、職場ごとに散る民間の慣行分布とは別物。借りると
+      #   「安定ハッシュがたまたま月末を引いた ⇒ 10 日ランで 1 円も出ない」= 第112 が塞いだ
+      #   のと同型の穴が復活する(実測でそうなった)。21 日は特別区の職員給与の支給日に倣う。
+      occupations:
+        タクシー運転手:   # 賃金構造基本統計調査「営業用乗用自動車運転者」東京の年収水準
+          {kind: gig, monthly: 380000, duty_min: 0.55, duty_max: 1.45, payday_dom: 0}
+        配信者:           # 公的統計の無い職種。裾の重さ(少数が大半を取る)を振れ幅で表す
+          {kind: gig, monthly: 240000, duty_min: 0.05, duty_max: 2.35, payday_dom: 0}
+        議員:             # 区議会議員の議員報酬(条例で定める月額。23 区の一般的な水準)
+          {kind: stipend, monthly: 610000, duty_min: 1.0, duty_max: 1.0, payday_dom: 21}
 
   # ---- IF-E2 案B: org の会計主体化 + rest-of-world(渋谷域外)部門(既定 OFF)----
   # 設計: docs/research/ifE2-org-accounting-research.md §4-3 / 実装: src/society/economy_sfc.py
@@ -922,6 +964,22 @@ economy:
     # 日給は economy.wage_plan(record と pid だけの純関数)= 在場個体の agent.wage と同値。
     # pool OFF では母集団が一致するので値は変わらない。既定 false=現行と完全同一。
     seed_from_pool_roster: false  # ★ON 推奨(本番): true(要 pool.enabled=true)
+
+  # ---- 経済の追加層 E-W1/E-W2/E-W3(既定 OFF。第114 レーン 1d で**宣言だけ**を足した)----
+  # ★これら 4 ブロックは元々 conf/config.yaml に 1 行も書かれておらず、コード側の
+  #   既定(build_*_cfg の enabled=False)だけで OFF になっていた。conf/finals_observe.yaml が
+  #   4 つとも true にしているのに基底 conf に姿が無いので、未宣言トグル検出
+  #   (tests/test_registry_modes.py)の網に**掛からなかった**(第109 の発見)。
+  #   ここに既定値そのものを書き足すことで機能レジストリへ宣言できる = 挙動は 1 バイトも
+  #   変わらない(いずれも build_*_cfg の既定と同値)。
+  consumption:                    # E-W3 消費行動(家計調査2024 の費目シェア + 予算制約)
+    enabled: false                # ★ON 推奨(本番): true
+  payment:                        # E-W3 決済手段(キャッシュレス比率 42.8%・金額帯 × 個体嗜好)
+    enabled: false                # ★ON 推奨(本番): true(spend payload に method が 1 欄増える)
+  bank:                           # E-W1 銀行(預金利息・与信スコア・融資・延滞→破産サイクル)
+    enabled: false                # ★ON 推奨(本番): true(要 economy.accounts.enabled=true)
+  vc:                             # E-W2 VC/出資(観測可能な代理変数のみで審査。配当は commerce 側)
+    enabled: false                # ★ON 推奨(本番): true(要 tools.enabled=true=出店が在ること)
 
 # ---- 「世界を変える」ツール群(4軸を最小で覆う affordance。中立提示・自然使用の観察)----
 # モノ=open_venture / 制度=propose / 人=host_event(勉強会) / 虚構=host_event・flyer・group。
@@ -1223,6 +1281,12 @@ prompts:
                                 # 決定論ローテーション(_stable_hash 選択=乱数不使用)+「決まり文句で始めない」
                                 # 1行を追加。バリアントは意味等価・JSON契約キー不変・呼数/発火は不変(R1)。
                                 # 既定 OFF=内省プロンプトが現行とバイト一致=ゴールデン不変。★ON 推奨(本番): true
+  # ★第114 レーン 1d: 下の 1 キーは元々 conf/config.yaml に姿が無く(コード既定 false だけで
+  #   OFF)、finals_observe.yaml だけが true にしていたので未宣言トグル検出の網に掛からなかった。
+  #   既定値を書き足すだけ = 挙動は 1 バイトも変わらない(_dialog_on は .get の既定で読む)。
+  dialog_history: false         # ★ON 推奨(本番): true。social/reply の発火プロンプトに
+                                # その相手との直近 2 往復(最大 4 発話)を注入する。追加 LLM 呼は
+                                # ゼロ・乱数ゼロ(保持は個体側のリングバッファ=相手 8 人 LRU)
   # ---- ナラティブ補間(P2 S2。docs/plans/p2-interstitial-design.md §1 S2)。既定 OFF=バイト一致 ----
   # ON 時: 各 LLM 発火(計画/発話/内省)のプロンプトに、前回発火以降のその個体の客観的な出来事
   # (立ち寄った場所・会った人・起きたこと)を機械ダイジェスト(意味づけしない列挙)として1行注入する。
@@ -1278,6 +1342,25 @@ transit_ride:
 transit:
   file: data/transit_shibuya.json  # 定刻ダイヤ(乱れなし)。GTFS 実ダイヤに差し替え可
   gtfs_dir: null                # ODPT 等の GTFS(stops.txt 等)を置いたフォルダを指定すると実ダイヤに切替
+  # ---- 1 本ごとの実発車時刻(第114 レーン 3b)。既定 false=従来の等間隔再構成のまま ----
+  # これまでダイヤは路線ごとの (始発, 終電, 中央値間隔) の 3 値しか持っておらず、ODPT の
+  # 駅時刻表や静的 GTFS から実発車時刻を読んだ**後で**その 3 値へ畳んでいた。つまり
+  # 「実ダイヤに差し替え済み」と言いながら、シムが見ていたのは**等間隔の再構成**だった。
+  # true にすると departures(1 本ごとの実時刻)を持つ路線はその列がそのまま到着表になる。
+  # ★実測(6 路線・1,810 本。第114 レーン 3b): 効くのは**時刻帯プロファイル**であって
+  #   塊(platoon)ではなかった —— 正直に書く:
+  #     - 中央値間隔 3〜4 分に対し、実測の朝(7:30-9:00)は 2〜3 分・日中(11-15時)は 4〜5 分。
+  #       単一の中央値は朝を過少・日中を過大に代表していた。
+  #     - 渋谷駅の到着総数 7:30-9:00: 228 → 269 本(+18.0%)= 朝ラッシュの厚みが戻る。
+  #       1 日の総数は 2,911 → 2,601 本(-10.6%)= 日中/深夜の水増しが消える。
+  #     - 「到着のない分」は 95 → 73 分(5:00-24:00)で**減った**。9 路線の合併集合は
+  #       実ダイヤでもほぼ毎分に立つので、量子化しても塊にはならない(期待と逆の実測)。
+  # ★列を持たない路線(渋谷では JR 3 路線 = 駅時刻表が非提供)は従来どおり再構成へ後退する。
+  #   混在は正直な状態で、路線ごとの source 欄で事後に区別できる。
+  # ★data/transit_shibuya.json(公表値の近似)には departures が無いので、既定ファイルの
+  #   ままなら true にしても挙動は 1 バイトも変わらない。効くのは data/transit_odpt.json。
+  # ★ON 推奨(本番): true(transit.file が実ダイヤ版であること)
+  real_departures: false
 
 # ---- 駅員・車掌 = 持ち場を持つアクター(actor model P3a。実装 src/society/transit_staff.py)----
 # 正典: docs/plans/actor-model-migration-plan.md「3a 駅員・車掌」= 車掌をドア閉判断エージェントに
@@ -1984,6 +2067,13 @@ memory:
   agentic_pull: false           # 発火・内省で能動的に記憶検索する(true でプロンプトに1行想起を追加)
   relations_max: 0              # B6(スケール): 関係台帳の上限件数。>0 で超過時に LRU(last_step 最古)を退避。
                                 # 0=無制限で従来と完全同一。大規模ラン(hub 個体の台帳肥大・checkpoint 膨張)対策。
+  # ---- ACT-R 活性化記憶 M-W(第37バッチ)。★第114 レーン 1d で**宣言だけ**を足した ----
+  # 元々 conf/config.yaml に姿が無く(コード既定 = agent.mem.actr が None)、finals_observe.yaml
+  # だけが true にしていたので未宣言トグル検出の網に掛からなかった。既定値を書き足すだけ=
+  # 挙動は 1 バイトも変わらない(simulation は actrcfg.get("enabled", False) でしか見ない)。
+  actr:
+    enabled: false              # ★ON 推奨(本番): true。想起を「最近性 × 頻度 × 文脈類似」の
+                                # 活性化式にする(現行の固定重み 0.5:2:3 の置換)。専用 stream のみ
 
 # ---- 社会関係の質(現実ギャップ Wave G2 2026-07-07。既定 OFF=現行挙動と完全同一)----
 # ON 時: 関係台帳に親密度 weight(closeness)を持たせ、交流の符号(発話/DM の感情価)で増減。
@@ -2933,6 +3023,16 @@ institution_routes:
     enabled: false              # ★ON 推奨(本番): true(要 vote.enabled=true)
     size: 9                     # 議席数(渋谷区議会34議席を100体スケールに圧縮)
     term_days: 30               # 任期(日)。満了で改選(100日ランで3期)
+    # ★第114 レーン 1d: 下の 2 キーは元々 conf/config.yaml に姿が無く(コード既定 false だけで
+    #   OFF)、finals_observe.yaml だけが触っていたので未宣言トグル検出の網に掛からなかった。
+    #   既定値そのものを書き足して機能レジストリへ宣言する = 挙動は 1 バイトも変わらない。
+    from_roster: false          # ★ON 推奨(本番): true。名簿制議会(ユーザー決定 2026-07-19:
+                                # 本番シミュ内で選挙は行わない)= persona の occupation が議員の
+                                # 住民を id 昇順で議席に据え、term_days を無視して改選しない
+    realism:
+      enabled: false            # 議会選挙の現実化(batch37・渋谷区議会準拠): 告示 → 自発的立候補
+                                # (供託金30万) → SNTV 開票 → 予算承認/条例議決/住民署名。決定論。
+                                # ★from_roster が ON のときは組成がそちらで済むので評価されない
   # 警察/条例執行(執行ルート): 制度DSL の prohibit ルール下で、近傍(同ノード)の警察官が
   #   禁止カテゴリの場所に居る違反者を執行=罰金(区の歳入)+ grievance+(factors 経由)。
   enforcement:
@@ -3258,6 +3358,94 @@ housing:
     rent_prob: 0.3              # 家賃逼迫(E5 滞納)時の日次転居確率(要 economy.accounts.enabled=true)
     commute_threshold_m: 1500.0 # この通勤距離(m)超で職場近接転居を検討
     candidate_k: 5              # 近接上位 K 件から (agent,day) 乱数で1件(過度な遠距離を避ける)
+
+# ---- 存在の内生化 POP(転出・転入・出生。2026-08-14 ユーザー承認。既定 OFF=現行挙動と完全同一)----
+# 正典: docs/plans/population-endogenization-plan.md / docs/research/population-endogenization.md /
+#       src/society/population.py の docstring。
+# ユーザー原理:「エージェントの存在(生成・消滅)は、エージェント自身の思考や行動によって決まるべきで
+# あり、世界側のプログラムが規定するものであってはならない」。既に行動由来化済みの死・世帯形成・域内
+# 転居・境界出入りに対し、**名簿そのものが増減する 3 イベント**(転出・転入・出生)だけが空白だった。
+# ★現実のレート(区の転入 23,456 / 転出 21,898 / 出生 1,669 人年 → bbox 常住按分で 8.4 / 7.8 / 0.59
+#   人日)は**駆動に使わない**。日次の抽選割当・クォータを 1 つも持たず、発火は個体状態の関数に置き、
+#   レートは事後集計(summary.json の population)で照合する**検証目標**にする(H3 遺失物の返還率と同型)。
+# R1: 乱数 stream を 1 本も引かない(全て安定ハッシュ=run.seed 非依存)・generate() を 1 本も足さない
+#   (新生児はエージェントではないので発火母集団を 1 人も増やさない)・**新しい L1 kind をゼロ**
+#   (転出/定着/出生はいずれも既存 life_event の下位 kind。退職は job_change、関係は relation_dormant)。
+# 既定 OFF=台帳オブジェクトすら作らない(sim._pop_state が生えない)= イベント 0 件・属性 0 増。
+population:
+  # ---- ① 恒久転出(POP-1)= Wolpert 1965 の stress-threshold ----------------------------
+  # 居住ストレス(家賃滞納・立退き・失職・破産・引きこもり・縁の喪失)が日々**蓄積**し、
+  # **個体固定の閾値**を跨いだ日に街を出る。縁(closeness の高い関係・パートナー)は蓄積を押し戻す。
+  # 物理表現は死と同型の永続退場(loc=outside + 帰還予定を実質無限)= 新しい退場機構は作らない。
+  # 後始末: 住戸解放・org 退職(lay_off)・世帯離脱・パートナー清算・相手側の関係を休眠・
+  #   現金/口座を IF-E の RoW へ持ち出し(org 会計 OFF のランは第107 の死と同じく凍結)。
+  emigration:
+    enabled: false            # ★ON 推奨(長期ラン): true(要 relations.enabled=true で「縁」が動く)
+    threshold: 6.0            # 転出を決断する蓄積ストレスの基準値(個体ごとに spread で散る)
+    spread: 0.6               # 閾値の個人差の幅(0=全員同じ / 0.6=0.7〜1.3倍)
+    decay: 0.85               # 前日までの蓄積の持ち越し率(ストレスは癒える)
+    seed: 20260814            # 安定ハッシュ種(run.seed と独立=別ランでも同じ人が同じ閾値)
+    w_rent: 0.6               # 家賃の未払いが在る(要 economy.accounts.enabled=true)
+    w_arrears: 1.0            # 滞納日数(arrears_full_days で頭打ち)
+    arrears_full_days: 30
+    w_evicted: 2.0            # 立退き中(住居を失っている)
+    w_jobless: 0.8            # career で職を失い求職中(要 career.enabled=true)
+    w_bankrupt: 1.2           # 破産の制限期間中
+    w_withdrawn: 0.5          # 慢性の引きこもり(要 health.enabled=true)
+    w_alone: 0.4              # 縁が 1 つも無い
+    w_tie: 0.8                # 縁アンカー 1.0 が打ち消すストレス量
+    tie_closeness: 3.0        # 「縁」と数える closeness の下限(休眠は数えない)
+    tie_k: 5                  # この本数で縁アンカーが 1.0(飽和)
+    w_partner: 0.5            # パートナーが居る(縁アンカーへの加算)
+  # ---- ② 転入(POP-2)= 案A「L4 定着昇格」(ユーザー決定 2026-08-14)---------------------
+  # ★正直な限界: 域外の決断はシムしていないので転入は原理的に閉じない(ILUTE / SVERIGE も外生)。
+  #   到着レートという世界のノブは持たず、**既にプールに居る非定期来街者(L4)が「通ううちに
+  #   住むことにした」**という本人の来街履歴と域内状態への応答としてのみ発生させる。
+  #   名簿(pool record)は 1 バイトも書き換えない(決定論の礎)。昇格は台帳が持ち、入場のたびに
+  #   冪等に着せ直す(household.pool_bind と同型)。要 pool.enabled=true。
+  # ★**空き住戸は誰かが出ていくことでしか生まれない**: 名簿の常住者(L1 3万)は地図の住宅系建物
+  #   (5,531 棟)をほぼ埋め切っているので、転入の受け皿は実質**転出の裏面**になる。渋谷の人口動態が
+  #   「総量ほぼ静止・中身が高速入替」であることと機構の形が一致する(= 世界が転入枠を配らない)。
+  immigration:
+    enabled: false            # ★ON 推奨(長期ラン): true(要 pool.enabled=true)
+    days_min: 4               # この街で過ごした日数の基準値(個体固定閾値の中心)
+    spread: 0.6               # 日数閾値の個人差の幅
+    ties_min: 2               # 域内に築いた関係の最小本数(要 relations.enabled=true)
+    tie_closeness: 3.0        # 「縁」と数える closeness の下限
+    require_job: true         # 街に空き定員のある職場が在ることを受け皿の条件にする(要 organizations)
+    max_per_day: 0            # 0=無制限。>0 は縮退用の安全弁(通常は使わない=世界の割当になるため)
+    seed: 20260814
+  # ---- ③ 出生(POP-3)= 夫婦固定の位相(PRES-A1 と同じ Bresenham 構成)-------------------
+  # form_partners(Wedding Ring 系譜=レート表なしの内生的な結婚)で成立したパートナーのうち、
+  # 両者が年齢帯にあり、世帯の子が上限未満で**個体固定の性向**を持つ夫婦について、
+  #     出産 ⟺ floor(θ + (d+1)/I) > floor(θ + d/I)      (θ=夫婦固定の位相 / I=夫婦固定の間隔)
+  # の日に子が生まれる。**当日の乱数は 1 粒も引かない**(1 日あたりの出産確率は Bernoulli(1/I) と
+  # 厳密に一致する = PRES-A1 の習慣カレンダーと同じ分布保存の証明が効く)。
+  # ★10 日ランでも出生が観測されるのはこの構成のおかげ(θ が夫婦ごとに一様に散っている)。これは
+  #   「この 10 日で出会って産んだ」ではなく「**この街に既に居る夫婦のもとに子が生まれた**」という
+  #   読みで、初期条件が t=0 の状態を与える(R-c 契約)ことと整合する = min_days の既定は 0。
+  # 新生児は**世帯メンバの最小エージェント**(戸籍=台帳の 1 行 + 親の housemates の 1 要素)で、
+  # sim.agents に入らない=LLM 呼数・在場数・発火母集団を 1 も変えない。
+  # ★プールの L1 に子どもが 1 人も居ない(既知ギャップ)ので、深いペルソナ文を持つ子は発明しない。
+  births:
+    enabled: false            # ★ON 推奨(長期ラン): true(要 household.enabled=true + relations)
+    # 夫婦 1 組が子を持つ平均間隔[日]。IPSS 第16回「夫婦完結出生児数 1.90 人」÷ 有配偶の妊よう性
+    # 期間(概ね 25 年=9,125 日)≒ 1 人あたり 4,800 日 を出発点に、本実装の資格窓(両親とも 18-45 歳)
+    # の狭さを考慮して 3,000 日を既定に置く(**設計値**。実測が 0.59 人日 の帯に入るかは事後照合)。
+    interval_days: 3000.0
+    spread: 0.6               # 間隔の個人差の幅(0=全夫婦同じ)
+    age_min: 18               # 親の年齢帯(名簿の属性=k 非依存)
+    age_max: 45
+    max_children: 3           # 1 世帯の子の上限
+    couple_share: 0.6         # 子を持つ性向を持つ夫婦の割合(個体固定=当日の抽選ではない)
+    min_days: 0               # パートナー成立からの最短日数(0=置かない。上の R-c の理由)
+    min_interval_days: 300    # 同じ夫婦の次子までの最短間隔(日)
+    # 世帯の**続柄**(household.realistic が配る夫/妻)も夫婦として数えるか。
+    # ★false だと 10 日ランでは夫婦が原理的にほぼ存在しない(partner_id は form_partners が
+    #   closeness 閾値超で張るので短いランでは成立しない)= 出生が構造的に 0 件になる。
+    #   true は「初期条件として既にこの街に居る夫婦」を拾う(R-c 契約)。要 household.realistic=true。
+    household_spouses: true
+    seed: 20260814
 
 # ---- 共同行動エンジン(関係性の再現 第44バッチ S-R3。ユーザー要望 2026-07-21。既定 OFF=現行挙動と完全同一)----
 # 関係(友人 relations tier≥2 / 同居人 housemates)を起点に「N人が同一(POI,時刻)へ独立に収束+合流は
@@ -3752,6 +3940,17 @@ society_diversity:
   landmark_top: 8              # 回遊先候補にする上位ランドマーク数
   # ---- 多言語・文化の多様性 ----
   foreign_ratio: 0.0            # ★ON 推奨: 例 0.2(非日本語話者にする割合。決定論・id 順)
+  # ---- 台帳駆動(第114 レーン 1b。既定 false=従来のハッシュ割当のまま)----
+  # 第113 ペルソナ全数調査の実測: 名簿の is_foreign(L4 の 15%=149,895 人)は persona 文に
+  # 「訪日外国人」と書かれているのに**読み手がゼロ**で、engine の agent.language は上の
+  # foreign_ratio から別のハッシュで決まっていた = 両者が一致しない内部矛盾(「日本語で
+  # 不自由しない訪日外国人」と「persona 文は日本人なのに主に中国語を話す人」が同時に出る)。
+  # true にすると org_id 解決と同じ規律で**台帳を真実**に据える:
+  #   is_foreign=true      → 非日本語話者(言語ラベルは languages から安定ハッシュで 1 つ)
+  #   visit_purpose=観光…  → 観光客(persona 文の「観光・見物のため訪れる」と一致する)
+  # このとき tourist_ratio / foreign_ratio は **その欄を持つ個体には効かない**(欄の無い
+  # 手続き生成の直接ランは従来どおり比率へ後退する)。★ON 推奨(本番): true
+  record_driven: false
   languages: [英語, 中国語, 韓国語]  # 割り当てる言語ラベル(循環)
   cross_lang_barrier: 2         # 異言語間の語採用に必要な追加聴取回数(伝播障壁)
   # ---- 犯罪・迷惑行為 ----

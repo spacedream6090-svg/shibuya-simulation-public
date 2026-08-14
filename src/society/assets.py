@@ -239,6 +239,10 @@ DEFAULTS: dict = {
     "enabled": False,
     # ---- 権利種の宣言(O1 が書くのは own 1 種。残りは段階拡張の枠)----
     "right_kinds": (OWN,),
+    # ---- O4 賃借(第114 レーン 優先2。既定 OFF=lease 行を 1 つも書かない)----
+    #  lease.enabled=true で ①賃貸住戸に lease 行(住戸 × 借主)が立ち
+    #  ②家賃の受け手が own 行の家主(org / 個人 / RoW)になる。
+    "lease": {"enabled": False},
     # ---- 初期配賦 ----
     "owner_occupancy_rate": OWNER_OCCUPANCY_RATE,
     "org_landlord_share": ORG_LANDLORD_SHARE,
@@ -301,7 +305,22 @@ def build_cfg(raw) -> dict:
             got = [str(s) for s in (_to_plain(val) or ()) if str(s) in RIGHT_KINDS]
             cfg["right_kinds"] = tuple(
                 [OWN] + [k for k in RIGHT_KINDS if k != OWN and k in got])
+        elif key == "lease":
+            sub = dict(_to_plain(val) or {})
+            on = sub.get("enabled", False)
+            cfg["lease"] = {"enabled": (on if isinstance(on, bool)
+                                        else str(on).strip().lower() == "true")}
+    # ★lease を ON にしたら right_kinds にも lease を必ず載せる(宣言と実態を割らない):
+    #   provenance の right_kinds は「この台帳にどの権利種の行が在りうるか」の申告なので、
+    #   行を書くのに宣言に無い、という状態を config の書き方次第で作れてはならない。
+    if cfg["lease"]["enabled"] and LEASE not in cfg["right_kinds"]:
+        cfg["right_kinds"] = tuple(list(cfg["right_kinds"]) + [LEASE])
     return cfg
+
+
+def lease_on(sim) -> bool:
+    """O4 賃借の行と家賃の受け手解決が有効か(親 world.assets.enabled との論理積)。"""
+    return bool(enabled(sim) and cfg_of(sim)["lease"]["enabled"])
 
 
 def cfg_of(sim) -> dict:
@@ -433,6 +452,10 @@ def _state(sim) -> dict:
             "escheat_assets": 0,
             "escheat_money": 0.0,     # 相続人不存在で街の外(国庫)へ出た現金
             "sales": 0,
+            # ---- O4 家賃の着金先(観測。金額は円・件数は回)----
+            #   org … 域内の不動産 org の預金へ / agent … 個人家主の口座へ /
+            #   row … 域外の不在家主(後退経路)/ absent … 家主が街を離れていて届かなかった
+            "rent_to": {},
         }
         sim._ledger_state = st
     return st
@@ -488,6 +511,23 @@ def _register(st: dict, aid: str, cat: str, party: str, step: int, rec: dict) ->
     st["assets"][aid] = dict(rec, cat=str(cat))
     st["rows"][aid] = {OWN: {"party": str(party), "since": int(step)}}
     st["by_owner"].setdefault(str(party), {})[aid] = OWN
+
+
+def _grant(st: dict, aid: str, right: str, party: str, step: int) -> None:
+    """**所有以外の権利行**を 1 本立てる(O4 の lease。同じ資産に own と並ぶ)。
+
+    ★資産保存則を壊さないための規約: 保有数(:func:`conservation` / :func:`holdings`)は
+      **own 行だけ**を数える。「賃貸中」は同じ 1 戸に own(家主)と lease(借主)が並ぶ状態で、
+      戸数が 2 になるわけではない(LADM の RRR = 権利の束理論そのもの)。
+    ★1 資産 1 権利種 1 行(``rows[aid][right]`` は 1 枠)。同じ住戸の同居人が全員 lease を
+      持つ形にはしない —— 賃貸借契約は住戸につき 1 本で、``_occupancy`` と同じ規約で
+      **世帯の代表(最小 id)**を借主に据える。
+    """
+    row = st["rows"].get(str(aid))
+    if row is None or str(right) in row:
+        return
+    row[str(right)] = {"party": str(party), "since": int(step)}
+    st["by_owner"].setdefault(str(party), {})[str(aid)] = str(right)
 
 
 def transfer(sim, asset_id: str, to_party: str, kind: str, step: int,
@@ -547,7 +587,12 @@ def conservation(sim) -> dict:
     rot = st.get("rot_in") or {}                   # 旧 checkpoint 互換(キー欠落は 0 扱い)
     live: dict[str, int] = {}
     for holds in st["by_owner"].values():          # ★**所有者別**に数える(台帳の左辺そのもの)
-        for aid in holds:
+        for aid, right in holds.items():
+            # ★own 行だけを数える(O4)。「賃貸中」= 同じ 1 戸に own(家主)と lease(借主)が
+            #   並ぶ状態であって戸数が 2 になるわけではない。O1 の時点では own しか無いので
+            #   この 1 行は**既存ランに対して完全な no-op** である。
+            if str(right) != OWN:
+                continue
             rec = st["assets"].get(aid)
             if rec is not None:
                 live[rec["cat"]] = live.get(rec["cat"], 0) + 1
@@ -680,6 +725,7 @@ def _alloc_dwellings(sim, cfg: dict, st: dict, rng, step: int) -> None:
     own_rate = float(cfg["owner_occupancy_rate"])
     org_share = float(cfg["org_landlord_share"]) if landlords else 0.0
     cap = int(cfg["max_assets"])
+    lease = bool(cfg["lease"]["enabled"])          # O4(既定 false = lease 行を書かない)
     for b in blds:
         bid = str(b["id"])
         levels = max(1, int(b.get("levels", 1) or 1))
@@ -709,6 +755,12 @@ def _alloc_dwellings(sim, cfg: dict, st: dict, rng, step: int) -> None:
                        "x": float(cx), "y": float(cy),
                        "occupied": bool(resident is not None)})
             _bump(st["alloc"], label)
+            # ---- O4: 賃貸中の住戸に lease 行(住戸 × 借主)を並べる ----
+            # 家主が本人でない**居住中**の住戸だけが賃貸借契約を持つ(空き家は借主が居ない)。
+            # 借主は世帯の代表(最小 id)= `_occupancy` と同じ規約。own 行は 1 バイトも動かない。
+            if lease and resident is not None and label != ALLOC_RESIDENT:
+                _grant(st, aid, LEASE, agent_party(resident), step)
+                _bump(st["alloc"], "lease")
 
 
 def _alloc_vehicles(sim, cfg: dict, st: dict, step: int, *, inflow: bool = False) -> int:
@@ -1026,20 +1078,127 @@ def _gini(counts: list) -> float:
 
 
 def holdings(sim, cat: str | None = None) -> dict:
-    """party → 保有数(``cat`` 指定でカテゴリ別)。**台帳の純関数**(シムに走査を足さない)。"""
+    """party → **所有**数(``cat`` 指定でカテゴリ別)。**台帳の純関数**(シムに走査を足さない)。
+
+    ★数えるのは own 行だけ(O4)。借主が住んでいる部屋を「その人の資産」として
+      Gini に載せると、賃借人が家主と同じだけ資産を持っていることになってしまう。"""
     st = state_of(sim)
     out: dict[str, int] = {}
     if st is None:
         return out
     for party, holds in st["by_owner"].items():
         n = 0
-        for aid in holds:
+        for aid, right in holds.items():
+            if str(right) != OWN:
+                continue
             rec = st["assets"].get(aid)
             if rec is not None and (cat is None or rec["cat"] == str(cat)):
                 n += 1
         if n:
             out[str(party)] = n
     return out
+
+
+def leases(sim) -> dict:
+    """借主 party → 借りている資産 id(**id 昇順**)。O4 の家主 − 借家人ネットワークの素材。"""
+    st = state_of(sim)
+    out: dict[str, list] = {}
+    if st is None:
+        return out
+    for party, holds in st["by_owner"].items():
+        got = sorted(aid for aid, right in holds.items() if str(right) == LEASE)
+        if got:
+            out[str(party)] = got
+    return out
+
+
+def dwelling_of(agent) -> str | None:
+    """その個体が住んでいる住戸の資産 id(来街者・住所なしは None)。純関数・O(1)。"""
+    if bool(getattr(agent, "visitor", False)):
+        return None                                # 街の外に家がある = 域内の住戸ではない
+    bld = str(getattr(agent, "home_building", "") or "")
+    if not bld:
+        return None
+    return dwelling_id(bld, int(getattr(agent, "home_floor", 1) or 1))
+
+
+def landlord_of(sim, agent) -> str | None:
+    """その個体が**借りている**住戸の家主 party(O4)。持ち家 / 台帳外 / OFF は None。
+
+    条件は 2 つとも台帳の行だけで決まる(仮定を 1 つも足さない):
+      ① その住戸に **lease 行が立っている**(= 賃貸借契約の下にある住戸である)
+      ② own 行の party が本人自身でない(= 自分に家賃を払う形にはしない)
+
+    ★① を「本人が lease 行の名義人か」にしない理由: 賃貸借契約は住戸 1 戸につき 1 本で、
+      名義人は世帯の代表(最小 id)である。同居人も同じ借家に住んでいるので、彼らが払う分も
+      同じ家主に着く方が実態に合う(現行の家計会計は世帯員 1 人ずつに家賃を課している)。
+    ★None を返す場合は呼び出し側が従来どおり RoW(域外の不在家主)へ落とす = 後退経路。
+      持ち家(own 行が本人)については現行の家計会計がそれでも rent_share を引くが、その額の
+      意味づけ(住宅ローン)は O4 の範囲外なので**触らない** = 既存の動力学は 1 バイト不変。
+    """
+    if not lease_on(sim):
+        return None
+    aid = dwelling_of(agent)
+    if aid is None:
+        return None
+    st = state_of(sim)
+    row = (st or {}).get("rows", {}).get(aid) if st is not None else None
+    if not row or LEASE not in row:                # 賃貸借契約の無い住戸(持ち家・空き家)
+        return None
+    owner = row.get(OWN)
+    party = None if owner is None else str(owner["party"])
+    if party is None or party == agent_party(agent.id):
+        return None
+    return party
+
+
+def _bump_rent(st: dict, key: str, amount: float) -> None:
+    """家賃の着金先の件数と金額を控える(観測のみ。summary.assets.rent_to)。"""
+    rt = st.setdefault("rent_to", {})              # 旧 checkpoint 互換(setdefault)
+    rt[str(key)] = int(rt.get(str(key), 0)) + 1
+    ykey = f"{key}_yen"
+    rt[ykey] = float(rt.get(ykey, 0.0)) + float(amount)
+
+
+def settle_rent(sim, agent, paid: float, step: int, sim_min: int) -> str | None:
+    """家賃を **own 行の家主**へ着金させる(O4 の唯一の書き手)。戻り値 = payload の ``payee``。
+
+    ``None`` を返したら呼び出し側は従来どおり RoW(域外の不在家主)へ落とす —— 後退経路を
+    残すのが要点で、次のどれでも None になる:
+      - O4 OFF / 台帳 OFF / 借主でない(持ち家・来街者・台帳外の住戸)
+      - 家主が域内 org だが ``economy.org_accounting`` が OFF(org に預金という器が無い)
+      - 家主が個人だが**その日は街に居ない**(退場中の個体へ書くと hydrate で捨てられる
+        = レーン甲が根治した「幽霊への書き込み」と同じ事故になる。件数は ``absent`` に残す)
+
+    ★お金は 1 円も増えない: 借主の口座からの引き落としは呼び出し側が既に済ませてあり、
+      ここは**同額を受け手に入れるだけ**(部門間の移転)。RoW へ出ていた分が街の中に
+      留まるようになるので、``economy_sfc.total_money`` の不変量はそのまま保たれる。
+    """
+    amt = float(paid)
+    if amt <= 0.0 or not lease_on(sim):
+        return None
+    owner = landlord_of(sim, agent)
+    if owner is None:
+        return None
+    st = _state(sim)
+    kind = party_kind(owner)
+    if kind == "org":
+        oid = str(owner.split(":", 1)[1])
+        book = getattr(sim, "orgs", None) or {}
+        if not sfc_mod.enabled(sim) or oid not in book:
+            return None                            # 預金という器が無い → 後退
+        sfc_mod.credit_org(sim, oid, amt)
+        _bump_rent(st, "org", amt)
+        return oid                                 # analyze_accounting は org_id を ORG に写す
+    if kind == "agent":
+        landlord = sim.present_agent(party_agent_id(owner))
+        if landlord is None:
+            _bump_rent(st, "absent", amt)
+            return None                            # 不在家主 → 後退(幽霊へは書かない)
+        landlord.account = float(getattr(landlord, "account", 0.0) or 0.0) + amt
+        _bump_rent(st, "agent", amt)
+        return f"household:{int(landlord.id)}"
+    return None
 
 
 def provenance(sim) -> dict | None:
@@ -1067,6 +1226,7 @@ def provenance(sim) -> dict | None:
                     "deaths": 0, "heirs_absent": 0,
                     "inherited_assets": 0, "inherited_money": 0.0,
                     "escheat_assets": 0, "escheat_money": 0.0, "sales": 0,
+                    "n_leases": 0, "rent_to": {},
                     "capped": False})
         return out
     hold = holdings(sim)
@@ -1087,6 +1247,10 @@ def provenance(sim) -> dict | None:
         "org_source": str(st["org_source"]),
         "n_landlord_orgs": len(st["landlords"]),
         "n_holders": len(hold),
+        # ---- O4 賃借(既定 OFF では 0 と空 dict のまま)----
+        "n_leases": sum(len(v) for v in leases(sim).values()),
+        "rent_to": {k: (round(float(v), 1) if k.endswith("_yen") else int(v))
+                    for k, v in sorted((st.get("rent_to") or {}).items())},
         "by_party_kind": {k: int(v) for k, v in sorted(by_kind.items())},
         # 所有の集中(agent / org / RoW を party として同列に数えた保有数の Gini)
         "holder_gini": _gini(list(hold.values())),

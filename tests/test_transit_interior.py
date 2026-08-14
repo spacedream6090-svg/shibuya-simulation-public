@@ -1003,3 +1003,89 @@ def test_persona_pool_generator_declares_conductors():
     assert roles["電車運転士"][2] >= n
     # conf 側の既定と綴りが一致している(綴り違いで永久に 0 人になるのを防ぐ)
     assert set(TS.DEFAULTS["bind"]["crew_occupations"]) <= set(roles)
+
+
+# =========================================================================== #
+# (K) 同席の日次上限は**ログの量だけ**を動かす(第114 レーン 1c)
+# =========================================================================== #
+# 本選 conf(conf/finals_observe.yaml)で max_pairs_per_day を 8 → 24 へ引き上げた。
+# 引き上げてよい機械的な根拠は「この上限が動力学に触れない」ことなので、それを
+# **同 seed の 2 ラン(8 と 24)**で固定する。実装上の根拠は 3 つ:
+#   ① `_copresence` は Event を 1 件出すか出さないかを分けるだけで、乱数を 1 粒も引かない
+#   ② 重複判定の印(`_train_seen`)は**出しても捨てても同じように**付く(予算切れでも付く)
+#   ③ 他の誰の state も触らない(疲労・記憶・位置はこの関数の外)
+@_needs_roster
+def test_daily_cap_only_changes_the_copresence_rows(tmp_path):
+    """上限 8 と 24 で、同席以外の L1 行集合と乱数 stream の要求列が完全一致する。"""
+    def run(name, cap):
+        sim = _inflow(tmp_path, name, on=True, n_steps=288, n_agents=200,
+                      **{"transit_interior.copresence.max_pairs_per_day": cap})
+        seen: list[tuple] = []
+        original = sim.hub.stream
+
+        def spy(*key):
+            seen.append(tuple(str(k) for k in key))
+            return original(*key)
+
+        sim.hub.stream = spy
+        sim.run()
+        return sim, seen
+
+    a, keys_a = run("ti_cap8", 8)
+    b, keys_b = run("ti_cap24", 24)
+    # ① 乱数の要求列(用途・キー・順序)が完全一致 = 乱数消費が 1 バイトも動かない
+    assert keys_a == keys_b, "上限の変更で乱数 stream の要求列が変わった"
+    # ② 同席以外の L1 行が完全一致
+    other_a = [r for r in _l1(a) if r[2] != "train_copresence"]
+    other_b = [r for r in _l1(b) if r[2] != "train_copresence"]
+    assert other_a == other_b, "上限の変更で同席以外の L1 が変わった"
+    # ③ 対の総数(記録 + 打ち切り)は保存する = 動くのは「載せた割合」だけ
+    pa, pb = TI.provenance(a), TI.provenance(b)
+    assert pa["copresence"] + pa["copresence_dropped"] == \
+        pb["copresence"] + pb["copresence_dropped"]
+
+    # ④ 上限を上げても**対の集合は増えるだけ**(8 で載った対は 24 でも必ず載る)
+    def pairs(sim):
+        return {(e.sim_min // 1440, e.agent_id, e.payload["other_id"])
+                for e in _kind(sim, "train_copresence")}
+    assert pairs(a) <= pairs(b)
+
+
+@_needs_roster
+def test_daily_cap_is_binding_and_conserves_the_pair_total(tmp_path):
+    """上限が実際に効く密度(1 両 12 人 = 1 人あたり 11 対)で 8 と 24 を比べる。
+
+    ★上のテストの実ランは 288 step / 200 体では 1 人 8 対に届かない(上限が
+      binding でない)。ここは「上限が効いている状態で何が起きるか」を分けて固定する:
+      予算 8 では打ち切りが出て、24 では 1 対も落ちず、**対の総数は両者で等しい**。
+    """
+    def run(name, cap):
+        sim = _train_sim(tmp_path, name,
+                         **{"transit_interior.copresence.max_pairs_per_day": cap})
+        crowd = sim.agents[:12]                    # 12 人 = 66 対・1 人あたり 11 対
+        _board(sim, crowd, return_at=2)
+        TI.cfg_of(sim)["lines"] = [{"match": "A線", "cars": 1, "car_len_m": 20.0,
+                                    "capacity": 150, "seats": 51, "doors": 4,
+                                    "congestion": 1.5}]
+        TI.phase(sim, 0, 480)
+        TI.phase(sim, 1, 490)
+        TI.phase(sim, 2, 500)                      # return_at 到達 → 全員降車
+        return sim
+
+    a, b = run("ti_bind8", 8), run("ti_bind24", 24)
+    pa, pb = TI.provenance(a), TI.provenance(b)
+    assert pa["copresence_dropped"] > 0, "上限 8 が binding でない(素材が足りない)"
+    assert pb["copresence_dropped"] == 0, "1 人 11 対なら上限 24 では 1 対も落ちない"
+    assert pb["copresence"] > pa["copresence"], "24 に上げても記録が増えていない"
+    # 対の総数(= 世界で実際に起きた同席)は上限に依らない = 上限はログの量だけを切る
+    assert pa["copresence"] + pa["copresence_dropped"] == \
+        pb["copresence"] + pb["copresence_dropped"] == 66
+    # 予算 8 でも「今日この相手は見た」の印は全対に付く(= 打ち切り数が試行回数に化けない)
+    assert all(len(x._train_seen) == 11 for x in a.agents[:12])
+
+
+def test_finals_conf_raises_the_daily_cap(tmp_path):
+    """本選 conf が上限 24 を宣言している(第114 レーン 1c の決定を conf で固定)。"""
+    from omegaconf import OmegaConf
+    fin = OmegaConf.load(REPO / "conf" / "finals_observe.yaml")
+    assert int(fin.transit_interior.copresence.max_pairs_per_day) == 24

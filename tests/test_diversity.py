@@ -258,3 +258,121 @@ def test_diversity_call_count_k_invariant(tmp_path):
     off = _run_k(tmp_path, "dk_off", writeback="off")
     assert free.llm.calls == off.llm.calls and free.llm.calls > 0, \
         f"diversity の呼数が k に依存(R1 違反): free={free.llm.calls} off={off.llm.calls}"
+
+
+# ============================================================ 台帳駆動(第114 レーン 1b)
+# 第113 ペルソナ全数調査で見つかった**内部矛盾**の解消:
+#   名簿の `is_foreign`(L4 の 15% = 149,895 人)は persona 文に「訪日外国人」と書かれて
+#   いるのに engine 側の読み手がゼロで、`agent.language` は `foreign_ratio` の**別ハッシュ**
+#   で決まっていた =「日本語で不自由しない訪日外国人」と「persona 文は日本人なのに主に
+#   中国語を話す人」が同時に生まれていた。org_id と同じ規律で台帳を真実に据える。
+_REC_ON = {"society_diversity.enabled": "true",
+           "society_diversity.record_driven": "true",
+           "society_diversity.foreign_ratio": "0.2",
+           "society_diversity.tourist_ratio": "0.5"}
+
+
+def _rec_roster(tmp_path, rows):
+    """is_foreign / visit_purpose を持つ名簿(L4 record と同じ 2 欄)を書き出す。"""
+    personas = []
+    for i, (foreign, purpose) in enumerate(rows):
+        r = {"name": f"来街{i}", "age": 30, "gender": "男", "occupation": "会社員",
+             "visitor": True, "commute": False,
+             "persona": f"あなたは来街{i}、30歳(男性)。",
+             "traits": {"internal_locus": 0.5, "nfc": 0.5, "risk_tolerance": 0.5},
+             "drive_threshold": 0.7, "fire_weight": 0.5,
+             "bedtime_min": 40, "sleep_steps": 48,
+             "has_bicycle": False, "has_car": False}
+        if foreign is not None:
+            r["is_foreign"] = bool(foreign)
+        if purpose is not None:
+            r["visit_purpose"] = str(purpose)
+        personas.append(r)
+    p = tmp_path / "rec_roster.json"
+    p.write_text(json.dumps({"meta": {}, "personas": personas}, ensure_ascii=False),
+                 encoding="utf-8")
+    return p.as_posix()
+
+
+def _rec_sim(tmp_path, name, rows, **ov):
+    return _sim(tmp_path, name, n=len(rows), steps=1,
+                **{"agents.personas_file": _rec_roster(tmp_path, rows), **ov})
+
+
+def test_record_driven_defaults_to_off_and_changes_nothing(tmp_path):
+    """既定 false: 名簿に is_foreign が在っても従来のハッシュ割当のまま(L1 も属性も不変)。"""
+    rows = [(True, "観光・見物"), (False, "買い物")] * 8
+    a = _rec_sim(tmp_path, "rec_def", rows, **_ON)
+    a.run()
+    b = _rec_sim(tmp_path, "rec_expl", rows,
+                 **{**_ON, "society_diversity.record_driven": "false"})
+    b.run()
+    assert _l1(a) == _l1(b)
+    # 台帳の 2 欄は個体に 1 つも控えられない(属性不在の慣用)
+    assert all(not hasattr(x, diversity._REC_FOREIGN) for x in a.agents)
+    assert all(not hasattr(x, diversity._REC_PURPOSE) for x in a.agents)
+
+
+def test_language_now_agrees_with_the_roster(tmp_path):
+    """★矛盾の解消: 言語が付くのは名簿が is_foreign=true と言った個体**だけ**。"""
+    rows = [(True, "観光・見物")] * 8 + [(False, "買い物")] * 8
+    sim = _rec_sim(tmp_path, "rec_lang", rows, **_REC_ON)
+    langs = sim.diversitycfg["languages"]
+    for a in sim.agents:
+        foreign = getattr(a, diversity._REC_FOREIGN)
+        lang = getattr(a, "language", "")
+        assert bool(lang) is foreign, f"名簿 is_foreign={foreign} なのに language={lang!r}"
+        if foreign:
+            assert lang in langs
+    # 比率(foreign_ratio=0.2)ではなく名簿どおり 8/16 が非日本語話者になる
+    assert sum(1 for a in sim.agents if getattr(a, "language", "")) == 8
+
+
+def test_tourist_now_agrees_with_the_visit_purpose(tmp_path):
+    """観光客も台帳から: persona 文の「観光・見物のため訪れる」と一致する。"""
+    rows = [(False, "観光・見物"), (False, "買い物"), (False, "ビジネス来訪"),
+            (False, "飲食")] * 4
+    sim = _rec_sim(tmp_path, "rec_tour", rows, **_REC_ON)
+    for a in sim.agents:
+        want = str(getattr(a, diversity._REC_PURPOSE)).startswith(
+            diversity.TOURIST_PURPOSE_PREFIX)
+        assert bool(getattr(a, "tourist", False)) is want
+    assert sum(1 for a in sim.agents if getattr(a, "tourist", False)) == 4
+
+
+def test_missing_columns_fall_back_to_the_ratios(tmp_path):
+    """欄を持たない層(手続き生成の直接ラン)は従来の比率抽選へ後退する。"""
+    sim = _sim(tmp_path, "rec_fallback", n=40, steps=1,
+               **{**_REC_ON, "society_diversity.foreign_ratio": "1.0",
+                  "society_diversity.tourist_ratio": "1.0"})
+    assert all(not hasattr(a, diversity._REC_FOREIGN) for a in sim.agents)
+    assert all(getattr(a, "language", "") for a in sim.agents), \
+        "record の無い個体で比率抽選へ後退していない"
+
+
+def test_record_driven_is_idempotent_and_random_free(tmp_path):
+    """入場駆動の再適用(回転の再入場)で値が動かない・乱数を 1 粒も引かない。"""
+    rows = [(True, "観光・見物"), (False, "買い物")] * 4
+    sim = _rec_sim(tmp_path, "rec_idem", rows, **_REC_ON)
+    before = [(getattr(a, "language", ""), getattr(a, "tourist", False))
+              for a in sim.agents]
+    seen = []
+    original = sim.hub.stream
+    sim.hub.stream = lambda *k: (seen.append(k), original(*k))[1]
+    for a in sim.agents:                      # 2 度目・3 度目の入場を模す
+        diversity.assign_for_entry(sim, a)
+        diversity.assign_for_entry(sim, a)
+    sim.hub.stream = original
+    assert seen == [], "台帳駆動の割当が乱数 stream を引いた"
+    assert before == [(getattr(a, "language", ""), getattr(a, "tourist", False))
+                      for a in sim.agents]
+
+
+def test_finals_conf_turns_record_driven_on():
+    """本選 conf が台帳駆動を宣言している(第114 レーン 1b の決定を conf で固定)。"""
+    from pathlib import Path
+
+    from omegaconf import OmegaConf
+    root = Path(__file__).resolve().parents[1]
+    fin = OmegaConf.load(root / "conf" / "finals_observe.yaml")
+    assert bool(fin.society_diversity.record_driven) is True

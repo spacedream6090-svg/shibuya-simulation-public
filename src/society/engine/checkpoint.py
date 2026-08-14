@@ -30,6 +30,7 @@ from pathlib import Path
 from .. import ablate as _ablate_ckpt
 from .. import facility_devices as _facility_mod
 from .. import medical as _medical_mod
+from .. import population as _population
 from .. import worldview as _wv_ckpt
 
 FORMAT = 1
@@ -256,6 +257,14 @@ def save(sim, step: int, path: str | Path) -> Path:
             #   **レンズ**(observer/assets.py)が既に "assets_state" / sim._assets_state を
             #   使っているため(所有の台帳と資産分布の観測レンズは別物)。
             "asset_ledger": getattr(sim, "_ledger_state", None),
+            # 存在の内生化 POP(転出・転入=定着昇格・出生の台帳)。★**状態の本体が sim 側に
+            # ある**(「誰がもう名簿に居ないか」「誰が住民に昇格したか」は個体ではなく世界の
+            # 台帳)= 保存しないと resume 直後に転出者が街へ戻り、定着者が来街者へ落ち、
+            # 新生児 id が振り直される(= 人口会計も決定論も同時に破れる)。日境界の進行
+            # (state["day"])も同じ dict に入っているので mid-day resume の二重発火も防げる。
+            # 第109 asset_ledger / 第97 IF-E2 と同じ型の中央管理。既定 OFF では state 自体が
+            # 生えない → None=挙動不変(load は .get で旧 checkpoint 互換)。
+            "pop_state": _population.checkpoint_state(sim),
             # 第88バッチ 心モデル固定: L1 `mind_assign` を出し終えた agent_id。
             # **割当そのものは保存しない** — 誕生時固定は (master_seed, agent_id) の純関数
             # (専用 stream mind_model / mind_tier)なので resume でも pool 再入場でも同じ
@@ -643,6 +652,8 @@ def load(sim, path: str | Path) -> int:
         sim._sfc_state = sfc
     # H2 医療(旧 ckpt 互換=無ければ no-op = OFF ランは無風)。
     _medical_mod.restore_state(sim, rt.get("medical_state"))
+    # 存在の内生化 POP(旧 ckpt 互換=無ければ no-op = OFF ランは属性も生えない)。
+    _population.restore_state(sim, rt.get("pop_state"))
     # 非エージェント残高 3 つ(既存欠陥の修復)。旧 checkpoint / 未構築ランでは None=従来どおり
     # 遅延構築に任せる(= resume で初期値に戻る旧挙動)。
     for _attr in ("government", "bank", "vc_fund"):

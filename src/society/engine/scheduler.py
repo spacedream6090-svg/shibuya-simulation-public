@@ -38,6 +38,7 @@ from .. import night as night_mod
 from .. import opinion as opinion_mod
 from .. import party as party_mod
 from .. import physics as physics_mod
+from .. import population as population_mod
 from .. import provlink as provlink_mod
 from ..observer import causality as causality_mod
 from ..observer import gt_extras as gt_extras_mod
@@ -3392,8 +3393,14 @@ def _log_rent(sim, agent, amount: float, paid: float, step: int, sim_min: int,
                "carry": round(agent.rent_due, 1),
                "account": round(agent.account, 1),
                "phase": phase}
+    # O4 権利行(第114 優先2。既定 OFF=None=1 行も通らない): 登記簿の own 行に家主が
+    # 居るなら**その口座へ着金させる**(域内 org の預金 / 個人家主の口座)。家賃が街の外へ
+    # 出ていくのは「家主が域外に居る」ときだけになる = 賃料が街の中で循環する。
+    payee = assets_mod.settle_rent(sim, agent, float(paid), step, sim_min)
+    if payee is not None:
+        payload["payee"] = payee
     # IF-E2(既定 OFF=キーなし): 家主が街に居ない → 域外の不動産所有者(RoW)が受け取る。
-    if sfc_mod.enabled(sim) and float(paid) > 0.0:
+    elif sfc_mod.enabled(sim) and float(paid) > 0.0:
         payload["payee"] = sfc_mod.row_out(sim, "rent_landlord", float(paid))
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                          kind="rent", x=agent.x, y=agent.y, payload=payload))
@@ -3560,7 +3567,10 @@ def wage_assign(sim, agent, record: dict | None = None) -> dict | None:
 def _wage_covered(sim, agent) -> bool:
     """本業の賃金を WAGE の日次清算が持っている個体か(`_settle_work` の二重支給ガード)。
 
-    既定 OFF では `_wage_cfg` が None を返して即 False = 既存の分岐と完全同一。"""
+    既定 OFF では `_wage_cfg` が None を返して即 False = 既存の分岐と完全同一。
+    第114 レーン 1a: L5 役割職(§ROLE)も日次清算が持つので True を返す。"""
+    if _role_plan(sim, agent) is not None:
+        return True
     return wage_assign(sim, agent) is not None
 
 
@@ -3667,6 +3677,64 @@ def _ensure_wage_profile(sim) -> None:
         wage_assign(sim, agent)
 
 
+# ------------------------------------------- L5 役割職の賃金 §ROLE(第114 レーン 1a)
+# 対象は 3 職(タクシー運転手 350 / 配信者 16 / 議員 34)。どれも「勤務窓を与える経路が
+# 1 本も無い」ため第112 WAGE の対象条件②を満たせず日給 0 円のまま残っていた層である。
+# ★行動は 1 バイトも変えない: 勤務窓も職場 POI も与えず、**支給だけ**を在場に吊る。
+# ★二重支給ガードは 3 重に張ってある:
+#   ① `economy.assign_wage_plan` が役割職には通常プランを作らない(§ROLE のコメント)
+#   ② `_wage_covered` が True を返すので `_settle_work` の都度払いが走らない
+#      (そもそも `wage_amount` は WAGE_CAT に無い 3 職へ 0 を返すので実額も 0)
+#   ③ `gig_profile` は WAGE_CAT=="自営" の層にしか出ないので `_phase_daily` の日銭と
+#      重ならない(3 職はどれも WAGE_CAT に無い)
+def _role_plan(sim, agent) -> dict | None:
+    """1 体の L5 役割職プラン(ON のときだけ dict)。OFF・非該当は None=以降を通らない。
+
+    ★「この街で働いているか」は通常プラン(`wage_target` ③)と同じ基準を使う:
+      居住者 / org 配属 / 通勤者 のいずれか。L4(非定期来街)に同名の職業タグが
+      紛れ込んでも支給しない。名簿の L5 3 職はタクシー/配信者が commute=true、
+      議員が居住者なので全員この門を通る。"""
+    cfg = _wage_cfg(sim)
+    if cfg is None:
+        return None
+    plan = economy_mod.role_pay_of(getattr(agent, "occupation", ""), cfg)
+    if plan is None:
+        return None
+    if getattr(agent, "visitor", False) and not getattr(agent, "commute", False) \
+            and not getattr(agent, "org_id", None):
+        return None
+    return plan
+
+
+def _role_settle(sim, agent, plan: dict, cfg: dict, day: int,
+                 step: int, sim_min: int) -> None:
+    """1 体ぶんの日次清算(歩合はその日ぶん・議員報酬は給料日に月額)。決定論・乱数ゼロ。"""
+    last = int(getattr(agent, "rp_settled_day", -1))
+    if day <= last:                                    # 同じ日を二度清算しない
+        return
+    key = str(getattr(agent, "pool_pid", "") or getattr(agent, "id", 0))
+    if plan["kind"] == "gig":
+        # 歩合: 病臥の日は稼ぎが立たない(車も出せず配信もできない)。在場は
+        # 呼び出し側(sim.agents の走査)が保証している = 在場が稼働の資格そのもの。
+        if not getattr(agent, "sick", False):
+            amount = economy_mod.role_gig_amount(plan, key, day)
+            if amount > 0.0:
+                _pay_wage(sim, agent, amount, step, sim_min, source="gig")
+        agent.rp_settled_day = day
+        return
+    # 議員報酬: 勤務日数に依らない月額(自治法 203 条)。支給日は**表に書いた 1 日**で、
+    # 民間の payday_weights(職場ごとに散る慣行分布)は借りない —— 借りると安定ハッシュが
+    # 月末を引いた瞬間に 10 日ランで 1 円も出ず、第112 が塞いだのと同型の穴が復活する。
+    if _wage_fires(sim, cfg, last, day, int(plan["payday"])):
+        amount = float(plan["monthly"])
+        if amount > 0.0:
+            agent.last_salary = amount
+            # 出所は区の一般会計(fund_level="ward" = 行政 ON なら実際に歳出計上)。
+            _pay_wage(sim, agent, amount, step, sim_min, source="stipend",
+                      fund_level="ward", annual_income=plan["annual"])
+    agent.rp_settled_day = day
+
+
 def _phase_wage_profile(sim, step: int, sim_min: int) -> None:
     """日次境界: 在場している被用者の賃金を清算する(既定 OFF=即 return=バイト一致)。"""
     cfg = _wage_cfg(sim)
@@ -3677,6 +3745,10 @@ def _phase_wage_profile(sim, step: int, sim_min: int) -> None:
         return
     sim._wage_day = day
     for agent in sim.agents:                           # id 昇順(sim.agents の順)= 決定論
+        role = _role_plan(sim, agent)                  # §ROLE(第114 1a)を先に見る
+        if role is not None:
+            _role_settle(sim, agent, role, cfg, day, step, sim_min)
+            continue
         plan = wage_assign(sim, agent)
         if plan is None:
             continue
@@ -4680,6 +4752,24 @@ def _phase_housing(sim, step: int, sim_min: int) -> None:
     mobility_mod.relocate_day(sim, step, sim_min)      # ① 転居(職場/家賃逼迫。housing.relocation)
 
 
+def _phase_population(sim, step: int, sim_min: int) -> None:
+    """日次境界: 存在の内生化 POP(恒久転出 → 転入=定着昇格 → 出生)。既定 OFF=即 return。
+
+    「名簿そのものが誰を含むか」の変化を、日次の抽選割当ではなく**個体状態の関数**として
+    起こす層(``src/society/population.py``)。転出=Wolpert 1965 の閾値型(居住ストレスの
+    蓄積が個体固定の閾値を跨ぐ)/ 転入=案A「L4 来街者の定着昇格」(来街履歴 × 縁 ×
+    空き住戸 × 求人という**域内状態への応答**)/ 出生=パートナー継続日数と年齢帯からの決定論。
+
+    ★**_phase_housing の後**に置く: 同棲・転居でその日の世帯と住居が確定してから、
+      「この街に住み続けるか」「住み始めるか」を評価する(空き住戸の判定が 1 日ずれない)。
+    ★日境界の進行は ``sim._pop_state["day"]`` が中央管理する(mid-day checkpoint でも
+      resume==straight。checkpoint.py が runtime["pop_state"] で丸ごと運ぶ)。
+    R1: generate() を 1 本も足さず、乱数 stream を 1 本も引かず(全て安定ハッシュ)、
+    新しい L1 kind を 1 つも作らない(既存 life_event / job_change / relation_dormant)。
+    """
+    population_mod.phase(sim, step, sim_min)
+
+
 # ---------------------------------------------------------------- 健康・疲労・病気(後続波 H1)
 def _health_on(sim) -> bool:
     """健康(疲労・病気・メンタル)が有効か。既定 OFF=新経路を一切通さない(バイト一致)。"""
@@ -5060,6 +5150,12 @@ def _phase_pool_rotation(sim, step: int, sim_min: int) -> None:
         getattr(sim, "_pool_tier_quota", False),
         habit=pres["habit"], emergent=pres["emergent"],
         rain=sim._pool_rain(day)))
+    # 存在の内生化 POP(既定 OFF=台帳が無い=同一オブジェクトがそのまま返る=バイト一致)。
+    # ★presence 純関数の**外側**で当てる: あちらの入力は「暦 + 名簿のペルソナ属性」だけ、
+    #   という契約(k 非依存・trait 非依存・resume 不変)を保つため。転出(永久失格)と
+    #   定着昇格(resident 資格の獲得)は名簿の属性ではなく**ラン内に起きた出来事**であり、
+    #   台帳は checkpoint が中央管理する(= resume でも同じ集合になる)。
+    new_ids = population_mod.apply_presence(sim, new_ids)
     cur = {getattr(a, "pool_pid", None): a for a in sim.agents}
     cur.pop(None, None)
     old_ids = set(cur)
@@ -5547,6 +5643,7 @@ def run_step(sim, step: int) -> None:
     _phase_bank_day(sim, step, sim_min)            # 日次境界: 融資の定期返済・延滞→破産接続(既定OFF=no-op。E-W1)
     _phase_career(sim, step, sim_min)              # 日次境界: 失業/求職/転職(既定OFF=no-op。Wave G5)
     _phase_housing(sim, step, sim_min)             # 日次境界: 同棲(move_in)→転居(relocate)(既定OFF=no-op。第60バッチ b)
+    _phase_population(sim, step, sim_min)          # 日次境界: 転出/転入(定着昇格)/出生(既定OFF=no-op。POP)
     _phase_health(sim, step, sim_min)              # 日次境界: 病気の発症/回復・受診・メンタル(既定OFF=no-op。H1)
     _phase_disaster(sim, step, sim_min)            # 日次境界: 災害・交通遅延/運休・インフラ障害(既定OFF=no-op。H4)
     _phase_chance(sim, step, sim_min)              # 日次境界: 生活の偶発(臨時収入/財布紛失/偶然の出会い。既定OFF=no-op。第54バッチ)

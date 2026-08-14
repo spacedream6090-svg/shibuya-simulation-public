@@ -529,3 +529,127 @@ def test_pulse_survives_to_the_next_day(tmp_path):
     on = _sim(tmp_path, pulse=True, tt=tt, n_steps=1, name="p_next")
     for a in _station_commuters(on):
         assert a.arrival_min % 30 == 0, (a.id, a.arrival_min)
+
+
+# --------------------------------------------------------------------------- #
+# 1c. 1 本ごとの実発車時刻(第114 レーン 3b。transit.real_departures)
+#
+# 何が壊れていたか: ダイヤは路線ごとの (始発, 終電, 中央値間隔) の 3 値しか持たず、
+# ODPT 駅時刻表や静的 GTFS から**実発車時刻を読んだ後で**その 3 値へ畳んでいた。つまり
+# 「実ダイヤに差し替え済み」と言いながら、シムが見ていたのは等間隔の再構成だった。
+# --------------------------------------------------------------------------- #
+ODPT_TT = DATA / "transit_odpt.json"
+
+_needs_odpt = pytest.mark.skipif(not ODPT_TT.exists(), reason="ODPT 実ダイヤ未生成")
+
+_DEP_LINE = [{"name": "A線", "first": "07:00", "last": "07:30", "headway_min": 10,
+              "departures": [420, 421, 422, 450, 451, 452]}]
+
+
+def test_departures_are_ignored_unless_the_toggle_is_on(tmp_path):
+    """既定 OFF: departures 列が在っても等間隔の再構成のまま(バイト一致)。"""
+    tr = Transit(_timetable(tmp_path, _DEP_LINE, "dep_off.json"))
+    assert tr.real_departures is False
+    got = [m for m, _ in tr.arrivals_between(0, 1439)]
+    assert got == [420, 430, 440, 450]            # 07:00 から 10 分刻み
+
+
+def test_departures_replace_the_reconstruction_when_on(tmp_path):
+    """ON: 実発車時刻がそのまま到着表になる(再構成は 1 本も混ざらない)。"""
+    tr = Transit(_timetable(tmp_path, _DEP_LINE, "dep_on.json"), real_departures=True)
+    got = [m for m, _ in tr.arrivals_between(0, 1439)]
+    assert got == [420, 421, 422, 450, 451, 452]
+    # 日跨ぎも従来と同じ規約(サービス日の分にそのまま base を足す)
+    assert [m for m, _ in tr.arrivals_between(1440, 2879)] == \
+        [1440 + t for t in (420, 421, 422, 450, 451, 452)]
+
+
+def test_lines_without_departures_fall_back_to_the_reconstruction(tmp_path):
+    """列を持たない路線は ON でも従来どおり = 混在が正しく成立する。"""
+    lines = list(_DEP_LINE) + [{"name": "B線", "first": "07:00", "last": "07:20",
+                                "headway_min": 10}]
+    tr = Transit(_timetable(tmp_path, lines, "dep_mix.json"), real_departures=True)
+    got = tr.arrivals_between(0, 1439)
+    assert [m for m, ln in got if ln == "A線"] == [420, 421, 422, 450, 451, 452]
+    assert [m for m, ln in got if ln == "B線"] == [420, 430, 440]
+    assert got == sorted(got)                      # 並びは (時刻, 路線名) の辞書順のまま
+
+
+def test_departure_list_is_canonicalised(tmp_path):
+    """重複・逆順・型違い・範囲外を落とす純関数(壊れたデータで世界が歪まない)。"""
+    from society.world.transit import _canon_departures
+    assert _canon_departures(None) == () and _canon_departures([]) == ()
+    assert _canon_departures([430, 420, 430, "425", -5, 9999, None]) == (420, 425, 430)
+
+
+def test_arrivals_stay_read_only_and_repeatable(tmp_path):
+    """ON でも到着表は読み取り専用の純関数(2 度呼んで同一・ファイルを書き換えない)。"""
+    tr = Transit(_timetable(tmp_path, _DEP_LINE, "dep_pure.json"), real_departures=True)
+    before = json.loads((tmp_path / "dep_pure.json").read_text(encoding="utf-8"))
+    a = tr.arrivals_between(0, 1439)
+    b = tr.arrivals_between(0, 1439)
+    assert a == b
+    assert json.loads((tmp_path / "dep_pure.json").read_text(encoding="utf-8")) == before
+
+
+@_needs_odpt
+def test_shipped_odpt_timetable_carries_the_real_departures():
+    """同梱の実ダイヤが 1 本ごとの時刻を持つ(畳んだままの退行を止める)。"""
+    doc = json.loads(ODPT_TT.read_text(encoding="utf-8"))
+    real = [ln for ln in doc["lines"] if "実ダイヤ" in str(ln.get("source", ""))]
+    approx = [ln for ln in doc["lines"] if "実ダイヤ" not in str(ln.get("source", ""))]
+    assert len(real) >= 6, f"実ダイヤ路線が減っている: {len(real)}"
+    for ln in real:
+        deps = ln.get("departures")
+        assert deps and len(deps) > 100, (ln["name"], deps and len(deps))
+        assert deps == sorted(deps) and len(set(deps)) == len(deps)
+    # ★近似路線には列を**作らない**(空列を置くと「実時刻を持っている」と読めてしまう)
+    for ln in approx:
+        assert "departures" not in ln, ln["name"]
+
+
+@_needs_odpt
+def test_real_departures_restore_the_morning_peak():
+    """★塞いだ穴そのもの: 単一の中央値間隔が朝を過少・日中を過大に代表していた。
+
+    実測(本テストが数字ごと固定する): 渋谷駅の到着は朝 7:30-9:00 で **増え**、
+    1 日の総数は **減る**。前者はラッシュの厚みが戻ったこと、後者は日中/深夜の
+    水増しが消えたことを意味する。"""
+    approx = Transit(ODPT_TT)
+    real = Transit(ODPT_TT, real_departures=True)
+    a_day = approx.arrivals_between(0, 1439)
+    r_day = real.arrivals_between(0, 1439)
+    rush = (450, 540)                              # 7:30-9:00
+
+    def n_rush(rows):
+        return sum(1 for m, _ in rows if rush[0] <= m <= rush[1])
+
+    assert n_rush(r_day) > n_rush(a_day) * 1.10, \
+        f"朝ラッシュが厚くなっていない: {n_rush(a_day)} → {n_rush(r_day)}"
+    assert len(r_day) < len(a_day), \
+        f"1 日の総本数が減っていない: {len(a_day)} → {len(r_day)}"
+    # 実ダイヤ路線は朝の実測間隔が中央値間隔より**短い**(過少代表の直接の証拠)
+    doc = json.loads(ODPT_TT.read_text(encoding="utf-8"))
+    tighter = 0
+    for ln in doc["lines"]:
+        deps = ln.get("departures")
+        if not deps:
+            continue
+        peak = [t for t in deps if rush[0] <= t <= rush[1]]
+        gaps = [b - a for a, b in zip(peak, peak[1:])]
+        if gaps and sorted(gaps)[len(gaps) // 2] < int(ln["headway_min"]):
+            tighter += 1
+    assert tighter >= 5, f"朝の間隔が中央値より短い路線が {tighter} 本しかない"
+
+
+@_needs_odpt
+def test_off_run_is_unchanged_by_the_new_field(tmp_path):
+    """既定 OFF のランは departures 入りのダイヤでも L1 が完全一致(バイト一致)。"""
+    if not (ROSTER.exists() and V6.exists()):
+        pytest.skip("流入名簿 or v6 地図が未生成")
+    a = _sim(tmp_path, pulse=True, tt=ODPT_TT, n_steps=48, name="dep_run_def")
+    a.run()
+    b = _sim(tmp_path, pulse=True, tt=ODPT_TT, n_steps=48, name="dep_run_off",
+             extra=["transit.real_departures=false"])
+    b.run()
+    assert _events(a) == _events(b)

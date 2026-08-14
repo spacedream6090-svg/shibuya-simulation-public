@@ -315,6 +315,28 @@ def _make_dormant(sim, agent, other_id: int, step: int, sim_min: int) -> None:
                                                         rel.get("last_step", 0))}))
 
 
+def mark_dormant(sim, agent, other_id: int, step: int, sim_min: int) -> bool:
+    """**他レーンからの公開 API**: 1 件の関係を休眠にする(既に休眠 / 対象外なら False)。
+
+    存在の内生化 POP(``population.py``)の転出が使う: 街を去った相手との関係は
+    「切れた」のではなく「会えなくなった」= 既存の休眠(``relation_dormant``)そのもの
+    なので、**新しい関係イベントを 1 種も作らない**でこれを流用する。
+
+    dunbar OFF(= ``relations.dunbar.enabled=false`` or relations OFF)のときは
+    **何もしない**(休眠という概念がそのランに無いのに台帳へキーを生やさない)。
+    """
+    if not enabled(sim):
+        return False
+    rels = getattr(getattr(agent, "mem", None), "relations", None)
+    if not rels:
+        return False
+    rel = rels.get(int(other_id))
+    if rel is None or rel.get("dormant"):
+        return False
+    _make_dormant(sim, agent, int(other_id), step, sim_min)
+    return True
+
+
 def _rekindle(sim, agent, other_id: int, step: int, sim_min: int) -> None:
     """休眠関係を再活性化する(休眠前 closeness × rekindle_discount で復元)。"""
     cfg = cfg_of(sim)
