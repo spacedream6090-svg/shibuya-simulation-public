@@ -2446,12 +2446,54 @@ def build_perception(sim, agent, material: dict):
         salience=_percept_salience(sim, agent))
 
 
+def _gen_call(sim, req: dict):
+    """生成器が yield した要求を 1 本だけ逐次発行する(従来の `sim.llm.generate` と同一)。"""
+    return sim.llm.generate(req["prompt"], rng_key=req["rng_key"],
+                            temperature=req["temperature"],
+                            max_tokens=req["max_tokens"])
+
+
+def _run_gen(sim, gen, first: dict | None = None):
+    """熟慮生成器を**その場で**逐次に回す(= engine.batch_llm OFF の既定経路)。
+
+    生成器が yield する要求をその都度 `sim.llm.generate` へ渡して送り返すだけなので、
+    生成器へ切り出す前の一本道の実装と **呼び出し順・乱数消費・イベント列が 1 命令も
+    違わない**。`first` は「既に 1 回 advance 済み」の要求(batch 経路で安全弁に落ちた
+    個体をここへ引き継ぐときに使う)。
+    """
+    try:
+        req = gen.send(None) if first is None else first
+        while True:
+            req = gen.send(_gen_call(sim, req))
+    except StopIteration as stop:
+        return stop.value
+
+
 def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
                dm_target: str | None = None,
                feed_texts: list[str] | None = None,
                reply_to: tuple[str, str] | None = None,
                partner_id: int | None = None) -> dict | None:
-    """LLM に発話/行動を生成させる。解釈不能なら None(沈黙)。
+    """LLM に発話/行動を生成させる(逐次経路)。解釈不能なら None(沈黙)。
+
+    実体は生成器 `_llm_speak_g` 1 本で、ここはそれを回すだけの薄い駆動。分割の目的は
+    engine.batch_llm(一括発行)で「要求を組む」と「応答を適用する」を切り離せるように
+    することだけで、`_phase_planning_batched` の build/apply 分割と同じ作法である
+    (逐次経路の処理順は分割前と完全同一)。
+    """
+    return _run_gen(sim, _llm_speak_g(sim, agent, trigger, step, sim_min,
+                                      dm_target=dm_target,
+                                      feed_texts=feed_texts,
+                                      reply_to=reply_to,
+                                      partner_id=partner_id))
+
+
+def _llm_speak_g(sim, agent, trigger: str, step: int, sim_min: int, *,
+                 dm_target: str | None = None,
+                 feed_texts: list[str] | None = None,
+                 reply_to: tuple[str, str] | None = None,
+                 partner_id: int | None = None):
+    """(生成器)LLM 要求を 1 回 yield し `(response, call_id, cached)` を受けて適用する。
     予算は欲求フェーズ(_phase_drive)で消費済み(発火権を得た者だけが来る)。"""
     # ---- ablate.llm_off(第78バッチ・既定 OFF=この 2 行は素通り)----
     # LLM を 1 本も呼ばず即 None を返す。呼び出し元(_decide)は既存の「解釈不能=沈黙」経路と
@@ -2495,10 +2537,12 @@ def _llm_speak(sim, agent, trigger: str, step: int, sim_min: int, *,
         kwargs = material
     prompt = deliberate.build_prompt(agent, **kwargs)
     rng_key = f"deliberate/{agent.id}/{step}"
-    response, call_id, cached = sim.llm.generate(
-        prompt, rng_key=rng_key,
-        temperature=float(sim.cfg.model.temperature),
-        max_tokens=int(sim.cfg.model.max_tokens))
+    # ★ここが build/apply の境目(engine.batch_llm の唯一の切断点)。逐次経路では
+    #   `_run_gen` が即座に `sim.llm.generate` を回して送り返すので従来と同一。
+    response, call_id, cached = yield {
+        "prompt": prompt, "rng_key": rng_key,
+        "temperature": float(sim.cfg.model.temperature),
+        "max_tokens": int(sim.cfg.model.max_tokens)}
     sim.logger.log_llm_call({"llm_call_id": call_id, "agent_id": agent.id,
                              "purpose": trigger, "step": step, "cached": cached})
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
@@ -2790,45 +2834,52 @@ def _feed_texts(sim, agent, step: int, sim_min: int) -> list[str]:
     return [] if ablate_mod.propagation_off(sim) else out
 
 
-def _fire_llm(sim, agent, reason: str, step: int, sim_min: int,
-              rng) -> dict | None:
-    """発火権を得た思考の文脈選択 → LLM。きっかけ(reason)で表現形を選ぶ。
+def _fire_llm_g(sim, agent, reason: str, step: int, sim_min: int, rng):
+    """(生成器)発火権を得た思考の文脈選択 → LLM。きっかけ(reason)で表現形を選ぶ。
 
     同席時の対面会話は _phase_drive で確定発火(reason="social_face")済み。
+    どの枝も `_llm_speak_g` をちょうど 1 回だけ通す(= 1 発火 1 呼)。
     """
     if reason == "social_face":
-        return _llm_speak(sim, agent, "social", step, sim_min)
+        return (yield from _llm_speak_g(sim, agent, "social", step, sim_min))
     if reason in ("novel_place", "congestion", "unknown_word"):
-        return _llm_speak(sim, agent, reason, step, sim_min)
+        return (yield from _llm_speak_g(sim, agent, reason, step, sim_min))
     if reason == "dm_received" and agent._last_dm_from is not None:
         target = sim.agent_by_id.get(agent._last_dm_from)
         if target is not None:
-            action = _llm_speak(sim, agent, "dm", step, sim_min,
-                                dm_target=target.name)
+            action = yield from _llm_speak_g(sim, agent, "dm", step, sim_min,
+                                             dm_target=target.name)
             if action is not None and action.get("type") == "dm":
                 action["to"] = target.id
             return action
     if reason == "news":
-        return _llm_speak(sim, agent, "post", step, sim_min,
-                          feed_texts=_feed_texts(sim, agent, step, sim_min))
+        return (yield from _llm_speak_g(
+            sim, agent, "post", step, sim_min,
+            feed_texts=_feed_texts(sim, agent, step, sim_min)))
     if agent.has_phone and rng.random() < 0.45:
         contacts = sorted(sim.net.contacts.get(agent.id, ()))
         if contacts and rng.random() < 0.35:
             target_id = contacts[int(rng.integers(len(contacts)))]
             meta = sim.agent_by_id.get(target_id)
             if meta is not None:
-                action = _llm_speak(sim, agent, "dm", step, sim_min,
-                                    dm_target=meta.name)
+                action = yield from _llm_speak_g(sim, agent, "dm", step,
+                                                 sim_min, dm_target=meta.name)
                 if action is not None and action.get("type") == "dm":
                     action["to"] = target_id
                 return action
-        return _llm_speak(sim, agent, "post", step, sim_min,
-                          feed_texts=_feed_texts(sim, agent, step, sim_min))
-    return _llm_speak(sim, agent, "solo", step, sim_min)
+        return (yield from _llm_speak_g(
+            sim, agent, "post", step, sim_min,
+            feed_texts=_feed_texts(sim, agent, step, sim_min)))
+    return (yield from _llm_speak_g(sim, agent, "solo", step, sim_min))
 
 
 # ---------------------------------------------------------------- 意思決定
 def _decide(sim, agent, step: int, sim_min: int) -> dict:
+    """意思決定(逐次経路)。実体は生成器 `_decide_g` で、ここは回すだけの薄い駆動。"""
+    return _run_gen(sim, _decide_g(sim, agent, step, sim_min))
+
+
+def _decide_g(sim, agent, step: int, sim_min: int):
     # 勾留(制度深化2・既定 0=フラグ立たず不変): 拘束中は行動しない(返答・発火・移動なし)。
     if step < getattr(agent, "detained_until", 0):
         return {"type": "stay"}
@@ -2873,8 +2924,9 @@ def _decide(sim, agent, step: int, sim_min: int) -> dict:
             # られたのに内容が空」という不自然な行は生まれない)。
             if ablate_mod.propagation_off(sim):
                 reply_to = None
-            action = _llm_speak(sim, agent, "reply", step, sim_min,
-                                reply_to=reply_to, partner_id=speaker_id)
+            action = yield from _llm_speak_g(sim, agent, "reply", step, sim_min,
+                                             reply_to=reply_to,
+                                             partner_id=speaker_id)
             agent.conv_turns_left -= 1
             if agent.conv_turns_left <= 0:         # セッション上限 → クールダウン
                 agent.conv_cooldown_until = step + sim.drivecfg["conv_cooldown_steps"]
@@ -2886,7 +2938,7 @@ def _decide(sim, agent, step: int, sim_min: int) -> dict:
         reason = agent._fire_reason
         agent._fire_reason = ""
         agent._last_fire_reason = reason           # 造語の発生きっかけの記録用
-        action = _fire_llm(sim, agent, reason, step, sim_min, rng)
+        action = yield from _fire_llm_g(sim, agent, reason, step, sim_min, rng)
         if action is not None:
             return action
 
@@ -2897,6 +2949,250 @@ def _decide(sim, agent, step: int, sim_min: int) -> dict:
         if phone_action is not None:
             return phone_action
     return action
+
+
+# --------------------------------------------------------------------------- #
+# 日中熟慮の一括発行(engine.batch_llm。既定 OFF=以下は 1 度も呼ばれない)
+#
+# 朝計画・夜内省(_phase_planning_batched / _phase_reflect_batched)と違い、日中熟慮は
+# **個体間で独立ではない**。`_decide` は 1 個体ぶんが
+#     prefix(材料収集・プロンプト構成)→ LLM → suffix(応答の適用/場合により後退経路)
+# という並びで、suffix が世界へ書いた結果を **次の個体の prefix が読む**経路が実在する。
+# したがって「全員の prefix を先に回す」形の素朴な一括化は成立しない。ここでの境界は:
+#
+#   ① LLM を 1 本も撃たない個体(= 大多数)は **その場で最後まで走らせる**。
+#      → 後退経路(routine.decide / _phone → _hear_words / SNS 反応 / イベント参加)の
+#        他個体への書き込みは、逐次と同じ位置で起きる。
+#   ② LLM を撃つ個体だけを応答待ちで中断し、まとめて発行して id 順に再開する。
+#      遅らせるのは「応答を適用する部分」だけで、そこは自個体の状態と L1 に閉じている。
+#   ③ ただし **パース不成立の後退経路**(壊れた JSON → routine.decide/_phone、
+#      返事が壊れた個体の 2 本目の熟慮)は他個体を読み書きする。これが起こりうる個体は
+#      `_deliberate_defer_ok` が **batch に入れず**、その場で逐次に走らせる(= OFF と同一経路)。
+#   ④ 観測出力の並びは `_reorder_decide_log` が個体単位で逐次と同じ順へ戻す。
+#      (L1 events と L1b llm_calls の両方。step 内の他フェーズは走っていないので安全)
+#   ⑤ **残る 1 点を正直に書く**: ③の安全弁を通った個体でもパースが不成立になれば
+#      後退の `routine.decide` は走る。`routine.decide` 自体が他個体へ書く経路は
+#      すべて既定 OFF の下位系(宅配の注文・共同行動/デート/party/火種の合流先・
+#      サービス来店・相乗り)に限られるが、それらが ON のランでは「壊れた JSON を
+#      返した個体の後退が、逐次なら先に起きていた」という 1 step 内の順序差になりうる。
+#      そこで `deferred_fallback` を数える: **この値が 0 のあいだ batch 経路は逐次
+#      経路と機械的に同値**(= 遅延した部分に後退経路が 1 度も現れていない)。
+#      ラン後にこの 1 個の整数を見れば「厳密一致だったか」が判定できる。
+# --------------------------------------------------------------------------- #
+def _batch_llm_cfg(sim) -> dict:
+    return (sim.cfg.get("engine", {}) or {}).get("batch_llm", {}) or {}
+
+
+def _policy_cache_on(sim) -> bool:
+    """方針キャッシュが有効か(conf を読むだけ・副作用ゼロ)。"""
+    raw = (sim.cfg.get("cognition", {}) or {}).get("policy_cache", {}) or {}
+    return bool(raw.get("enabled", False))
+
+
+def _deliberate_batch_on(sim) -> bool:
+    """日中熟慮を一括発行してよいか(step ごとに 1 度だけ判定する phase 級の安全弁)。
+
+    方針キャッシュ ON では `store_action` が **全体 LRU** を持つ共有キャッシュを触る
+    (= 他個体の枠を追い出す)ので、適用を遅らせると後続個体の `reuse_action` の
+    命中が変わりうる。exact でない一括化はしない、が本レーンの規律なので丸ごと外す。
+    """
+    return bool(_batch_llm_cfg(sim).get("enabled", False)) \
+        and not _policy_cache_on(sim)
+
+
+def _deliberate_defer_ok(sim, agent, step: int) -> bool:
+    """この個体の**応答適用以降**を後回しにしてよいか(個体級の安全弁)。
+
+    後回しにしてよいのは「遅らせる部分が他個体の状態を読みも書きもしない」ときだけ。
+    応答を適用する部分(記録 → parse → watch → 信念 → provlink)は自個体と L1 に
+    閉じているが、**パース不成立のときに続く後退経路**は違う:
+
+      ① 返事(reply)が壊れた個体はこの後 **もう 1 本**(発火)の熟慮を撃つ。その
+         材料収集は他個体の状態(評判・語・イベント・TL)を**読む**。
+      ② 後退の `routine.decide` → `_phone` は検索/TL 閲覧/ニュースで `_hear_words`・
+         SNS 反応・イベント参加を起こし、造語者や投稿者といった **他個体へ書く**。
+
+    ①は `agent._fire_reason`(発火権が残っているか)で判る。②は `_phone` が実際に
+    何かをする枝へ入るかで判り、その枝分岐は `phone` stream の 1 draw で決まる。
+    `RngHub.stream` は毎回**新しい Generator** を作るので、ここで `random()` を引いても
+    後で `_phone` が引く値は 1 ビットも変わらない(= 覗き見・乱数消費ゼロ)。
+    """
+    if agent._fire_reason:                         # ①: 2 本目の熟慮が控えている
+        return False
+    if not agent.has_phone or agent.sleeping:      # ②: _phone へ到達しない
+        return True
+    ncfg = sim.netcfg
+    if not ncfg["enabled"] or disaster_mod.infra_out(sim):
+        return True                                # _phone は即 None(何もしない)
+    if agent._search_queue:                        # 検索 → _hear_words(造語者へ書く)
+        return False
+    r = float(sim.hub.stream("phone", agent.id, step).random())
+    return r >= float(ncfg["browse_prob"]) + float(ncfg["news_prob"])
+
+
+class _JournalRelay:
+    """このフェーズのジャーナル書き込みを退避する中継(第71 LlmJournal と同じ口)。
+
+    ジャーナルは `seq` を書き込み順に振るので、**一括発行で入れ替わった順のまま**
+    本物へ流すと ON/OFF でファイルが変わってしまう(tests/test_llm_journal.py の契約)。
+    ここで受けて `_replay_decide_journal` が個体順に流し直す。record 以外の呼び出し
+    (flush / path / seq …)は本物へそのまま委譲する。
+    """
+
+    def __init__(self, real, sink: list) -> None:
+        self.__dict__["_real"] = real
+        self.__dict__["_sink"] = sink
+
+    def record(self, **kw) -> None:
+        self._sink.append((self._real, kw))
+
+    def __getattr__(self, name):
+        return getattr(self.__dict__["_real"], name)
+
+
+def _journal_owners(llm) -> list:
+    """`journal` を持つ層(= CachedLLM)を重複なく列挙する(router / mind 配線を含む)。"""
+    out, seen, stack = [], set(), [llm]
+    while stack:
+        x = stack.pop()
+        if x is None or id(x) in seen:
+            continue
+        seen.add(id(x))
+        if getattr(x, "journal", None) is not None:
+            out.append(x)
+        ch = getattr(x, "children", None)
+        if isinstance(ch, dict):
+            stack.extend(ch.values())
+        d = getattr(x, "default", None)
+        if d is not None:
+            stack.append(d)
+    return out
+
+
+def _replay_decide_journal(sink: list, active: list) -> None:
+    """退避したジャーナル行を**個体順**(= 逐次実行の書き込み順)で本物へ流す。
+
+    熟慮の rng_key は `deliberate/<agent_id>/<step>` なので個体は行から一意に判る。
+    同じ個体が 2 本撃った場合(返事 → 発火)は捕捉順がそのまま保たれる(安定ソート)。
+    """
+    if not sink:
+        return
+    pos = {int(a.id): i for i, a in enumerate(active)}
+
+    def _key(row):
+        parts = str(row[1].get("rng_key", "")).split("/")
+        try:
+            return pos.get(int(parts[1]), -1)
+        except (IndexError, ValueError):
+            return -1
+
+    for real, kw in sorted(sink, key=_key):
+        real.record(**kw)
+
+
+def _reorder_decide_log(sim, ev0: int, lc0: int, frags: list) -> None:
+    """遅延した個体の観測出力を**逐次実行と同じ並び**(個体単位の連結)へ戻す。
+
+    `frags[i]` は個体 i が書いた区間 `(ev_a, ev_b, lc_a, lc_b)` の列(生成順)。
+    このフェーズの間に L1/L1b へ書くのは `_decide` だけ(一括発行はジャーナルへしか
+    書かない)なので、区間の連結は元の並びの完全な分割になる。分割が漏れていたら
+    黙って並べ替えず**即座に落とす**(静かな L1 破壊を作らないため)。
+    """
+    if all(len(f) <= 1 for f in frags):            # 分割された個体が無い=既に逐次と同一
+        return
+    ev, lc = sim.logger.events, sim.logger.llm_calls
+    ev_tail, lc_tail = ev[ev0:], lc[lc0:]
+    new_ev, new_lc = [], []
+    for one in frags:
+        for a, b, c, d in one:
+            new_ev.extend(ev_tail[a - ev0:b - ev0])
+            new_lc.extend(lc_tail[c - lc0:d - lc0])
+    if len(new_ev) != len(ev_tail) or len(new_lc) != len(lc_tail):
+        raise RuntimeError(
+            "batch_llm(熟慮)の観測出力の区間分割が壊れている"
+            f"(L1 {len(new_ev)}/{len(ev_tail)} L1b {len(new_lc)}/{len(lc_tail)})。")
+    ev[ev0:] = new_ev
+    lc[lc0:] = new_lc
+
+
+def _phase_decide_batched(sim, active: list, step: int, sim_min: int,
+                          workers: int) -> list:
+    """日中熟慮の一括発行。返り値は逐次経路と同じ `[(agent, action), ...]`。"""
+    n = len(active)
+    actions: list = [None] * n
+    ev, lc = sim.logger.events, sim.logger.llm_calls
+    ev0, lc0 = len(ev), len(lc)
+    frags: list[list[tuple[int, int, int, int]]] = [[] for _ in range(n)]
+    pending: list[tuple[int, object, dict]] = []
+    stats = getattr(sim, "_batch_decide_stats", None)
+    if stats is None:                              # ラン通算(観測用。L1 にも state にも出ない)
+        stats = {"batched": 0, "serial_llm": 0, "no_llm": 0, "rounds": 0,
+                 "requests": 0, "steps": 0, "max_batch": 0,
+                 # ★厳密一致の証人(下の設計注記):遅延した個体で**パース不成立**が
+                 #   起きた回数。0 のあいだ、batch 経路は逐次経路と機械的に同値である。
+                 "deferred_fallback": 0}
+        sim._batch_decide_stats = stats
+    stats["steps"] += 1
+    # LLM ジャーナル(第71)の書き込みも並び替えの対象なので、このフェーズのあいだだけ
+    # 中継へ差し替えて退避する(finally で必ず戻す)。
+    jsink: list = []
+    jsaved = [(c, c.journal) for c in _journal_owners(sim.llm)]
+    for _c, _j in jsaved:
+        _c.journal = _JournalRelay(_j, jsink)
+    try:
+        _decide_rounds(sim, active, step, sim_min, workers, actions, frags,
+                       pending, stats, ev, lc)
+    finally:
+        for _c, _j in jsaved:
+            _c.journal = _j
+        _replay_decide_journal(jsink, active)
+    _reorder_decide_log(sim, ev0, lc0, frags)
+    return actions
+
+
+def _decide_rounds(sim, active: list, step: int, sim_min: int, workers: int,
+                   actions: list, frags: list, pending: list, stats: dict,
+                   ev: list, lc: list) -> None:
+    """`_phase_decide_batched` の本体(ラウンド 0 → 一括発行 → id 順の再開)。"""
+    # ---- ラウンド 0(id 順・逐次): 最初の要求まで走らせる ----
+    for i, agent in enumerate(active):
+        ea, la = len(ev), len(lc)
+        gen = _decide_g(sim, agent, step, sim_min)
+        try:
+            req = gen.send(None)
+        except StopIteration as stop:              # LLM を 1 本も撃たない個体=完了
+            actions[i] = (agent, stop.value)
+            stats["no_llm"] += 1
+        else:
+            if _deliberate_defer_ok(sim, agent, step):
+                pending.append((i, gen, req))
+                stats["batched"] += 1
+            else:                                  # 安全弁: その場で逐次に走らせる
+                actions[i] = (agent, _run_gen(sim, gen, first=req))
+                stats["serial_llm"] += 1
+        frags[i].append((ea, len(ev), la, len(lc)))
+    # ---- ラウンド 1..: 未解決分を一括発行し id 順に再開する ----
+    while pending:
+        stats["rounds"] += 1
+        stats["requests"] += len(pending)
+        stats["max_batch"] = max(stats["max_batch"], len(pending))
+        results = sim.llm.generate_many([r for _i, _g, r in pending],
+                                        workers=workers)
+        nxt: list[tuple[int, object, dict]] = []
+        for (i, gen, _req), res in zip(pending, results):
+            ea, la = len(ev), len(lc)
+            try:
+                req = gen.send(res)
+            except StopIteration as stop:
+                actions[i] = (active[i], stop.value)
+            else:
+                nxt.append((i, gen, req))
+            for _e in ev[ea:]:                     # 厳密一致の証人(設計注記 ⑤)
+                if _e.kind in ("fallback", "undefined_action"):
+                    stats["deferred_fallback"] += 1
+                    break
+            frags[i].append((ea, len(ev), la, len(lc)))
+        pending = nxt
 
 
 # ---------------------------------------------------------------- 検索エンジン
@@ -5920,7 +6216,14 @@ def run_step(sim, step: int) -> None:
 
     active = [a for a in sim.agents
               if a.loc != "outside" and not a.sleeping]   # 外・睡眠中=計算しない
-    actions = [(agent, _decide(sim, agent, step, sim_min)) for agent in active]
+    # 日中熟慮の一括発行(engine.batch_llm。既定 OFF=下の内包表記=従来と 1 命令も同じ)。
+    if _deliberate_batch_on(sim):
+        actions = _phase_decide_batched(
+            sim, active, step, sim_min,
+            workers=int(_batch_llm_cfg(sim).get("workers", 8)))
+    else:
+        actions = [(agent, _decide(sim, agent, step, sim_min))
+                   for agent in active]
     # 同期バリア + ダブルバッファ(第81・設計 §3.3)。既定 OFF は引数をそのまま返す恒等。
     # ON では推論結果の **world への適用順を agent_id 昇順に正準化**する(到着順=推論の
     # 完了順が世界に漏れない。T1 完了順序不変性テストがこれを固定する)。

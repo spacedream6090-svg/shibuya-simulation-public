@@ -122,3 +122,190 @@ def test_batched_reflect_identical_with_agentic_pull(tmp_path):
     assert "memory_recall" in _kinds(off)             # recall ラウンドを実際に通った
     assert _l1(off) == _l1(on)
     assert off.llm.calls == on.llm.calls
+
+
+# --------------------------------------------------------------------------- #
+# 第118 レーン B5: 日中熟慮(deliberate)の step 単位 batch 化
+#
+# 契約は上と同じ「逐次と完全同一」だが、熟慮は朝計画・夜内省と違い **個体間で独立で
+# ない**(1 個体の後段が世界へ書いた結果を次の個体の材料収集が読む)。そのため
+# scheduler 側は
+#   ① LLM を撃たない個体はその場で最後まで走らせる
+#   ② 撃つ個体だけを応答待ちで中断 → 一括発行 → id 順に再開
+#   ③ 遅らせた後段が他個体を読み書きしうる個体は batch に入れない(安全弁)
+#   ④ 観測出力(L1 / L1b)の並びを個体単位で逐次と同じ順へ戻す
+# という境界を持つ。以下はその 4 つを固定する。
+# --------------------------------------------------------------------------- #
+import hashlib
+
+import pyarrow.parquet as pq
+import pytest
+
+from society.cognition import deliberate as _deliberate_mod
+from society.engine import checkpoint as _checkpoint
+from society.engine import scheduler as _scheduler
+
+
+def _l1b(sim):
+    return [dict(r) for r in sim.logger.llm_calls]
+
+
+def _digest(sim):
+    """最終状態の要約(位置・所持金・欲求・語彙・計画)。"""
+    return [[a.id, a.node, a.building, a.floor, a.loc, bool(a.sleeping),
+             round(float(a.x), 6), round(float(a.y), 6),
+             round(float(a.drive), 9), round(float(a.money), 6),
+             sorted(a.adopted), len(a.day_plan or [])] for a in sim.agents]
+
+
+def _cache_mem(sim):
+    return sorted(getattr(sim.llm, "_mem", {}).items())
+
+
+_BATCH_ON = {"engine.batch_llm.enabled": "true"}
+
+
+def test_deliberate_actually_uses_batch_path(tmp_path):
+    """熟慮が **実際に一括経路を通った**ことの機械確認(逐次に落ちていない)。"""
+    on = _run(tmp_path, "dbg", steps=144, **{**_BATCH_ON,
+                                             "engine.batch_llm.workers": "8"})
+    st = on._batch_decide_stats
+    assert st["batched"] > 0, "熟慮が 1 件も batch に乗っていない"
+    assert st["requests"] == st["batched"]     # 1 個体 1 要求(2 本目は安全弁で除外済み)
+    assert st["max_batch"] >= 2, "同 step に 2 件以上まとまった実績が無い"
+    assert st["rounds"] > 0 and st["no_llm"] > 0
+    assert st["serial_llm"] > 0, "安全弁(逐次退避)の枝が 1 度も踏まれていない"
+    assert st["deferred_fallback"] == 0        # 厳密一致の証人
+    # OFF 側には統計そのものが生えない(= 一括経路を 1 度も通らない)
+    off = _run(tmp_path, "dbg_off", steps=144)
+    assert not hasattr(off, "_batch_decide_stats")
+
+
+def test_batched_deliberate_is_identical_to_sequential(tmp_path):
+    """OFF / ON(workers=1)/ ON(workers=8): L1・L1b・キャッシュ・カウンタ・最終状態が一致。"""
+    off = _run(tmp_path, "d_off", steps=144)
+    on1 = _run(tmp_path, "d_on1", steps=144,
+               **{**_BATCH_ON, "engine.batch_llm.workers": "1"})
+    on8 = _run(tmp_path, "d_on8", steps=144,
+               **{**_BATCH_ON, "engine.batch_llm.workers": "8"})
+    assert "llm_deliberate" in _kinds(off)      # 熟慮パスを実際に通った
+    for on in (on1, on8):
+        assert on._batch_decide_stats["batched"] > 0
+        assert _l1(off) == _l1(on)              # L1 イベント列(並びまで)
+        assert _l1b(off) == _l1b(on)            # L1b(呼の並び・cached フラグ)
+        assert (off.llm.calls, off.llm.hits) == (on.llm.calls, on.llm.hits)
+        assert _cache_mem(off) == _cache_mem(on)
+        assert _digest(off) == _digest(on)
+
+
+def test_batched_deliberate_identical_under_parse_failures(tmp_path, monkeypatch):
+    """壊れた JSON(= 後退経路)が混ざっても ON=OFF。
+
+    後退経路(routine.decide / _phone)は遅延させると他個体との順序が変わりうる箇所
+    なので、**わざと 4 回に 1 回パースを壊して**両経路を突き合わせる。安全弁が効いて
+    いれば L1 は一致し、遅延側で後退が起きた回数(deferred_fallback)は記録される。
+    """
+    real = _deliberate_mod.parse_action
+
+    def flaky(response):
+        h = hashlib.blake2b(str(response).encode("utf-8"), digest_size=4).digest()
+        return None if h[0] % 4 == 0 else real(response)
+
+    monkeypatch.setattr(_deliberate_mod, "parse_action", flaky)
+    off = _run(tmp_path, "f_off", steps=144)
+    on = _run(tmp_path, "f_on", steps=144, **{**_BATCH_ON,
+                                              "engine.batch_llm.workers": "4"})
+    assert "fallback" in _kinds(off), "後退経路(fallback)が 1 件も起きていない"
+    assert on._batch_decide_stats["deferred_fallback"] > 0, \
+        "遅延した個体で後退経路が 1 度も起きていない(= この試験が無風)"
+    assert _l1(off) == _l1(on)
+    assert _l1b(off) == _l1b(on)
+    assert _digest(off) == _digest(on)
+
+
+def test_batched_deliberate_identical_with_finals_like_subsystems(tmp_path,
+                                                                  monkeypatch):
+    """本選相当の下位系 ON + 壊れた JSON でも ON=OFF。
+
+    遅延した個体の後退経路(`routine.decide`)が **他個体へ書きうる**のは宅配の注文・
+    共同行動/party の合流先・サービス来店といった下位系が ON のときだけなので、それらを
+    まとめて立てた状態で突き合わせる(= 設計注記 ⑤ の残り 1 点を実測で潰す試験)。
+    """
+    real = _deliberate_mod.parse_action
+
+    def flaky(response):
+        h = hashlib.blake2b(str(response).encode("utf-8"), digest_size=4).digest()
+        return None if h[0] % 4 == 0 else real(response)
+
+    monkeypatch.setattr(_deliberate_mod, "parse_action", flaky)
+    subs = {"delivery.enabled": "true", "joint.enabled": "true",
+            "party.enabled": "true", "services.enabled": "true",
+            "household.enabled": "true", "diversity.enabled": "true",
+            "relations.enabled": "true", "inner_life.enabled": "true"}
+    off = _run(tmp_path, "g_off", steps=144, **subs)
+    on = _run(tmp_path, "g_on", steps=144, **{**subs, **_BATCH_ON,
+                                              "engine.batch_llm.workers": "8"})
+    assert on._batch_decide_stats["deferred_fallback"] > 0
+    assert _l1(off) == _l1(on)
+    assert _l1b(off) == _l1b(on)
+    assert _digest(off) == _digest(on)
+
+
+def test_policy_cache_disables_deliberate_batch(tmp_path):
+    """方針キャッシュ ON では熟慮の一括発行を丸ごと外す(全体 LRU は遅延できない)。"""
+    pc = {"cognition.policy_cache.enabled": "true"}
+    off = _run(tmp_path, "pc_off", steps=144, **pc)
+    on = _run(tmp_path, "pc_on", steps=144, **{**pc, **_BATCH_ON})
+    assert not hasattr(on, "_batch_decide_stats"), "安全弁が外れている"
+    assert _l1(off) == _l1(on)                  # 計画・内省の一括は従来どおり効く
+
+
+def test_reorder_decide_log_rejects_broken_split():
+    """反証: 区間分割が元の並びを覆っていなければ黙って並べ替えず即座に落ちる。"""
+    class _Log:
+        def __init__(self):
+            self.events = ["a", "b", "c"]
+            self.llm_calls = []
+
+    class _Sim:
+        pass
+
+    sim = _Sim()
+    sim.logger = _Log()
+    try:
+        _scheduler._reorder_decide_log(sim, 0, 0, [[(0, 1, 0, 0), (1, 2, 0, 0)],
+                                                   [(2, 3, 0, 0)]])
+    except RuntimeError:                        # 覆っていれば通る(下の壊れた分割と対比)
+        raise AssertionError("正しい分割で落ちてはいけない")
+    sim.logger.events = ["a", "b", "c"]
+    with pytest.raises(RuntimeError):
+        _scheduler._reorder_decide_log(sim, 0, 0, [[(0, 1, 0, 0), (1, 2, 0, 0)]])
+
+
+def test_batched_deliberate_resume_equals_straight(tmp_path):
+    """batch ON で checkpoint を跨いでも resume == straight(L1 parquet 一致)。"""
+    from society.config import load_config as _load
+
+    def _cfg(name, n_steps, **ov):
+        dot = ["run.seed=42", "run.n_agents=30", f"run.n_steps={n_steps}",
+               f"run.name={name}", "model.backend=mock",
+               "engine.batch_llm.enabled=true", "engine.batch_llm.workers=4",
+               "observer.checkpoint_every=48"]
+        return _load(dot + [f"{k}={v}" for k, v in ov.items()])
+
+    straight = tmp_path / "b_straight"
+    Simulation(_cfg("b_straight", 96), out_dir=straight).run()
+
+    d = tmp_path / "b_resumed"
+    sim1 = Simulation(_cfg("b_resumed", 48), out_dir=d)
+    for step in range(48):
+        _scheduler.run_step(sim1, step)
+    _checkpoint.save(sim1, 48, d / "checkpoint" / "ckpt-000048.pkl.gz")
+    sim1.logger.flush_segment()
+    sim2 = Simulation(_cfg("b_resumed", 96), out_dir=d)
+    sim2.run(resume_from=d)
+
+    def _rows(run_dir):
+        return pq.read_table(run_dir / "l1_events.parquet").to_pylist()
+
+    assert _rows(d) == _rows(straight)
