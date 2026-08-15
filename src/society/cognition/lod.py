@@ -17,6 +17,8 @@ LOD 軸の一貫設計(ユーザー要件 2026-07-14):
 """
 from __future__ import annotations
 
+import math
+
 # ---- 入力解像度LOD(docs/plans/input-resolution-lod.md)------------------------
 # mid = 現行の定数(poi[:3]・recent(4)・retrieve(n=3)・feed[:3]・人は全列挙)と完全一致
 # = ON でも全員 mid なら注入内容は現行と同じ。people_n 0 / salience_k 0 は「現行のまま」。
@@ -77,16 +79,129 @@ def assign_axis(agent_ids: list[int], stream, levels: dict[str, dict]) -> dict[i
     return out
 
 
+# ---- 二層予算(DPH-B。docs/plans/dayplan-horizon-plan.md §3.3・既定 OFF)------------
+#
+# 何を解く問題か
+# --------------
+# 現行の `LodBudget` は step あたりの単一カウンタで、`take()` を呼ぶのは scheduler の
+# 3 箇所だけ(対面/割込みの確定発火・媒体/独り言の抽選当選・返答保証)。
+# **朝の計画と夜の内省は予算の外**を無条件に走るので、
+#   (a) 実効の per-step 上限が `cap + 予算外呼` になり(実測 cap 60 のランで 1 step 96 呼)、
+#   (b) cap が binding なランでは発火側(先に走る)が食い切って **返答保証が枯渇**する
+#       (実測: cap 60 で reply −96%・08-23 時は 1 件も返らない)。
+#
+# 契約(ON のとき)
+# ----------------
+# - **総量は増えない**: どのレーンから取っても `used <= max_per_step` を必ず満たす。
+#   plan / reflect が予算の**中**へ入るので、ON の総呼数は OFF 以下にしかならない
+#   (= 分配だけを変える。tests が機械固定する)。
+# - **予約は必ず守られる**: general(発火・独り言・投稿)は自分の枠しか使えない。
+#   一方 reply / life(plan・reflect)は自分の枠を使い切ったら general の**余り**を借りる。
+# - **正直な限界**: 「未使用の reserved を同 step 内で general へ流す」(計画書 §3.3 の
+#   最後の 1 行)は**実装しない**。run_step のフェーズ順が
+#   planning(life)→ drive(general)→ decide(reply)→ reflect(life) なので、
+#   general が走る時点では reply / reflect の予約が余るかどうかがまだ判らない。
+#   先に流すと予約が守れず、後から流しても general は既に終わっている。
+#   代わりに**逆向き**(予約超過は general の余りを借りる)だけを入れてある =
+#   総量は cap のまま・予約は必ず守られる・遊ぶのは「予約が余った分」だけ。
+BUDGET_TIER_DEFAULTS = {
+    "enabled": False,
+    "reply_share": 0.20,      # 返答保証の先取り枠(cap に対する割合)
+    "life_share": 0.30,       # 生活基盤(朝の計画 plan / 夜の内省 reflect)の先取り枠
+    "max_defer_steps": 18,    # plan/reflect の FIFO 繰り越し上限(18 step = 3 時間 @Δt10)
+}
+
+# 観測ラベル(purpose)→ 予算レーン。**観測の粒度と配分の粒度を分ける**ための 1 枚。
+#   観測は「どの呼び出し site で落ちたか」を purpose 別に数えたい(DPH-O ④)が、
+#   配分は 3 レーンで足りる。既知でない purpose は general 扱い(捏造しない)。
+PURPOSE_LANE: dict[str, str] = {
+    "reply": "reply",
+    "plan": "life", "reflect": "life",
+    "face": "general", "interrupt": "general", "media": "general",
+}
+BUDGET_LANES: tuple[str, ...] = ("life", "reply", "general")
+
+
+def build_budget_cfg(raw) -> dict | None:
+    """config(lod.budget.tiers)→ 検証済み cfg。enabled=False なら None(=完全 no-op)。"""
+    try:
+        from omegaconf import OmegaConf
+        if OmegaConf.is_config(raw):
+            raw = OmegaConf.to_container(raw, resolve=True)
+    except Exception:                              # noqa: BLE001 (omegaconf 不在でも動く)
+        pass
+    raw = dict(raw or {})
+    if not raw.get("enabled", False):
+        return None
+    cfg = dict(BUDGET_TIER_DEFAULTS)
+    cfg.update({k: v for k, v in raw.items() if k in BUDGET_TIER_DEFAULTS})
+    cfg["enabled"] = True
+    cfg["reply_share"] = max(0.0, float(cfg["reply_share"]))
+    cfg["life_share"] = max(0.0, float(cfg["life_share"]))
+    cfg["max_defer_steps"] = max(0, int(cfg["max_defer_steps"]))
+    if cfg["reply_share"] + cfg["life_share"] > 1.0:
+        raise ValueError("lod.budget.tiers: reply_share + life_share は 1.0 以下。")
+    return cfg
+
+
 class LodBudget:
-    def __init__(self, max_per_step: int):
+    """step あたりの LLM 発火予算。
+
+    `tiers=None`(既定)では第30バッチ以来の単一カウンタと**完全に同一**に振る舞う
+    (`take()` の返り値列も同じ)。`counters` を渡すと purpose 別の許可/拒否件数を
+    そこへ積む(DPH-O ④ の観測。**判定には 1 度も使わない**)。
+    """
+
+    def __init__(self, max_per_step: int, tiers: dict | None = None,
+                 counters: dict | None = None):
         self.max_per_step = int(max_per_step)
         self.used = 0
+        self.tiers = tiers or None
+        self.counters = counters                   # None = 観測 OFF(dict も作らない)
+        self.caps: dict[str, int] = {}
+        self.lane_used: dict[str, int] = {}
+        if self.tiers:
+            cap = self.max_per_step
+            # ★切り上げ: 宣言された予約が丸めでゼロへ消えない(cap が小さいランほど
+            #   予約が要るのに、切り捨てだと cap=4 × 0.20 → 0 枠になって飢餓が直らない)。
+            #   round(…, 9) は 300×0.2=60.000000000000004 のような float 誤差での
+            #   繰り上げ事故を防ぐ(simulation.py の n_proportional と同じ作法)。
+            reply = min(cap, math.ceil(round(cap * float(self.tiers["reply_share"]), 9)))
+            life = min(cap - reply,
+                       math.ceil(round(cap * float(self.tiers["life_share"]), 9)))
+            self.caps = {"reply": int(reply), "life": int(life),
+                         "general": max(0, cap - int(reply) - int(life))}
+            self.lane_used = {k: 0 for k in BUDGET_LANES}
 
+    # -- step 境界 ---------------------------------------------------------- #
     def reset(self) -> None:
         self.used = 0
+        if self.tiers:
+            self.lane_used = {k: 0 for k in BUDGET_LANES}
 
-    def take(self) -> bool:
-        if self.used < self.max_per_step:
+    # -- 消費 --------------------------------------------------------------- #
+    def take(self, purpose: str | None = None) -> bool:
+        ok = self._take(PURPOSE_LANE.get(str(purpose or ""), "general"))
+        if self.counters is not None:              # 観測(判定に影響しない)
+            row = self.counters.setdefault(str(purpose or "unknown"),
+                                           {"granted": 0, "denied": 0})
+            row["granted" if ok else "denied"] += 1
+        return ok
+
+    def _take(self, lane: str) -> bool:
+        if self.used >= self.max_per_step:         # ★総量の硬い上限(ON/OFF 共通)
+            return False
+        if not self.tiers:
+            self.used += 1
+            return True
+        if self.lane_used[lane] < self.caps[lane]:
+            self.lane_used[lane] += 1
+            self.used += 1
+            return True
+        # 予約レーン(reply / life)は general の**余り**だけを借りられる。
+        # general 自身は借りない = 予約が先に食われることが原理的に起きない。
+        if lane != "general" and self.lane_used["general"] < self.caps["general"]:
+            self.lane_used["general"] += 1
             self.used += 1
             return True
         return False

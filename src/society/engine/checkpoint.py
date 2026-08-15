@@ -175,6 +175,13 @@ def save(sim, step: int, path: str | Path) -> Path:
             # 同じ型のギャップ)。既定 OFF では state 自体が生えない → None=挙動不変
             # (load は .get で旧 checkpoint 互換)。
             "dayplan_state": getattr(sim, "_dayplan_state", None),
+            # DPH-O 観測 4 点(observer.starvation): 返事の枯渇 / 日跨ぎの圧潰 / 計画の欠落 /
+            # purpose 別の予算許可・拒否の累積タリー(int と素の dict のみ)。**個体側の印**
+            # (agent._plan_expired_day / plan_due_step / reflect_due_step)は agents pickle に
+            # 自然同梱されるので、ここで中央管理するのは summary.starvation の材料だけ
+            # (第86 day_plan / 第94 IF-B と同じ型)。保存しないと mid-day resume で
+            # summary の累積値が straight と食い違う。既定 OFF では state 自体が生えない。
+            "starvation_state": getattr(sim, "_starvation_state", None),
             # 第87バッチ engaged モード: エピソード数/ターン/滞在分/脱出理由の累積タリー
             # (int と素の dict のみ)。**エピソードそのもの**(agent._engaged)と不応期
             # (agent._engaged_refr)は agents pickle に自然同梱されるので、ここで中央管理
@@ -618,6 +625,15 @@ def load(sim, path: str | Path) -> int:
     dps = rt.get("dayplan_state")               # 第86 day_plan v1(旧 ckpt 互換=無ければ素通り)
     if dps is not None:
         sim._dayplan_state = dps
+    sts = rt.get("starvation_state")            # DPH-O 観測 4 点(旧 ckpt 互換=無ければ素通り)
+    if sts is not None:
+        sim._starvation_state = sts
+        # ★予算オブジェクトが握っている purpose 別カウンタは **同じ dict の実体**でなければ
+        #   ならない(LodBudget は初期化時に受け取った参照へ書き込む)。差し替えを忘れると
+        #   resume 後の集計が straight と食い違う。
+        if getattr(sim, "budget", None) is not None \
+                and getattr(sim.budget, "counters", None) is not None:
+            sim.budget.counters = sts.setdefault("budget", {})
     egs = rt.get("engaged_state")               # 第87 engaged(旧 ckpt 互換=無ければ素通り)
     if egs is not None:
         sim._engaged_state = egs

@@ -122,6 +122,7 @@ from __future__ import annotations
 
 import math
 
+from ..observer import starvation as _starvation
 from ..observer.schema import Event
 from . import plan_boundary as _bnd
 from .deliberate import _loads_lenient
@@ -272,14 +273,25 @@ DEFAULTS = {
     "transfer_min": 5,           # 同一ノード内でも要る最小の乗り換え/準備時間[分]
     "max_slide_min": 180,        # 1 ブロックの累積ずらし上限[分](超えたら drop)
     "day_end_min": 1440,         # 計画が収まるべき日の終端[分 of day]
+    # ---- DPH-C 日跨ぎブロック(既定 False=現行とバイト一致)-------------------- #
+    #   docs/plans/dayplan-horizon-plan.md §1.2 / §3.1 案 C。
+    #   OFF では「23:00 から 2:00 まで飲む」は **書けない**: `_hhmm` が 24 時超え表記を
+    #   弾き、`end < start` は `repair` の round が最小継続(10 分)へ潰す。潰した事実は
+    #   `round`(ほぼ全計画で起きる正規化)に埋もれて 1 つの指標にも現れない。
+    #   ON では (a) `_hhmm` が 24:00-29:59 を受け、(b) `end < start` を「翌日の同時刻」と
+    #   読み(+1440)、(c) 検証・修復・実行・割り込みを **計画の原点からの絶対分**で見る。
+    #   ★地平(plan["day"] の失効)そのものは変えない(DPH-A は別レーン)。前日の計画は
+    #     **自分の日跨ぎブロックが伸びている間だけ**生き延びる(`_plan_of`)。
+    "wrap_blocks": False,
+    "wrap_end_min": 1800,        # wrap ON のときの終端[分](= 翌 06:00)。OFF では読まない
     "mood_chars": 60,            # 自由文欄の上限(mood)
     "text_chars": 80,            # 自由文欄の上限(reason / note / carry)
 }
-_BOOL_KEYS = ("enabled", "use_contingency")
+_BOOL_KEYS = ("enabled", "use_contingency", "wrap_blocks")
 _INT_KEYS = ("min_blocks", "max_blocks", "max_conting", "round_min",
              "min_dur_min", "max_dur_min", "grace_min", "transfer_min",
              "max_slide_min", "day_end_min", "mood_chars", "text_chars",
-             "postpone_min", "shorten_min")
+             "postpone_min", "shorten_min", "wrap_end_min")
 _FLOAT_KEYS = ("walk_m_per_min",)
 
 
@@ -310,7 +322,15 @@ def build_cfg(raw) -> dict:
     cfg["min_blocks"] = max(1, cfg["min_blocks"])
     cfg["max_blocks"] = max(cfg["min_blocks"], cfg["max_blocks"])
     cfg["max_conting"] = max(0, cfg["max_conting"])
+    if cfg["wrap_blocks"]:                         # 終端は必ず 1 日より後(でないと wrap の意味がない)
+        cfg["wrap_end_min"] = max(cfg["day_end_min"] + cfg["min_dur_min"],
+                                  cfg["wrap_end_min"])
     return cfg
+
+
+def _day_end(cfg: dict) -> int:
+    """計画が収まるべき終端[分]。wrap ON では翌日側へ伸びる(DPH-C の単一の源)。"""
+    return int(cfg["wrap_end_min"] if cfg.get("wrap_blocks") else cfg["day_end_min"])
 
 
 def cfg_of(sim) -> dict:
@@ -405,24 +425,32 @@ def schema_prompt(cfg: dict) -> str:
 # --------------------------------------------------------------------------- #
 # ① スキーマ検証(列挙・個数・型)
 # --------------------------------------------------------------------------- #
-def _hhmm(value) -> int | None:
-    """"HH:MM"(または分の整数)を分 of day へ。壊れていれば None。"""
+def _hhmm(value, hi: int = 1440) -> int | None:
+    """"HH:MM"(または分の整数)を分 of day へ。壊れていれば None。
+
+    `hi` = 受理する上限[分](上限そのものは含まない)。既定 1440 = 現行と完全同一。
+    DPH-C(wrap ON)では `hi = wrap_end_min`(既定 1800)を渡す = 日本の生活時間表記で
+    よく使う **24:00〜29:59**(「26 時から」)をそのまま受ける。日跨ぎの表記法として
+    実在するもの(放送・鉄道・飲食店の営業時刻)であって、新しい語彙ではない。
+    """
     if isinstance(value, bool):
         return None
+    hi = int(hi)
     if isinstance(value, (int, float)):
         m = int(value)
-        return m if 0 <= m < 1440 else None
+        return m if 0 <= m < hi else None
     if not isinstance(value, str):
         return None
     text = value.strip()
     if ":" not in text:
-        return int(text) if text.isdigit() and 0 <= int(text) < 1440 else None
+        return int(text) if text.isdigit() and 0 <= int(text) < hi else None
     hh, _sep, mm = text.partition(":")
     try:
         h, m = int(hh), int(mm)
     except (TypeError, ValueError):
         return None
-    return h * 60 + m if 0 <= h < 24 and 0 <= m < 60 else None
+    total = h * 60 + m
+    return total if 0 <= h and 0 <= m < 60 and total < hi else None
 
 
 def _names(value) -> list:
@@ -463,11 +491,21 @@ def validate_schema(raw: dict | None, cfg: dict) -> tuple[list, list, list]:
     if not isinstance(rows, list) or not rows:
         return [], [], errors + ["no_blocks:root"]
     blocks: list = []
+    # DPH-C(既定 OFF=hi は 1440 のまま=既存と 1 バイトも変わらない)
+    wrap = bool(cfg.get("wrap_blocks"))
+    hi = _day_end(cfg) if wrap else 1440
     for i, it in enumerate(rows):
         if not isinstance(it, dict):
             errors.append(f"not_object:b{i}")
             continue
-        start, end = _hhmm(it.get("start")), _hhmm(it.get("end"))
+        start, end = _hhmm(it.get("start"), hi), _hhmm(it.get("end"), hi)
+        # 「23:00-02:00」= 素直に日を跨ぐ意図。終わりが始まりより前なら翌日の同時刻と読む。
+        # (OFF では start=1380/end=120 のまま通り、repair の round が 23:00-23:10 へ潰す)
+        if wrap and start is not None and end is not None and end < start:
+            end += 1440
+            if end >= hi:                          # 伸ばした先が終端を越える = 表現できない
+                errors.append(f"bad_end:b{i}")
+                end = None
         if start is None:
             errors.append(f"bad_start:b{i}")
         if end is None:
@@ -627,7 +665,7 @@ def validate_physical(sim, agent, blocks: list, cfg: dict,
             need = travel_min(sim, cfg, prev_node, node or prev_node)
             if int(start) < prev_end + need:
                 errors.append(f"unreachable:b{i}")
-        if end is not None and int(end) > int(cfg["day_end_min"]):
+        if end is not None and int(end) > _day_end(cfg):   # DPH-C OFF は day_end_min
             errors.append(f"overflow:b{i}")
         if end is not None:
             prev_end = int(end)
@@ -681,11 +719,17 @@ def repair(sim, agent, blocks: list, conts: list, cfg: dict,
     blocks = kept
 
     # -- round: 時刻の丸め・欠損補完・最小/最大継続・日内クランプ -----------------
-    day_end = int(cfg["day_end_min"])
+    day_end = _day_end(cfg)                        # DPH-C OFF では従来どおり day_end_min
     grid, lo_dur, hi_dur = cfg["round_min"], cfg["min_dur_min"], cfg["max_dur_min"]
+    n_wrap_clipped = 0
     for b in blocks:
         s, e = b["start"], b["end"]
         before = (s, e)
+        # DPH-O ②: 「end < start」= 日跨ぎ表記が、下の最小継続クランプで潰される瞬間。
+        #   これまでは `round` 演算子 1 件として数えられ(= conflict_repair_rate からも
+        #   除外され)、**1 つの指標にも現れなかった**。数えるだけで挙動は変えない。
+        if s is not None and e is not None and e < s:
+            n_wrap_clipped += 1
         if s is None and e is None:
             s, e = 12 * 60, 12 * 60 + lo_dur     # 時刻が皆無 = 正午に最小幅で置く
         elif s is None:
@@ -706,6 +750,11 @@ def repair(sim, agent, blocks: list, conts: list, cfg: dict,
         if (s, e) != before:
             ops["round"] += 1
         b["start"], b["end"] = int(s), int(e)
+    # ★`ops` へは足さない: REPAIR_OPS は L2 7 列と summary.by_model.repair_ops の唯一の源で、
+    #   ここに 1 キー増やすと n_ops / conflict の判定が動いて **観測が世界を変える**。
+    #   累積タリー(サイドカー)だけに積み、L1 payload は apply() が差分で載せる。
+    if n_wrap_clipped:                             # 記録専用(OFF は即 return=state も生えない)
+        _starvation.note_wrap_clipped(sim, n_wrap_clipped)
 
     # -- 並べ替え(開始時刻昇順・同時刻は priority 強い順・さらに act 名で全順序)-----
     blocks.sort(key=lambda b: (b["start"], _PRIO_RANK[b["priority"]], b["act"]))
@@ -800,10 +849,16 @@ def skeleton(sim, agent, cfg: dict) -> list:
         s = ws if ws >= 0 else int(pt["start_min"])
         e = int(getattr(agent, "work_end_min", 0) or 0) if ws >= 0 \
             else int(pt["end_min"])
+        # DPH-C: 日跨ぎ勤務(18:00→02:00 = 台帳実測 254 社・従業者 4,984 人)は
+        #   `work_end_min` が 120 で入っているので、OFF ではここが max(s+10, 120) = 18:10 に
+        #   潰れていた(= 骨格へ落ちた夜勤者は「10 分だけ働く」計画を持つ)。
+        #   ON では退勤を翌日側へ持ち上げる = 既存 work._window の wraps 判定と同じ読み方。
+        if cfg.get("wrap_blocks") and e < s:
+            e += 1440
         e = max(s + cfg["min_dur_min"], e)
         rows = [_b(s, e, "work", "work", "must", "fixed", "いつもの時間に働く"),
                 _b(e, e + 60, "food", "meal", "should", "slideable", "働いた後に食べる"),
-                _b(e + 60, min(cfg["day_end_min"], e + 180), "home", "home",
+                _b(e + 60, min(_day_end(cfg), e + 180), "home", "home",
                    "should", "slideable", "家に帰って休む")]
     else:
         rows = [_b(11 * 60, 12 * 60, "shop", "shop", "should", "slideable",
@@ -814,7 +869,7 @@ def skeleton(sim, agent, cfg: dict) -> list:
                    "夕飯を食べる"),
                 _b(19 * 60, 21 * 60, "home", "home", "should", "slideable",
                    "家でゆっくり過ごす")]
-    return [b for b in rows if b["start"] < cfg["day_end_min"]]
+    return [b for b in rows if b["start"] < _day_end(cfg)]
 
 
 # --------------------------------------------------------------------------- #
@@ -920,6 +975,15 @@ def apply(sim, agent, step: int, sim_min: int, response: str,
     st = _state(sim)
     row = _model_row(st, mid)
 
+    # DPH-O ②: この計画で潰れた日跨ぎ表記の件数(累積タリーの差分。OFF は常に 0)。
+    _wrap0 = _starvation.state(sim)["wrap_clipped"] if _starvation.enabled(sim) else 0
+    # DPH-O: 上書きされる旧計画に、まだ実行されていない**翌日側**のブロックが残っていたか。
+    _prev_plan = getattr(agent, "_dayplan", None)
+    if _starvation.enabled(sim) and _prev_plan and cfg.get("wrap_blocks"):
+        _lost = sum(1 for b in (_prev_plan.get("blocks") or ())
+                    if b.get("state") == "todo" and int(b["end"]) > 1440)
+        _starvation.note_wrap_tail_lost(sim, _lost)
+
     raw = _loads_lenient(response)
     blocks, conts, errs = validate_schema(raw, cfg)
     row["schema_err"] += len(errs)
@@ -939,14 +1003,15 @@ def apply(sim, agent, step: int, sim_min: int, response: str,
         for k, v in ops.items():
             if v:
                 row["repair_ops"][k] = row["repair_ops"].get(k, 0) + int(v)
+        _rp = {"ops": {k: int(v) for k, v in sorted(ops.items()) if v},
+               "n_schema_err": len(errs), "n_phys_err": len(perrs),
+               "model": mid}
+        # DPH-O ②(既定 OFF ではキー自体を生やさない = L1 バイト一致)。
+        if _starvation.enabled(sim):
+            _rp["wrap_clipped"] = int(_starvation.state(sim)["wrap_clipped"] - _wrap0)
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                              kind="plan_repair", x=agent.x, y=agent.y,
-                             llm_call_id=call_id,
-                             payload={"ops": {k: int(v) for k, v in sorted(ops.items())
-                                              if v},
-                                      "n_schema_err": len(errs),
-                                      "n_phys_err": len(perrs),
-                                      "model": mid}))
+                             llm_call_id=call_id, payload=_rp))
 
     fallback = ""
     if not blocks:                               # 修復不能 → 世界を止めない
@@ -1014,6 +1079,58 @@ def apply(sim, agent, step: int, sim_min: int, response: str,
         _engaged.note_resolved(sim, agent)
 
 
+def install_skeleton(sim, agent, step: int, sim_min: int) -> None:
+    """LLM を 1 本も呼ばずに骨格計画を据える(DPH-B の繰り越し上限の受け皿)。
+
+    二層予算 ON で朝の計画が `max_defer_steps` を超えて待たされたときに呼ばれる。
+    **既存の失敗階段の最後の 1 段(`skeleton`)をそのまま使う**ので、新しい概念も
+    新しい L1 kind も足さない: `plan_fallback{kind:"skeleton"}` + `plan_created{src:"skeleton"}`
+    が、応答が壊れていたときと同じ形で出る(事後解析は payload の src で分離できる)。
+    day_plan v1 が OFF のランでは何もしない(旧経路には据える先が無い)。
+    """
+    if not enabled(sim):
+        return
+    cfg = cfg_of(sim)
+    day = int(sim_min) // 1440
+    _clear_why(sim, agent)
+    _bnd.ensure(sim, agent)
+    mid = model_id(sim, agent)
+    st = _state(sim)
+    row = _model_row(st, mid)
+    blocks, conts, _ops = repair(sim, agent, skeleton(sim, agent, cfg), [],
+                                 cfg, day * 1440)
+    st["fallback"] += 1
+    row["fallback"] += 1
+    row["fallback_kinds"]["skeleton"] = row["fallback_kinds"].get("skeleton", 0) + 1
+    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                         kind="plan_fallback", x=agent.x, y=agent.y,
+                         payload={"kind": "skeleton", "n": len(blocks),
+                                  "n_schema_err": 0, "n_phys_err": 0,
+                                  "model": mid}))
+    plan = {"schema": SCHEMA, "day": day, "version": 1, "model": mid,
+            "mood": "", "carry": "", "blocks": blocks, "cont": conts,
+            "src": "skeleton"}
+    agent._dayplan = plan
+    agent._dayplan_prev = [dict(b) for b in blocks]
+    agent.day_plan = []
+    st["plans"] += 1
+    st["blocks"] += len(blocks)
+    row["plans"] += 1
+    row["blocks"] += len(blocks)
+    _payload = {"n": len(blocks), "version": 1, "src": "skeleton",
+                "model": mid, "n_cont": len(conts),
+                "blocks": [{"start": b["start"], "end": b["end"],
+                            "place": b["place"], "act": b["act"],
+                            "aim": b["purpose"], "priority": b["priority"],
+                            "flex": b["flex"]} for b in blocks]}
+    from ..observer import gt_extras as _gt
+    if _gt.enabled(sim):
+        _payload.update(_gt.plan_extras(plan, blocks))
+    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                         kind="plan_created", x=agent.x, y=agent.y,
+                         payload=_payload))
+
+
 # --------------------------------------------------------------------------- #
 # 実行系(routine.decide からの**単一作用点**)
 # --------------------------------------------------------------------------- #
@@ -1022,11 +1139,41 @@ def _log(sim, agent, step, sim_min, kind, payload) -> None:
                          kind=kind, x=agent.x, y=agent.y, payload=payload))
 
 
-def _plan_of(agent, sim_min: int):
+def plan_horizon(plan: dict) -> int:
+    """この計画が届く最後の分(計画の原点 = その日の 00:00 からの絶対分)。
+
+    日跨ぎブロックが 1 つも無い計画では 1440 以下 = 従来の暦日境界と同じ。
+    """
+    return max((int(b["end"]) for b in plan.get("blocks") or ()), default=0)
+
+
+def _plan_of(agent, sim_min: int, cfg: dict | None = None):
     plan = getattr(agent, "_dayplan", None)
-    if not plan or int(plan.get("day", -1)) != int(sim_min) // 1440:
+    if not plan:
         return None
-    return plan
+    day, today = int(plan.get("day", -1)), int(sim_min) // 1440
+    if day == today:
+        return plan
+    # ---- DPH-C(既定 OFF=ここに来たら必ず None=従来と 1 バイトも変わらない)----
+    #  地平そのものは変えない(DPH-A は別レーン)。前日の計画は **自分の日跨ぎブロックが
+    #  伸びている間だけ**生き延びる = 「23:00-02:00 に飲む」と書いた人が 0 時をまたいで
+    #  そのまま飲み続けられる、という 1 点だけを直す。02:00 を過ぎれば従来どおり失効する。
+    if cfg is not None and cfg.get("wrap_blocks") and day == today - 1:
+        horizon = plan_horizon(plan)
+        if horizon > 1440 and int(sim_min) - day * 1440 < horizon:
+            return plan
+    return None
+
+
+def _now_of(plan: dict, sim_min: int, cfg: dict | None = None) -> int:
+    """「いま」を**計画の原点からの絶対分**で返す(DPH-C OFF は `sim_min % 1440` と同値)。
+
+    wrap ON では前日の計画が生きていることがあるので `% 1440` では窓の判定ができない
+    (start=1380 / end=1560 のブロックは翌 01:00 の 60 分と一致しない)。
+    """
+    if cfg is None or not cfg.get("wrap_blocks"):
+        return int(sim_min) % 1440
+    return int(sim_min) - int(plan.get("day", int(sim_min) // 1440)) * 1440
 
 
 def _bi(plan: dict, b: dict) -> int:
@@ -1053,8 +1200,8 @@ def _sweep(sim, agent, plan: dict, cfg: dict, step: int, sim_min: int) -> None:
     fixed は動かさない(時刻を動かせない宣言なので、間に合わなければ must なら再計画、
     must でなければ削る)。
     """
-    now = int(sim_min) % 1440
-    grace, day_end = int(cfg["grace_min"]), int(cfg["day_end_min"])
+    now = _now_of(plan, sim_min, cfg)              # DPH-C OFF は sim_min % 1440(同値)
+    grace, day_end = int(cfg["grace_min"]), _day_end(cfg)
     threatened: list = []
     for i, b in enumerate(plan["blocks"]):
         if b["state"] != "todo" or now <= b["start"] + grace:
@@ -1116,7 +1263,7 @@ def _replan(sim, agent, plan: dict, cfg: dict, step: int, sim_min: int,
 
     ★ 1 step につき高々 1 回(`replan_at` で冪等)。
     """
-    now = int(sim_min) % 1440
+    now = _now_of(plan, sim_min, cfg)              # DPH-C OFF は sim_min % 1440(同値)
     if int(plan.get("replan_at", -1)) == int(sim_min):
         return
     plan["replan_at"] = int(sim_min)
@@ -1136,7 +1283,7 @@ def _replan(sim, agent, plan: dict, cfg: dict, step: int, sim_min: int,
             shift = _round_to(now, cfg["round_min"]) - m["start"]
             m["slid"] = int(m["slid"]) + max(0, int(shift))
             m["start"] = _round_to(now, cfg["round_min"])
-            m["end"] = min(int(cfg["day_end_min"]), m["start"] + dur)
+            m["end"] = min(_day_end(cfg), m["start"] + dur)
         elif now >= m["end"]:                    # 動かせず窓も過ぎた = 組めなかった
             m["state"] = "dropped"
             retired += 1
@@ -1313,7 +1460,7 @@ def _then_postpone(sim, agent, b: dict, cfg: dict, step: int, sim_min: int,
     shift = int(cfg["postpone_min"])
     start = _round_to(int(b["start"]) + shift, cfg["round_min"])
     slid = int(b.get("slid", 0) or 0) + shift
-    if slid > int(cfg["max_slide_min"]) or start + dur > int(cfg["day_end_min"]):
+    if slid > int(cfg["max_slide_min"]) or start + dur > _day_end(cfg):
         _drop_block(sim, agent, b, step, sim_min, "cont_postpone", block)
         return True
     b["start"], b["end"], b["slid"] = start, start + dur, slid
@@ -1405,9 +1552,9 @@ def _clear_why(sim, agent) -> None:
     _reject.clear_why(sim, agent)
 
 
-def current_block(plan: dict, sim_min: int):
+def current_block(plan: dict, sim_min: int, cfg: dict | None = None):
     """いま実行すべきブロック(開始済み・未消化・窓の中)。無ければ None = 空き時間。"""
-    now = int(sim_min) % 1440
+    now = _now_of(plan, sim_min, cfg)              # DPH-C OFF は sim_min % 1440(同値)
     for b in plan["blocks"]:
         if b["state"] == "todo" and b["start"] <= now < b["end"]:
             return b
@@ -1422,11 +1569,15 @@ def plan_action(agent, sim, sim_min: int, step: int, rng, scfg=None):
       同じ順で `rng` を使う(滞在長 → 移動手段)= 既存の draw 作法に合わせる。
     """
     cfg = cfg_of(sim)
-    plan = _plan_of(agent, sim_min)
+    plan = _plan_of(agent, sim_min, cfg)
     if plan is None:
+        # DPH-O: 「深夜 0 時の無条件失効で、計画なしのまま覚醒していた」個体×step。
+        #   実測 741 件/3 日(600 体)。**記録専用**(OFF は即 return=state も生えない)。
+        if getattr(agent, "_dayplan", None):
+            _starvation.note_plan_expired_awake(sim, agent, sim_min)
         return None
     _sweep(sim, agent, plan, cfg, step, sim_min)
-    b = current_block(plan, sim_min)
+    b = current_block(plan, sim_min, cfg)
     if b is None:
         return None
     # ---- contingency の消費(第93 IF-A・既定 OFF=この 5 行は即素通り)------------ #
@@ -1435,7 +1586,7 @@ def plan_action(agent, sim, sim_min: int, step: int, rng, scfg=None):
     #  (= 既存の習慣ポリシーが埋める。世界を止めない第86 の流儀と同じ)。
     if cfg["use_contingency"] and plan.get("cont"):
         if apply_contingency(sim, agent, plan, b, cfg, step, sim_min):
-            now = int(sim_min) % 1440
+            now = _now_of(plan, sim_min, cfg)
             if b["state"] != "todo" or not (b["start"] <= now < b["end"]):
                 return None
     from . import routine as _routine

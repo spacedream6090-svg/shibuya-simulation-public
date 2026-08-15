@@ -216,6 +216,18 @@ CAUSE_OF_KIND: dict[str, str] = {
     "plan_slide":    DEVICE,
     "plan_replan":   DEVICE,
     "plan_cont_fire": DEVICE,        # contingency の決定論評価
+    # ---- DPH-O「削ったなら記録する」の 3 種(observer/starvation.py。既定 OFF)------ #
+    #  どれも「起きなかったこと」の記録であり、**個体は 1 つも選んでいない**。
+    "reply_dropped": BOUNDARY,       # 話しかけられたのに返せなかった。落としたのは
+                                     # lod.max_llm_per_step という**実験者側の上限**で、
+                                     # 世界の中の誰も制度も選んでいない(llm_null と同族)
+    "reflect_dropped": BOUNDARY,     # 同上(夜の内省が予算の繰り越し上限で諦められた)
+    "plan_skipped":  DEVICE,         # 予約 step に眠っていた/街の外に居たので計画フェーズが
+                                     # 飛ばした = ルールが世界状態に反応した(plan_fallback と同族)。
+                                     # ★正直な限界: reason="defer_cap" の行だけは予算由来
+                                     #   (= boundary 寄り)だが、分類は kind 単位なので畳む。
+                                     #   原則 3(迷ったら帰属率を過大評価しない側)に従い、
+                                     #   多数派である sleeping/outside の device に寄せた
     "policy_reuse":  DEVICE,         # 方針キャッシュの再利用(LLM を撃たない側の判断)
     "fallback":      AGENT,          # LLM 出力が使えなかった = その個体の思考の記録
     "undefined_action": AGENT,       # enum 外の行動主張 = 行動空間の外へ出ようとした痕跡

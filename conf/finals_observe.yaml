@@ -418,14 +418,39 @@ cognition:
   #    下の fire 行のコメントを外すこと(そのとき初めて g_update が実効になる)。
   g_update:
     enabled: true
-  # watch:     { enabled: true }   # ← ô を LLM が出す層(fire ON が前提・未承認)
-  # fire:      { enabled: true }   # ← ★affects_k=True。開けると g_update が実効になる(未承認)
-  # engaged:   { enabled: true }   # ← エピソード層(fire ON が前提・未承認)
+  # ==========================================================================
+  # ★D1 = b案(2026-08-15 ユーザー決定): 「8/15 診断で呼数実測 → 許容ならこの 3 行を解凍」
+  # ==========================================================================
+  # 解凍手順・判定基準・事前チェックリストは docs/plans/decision-dashboard.md §D1 に
+  # 実測コマンドつきで書いてある。**数値を見る前に開けてはいけない**(affects_k=True)。
+  #
+  # 判定基準(要点だけ再掲。導出は dashboard §D1):
+  #   許容線 = fire ON による **予算内呼の増分が総枠の +15% 以内**、かつ
+  #            per-step 実効呼(cap + 予算外)のピークが壁時計の余裕を食い潰さないこと。
+  #   +15% の出どころ = Δt 計画の壁時計表(dt-reduction-plan.md §5)。エンジン側の余裕は
+  #   ×1.65 で消えるので、思考側に許せるのは総枠の 1 割台までという実測由来の線。
+  # 相互作用(必ず同時に見る):
+  #   - fire が増やす呼は **general レーン**(発火)に入る。lod.budget.tiers が ON なら
+  #     reply / life の予約は原理的に食われないので、fire ON の副作用は「発火同士の競合が
+  #     増えて granted 率が下がる」に閉じる(= 返事の飢餓は悪化しない)。tiers が OFF の
+  #     ままだと fire ON は D4 の reply 飢餓を直接悪化させる → **B と同時に開けること**。
+  #   - fire ON で初めて g_update(上の 1 行)と watch / engaged が実効になる。
+  #   - rotation 搬送は第113 で 4 族(g 族・θ倍率・ê・credit)済み = 在場回転で消えない。
+  #
+  # watch:     { enabled: true }   # ← ô を LLM が出す層(fire ON が前提)
+  # fire:      { enabled: true }   # ← ★affects_k=True。開けると g_update が実効になる
+  # engaged:   { enabled: true }   # ← エピソード層(fire ON が前提)
 
 planning:
   day_plan:
     enabled: true          # 構造化された朝の計画(conf「★本番はユーザー判断で ON」)
     use_contingency: true  # 第86 のデッドデータ(if_then)を消費する
+    # ---- DPH-C 日跨ぎブロック(2026-08-15 ユーザー決定 D3)----
+    # 渋谷は夜の街なのに「23:00 から 2:00 まで」が書けず 23:00-23:10 へ潰れていた。
+    # 台帳実測: 日跨ぎシフト 254 社・従業者 4,984 人(18:00→02:00)が毎日
+    # 「勤務末尾 2 時間 + 帰宅 + 就寝(02:30)まで」を無計画で過ごしていた。
+    # プロンプトは 1 バイトも変わらず(HH:MM のまま)、朝の呼数も 1 も変わらない。
+    wrap_blocks: true
     boundary:
       enabled: true        # 計画駆動の圏外滞在(despawn/respawn=朝の計画が予定表)
                            # transit_interior.include_plan_returnees の前提
@@ -868,6 +893,21 @@ lod:
   n_proportional:
     enabled: false
   max_llm_per_step: 300
+  # ---- DPH-B 二層予算 + FIFO 繰り越し(2026-08-15 ユーザー決定 D3)----
+  # 塞ぐ穴(600体×3日 mock 実測): cap が binding なランでは発火側が先に食い切り、
+  #   **返答保証が 08-23 時に 100% 消滅**する(reply 16,722 → 618 = −96%)。しかも
+  #   その枯渇は L1 に 1 件も残らない(= 観測不能なまま「誰も返さない街」が成立する)。
+  #   さらに朝の計画と夜の内省が予算外を無条件に走るので、実効の per-step 上限は
+  #   cap+予算外(実測 cap60 で 96 呼)= 25 万在場のピーク step で推定 1.5 万呼。
+  # ON で総呼数は増えない(used <= max_llm_per_step を常に満たす)。分配だけが変わる。
+  # ★D1(fire)を開けるならこちらも ON でなければならない: fire が増やすのは general
+  #   レーンの呼なので、tiers ON なら reply / life の予約は原理的に食われない。
+  budget:
+    tiers:
+      enabled: true
+      reply_share: 0.20
+      life_share: 0.30
+      max_defer_steps: 18   # 3 時間。超えたら骨格計画へ落とす(LLM ゼロ)
 lens:
   enabled: true
   deviation:
@@ -881,6 +921,12 @@ lens:
 # (13) 観測 — 25万 × 10日を「書き終われる」形にする
 # ============================================================================
 observer:
+  # ---- DPH-O 観測 4 点(2026-08-15 ユーザー決定 D3。**世界を 1 バイトも動かさない**)----
+  # ON の理由: 本選 10 日ランで「返事が落ちた」「日跨ぎの予定が潰れた」「朝の計画が立たな
+  # かった」「どの用途で予算が枯れた」が **事後に 1 件も検出できない**のが現状。記録専用で
+  # 分岐も乱数も呼数も 1 つも動かさないのでリスクはゼロ、規模も L1 の新 kind 3 種だけ。
+  starvation:
+    enabled: true
   causality:
     enabled: true          # cause_type / actor_id / device_id(「世界を変えた人」の測定に必須)
   llm_link: true           # 行為 → 思考の PROV リンク

@@ -195,6 +195,13 @@ TABLE: tuple[tuple[str, str, str], ...] = (
 
     # ---- 毎 step の予算 ----
     ("lod.max_llm_per_step", RATE, "LLM 発火の step 上限(1日あたりの総量を保つ)"),
+    # DPH-B 二層予算の FIFO 繰り越し上限。**実時間の長さ**(既定 18 step = 3 時間 @Δt10)
+    # として意味を持つ量なので STEPS = 実時間を保つ側へ倒す。ここを RATE にすると
+    # Δt=1 で「18 分待ったら骨格へ落とす」になり、朝の計画がほぼ全部骨格へ落ちる。
+    # 兄弟キー reply_share / life_share は **cap に対する割合**(無次元)なので
+    # timeconv の棚卸し grep(`_steps` / `_min` / `per_step` 等)に掛からず分類不要。
+    ("lod.budget.tiers.max_defer_steps", STEPS,
+     "朝の計画/夜の内省を予算不足で繰り越してよい上限 [step](超過で骨格へ後退)"),
     ("env.feedback.transit.dwell_sec_per_pax", RATE,
      "超過1人あたりの停車時間延長[秒]。**1 step ぶんの注入量**として使うので、Δt が伸びれば"
      "その step に含まれる発車回数が増える=線形にスケールする(第84バッチ)"),
@@ -477,6 +484,11 @@ TABLE: tuple[tuple[str, str, str], ...] = (
     ("planning.day_plan.transfer_min", INVARIANT, "移動/準備の最小時間[分](物理時間)"),
     ("planning.day_plan.max_slide_min", INVARIANT, "累積ずらしの上限[分](物理時間)"),
     ("planning.day_plan.day_end_min", INVARIANT, "計画が収まるべき終端。分 of day の時刻"),
+    # DPH-C 日跨ぎブロック。wrap ON のときの終端で、1800 = 翌 06:00 という**時刻**。
+    # day_end_min と同じ理由で Δt に依らない(棚卸し grep には掛からないが、姉妹キーが
+    # 分類済みなのに片方だけ表に無いと「見落としたのか意図なのか」が後から判らないので置く)。
+    ("planning.day_plan.wrap_end_min", INVARIANT,
+     "日跨ぎ計画の終端。分 of day を 1440 超へ延ばした時刻(1800 = 翌 06:00)"),
     # ---- 計画駆動の圏外滞在(actor model P4)。時刻・時間量は全て**物理時間[分]**で持つ ----
     # (start_min / start_spread_min / start_grid_min / hours_min は棚卸し正規表現に
     #  掛からない = 分の量として自明。ここに宣言が要るのは step を名に持つ 1 件だけ)。

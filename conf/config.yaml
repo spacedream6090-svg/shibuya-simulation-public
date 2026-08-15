@@ -1211,6 +1211,24 @@ planning:
     use_contingency: false
     postpone_min: 60          # then=postpone のずらし幅[分](max_slide_min を超えたら削除)
     shorten_min: 30           # then=shorten の短縮幅[分](min_dur_min は下回らない)
+    # ---- 日跨ぎブロック DPH-C(**既定 OFF** = 現行とバイト一致)----------------------
+    # 正典: docs/plans/dayplan-horizon-plan.md §1.2 / §3.1 案 C / §6 レーン DPH-C。
+    # 現行の穴(プローブ実測): 「23:00-02:00 に飲む」は **書けない**。_hhmm が 24 時超え表記を
+    #   弾き(24:00 → None)、end<start は repair の round が最小継続へ潰す(23:00-23:10)。
+    #   潰した事実は round(ほぼ全計画で起きる正規化)に埋もれ、conflict_repair_rate からも
+    #   除外されるので**1 つの指標にも現れない**。渋谷は夜の街なのに夜が計画できない。
+    #   台帳実測: 日跨ぎシフト(close<open)は 254 社・従業者 4,984 人(18:00→02:00)。
+    # ON で変わるのは 4 点だけ:
+    #   (a) _hhmm が 24:00〜(wrap_end_min)を受ける(放送・鉄道の 26 時表記と同じ読み方)
+    #   (b) end < start を「翌日の同時刻」と読む(+1440)
+    #   (c) 検証・修復・実行・割り込みが**計画の原点からの絶対分**で窓を見る
+    #   (d) 骨格(skeleton)の夜勤シフトが 18:00→02:00 のまま組める(OFF では 18:10 に潰れる)
+    # ★地平(plan["day"] の 0 時失効)そのものは変えない = DPH-A は別レーン・別判断。
+    #   前日の計画は**自分の日跨ぎブロックが伸びている間だけ**生き延びる(02:00 で従来どおり失効)。
+    # ★プロンプトは 1 バイトも変わらない(HH:MM のまま書かせる)= no-fingerprint 維持。
+    # ★LLM 呼数は 1 も変わらない(「1 暦日 1 計画」ガードは触らない)。
+    wrap_blocks: false
+    wrap_end_min: 1800        # wrap ON のときの終端[分](1800 = 翌 06:00)。OFF では読まない
     # ---- 計画駆動の圏外滞在(actor model P4・**既定 OFF** = 第86 と完全同一)----
     # 原文書: docs/plans/actor-model-migration-plan.md §4(境界)。実装 cognition/plan_boundary.py。
     # 「勤務先が街の外にある居住者」を (run.seed, agent.id) の純関数で指名し、その人の計画の
@@ -1520,6 +1538,28 @@ lod:
   n_proportional:
     enabled: false
     density: 0.15
+  # ---- 二層予算 + FIFO 繰り越し DPH-B(**既定 OFF** = 単一カウンタ=第30 とバイト一致)----
+  # 正典: docs/plans/dayplan-horizon-plan.md §1.5 / §3.3 / §6 レーン DPH-B。
+  # 現行の穴(600体×3日 mock 実測):
+  #   ① 実効の per-step 上限が `cap + 予算外呼`(plan/reflect)になる。cap 60 のランで 1 step 96 呼。
+  #      25 万在場の朝ピーク step では予算外だけで推定 1.5 万呼(cap 300 の 50 倍)。
+  #   ② cap が binding だと発火側(先に走る)が食い切り、**返答保証が枯渇**する。
+  #      実測 reply 16,722 → 618(−96%)・08-23 時は 1 件も返らない。しかも L1 に痕跡ゼロ。
+  # ON で変わるのは分配だけ:
+  #   - plan / reflect が予算の**中**へ入る(life レーン)= 総呼数は cap を超えない
+  #   - reply に先取り枠(reply レーン)= 発火側に食い尽くされない
+  #   - general(発火・独り言・投稿)は自分の枠しか使えない / reply・life は general の余りを借りる
+  #   - life が溢れたら **翌 step へ FIFO 繰り越し**(順序 = (最初に予約された step, agent_id))。
+  #     max_defer_steps を超えたら骨格計画へ落とす(LLM ゼロ)= 既存の失敗階段の最後の 1 段。
+  # ★総量は増えない(used <= max_llm_per_step を常に満たす)。tests が機械固定する。
+  # ★正直な限界: 「未使用 reserved を同 step 内で general へ流す」は実装しない(フェーズ順の
+  #   都合で、general が走る時点では余るかどうかが未確定)。詳細は cognition/lod.py の docstring。
+  budget:
+    tiers:
+      enabled: false
+      reply_share: 0.20       # 返答保証の先取り枠(cap に対する割合)
+      life_share: 0.30        # 朝の計画 + 夜の内省の先取り枠
+      max_defer_steps: 18     # FIFO 繰り越しの上限(18 step = 3 時間 @Δt10)。超過=骨格へ
   # ---- 入力解像度LOD(第30バッチ・既定OFF=バイト一致)。docs/plans/input-resolution-lod.md ----
   # 「世界に対する解像度」の個体差: 知覚/記憶/フィードの注入件数を水準別に振る(呼数不変=R1安全)。
   # 割当は cognition/lod.py の共通軸機構(trait非依存・軸専用 stream "lod_input_res")。
@@ -2350,6 +2390,24 @@ storage:
   backend: memory               # memory(開発) | redis_pg(本番)
 
 observer:
+  # ---- DPH-O 観測 4 点(**既定 OFF** = L1 バイト一致・summary にキーなし)-------------
+  # 正典: docs/plans/dayplan-horizon-plan.md §4.2 / §6 レーン DPH-O。
+  # 「削るなら、削ったことを必ず記録する」。静かに消えていた 4 本を数えるだけの層で、
+  # 分岐を 1 つも作らず・乱数を 1 本も引かず・LLM 呼数を 1 も変えず・プロンプトを 1 バイトも
+  # 変えない(ここが数えた値を読んで動く行はシム側に 1 行も無い)。
+  #   ① reply_dropped   … 予算切れで返事が落ちた(現行は _reply_to を消してから予算を
+  #                        取りに行くので **L1 に痕跡ゼロ**。実測 cap60 で reply −96%)
+  #   ② wrap_clipped    … 「23:00-02:00」が最小継続 10 分へ潰された件数(現行は round に
+  #                        埋もれ conflict_repair_rate からも除外 = 1 指標にも出ない)
+  #   ③ plan_skipped    … 予約 step に sleeping/outside で朝の計画が立たなかった
+  #                        + plan_expired_awake(0 時失効で無計画のまま覚醒。実測 741 件/3日)
+  #   ④ purpose 別の予算許可/拒否 … L1 には drive_request{granted:false} しか無く、
+  #                        **どの用途が落ちたか**が判らなかった
+  # ★L2 へ列は足さない: observer/aggregate.py は metrics_spec.SPEC_FILES の凍結対象。
+  #   出口は L1 の新 kind 3 種(reply_dropped / plan_skipped / reflect_dropped)と
+  #   summary.json の starvation ブロック。実装 src/society/observer/starvation.py。
+  starvation:
+    enabled: false
   snapshot_every: 12            # L3 スナップショット間隔(=2時間ごと)
   checkpoint_every: 0           # D16: この step ごとに完全状態を保存+ログを part 化(0=無効)。
                                 # >0 で --resume 可能に。既定0=part を作らず出力・挙動は従来と完全同一。

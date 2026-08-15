@@ -551,6 +551,22 @@ FEATURES: tuple[Feature, ...] = (
        "再利用し payload に boundary='plan' を足すだけ)。圏外ではイベント 0 件・乱数 0 本・"
        "LLM 0 呼で、帰還時に定型の圧縮記憶 1 行だけが残る。統計駆動の流入通勤者(commute)"
        "とは別台帳(payload の boundary 欄で機械的に分離できる)"),
+    # DPH-C 日跨ぎブロック(docs/plans/dayplan-horizon-plan.md §1.2 / §3.1 案 C)。
+    # strict の根拠: 読むのは LLM が書いた **HH:MM の 2 欄**という構造化された値だけで、
+    #   自由文は 1 バイトも読まない。判定は全て時刻の算術(決定論・乱数 stream ゼロ)。
+    # affects_k=False: generate() の呼び出し点を 1 つも足さず・減らさない。
+    #   「1 暦日 1 計画」ガード(_schedule_plan)には触れていないので朝の呼数は不変で、
+    #   前日の計画が生き延びるのも**自分の日跨ぎブロックが伸びている間だけ**(地平の
+    #   変更 = DPH-A は別レーン・未実装)。行き先が変われば co-location 経由で発火数が
+    #   間接的に動きうるのは commerce / health と同型で、レジストリ冒頭の方針どおり False 側。
+    # fingerprint_risk=none: **プロンプトを 1 バイトも変えない**(HH:MM のまま書かせる)。
+    _f("planning.day_plan.wrap_blocks", "strict", False, "none",
+       "日跨ぎの計画ブロック(DPH-C)。_hhmm が 24:00〜29:59 表記を受け、end<start を"
+       "「翌日の同時刻」と読み(+1440)、検証・修復・実行・割り込みを**計画の原点からの"
+       "絶対分**で見る。OFF では「23:00-02:00 に飲む」が 23:00-23:10 へ潰され、しかも"
+       "その事故が round に埋もれて 1 つの指標にも現れない(台帳実測: 日跨ぎシフトの"
+       "従業者 4,984 人が毎日「勤務末尾 2 時間 + 帰宅 + 就寝」を無計画で過ごす)。"
+       "骨格(skeleton)の夜勤シフトも ON で初めて 18:00→02:00 のまま組める"),
     _f("planning.day_plan.use_contingency", "journal", False, "none",
        "day_plan の contingency(if_then)を実行時に消費する。ブロック実行の直前に "
        "CONDS 7 種を決定論評価し(前提機構が OFF の条件は常に不成立=捏造しない)、"
@@ -989,6 +1005,22 @@ FEATURES: tuple[Feature, ...] = (
        "LLM 発火の step 上限を人数比例 ceil(density×N)へ置換する予算制御"),
     _f("lod.input_res.enabled", "strict", False, "possible",
        "入力解像度 LOD(知覚・記憶・フィードの注入件数を水準別に振る)"),
+    # DPH-B 二層予算 + FIFO 繰り越し(docs/plans/dayplan-horizon-plan.md §3.3)。
+    # strict の根拠: 配分は step 予算・purpose・agent_id・予約 step だけの決定論で、
+    #   LLM の出力も自由文も 1 バイトも読まない。新しい乱数 stream を 1 本も引かない。
+    # ★affects_k=True を正直に宣言する: 朝の計画と夜の内省が**予算の中へ入る**ので
+    #   generate() の総数が確実に動く(現行は予算外の無条件呼)。総量は増える向きには
+    #   動かない(used <= max_llm_per_step を常に満たす)が、減る向きには動く。
+    # fingerprint_risk=none: プロンプトを 1 バイトも変えない。繰り越しの結果として
+    #   計画が 10 分遅れて立つことはあるが、その時刻は当人から見て毎朝ばらついている値。
+    _f("lod.budget.tiers.enabled", "strict", True, "none",
+       "二層予算(DPH-B)。step 予算 C を life(朝の計画+夜の内省)/ reply(返答保証)/ "
+       "general(発火・独り言・投稿)の 3 レーンに分け、general は自分の枠しか使えず "
+       "reply・life は general の余りだけを借りる = **予約が先に食われることが原理的に"
+       "起きない**。溢れた life は翌 step へ FIFO 繰り越し(順序 = (最初に予約された step, "
+       "agent_id) の全順序)し、max_defer_steps を超えたら骨格計画へ落とす(LLM ゼロ)。"
+       "OFF では plan/reflect が予算外を無条件に走るため実効上限が cap+予算外 になり"
+       "(実測 cap60 で 1 step 96 呼)、cap 拘束下で返答保証が枯渇する(実測 reply −96%)"),
     _f("pool.enabled", "strict", True, "none",
        "ペルソナプールの日次ローテーション(在場者の決定論選択=当日の思考対象人数が変わる)"),
     _f("pool.tier_quota.enabled", "strict", True, "none",
@@ -1364,6 +1396,22 @@ FEATURES: tuple[Feature, ...] = (
        "新イベント種も新ファイルも作らず、既存 payload にキーを足すだけ。"
        "OFF では payload に一時キーすら積まれない = ゴールデン L1 バイト一致。"
        "★規模: +500MB 前後(大半は ⑤)"),
+    # DPH-O 観測 4 点(docs/plans/dayplan-horizon-plan.md §4.2 / §6)。
+    # strict の根拠: 数えるのは既存の分岐が既に出した結果(予算の可否・修復の演算子・
+    #   スキップの理由)だけで、LLM の自由文を 1 バイトも読まない。
+    # affects_k=False: **記録専用**。分岐を 1 つも作らず、乱数 stream を 1 本も引かず、
+    #   generate() の呼び出し点を足しも減らしもしない(tests が呼数の完全一致を機械固定)。
+    # fingerprint_risk=none: プロンプトを 1 バイトも変えない。
+    _f("observer.starvation.enabled", "strict", False, "none",
+       "「削ったなら記録する」観測 4 点(DPH-O)。① reply_dropped=予算切れで落ちた返事"
+       "(現行は _reply_to を消してから予算を取るので **L1 に痕跡ゼロ**の観測不能な飢餓。"
+       "実測 cap60 で reply −96%・08-23 時は 1 件も返らない)② wrap_clipped=「23:00-02:00」が"
+       "最小継続へ潰された件数(現行は round に埋もれ conflict_repair_rate からも除外)"
+       "③ plan_skipped / plan_expired_awake=朝の計画が立たなかった・0 時失効で無計画のまま"
+       "覚醒していた(実測 741 件/3 日)④ purpose 別の予算許可/拒否(現行は "
+       "drive_request{granted:false} しか無く用途が判らない)。"
+       "★L2 へ列は足さない(observer/aggregate.py は metrics_spec の凍結対象)= 出口は"
+       "L1 の新 kind 3 種と summary.json の starvation ブロック。OFF は新 kind 0 件"),
     _f("cognition.channels.sat_columns", "strict", False, "none",
        "channels.parquet の末尾に価値 4 軸の充足 sat を 4 列足す(G6)。values.py の "
        "agent.sat(「いま何が満たされていないか」= 復元実験の直接の正解ラベル)は writer が"

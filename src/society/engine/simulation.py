@@ -276,7 +276,15 @@ class Simulation:
             cap = max(1, math.ceil(round(dens * int(cfg.run.n_agents), 9)))
         else:
             cap = cfg.lod.max_llm_per_step
-        self.budget = LodBudget(cap)
+        # ---- DPH-B 二層予算(lod.budget.tiers・既定 OFF=tiers None=第30 と完全同一)----
+        #   ON では plan / reflect が予算の**中**へ入り、返答保証に先取り枠が立つ
+        #   (総量は cap のまま = 分配だけが変わる)。docs/plans/dayplan-horizon-plan.md §3.3
+        from ..cognition.lod import build_budget_cfg as _build_budget_cfg
+        _tiers = _build_budget_cfg((cfg.lod.get("budget", None) or {}).get("tiers", None))
+        # ---- DPH-O ④ purpose 別の許可/拒否カウンタ(observer.starvation・既定 OFF=None)----
+        from ..observer import starvation as _starv
+        self.budget = LodBudget(cap, tiers=_tiers,
+                                counters=_starv.budget_counters(self))
         self.pois = self.city.pois()
         self.dests = self.city.destinations()
         # ---- 屋内エンジン配線(B3。既定 OFF=完全 no-op=バイト一致)----
@@ -2369,6 +2377,13 @@ class Simulation:
         _dpprov = _day_plan_prov.provenance(self)
         if _dpprov is not None:
             summary["day_plan"] = _dpprov
+        # ---- DPH-O 観測 4 点(observer.starvation.enabled=false = 既定 OFF はキーなし)----
+        # 「削ったなら記録する」の受け皿。L2 へ列を足すのは observer/aggregate.py が
+        # 凍結対象(metrics_spec.SPEC_FILES)なので不可 → summary の provenance に出す。
+        from ..observer import starvation as _starv_prov
+        _stprov = _starv_prov.provenance(self)
+        if _stprov is not None:
+            summary["starvation"] = _stprov
         # ---- engaged モード 第87バッチ(cognition.engaged.enabled=false = 既定 OFF はキーなし)----
         # 原文書 §8 補助規則 3 が「全エピソードのログ(トリガー種別・滞在時間・ターン数・
         # 脱出理由・モデルID)を記録し思考量の個体差の観測量とする」と明記しているので、

@@ -42,6 +42,7 @@ from .. import population as population_mod
 from .. import provlink as provlink_mod
 from ..observer import causality as causality_mod
 from ..observer import gt_extras as gt_extras_mod
+from ..observer import starvation as starvation_mod
 from .. import reject as reject_mod
 from .. import relations as relations_mod
 from .. import relations_endo as relations_endo_mod
@@ -66,6 +67,7 @@ from .. import work as work_mod
 from .. import worldview as worldview_mod
 from ..net import infoenv as infoenv_mod
 from ..cognition import deliberate, drive, planning, routine
+from ..cognition import day_plan as day_plan_mod
 from ..cognition import engaged as engaged_mod
 from ..cognition import fire as fire_mod
 from ..cognition import perception_contract as contract_mod
@@ -965,15 +967,66 @@ def _phase_planning(sim, step: int, sim_min: int) -> None:
         _phase_planning_batched(sim, step, sim_min,
                                 workers=int(bl.get("workers", 8)))
         return
+    if sim.budget.tiers:                           # DPH-B(既定 OFF=この分岐に入らない)
+        _phase_planning_tiered(sim, step, sim_min)
+        return
     for agent in sim.agents:
         if agent.plan_step != step:
             continue
         agent.plan_step = -1
         if agent.loc == "outside" or agent.sleeping:
+            starvation_mod.note_plan_skipped(       # DPH-O ③(OFF は即 return=不変)
+                sim, agent, step, sim_min,
+                "outside" if agent.loc == "outside" else "sleeping")
             continue
         # 行間補間(P2 S2): 前回発火以降の客観ダイジェスト。OFF は None=注入せず不変。
         planning.make_plan(sim, agent, step, sim_min, _place_of(sim, agent),
                            interstitial_digest=_isl_take(sim, agent))
+
+
+def _defer_first(agent, attr: str, step: int) -> int:
+    """FIFO キューの「最初に予約された step」(初回は今の step)。"""
+    first = int(getattr(agent, attr, -1))
+    return step if first < 0 else first
+
+
+def _phase_planning_tiered(sim, step: int, sim_min: int) -> None:
+    """DPH-B: 朝の計画を**予算の中**で撃つ(既定 OFF=この関数は呼ばれない)。
+
+    現行は「予約された step で撃つか、`sleeping`/`outside` なら永久に失う」の 2 択で、
+    予算という概念すら無かった(= 予算外呼)。ここでは
+      (1) `life` レーンの予約枠(足りなければ general の余り)を取れた個体だけが撃ち、
+      (2) 取れなかった個体は **翌 step へ FIFO 繰り越し**(失わない)、
+      (3) 繰り越しが `max_defer_steps` を超えたら **骨格計画へ落とす**(LLM ゼロ)
+    の 3 段にする。順序は `(最初に予約された sim step, agent_id)` の全順序 = 決定論で、
+    キューの実体は **agent の属性 1 つ**(`plan_due_step`)= sim 級の状態を新設しない
+    (agents pickle に自然同梱される = checkpoint 追加作業ゼロ)。
+    """
+    cap = int(sim.budget.tiers["max_defer_steps"])
+    due = [a for a in sim.agents if a.plan_step == step]
+    due.sort(key=lambda a: (_defer_first(a, "plan_due_step", step), a.id))
+    for agent in due:
+        agent.plan_step = -1
+        first = _defer_first(agent, "plan_due_step", step)
+        waited = step - first
+        if agent.loc == "outside" or agent.sleeping:
+            agent.plan_due_step = -1
+            starvation_mod.note_plan_skipped(
+                sim, agent, step, sim_min,
+                "outside" if agent.loc == "outside" else "sleeping", waited)
+            continue
+        if sim.budget.take("plan"):
+            agent.plan_due_step = -1
+            planning.make_plan(sim, agent, step, sim_min, _place_of(sim, agent),
+                               interstitial_digest=_isl_take(sim, agent))
+        elif waited >= cap:                        # 待たせすぎ → 骨格(LLM を 1 本も呼ばない)
+            agent.plan_due_step = -1
+            starvation_mod.note_plan_skipped(sim, agent, step, sim_min,
+                                             "defer_cap", waited)
+            day_plan_mod.install_skeleton(sim, agent, step, sim_min)
+        else:                                      # 翌 step へ繰り越す(失わない)
+            agent.plan_due_step = first
+            agent.plan_step = step + 1
 
 
 def _phase_planning_batched(sim, step: int, sim_min: int, workers: int) -> None:
@@ -986,12 +1039,37 @@ def _phase_planning_batched(sim, step: int, sim_min: int, workers: int) -> None:
     スループットが per-call レイテンシから解放される。
     """
     pending: list[tuple[object, dict]] = []
-    for agent in sim.agents:
+    tiers = sim.budget.tiers                       # DPH-B(既定 OFF=None=以下は従来どおり)
+    cap = int(tiers["max_defer_steps"]) if tiers else 0
+    order = sorted((a for a in sim.agents if a.plan_step == step),
+                   key=lambda a: (_defer_first(a, "plan_due_step", step), a.id)) \
+        if tiers else sim.agents
+    for agent in order:
         if agent.plan_step != step:
             continue
         agent.plan_step = -1
+        first = _defer_first(agent, "plan_due_step", step)
         if agent.loc == "outside" or agent.sleeping:
+            if tiers:
+                agent.plan_due_step = -1
+            starvation_mod.note_plan_skipped(       # DPH-O ③(OFF は即 return=不変)
+                sim, agent, step, sim_min,
+                "outside" if agent.loc == "outside" else "sleeping",
+                step - first if tiers else 0)
             continue
+        if tiers:                                  # 予算の中で撃つ / 繰り越す / 骨格へ落とす
+            if sim.budget.take("plan"):
+                agent.plan_due_step = -1
+            elif step - first >= cap:
+                agent.plan_due_step = -1
+                starvation_mod.note_plan_skipped(sim, agent, step, sim_min,
+                                                 "defer_cap", step - first)
+                day_plan_mod.install_skeleton(sim, agent, step, sim_min)
+                continue
+            else:
+                agent.plan_due_step = first
+                agent.plan_step = step + 1
+                continue
         req = planning.build_plan_request(
             sim, agent, step, sim_min, _place_of(sim, agent),
             interstitial_digest=_isl_take(sim, agent))
@@ -1028,7 +1106,7 @@ def _phase_reflect_batched(sim, step: int, sim_min: int, workers: int) -> None:
     think = bool(sim.cfg.model.reflect_think)
 
     due: list[dict] = []
-    for agent in sim.agents:
+    for agent in _reflect_due(sim, step, sim_min):  # DPH-B(OFF は sim.agents=不変)
         if agent.reflect_step != step:
             continue
         # 逐次経路の引数評価と同順(rng 派生→ダイジェスト消費)を保つ
@@ -1075,6 +1153,37 @@ def _phase_reflect_batched(sim, step: int, sim_min: int, workers: int) -> None:
             response=response, call_id=call_id, cached=cached,
             discard=d["discard"],
             gt_extras=gt_extras_mod.enabled(sim))   # G7-②(既定 OFF=キーなし)
+
+
+def _reflect_due(sim, step: int, sim_min: int):
+    """内省の対象者(DPH-B。既定 OFF では `sim.agents` をそのまま返す=バイト一致)。
+
+    ON では朝の計画(`_phase_planning_tiered`)と**同じ 3 段**を内省へも当てる:
+    予算が取れた個体だけを返し、取れなければ翌 step へ FIFO 繰り越し、
+    `max_defer_steps` を超えたら諦めて 1 件記録する(内省には骨格に相当する退路が無い
+    = 「撃たなかった」を捏造せず数える。DPH-O ③')。
+    """
+    tiers = sim.budget.tiers
+    if not tiers:
+        return sim.agents
+    cap = int(tiers["max_defer_steps"])
+    due = [a for a in sim.agents if a.reflect_step == step]
+    due.sort(key=lambda a: (_defer_first(a, "reflect_due_step", step), a.id))
+    out = []
+    for agent in due:
+        first = _defer_first(agent, "reflect_due_step", step)
+        if sim.budget.take("reflect"):
+            agent.reflect_due_step = -1
+            out.append(agent)
+        elif step - first >= cap:
+            agent.reflect_due_step = -1
+            agent.reflect_step = -1                # 消費済み(同じ step を二度見ない)
+            starvation_mod.note_reflect_dropped(sim, agent, step, sim_min,
+                                                step - first)
+        else:
+            agent.reflect_due_step = first
+            agent.reflect_step = step + 1          # 翌 step へ繰り越す
+    return out
 
 
 def _phase_wake_and_returns(sim, step: int, sim_min: int) -> None:
@@ -2563,7 +2672,9 @@ def _phase_drive(sim, step: int, sim_min: int) -> None:
         granted = False
         if face or interrupt:
             lottery = None
-            if sim.budget.take():                  # 予算切れ=ゲージ維持で持ち越し
+            # purpose 引数は **観測ラベルだけ**(DPH-O ④)。二層予算 OFF ではレーンも
+            # 判定も従来と同一(lod.PURPOSE_LANE が face/interrupt を general へ写す)。
+            if sim.budget.take("face" if face else "interrupt"):  # 予算切れ=ゲージ維持で持ち越し
                 granted = True
                 # 割込みでも LLM へ渡す「きっかけ」は既存語彙のまま(no-fingerprint:
                 # 発火機構の ON/OFF がプロンプトから読めない)。理由は L1 の cog_fire にだけ残る。
@@ -2579,7 +2690,7 @@ def _phase_drive(sim, step: int, sim_min: int) -> None:
             else:
                 p = agent.fire_weight
             lottery = bool(rng.random() < p)
-            if lottery and sim.budget.take():
+            if lottery and sim.budget.take("media"):
                 granted = True
                 agent._fire_reason = reason
                 drive.on_fire(agent, step, cfg)
@@ -2699,7 +2810,13 @@ def _decide(sim, agent, step: int, sim_min: int) -> dict:
             return engaged_mod.template_reply(sim, agent, step, sim_min)
         speaker_id, said = agent._reply_to
         agent._reply_to = None
-        if sim.budget.take():
+        # DPH-O ①: 予算切れで落ちた返事は**痕跡ゼロ**だった(_reply_to は上で既に消えている)。
+        #   observer.starvation OFF では note_* が即 return = L1 も state も 1 バイト不変。
+        #   予算の取り方(引数 1 つ)も返り値も従来と同じ = 呼数・乱数・分岐は不変。
+        _reply_ok = sim.budget.take("reply")
+        if not _reply_ok:
+            starvation_mod.note_reply_dropped(sim, agent, step, sim_min, speaker_id)
+        if _reply_ok:
             speaker = sim.agent_by_id.get(speaker_id)
             reply_to = (speaker.name, said) if speaker is not None else None
             # ablate.propagation_off(第78): **返答の LLM 呼はこれまでどおり撃つ**(予算も
@@ -5818,7 +5935,7 @@ def run_step(sim, step: int) -> None:
         _phase_reflect_batched(sim, step, sim_min,
                                workers=int(_bl.get("workers", 8)))
     else:
-        for agent in sim.agents:  # 内省(就寝直後 or 来街者の帰路。個別時刻に分散)
+        for agent in _reflect_due(sim, step, sim_min):  # 内省(就寝直後 or 来街者の帰路)
             if agent.reflect_step == step:
                 maybe_reflect(agent, step=step, sim_min=sim_min,
                               writeback=str(sim.cfg.k.writeback),
