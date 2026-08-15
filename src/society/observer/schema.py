@@ -103,6 +103,11 @@ register_event_kind("tax",           "税の徴収(所得税・住民税・消�
 register_event_kind("civic_service", "行政サービスの利用・給付(区/都/国){service, level, amount?, detail?}")
 register_event_kind("public_budget", "行政主体の会計集計(歳入・歳出・残高){level, revenue, expense, balance}")
 register_event_kind("media_use",     "娯楽メディアの利用(TV/動画/ゲーム。タイトルは架空){medium, title?, steps, at}")
+# ---- 在宅覚醒 HOME_AWAKE(β9。既定 OFF=0件。設計: docs/plans/beta-implementation-plan.md §2)----
+#  ★新 kind を足したら observer/causality.py の CAUSE_OF_KIND にも同時に登録すること
+#    (2 箇所登録。網羅は tests/test_causality.py + tests/test_home_awake.py が機械固定)。
+register_event_kind("home_activity", "帰宅後・起床後の在宅活動(ルールベース・LLM 呼ゼロ)"
+                                     "{act, steps, at, awake_min}")
 register_event_kind("study",         "学校の授業・学習(教科・講義){org, subject, role}")
 register_event_kind("production",    "職場での産出(財・サービスの実態){org, output, kind}")
 # ---- 第7バッチ(ユーザー要望 2026-07-07: 日付・天気)----

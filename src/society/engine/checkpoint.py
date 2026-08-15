@@ -9,8 +9,23 @@
   load 時に city.graph へ再適用し、router.invalidate() で経路キャッシュを捨てる。
 - 「何を集め、どう戻すか」は本モジュールに一元管理する(個別クラスに __getstate__ を
   生やさない)。共有参照(labels.items ⇄ sim.items の ItemStore、Item 実体、
-  labels.text_to_item と items.items が同じ Item を指すこと)は **1 回の
-  pickle.dumps に同梱**して保つ(pickle は 1 回の dumps 内では共有参照を保存する)。
+  labels.text_to_item と items.items が同じ Item を指すこと)は **1 回のシリアライズに
+  同梱**して保つ(pickle は 1 回の dump/dumps 内では memo によって共有参照を保存する。
+  第117 β7 で `pickle.dumps(blob)` → gzip ストリームへの `pickle.dump(blob, f)` へ
+  変えたが、**1 回の呼び出しであることは同じ**なのでこの保証は 1 ビットも変わらない)。
+
+保存の耐久性(第117バッチ β7。監査 E0-2 / E0-3 = external-audit-triage.md F3 / F4)
+------------------------------------------------------------------------------
+- **RAM スパイクを作らない**: 旧実装は `pickle.dumps` で全状態を bytes 化してから gzip へ
+  書いていたので、保存の瞬間だけ「オブジェクト + 生 pickle バイト列 + 圧縮バッファ」が
+  同時に載った(25 万体では数十 GB 級の一過性ピークが RSS 判定線を押し上げる)。
+  gzip ストリームへ直接 `pickle.dump` すれば中間の bytes が存在しない。
+- **fsync**: gzip メンバを閉じてから下位ファイルを flush + `os.fsync` する(電源断で
+  「rename は見えるが中身が届いていない」状態を作らない)。既存の原子的 rename は不変。
+- **COMPLETE マーカー**: rename 後に `<checkpoint 名>.complete` の空ファイルを fsync 付きで
+  書く。`latest()` はマーカーのある checkpoint だけを最新候補にする = 書き込み途中で
+  プロセスが死んだ世代を resume が掴まない。**後方互換**: マーカーが 1 つも無い
+  checkpoint ディレクトリ(第117 以前のラン)は従来どおり全候補を許す。
 - 決定論: set は原則 membership / sorted 反復のみ(全ファイル監査済み)。順序安定の
   ため scenario.closed は sorted list で直列化して復元する。pickle はプロセス内でも
   set の反復順を保存しない(dict は保存する)ため、反復順が観測に効く箇所は sorted で
@@ -34,6 +49,12 @@ from .. import population as _population
 from .. import worldview as _wv_ckpt
 
 FORMAT = 1
+
+#: 第117 β7: 「この checkpoint は最後まで書けた」ことを表す空ファイルの拡張子
+#: (`ckpt-000144.pkl.gz` に対し `ckpt-000144.pkl.gz.complete`)。
+#: ★`.pkl.gz` で終わらないので watchdog / report_progress の glob("ckpt-*.pkl.gz") にも
+#:   backup_run の `_ckpt_step`(`.pkl.gz` 終端が条件)にも掛からない = 既存の運用道具は無風。
+COMPLETE_SUFFIX = ".complete"
 
 # resume で正当に変わりうるキー(整合性ハッシュから除外する)。
 # n_steps は「さらに先まで回す」ため必ず変わる。name/out_dir/checkpoint_every も run 制御。
@@ -63,8 +84,28 @@ def config_hash(cfg) -> str:
     return config_hash_from_container(OmegaConf.to_container(cfg, resolve=True))
 
 
+def complete_marker(path: str | Path) -> Path:
+    """checkpoint に対する COMPLETE マーカーのパス(第117 β7)。"""
+    p = Path(path)
+    return p.with_name(p.name + COMPLETE_SUFFIX)
+
+
+def _write_complete_marker(path: Path) -> Path:
+    """`<checkpoint 名>.complete` を空ファイルとして fsync 付きで置く。
+
+    中身を持たせない(= 書き終わったこと自体が唯一の情報)。checkpoint 本体が
+    `os.replace` で最終名に現れた**後**に作るので、マーカーの存在は「本体が完結して
+    いる」ことしか意味しない。
+    """
+    marker = complete_marker(path)
+    with open(marker, "wb") as f:
+        f.flush()
+        os.fsync(f.fileno())
+    return marker
+
+
 def save(sim, step: int, path: str | Path) -> Path:
-    """シミュレーションの完全状態を pickle+gzip で保存する(原子的 rename)。"""
+    """シミュレーションの完全状態を pickle+gzip で保存する(原子的 rename + COMPLETE)。"""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     blob = {
@@ -532,18 +573,28 @@ def save(sim, step: int, path: str | Path) -> Path:
             "total_spawned": sim.traffic.total_spawned,
         },
     }
-    raw = pickle.dumps(blob, protocol=pickle.HIGHEST_PROTOCOL)
     tmp = path.with_name(path.name + ".tmp")
-    with gzip.open(tmp, "wb") as f:
-        f.write(raw)
+    # ★第117 β7: 中間の bytes を作らずに gzip ストリームへ直接流す(保存時 RAM スパイクの根治)。
+    #   共有参照は「1 回の pickle 呼び出し」の memo が保つので dumps→dump で契約は不変。
+    #   gzip の trailer(CRC + 長さ)は GzipFile.close() で書かれるため、fsync は
+    #   **gzip を閉じた後**に下位ファイルへ掛ける(順序を入れ替えると不完全な .gz を同期する)。
+    with open(tmp, "wb") as fh:
+        with gzip.GzipFile(fileobj=fh, mode="wb") as gz:
+            pickle.dump(blob, gz, protocol=pickle.HIGHEST_PROTOCOL)
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, path)
+    _write_complete_marker(path)
     return path
 
 
 def load(sim, path: str | Path) -> int:
     """checkpoint を sim へ上書き復元し、次に実行すべき step を返す。"""
+    # save と対称に**ストリームから直接** unpickle する(第117 β7)。`pickle.loads(f.read())`
+    # は展開済みバイト列を丸ごと RAM に置いてから同じ物を再構築するので、復元の瞬間だけ
+    # ピークが二重になっていた。共有参照の復元は 1 回の load/loads で同一(memo は呼び出し内)。
     with gzip.open(Path(path), "rb") as f:
-        blob = pickle.loads(f.read())
+        blob = pickle.load(f)
     if blob.get("format") != FORMAT:
         raise ValueError(f"未知の checkpoint format: {blob.get('format')}")
     expect = config_hash(sim.cfg)
@@ -875,13 +926,22 @@ def load(sim, path: str | Path) -> int:
 
 
 def latest(run_dir: str | Path) -> Path | None:
-    """run_dir/checkpoint/ 内の最新(step 最大)の checkpoint パス。無ければ None。"""
+    """run_dir/checkpoint/ 内の最新(step 最大)の checkpoint パス。無ければ None。
+
+    第117 β7: **COMPLETE マーカー(`<名前>.complete`)のある世代だけ**を候補にする
+    = 書き込み途中でプロセスが死んだ checkpoint を resume が掴まない。
+    ★後方互換: マーカーが**1 つも無い**ディレクトリ(第117 以前のラン・バックアップから
+      戻したディレクトリ)は従来どおり全候補を許す(既存 checkpoint を読めなくしない)。
+    """
     ckpt_dir = Path(run_dir) / "checkpoint"
     if not ckpt_dir.is_dir():
         return None
     cands = sorted(ckpt_dir.glob("ckpt-*.pkl.gz"))
     if not cands:
         return None
+    marked = [p for p in cands if complete_marker(p).exists()]
+    if marked:                      # 1 つでもマーカーがあれば「マーカー運用中」とみなす
+        cands = marked
 
     def _step(p: Path) -> int:
         try:

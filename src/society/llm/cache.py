@@ -78,6 +78,16 @@ class CachedLLM:
             f" cache={self.path}")
 
     # ------------------------------------------------------------------ 記録
+    def _request_seed(self, rng_key: str) -> int | None:
+        """β11(第117): backend が送る request-level seed。持たない backend では None。
+
+        値の導出は backend 側の 1 箇所(vllm.stable_request_seed)にしかなく、ここは
+        **同じ口を読むだけ**なので「記録した seed と送った seed が違う」が原理的に起きない。
+        既定 OFF / mock / ollama / API 系では None = ジャーナルに欄が生えない。
+        """
+        fn = getattr(self.backend, "request_seed_for", None)
+        return fn(rng_key) if fn is not None else None
+
     def _journal_write(self, *, key: str, rng_key: str, prompt: str,
                        response: str, temperature: float, max_tokens: int,
                        think: bool, cached: bool) -> None:
@@ -86,7 +96,8 @@ class CachedLLM:
         self.journal.record(key=key, rng_key=rng_key, prompt=prompt,
                             response=response, temperature=temperature,
                             max_tokens=max_tokens, think=think, cached=cached,
-                            backend=self.backend.name)
+                            backend=self.backend.name,
+                            seed=self._request_seed(rng_key))
 
     def generate(self, prompt: str, *, rng_key: str, temperature: float,
                  max_tokens: int, think: bool = False) -> tuple[str, str, bool]:

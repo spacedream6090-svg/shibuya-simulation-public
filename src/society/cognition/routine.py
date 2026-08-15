@@ -20,6 +20,7 @@ from .. import commerce as _commerce
 from .. import delivery as _delivery
 from .. import disaster as _disaster
 from .. import diversity as _diversity
+from .. import home_awake as _home_awake
 from .. import household as _household
 from .. import inner_life as _inner
 from .. import joint as _joint
@@ -769,6 +770,136 @@ def _media_action(agent, sim, sim_min: int, step: int) -> dict | None:
     return {"type": "media_stay"}
 
 
+# ---- 在宅覚醒(HOME_AWAKE・β9。既定 OFF)------------------------------------ #
+# 設計は src/society/home_awake.py と docs/plans/beta-implementation-plan.md §2。
+# 現状(OFF)は `go_to_bed` が入館と就寝を同じ step で連続実行する = 帰宅 → 就寝が 100.0%
+# 0 分(実測 n=1,512)。ON では入館と就寝の間に**就寝ハザード**を挟み、その間の各 step で
+# 在宅活動ラベル(8 種)を抽選する。乱数は新 stream "home_awake" だけ・LLM 呼はゼロ。
+def _home_awake_settings(sim) -> dict:
+    """home_awake 設定を sim に一度だけキャッシュ(以後は再解析しない。media と同型)。"""
+    hcfg = getattr(sim, "_home_awake_settings", None)
+    if hcfg is None:
+        hcfg = _home_awake.cfg_of(sim.cfg)
+        sim._home_awake_settings = hcfg
+    return hcfg
+
+
+def _can_home_awake(agent, sim) -> bool:
+    """在宅覚醒の対象か。来街者・自宅建物を持たない個体・立退き中は対象外(= 従来経路)。"""
+    if agent.visitor or agent.loc == "outside":
+        return False
+    if getattr(agent, "evicted", False):
+        return False
+    return bool(agent.home_building) and sim.city.has_building(agent.home_building)
+
+
+def _mates_home_awake(agent, sim) -> bool:
+    """同居人が「自宅の中に居て寝ていない」か(世帯シナジー・最小)。
+
+    位置と sleeping は decide フェーズの手前で確定済み = 同 step の他個体の決定順に
+    依存しない(household の同居人索引 housemates + 在場述語 present_agent を流用)。"""
+    for oid in (getattr(agent, "housemates", None) or []):
+        other = sim.present_agent(int(oid))
+        if other is None or int(other.id) == int(agent.id):
+            continue
+        if not other.sleeping and other.building \
+                and other.building == other.home_building:
+            return True
+    return False
+
+
+def _home_awake_engaged(agent, hcfg: dict) -> bool:
+    return str(getattr(agent, "_home_act", "") or "") in hcfg["engaged_acts"]
+
+
+def _home_awake_sleeps(agent, sim, sim_min: int, step: int, hcfg: dict, rng) -> bool:
+    """就寝ハザードを 1 回引く。True = この step で寝る。
+
+    ★上限 max_awake_min に達していたら**先に**必ず寝る(裾を切る安全弁)。乱数は
+      分岐に依らず必ず 1 本引く(引く/引かないが状態で変わると再現性の追跡が難しくなる)。"""
+    p = _home_awake.sleep_prob(agent, sim, sim_min, hcfg,
+                               engaged=_home_awake_engaged(agent, hcfg))
+    fired = float(rng.random()) < p
+    since = int(getattr(agent, "_home_awake_since", -1))
+    if since >= 0 and (step - since) * sim.clock.step_minutes \
+            >= int(hcfg["max_awake_min"]):
+        return True
+    return fired
+
+
+def _end_home_awake(agent) -> None:
+    agent._home_awake_since = -1
+    agent._home_act = ""
+    agent._home_act_end = -1
+    if getattr(agent, "activity", "") in _home_awake.ACTS:
+        agent.activity = ""
+
+
+def _home_awake_begin(agent, sim, sim_min: int, step: int) -> bool:
+    """自宅前 → 「入るが寝ない」か。False なら従来どおり入って即就寝(go_to_bed)。"""
+    hcfg = _home_awake_settings(sim)
+    if not hcfg["enabled"] or not _can_home_awake(agent, sim):
+        return False
+    agent._home_awake_since = step            # ハザードの上限起点(この step から起きている)
+    rng = sim.hub.stream("home_awake", agent.id, step)
+    if _home_awake_sleeps(agent, sim, sim_min, step, hcfg, rng):
+        _end_home_awake(agent)                # 帰宅と同時に就寝(gap 0 分)= 従来と同じ帰結
+        return False
+    return True
+
+
+def _home_awake_action(agent, sim, sim_min: int, step: int) -> dict | None:
+    """自宅の中で覚醒中の 1 step。dict(= home_stay で在宅を占有)か None(= 就寝へ)。
+
+    home_stay は `_apply` では no-op(その場に留まる)、かつ type != "stay" なので
+    scheduler はスマホ閲覧(SNS/ニュース)を挟まない = **LLM 呼を 1 本も足さない**。"""
+    hcfg = _home_awake_settings(sim)
+    if not hcfg["enabled"]:
+        return None
+    if not _can_home_awake(agent, sim) \
+            or agent.building != agent.home_building:
+        _end_home_awake(agent)
+        return None
+    if int(getattr(agent, "_home_awake_since", -1)) < 0:
+        agent._home_awake_since = step        # 途中から在宅覚醒に入った(lead_min 経路)
+    rng = sim.hub.stream("home_awake", agent.id, step)
+    if _home_awake_sleeps(agent, sim, sim_min, step, hcfg, rng):
+        _end_home_awake(agent)
+        return None
+    # --- 在宅活動セッション(継続中なら維持・切れたら抽選し直す)---
+    if step >= int(getattr(agent, "_home_act_end", -1)):
+        weights = _home_awake.act_weights(
+            agent, sim_min, hcfg, mates_awake=_mates_home_awake(agent, sim))
+        act = _home_awake.pick_act(weights, rng)
+        steps = _home_awake.session_steps(act, rng, sim.clock)
+        agent._home_act = act
+        agent._home_act_end = step + steps
+        sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                             kind="home_activity", x=agent.x, y=agent.y,
+                             payload={"act": act, "steps": int(steps),
+                                      "at": _time_band(sim_min),
+                                      "awake_min": int(
+                                          (step - int(agent._home_awake_since))
+                                          * sim.clock.step_minutes)}))
+    agent.activity = str(getattr(agent, "_home_act", "") or "rest")
+    return {"type": "home_stay"}
+
+
+def _home_awake_window(agent, sim, sim_min: int, hcfg: dict) -> bool:
+    """就寝分岐へ入る追加条件(既定 lead_min=0 かつ在宅覚醒中でなければ常に False=不変)。
+
+    ① 在宅覚醒が始まっている個体は bedtime_reached の 4 時間窓を出ても分岐に留まる
+       (窓を出た瞬間に夜中の街へ歩き出す、という現象を作らない)。
+    ② lead_min>0 のときだけ帰宅トリガを就寝時刻の lead_min 分前へ前倒しする
+       (現実の帰宅 19:15 / 就寝 23:39 へ寄せる LSR-H 相当。既定 0 = 帰宅時刻は動かない)。"""
+    if int(getattr(agent, "_home_awake_since", -1)) >= 0:
+        return True
+    lead = int(hcfg["lead_min"])
+    if lead <= 0:
+        return False
+    return ((int(agent.bedtime_min) - int(sim_min)) % 1440) <= lead
+
+
 def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
            has_company: bool) -> dict:
     """routine の行動決定。発話はしない(socialize で LLM へ委譲)。"""
@@ -789,7 +920,12 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
         return media_action
 
     # ---- 就寝時刻: 居住者は自宅(実在の住宅建物)へ、来街者は街の外の家へ帰る ----
-    if bedtime_reached(agent, sim_min) and not agent.sleeping:
+    #  在宅覚醒 HOME_AWAKE(β9・既定 OFF): _home_awake_window は既定 conf で常に False を
+    #  返す(lead_min=0 かつ _home_awake_since=-1)= この行は 1 ビットも変えない。
+    _ha = _home_awake_settings(sim)
+    if (bedtime_reached(agent, sim_min)
+            or (_ha["enabled"] and _home_awake_window(agent, sim, sim_min, _ha))) \
+            and not agent.sleeping:
         if agent.visitor and agent.loc == "street":
             if agent.building:
                 return {"type": "exit_building"}
@@ -805,10 +941,15 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
                     "mode": _choose_mode(agent, sim, dest, rng),
                     "exit": True, "homing": True}
         if agent.building and agent.building == agent.home_building:
+            ha_action = _home_awake_action(agent, sim, sim_min, step)
+            if ha_action is not None:              # 在宅覚醒中(既定 OFF は常に None)
+                return ha_action
             return {"type": "sleep"}               # すでに自宅の中 → 就寝
         if agent.building:
             return {"type": "exit_building"}
         if agent.node == agent.home_node and not agent.route:
+            if _home_awake_begin(agent, sim, sim_min, step):   # 既定 OFF は常に False
+                return {"type": "go_to_bed", "awake": True}    # 入るが寝ない
             return {"type": "go_to_bed"}           # 自宅前 → 入って就寝
         if not agent.homing and not agent.route:
             return {"type": "move_to", "dest": agent.home_node, "stay_steps": 0,

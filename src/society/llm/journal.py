@@ -38,6 +38,8 @@ world snapshot 間隔は設定可能。容量が逼迫した場合に削るの�
 
 容量(実測は docs/log/devlog に記録。tests/test_llm_journal.py が回帰を見る)
 - 1 レコード = seq/key/rng_key/backend/params/cached + prompt 全文 + response 全文。
+- β11(第117): `llm.request_seed.enabled` が ON のときだけ `seed` 欄が 1 つ増える
+  (OFF では欄自体を出さない = 既存ランと同形)。
 """
 from __future__ import annotations
 
@@ -90,7 +92,7 @@ class LlmJournal:
     # ------------------------------------------------------------------ 記録
     def record(self, *, key: str, rng_key: str, prompt: str, response: str,
                temperature: float, max_tokens: int, think: bool,
-               cached: bool, backend: str) -> None:
+               cached: bool, backend: str, seed: int | None = None) -> None:
         row = {
             "seq": self.seq,
             "key": key,
@@ -103,6 +105,10 @@ class LlmJournal:
             "prompt": prompt,
             "response": response,
         }
+        # β11(第117): 実際に送出した request-level seed。**OFF では欄自体を出さない**
+        # (= 既存ランのジャーナルと同形・バイト一致)。欠測を 0 や -1 で埋めない。
+        if seed is not None:
+            row["seed"] = int(seed)
         self._buf.append(json.dumps(row, ensure_ascii=False))
         self.seq += 1
         if len(self._buf) >= self.flush_records:

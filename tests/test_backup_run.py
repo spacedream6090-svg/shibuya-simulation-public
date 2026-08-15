@@ -441,3 +441,86 @@ def test_no_checkpoint_yet_waits_for_quiescence(tmp_path):
 def test_missing_run_dir_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         BR.select_payload(tmp_path / "nope")
+
+
+# --------------------------------------------------------------------------- #
+# COMPLETE マーカー(第117 β7)の退避(第117 レーンB3 追加発注1)
+#
+#   `checkpoint.latest` は「マーカーのある世代だけ」を resume 候補にする安全装置なので、
+#   本体だけ運ぶと **退避先で resume したときにその装置が効かない**(マーカーが 1 つも
+#   無いディレクトリは後方互換で全候補を許すため、書きかけを掴む余地が戻ってしまう)。
+#   マーカーは本体と同じ世代に束ね、必ず一緒に行く / 一緒に落ちるようにする。
+# --------------------------------------------------------------------------- #
+def _mark_complete(run_dir: Path, step: int) -> Path:
+    """checkpoint 本体の COMPLETE マーカー(空ファイル)を置く。"""
+    body = run_dir / "checkpoint" / f"ckpt-{step:06d}.pkl.gz"
+    marker = body.with_name(body.name + BR.CKPT_COMPLETE_SUFFIX)
+    marker.write_bytes(b"")
+    _touch(marker, body.stat().st_mtime)
+    return marker
+
+
+def test_complete_marker_rides_with_its_checkpoint(tmp_path):
+    run = _make_run(tmp_path)
+    _mark_complete(run, 72)
+    _mark_complete(run, 0)
+    rels = {i.rel for i in BR.select_payload(run)[0]}
+    for step in (72, 0):
+        assert f"checkpoint/ckpt-{step:06d}.pkl.gz" in rels
+        assert f"checkpoint/ckpt-{step:06d}.pkl.gz.complete" in rels, \
+            "★COMPLETE マーカーが退避されていない(退避先で resume の安全装置が効かない)"
+
+
+def test_complete_marker_follows_the_generation_cut(tmp_path):
+    """世代を絞ったとき、マーカーは**本体と同じ側**へ落ちる(片方だけ残らない)。"""
+    run = _make_run(tmp_path)
+    _mark_complete(run, 72)
+    _mark_complete(run, 0)
+    items, skips = BR.select_payload(run, ckpt_generations=1)
+    rels = {i.rel for i in items}
+    assert "checkpoint/ckpt-000072.pkl.gz" in rels
+    assert "checkpoint/ckpt-000072.pkl.gz.complete" in rels
+    assert "checkpoint/ckpt-000000.pkl.gz" not in rels
+    assert "checkpoint/ckpt-000000.pkl.gz.complete" not in rels
+    dropped = {s.rel for s in skips if "older-generation" in s.reason}
+    assert {"checkpoint/ckpt-000000.pkl.gz",
+            "checkpoint/ckpt-000000.pkl.gz.complete"} <= dropped, \
+        "マーカーが『命名が想定外』で落ちている(世代として扱われていない)"
+
+
+def test_tree_layout_restores_body_and_marker_together(tmp_path):
+    """展開コピー(restore drill 向き)に本体とマーカーが揃う。"""
+    run = _make_run(tmp_path)
+    _mark_complete(run, 72)
+    dest = tmp_path / "dest"
+    BR.backup(run, dest, layout="tree", quiet=True)
+    ck = dest / "finals" / BR.PAYLOAD_DIR / "checkpoint"
+    assert (ck / "ckpt-000072.pkl.gz").exists()
+    marker = ck / "ckpt-000072.pkl.gz.complete"
+    assert marker.exists() and marker.stat().st_size == 0, \
+        "★復元先にマーカーが揃っていない"
+    # tar 側にも同じものが入っている(増分の中身とツリーは同一集合)
+    rep = BR.backup(run, tmp_path / "dest2", quiet=True)
+    tar = tmp_path / "dest2" / "finals" / BR.INCREMENTS_DIR / rep["increment"]
+    assert "data/checkpoint/ckpt-000072.pkl.gz.complete" in _tar_members(tar)
+
+
+def test_runs_without_markers_are_unchanged(tmp_path):
+    """★後方互換: マーカーの無い(第117 以前の)ランは選別結果が従来どおり。"""
+    run = _make_run(tmp_path)
+    rels = {i.rel for i in BR.select_payload(run)[0]}
+    assert not any(r.endswith(BR.CKPT_COMPLETE_SUFFIX) for r in rels)
+    assert "checkpoint/ckpt-000072.pkl.gz" in rels
+    assert "checkpoint/dormant-000072.pkl.gz" in rels
+
+
+def test_marker_does_not_move_the_checkpoint_boundary(tmp_path):
+    """★マーカーは `checkpoint_boundary` に混ざらない(part の締切が緩まない)。"""
+    run = _make_run(tmp_path)
+    before = BR.checkpoint_boundary(run)
+    marker = _mark_complete(run, 72)
+    _touch(marker, time.time())                    # 本体よりずっと後の mtime を付ける
+    assert BR.checkpoint_boundary(run) == before, \
+        "マーカーの mtime が checkpoint 境界を動かした(未確定 part が混じる)"
+    assert BR._ckpt_step(marker.name) is None      # 本体判定はマーカーを拾わない
+    assert BR._ckpt_gen_step(marker.name) == 72    # 世代判定だけが拾う

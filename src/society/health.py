@@ -1139,6 +1139,20 @@ def _exit_world(agent) -> None:
     agent.stay_until = 0
     agent.day_plan = []
     agent.plan_step = -1
+    # ★DPH-B(`lod.budget.tiers`)の FIFO 繰り越し予約の後始末(第117 レーンB3)。
+    #   `plan_due_step` は「最初に予約された step」の印で、**`plan_step` とセットでしか
+    #   意味を持たない**。上で `plan_step` を落としながらこの印を残すと、印だけが宙に浮き、
+    #   同じ実体が次に予約を受けた日に `scheduler._defer_first` が**何日も前の step** を
+    #   返す = `waited` が巨大 = 初回から `max_defer_steps` 超過扱いで、LLM 計画を一度も
+    #   撃たないまま骨格へ落ちる(「今日はじめて予約された人」が「何日も待たされた人」に
+    #   化ける)。この関数はプール回転で再実体化された退場者へ**毎 step 冪等に貼り直される**
+    #   (上の `phase` 参照)ので、印の寿命は実体の寿命より長くなりうる。
+    #   ★既定(tiers OFF)では**誰もこの属性を生やさない**ので、下の分岐は必ず False =
+    #     1 ビットも書かない(ゴールデン L1・checkpoint の pickle バイトとも不変)。
+    #   ★内省側(`reflect_due_step`)は対象外: ここは `reflect_step` を落とさないので
+    #     予約は生きたまま `_reflect_due` にドレインされる = 宙に浮かない。
+    if int(getattr(agent, "plan_due_step", -1)) >= 0:
+        agent.plan_due_step = -1
 
 
 # =========================================================================== #

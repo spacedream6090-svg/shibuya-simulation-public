@@ -28,6 +28,13 @@
      L2 へ列を足すのは `observer/aggregate.py` が凍結対象(metrics_spec.SPEC_FILES)なので
      不可 → summary.json の provenance へ出す(第86 day_plan / 第94 IF-B と同じ作法)。
 
+  ⑤ **予算がどれだけ拘束していたか**(`llm_budget` の used / cap。第117 レーンB3)
+     ④ は「落ちた呼」を数えるが、**cap そのものが binding だったのか**は判らない。
+     1 step の実使用 `LodBudget.used` と上限 `max_per_step` を step ごとに拾い、
+     `used_per_step`(平均 / p95)と `used_over_cap_mean`(= 予算の充填率)を出す。
+     ★ p95 のために step 列は持たず**ヒストグラム**(used → 件数)で持つ:
+       10 日ラン(1,440 step)でも cap+1 個の整数で足り、checkpoint も膨らまない。
+
 契約
 ----
 - **記録専用**: 分岐を 1 つも作らず、乱数 stream を 1 本も引かず、LLM 呼数を 1 も変えず、
@@ -75,6 +82,12 @@ def enabled(sim) -> bool:
     return flag
 
 
+def _step_budget_zero() -> dict:
+    """⑤ step 予算タリーの初期値(int と素の dict のみ。over_cap_sum だけ float)。"""
+    return {"steps": 0, "used_sum": 0, "cap_sum": 0,
+            "over_cap_sum": 0.0, "over_cap_steps": 0, "used_hist": {}}
+
+
 def state(sim) -> dict:
     """累積タリー(checkpoint.py が中央管理する。ON のときだけ生える)。"""
     st = getattr(sim, "_starvation_state", None)
@@ -82,7 +95,8 @@ def state(sim) -> dict:
         st = {"schema": SCHEMA, "reply_dropped": 0, "reflect_dropped": 0,
               "wrap_clipped": 0, "plan_expired_awake_steps": 0,
               "plan_expired_awake_agent_days": 0, "wrap_tail_lost": 0,
-              "plan_skipped": {}, "budget": {}}
+              "plan_skipped": {}, "budget": {},
+              "step_budget": _step_budget_zero()}
         sim._starvation_state = st
     return st
 
@@ -161,6 +175,42 @@ def note_plan_expired_awake(sim, agent, sim_min: int) -> None:
         st["plan_expired_awake_agent_days"] += 1
 
 
+def note_step_budget(sim, budget) -> None:
+    """⑤ この step の LLM 予算の使用量(used / cap)を 1 件積む。**記録専用**。
+
+    `scheduler.run_step` の末尾から 1 step につき 1 度だけ呼ぶ(`budget.reset()` が
+    次 step の頭で `used` を 0 に戻すので、ここが読める最後の位置)。読むだけで
+    `budget` にも `sim` にも書かない = 呼数・乱数・L1 のいずれも動かさない。
+    """
+    if not enabled(sim):
+        return
+    sb = state(sim).setdefault("step_budget", _step_budget_zero())
+    used = int(getattr(budget, "used", 0))
+    cap = int(getattr(budget, "max_per_step", 0))
+    sb["steps"] = int(sb.get("steps", 0)) + 1
+    sb["used_sum"] = int(sb.get("used_sum", 0)) + used
+    sb["cap_sum"] = int(sb.get("cap_sum", 0)) + cap
+    hist = sb.setdefault("used_hist", {})
+    hist[used] = int(hist.get(used, 0)) + 1
+    if cap > 0:                                    # cap=0 の step は比を作れない(0 と偽らない)
+        sb["over_cap_sum"] = float(sb.get("over_cap_sum", 0.0)) + used / cap
+        sb["over_cap_steps"] = int(sb.get("over_cap_steps", 0)) + 1
+
+
+def _p95_from_hist(hist: dict) -> int:
+    """ヒストグラム(値 → 件数)から p95 を最近傍順位法で取る(numpy 非依存・整数)。"""
+    total = sum(int(v) for v in hist.values())
+    if total <= 0:
+        return 0
+    need = -(-total * 95 // 100)                   # ceil(0.95 * N)
+    acc = 0
+    for value in sorted(int(k) for k in hist):
+        acc += int(hist[value])
+        if acc >= need:
+            return int(value)
+    return int(max(int(k) for k in hist))
+
+
 def note_wrap_tail_lost(sim, n: int = 1) -> None:
     """日跨ぎの尾(まだ実行されていない翌日側のブロック)が新しい計画で上書きされた件数。"""
     if not enabled(sim) or n <= 0:
@@ -181,6 +231,23 @@ def provenance(sim) -> dict | None:
               for k, v in sorted(st["budget"].items())}
     total_g = sum(v["granted"] for v in budget.values())
     total_d = sum(v["denied"] for v in budget.values())
+    # ⑤ step あたりの used / cap(旧 checkpoint から復元した state にはキーが無いので .get)
+    sb = st.get("step_budget") or _step_budget_zero()
+    n_steps = int(sb.get("steps", 0))
+    n_ratio = int(sb.get("over_cap_steps", 0))
+    used_hist = sb.get("used_hist") or {}
+    llm_budget = {
+        "steps": n_steps,
+        "used_total": int(sb.get("used_sum", 0)),
+        "used_per_step": {
+            "mean": (round(int(sb.get("used_sum", 0)) / n_steps, 4)
+                     if n_steps else 0.0),
+            "p95": _p95_from_hist(used_hist)},
+        "cap_per_step_mean": (round(int(sb.get("cap_sum", 0)) / n_steps, 4)
+                              if n_steps else 0.0),
+        # 予算の充填率(1.0 = 毎 step 使い切っていた = cap が完全に binding)
+        "used_over_cap_mean": (round(float(sb.get("over_cap_sum", 0.0)) / n_ratio, 4)
+                               if n_ratio else 0.0)}
     return {"schema": SCHEMA,
             "reply_dropped": int(st["reply_dropped"]),
             "reflect_dropped": int(st["reflect_dropped"]),
@@ -192,4 +259,5 @@ def provenance(sim) -> dict | None:
             "plan_skipped": {k: int(v) for k, v in sorted(st["plan_skipped"].items())},
             "llm_budget_by_purpose": budget,
             "llm_budget_granted_total": int(total_g),
-            "llm_budget_denied_total": int(total_d)}
+            "llm_budget_denied_total": int(total_d),
+            "llm_budget": llm_budget}

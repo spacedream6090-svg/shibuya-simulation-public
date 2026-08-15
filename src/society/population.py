@@ -458,6 +458,12 @@ def _leave_world(agent) -> None:
     agent.stay_until = 0
     agent.day_plan = []
     agent.plan_step = -1
+    # ★DPH-B の FIFO 繰り越し予約の後始末(第117 レーンB3)。理由と不変量は
+    #   `health._exit_world` の同じ 1 行のコメントに書いた(この 2 つは意図して同型)。
+    #   要点だけ: `plan_due_step` は `plan_step` とセットでしか意味を持たない印なので、
+    #   落とすときは一緒に畳む。既定(tiers OFF)では属性が生えないので分岐は常に False。
+    if int(getattr(agent, "plan_due_step", -1)) >= 0:
+        agent.plan_due_step = -1
 
 
 # =========================================================================== #

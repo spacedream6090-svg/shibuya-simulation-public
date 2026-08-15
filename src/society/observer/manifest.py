@@ -197,6 +197,82 @@ def input_provenance(sim) -> dict | None:
     return out if len(out) > 1 else None
 
 
+# ------------------------------------------------- β10 起動側申告(モデル・サンプリング凍結)
+# 塞ぐ穴(docs/plans/external-audit-triage.md F15 / beta-implementation-plan.md §1 β10):
+# manifest の `model` ブロックは conf の写しであって「実際にどの重みへ、どのサンプリングで
+# 投げたか」を主張していない。特に vLLM は `--generation-config auto`(既定)のとき
+# **モデル同梱の generation_config.json** を未指定パラメータの既定に使うので、
+# 「conf を 1 文字も変えていないのに分布が変わる」経路が起動側に開いている。
+#
+# 設計(★捏造しない):
+#   - 本ブロックは **起動側の申告**であって、稼働中のサーバから取得した値ではない。
+#     そのことを `declared_by: "launcher"` と `verified: false` で明示する。
+#   - client が **送っていない** サンプリングパラメータ(top_p / top_k)は **null**。
+#     「送っていない」と「0 だった」を混同させない(欠測は欠測と判る値にする)。
+#   - vLLM の版は **このプロセスから見える vllm パッケージ**の版だけを報告する。
+#     取れなければ null(リモートのサーバ版を推測で書かない)。
+_SAMPLING_NOT_SENT = ("top_p", "top_k")
+
+
+@lru_cache(maxsize=1)
+def local_vllm_version() -> str | None:
+    """このプロセスから import できる vllm パッケージの版(取れなければ None)。
+
+    ★これは「起動スクリプトと同じ機で動いている vLLM の版」に一致する**かもしれない**値で
+    あって、リモートのサーバ版の保証ではない。取れない環境(ローカル Windows・別ノード)では
+    None を返し、run_manifest には null が入る(推測で埋めない)。
+    """
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+    except ImportError:                                   # pragma: no cover (py<3.8)
+        return None
+    try:
+        return str(version("vllm"))
+    except (PackageNotFoundError, ValueError, OSError):   # 未インストール等
+        return None
+
+
+def launch_declaration(sim) -> dict:
+    """β10: model / backend / sampling / vLLM 版の「起動側申告」欄。"""
+    cfg = sim.cfg
+    model = cfg.get("model", {}) or {}
+    backend = str(model.get("backend", ""))
+    servers = [str(s) for s in (model.get("servers", []) or [])]
+    rs = ((cfg.get("llm", {}) or {}).get("request_seed", {}) or {})
+    seed_on = bool(rs.get("enabled", False))
+    sampling: dict = {
+        # client が送出ボディへ必ず載せる値(src/society/llm/vllm.py の _completions_body)
+        "temperature": float(model.get("temperature", 0.0)),
+        "max_tokens": int(model.get("max_tokens", 0)),
+        "reflect_max_tokens": int(model.get("reflect_max_tokens", 0)),
+        "plan_max_tokens": int(model.get("plan_max_tokens", 0) or 0),
+        "response_format": ("json_object" if str(model.get("format", "json")) == "json"
+                            else None),
+        # β11: 送るなら方式を明記する(値は呼ごとに変わるので式だけを残す)
+        "seed": ("blake2b(run_seed, agent_id, step, purpose, ordinal) & 0x7fffffff"
+                 if seed_on else None),
+        "seed_enabled": seed_on,
+        "seed_run_seed": (int(cfg.run.seed) if seed_on else None),
+    }
+    for key in _SAMPLING_NOT_SENT:      # ★client は送らない = サーバ既定に従う(null で残す)
+        sampling[key] = None
+    return {
+        "schema": 1,
+        # ★この欄は「起動側がそう申告した」という記録であって、稼働サーバからの取得値ではない。
+        "declared_by": "launcher",
+        "verified": False,
+        "backend": backend,
+        "model": str(model.get("name", "")),
+        "n_servers": len(servers),
+        "servers": servers,
+        # vLLM 経路以外(mock / ollama / router / API)では版の概念が無いので null。
+        "vllm_version": (local_vllm_version() if backend == "vllm" else None),
+        # 未送出のパラメータがサーバ側の何に従うか(起動フラグ)は取得できないので申告しない。
+        # ops/launch-vllm-finals.ps1 が `--generation-config vllm` を付ける規約になっている。
+        "sampling": sampling,
+    }
+
+
 def collect_toggles(cfg) -> dict:
     """resolved config の**真偽値リーフを全部**ドット記法で平坦化する。
 
@@ -279,6 +355,10 @@ def build(sim) -> dict:
             "format": str(model.get("format", "json")),
             "servers": [str(s) for s in (model.get("servers", []) or [])],
         },
+        # β10(第117): モデル・サンプリング凍結の「起動側申告」欄。conf の写しである
+        # `model` とは別に、**client が実際に送るサンプリング**と、送っていない
+        # パラメータ(null)、vLLM の版(取れなければ null)を 1 箇所に集めて残す。
+        "launch": launch_declaration(sim),
         "world": {
             "map": str((cfg.get("world", {}) or {}).get("map", "")),
             "scenario": str((cfg.get("world", {}) or {}).get("scenario", "")),

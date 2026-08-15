@@ -52,6 +52,25 @@ DEFAULTS = {
     "friend_max": 12,          # 友人層の追加次数上限
     "acq_extra": 20,           # 知人層(tier1)の追加次数(弱い紐帯を薄く)
     "margin": 0.5,             # 注入 closeness の上乗せ(閾値+margin=その tier に確実に載る)
+    # ---- β4 初期関係の減衰整合(第117 レーンB3・**既定 None = 上の margin と完全に同一**)----
+    # 正典: docs/research/initial-relations-improvement.md §0 R2 / §1.3 / §4 機構4 (4-d) / §8.2。
+    # 何が壊れていたか: 注入値は「tier 閾値 + 0.5」ちょうどなのに、`relations.decay_day` は
+    #   closeness を持つ台帳を **毎日 1.0 減らす**(decay_per_day=1.0 / decay_after_days=0)。
+    #   → 接触が無ければ **親友は翌日に tier2・知人は 3 日で関係消滅**、親友も 13 日で
+    #   closeness 0 = **初期友人グラフは 2 週間で蒸発する過渡現象**だった(§1.3 の表)。
+    #   しかも顔なじみ・icebreak は closeness を持たないので減衰の対象外 =
+    #   **構造化された初期関係だけが真っ先に腐る**という逆転が起きていた。
+    # 一次データ: 日本人の対面交際頻度の**中央値は「月1回〜2週に1回」**(§8.2)。
+    #   「知人は 2 日会わないと消える」は現実と 1 桁以上ずれている。
+    # 直し方(§4 R2): margin を層別に分け、減衰 1.0/日 の下で
+    #   **親友 ≈ 2 週間 / 友人 ≈ 1 週間 / 知人 2〜3 日**は接触ゼロでも層に留まるようにする。
+    # ★上限の制約: `relations.tier_of` は closeness から tier を引き直すので、注入値が
+    #   **上の層の閾値に届くと昇格してしまう**(margin_friend は tier_close−tier_friend 未満、
+    #   margin_acq は tier_friend−tier_acquaintance 未満でなければならない)。
+    # None = このキーを書かない = 従来どおり全層 `margin` = ゴールデン L1 バイト一致。
+    "margin_close": None,      # 親友(tier3)の上乗せ。既定 None → margin
+    "margin_friend": None,     # 友人(tier2)の上乗せ。既定 None → margin
+    "margin_acq": None,        # 知人(tier1)の上乗せ。既定 None → margin
     # ---- AGE-D: 次数の年齢曲線(第116バッチ 2026-08-15・**既定 OFF**)----
     # 正典: docs/plans/age-diversity-plan.md §4-6。
     # 現状の穴: `w_age` で「誰と繋がるか」は年齢に依るのに、**次数(何人と繋がるか)は
@@ -80,7 +99,11 @@ _INT_KEYS = ("seed", "close_min", "close_max", "friend_min", "friend_max", "acq_
 _FLOAT_KEYS = ("w_age", "w_occ", "w_same_work", "w_same_school", "w_same_area",
                "age_scale", "noise", "margin", "age_degree_ref",
                "age_degree_min", "age_degree_max")
+# 層別 margin は「書かない = None = margin へ後退」を表せる必要があるので float 強制しない
+_OPT_FLOAT_KEYS = ("margin_close", "margin_friend", "margin_acq")
 _KNOT_KEYS = ("age_degree_knots",)
+# 層別 margin の tier 対応(3=親友 / 2=友人 / 1=知人)。build_friend_graph が引く。
+_MARGIN_KEY_OF_TIER = {3: "margin_close", 2: "margin_friend", 1: "margin_acq"}
 
 
 def build_cfg(raw) -> dict:
@@ -99,6 +122,8 @@ def build_cfg(raw) -> dict:
             cfg[k] = int(v)
         elif k in _FLOAT_KEYS:
             cfg[k] = float(v)
+        elif k in _OPT_FLOAT_KEYS:
+            cfg[k] = None if v is None else float(v)
         elif k in _KNOT_KEYS:
             cfg[k] = sorted(([float(x), float(y)] for x, y in (v or [])),
                             key=lambda p: p[0])
@@ -218,6 +243,10 @@ def build_friend_graph(sim) -> None:
     thr = {1: float(rc["tier_acquaintance"]), 2: float(rc["tier_friend"]),
            3: float(rc["tier_close"])}
     margin = float(cfg["margin"])
+    # β4: 層別 margin(既定は 3 層とも None = margin = 従来と 1 バイトも変わらない)。
+    # 減衰 1.0/日 の下で「その層が接触ゼロで何日もつか」を決める唯一の数値。
+    margin_of = {tier: (margin if cfg.get(key) is None else float(cfg[key]))
+                 for tier, key in _MARGIN_KEY_OF_TIER.items()}
     # 各居住者の相手を親和スコア降順に並べ、Dunbar 層で desired tier を割る(有向)。
     desired: dict = {}
     for a in residents:
@@ -250,7 +279,7 @@ def build_friend_graph(sim) -> None:
             tier = max(desired.get((a.id, b.id), 0), desired.get((b.id, a.id), 0))
             if tier <= 0:
                 continue
-            clo = thr[tier] + margin
+            clo = thr[tier] + margin_of[tier]
             _inject(a, b, tier, clo)
             _inject(b, a, tier, clo)
             n_edges += 1

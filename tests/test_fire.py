@@ -651,3 +651,84 @@ def test_variable_thinking_changes_the_llm_call_count(tmp_path):
     assert off.llm.calls > 0 and on.llm.calls > 0
     assert off.llm.calls != on.llm.calls, \
         "可変思考 ON で呼数が全く変わらないなら発火機構が効いていない"
+
+
+# --------------------------------------------------------------------------- #
+# (K) DPH-B(二層予算の FIFO 繰り越し)との相互作用 — D1-c #4b(第117 レーンB3)
+# --------------------------------------------------------------------------- #
+#   `lod.budget.tiers` は予算の取れなかった計画/内省を翌 step へ繰り越す
+#   (`plan_due_step` に初回予約 step を控えて `plan_step` を step+1 へ立て直す)。
+#   素朴に `plan_step == step` で拾うと **繰り越した step 数だけ** cog_event が出て、
+#   そのたびに周期発火が先送りされる = 「予算が足りなかった」という実験者側の都合が
+#   「その個体が何度も考えた」に化ける。案(b)= 初回予約 step だけを拾う。
+def _defer_sim(tmp_path, name, n_agents=6, **ov):
+    """予算ゼロ(= 必ず繰り越す)+ fire ON の sim を **run せずに**作る。"""
+    base = {**FULL, "lod.budget.tiers.enabled": "true",
+            "lod.max_llm_per_step": 0,
+            "lod.budget.tiers.max_defer_steps": 9}
+    return Simulation(_cfg(name, 1, n_agents, **base, **ov), out_dir=tmp_path / name)
+
+
+def test_first_reservation_predicate_ignores_agents_without_the_attribute():
+    """tiers OFF では `plan_due_step` が生えない = 常に True(既定は 1 バイトも変わらない)。"""
+    class _A:
+        pass
+    a = _A()
+    assert F._at_first_reservation(a, "plan_due_step", 7) is True
+    a.plan_due_step = -1
+    assert F._at_first_reservation(a, "plan_due_step", 7) is True
+    a.plan_due_step = 7
+    assert F._at_first_reservation(a, "plan_due_step", 7) is True
+    a.plan_due_step = 5                            # 5 に予約されて 7 まで繰り越し中
+    assert F._at_first_reservation(a, "plan_due_step", 7) is False
+
+
+def test_deferred_plan_is_noted_only_at_the_first_reservation(tmp_path):
+    """★D1-c #4b: 繰り越し 2 step でも cog_event{via:"plan"} は **初回の 1 回だけ**。"""
+    sim = _defer_sim(tmp_path, "fire_defer_plan")
+    agent = sim.agents[0]
+    for a in sim.agents:                           # 他の個体を巻き込まない
+        a.plan_step, a.reflect_step, a._reply_to = -1, -1, None
+        a.sleeping, a.loc = False, "street"
+    agent.plan_step = 5                            # step 5 に予約された計画
+    vias = []
+    for step in (5, 6, 7):
+        F.note_plan_due(sim, step)
+        due = frozenset(getattr(sim, "_fire_plan_due", ()) or ())
+        vias.append(F._social_via(sim, agent, step, due))
+        scheduler._phase_planning(sim, step, sim.clock.sim_min(step))
+        assert agent.plan_step == step + 1, "予算ゼロなのに繰り越されていない(前提が崩れた)"
+        assert agent.plan_due_step == 5, "初回予約 step が保たれていない"
+    assert vias == ["plan", "", ""], \
+        f"繰り越し中も plan を拾っている(周期発火が先送りされる): {vias}"
+
+
+def test_deferred_reflect_is_noted_only_at_the_first_reservation(tmp_path):
+    """内省も同じ穴を持つ(`_reflect_due` が `reflect_step` を翌 step へ立て直す)。"""
+    sim = _defer_sim(tmp_path, "fire_defer_reflect")
+    agent = sim.agents[0]
+    for a in sim.agents:
+        a.plan_step, a.reflect_step, a._reply_to = -1, -1, None
+        a.sleeping, a.loc = False, "street"
+    agent.reflect_step = 5
+    vias = []
+    for step in (5, 6, 7):
+        F.note_plan_due(sim, step)
+        due = frozenset(getattr(sim, "_fire_plan_due", ()) or ())
+        vias.append(F._social_via(sim, agent, step, due))
+        assert scheduler._reflect_due(sim, step, sim.clock.sim_min(step)) == []
+        assert agent.reflect_step == step + 1 and agent.reflect_due_step == 5
+    assert vias == ["reflect", "", ""], \
+        f"繰り越し中も reflect を拾っている: {vias}"
+
+
+def test_tiers_off_note_plan_due_is_unchanged(tmp_path):
+    """二層予算 OFF(既定)では従来どおり `plan_step == step` の全員を拾う。"""
+    sim = Simulation(_cfg("fire_plain", 1, 6, **FULL), out_dir=tmp_path / "fire_plain")
+    for a in sim.agents:
+        a.plan_step = -1
+    picked = [int(a.id) for a in sim.agents[:3]]
+    for a in sim.agents[:3]:
+        a.plan_step = 4
+    F.note_plan_due(sim, 4)
+    assert list(sim._fire_plan_due) == sorted(picked)

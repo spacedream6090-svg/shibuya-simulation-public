@@ -175,6 +175,7 @@ CAUSE_OF_KIND: dict[str, str] = {
     "ride":          AGENT,
     "taxi_unmatched": DEVICE,        # 配車装置が捕まえられなかった(個体は乗ろうとしただけ)
     "sleep_start":   AGENT,          # 自宅へ帰って就寝する = 選択の帰結
+    "home_activity": AGENT,          # 帰宅後の在宅活動(食事/入浴/家事/団らん/…)= 個体の選択
     "wake_up":       PHYSICS,        # 起床は概日リズム側(選べない)
     "space_move":    PHYSICS,        # 屋内区画遷移 = markov 回遊(個体の選択ではない)
     "zone_gate":     PHYSICS,        # 物理ゾーンの境界通過(SFM の積分結果)

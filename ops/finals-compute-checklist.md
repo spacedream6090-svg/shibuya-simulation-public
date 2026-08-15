@@ -40,6 +40,31 @@ E1-1〜E1-4 / 起動スクリプト [launch-vllm-finals.ps1](launch-vllm-finals.
 
 ---
 
+## E3 ★watchdog / backup の本選値(第121 レーンB3・2026-08-15)
+
+**コードの既定値は 1 つも変えていない**(開発用の小ランで回している既存テストを守るため)。
+本選は**下のコマンドラインで明示的に上書きする**。根拠と引数の意味は
+[scripts/watchdog.py](../scripts/watchdog.py) の冒頭 docstring と `--help` にも同じものがある。
+
+```bash
+python scripts/watchdog.py --run-dir runs/finals1 \
+  --stall-step-sec <8/15 実測の 1 step 秒> --stall-factor 6 \
+  --disk-warn-gb 50 --disk-crit-gb 20 \
+  -- run.out_dir=runs run.name=finals1 --profile conf/finals_observe.yaml
+```
+
+| 項目 | 既定 | **本選値** | なぜ |
+|---|---:|---:|---|
+| 停滞判定 | `--stall-min 20`(= 20 分固定) | `--stall-step-sec <実測>` + `--stall-factor 6` | 25万体の 1 step は開発機の数百倍。進捗は checkpoint 粒度でしか見えないので、**1 step も進まないうちに kill する**のが最悪の事故。判定は `max(--stall-min, step_sec × factor)` = **必ず待つ側へ倒れる**(1 step 90 秒なら 20 分側が勝ち、1 step 600 秒なら 60 分側が勝つ) |
+| ディスク警告 | `--disk-warn-gb 20` | **50** | E0 で checkpoint / dormant を 1 世代も剪定しない。警告が出た時点で世代コピー数回ぶんの余裕が要る |
+| ディスク致命 | `--disk-crit-gb 5` | **20** | 世代バックアップ 1 回ぶん(数 GB)を書き切れる残量で「最後の一声」を出す |
+| 世代保全 | `backup_run.py --ckpt-generations 2` | **999** | E0。既定のままだと 20 世代のうち 18 世代が手元に残らない(§E0 の 1.) |
+
+★ `--stall-step-sec` の実測値は **8/15 診断(D1-a と同じラン)の壁時計 ÷ step 数**で足りる。
+測っていない場合は引数を渡さなければ従来どおり `--stall-min` だけで動く(退路つき)。
+
+---
+
 ## E1-1 speculative decoding(無損失・文献値 最大 ~2.8x)
 
 **狙い**: 目標モデルと同一分布のまま decode を速くする(出力の意味は変えない)。

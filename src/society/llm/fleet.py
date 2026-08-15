@@ -41,7 +41,8 @@ class FleetLLM(LLMBackend):
                  cooldown_s: float = 30.0,
                  now: Callable[[], float] = time.monotonic,
                  format_mode: str = "json",
-                 deadline_s: float = DEFAULT_DEADLINE_S):
+                 deadline_s: float = DEFAULT_DEADLINE_S,
+                 request_seed: int | None = None):
         if not servers:
             raise ValueError("FleetLLM には少なくとも1本の server URL が必要。")
         self.name = f"fleet/{model}"          # ★URL 非依存(D13)
@@ -57,9 +58,13 @@ class FleetLLM(LLMBackend):
         # 他サーバへ再分配されるべき事象なので、子が時限で "__vllm_error__" を
         # 返せば既存のフェイルオーバ(cooldown)がそのまま働く。
         self.deadline_s = float(deadline_s)
+        # β11 request-level stable seed(第117)。None(既定)= 子は seed を送らない
+        # = 送出ボディが従来とバイト一致。どのサーバに振られても seed は同じ材料
+        # (run_seed, rng_key)から出るので、**sticky 先が変わっても値は動かない**。
+        self.request_seed = None if request_seed is None else int(request_seed)
         self._backend: dict[str, VllmBackend] = {
             u: VllmBackend(model, u, timeout_s=timeout_s, format_mode=format_mode,
-                           deadline_s=deadline_s)
+                           deadline_s=deadline_s, request_seed=self.request_seed)
             for u in self.servers}
         # tier プール(purpose → URL リスト)。既定は全 URL の default 1プール。
         self._tiers: dict[str, list[str]] = {}
@@ -70,7 +75,8 @@ class FleetLLM(LLMBackend):
                     self._backend.setdefault(
                         u, VllmBackend(model, u, timeout_s=timeout_s,
                                        format_mode=format_mode,
-                                       deadline_s=deadline_s))
+                                       deadline_s=deadline_s,
+                                       request_seed=self.request_seed))
                 self._tiers[str(purpose)] = pool
         self._default = self._tiers.get("default", list(self.servers))
         self._cooldown: dict[str, float] = {}
@@ -80,6 +86,16 @@ class FleetLLM(LLMBackend):
         # 構築時に 1 回だけ行い、以降は不変(ラン途中で変えない=指紋を作らない)。
         # 存在しないティア名を入れても素通り(_pool が既定へ後退)= 縮退は ablate 側が告知する。
         self.force_tier: str | None = None
+
+    def request_seed_for(self, rng_key: str) -> int | None:
+        """β11: この呼び出しへ送る seed(OFF=None)。CachedLLM の journal 記録用の口。
+
+        値は (run_seed, rng_key) だけの純関数なので、どの子 backend に聞いても同じ。
+        """
+        if self.request_seed is None:
+            return None
+        from .vllm import stable_request_seed
+        return stable_request_seed(self.request_seed, rng_key)
 
     @staticmethod
     def _parse_key(rng_key: str) -> tuple[str, str | None]:

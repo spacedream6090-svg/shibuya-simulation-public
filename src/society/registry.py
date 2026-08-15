@@ -155,6 +155,17 @@ FEATURES: tuple[Feature, ...] = (
        "free(既定)/ replay(キャッシュミスで即例外=再現ランの fail-fast)", off_value="free"),
     _f("model.reflect_think", "strict", False, "none",
        "内省を思考モードで回す。LLM のパラメータ(キャッシュキーに含まれる)=分岐は生まない"),
+    # β11 request-level stable seed(第117 レーン B1。監査 F14)。
+    # strict の根拠: seed の値は (run.seed, rng_key) の blake2b **純関数**で、乱数 stream を
+    #   1 本も引かず LLM の自由文も 1 バイト読まない。再現性を**上げる**方向の装置なので
+    #   verify モードでも落とさない(model.cache と同じ理由づけ)。
+    # affects_k=False: generate() の呼び出し点を 1 つも足さず・減らさない。
+    # fingerprint_risk=none: プロンプトを 1 バイトも変えない(送出ボディの seed 欄だけ)。
+    _f("llm.request_seed.enabled", "strict", False, "none",
+       "vLLM への 1 リクエストごとの安定 seed。OFF(既定)では送出ボディがバイト単位で"
+       "従来と同一。ON では seed = blake2b(run_seed, agent_id, step, purpose, ordinal) & "
+       "0x7fffffff を付け、llm_journal に seed 欄を残す。主張できるのは『乱数条件を明示して"
+       "保存した』ことまでで、bit 単位の決定論ではない(連続バッチングの数値差は残る)"),
 
     # ---- world ----
     _f("world.scenario", "strict", False, "possible",
@@ -1536,6 +1547,13 @@ FEATURES: tuple[Feature, ...] = (
        "娯楽メディア(TV/動画/ゲームの在宅娯楽と気分修復)"),
     _f("media.prompt_context", "strict", False, "possible",
        "直近視聴タイトル(架空)1行を発火文脈へ入れる"),
+    _f("daily.home_awake.enabled", "strict", False, "none",
+       "在宅覚醒 HOME_AWAKE(β9): 帰宅と就寝を分ける。現行は go_to_bed が入館と就寝を"
+       "同じ step で連続実行する構造で、帰宅→就寝が実測 100.0% 0 分(在宅の覚醒時間が"
+       "世界に無い)。ON では就寝ハザード p=sigmoid(b0+b1*概日+b2*疲労+b3*翌日早出−b4*没入)"
+       "を挟み、在宅活動ラベル 8 種をルールベース抽選する。★affects_k=False: LLM の"
+       "呼び出し点を 1 つも足さない(在宅覚醒中は睡眠中と同じく _phase_drive の対象外)。"
+       "乱数は新 stream \"home_awake\" のみ・プロンプトに機構語ゼロ"),
     _f("organizations.enabled", "strict", False, "none",
        "組織(職場・学校)台帳の配属"),
     _f("organizations.commute_to_poi", "strict", False, "none",
@@ -1839,6 +1857,12 @@ ALLOWLIST: dict[str, str] = {
     # conf には無く、実行時に scripts/run.py が dotlist で足す実行制御フラグ。
     # 「seed を OS エントロピーから採るよう要求したか」の記録であって世界の機能ではない。
     "run.seed_auto": "実行時の seed 採取要求フラグ(conf 非搭載・世界の挙動を変えない)",
+    # β6(第117 レーン B1): 起動口(scripts/run.py)の**誤爆ガードの逃し弁**であって
+    # 世界の機能ではない。シム本体はこのキーを 1 度も読まない(Simulation も scheduler も
+    # 参照しない)= ON/OFF で L1 が 1 バイトも変わらない。run.seed_auto と同じ族。
+    "run.allow_mock_production":
+        "本番規模(n_agents>=10,000)の mock ランを明示的に許す起動制御フラグ"
+        "(既定 false=起動口で RuntimeError。世界の挙動には一切関与しない)",
     # 第82バッチ: watch 機能**内部**の形の指定であって独立した機能トグルではない
     # (cognition.watch.enabled が OFF なら 1 バイトも効かない)。ON のときこの行を
     # 落とすと「watch 節はあるが驚き発火の 1 行が無い」対照条件になる=解析用の内部レバー。

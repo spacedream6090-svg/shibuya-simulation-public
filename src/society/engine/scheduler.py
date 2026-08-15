@@ -26,6 +26,7 @@ from .. import freedom_p2 as freedom_p2_mod
 from .. import gossip as gossip_mod
 from .. import goods as goods_mod
 from .. import health as health_mod
+from .. import home_awake as home_awake_mod
 from .. import household as household_mod
 from .. import incidents_interpersonal as incidents_mod
 from .. import inner_life as inner_life_mod
@@ -2610,9 +2611,14 @@ def _phase_drive(sim, step: int, sim_min: int) -> None:
     cfg = sim.drivecfg
     radius = float(sim.cfg.world.perception_radius_m)
     stats = {"requests": 0, "fires": 0, "face_fires": 0, "replies": 0}
-    # 勾留中(detained_until。既定 0=全員 step>=0 で常に通過=不変)は欲求発火の対象外
+    # 勾留中(detained_until。既定 0=全員 step>=0 で常に通過=不変)は欲求発火の対象外。
+    # 在宅覚醒中(HOME_AWAKE β9・既定 OFF=属性が存在せず home_awake_mod.muted は常に False)
+    # も同様に対象外にする = **起きている時間が伸びたぶんだけ呼数が増える**という副作用を
+    # 構造で断つ(R1: この機能は LLM を 1 呼も足さない)。睡眠中と同じ扱い = 差分は
+    # 「その時間に家に居るか路上に居るか」だけに絞られる。
     active = [a for a in sim.agents if a.loc != "outside" and not a.sleeping
-              and step >= getattr(a, "detained_until", 0)]
+              and step >= getattr(a, "detained_until", 0)
+              and not home_awake_mod.muted(a)]
     affect_on = _affect_on(sim)
     health_on = _health_on(sim)
     # 離散感情ラベル(内面 H6): affect ON 前提で core affect(mood_valence × arousal)から離散ラベルを
@@ -2826,7 +2832,11 @@ def _decide(sim, agent, step: int, sim_min: int) -> dict:
     agent._heard_unknown = False
 
     # 返答保証: 話しかけられたら抽選なしで必ずLLMで返答(予算があれば)。
-    if agent._reply_to is not None:
+    #  ★在宅覚醒(HOME_AWAKE β9・既定 OFF=muted は常に False=従来経路): 睡眠中と同じ扱いで
+    #    ここを素通りする。`_reply_to` は**消さずに預かったまま**にするので、OFF で就寝中に
+    #    保留された返事が起床後に撃たれるのと同じ挙動になる(返事を落とさない = DPH-B の
+    #    「返事保証 100%」を壊さない)。これで在宅覚醒は LLM 呼を 1 本も足さない。
+    if agent._reply_to is not None and not home_awake_mod.muted(agent):
         # ---- 第87バッチ: 関係の薄い相手からの定型接触は 1 ターンのテンプレで流す(§8 突入 2)。
         #  **LLM を 1 本も呼ばず・予算も取らず**返す = ENGAGED に突入しない = この後
         #  _apply(speak) の handoff_ok が返答権を渡さないので、やりとりは 1 ターンで終わる。
@@ -3182,6 +3192,11 @@ def _apply_action(sim, agent, action: dict, step: int, sim_min: int) -> None:
                                           "floor": agent.floor,
                                           "levels": int(bld["levels"]),
                                           "home": True}))
+        # 在宅覚醒 HOME_AWAKE(β9・既定 OFF): routine が awake=True を付けたときだけ
+        # 「入館したが寝ない」で止める。既定 conf では awake キーが存在しない
+        # (routine._home_awake_begin が常に False)= ここは 1 ビットも変わらない。
+        if action.get("awake"):
+            return
         kind = "sleep"
 
     if kind == "sleep":
@@ -3407,6 +3422,12 @@ def _apply_action(sim, agent, action: dict, step: int, sim_min: int) -> None:
         if hearers:
             partner = _select_partner(sim, agent, hearers)
             if (not partner.sleeping and partner.conv_turns_left > 0
+                    # 在宅覚醒(HOME_AWAKE β9・既定 OFF=muted は常に False=従来経路)。
+                    # 睡眠中と同じ扱いで返答権を渡さない = この機能が **返事の LLM 呼を
+                    # 1 本も足さない**ことを構造で保証する(R1)。★代償として「同居人どうしが
+                    # 夜の自宅で話す」発話は成立しない(現行 OFF でも両者は就寝中なので
+                    # 失うものは無いが、開けるなら conf ではなくこの 1 行の判断)。
+                    and not home_awake_mod.muted(partner)
                     and step >= partner.conv_cooldown_until
                     # 第87: **会話は両者 ENGAGED が成立条件**(§8 補助規則 2)。話者が
                     # AUTOPILOT(通りすがりの独り言・定型で流した側)なら返答権を渡さない
@@ -6049,6 +6070,10 @@ def run_step(sim, step: int) -> None:
     if getattr(sim, "cognition_g_sc", None) is not None and plasticity_mod.due(sim, step):
         sim.cognition_g_sc.add_rows(plasticity_mod.rows(sim, step, sim_min))
 
+    # DPH-O ⑤(observer.starvation。既定 OFF は即 return=1 バイトも動かない): この step の
+    # LLM 予算の使用量 used / cap を 1 件積む。**読むだけ**で、この値を見て動く行はシム側に
+    # 1 行も無い。位置は「全ての budget.take が済んだあと・次 step 頭の reset の前」= ここ。
+    starvation_mod.note_step_budget(sim, sim.budget)
     sim.logger.log_metrics(step, collect(sim))
     if step % int(sim.cfg.observer.snapshot_every) == 0:
         # 既定(drift/accounts OFF)は下の dict がそのまま=L3 バイト一致。ON 時のみ追記。

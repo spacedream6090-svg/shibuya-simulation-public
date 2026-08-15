@@ -16,6 +16,36 @@
 #                                 ★EAGLE 等の draft は本選機で未検証 → 起動疎通 + ゴールデン一致 +
 #                                   tok/s before/after を必ず実測してから本番採用(数値は約束しない)。
 #
+# -----------------------------------------------------------------------------
+# β10 モデル・サンプリングの完全凍結(第117バッチ 2026-08-16)
+#   正典: docs/plans/beta-implementation-plan.md §1 β10 / external-audit-triage.md F15。
+#
+#   ① --generation-config vllm(★本バッチで追加)
+#      vLLM の既定は `--generation-config auto` = **モデルリポジトリ同梱の
+#      generation_config.json をサンプリング既定として採用する**。つまり未指定の
+#      temperature / top_p / top_k / repetition_penalty が「そのモデルの作者が置いた値」に
+#      なり、モデルを差し替えると**こちらの conf を 1 文字も変えていないのに分布が変わる**。
+#      `vllm` を指定すると vLLM 自身の中立な既定に固定され、実際に効くのは
+#      「リクエストで明示した値」だけになる = 実験条件が起動側で閉じる。
+#
+#   ② モデル表記は **HF repo id + revision 固定を推奨**(第一候補 Qwen/Qwen3-8B-AWQ)
+#      `-Model qwen3:8b` のような ollama 風タグは vLLM では「served-model-name(別名)」に
+#      しかならず、**実体がどの重みか**を後から確定できない。本選では
+#        vllm serve Qwen/Qwen3-8B-AWQ --revision <commit sha> --served-model-name qwen3-8b ...
+#      の形にして、run_manifest の launch 欄(起動側申告)へ同じ文字列を書き写すこと。
+#      候補サイズ: Qwen3-8B-AWQ 約6.11GB / Qwen3-14B-AWQ 約9.99GB(A5000 24GB × 7 枚)。
+#      ★revision を省くと HF 側の main が動いた瞬間に「同じ名前で違う重み」になる。
+#
+#   ③ sampling は**全部明示**する(client 側 = conf/finals 側の責務)
+#        temperature … conf `model.temperature`(既定 0.7)= 送出ボディに必ず載る
+#        max_tokens  … conf `model.max_tokens` / `model.reflect_max_tokens` = 必ず載る
+#        top_p/top_k … ★現状 **client は送っていない** = ① の既定に従う。値を主張したい
+#                       なら vllm.py の body へ足す(送っていない値を manifest に書かない)。
+#        seed        … conf `llm.request_seed.enabled=true`(β11)で 1 リクエストごとに
+#                       blake2b(run_seed, agent_id, step, purpose, ordinal) を送る。
+#                       OFF ではサーバ側のグローバル乱数 = 同じ入力でも応答が揺れる。
+# -----------------------------------------------------------------------------
+#
 # 使い方:
 #   powershell -NoProfile -File ops/launch-vllm-finals.ps1                 # dry-run(表示のみ)
 #   powershell -NoProfile -File ops/launch-vllm-finals.ps1 -Model qwen3:8b -Speculative
@@ -58,7 +88,10 @@ for ($i = 0; $i -lt $NumGpus; $i++) {
         "--port $port",
         "--served-model-name $Model",
         "--gpu-memory-utilization $GpuMemUtil",
-        "--max-model-len $MaxModelLen"
+        "--max-model-len $MaxModelLen",
+        # β10: サンプリング既定をモデル同梱の generation_config.json ではなく vLLM 側へ固定する
+        # (auto のままだとモデル差し替えで未指定パラメータが黙って変わる。上部の注記 ① を参照)。
+        "--generation-config vllm"
     )
     if ($EnablePrefixCache) { $flags += "--enable-prefix-caching" }
     if ($Speculative) {
@@ -89,5 +122,11 @@ for ($i = 0; $i -lt $NumGpus; $i++) {
 }
 
 Write-Host ""
+if ($Model -notmatch "/") {
+    # β10: HF repo id(`org/repo`)でない = 実体の重みが事後に確定できない表記。
+    Write-Host "[β10 注意] -Model '$Model' は HF repo id ではありません。本選は" -ForegroundColor Yellow
+    Write-Host "          'Qwen/Qwen3-8B-AWQ' + --revision <commit sha> で起動し、" -ForegroundColor Yellow
+    Write-Host "          別名は --served-model-name で付けること(冒頭の注記 ② を参照)。" -ForegroundColor Yellow
+}
 Write-Host "次の手順: ops/finals-compute-checklist.md(speculative の before/after 実測・prefix cache ヒット率確認)"
 if (-not $Execute) { Write-Host "(何も起動していません=dry-run)" -ForegroundColor Yellow }

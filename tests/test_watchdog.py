@@ -10,8 +10,10 @@
 """
 from __future__ import annotations
 
+import gzip
 import importlib.util
 import json
+import pickle
 import shlex
 import sys
 from pathlib import Path
@@ -436,3 +438,133 @@ def test_real_run_py_smoke_completes(tmp_path):
     assert (run_dir / "summary.json").exists()
     assert (run_dir / "l1_events.parquet").exists()  # part は finalize で結合済み
     assert not list(run_dir.glob("l1_events.part-*.parquet"))
+
+
+# --------------------------------------------------------------------------- #
+# 停滞判定の本選値化(第117 レーンB3 β2)
+#
+#   既定は開発用の小ラン向け(20 分固定)。25万体では 1 step が checkpoint 粒度より長く
+#   なりうるので「1 step の実測秒 × 係数」と連動できる引数を足した。**既定値は 1 つも
+#   変えていない**(--stall-step-sec を渡さなければ従来と 1 秒も変わらない)。
+# --------------------------------------------------------------------------- #
+def test_stall_seconds_defaults_to_stall_min_only():
+    assert WD.stall_seconds(20.0) == 1200.0
+    assert WD.stall_seconds(20.0, 0.0) == 1200.0
+    assert WD.stall_seconds(20.0, 0.0, 6.0) == 1200.0
+    assert WD.stall_seconds(20.0, 90.0, 0.0) == 1200.0     # 係数 0 = 連動を切る
+
+
+def test_stall_seconds_takes_the_larger_of_the_two():
+    """必ず「待つ側」へ倒れる(短い実測で本選を誤 kill しない)。"""
+    assert WD.stall_seconds(20.0, 90.0, 6.0) == 1200.0     # 90*6=540 < 1200 → 20 分側
+    assert WD.stall_seconds(20.0, 600.0, 6.0) == 3600.0    # 600*6=3600 > 1200 → 1 step 側
+    assert WD.stall_seconds(0.0, 600.0, 6.0) == 3600.0
+
+
+def test_stall_args_defaults_are_unchanged_and_overridable(tmp_path):
+    ns = WD.parse_args(["--run-dir", str(tmp_path)])
+    assert (ns.stall_min, ns.stall_step_sec, ns.stall_factor) == (20.0, 0.0, 6.0)
+    assert _wd(tmp_path).stall_sec == 1200.0               # 既定は従来どおり
+    wd = _wd(tmp_path, stall_step_sec=600, stall_factor=6)
+    assert wd.stall_sec == 3600.0
+    wd = _wd(tmp_path, stall_min=90)                       # 単独指定も従来どおり
+    assert wd.stall_sec == 5400.0
+
+
+def test_help_carries_the_finals_recommendations():
+    """本選推奨値(ディスク 50/20・stall 連動・ckpt-generations 999)が読める場所にある。
+
+    ★「既定値は変えない代わりにヘルプと手順書へ書く」が β2 の契約なので、
+      **その文言そのもの**を機械固定する(消えたら赤くなる)。
+    """
+    scripts = Path(WD.__file__).parent
+    doc = WD.__doc__ or ""
+    assert "--disk-warn-gb 50" in doc and "--disk-crit-gb 20" in doc
+    assert "--ckpt-generations 999" in doc
+    assert "--stall-step-sec" in doc
+    parser_src = Path(WD.__file__).read_text(encoding="utf-8")
+    assert "★本選推奨 50" in parser_src and "★本選推奨 20" in parser_src
+    backup_src = (scripts / "backup_run.py").read_text(encoding="utf-8")
+    assert "本選は必ず 999" in backup_src
+    checklist = (scripts.parent / "ops" / "finals-compute-checklist.md"
+                 ).read_text(encoding="utf-8")
+    assert "--stall-step-sec" in checklist and "--disk-warn-gb 50" in checklist
+
+
+# --------------------------------------------------------------------------- #
+# COMPLETE マーカー(第117 β7)の取り回し(第117 レーンB3 追加発注2)
+#
+#   マーカーの意味は「この本体は最後まで書けた」。したがって**本体と運命を共にする**の
+#   が唯一の正しい規約で、片方だけ残すと「本体の無い完了印」= 孤児マーカーができる。
+#   ★`CKPT_GLOB` は `.pkl.gz` 終端なので進捗検知・`_latest_ckpt` はマーカーに掛からない
+#     (= 既存挙動は無風)。明示的に扱うのは隔離と一掃の 2 箇所だけ。
+# --------------------------------------------------------------------------- #
+def _put_ckpt(run_dir: Path, step: int, *, marker: bool = True) -> Path:
+    d = run_dir / "checkpoint"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"ckpt-{step:06d}.pkl.gz"
+    with gzip.open(p, "wb") as f:
+        f.write(pickle.dumps({"format": 1, "step": step}))
+    if marker:
+        (d / (p.name + WD.COMPLETE_SUFFIX)).write_bytes(b"")
+    return p
+
+
+def test_rollback_quarantines_the_marker_with_its_body(tmp_path):
+    """★本体を corrupt/ へ隔離したら、その COMPLETE マーカーも一緒に降りる。"""
+    wd = _wd(tmp_path)
+    run_dir = wd.run_dir
+    _put_ckpt(run_dir, 100)
+    _put_ckpt(run_dir, 200)
+    ck = run_dir / "checkpoint"
+    wd._rollback_one_generation(200)               # 200 を疑って隔離する
+    quar = ck / "corrupt"
+    assert (quar / "ckpt-000200.pkl.gz").exists(), "本体が隔離されていない(前提が崩れた)"
+    assert (quar / "ckpt-000200.pkl.gz.complete").exists(), \
+        "★マーカーが隔離されず run-dir に取り残された(孤児マーカー)"
+    assert not (ck / "ckpt-000200.pkl.gz.complete").exists()
+    # 巻き戻し先(100)は本体もマーカーも無傷
+    assert (ck / "ckpt-000100.pkl.gz").exists()
+    assert (ck / "ckpt-000100.pkl.gz.complete").exists()
+
+
+def test_rollback_without_a_marker_still_works(tmp_path):
+    """★後方互換: マーカーの無い(第117 以前の)checkpoint でも従来どおり隔離できる。"""
+    wd = _wd(tmp_path)
+    ck = wd.run_dir / "checkpoint"
+    _put_ckpt(wd.run_dir, 100, marker=False)
+    _put_ckpt(wd.run_dir, 200, marker=False)
+    wd._rollback_one_generation(200)
+    assert (ck / "corrupt" / "ckpt-000200.pkl.gz").exists()
+    assert not list((ck / "corrupt").glob("*" + WD.COMPLETE_SUFFIX))
+    assert "quarantined suspect checkpoint" in _log(wd)
+
+
+def test_clear_run_state_leaves_no_orphan_markers(tmp_path):
+    """本体を消すときはマーカーも消す(孤児マーカーを積み上げない)。"""
+    wd = _wd(tmp_path)
+    ck = wd.run_dir / "checkpoint"
+    _put_ckpt(wd.run_dir, 100)
+    _put_ckpt(wd.run_dir, 200)
+    wd._clear_run_state()
+    assert not list(ck.glob("ckpt-*.pkl.gz"))
+    assert not list(ck.glob("*" + WD.COMPLETE_SUFFIX)), \
+        "★本体を消したのにマーカーが残った(孤児マーカー)"
+
+
+def test_marker_is_invisible_to_progress_and_latest(tmp_path):
+    """マーカーは進捗指紋にも `_latest_ckpt` にも掛からない(既存挙動が無風)。"""
+    wd = _wd(tmp_path)
+    _put_ckpt(wd.run_dir, 100, marker=False)
+    fp_before = wd._progress_fp()
+    latest_before = wd._latest_ckpt()
+    (wd.run_dir / "checkpoint" / "ckpt-000100.pkl.gz.complete").write_bytes(b"")
+    assert wd._progress_fp() == fp_before, "マーカーを置いただけで進捗が動いた"
+    assert wd._latest_ckpt() == latest_before
+    # ★不変量の在処: `_ckpt_step` は名前の**前半だけ**を見るのでマーカーを渡せば 100 を
+    #   返してしまう(下)。守っているのは「マーカーがそこへ渡らない」= 候補を作る glob が
+    #   `.pkl.gz` 終端であること。ここを緩めると隔離・剪定の対象が静かに広がる。
+    assert WD.CKPT_GLOB.endswith(".pkl.gz")
+    assert not list((wd.run_dir / "checkpoint").glob(WD.CKPT_GLOB)) == []
+    assert all(not p.name.endswith(WD.COMPLETE_SUFFIX)
+               for p in (wd.run_dir / "checkpoint").glob(WD.CKPT_GLOB))

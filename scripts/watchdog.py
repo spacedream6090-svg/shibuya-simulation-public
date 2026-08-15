@@ -18,7 +18,8 @@ checkpoint / resume(D16)はエンジン側に実装済み。本モジュール�
 ------------------
 - **プロセス死**(exit != 0): 最新 checkpoint から `--resume` で再起動。
 - **ストール**: run-dir の checkpoint / l1 part が `--stall-min`(既定20分)進まず、かつ
-  プロセスが生きている → kill して再開。
+  プロセスが生きている → kill して再開。**`--stall-step-sec` を渡すと
+  `max(--stall-min, --stall-step-sec × --stall-factor)`** で判定する(下記「本選値」)。
 - **正常終了**: exit 0 かつ summary.json 存在(= n_steps 到達)→ 再起動せず終了。
 - **リトライ上限** `--max-restarts`(既定10)超過 → status=failed で諦める。
 - **連続即死**(起動 `--min-uptime-sec` 秒以内に進捗なく死ぬ)→ 指数バックオフ。
@@ -51,6 +52,24 @@ LLM 健全性の監視(P0バッチ 2026-07-29 追加)
 - 空き容量は `shutil.disk_usage`(stdlib)。取得できない環境では state="unknown" として
   1 回だけ記録し、以後は黙る(欠測を 0 と偽らない)。
 
+★本選(25万体 10 シミュ日)の推奨値 — 既定値は 1 つも変えていない(第117 レーンB3)
+------------------------------------------------------------------------------
+正典: [ops/finals-compute-checklist.md](../ops/finals-compute-checklist.md) E3。
+**既定は開発用の小さいラン向け**で、本選規模ではどれも小さすぎる:
+
+- **停滞判定**: 25万体の 1 step は checkpoint 間隔より遥かに長い。**8/15 診断で測った
+  1 step の実測秒**を `--stall-step-sec` に入れ、`--stall-factor`(既定6)を掛けた値と
+  `--stall-min` の**大きい方**で判定する。1 step 90 秒なら 90×6=540 秒 = 9 分 → 20 分側が
+  勝つ。1 step 600 秒なら 3,600 秒 = 60 分が勝つ。**「1 step も進まないうちに kill する」
+  という最悪の事故**(= 進捗が checkpoint 粒度でしか見えないのに待ち時間が固定)を、
+  実測 1 本で塞ぐための引数。
+- **ディスク**: `--disk-warn-gb 50 --disk-crit-gb 20`。既定(20/5)は本選には小さい —
+  E0(剪定禁止)で checkpoint と dormant を**1 世代も消さない**運用なので、警告が出た
+  時点で数十 GB の余裕が要る(世代バックアップのコピー 1 回ぶんが数 GB)。
+- **バックアップ**: watchdog の `--keep-backups` はノード内のローリング複製。
+  **世代保全は `scripts/backup_run.py <run> <dest> --ckpt-generations 999`** だけが担う
+  (backup_run 側の既定 2 のままだと 18 世代が手元に残らない = E0 事故)。
+
 記録
 ----
 - `<run-dir>/watchdog.log`: タイムスタンプ付きの全アクション。
@@ -79,6 +98,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RUN_PY = REPO_ROOT / "scripts" / "run.py"
 CKPT_GLOB = "ckpt-*.pkl.gz"
 PART_GLOB = "*.part-*.parquet"
+#: 第117 β7 の COMPLETE マーカー拡張子(`society/engine/checkpoint.COMPLETE_SUFFIX` と同値。
+#: 本 module は society を import しない stdlib 限定なので値だけを写している)。
+#: ★`CKPT_GLOB` は `.pkl.gz` 終端なのでマーカーには**掛からない** = 進捗検知や
+#:   `_latest_ckpt` は無風。マーカーを明示的に扱うのは「本体と一緒に動かす」2 箇所だけ。
+COMPLETE_SUFFIX = ".complete"
 GB = float(1 << 30)
 
 
@@ -105,6 +129,21 @@ def disk_state(free_bytes: int | None, warn_gb: float, crit_gb: float) -> str:
     if warn_gb > 0 and free_gb < warn_gb:
         return "warn"
     return "ok"
+
+
+def stall_seconds(stall_min: float, step_sec: float = 0.0,
+                  factor: float = 6.0) -> float:
+    """停滞と判定するまでの秒数(純関数 = 単体テストできるように切り出す)。
+
+    - `step_sec <= 0`(既定)では **`--stall-min` そのまま** = 従来と 1 秒も変わらない。
+    - `step_sec > 0` を渡すと「**1 step の実測時間 × 係数**」と `--stall-min` の
+      **大きい方**を採る。小さい方を採らないのは、実測が短い(= 開発機で測った)ときに
+      本選で誤 kill する側へ倒れないため。閾値は必ず「安全側 = 待つ側」へ動く。
+    """
+    base = float(stall_min) * 60.0
+    if step_sec > 0.0 and factor > 0.0:
+        return max(base, float(step_sec) * float(factor))
+    return base
 
 
 def _existing_ancestor(path: Path) -> Path | None:
@@ -159,7 +198,10 @@ class Watchdog:
         self.child_args = list(args.child_args)
         self.base_cmd = (shlex.split(args.cmd) if args.cmd
                          else [sys.executable, str(DEFAULT_RUN_PY)])
-        self.stall_sec = float(args.stall_min) * 60.0
+        # 停滞判定(既定 = --stall-min のみ。--stall-step-sec を渡したときだけ 1 step 連動)
+        self.stall_sec = stall_seconds(args.stall_min,
+                                       float(getattr(args, "stall_step_sec", 0.0) or 0.0),
+                                       float(getattr(args, "stall_factor", 6.0) or 0.0))
         self.max_restarts = int(args.max_restarts)
         self.poll_sec = float(args.poll_sec)
         self.min_uptime_sec = float(args.min_uptime_sec)
@@ -485,8 +527,19 @@ class Watchdog:
         return None
 
     def _clear_run_state(self) -> None:
-        """run-dir の checkpoint(隔離した corrupt は残す)と part を消す。"""
+        """run-dir の checkpoint(隔離した corrupt は残す)と part を消す。
+
+        ★COMPLETE マーカー(第117 β7)も一緒に消す = **孤児マーカーを作らない**
+          (本体を消してマーカーだけ残すと「本体の無い完了印」が積み上がる)。
+          `_restore_from_backup` はこの直後にバックアップ世代を copytree で被せるので、
+          運んできた世代のマーカーは正しく揃った状態で置かれる。
+        """
         for p in self._ckpt_dir().glob(CKPT_GLOB):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        for p in self._ckpt_dir().glob(CKPT_GLOB + COMPLETE_SUFFIX):
             try:
                 p.unlink()
             except OSError:
@@ -524,6 +577,20 @@ class Watchdog:
             try:
                 shutil.move(str(latest), str(quar / latest.name))
                 self.log(f"quarantined suspect checkpoint {latest.name}")
+                # ★COMPLETE マーカー(第117 β7)は**本体と同時に**隔離する。本体だけを
+                #   corrupt/ へ移すと `<名前>.complete` が run-dir に取り残され、
+                #   「本体の無い完了印」= 孤児マーカーができる。マーカーの意味は
+                #   「この本体は最後まで書けた」なので、本体を疑って隔離した以上、
+                #   その保証も一緒に降ろすのが正しい(片方だけ残さない)。
+                marker = latest.with_name(latest.name + COMPLETE_SUFFIX)
+                if marker.exists():
+                    shutil.move(str(marker), str(quar / marker.name))
+                    self.log(f"quarantined COMPLETE marker {marker.name}", echo=False)
+                # ★COMPLETE マーカー(第117 β7)は**本体と同時に**隔離する。本体だけを
+                #   corrupt/ へ移すと `<名前>.complete` が run-dir に取り残され、
+                #   「本体の無い完了印」= 孤児マーカーができる。マーカーの意味は
+                #   「この本体は最後まで書けた」なので、本体を疑って隔離した以上、
+                #   その保証も一緒に降ろすのが正しい(片方だけ残さない)。
             except Exception as e:
                 self.log(f"quarantine failed: {e}")
         # 整合スナップショット(parts 同梱)を最優先で復元
@@ -731,7 +798,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--backup-dir", default=None,
                    help="バックアップ世代の置き場(既定: <run-dir>_backup)")
     p.add_argument("--stall-min", type=float, default=20.0,
-                   help="進捗が止まったと判定するまでの分(既定20)")
+                   help="進捗が止まったと判定するまでの分(既定20=開発用の小ラン向け)。"
+                        "★本選(25万体)は --stall-step-sec に 1 step の実測秒を渡して"
+                        "自動連動させる(下記)。単独で使うなら 60 以上を推奨")
+    p.add_argument("--stall-step-sec", type=float, default=0.0,
+                   help="1 step の実測秒(既定0=使わない=--stall-min そのまま)。"
+                        "渡すと停滞判定を max(--stall-min, これ × --stall-factor) にする。"
+                        "★本選は 8/15 診断の実測 1 step 秒を入れる"
+                        "(進捗は checkpoint 粒度でしか見えないので、1 step も進まないうちに"
+                        "kill する事故をこの 1 本で塞ぐ)")
+    p.add_argument("--stall-factor", type=float, default=6.0,
+                   help="--stall-step-sec に掛ける安全係数(既定6)。"
+                        "--stall-step-sec を渡さないときは一切効かない")
     p.add_argument("--max-restarts", type=int, default=10,
                    help="再起動の上限回数(既定10)。超えたら status=failed")
     p.add_argument("--poll-sec", type=float, default=5.0,
@@ -751,10 +829,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="LLM 健全性の点検間隔・分(既定10。最小30秒)")
     p.add_argument("--disk-warn-gb", type=float, default=20.0,
                    help="空き容量がこれを下回ったら警告・GB(既定20=安全側。0=警告しない)。"
-                        "警告のみでランは止めない")
+                        "警告のみでランは止めない。★本選推奨 50"
+                        "(E0=checkpoint/dormant を 1 世代も剪定しない運用のため)")
     p.add_argument("--disk-crit-gb", type=float, default=5.0,
                    help="空き容量がこれを下回ったら致命警告・GB(既定5)。世代バックアップを"
-                        "書く直前にも強調して出す(0=致命段を使わない)")
+                        "書く直前にも強調して出す(0=致命段を使わない)。★本選推奨 20"
+                        "(世代コピー 1 回ぶんの余裕を残して警告するため)")
     p.add_argument("--disk-check-min", type=float, default=5.0,
                    help="残量の点検・記録の間隔・分(既定5。最小30秒。0=監視しない)")
     p.add_argument("--cmd", default=None,

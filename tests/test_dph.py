@@ -577,3 +577,167 @@ def test_finals_keeps_the_fire_block_commented_out():
     from omegaconf import OmegaConf
     cog = OmegaConf.load(_REPO / "conf" / "finals_observe.yaml").get("cognition")
     assert "fire" not in cog and "watch" not in cog and "engaged" not in cog
+
+
+# =========================================================================== #
+# (7) DPH-O ⑤ = step あたりの used / cap(第117 レーンB3・**観測のみ**)
+# =========================================================================== #
+def test_used_per_step_is_absent_when_observation_is_off(tmp_path):
+    """既定 OFF では summary に starvation ごと出ない(= llm_budget も出ない)。"""
+    sim = _run(tmp_path, "sb_off", n_steps=24)
+    assert SV.provenance(sim) is None
+    assert "step_budget" not in (getattr(sim, "_starvation_state", None) or {})
+
+
+def test_used_per_step_observation_does_not_change_the_world(tmp_path):
+    """★観測 ON/OFF で行動列・LLM 呼数・世界の最終状態が完全一致(⑤ を足しても不変)。"""
+    ov = {"lod.max_llm_per_step": 4, "planning.day_plan.enabled": "true",
+          "lod.budget.tiers.enabled": "true"}
+    off = _run(tmp_path, "sb_world_off", n_steps=120, n_agents=30, **ov)
+    on = _run(tmp_path, "sb_world_on", n_steps=120, n_agents=30, **ov, **OBS)
+    assert _l1(off) == _l1_without_obs(on), "⑤ の観測で行動列が変わった"
+    assert _calls(off) == _calls(on), "⑤ の観測で LLM 呼数が変わった"
+    assert [c.get("llm_call_id") for c in off.logger.llm_calls] \
+        == [c.get("llm_call_id") for c in on.logger.llm_calls]
+    assert _world_state(off, 120) == _world_state(on, 120), \
+        "⑤ の観測で世界の最終状態が変わった"
+    assert SV.provenance(on)["llm_budget"]["steps"] == 120
+
+
+def test_used_per_step_matches_the_granted_calls(tmp_path):
+    """used の総和 = 予算が許可した呼の総数(二重計上も欠落もない)。"""
+    cap = 4
+    on = _run(tmp_path, "sb_sum", n_steps=120, n_agents=30,
+              **{"lod.max_llm_per_step": cap, "planning.day_plan.enabled": "true"},
+              **OBS)
+    prov = SV.provenance(on)
+    lb = prov["llm_budget"]
+    assert lb["steps"] == 120
+    assert lb["used_total"] == prov["llm_budget_granted_total"] > 0, \
+        "used の総和が purpose 別 granted の総和と食い違う"
+    assert lb["used_per_step"]["mean"] == round(lb["used_total"] / 120, 4)
+    assert 0 <= lb["used_per_step"]["p95"] <= cap
+    assert lb["cap_per_step_mean"] == float(cap)
+    assert 0.0 < lb["used_over_cap_mean"] <= 1.0, \
+        "充填率が (0, 1] の外(used <= cap の硬い上限が壊れている)"
+    assert lb["used_over_cap_mean"] == round(lb["used_per_step"]["mean"] / cap, 4)
+
+
+def test_used_p95_is_the_nearest_rank_of_the_histogram():
+    """p95 はヒストグラムからの最近傍順位法(numpy 非依存・step 列を持たない)。"""
+    assert SV._p95_from_hist({}) == 0
+    assert SV._p95_from_hist({0: 100}) == 0
+    # 100 件中 95 件が 1・5 件が 9 → ceil(0.95*100)=95 件目 = 1
+    assert SV._p95_from_hist({1: 95, 9: 5}) == 1
+    # 100 件中 94 件が 1・6 件が 9 → 95 件目 = 9
+    assert SV._p95_from_hist({1: 94, 9: 6}) == 9
+    assert SV._p95_from_hist({0: 1, 4: 1}) == 4
+
+
+def test_tight_cap_shows_a_binding_budget(tmp_path):
+    """cap を締めると充填率が上がる = 「cap が binding だったか」が事後に読める。"""
+    ov = {"planning.day_plan.enabled": "true"}
+    tight = _run(tmp_path, "sb_tight", n_steps=120, n_agents=40,
+                 **{"lod.max_llm_per_step": 2}, **ov, **OBS)
+    loose = _run(tmp_path, "sb_loose", n_steps=120, n_agents=40,
+                 **{"lod.max_llm_per_step": 200}, **ov, **OBS)
+    t = SV.provenance(tight)["llm_budget"]["used_over_cap_mean"]
+    l = SV.provenance(loose)["llm_budget"]["used_over_cap_mean"]
+    assert t > l, f"cap を締めても充填率が上がらない: tight={t} loose={l}"
+
+
+# =========================================================================== #
+# (8) DPH-B の繰り越し予約 staleness(第117 レーンB3 追加発注)
+#
+#   `plan_due_step` は「最初に予約された step」の印で、`plan_step` とセットでしか意味を
+#   持たない。退場ヘルパ(`health._exit_world` = 死亡 / `population._leave_world` = 転出)は
+#   `plan_step` を -1 に落とすのに印を残していたため、同じ実体が次に予約を受けた日に
+#   `_defer_first` が何日も前の step を返し、`waited` が巨大 = 初回から max_defer_steps
+#   超過扱いで **LLM 計画を一度も撃たずに骨格へ落ちる**。
+#   ★どちらのヘルパもプール回転で再実体化された退場者へ毎 step 冪等に貼り直されるので
+#     (health.phase / population の ready フック)、印の寿命は実体の寿命より長くなりうる。
+# =========================================================================== #
+def _carry_over_one_plan(sim, agent, step: int):
+    """予算ゼロで 1 回だけ繰り越させ、(plan_step, plan_due_step) を立てる。"""
+    for a in sim.agents:
+        a.plan_step, a.plan_due_step = -1, -1
+        a.sleeping, a.loc = False, "street"
+    agent.plan_step = step
+    scheduler._phase_planning(sim, step, sim.clock.sim_min(step))
+    assert agent.plan_step == step + 1 and agent.plan_due_step == step, \
+        "前提が崩れた(予算ゼロでも繰り越されていない)"
+
+
+def _next_reservation_is_fresh(sim, agent, later: int) -> dict:
+    """ずっと後の step で予約し直したときに「待たされた人」扱いされないか。"""
+    for a in sim.agents:
+        a.plan_step, a.sleeping, a.loc = -1, False, "street"
+    agent.plan_step = later
+    n0 = len(sim.logger.events)
+    scheduler._phase_planning(sim, later, sim.clock.sim_min(later))
+    new = sim.logger.events[n0:]
+    return {"plan_step": agent.plan_step,
+            "defer_cap": [e for e in new if e.kind == "plan_skipped"
+                          and e.payload["reason"] == "defer_cap"],
+            "skeleton": [e for e in new if e.kind == "plan_created"
+                         and e.payload.get("src") == "skeleton"]}
+
+
+def _stale_sim(tmp_path, name):
+    """tiers ON・予算ゼロ・繰り越し上限 1・観測 ON(= 骨格落ちが L1 に出る)。"""
+    return _sim(tmp_path, name, n_steps=1, n_agents=6,
+                **{"lod.max_llm_per_step": 0,
+                   "lod.budget.tiers.max_defer_steps": 1,
+                   "planning.day_plan.enabled": "true"}, **TIERS, **OBS)
+
+
+def test_death_clears_the_carry_over_reservation(tmp_path):
+    """★死亡(`health._exit_world`)が繰り越しの印を残さない。"""
+    from society import health as H
+
+    sim = _stale_sim(tmp_path, "stale_death")
+    agent = sim.agents[0]
+    _carry_over_one_plan(sim, agent, 10)
+    H._exit_world(agent)
+    assert agent.plan_step == -1, "退場で予約が畳まれていない(前提が崩れた)"
+    assert int(getattr(agent, "plan_due_step", -1)) == -1, \
+        "★繰り越しの印が宙に浮いている(plan_due_step が残った)"
+    # 帰結: ずっと後の日に予約し直しても「待たされた人」にならない
+    got = _next_reservation_is_fresh(sim, agent, 200)
+    assert got["defer_cap"] == [], \
+        f"新しい予約が初回から defer_cap 扱いになった: {got['defer_cap'][0].payload}"
+    assert got["skeleton"] == [], "LLM 計画を撃つ前に骨格へ落ちた"
+    assert got["plan_step"] == 201, "普通に翌 step へ繰り越されていない"
+
+
+def test_emigration_clears_the_carry_over_reservation(tmp_path):
+    """★転出(`population._leave_world`)が繰り越しの印を残さない(死亡版と同型)。"""
+    from society import population as P
+
+    sim = _stale_sim(tmp_path, "stale_emigrate")
+    agent = sim.agents[0]
+    _carry_over_one_plan(sim, agent, 10)
+    P._leave_world(agent)
+    assert agent.plan_step == -1
+    assert int(getattr(agent, "plan_due_step", -1)) == -1, \
+        "★繰り越しの印が宙に浮いている(plan_due_step が残った)"
+    got = _next_reservation_is_fresh(sim, agent, 200)
+    assert got["defer_cap"] == [] and got["skeleton"] == []
+    assert got["plan_step"] == 201
+
+
+def test_exit_helpers_grow_no_attribute_when_tiers_are_off(tmp_path):
+    """★既定(tiers OFF)では属性を 1 つも生やさない = pickle も L1 もバイト不変。"""
+    from society import health as H
+    from society import population as P
+
+    sim = _sim(tmp_path, "stale_off", n_steps=1, n_agents=4)
+    assert sim.budget.tiers is None
+    a, b = sim.agents[0], sim.agents[1]
+    for x in (a, b):
+        assert not hasattr(x, "plan_due_step")
+    H._exit_world(a)
+    P._leave_world(b)
+    for x in (a, b):
+        assert not hasattr(x, "plan_due_step"), \
+            "tiers OFF なのに繰り越し用の属性が生えた(既定挙動が変わっている)"

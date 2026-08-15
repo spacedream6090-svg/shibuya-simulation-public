@@ -85,6 +85,12 @@ CHUNK = 1 << 20
 
 CKPT_PREFIXES = ("ckpt-", "dormant-")            # 同 step の 2 つで 1 世代(pool サイドカー)
 CKPT_SUFFIX = ".pkl.gz"
+#: 第117 β7 の COMPLETE マーカー(`ckpt-000144.pkl.gz.complete` の空ファイル)。
+#: `society/engine/checkpoint.COMPLETE_SUFFIX` と同値だが、本スクリプトは stdlib 限定
+#: (society を import しない)なので値だけを写している。**マーカーは本体と同じ世代**
+#: として運ぶ: 退避先で resume するとき `checkpoint.latest` は「マーカーのある世代だけ」
+#: を候補にするので、本体だけ運ぶとその安全装置が退避先で効かなくなる。
+CKPT_COMPLETE_SUFFIX = ".complete"
 
 #: 既定で対象外にするもの(派生物・巨大ログ・書きかけ)。--exclude で足せる。
 DEFAULT_EXCLUDE = ("*.tmp", "run.out.log", "*.html")
@@ -218,6 +224,9 @@ def _excluded(name: str, patterns: tuple[str, ...]) -> bool:
 
 
 def _ckpt_step(name: str) -> int | None:
+    """checkpoint **本体**の step(マーカーは対象外 = `checkpoint_boundary` の mtime 基準を
+    本体だけに保つ。マーカーは本体の直後に書かれるので、境界に混ぜると part の締切が
+    わずかに緩む = 既定挙動が変わる)。"""
     for pre in CKPT_PREFIXES:
         if name.startswith(pre) and name.endswith(CKPT_SUFFIX):
             try:
@@ -225,6 +234,18 @@ def _ckpt_step(name: str) -> int | None:
             except ValueError:
                 return None
     return None
+
+
+def _ckpt_gen_step(name: str) -> int | None:
+    """**世代の割り当て**に使う step: 本体に加えて COMPLETE マーカーも同じ世代に入れる。
+
+    `select_payload` だけがこちらを使う。マーカーは本体と同じ step に束ねられるので、
+    「直近 N 世代だけ運ぶ」の切り出しでも**本体とマーカーが必ず一緒に行く/一緒に落ちる**
+    (片方だけが退避先に現れることが原理的に無い)。
+    """
+    if name.endswith(CKPT_COMPLETE_SUFFIX):
+        name = name[:-len(CKPT_COMPLETE_SUFFIX)]
+    return _ckpt_step(name)
 
 
 def checkpoint_boundary(run_dir: Path) -> tuple[int | None, float | None]:
@@ -257,8 +278,10 @@ def select_payload(run_dir: Path, *, ckpt_generations: int = 2,
 
     - `*.part-*.parquet` … footer 完結 + checkpoint 境界の内側(完走ランは境界不問)
     - その他 `*.parquet`(canonical) … footer 完結(finalize は tmp→replace の原子的書き)
-    - `checkpoint/` … **直近 `ckpt_generations` 世代**の `ckpt-` と `dormant-`(pool サイドカー)。
-      どちらも tmp→os.replace の原子的書きなので、最終名で存在すれば完結している。
+    - `checkpoint/` … **直近 `ckpt_generations` 世代**の `ckpt-` と `dormant-`(pool サイドカー)
+      **+ その COMPLETE マーカー(`*.pkl.gz.complete`)**。本体は tmp→os.replace の原子的
+      書きなので最終名で存在すれば完結しており、マーカーは**退避先で resume するときに
+      `checkpoint.latest` の「書きかけを掴まない」判定を効かせるため**に一緒に運ぶ。
     - それ以外の直下ファイル(summary.json / run_manifest.json / config.yaml / サイドカー /
       llm_journal.jsonl.gz / llm_cache.jsonl …) … そのまま同梱。追記中でも「その時点までの
       前半」は有効(journal の確定点は checkpoint 側に記録されている)。
@@ -326,7 +349,7 @@ def select_payload(run_dir: Path, *, ckpt_generations: int = 2,
             if _excluded(p.name, pats):
                 skips.append(Skip(f"checkpoint/{p.name}", "excluded(既定除外 or --exclude)"))
                 continue
-            step = _ckpt_step(p.name)
+            step = _ckpt_gen_step(p.name)          # 本体 + COMPLETE マーカーを同じ世代へ
             if step is None:
                 skips.append(Skip(f"checkpoint/{p.name}", "not-a-checkpoint(命名が想定外)"))
                 continue
@@ -854,7 +877,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="tar=増分tarのみ(既定・転送向き) / tree=展開コピー(解析をそのまま"
                         "掛けられる) / both=両方")
     p.add_argument("--ckpt-generations", type=int, default=2,
-                   help="転送する checkpoint 世代数(既定2。ckpt- と dormant- を同 step で対に)")
+                   help="転送する checkpoint 世代数(既定2。ckpt- と dormant- を同 step で対に)。"
+                        "★本選は必ず 999(= 全世代)で回す: E0『checkpoint/dormant の剪定禁止』"
+                        "(ops/finals-compute-checklist.md)により 1 世代も消さない運用で、"
+                        "既定 2 のままだと 20 世代のうち 18 世代が手元に残らない")
     p.add_argument("--min-age-sec", type=float, default=300.0,
                    help="checkpoint がまだ 1 つも無いときに part を確定とみなす静止秒(既定300)")
     p.add_argument("--no-checkpoint-boundary", action="store_true",

@@ -25,3 +25,6 @@ data/persona_pool_v2_smoke/
 data/juelich_ped/
 # 解析スクリプトの実験出力(runs/ と同格・再生成可能)
 experiments/
+# 完全解決済み本番conf(scripts/freeze_config.py が本番直前に生成。sha256 は manifest 側に残る)
+conf/finals_*_frozen.yaml
+conf/finals_*_frozen.yaml.sha256

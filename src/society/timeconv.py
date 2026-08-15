@@ -165,6 +165,13 @@ TABLE: tuple[tuple[str, str, str], ...] = (
     ("conversation.c2.meet_prob", PROB, "同席1対あたり毎 step の会話成立確率"),
     ("routine.stochastic.interrupt_prob.*", PROB, "滞在中の活動を中断する確率/step"),
     ("media.start_prob", PROB, "在宅×帯の 1 step あたり視聴開始確率"),
+    # ---- 在宅覚醒 HOME_AWAKE(β9)。ハザードの切片だけが「1 step あたり」の量 ----
+    #  p_sleep = sigmoid(logit(p0) + b1*概日 + b2*疲労 + b3*翌日早出 − b4*没入)。
+    #  切片を**確率 p0** で持たせてあるのは、まさにこの PROB 変換を通すため
+    #  (対数オッズのまま conf に置くと既存 4 分類のどれにも乗らず、Δt≠10 で静かに壊れる)。
+    ("daily.home_awake.hazard.p0", PROB,
+     "就寝ハザードの切片 = 就寝時刻ちょうど・他項ゼロのときの 1 step あたり就寝確率。"
+     "コード側は logit(p0) を切片に使うので、この変換で 10 分あたりのハザードが保たれる"),
     ("annual_events.crowd_bias", PROB, "群集日に集会ノードへ寄せる確率/step"),
     ("household.date_bias", PROB, "自由時間にデート先へ寄せる確率/step"),
     ("household.family_dinner.prob", PROB, "夕食帯の home 収束バイアス/step"),
@@ -380,6 +387,25 @@ TABLE: tuple[tuple[str, str, str], ...] = (
      "step ではないので Δt に依存しない(分 → step の換算は既存の clock.min_to_steps / "
      "_steps_until_tod が Δt 込みで行う=A9/A1 の経路をそのまま通る)"),
     ("indoor.meeting.window_min", INVARIANT, "分 of day の時刻帯。step ではない"),
+    # ---- 在宅覚醒 HOME_AWAKE(β9)の残り = すべて Δt 非依存(理由つき)----
+    ("daily.home_awake.enabled", INVARIANT, "機構トグル(量ではない)"),
+    ("daily.home_awake.lead_min", INVARIANT,
+     "帰宅トリガの前倒し[分]。実時間の長さなので Δt を変えても同じ分数を意味する"),
+    ("daily.home_awake.max_awake_min", INVARIANT,
+     "帰宅後に起きていられる上限[分]。実時間の長さ(コード側は step 差×step_minutes で"
+     "分へ直して比較する)"),
+    ("daily.home_awake.early_start_min", INVARIANT,
+     "「翌日早出」の判定境界[分 of day]= 時刻。step ではない"),
+    ("daily.home_awake.family_talk_boost", INVARIANT,
+     "在宅活動の重み表にかける無次元倍率(1 回の抽選にかかる比であって毎 step の量ではない)"),
+    ("daily.home_awake.engaged_acts", INVARIANT, "没入とみなす活動ラベルの集合(語彙)"),
+    ("daily.home_awake.hazard.b1", INVARIANT,
+     "概日項の傾き[対数オッズ/**時間**]。step ではなく実時間あたりの勾配なので Δt 非依存"),
+    ("daily.home_awake.hazard.b2", INVARIANT,
+     "疲労項の対数オッズ寄与 = ハザード比の対数。切片(p0)が Δt 変換を吸収するので"
+     "比のほうは Δt 非依存(小さい p では logit 差 ≒ log ハザード比)"),
+    ("daily.home_awake.hazard.b3", INVARIANT, "翌日早出項。b2 と同じ理由で Δt 非依存"),
+    ("daily.home_awake.hazard.b4", INVARIANT, "在宅活動への没入項。b2 と同じ理由で Δt 非依存"),
     # Wave 4 III-1(夜間開放)。**どれも step 量ではない**ので不変で正しい:
     #   hours は「分 of day の時刻帯」(indoor.meeting.window_min と同族)、max_stay_min は
     #   分(実時間。step 換算は呼び出し側の clock.min_to_steps が Δt 込みで行う = A1 の経路)、

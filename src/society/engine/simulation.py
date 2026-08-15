@@ -960,6 +960,14 @@ class Simulation:
         backend = str(cfg.model.backend)
         # 1 呼の絶対時限(M-1)。mock は HTTP を張らないので対象外。0 以下で無効=従来経路。
         deadline_s = float(cfg.model.get("call_deadline_s", 300.0))
+        # β11(第117): request-level stable seed。既定 OFF では **None** を渡す
+        # = vLLM 送出ボディが従来とバイト一致(seed キー自体を作らない)。
+        # ON では run.seed を材料の 1 つとして子 backend へ渡すだけで、乱数 stream は
+        # 1 本も引かない(値は (run_seed, rng_key) の blake2b 純関数)。
+        _rs_cfg = (cfg.get("llm", {}) or {}).get("request_seed", {}) or {}
+        request_seed = (int(cfg.run.seed)
+                        if bool(_rs_cfg.get("enabled", False)) else None)
+        self.llm_request_seed = request_seed
         if backend == "mock":
             raw = MockBackend(self.hub)
         elif backend == "ollama":
@@ -982,12 +990,14 @@ class Simulation:
             if len(servers) == 1 and not tiers:
                 from ..llm.vllm import VllmBackend
                 raw = VllmBackend(model_name, servers[0], timeout_s=timeout_s,
-                                  format_mode=fmt, deadline_s=deadline_s)
+                                  format_mode=fmt, deadline_s=deadline_s,
+                                  request_seed=request_seed)
             else:
                 from ..llm.fleet import FleetLLM
                 raw = FleetLLM(servers, model_name, timeout_s=timeout_s,
                                tiers=tiers, format_mode=fmt,
-                               deadline_s=deadline_s)
+                               deadline_s=deadline_s,
+                               request_seed=request_seed)
         elif backend == "router":
             # 第23バッチ M2: 合成ルータ。purpose(rng_key 先頭)別に子バックエンドへ振り分ける。
             # ★子を各自 CachedLLM で包んでから router に渡す(キャッシュキーは子の name 由来=D13)。
@@ -1488,7 +1498,9 @@ class Simulation:
             return VllmBackend(name, str(spec.get("base_url", "http://localhost:8000")),
                                timeout_s=timeout_s,
                                format_mode=str(spec.get("format", "json")),
-                               deadline_s=deadline_s)
+                               deadline_s=deadline_s,
+                               # β11: router / mind の子も同じノブに従う(既定 None=不変)
+                               request_seed=getattr(self, "llm_request_seed", None))
         if b == "openai_compat":
             from ..llm.openai_compat import OpenAICompatBackend
             return OpenAICompatBackend(
@@ -2088,8 +2100,17 @@ class Simulation:
         path = self._pool_sidecar_path(step)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
-        with gzip.open(tmp, "wb") as f:
-            f.write(pickle.dumps(blob, protocol=pickle.HIGHEST_PROTOCOL))
+        # ★β7(第117): checkpoint.save と**同じ理由・同じ書き方**にする。ここは pool ON の
+        #   本選で checkpoint と対で必ず走る双子の writer で、`departed`(退場済み個体の実体)と
+        #   ドーマントストアを丸ごと運ぶため、25 万規模では本体と同オーダーの一過性ピークを
+        #   作っていた(`pickle.dumps` の中間バイト列 + 圧縮バッファ)。gzip ストリームへ直接
+        #   dump すれば中間 bytes が消える。共有参照の保証は「1 回のシリアライズ」なので不変。
+        #   gzip の trailer は close で書かれるので fsync は **gzip を閉じた後**に掛ける。
+        with open(tmp, "wb") as fh:
+            with gzip.GzipFile(fileobj=fh, mode="wb") as gz:
+                pickle.dump(blob, gz, protocol=pickle.HIGHEST_PROTOCOL)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, path)
 
     def _restore_pool_resume(self, start: int) -> None:

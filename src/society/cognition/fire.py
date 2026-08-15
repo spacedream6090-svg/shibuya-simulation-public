@@ -411,17 +411,41 @@ def observe_end(sim, step: int, sim_min: int, since_idx: int) -> None:
 # --------------------------------------------------------------------------- #
 # 発火源 ④ social: 既存機構(会話返答・夜内省・朝計画)の第一級化(§6-3)
 # --------------------------------------------------------------------------- #
+def _at_first_reservation(agent, attr: str, step: int) -> bool:
+    """DPH-B の FIFO 繰り越し中**でない**(= この step が初回予約 step)か。
+
+    `lod.budget.tiers`(DPH-B)は予算の取れなかった計画/内省を翌 step へ繰り越すとき、
+    `plan_due_step` / `reflect_due_step` に**最初に予約された step** を控えて
+    `plan_step` / `reflect_step` を step+1 へ立て直す(`scheduler._defer_first` と同じ規約)。
+    属性が生えていない = 繰り越しの概念が無い(tiers OFF)なので **常に True** を返す
+    = 既定ランでは 1 バイトも挙動が変わらない。
+    """
+    first = int(getattr(agent, attr, -1))
+    return first < 0 or first == int(step)
+
+
 def note_plan_due(sim, step: int) -> None:
     """朝計画の対象者を `_phase_planning` が消費する**前に**控える(記録専用)。
 
     `_phase_planning` は処理した個体の `plan_step` を -1 に落とすので、`_phase_drive` の
     時点では観測できない。OFF は完全 no-op。
+
+    ★D1-c #4b(意思決定ダッシュボード・案 b)= **初回予約 step だけを拾う**。
+      DPH-B(`lod.budget.tiers`)ON では、予算の取れなかった計画は翌 step へ FIFO 繰り越し
+      される(`plan_step = step + 1` が立ち直る)。素朴に `plan_step == step` で拾うと
+      **繰り越した step 数だけ** `cog_event{via:"plan"}` が出て、そのたびに
+      `q.schedule(... + _period_min(...))` で周期発火が先送りされる = 「予算が足りなかった」
+      という実験者側の都合が「その個体が何度も考えた」に化ける。計画は 1 回の予約につき
+      高々 1 回しか実行されないのだから、認知イベントも 1 回でなければならない。
+      tiers OFF では `plan_due_step` が誰にも生えないので従来と完全に同一。
     """
     if not enabled(sim) or SOCIAL not in sim.firecfg["sources"]:
         sim._fire_plan_due = ()
         return
     sim._fire_plan_due = tuple(sorted(
-        int(a.id) for a in sim.agents if int(getattr(a, "plan_step", -1)) == int(step)))
+        int(a.id) for a in sim.agents
+        if int(getattr(a, "plan_step", -1)) == int(step)
+        and _at_first_reservation(a, "plan_due_step", step)))
 
 
 def _social_via(sim, agent, step: int, plan_due: frozenset) -> str:
@@ -431,10 +455,15 @@ def _social_via(sim, agent, step: int, plan_due: frozenset) -> str:
     - reflect … 夜の内省(`reflect_step == step`)
     - plan    … 朝の一日計画(`_phase_planning` が同 step で処理する)
     優先順は「今この場の相手 > 内省 > 計画」。
+
+    ★D1-c #4b: 内省も DPH-B の FIFO 繰り越しの対象(`_reflect_due` が `reflect_step` を
+      翌 step へ立て直す)なので、計画とまったく同じ理由で **初回予約 step だけ** を拾う。
+      tiers OFF では `reflect_due_step` が生えない = 従来と 1 バイトも変わらない。
     """
     if getattr(agent, "_reply_to", None) is not None:
         return "reply"
-    if int(getattr(agent, "reflect_step", -1)) == int(step):
+    if (int(getattr(agent, "reflect_step", -1)) == int(step)
+            and _at_first_reservation(agent, "reflect_due_step", step)):
         return "reflect"
     if int(agent.id) in plan_due:
         return "plan"

@@ -45,6 +45,15 @@ run:
   # 自動 OFF は黙って起きない: WARNING ログ(明示 ON を落としたときは★印)+ run_manifest.json の
   # features.auto_disabled に必ず出る。落とした後の config が runs/<name>/config.yaml に保存される。
   mode: none
+  # ---- β6 mock 誤爆ガード(監査 E0-4。既定 false=本番規模の mock ランを拒否する)----
+  # 塞ぐ穴: 基底 conf の model.backend は **mock**(縦煙・テスト用の意図的な既定)なので、
+  # 本選の起動で `model.backend=vllm` の dotlist を 1 つ打ち間違えると、25 万体の
+  # 「LLM が 1 本も走っていないラン」が数十時間ぶん静かに完走してしまう(L1 は正常に見える)。
+  # 起動口(scripts/run.py)で run.n_agents >= 10,000 かつ model.backend == "mock" のとき
+  # RuntimeError を出す。**逃し弁**がこのキー: true にすると大規模 mock ランを明示的に許す
+  # (スケールスモーク・性能計測など「mock で回すことが目的」のランはこちらを立てる)。
+  # ★世界の機能ではない(起動制御フラグ)。シム本体はこのキーを 1 度も読まない=挙動不変。
+  allow_mock_production: false
 
 # ---- state 更新則の magnitude(OPEN#2: 因果構造は factors/update.py、量はここで調律)----
 factors:
@@ -310,6 +319,26 @@ model:
                         #   traits = 指定 trait の上位 frac。**アブレーション専用の意図的な交絡**で、
                         #     k* の主張には使えない(ON にすると manifest に警告が残る)。
         select_trait: ""  # select: traits のときに読む agent.traits のキー
+
+# ---- LLM 送出側のノブ(β11。model: は「どのモデルをどう組むか」・ここは「1 リクエストの中身」)----
+# 正典: docs/plans/beta-implementation-plan.md §1 β11 / docs/plans/external-audit-triage.md F14。
+llm:
+  # request-level stable seed(**既定 OFF** = 送出ボディがバイト単位で従来と同一)。
+  # 監査 F14 の確認事実: VllmBackend は `seed` を 1 度も送っておらず、vLLM は
+  # SamplingParams.seed 未指定時にサーバ側のグローバル乱数から引く = **同じプロンプト・
+  # 同じ温度でも応答が毎回変わりうる**(llm_cache が効く範囲でしか再現しない)。
+  # true にすると 1 リクエストごとに
+  #     seed = blake2b(run_seed, agent_id, step, purpose, ordinal) & 0x7fffffff
+  # を送出ボディへ付ける(材料は既存の rng_key = "purpose/agent_id/step[/ordinal]" だけで、
+  # 新しい乱数 stream は 1 本も引かない=決定論・resume 不変・呼数不変)。
+  # ★主張できるのは「乱数条件を明示して保存した」ことまでで、bit 単位の決定論ではない
+  #   (連続バッチングのバッチ構成で数値が動きうるのは vLLM の既知の性質)。
+  # ★プロンプトは 1 バイトも変わらない = キャッシュキー(sha256(model+params+prompt))も不変
+  #   なので、過去ランの llm_cache.jsonl はそのまま再生できる。
+  # ★mock / ollama / API 系バックエンドは本キーを読まない(vLLM 経路だけの送出ノブ)。
+  # 実際に送った seed は llm_journal の各行の `seed` 欄に残る(OFF では欄自体を出さない)。
+  request_seed:
+    enabled: false
 
 world:
   map: data/shibuya_osm.json    # ★OSM 実道路網(渋谷駅中心 約1.0×0.7km)。旧: data/shibuya_core.json
@@ -2941,6 +2970,38 @@ media:
   min_steps: 2                  # セッション長 下限(20分)
   max_steps: 8                  # セッション長 上限(80分)
   max_sessions_per_day: 2
+
+# ---- 日課の内部構造(daily)----------------------------------------------------
+# ★在宅覚醒 HOME_AWAKE(β9。設計: docs/plans/beta-implementation-plan.md §2 /
+#   docs/plans/reflection-leisure-plan.md §5.2・§4)。既定 OFF = 1 ビットも変わらない。
+# 現状(OFF)は `go_to_bed` が入館と就寝を同じ step で連続実行する構造なので、
+# 「帰宅 → 就寝」は実測 n=1,512 の **100.0% が 0 分**(= 在宅の覚醒時間が世界に無い)。
+# 現実は帰宅 19:15 / 就寝 23:39 = 4 時間 24 分(社会生活基本調査 令和3年・東京・有業者)。
+# ON では入館と就寝の間に**就寝ハザード**を挟み(概日の中心 = 既存の個体差 bedtime_min)、
+# その間の各 step で在宅活動ラベル 8 種をルールベース抽選する。
+#   ★LLM 呼はこの機能から 1 本も出ない(在宅覚醒中は睡眠中と同じく欲求発火の対象外)。
+#   ★乱数は新 stream "home_awake" だけ(既存 stream の draw 順に触らない)。
+daily:
+  home_awake:
+    enabled: false              # ★本選 ON は縦煙後にユーザー判断(finals conf の 1 行)
+    lead_min: 0                 # 帰宅トリガの前倒し[分]。0=既存の帰宅時刻のまま(スコープ最小)。
+                                # >0 にすると就寝時刻の lead_min 前から帰路につく(帰宅を
+                                # 19:15 側へ寄せる LSR-H 相当)。120 で 21 時台の在宅覚醒が立つ。
+    max_awake_min: 200          # 帰宅後に起きていられる上限[分](ハザードの裾を切る安全弁)。
+                                # ★起点は**帰宅**なので lead_min を上げるなら同じだけ足すこと
+                                #   (lead_min=120 のまま 200 だと就寝時刻の +80 分で頭打ち=
+                                #   実測 p50 が上限に貼りつく。lead_min=120 なら 320 が目安)
+    early_start_min: 480        # 「翌日早出」の判定境界(分 of day。480 = 08:00)
+    family_talk_boost: 3.0      # 同居人も在宅覚醒中なら family_talk の重み ×(世帯シナジー最小)
+    engaged_acts: [media, hobby, study, family_talk]   # b4(没入 → 就寝を遅らせる)の対象
+    hazard:                     # p_sleep = sigmoid(logit(p0) + b1*概日 + b2*疲労 + b3*翌日早出 − b4*没入)
+                                # ★切片だけ**確率** p0 で持つ = Δt 変換(timeconv の PROB)が
+                                #   効く唯一の係数。b1..b4 は対数オッズの寄与=Δt 非依存。
+      p0: 0.032                 # 就寝時刻ちょうど・他項ゼロのときの 1 step あたり就寝確率
+      b1: 0.95                  # 概日: bedtime_min からの経過[時間]あたりの対数オッズ
+      b2: 1.20                  # 疲労(既存 agent.fatigue 0..1。health OFF では常に 0)
+      b3: 0.80                  # 翌日早出(0/1)
+      b4: 1.00                  # 在宅活動に没入中(0/1)= 就寝を遅らせる
 
 # ---- 組織 W2-1(職場・学校の実態。台帳: data/organizations_shibuya.json = 架空・統計準拠)----
 # ON 時: 名簿対応の配属(org_assignments_*)で各エージェントに職場/学校を付与。勤務完遂→

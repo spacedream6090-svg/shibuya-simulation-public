@@ -20,6 +20,16 @@ seed の自動採取(第54バッチ 2026-07-23。純観察=不確実性許容モ
     採取した seed は (a) 標準出力 (b) run dir の config.yaml(save_config が数値 seed をそのまま保存)+
     summary.json(seed/seed_source を追記)へ必ず記録=「選ばない」だけで「失わない」(事後に同 seed で完全
     再現できる)。**数値 seed を明示した既定の挙動は完全に不変**(auto を要求しない限り 1 バイトも変えない)。
+
+起動ガードと起動バナー(β6。第117バッチ 2026-08-16。監査 E0-4 = external-audit-triage.md F5):
+    基底 conf の `model.backend` は **mock**(縦煙・テストのための意図的な既定)なので、本選の起動で
+    `model.backend=vllm` の dotlist を 1 つ打ち間違えると「LLM が 1 本も走っていない 25 万体ラン」が
+    数十時間ぶん静かに完走してしまう(L1 は完全に正常な形をしている)。ここで 2 つの安い保険を張る:
+      - `check_mock_production()` … n_agents>=10,000 かつ backend=="mock" かつ
+        `run.allow_mock_production` が false なら **起動時に RuntimeError**。
+      - `print_banner()` … backend / モデル名 / servers 数 / pool dir / present_cap /
+        lod.max_llm_per_step を stdout へ 1 回だけ出す(目視 1 秒で条件を確かめられる)。
+    どちらも **世界へは 1 バイトも触らない**(Simulation はこの 2 関数の存在を知らない)。
 """
 from __future__ import annotations
 
@@ -34,6 +44,53 @@ from omegaconf import OmegaConf                  # noqa: E402
 
 from society.config import load_config          # noqa: E402
 from society.engine.simulation import Simulation  # noqa: E402
+
+#: β6: 「本番規模」とみなす名目エージェント数の下限(監査 E0-4 の推奨線)。
+MOCK_PRODUCTION_MIN_AGENTS = 10_000
+
+
+def check_mock_production(cfg) -> None:
+    """本番規模の mock ラン(= LLM が 1 本も走らないラン)を起動時に拒否する(β6)。
+
+    逃し弁は `run.allow_mock_production=true`(スケールスモーク・性能計測など「mock で回すこと
+    自体が目的」のラン)。判定材料は conf の 3 キーだけで、世界の状態も乱数も 1 ビットも触らない。
+    """
+    n_agents = int(cfg.run.get("n_agents", 0) or 0)
+    backend = str((cfg.get("model", {}) or {}).get("backend", "") or "")
+    if (n_agents >= MOCK_PRODUCTION_MIN_AGENTS and backend == "mock"
+            and not bool(cfg.run.get("allow_mock_production", False))):
+        raise RuntimeError(
+            f"本番規模({n_agents:,} 体 >= {MOCK_PRODUCTION_MIN_AGENTS:,})なのに "
+            "model.backend=mock です(LLM が 1 本も走らないランになります)。"
+            " 実 LLM で回すなら model.backend=vllm と model.servers=[...] を指定し"
+            "(例: --profile conf/profiles/finals-vllm7.yaml)、"
+            " mock で回すことが目的なら run.allow_mock_production=true を明示してください。")
+
+
+def banner_lines(cfg) -> list[str]:
+    """起動バナー(β6)。**読むだけ**の純関数=世界にも乱数にも触らない。"""
+    model = cfg.get("model", {}) or {}
+    pool = cfg.get("pool", {}) or {}
+    lod = cfg.get("lod", {}) or {}
+    servers = list(model.get("servers", []) or [])
+    return [
+        f"[launch] backend={model.get('backend', '')}"
+        f" model={model.get('name', '')}"
+        f" servers={len(servers)}"
+        f" n_agents={int(cfg.run.get('n_agents', 0) or 0)}"
+        f" n_steps={int(cfg.run.get('n_steps', 0) or 0)}"
+        f" seed={cfg.run.get('seed', '')}",
+        f"[launch] pool={'on' if bool(pool.get('enabled', False)) else 'off'}"
+        f" pool_dir={pool.get('dir', '')}"
+        f" present_cap={int(pool.get('present_cap', 0) or 0)}"
+        f" max_llm_per_step={int(lod.get('max_llm_per_step', 0) or 0)}",
+    ]
+
+
+def print_banner(cfg) -> None:
+    """起動バナーを stdout へ 1 回だけ出す(既存の `[seed]` 行と同じ様式)。"""
+    for line in banner_lines(cfg):
+        print(line)
 
 
 def _sample_seed() -> int:
@@ -113,6 +170,8 @@ def main() -> None:
         # apply_dt が恒等パスなので従来から無風=この行の追加でも 1 バイトも変わらない)。
         cfg = load_config(overrides=overrides, path=run_dir / "config.yaml",
                           apply_dt=False)
+        check_mock_production(cfg)                 # β6: resume でも同じ条件で守る
+        print_banner(cfg)
         sim = Simulation(cfg, out_dir=run_dir)     # 既存 run dir は消さずに続行する
         summary = sim.run(resume_from=run_dir)
         print(json.dumps(summary, ensure_ascii=False, indent=2))
@@ -128,6 +187,8 @@ def main() -> None:
         # 実験者が seed を選ばない代わりに「失わない」= 標準出力 + config.yaml(save_config) + summary.json。
         print(f"[seed] auto-sampled run.seed={sampled} "
               f"(OS エントロピー採取。config.yaml/summary.json に記録=同 seed で完全再現可)")
+    check_mock_production(cfg)                     # β6: 起動ガード(構築の前に落とす)
+    print_banner(cfg)
     sim = Simulation(cfg)
     summary = sim.run()
     if seed_auto:
