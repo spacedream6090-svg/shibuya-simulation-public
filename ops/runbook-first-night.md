@@ -81,7 +81,7 @@ python scripts/run.py --profile conf/finals_observe.yaml \
   run.seed=42 run.n_agents=10000 run.n_steps=144 run.name=scale1_10k \
   model.backend=<vllm7> &
 # 併走(別ターミナル・すべて読み取り専用):
-python scripts/watchdog.py runs/scale1_10k
+python scripts/watchdog.py --run-dir runs/scale1_10k
 python scripts/report_progress.py runs/scale1_10k --dry-run          # 初回は必ずdry-run
 # webhook を env に設定済みなら:
 #   export SHIBUYA_DISCORD_WEBHOOK=<URL>   (URLはチャット/リポに貼らない)
@@ -91,7 +91,7 @@ python scripts/live_viewer.py runs/scale1_10k                        # 途中経
 
 完走後:
 ```bash
-python scripts/backup_run.py runs/scale1_10k <退避先> --ckpt-generations 999   # E0
+python scripts/backup_run.py --run-dir runs/scale1_10k --dest <退避先> --ckpt-generations 999   # E0
 python scripts/calibrate_report.py runs/scale1_10k                             # 較正指標
 ```
 

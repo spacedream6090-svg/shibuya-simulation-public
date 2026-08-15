@@ -27,7 +27,7 @@ E1-1〜E1-4 / 起動スクリプト [launch-vllm-finals.ps1](launch-vllm-finals.
 
 運用の具体:
 
-1. バックアップは **`python scripts/backup_run.py <run_dir> <dest> --ckpt-generations 999`**
+1. バックアップは **`python scripts/backup_run.py --run-dir <run_dir> --dest <dest> --ckpt-generations 999`**
    で回す。★既定は `--ckpt-generations 2` = **直近 2 世代しか転送しない**。
    既定のままだと「20 世代のうち 18 世代が手元に無い」という事故になる。
 2. ディスク逼迫時に落とす順序は ① `indoor_tracks_*`(ON なら)② `llm_journal`
