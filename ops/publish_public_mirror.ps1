@@ -49,6 +49,9 @@ try {
     #   - env/ 全体: shimokita に OSM 生データ(_osm_raw.json)・shibuya も OSM/ODPT 由来値を参照
     # 残すもの: README.md / ETHICS.md / LICENSE / src / scripts / tests / conf / viz / ops / tools /
     #   reference/physics_bench(Jülich 派生 CSV は CC BY 4.0=README に帰属表示あり=再配布可)
+    #   - ops/setup-gpu-server.md・ops/codex-review-pack.md(2026-08-16 追加): 貸与サーバーの
+    #     識別子(hostname/内部IP/SSHユーザー)を含むため除外。両ファイルとも前回同期(8/12)以後の
+    #     コミットにのみ存在=既公開履歴のハッシュは不変=fast-forward push のまま
     python -m git_filter_repo --invert-paths `
         --path reference/2d-fire-sim `
         --path docs `
@@ -57,13 +60,20 @@ try {
         --path STATUS.md `
         --path IMPLEMENTED.md `
         --path PENDING.md `
+        --path ops/setup-gpu-server.md `
+        --path ops/codex-review-pack.md `
         --mailmap $mailmap
     if ($LASTEXITCODE -ne 0) { throw "git filter-repo failed" }
 
     # 検証(push 前の機械チェック): 除去パスの残存ゼロ・旧メールの残存ゼロ
     # 注意: '^reference/' で引くと physics_bench(残すもの)を誤検知する(2026-08-06 に実バグとして修正)。
-    $leftPaths = (git log --all --name-only --format= ) -match '^(reference/2d-fire-sim|docs/|data/|env/|STATUS\.md|IMPLEMENTED\.md|PENDING\.md)'
+    $leftPaths = (git log --all --name-only --format= ) -match '^(reference/2d-fire-sim|docs/|data/|env/|STATUS\.md|IMPLEMENTED\.md|PENDING\.md|ops/setup-gpu-server\.md|ops/codex-review-pack\.md)'
     if ($leftPaths) { throw "excluded paths still present in mirror history: $($leftPaths -join ', ')" }
+    # サーバー識別子の内容レベル検査(2026-08-16 追加): 除外パス以外の残存ファイルに
+    # 貸与サーバーの識別子が(全履歴のどのコミットにも)含まれないことを機械確認
+    $idPattern = '10\.10\.0\.102|gpu-server|user@|152\.165\.117\.187'
+    $idLeak = foreach ($r in (git rev-list --all)) { git grep -I -l -E $idPattern $r 2>$null }
+    if ($idLeak) { throw "server identifiers present in mirror history: $(($idLeak | Select-Object -First 5) -join ', ')" }
     $emails = (git log --all --format='%ae%n%ce' | Sort-Object -Unique)
     if ($emails -contains $oldEmail) { throw "old author email still present in mirror history" }
 
