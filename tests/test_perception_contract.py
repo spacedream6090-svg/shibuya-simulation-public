@@ -439,6 +439,16 @@ _NON_PROMPT_WORLD_READER_MODULES = frozenset({
     # graph)を読むのが本務で、プロンプトは一切組まない(LLM 呼び出しゼロ・乱数ゼロを
     # tests/test_plan_boundary.py が AST 固定)。day_plan.py と同じ位置づけ。P3 で契約経路へ。
     "plan_boundary.py",
+    # 第116バッチ AGE-C(年齢→思考/推論の量): sim から読むのは **conf ブロック 1 つだけ**
+    # (`cognition.age` の遅延構築+キャッシュ = status.cfg_of と同型)。年齢→係数の写像は
+    # factors/registry.age_cognition_params にあり、本 module はプロンプトを 1 文字も組まない
+    # (LLM 呼び出しゼロ・乱数ゼロ)。calib.py と同じ「cfg を読むだけ」の位置づけ。
+    "age_cog.py",
+    # 第116バッチ RFX-A(内省の現実的タイミング): 「内省的瞬間」の判定に world
+    # (`sim.percept_index` の同席・`sim.calendarcfg` の勤務曜日・perception_radius_m)を
+    # 読むのが本務。プロンプトは一切組まない(タスク文は reflection.py が持つ)。
+    # 乱数ゼロ・LLM 呼び出しゼロ。engaged.py / routine.py と同じ位置づけ。P3 で契約経路へ。
+    "reflect_timing.py",
 })
 
 

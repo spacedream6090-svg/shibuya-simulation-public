@@ -54,6 +54,12 @@ class Agent:
     sleep_until: int = 0
     homing: bool = False              # 帰宅移動中
     reflect_step: int = -1            # 就寝直後に1回の内省(記憶整理)
+    # ---- 内省タイミング RFX-A(既定 reflection.timing.mode="sleep" では**一度も動かない**)----
+    # 正典: docs/plans/reflection-leisure-plan.md §3。実装 cognition/reflect_timing.py。
+    # 発火点は 1 つも足さない。予約の**満期**を状態が決める(務め終了後の最初の「内省的瞬間」)。
+    reflect_moment_day: int = -1      # この日ぶんの早期発火がまだ残っている(-1=無し/消化済み)
+    reflect_suppress_arm: int = 0     # 1 = 次の予約イベント(就寝/宿泊/帰路退出)を 1 回だけ見送る
+    #                                 #     ⇒「早期発火 1 回 = 将来の予約 1 回を相殺」= 1 予約 1 発火
     # ---- 職場・活動(v3: POI ベースの日課)----
     work_name: str = ""               # 職場の実名(POI 名)。"" = 決まった職場なし
     work_node: str = ""

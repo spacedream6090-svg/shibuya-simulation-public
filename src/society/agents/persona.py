@@ -37,6 +37,15 @@ _WORK_CAT: dict[str, str | None] = {
     "ティッシュ配り": None, "ストリートミュージシャン": None,
     "キッチンカー営業者": None, "路上占い師": None, "街頭演説者": None,
     "募金スタッフ": None, "路上生活者": None, "路上支援員": None,
+    # ---- ペルソナプール v2(docs/plans/persona-pool-v2-plan.md §3-6)----
+    # 保育所・幼稚園の職員は**決まった職場を持つ**(台帳へ org を足したうえで生やした職種)。
+    # org_id 経由の束ね(work.bind_eligible は org_id で短絡)とは別に、手続き生成経路と
+    # bind_workplace OFF の退路でも職場が付くように写像を持たせる。cat は既存の education
+    # (v6 以降の地図では school へ自動フォールバックする=_pick_workplace の両対応)。
+    "保育士": "education", "幼稚園教諭": "education", "調理員": "education",
+    # 賃金労働をしない年齢層。★None を明示するのは .get の既定と同値だが、
+    # 「この職業は職場 POI を持たない」という設計判断を表に残すため(上の路上職と同じ作法)。
+    "未就学児": None, "年金生活者": None,
 }
 
 

@@ -1301,6 +1301,89 @@ def _run_dist_mode(args) -> None:
         print(f"written: {rep}")
 
 
+# ----------------------------------------------------------------------------
+# 保育所・幼稚園のサイドカー台帳(PPv2-D2)
+# ----------------------------------------------------------------------------
+# ★規律の順序(計画書 §3-6):「台帳に無い業種の職業は発明しない」ので、**保育士を
+#   生やす前に保育所を台帳に入れる**。逆順は不可。
+# ★正準台帳(data/organizations_shibuya_census.json は 10.7MB・コミット済み)は
+#   1 バイトも触らない。小さな**サイドカー**に分けて出し、プール生成器が
+#   --childcare で学校ブロックへ足す。これで旧プールの再現性が残る。
+#
+# 渋谷区の実数: 認可保育所 68 施設 / 定員 6,181 / 待機児童 0(区の公表)。
+# bbox は区面積 15.11km² の 25%(3.799km²)⇒ 概ね 17 施設 / 定員 1,545。
+# ★施設ごとの定員の実表は取得していないので、区の平均(6,181/68 ≈ 91)を基準に
+#   90〜100 人規模へ散らす = ESTIMATE(実数と偽装しない)。
+# 幼稚園は区立・私立あわせて実数の一次表を本レーンでは取っていないため、
+# **bbox 内 4 園・定員 480(区の幼稚園在園児から按分した概数)** に留める。
+CHILDCARE_SPEC: list[dict] = [
+    dict(kind="認可保育所", n=17, cap_base=91, start="07:30", close="18:30"),
+    dict(kind="幼稚園", n=4, cap_base=120, start="09:00", close="14:00"),
+]
+
+
+def build_childcare(by_cat: dict[str, list[dict]], seed: int) -> dict:
+    """保育所・幼稚園を school レコードと同じ形で組み立てる(POI は決定論束縛)。"""
+    import persona_v2 as PV2                          # noqa: PLC0415
+
+    distinct = {c: _distinct_by_node(v) for c, v in by_cat.items()}
+    pool = (distinct.get("education") or distinct.get("school")
+            or distinct.get("civic") or distinct.get("office") or [])
+    out: list[dict] = []
+    idx = 0
+    total_cap = 0
+    for spec in CHILDCARE_SPEC:
+        for i in range(spec["n"]):
+            # 定員は基準 ±10% を決定論で散らす(乱数ゼロ = seed に依存しない)
+            cap = int(round(spec["cap_base"] * (0.90 + 0.05 * (i % 5))))
+            total_cap += cap
+            oid = ("nu_%02d" % (i + 1)) if spec["kind"] == "認可保育所" else ("kg_%02d" % (i + 1))
+            poi = _poi_ref(pool, idx)
+            idx += 1
+            if spec["kind"] == "認可保育所":
+                n_staff, n_cook = PV2.nursery_staff(cap)
+                roles = ["保育士", "調理員"]
+                note = (f"配置基準(0歳3:1 / 1-2歳6:1 / 3歳15:1 / 4-5歳25:1・下限2人)"
+                        f"から保育士 {n_staff} 人・調理員 {n_cook} 人")
+            else:
+                n_staff, n_cook = PV2.school_staff_counts("幼稚園", cap)
+                roles = ["教員", "職員"]
+                note = f"全国 教員比 8.60:1 から教員 {n_staff} 人・職員 {n_cook} 人(職員比は代理値)"
+            rec = {
+                "id": oid,
+                "name": f"渋谷{'区立' if i % 2 == 0 else ''}"
+                        f"{'第' + str(i + 1) + '保育園(仮称)' if spec['kind'] == '認可保育所' else '第' + str(i + 1) + '幼稚園(仮称)'}",
+                "school_type": spec["kind"],
+                "timetable": {"period_min": 0, "periods_per_day": 0, "start": spec["start"]},
+                "capacity": cap,
+                "workplace_poi": ({"cat": "education", **poi} if poi else {"cat": "education"}),
+                "roles": roles,
+                "shift_pattern": {"open": spec["start"], "close": spec["close"],
+                                  "days": "mon-fri", "shift_hours": 8, "rotates": False},
+                "staffing_note": note,
+            }
+            out.append(rec)
+    return {
+        "meta": {
+            "generator": "scripts/build_orgs.py --childcare", "seed": seed,
+            "note": ("保育所・幼稚園のサイドカー台帳(R17: 実在園名なし)。正準台帳"
+                     "(organizations_shibuya_census.json)は 1 バイトも変更しない。"
+                     "build_persona_pool.py --v2 --childcare で schools ブロックへ足す。"),
+            "sources_doc": "docs/plans/persona-pool-v2-plan.md §1-3(e) / §3-6",
+            "law": ("児童福祉施設の設備及び運営に関する基準(昭和二十三年厚生省令第六十三号)"
+                    "第三十三条第二項(令和6年改正後)。第1項は保育士・嘱託医・調理員の"
+                    "配置を求める(嘱託医は非常勤のため職員に数えない)。"),
+            "shibuya_actual": {"認可保育所": 68, "定員": 6181, "待機児童": 0,
+                               "bbox_area_share": 0.25},
+            "honesty": ("施設数・定員は区の実数(68施設/6,181人)を bbox 面積比 25% で"
+                        "按分した概数であり、施設ごとの定員の実表は未取得 = ESTIMATE。"
+                        "幼稚園の区内実数(園数・定員)は本レーンでは取得していない。"),
+            "counts": {"childcare": len(out), "capacity_total": total_cap},
+        },
+        "schools": out,
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="架空の組織台帳と配属を生成(バッチE)")
     ap.add_argument("--map", default=str(DEFAULT_MAP), help="地図 JSON(既定 shibuya_osm.json)")
@@ -1329,7 +1412,28 @@ def main() -> None:
                          "scripts/calibrate_orgs_census.py が生成する。**無指定 = 従来と 1 バイトも"
                          "変わらない台帳**。指定時は --dist を暗黙に立て、出力先も"
                          "data/organizations_shibuya_census.json へ分ける(正準台帳を上書きしない)")
+    ap.add_argument("--childcare", nargs="?", const="data/organizations_shibuya_childcare.json",
+                    default=None,
+                    help="保育所・幼稚園の**サイドカー台帳**だけを書く(PPv2-D2)。"
+                         "正準台帳は 1 バイトも触らない。既定の出力先は "
+                         "data/organizations_shibuya_childcare.json。"
+                         "build_persona_pool.py --v2 --childcare <path> で使う")
     args = ap.parse_args()
+
+    if args.childcare:
+        map_path = Path(args.map if args.map else DEFAULT_MAP)
+        if not map_path.is_absolute():
+            map_path = REPO_ROOT / map_path
+        by_cat, _nodes = load_map(map_path)
+        doc = build_childcare(by_cat, args.seed)
+        doc["meta"]["map"] = str(map_path.relative_to(REPO_ROOT)).replace("\\", "/")
+        out = Path(args.childcare)
+        if not out.is_absolute():
+            out = REPO_ROOT / out
+        out.write_text(json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
+        m = doc["meta"]["counts"]
+        print(f"written: {out}  (保育所・幼稚園 {m['childcare']} 施設 / 定員 {m['capacity_total']:,})")
+        return
 
     if args.dist or args.census:
         # 分布駆動モードは既定 --map を広域地図へ切替(明示指定があればそれを優先)。

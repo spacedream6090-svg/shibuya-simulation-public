@@ -975,6 +975,680 @@ def gen_L5(writer: ShardWriter, seed: int, fraction: float):
     return councilors
 
 
+# =========================================================================== #
+# v2(ペルソナプール v2)。--v2 でのみ通る経路。**既定 OFF = v1 は 1 バイトも動かない**
+# =========================================================================== #
+# 正典: docs/plans/persona-pool-v2-plan.md / docs/plans/age-diversity-plan.md。
+# 一次統計と写像は scripts/persona_v2.py(データと写像だけ・出力書式は握らない)。
+#
+# v1 との非同値点(正直な申告):
+#  ① 年齢の抽出が clip(normal) → 5歳階級カテゴリカル + 帯内一様(乱数消費 1→2 draw)。
+#     これでクリップ堆積(全人口の 4.08% が「15 歳」1 点)が**原理的に**消える。
+#  ② L2 の役割割当が roles[i % len] → 第10-3表の職業大分類 行% による重み配分。
+#  ③ L2 の名簿人数に出勤率 0.62 を掛け、空いた枠が L4(残余)へ移る。
+#  ④ 学校の教職員が capacity/12 の一律 + i%2 の 1:1 → 校種別の 2 本の式(実数 4.4〜5.3:1)。
+#  ⑤ 姓 60→200・名が出生コホート条件つき。
+#  ⑥ L1 に世帯 id / 続柄 / 家族類型が埋まる(子どもが世帯に入る)。
+#  ⑦ 就寝時刻・睡眠長・来訪頻度・来訪目的が年齢条件つき(AGE-B)。
+# ⇒ **v2 プールは v1 プールと同一の世界ではない。** 別ディレクトリに吐き、切替は conf。
+
+V2_SCHEMA_VERSION = "persona-pool-2.0"
+V2_BASE_YEAR = 2026          # birth_year = V2_BASE_YEAR - age(住基の基準年 2026-08-01)
+
+try:                                                    # スクリプト実行/テスト双方で通す
+    import persona_v2 as PV2                            # noqa: E402
+except ModuleNotFoundError:                             # pragma: no cover
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import persona_v2 as PV2                            # noqa: E402
+
+#: 職業大分類 → L3常連/L4 の粗い職業語彙(v1 の _L4_OCCS 9 語を出ない)。
+_MAJOR_TO_COARSE: dict[str, str] = {
+    "管理": "経営者", "専門技術": "専門職", "事務": "会社員",
+    "販売": "販売・サービス", "サービス": "販売・サービス", "保安": "会社員",
+    "生産工程": "会社員", "輸送": "会社員", "建設": "会社員",
+    "運搬清掃": "販売・サービス",
+}
+
+#: 役職の年齢下限(これを下回る個体に役職が当たったら「一般」と交換する)。
+#: 実数の裏づけ: 役員は 30代前半 587 → 50代後半 1,736 と単調増加(§1-2(e))。
+_RANK_AGE_FLOOR: dict[str, int] = {"部長級": 38, "課長級": 33, "係長級": 28, "職長級": 30}
+
+#: 子ども(15 歳未満)の persona 文に使う趣味。★v1 の _HOBBIES は成人向けの語彙
+#: (サウナ・筋トレ・陶芸・韓国ドラマ)しか持たず、v2 で 0-14 歳を実在化させた瞬間に
+#: 「3 歳のサウナ好き」が生じる。年齢帯で語彙を分ける(語を減らすのではなく足す)。
+#: 世帯内の並び順(household.py の _family_roles は「年長 2 人が親」を仮定するので、
+#: 世帯主 → 配偶者 → 親 → 子 → その他 の順に置くとランタイム側の推定と食い違わない)。
+_HH_ROLE_ORDER: dict[str, int] = {"世帯主": 0, "夫": 1, "妻": 1, "親": 2, "子": 3, "その他": 4}
+
+_HOBBIES_CHILD = ["外あそび", "ゲーム", "アニメ", "絵をかくこと", "むしとり",
+                  "サッカー", "ダンス", "電車を見ること", "本を読むこと", "工作",
+                  "水泳", "ピアノ", "野球", "おえかき", "なわとび", "料理の手伝い"]
+
+
+def _v2_names(rng: np.random.Generator, ages, genders, families: list[str]):
+    """出生コホート条件つきの姓名(乱数 2 draw = v1 の _names_block と同数)。"""
+    n = len(genders)
+    fam_i = rng.integers(0, len(families), n)
+    giv_u = rng.random(n)
+    out = []
+    for i in range(n):
+        ck = PV2.cohort_key(V2_BASE_YEAR - int(ages[i]))
+        pool = PV2.given_pool(ck, genders[i])
+        out.append(str(families[fam_i[i]]) + str(pool[int(giv_u[i] * len(pool)) % len(pool)]))
+    return out
+
+
+def _v2_common(rec: dict, age: int, industry_key: str, occ_major: str,
+               rank: str, employment: str, scope: str, commute_mode: str) -> dict:
+    """v2 が全層に足す直交軸(既存欄は 1 つも削らない)。"""
+    ind = PV2.INDUSTRY_MAJOR.get(industry_key)
+    rec["industry_key"] = industry_key
+    rec["industry_major"] = ind[1] if ind else ""
+    rec["occupation_major"] = PV2.OCC_MAJOR_NAME.get(occ_major, occ_major)
+    rec["rank"] = rank
+    rec["employment"] = employment
+    rec["birth_year"] = V2_BASE_YEAR - int(age)
+    rec["school_stage"] = PV2.school_stage_of(age)
+    rec["workplace_scope"] = scope
+    rec["commute_mode"] = commute_mode
+    return rec
+
+
+def _v2_worker_attrs(u_state: float, u_emp: float, u_ind: float, u_role: float,
+                     u_rank: float, age: int, industries, ind_w):
+    """年齢 → 就業状態 → (業種, ロール, 職業大分類, 役職, 従業上の地位)。
+
+    3 段階すべてに一次データがある(§3-3):
+      ① 年齢別労働力率(渋谷区)で就業/非就業 → ② 非労働力の内訳で学生/家事/引退
+      → ③ 産業構成 × 産業×職業クロス × 年齢別非正規率・役員率
+    """
+    state = PV2.labour_state(u_state, age)
+    if state != "就業":
+        occ = PV2.nonworking_occupation(state, age)
+        major = "学生" if state == "通学" else "非就業"
+        return state, "", "", occ, major, "非就業", "非就業"
+    # --- 業種 ---
+    acc, ikey = 0.0, industries[-1]
+    for key, w in zip(industries, ind_w):
+        acc += w
+        if u_ind < acc:
+            ikey = key
+            break
+    sector = PV2.representative_sector(ikey)
+    # ★15-17 歳の就業(労働力率 13.49% / 非正規率 80.9%)は現実にはほぼ飲食・小売の
+    #   アルバイト。機能別の職業大分類で引くと「16 歳の会社員」が出る = v1 の欠陥の再生産。
+    if age < 18:
+        return state, "FB", "ホール", occupation_for("FB", "カフェ", "ホール"), \
+            "サービス", "一般", "非正規"
+    # --- 従業上の地位 → 役職 ---
+    emp = PV2.employment_of(u_emp, age)
+    if emp == "役員" and u_rank < PV2.EXEC_AS_MANAGER and age >= PV2.MANAGER_AGE_MIN:
+        # 管理的職業従事者 5.79% のうち 79.7% が役員 ⇒ 役員の 32.4% だけが「管理」
+        return state, ikey, "", "経営者", "管理", "役員", emp
+    rank = PV2.EMPLOYMENT_RANK.get(emp, "")
+    if not rank:                               # 雇用者 = 会社の役職ピラミッドに乗る
+        # 住民は勤務先の規模が分からないので最頻の規模区分(10-99)を使う。
+        w = list(PV2.RANK_BY_SIZE["10-99"])
+        if ikey not in PV2.FOREMAN_INDUSTRIES:
+            w[5] += w[3]
+            w[3] = 0.0
+        tot = sum(w)
+        acc, rank = 0.0, "一般"
+        for name, x in zip(PV2.RANK_NAMES, w):
+            acc += x / tot
+            if u_rank < acc:
+                rank = name
+                break
+        if age < _RANK_AGE_FLOOR.get(rank, 0):
+            rank = "一般"
+    # --- ロール(第10-3表の行% による重み)---
+    if ikey == "PA":                           # 公務(台帳に org が無い = 区役所等へ通う)
+        return state, ikey, "", "公務員", "事務", rank, emp
+    roles = tuple(sorted(set(PV2._LEDGER_ROLES.get(ikey, ()))))
+    if not roles:
+        return state, ikey, "", "会社員", "事務", rank, emp
+    w = PV2.role_weights(ikey, sector, roles)
+    acc, role = 0.0, roles[-1]
+    for r, x in zip(roles, w):
+        acc += x
+        if u_role < acc:
+            role = r
+            break
+    occ = occupation_for(ikey, sector, role)
+    return state, ikey, role, occ, PV2.role_major(ikey, sector, role), rank, emp
+
+
+def gen_L1_v2(writer: ShardWriter, n: int, seed: int, families: list[str]) -> None:
+    """L1 住民 v2: 全年齢(0-100+)・年齢×職業の整合・世帯の年齢整合。"""
+    industries = [k for k, _w in PV2.RESIDENT_INDUSTRY_SHARE]
+    iw = np.array([w for _k, w in PV2.RESIDENT_INDUSTRY_SHARE], float)
+    iw /= iw.sum()
+    scopes = [s for s, _w in PV2.WORKPLACE_SCOPE]
+    sw = np.array([w for _s, w in PV2.WORKPLACE_SCOPE], float)
+    modes = [m for m, _w in PV2.COMMUTE_MODES]
+    mw = np.array([w for _m, w in PV2.COMMUTE_MODES], float)
+    idx_global = 0
+    for part_idx in range(0, (n + PART_SIZE - 1) // PART_SIZE):
+        m = min(PART_SIZE, n - part_idx * PART_SIZE)
+        rng = _seed_rng(seed, LC["L1"], part_idx)
+        age, gender = PV2.resident_age_gender(rng, m)
+        names = _v2_names(rng, age, gender, families)
+        locus, nfc, risk, thr, fw = _traits_block(rng, m)
+        bedtime = PV2.bedtime_by_age(rng, age)
+        slp = PV2.sleep_steps_by_age(rng, age, gender)
+        bike = rng.random(m) < 0.15
+        car = rng.random(m) < 0.08
+        hob = np.array(_HOBBIES, object)[rng.integers(0, len(_HOBBIES), m)]
+        hob_c = np.array(_HOBBIES_CHILD, object)[rng.integers(0, len(_HOBBIES_CHILD), m)]
+        ton = np.array(_TONES, object)[rng.integers(0, len(_TONES), m)]
+        u_state = rng.random(m); u_emp = rng.random(m); u_ind = rng.random(m)
+        u_role = rng.random(m); u_rank = rng.random(m)
+        scope_i = rng.choice(len(scopes), size=m, p=sw / sw.sum())
+        mode_i = rng.choice(len(modes), size=m, p=mw / mw.sum())
+        hh = PV2.build_households(age, gender, rng)
+        # ★世帯単位で**連続して**吐く。理由: src/society/household.py の `_pool_partition` は
+        #   居住者名簿の**連続 n 人**を 1 世帯として束ねる(名簿の並びが唯一の手がかり)。
+        #   ここで世帯順に並べておけば、household.py 側を 1 行も触らなくても
+        #   「隣り合う人は実際に家族」という前提が成り立ち、年齢整合が名簿の並びに載る。
+        #   ★完全な一致(household_id をランタイムが読む)は別レーン = record に欄はある。
+        order = sorted(range(m), key=lambda i: (int(hh[i].get("hh", 0)),
+                                                _HH_ROLE_ORDER.get(hh[i].get("role", ""), 9),
+                                                -int(age[i]), i))
+        for i in order:
+            a = int(age[i])
+            (_st, ikey, role, occ, major, rank, emp) = _v2_worker_attrs(
+                float(u_state[i]), float(u_emp[i]), float(u_ind[i]),
+                float(u_role[i]), float(u_rank[i]), a, industries, iw)
+            scope = str(scopes[scope_i[i]]) if emp != "非就業" else "none"
+            mode = str(modes[mode_i[i]]) if scope == "out_area" else (
+                "walk" if scope == "in_area" else "none")
+            pid = f"L1_{idx_global:08d}"; idx_global += 1
+            if a < 15:
+                persona = (f"あなたは{names[i]}、{a}歳の{occ}({gender[i]}性)。"
+                           f"渋谷の街に住んでいる。{hob_c[i]}が好き。"
+                           "自分の言葉で自然に、短く話す。")
+            else:
+                persona = (f"あなたは{names[i]}、{a}歳の{occ}({gender[i]}性)。"
+                           f"渋谷の街に住んでいる。{hob[i]}が好きで、{ton[i]}。"
+                           "自分の言葉で自然に、短く話す。")
+            rec = {
+                "id": pid, "layer": "L1", "presence": "resident",
+                "name": names[i], "age": a, "gender": gender[i],
+                "occupation": occ, "visitor": False, "commute": False,
+                "persona": persona,
+                "traits": {"internal_locus": float(locus[i]), "nfc": float(nfc[i]),
+                           "risk_tolerance": float(risk[i])},
+                "drive_threshold": float(thr[i]), "fire_weight": float(fw[i]),
+                "bedtime_min": int(bedtime[i]), "sleep_steps": int(slp[i]),
+                "has_bicycle": bool(bike[i]), "has_car": bool(car[i]),
+            }
+            _v2_common(rec, a, ikey, major, rank, emp, scope, mode)
+            if role:
+                rec["role"] = role
+            h = hh[i]
+            rec["household_id"] = f"hh_{part_idx:02d}{int(h.get('hh', 0)):06d}"
+            rec["household_role"] = str(h.get("role", "世帯主"))
+            rec["household_type"] = str(h.get("type", "単独"))
+            writer.add(rec)
+
+
+def _slot_interleave(counts: list[int]) -> list[int]:
+    """各ロールの枠数 → スロット位置の並び(Bresenham 型の決定論インターリーブ)。
+
+    ロールごとに j 番目の枠を位置 (j+0.5)/c_r へ置き、位置順に並べる。
+    v1 の ``roles[i % len(roles)]`` と同じ「均した並び」だが**重みつき**になる。
+    """
+    k = sum(counts)
+    marks = []
+    for r, c in enumerate(counts):
+        for j in range(c):
+            marks.append((((j + 0.5) / c), r, j))
+    marks.sort()
+    return [r for _p, r, _j in marks][:k]
+
+
+def _build_L2_slots_v2(orgs: dict, fraction: float):
+    """v2 の L2 スロット展開。重み付きロール + 役職 + 出勤率 + 校種別教職員。"""
+    slots = []   # (org_id, role, occupation, shift_pattern, days, rank, industry_key, major)
+    rank_carry: dict[int, float] = {}     # 社をまたぐ端数の持ち越し(集計値を実比率へ)
+    for c in orgs["companies"]:
+        emp = int(c["size"]["employees"])
+        # ★出勤率(§3-5): 経済センサスの「従業者数」は名簿上の在籍者で、パート・シフト・
+        #   休暇・テレワーク・複数事業所計上を含む。bbox の通勤流入との突合比 0.62 を掛ける。
+        # ★丸めは 1 回だけ(fraction と出勤率を掛けてから丸める)。2 段で丸めると
+        #   従業者 1-4 人の社(台帳で最頻)が小 fraction で系統的に 0 へ潰れる。
+        k = int(round(emp * (1.0 if fraction >= 1.0 else fraction)
+                      * PV2.L2_ATTENDANCE_RATE))
+        if k <= 0:
+            continue
+        roles = tuple(c.get("roles") or ["スタッフ"])
+        sp = c.get("shift_pattern", {})
+        days = sp.get("days", "mon-fri")
+        ikey, sector = c.get("industry_key", ""), c.get("sector_detail", "")
+        n_night = night_slot_count(c, k)
+        k_day = k - n_night
+        w = PV2.role_weights(ikey, sector, roles)
+        counts = PV2.allocate_slots(w, k_day)
+        order = _slot_interleave(counts)
+        ranks = PV2.rank_slots(emp, ikey, k_day, carry=rank_carry)
+        for i, r_i in enumerate(order):
+            role = roles[r_i]
+            occ = occupation_for(ikey, sector, role)
+            slots.append((c["id"], role, occ, sp, days, ranks[i] if i < len(ranks) else "一般",
+                          ikey, PV2.role_major(ikey, sector, role)))
+        for i in range(n_night):
+            nsp = c["night_shift"]
+            nroles = nsp.get("roles") or list(roles)
+            nrole = nroles[i % len(nroles)]     # ★夜勤ロール名は写像を通さない(規律④)
+            slots.append((c["id"], nrole, nrole, nsp, nsp.get("days", days), "一般",
+                          ikey, PV2.role_major(ikey, sector, nrole)))
+    # ---- 学校・保育の教職員(校種別の 2 本の式。v1 の capacity/12 + i%2 を置き換える)----
+    for s in orgs["schools"]:
+        st = str(s.get("school_type", ""))
+        cap = int(s.get("capacity", 0))
+        if st == "認可保育所":
+            n_t, n_s = PV2.nursery_staff(cap)
+            kinds = (("保育士", "保育士", n_t), ("調理員", "調理員", n_s))
+        elif st == "幼稚園":
+            n_t, n_s = PV2.school_staff_counts(st, cap)
+            kinds = (("教員", "幼稚園教諭", n_t), ("職員", "学校事務職員", n_s))
+        else:
+            n_t, n_s = PV2.school_staff_counts(st, cap)
+            kinds = (("教員", "教員", n_t), ("職員", "学校事務職員", n_s))
+        # ★fraction は**職種ごとに**掛ける。まとめて先頭から切ると、教員が先に並んでいる
+        #   ぶん職員(と調理員)が小 fraction で丸ごと消える(= v1 の内訳誤りの再生産)。
+        pairs = []
+        for role, occ, cnt in kinds:
+            k = cnt if fraction >= 1.0 else max(1, int(round(cnt * fraction)))
+            pairs.extend([(role, occ)] * k)
+        tt = s.get("timetable", {})
+        # 台帳が shift_pattern を持つ施設(保育所は 07:30-18:30 で学校より長い)はそれを使う。
+        sp = dict(s.get("shift_pattern") or
+                  {"open": tt.get("start", "08:30"), "close": "17:00",
+                   "days": "mon-fri", "rotates": False})
+        # ★保育所は日本標準産業分類では **P 医療,福祉(児童福祉事業)** であって
+        #   O 教育,学習支援業ではない。賃金プランの産業基準(INDUSTRY_MONTHLY)が
+        #   ED 330,000 と MW 300,000 で違うので、ここを取り違えると水準がずれる。
+        ikey = "MW" if st == "認可保育所" else "ED"
+        for role, occ in pairs:
+            slots.append((s["id"], role, occ, sp, "mon-fri", "一般", ikey,
+                          "専門技術" if role in ("教員", "保育士") else
+                          ("サービス" if role == "調理員" else "事務")))
+    return slots
+
+
+def _build_L3_student_slots_v2(orgs: dict, fraction: float):
+    """v2 の L3 学生スロット。★保育所・幼稚園は**通わせない**。
+
+    0-5 歳は L1(住民)側に実在化させ、`school_stage` で行き先を示す。保育所を
+    L3(区外から通学する定期来街者)にすると「区外から通園する 0 歳児」になってしまう。
+    幼稚園も同じ理由で外す(園児は住民)。
+    """
+    slots = []
+    for s in orgs["schools"]:
+        st = str(s.get("school_type", ""))
+        if st not in _SCHOOL_OCC:            # 認可保育所 / 幼稚園 は学生を出さない
+            continue
+        cap = s["capacity"]
+        k = cap if fraction >= 1.0 else int(round(cap * fraction))
+        if k <= 0:
+            continue
+        occ, (lo, hi) = _SCHOOL_OCC[st]
+        start = s.get("timetable", {}).get("start", "08:30")
+        for _ in range(k):
+            slots.append((s["id"], occ, lo, hi, start))
+    return slots
+
+
+def _rank_age_repair(ranks: list[str], ages) -> list[str]:
+    """役職の年齢下限を、**役職の頭数を 1 人も変えずに**満たす(決定論の交換)。
+
+    §1-2(e)「役員は年齢とともに単調増加」を、org 単位のピラミッド(頭数)を壊さずに
+    表現する唯一の方法 = 若すぎる役職者と、条件を満たす一般社員の役職を入れ替える。
+    """
+    need: list[int] = []
+    for i, r in enumerate(ranks):
+        if int(ages[i]) < _RANK_AGE_FLOOR.get(r, 0):
+            need.append(i)
+    if not need:
+        return ranks
+    spare = [i for i, r in enumerate(ranks)
+             if r == "一般" and int(ages[i]) >= 38]
+    for i, j in zip(need, spare):
+        ranks[i], ranks[j] = ranks[j], ranks[i]
+    return ranks
+
+
+def gen_L2_v2(writer: ShardWriter, slots, seed: int, families: list[str]) -> None:
+    n = len(slots)
+    idx_global = 0
+    for part_idx in range(0, (n + PART_SIZE - 1) // PART_SIZE):
+        base = part_idx * PART_SIZE
+        m = min(PART_SIZE, n - base)
+        rng = _seed_rng(seed, LC["L2"], part_idx)
+        female = rng.random(m) < 0.49
+        gender = ["女" if f else "男" for f in female]
+        age = PV2.worker_ages(rng, m)
+        names = _v2_names(rng, age, gender, families)
+        locus, nfc, risk, thr, fw = _traits_block(rng, m)
+        depart = _depart_block(rng, m)
+        lead = _lead_block(rng, m, np.zeros(m, bool))
+        gate = np.where(rng.random(m) < 0.87, "station", "edge")
+        line = np.array(_RESIDENCE_LINES, object)[rng.integers(0, len(_RESIDENCE_LINES), m)]
+        slp = PV2.sleep_steps_by_age(rng, age, gender)
+        bike = rng.random(m) < 0.15; car = rng.random(m) < 0.08
+        ton = np.array(_TONES, object)[rng.integers(0, len(_TONES), m)]
+        u_emp = rng.random(m)
+        ranks = _rank_age_repair([slots[base + i][5] for i in range(m)], age)
+        for i in range(m):
+            org_id, role, occ, sp, days, _r0, ikey, major = slots[base + i]
+            pid = f"L2_{idx_global:08d}"; idx_global += 1
+            night = is_night_shift(sp)
+            commuting = "夜勤で通勤している" if night else "通勤している"
+            bedtime = night_bedtime_min(sp, i) if night else int(depart[i])
+            a = int(age[i])
+            emp = PV2.employment_of(float(u_emp[i]), a)
+            if emp in ("自営業主", "家族従業者"):     # 被用者スロットなので雇用者へ寄せる
+                emp = "非正規"
+            rank = ranks[i]
+            if emp == "役員" and rank == "一般":
+                rank = "役員"
+            persona = (f"あなたは{names[i]}、{a}歳の{occ}({gender[i]}性)。"
+                       f"{line[i]}に住んでいて、渋谷({role})に{commuting}。{ton[i]}。"
+                       "自分の言葉で自然に、短く話す。")
+            rec = {
+                "id": pid, "layer": "L2", "presence": "workday_shift",
+                "name": names[i], "age": a, "gender": gender[i],
+                "occupation": occ, "visitor": True, "commute": True,
+                "persona": persona,
+                "traits": {"internal_locus": float(locus[i]), "nfc": float(nfc[i]),
+                           "risk_tolerance": float(risk[i])},
+                "drive_threshold": float(thr[i]), "fire_weight": float(fw[i]),
+                "bedtime_min": int(bedtime), "sleep_steps": int(slp[i]),
+                "has_bicycle": bool(bike[i]), "has_car": bool(car[i]),
+                "arrival_lead_min": int(lead[i]), "commute_gateway": str(gate[i]),
+                "residence_line": str(line[i]),
+                "org_id": org_id, "role": role,
+                "shift_pattern": {"open": sp.get("open", "09:00"),
+                                  "close": sp.get("close", "18:00"),
+                                  "days": days, "rotates": bool(sp.get("rotates", False))},
+                "work_days": days,
+            }
+            _v2_common(rec, a, ikey, major, rank, emp, "in_area", "rail")
+            writer.add(rec)
+
+
+def gen_L3_students_v2(writer: ShardWriter, slots, seed: int, families: list[str]) -> None:
+    n = len(slots)
+    idx_global = 0
+    for part_idx in range(0, (n + PART_SIZE - 1) // PART_SIZE):
+        base = part_idx * PART_SIZE
+        m = min(PART_SIZE, n - base)
+        rng = _seed_rng(seed, LC["L3"], part_idx)
+        female = rng.random(m) < 0.49
+        gender = ["女" if f else "男" for f in female]
+        ages = np.array([slots[base + i][2] +
+                         int(rng.integers(0, slots[base + i][3] - slots[base + i][2] + 1))
+                         for i in range(m)])
+        names = _v2_names(rng, ages, gender, families)
+        locus, nfc, risk, thr, fw = _traits_block(rng, m)
+        lead = _lead_block(rng, m, np.ones(m, bool))
+        gate = np.where(rng.random(m) < 0.87, "station", "edge")
+        line = np.array(_RESIDENCE_LINES, object)[rng.integers(0, len(_RESIDENCE_LINES), m)]
+        slp = PV2.sleep_steps_by_age(rng, ages, gender)
+        bedt = PV2.bedtime_by_age(rng, ages)
+        for i in range(m):
+            sid, occ, _lo, _hi, _start = slots[base + i]
+            a = int(ages[i])
+            pid = f"L3_{idx_global:08d}"; idx_global += 1
+            persona = (f"あなたは{names[i]}、{a}歳の{occ}({gender[i]}性)。"
+                       f"{line[i]}から渋谷の学校に通っている。"
+                       "自分の言葉で自然に、短く話す。")
+            rec = {
+                "id": pid, "layer": "L3", "presence": "cadence",
+                "name": names[i], "age": a, "gender": gender[i],
+                "occupation": occ, "visitor": True, "commute": True,
+                "persona": persona,
+                "traits": {"internal_locus": float(locus[i]), "nfc": float(nfc[i]),
+                           "risk_tolerance": float(risk[i])},
+                "drive_threshold": float(thr[i]), "fire_weight": float(fw[i]),
+                "bedtime_min": int(bedt[i]), "sleep_steps": int(slp[i]),
+                "has_bicycle": bool(rng.random() < 0.2), "has_car": False,
+                "arrival_lead_min": int(lead[i]), "commute_gateway": str(gate[i]),
+                "residence_line": str(line[i]),
+                "org_id": sid, "role": "学生",
+                "visit_cadence": "school_day", "subtype": "student",
+            }
+            _v2_common(rec, a, "ED", "学生", "学生", "非就業", "none", "rail")
+            writer.add(rec)
+
+
+def _v2_visitor_occ(u_state: float, u_emp: float, u_ind: float, u_major: float,
+                    age: int, industries, ind_w):
+    """来街者(L3常連/L4)の職業。粗い 9 語 + v2 の 2 語に収める(語彙を増やさない)。"""
+    state = PV2.labour_state(u_state, age)
+    if state != "就業":
+        occ = PV2.nonworking_occupation(state, age)
+        if occ == "無職":
+            occ = "無職・求職"
+        if occ in ("大学生", "小学生", "中学生", "高校生") and age >= 18:
+            occ = "学生"
+        return occ, ("学生" if state == "通学" else "非就業"), "非就業", ""
+    acc, ikey = 0.0, industries[-1]
+    for key, w in zip(industries, ind_w):
+        acc += w
+        if u_ind < acc:
+            ikey = key
+            break
+    emp = PV2.employment_of(u_emp, age, metro=True)   # 来街者は東京圏全体から来る
+    # ★15-17 歳の就業は現実にはほぼ飲食・小売のアルバイト(非正規率 80.9%)。
+    #   ここを機能別の職業大分類で引くと「16 歳の会社員」が出る = v1 の欠陥の再生産。
+    if age < 18:
+        return "販売・サービス", "サービス", "非正規", ikey
+    if ikey == "PA":
+        return "公務員", "事務", emp, ikey
+    if emp == "役員" and u_major < PV2.EXEC_AS_MANAGER and age >= PV2.MANAGER_AGE_MIN:
+        return "経営者", "管理", emp, ikey     # 役員のうち職業分類が「管理」になるのは 32.4%
+    if emp in ("自営業主", "家族従業者"):
+        return "フリーランス", "専門技術", emp, ikey
+    row = PV2.IND_OCC_ROW.get(ikey, PV2.IND_OCC_ROW["CS"])
+    acc, major = 0.0, "事務"
+    tot = sum(row)
+    for name, x in zip(PV2.OCC_MAJORS, row):
+        acc += x / tot
+        if u_major < acc:                   # ★業種選択とは別の draw(共用すると相関が付く)
+            major = name
+            break
+    if major == "管理" and age < PV2.MANAGER_AGE_MIN:
+        major = "事務"
+    return _MAJOR_TO_COARSE.get(major, "会社員"), major, emp, ikey
+
+
+def gen_L3_regulars_v2(writer: ShardWriter, n: int, seed: int, families: list[str]) -> None:
+    industries = [k for k, _w in PV2.RESIDENT_INDUSTRY_SHARE]
+    iw = np.array([w for _k, w in PV2.RESIDENT_INDUSTRY_SHARE], float)
+    iw /= iw.sum()
+    idx_global = 0
+    for p in range(0, (n + PART_SIZE - 1) // PART_SIZE):
+        m = min(PART_SIZE, n - p * PART_SIZE)
+        rng = _seed_rng(seed, LC["L3"], 1000 + p)
+        female = rng.random(m) < PV2.VISITOR_FEMALE_SHARE
+        gender = ["女" if f else "男" for f in female]
+        age = PV2.visitor_ages(rng, m)
+        names = _v2_names(rng, age, gender, families)
+        u_state = rng.random(m); u_emp = rng.random(m); u_ind = rng.random(m)
+        u_major = rng.random(m)
+        locus, nfc, risk, thr, fw = _traits_block(rng, m)
+        line = np.array(_RESIDENCE_LINES, object)[rng.integers(0, len(_RESIDENCE_LINES), m)]
+        cad = rng.integers(2, 5, m)
+        slp = PV2.sleep_steps_by_age(rng, age, gender)
+        bedt = PV2.bedtime_by_age(rng, age)
+        hob = np.array(_HOBBIES, object)[rng.integers(0, len(_HOBBIES), m)]
+        for i in range(m):
+            a = int(age[i])
+            occ, major, emp, ikey = _v2_visitor_occ(
+                float(u_state[i]), float(u_emp[i]), float(u_ind[i]),
+                float(u_major[i]), a, industries, iw)
+            pid = f"L3reg_{idx_global:08d}"; idx_global += 1
+            persona = (f"あなたは{names[i]}、{a}歳の{occ}({gender[i]}性)。"
+                       f"{line[i]}に住み、週{int(cad[i])}回ほど渋谷に通う常連。{hob[i]}が好き。"
+                       "自分の言葉で自然に、短く話す。")
+            rec = {
+                "id": pid, "layer": "L3", "presence": "cadence",
+                "name": names[i], "age": a, "gender": gender[i],
+                "occupation": occ, "visitor": True, "commute": False,
+                "persona": persona,
+                "traits": {"internal_locus": float(locus[i]), "nfc": float(nfc[i]),
+                           "risk_tolerance": float(risk[i])},
+                "drive_threshold": float(thr[i]), "fire_weight": float(fw[i]),
+                "bedtime_min": int(bedt[i]), "sleep_steps": int(slp[i]),
+                "has_bicycle": bool(rng.random() < 0.15),
+                "has_car": bool(rng.random() < 0.08),
+                "residence_line": str(line[i]),
+                "visit_cadence": f"weekly_{int(cad[i])}", "subtype": "regular",
+            }
+            _v2_common(rec, a, ikey, major, "一般" if emp != "非就業" else "非就業",
+                       emp, "none", "rail")
+            writer.add(rec)
+
+
+def gen_L4_v2(writer: ShardWriter, n: int, seed: int, families: list[str]) -> None:
+    industries = [k for k, _w in PV2.RESIDENT_INDUSTRY_SHARE]
+    iw = np.array([w for _k, w in PV2.RESIDENT_INDUSTRY_SHARE], float)
+    iw /= iw.sum()
+    purposes = [p for p, _w in _VISIT_PURPOSES]
+    idx_global = 0
+    for part_idx in range(0, (n + PART_SIZE - 1) // PART_SIZE):
+        m = min(PART_SIZE, n - part_idx * PART_SIZE)
+        rng = _seed_rng(seed, LC["L4"], part_idx)
+        female = rng.random(m) < PV2.VISITOR_FEMALE_SHARE
+        gender = ["女" if f else "男" for f in female]
+        age = PV2.visitor_ages(rng, m)
+        names = _v2_names(rng, age, gender, families)
+        u_state = rng.random(m); u_emp = rng.random(m); u_ind = rng.random(m)
+        u_major = rng.random(m); u_purpose = rng.random(m)
+        locus, nfc, risk, thr, fw = _traits_block(rng, m)
+        is_foreign = rng.random(m) < PV2.FOREIGN_SHARE_VISITOR
+        party = 1 + rng.integers(0, 5, m)
+        visit_rate = PV2.visit_rates(rng, m)
+        revisit = rng.random(m) < 0.10
+        slp = PV2.sleep_steps_by_age(rng, age, gender)
+        bedt = PV2.bedtime_by_age(rng, age)
+        for i in range(m):
+            a = int(age[i])
+            occ, major, emp, ikey = _v2_visitor_occ(
+                float(u_state[i]), float(u_emp[i]), float(u_ind[i]),
+                float(u_major[i]), a, industries, iw)
+            # 来訪目的を年齢で条件づける(★7 語の語彙は変えない = presence の表を壊さない)
+            w = PV2.purpose_weights_for_age(_VISIT_PURPOSES, a)
+            acc, purpose = 0.0, purposes[-1]
+            for name, x in zip(purposes, w):
+                acc += x
+                if u_purpose[i] < acc:
+                    purpose = name
+                    break
+            pid = f"L4_{idx_global:08d}"; idx_global += 1
+            tag = "訪日外国人" if is_foreign[i] else str(occ)
+            persona = (f"あなたは{names[i]}、{a}歳({gender[i]}性)。"
+                       f"{purpose}のため渋谷を訪れる{tag}。"
+                       "自分の言葉で自然に、短く話す。")
+            rec = {
+                "id": pid, "layer": "L4", "presence": "stochastic",
+                "name": names[i], "age": a, "gender": gender[i],
+                "occupation": occ, "visitor": True, "commute": False,
+                "persona": persona,
+                "traits": {"internal_locus": float(locus[i]), "nfc": float(nfc[i]),
+                           "risk_tolerance": float(risk[i])},
+                "drive_threshold": float(thr[i]), "fire_weight": float(fw[i]),
+                "bedtime_min": int(bedt[i]), "sleep_steps": int(slp[i]),
+                "has_bicycle": False, "has_car": bool(rng.random() < 0.05),
+                "visit_purpose": str(purpose),
+                "visit_rate": round(float(visit_rate[i]), 4),
+                "is_foreign": bool(is_foreign[i]), "party_size": int(party[i]),
+                "revisit": bool(revisit[i]),
+            }
+            _v2_common(rec, a, ikey, major, "一般" if emp != "非就業" else "非就業",
+                       emp, "none", "rail")
+            writer.add(rec)
+
+
+def gen_L5_v2(writer: ShardWriter, seed: int, fraction: float, families: list[str]):
+    """L5 v2: 年齢は職務要件で決まる層なので v1 の分布を保ち、姓名と日課だけ v2 化する。"""
+    rng = _seed_rng(seed, LC["L5"], 0)
+    councilors = []
+    idx_global = 0
+    for role, occ, full_n, posts, duty, is_visitor in _L5_ROLES:
+        k = full_n if fraction >= 1.0 else max(1, int(round(full_n * fraction)))
+        female = rng.random(k) < 0.35
+        gender = ["女" if f else "男" for f in female]
+        age = np.clip(rng.normal(40, 11, k), 20, 66).astype(int)
+        names = _v2_names(rng, age, gender, families)
+        locus, nfc, risk, thr, fw = _traits_block(rng, k)
+        line = np.array(_RESIDENCE_LINES, object)[rng.integers(0, len(_RESIDENCE_LINES), k)]
+        slp = PV2.sleep_steps_by_age(rng, age, gender)
+        bedt = PV2.bedtime_by_age(rng, age)
+        for i in range(k):
+            post = posts[i % len(posts)]
+            pid = f"L5_{idx_global:08d}"; idx_global += 1
+            a = int(age[i])
+            core = _L5_ROLE_SENTENCE.get(role, "渋谷の{post}で{role}として働いている。")
+            persona = (f"あなたは{names[i]}、{a}歳の{occ}({gender[i]}性)。"
+                       + core.format(post=post, role=role)
+                       + "自分の言葉で自然に、短く話す。")
+            rec = {
+                "id": pid, "layer": "L5", "presence": "duty",
+                "name": names[i], "age": a, "gender": gender[i],
+                "occupation": occ, "visitor": bool(is_visitor),
+                "commute": bool(is_visitor),
+                "persona": persona,
+                "traits": {"internal_locus": float(locus[i]), "nfc": float(nfc[i]),
+                           "risk_tolerance": float(risk[i])},
+                "drive_threshold": float(thr[i]), "fire_weight": float(fw[i]),
+                "bedtime_min": int(bedt[i]), "sleep_steps": int(slp[i]),
+                "has_bicycle": False, "has_car": bool(rng.random() < 0.1),
+                "residence_line": str(line[i]) if is_visitor else "",
+                "role": role, "post": post, "duty_pattern": dict(duty),
+            }
+            _v2_common(rec, a, "", PV2.ROLE_OCC_MAJOR.get(role, "サービス"),
+                       "一般", "正規" if occ != "路上生活者" else "非就業",
+                       "in_area", "walk")
+            writer.add(rec)
+
+    crng = _seed_rng(seed, LC["L5"], 1)
+    k = N_COUNCILORS
+    female = crng.random(k) < 0.35
+    gender = ["女" if f else "男" for f in female]
+    age = np.clip(crng.normal(52, 9, k), 30, 74).astype(int)
+    names = _v2_names(crng, age, gender, families)
+    locus, nfc, risk, thr, fw = _traits_block(crng, k)
+    slp = PV2.sleep_steps_by_age(crng, age, gender)
+    bedt = PV2.bedtime_by_age(crng, age)
+    car = crng.random(k) < 0.3
+    for i in range(k):
+        party = _PARTIES[i % len(_PARTIES)]
+        pid = f"L5c_{i + 1:03d}"
+        a = int(age[i])
+        persona = (f"あなたは{names[i]}、{a}歳の渋谷区議会議員({gender[i]}性)。"
+                   f"会派は{party}。渋谷に住み、区政に取り組んでいる。"
+                   "自分の言葉で自然に、短く話す。")
+        rec = {
+            "id": pid, "layer": "L5", "presence": "resident",
+            "name": names[i], "age": a, "gender": gender[i],
+            "occupation": COUNCILOR_OCC, "visitor": False, "commute": False,
+            "persona": persona,
+            "traits": {"internal_locus": float(locus[i]), "nfc": float(nfc[i]),
+                       "risk_tolerance": float(risk[i])},
+            "drive_threshold": float(thr[i]), "fire_weight": float(fw[i]),
+            "bedtime_min": int(bedt[i]), "sleep_steps": int(slp[i]),
+            "has_bicycle": False, "has_car": bool(car[i]),
+            "role": "議員", "seat_id": f"seat_{i + 1:02d}", "party": party,
+        }
+        _v2_common(rec, a, "PA", "管理", "役員", "正規", "in_area", "walk")
+        writer.add(rec)
+        councilors.append(rec)
+    return councilors
+
+
 # ------------------------------------------------------------------ メイン
 def scan_existing_parts(out_dir: Path) -> set:
     """出力先に**いま在る** part-*.jsonl の相対名(``<layer>/part-XXXX.jsonl``)を集める。
@@ -1004,21 +1678,30 @@ def scan_existing_parts(out_dir: Path) -> set:
 def build_pool(out_dir: Path, seed: int, fraction: float,
                orgs: dict, pop: dict, total_target: int,
                orgs_file: str = DEFAULT_ORGS_FILE, clean: bool = False,
-               occupations: bool = True):
+               occupations: bool = True, v2: bool = False):
     """プールを生成する。``clean=True`` で**管理外の古い part を削除**する(既定は警告のみ)。
 
     ``occupations=False`` で職業名対応表(PRES-B)を通さない = 第108 までの名簿と
     1 バイト一致(occupation = 台帳ロール名)。回帰比較用の口。
+
+    ``v2=True`` で**ペルソナプール v2**(全年齢・業種×役職の分離・世帯・水準較正)。
+    既定 False = v1 と 1 バイト一致(v2 のコードは 1 行も通らない)。
     """
     t0 = time.time()
     out_dir.mkdir(parents=True, exist_ok=True)
     pre_parts = scan_existing_parts(out_dir)      # ★書き込み前に採る(D1)
+    families = list(_FAMILY)
+    if v2:
+        PV2.load_ledger_roles(orgs)               # 台帳から (業種 → ロール) を採る
+        families = PV2.family_names(_FAMILY)      # 60 → 200 姓
 
     # 層別目標
     n_L1 = int(round(30_000 * fraction))
-    L2_slots = _build_L2_slots(orgs, fraction, occupations=occupations)
+    L2_slots = (_build_L2_slots_v2(orgs, fraction) if v2
+                else _build_L2_slots(orgs, fraction, occupations=occupations))
     n_L2 = len(L2_slots)
-    L3_student_slots = _build_L3_student_slots(orgs, fraction)
+    L3_student_slots = (_build_L3_student_slots_v2(orgs, fraction) if v2
+                        else _build_L3_student_slots(orgs, fraction))
     n_L3s = len(L3_student_slots)
     n_L3r = int(round(20_000 * fraction))
     # L5 件数を先に確定(L4=残り の計算に必要)
@@ -1037,17 +1720,29 @@ def build_pool(out_dir: Path, seed: int, fraction: float,
         fn(w)
         timings[layer] = timings.get(layer, 0.0) + (time.time() - s)
 
-    _run("L1", lambda w: gen_L1(w, n_L1, seed, pop))
-    _run("L2", lambda w: gen_L2(w, L2_slots, seed))
-    _run("L3", lambda w: gen_L3_students(w, L3_student_slots, seed))
-    _run("L3", lambda w: gen_L3_regulars(w, n_L3r, seed, part_offset=0))
-    _run("L4", lambda w: gen_L4(w, n_L4, seed))
     councilors = []
+    if v2:
+        _run("L1", lambda w: gen_L1_v2(w, n_L1, seed, families))
+        _run("L2", lambda w: gen_L2_v2(w, L2_slots, seed, families))
+        _run("L3", lambda w: gen_L3_students_v2(w, L3_student_slots, seed, families))
+        _run("L3", lambda w: gen_L3_regulars_v2(w, n_L3r, seed, families))
+        _run("L4", lambda w: gen_L4_v2(w, n_L4, seed, families))
 
-    def _run_L5(w):
-        nonlocal councilors
-        councilors = gen_L5(w, seed, fraction)
-    _run("L5", _run_L5)
+        def _run_L5(w):
+            nonlocal councilors
+            councilors = gen_L5_v2(w, seed, fraction, families)
+        _run("L5", _run_L5)
+    else:
+        _run("L1", lambda w: gen_L1(w, n_L1, seed, pop))
+        _run("L2", lambda w: gen_L2(w, L2_slots, seed))
+        _run("L3", lambda w: gen_L3_students(w, L3_student_slots, seed))
+        _run("L3", lambda w: gen_L3_regulars(w, n_L3r, seed, part_offset=0))
+        _run("L4", lambda w: gen_L4(w, n_L4, seed))
+
+        def _run_L5_v1(w):
+            nonlocal councilors
+            councilors = gen_L5(w, seed, fraction)
+        _run("L5", _run_L5_v1)
 
     for w in writers.values():
         w.close()
@@ -1087,7 +1782,7 @@ def build_pool(out_dir: Path, seed: int, fraction: float,
     llm_targets = _collect_llm_targets(out_dir, seed)
 
     meta = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": V2_SCHEMA_VERSION if v2 else SCHEMA_VERSION,
         "generator": "scripts/build_persona_pool.py",
         "seed": seed, "fraction": fraction,
         "total_target": total_target, "total_generated": total,
@@ -1113,6 +1808,39 @@ def build_pool(out_dir: Path, seed: int, fraction: float,
         "occupations_distinct": len(occ_sorted),
         "occupations": occ_sorted,
         "llm_targets_count": len(llm_targets),
+        # ---- ペルソナプール v2(既定 false = v1 と 1 バイト一致)------------------
+        "v2": bool(v2),
+        "v2_params": ({
+            "base_year": V2_BASE_YEAR,
+            "l2_attendance_rate": PV2.L2_ATTENDANCE_RATE,
+            "foreign_share_visitor": PV2.FOREIGN_SHARE_VISITOR,
+            "visit_rate_mix": [list(x) for x in PV2.VISIT_RATE_MIX],
+            "family_names": len(families),
+            "schema_extensions_v2": [
+                "industry_key", "industry_major", "occupation_major", "rank",
+                "employment", "birth_year", "school_stage", "workplace_scope",
+                "commute_mode", "household_id", "household_role", "household_type"],
+            "sources": [
+                "住民基本台帳 渋谷区 月別年齢別男女別人口 2026-08-01(総数 231,047)",
+                "令和2年国勢調査 就業状態等基本集計 第10-3表(産業大分類×職業大分類・市区町村)",
+                "令和2年国勢調査 第1-2表(年齢別労働力状態)/ 第3-1表(従業上の地位)",
+                "賃金構造基本統計調査 役職第1表 令和7年(役職構成比)",
+                "文部科学省/東京都 令和7年度学校基本統計(区市町村別 教員・職員)",
+                "児童福祉施設の設備及び運営に関する基準 第三十三条(保育士配置基準)",
+                "令和2年国勢調査 人口等基本集計 第26-1表(世帯)",
+                "令和2年国勢調査 従業地・通学地集計(区外通勤55%/自宅従業16.8%)",
+                "NHK 国民生活時間調査 2020 表15/表16(年齢別睡眠長と位相)"],
+            "honesty": (
+                "年齢5歳階級・産業構成・産業×職業クロス・役職構成比・教職員比・"
+                "保育士配置基準・世帯類型・従業地は一次統計の実数。"
+                "★暫定(実数と偽装しない): (a) 来街者の年齢周辺分布(distinct 来訪者の"
+                "年齢構成の公表値は存在しない) (b) 来訪頻度分布の形(同上・水準のみ較正) "
+                "(c) 来訪目的の年齢弾性(PT 調査の該当表は図中画像で未取得) "
+                "(d) 名前のコホート割当(明治安田生命ランキングの世代傾向による分類で"
+                "年次表そのものではない) (e) 大学・専門学校の職員比(未取得・高校値を借用) "
+                "(f) 保育所の年齢別定員内訳 (g) 80歳以上の役員実数(外挿)。"
+                "★俗説(スクランブル交差点 26万/39万/50万)は出典が無いので使っていない。"),
+        } if v2 else None),
         "elapsed_sec": round(time.time() - t0, 2),
         "layer_elapsed_sec": {k: round(v, 2) for k, v in timings.items()},
         "shards": shards,
@@ -1196,8 +1924,19 @@ def main(argv=None):
     ap.add_argument("--no-occupation-map", action="store_true",
                     help="職業名対応表(PRES-B)を通さず occupation = 台帳ロール名にする"
                          "(第108 までの名簿と 1 バイト一致。回帰比較用)。")
+    ap.add_argument("--v2", action="store_true",
+                    help="ペルソナプール v2(全年齢 0-100+ / 業種×役職の分離 / 世帯の年齢整合 / "
+                         "来街水準の較正 / 出生コホート条件つき姓名 / 年齢別日課)。"
+                         "★--out を省略すると data/persona_pool_v2 へ吐く(旧プールを壊さない)。"
+                         "正典: docs/plans/persona-pool-v2-plan.md")
+    ap.add_argument("--childcare", default="",
+                    help="保育所・幼稚園のサイドカー台帳(scripts/build_orgs.py --childcare が"
+                         "書く data/organizations_shibuya_childcare.json)。--v2 と併用すると"
+                         "保育士・調理員・幼稚園教諭が名簿に生え、0-5 歳の行き先ができる。")
     args = ap.parse_args(argv)
 
+    if args.v2 and args.out == "data/persona_pool":
+        args.out = "data/persona_pool_v2"
     out_dir = Path(args.out)
     if not out_dir.is_absolute():
         out_dir = REPO_ROOT / out_dir
@@ -1208,13 +1947,24 @@ def main(argv=None):
     orgs = json.loads(orgs_path.read_text(encoding="utf-8"))
     pop = json.loads((REPO_ROOT / "data" / "shibuya_population.json")
                      .read_text(encoding="utf-8"))
+    if args.childcare:
+        cpath = Path(args.childcare)
+        if not cpath.is_absolute():
+            cpath = REPO_ROOT / cpath
+        side = json.loads(cpath.read_text(encoding="utf-8"))
+        # ★台帳本体(10.7MB・コミット済み)は 1 バイトも触らず、学校ブロックにだけ足す。
+        orgs = dict(orgs)
+        orgs["schools"] = list(orgs.get("schools", ())) + list(side.get("schools", ()))
 
     meta, councilors = build_pool(out_dir, args.seed, args.fraction, orgs, pop, args.total,
                                   orgs_file=str(args.orgs).replace("\\", "/"),
                                   clean=args.clean,
-                                  occupations=not args.no_occupation_map)
+                                  occupations=not args.no_occupation_map,
+                                  v2=args.v2)
 
-    if not args.no_councilors_json:
+    # ★v2 では data/personas_councilors.json(コミット対象・v1 名簿)を**上書きしない**。
+    #   v2 の議員名簿は v2 プール内にしか出さない = 旧プールで再現できる退路を残す。
+    if not args.no_councilors_json and not args.v2:
         cpath = _write_councilors_json(councilors, args.seed)
         print(f"written councilors: {cpath} ({len(councilors)})")
 

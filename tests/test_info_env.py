@@ -130,7 +130,7 @@ def test_viral_cascade_weights_high_follower(tmp_path):
                   "info_env.influence.follower_threshold": "2"})
     author = sim.agents[1].id
     for f in (2, 3, 4):                              # author を明示的に3人がフォロー
-        sim.net.follows[f].add(author)
+        sim.net.follow(f, author)
     pid = sim.net.post(author, "拡散して", [], 0)
     sim.net.react(5, pid, "reshare", 0, author_name=sim.agents[1].name)  # RT 生成
     before = sim.net.posts[pid]["reshares"]

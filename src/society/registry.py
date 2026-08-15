@@ -124,6 +124,27 @@ FEATURES: tuple[Feature, ...] = (
        "出来事誘発の深い内省。LLM 内省の自由文から自己像(self_model)を作る"),
     _f("reflection.implicit_self.enabled", "strict", False, "possible",
        "無意識層。行動カウントのベースライン逸脱から決定論で『最近の自分』1行を日次更新"),
+    _f("reflection.timing.mode", "strict", False, "possible",
+       "RFX-A 内省の発火タイミング(docs/plans/reflection-leisure-plan.md §3)。"
+       "sleep(既定=現行と完全同値。就寝イベントが予約し、その次 step で必ず発火)/ "
+       "reflective_moment(務め終了以降、最初の『内省的瞬間』= 一人 かつ 非作業 かつ "
+       "低負荷文脈 で発火。来なければ現行どおり就寝時)。★**発火点を 1 つも足さない**: "
+       "早期発火は `reflect_suppress_arm` で将来の予約 1 回を厳密に相殺する(1 予約 1 発火)。"
+       "乱数ゼロ・新 state は int 2 本。affects_k=False の理由: 呼び出し点も本数も増えず、"
+       "発火の**時刻**だけが動く。★正直な限界: ラン境界(早期発火したがその夜に眠らないまま"
+       "ランが終わる個体)で ±1 日ぶんの差が出うる。★前提: `lod.budget.tiers`(DPH-B)ON。"
+       "予算外の内省が飽和帯へ移るので、二層予算が無いと一般呼の granted 率を押し下げる",
+       off_value="sleep"),
+    _f("reflection.timing.context_tag", "strict", False, "none",
+       "RFX-O 内省の発火文脈の観測。reflect payload へ when(moment/sleep)と "
+       "context(home/media/walk/sleep)を足す**だけ**。世界も乱数も 1 ビットも動かさない"
+       "(既定 OFF ではキー自体を生やさない = L1 バイト一致)"),
+    _f("reflection.timing.sleep_task_rewrite", "strict", False, "possible",
+       "就寝前の内省タスク文を**良眠者型へ言い換える**。根拠: Lemyre 2020 *Sleep Med Rev* "
+       "50:101253(1,730 本の系統的レビュー)= 正常な入眠移行は『感覚的イメジャリ・高次認知の"
+       "脱活性化』で、**計画や問題解決に関わる就寝前思考は不眠者の特徴**。現行文の"
+       "『順に思い出し…明日の自分にどう影響するかまでじっくり』は分類上その不眠者型。"
+       "★プロンプト変更 = 挙動変化なのでトグル配下(JSON 契約キーは 1 つも変えない)"),
 
     # ---- model(LLM 側の装置。cache/journal は再現性の道具なので strict)----
     _f("model.cache", "strict", False, "none",
@@ -159,6 +180,13 @@ FEATURES: tuple[Feature, ...] = (
        "構造化シーン記述を発火プロンプトへ注入(方向つき視界・注視対象・垂直関係)"),
     _f("world.scene_desc.vertical", "strict", False, "possible",
        "シーン記述の垂直関係(レイヤ/標高)1行を出すか"),
+    _f("aging.enabled", "strict", False, "possible",
+       "AGE-F 加齢・誕生日(docs/plans/age-diversity-plan.md §4-8)。暦の実日付が個体の誕生日と"
+       "一致した日に age+1 し、既存 `life_event`(kind=birthday)を 1 件記録する。**新しい L1 kind は"
+       "足さない**。誕生日は (seed, persona id) の安定ハッシュ = 決定論・乱数ゼロ・resume 不変。"
+       "★ライフステージ遷移(就学・成人・退職)と年齢起因の死亡は**入れていない**(本選後)。"
+       "★要 world.calendar.enabled(暦が無ければ実日付が無く誕生日を定義できない=完全 no-op)。"
+       "fingerprint_risk=possible の理由: プロンプトの `{age}歳` が 1 増えるため当人から観測しうる"),
     _f("world.calendar.enabled", "strict", False, "possible",
        "暦(日付・曜日・祝日)。全プロンプトへ日付1行を注入する"),
     _f("world.calendar.weekday_work", "strict", False, "none",
@@ -1054,6 +1082,15 @@ FEATURES: tuple[Feature, ...] = (
        "pool.enabled が OFF なら 1 バイトも効かない子トグル"),
     _f("engine.batch_llm.enabled", "journal", False, "none",
        "LLM 一括発行(未命中のみ並行発行→id 順 apply)。LLM 発行経路そのものを差し替える"),
+    _f("cognition.age.enabled", "strict", False, "none",
+       "年齢→思考/推論の量(AGE-C。docs/plans/age-diversity-plan.md §4-4)。年齢から個体の"
+       "**基本思考周期の倍率**と**発火申請の実効閾値 delta** を決定論(乱数ゼロ)で決める。"
+       "★年齢は『誰が撃てるか』を決めない: LodBudget.take と requesters.sort、"
+       "mind.tiers.high.select: uniform(k* 自壊回避の掟)は 1 行も触らない。変わるのは"
+       "個体の drive 分布だけで、量は本人の発火から創発する。affects_k=False の理由: "
+       "生成の呼び出し点を 1 つも足さず、cap が binding するランでは総数が cap 固定"
+       "(変わるのは *誰が* 撃つか)。cap 非拘束の小規模構成では呼数が動きうるため、"
+       "係数は ref_age で恒等になるよう規格化して両側へ対称に振れる形にしてある"),
     _f("cognition.policy_cache.enabled", "journal", True, "none",
        "方針キャッシュ。過去の LLM 出力を物理量キーで再利用して呼をスキップする"),
     _f("cognition.channels.enabled", "strict", False, "none",
@@ -1229,6 +1266,12 @@ FEATURES: tuple[Feature, ...] = (
        "枠は消費するが落ちない)"),
     _f("friend_graph.enabled", "strict", False, "none",
        "現実的な友人ネットワークの生成(決定論+専用 stream)"),
+    _f("friend_graph.age_degree", "strict", False, "none",
+       "AGE-D 次数の年齢曲線(docs/plans/age-diversity-plan.md §4-6)。Bhattacharya 2016 "
+       "(携帯 CDR 660 万ユーザー)の『月間 alter は 25 歳前後で最大 → 45 まで減 → 45-55 台地 → "
+       "55 以降また減』を折れ線で当てる。★加齢が削るのは**外層だけ**という 4 ソース一致の所見に"
+       "従い、倍率は弱紐帯(friend tier2 / acq tier1)にのみ掛かり、親友(tier3=内核)は不変。"
+       "要 friend_graph.enabled。決定論・乱数ゼロ・LLM 呼ゼロ増(グラフ構築のみ)"),
     _f("hierarchy.enabled", "strict", False, "possible",
        "社会的ヒエラルキー(地位・信用・名声)の集計と反映"),
     _f("gossip.enabled", "strict", False, "possible",

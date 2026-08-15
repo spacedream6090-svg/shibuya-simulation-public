@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 
 from .. import ablate as ablate_mod
+from .. import aging as aging_mod
 from .. import annual as annual_mod
 from .. import assets as assets_mod
 from .. import chance as chance_mod
@@ -67,6 +68,7 @@ from .. import work as work_mod
 from .. import worldview as worldview_mod
 from ..net import infoenv as infoenv_mod
 from ..cognition import deliberate, drive, planning, routine
+from ..cognition import age_cog as age_cog_mod
 from ..cognition import day_plan as day_plan_mod
 from ..cognition import engaged as engaged_mod
 from ..cognition import fire as fire_mod
@@ -74,6 +76,7 @@ from ..cognition import perception_contract as contract_mod
 from ..cognition import plan_boundary as boundary_mod
 from ..cognition import plasticity as plasticity_mod
 from ..cognition import watch as watch_mod
+from ..cognition import reflect_timing as reflect_timing_mod
 from ..cognition import reflection as reflection_mod
 from ..cognition.reflection import maybe_reflect
 from ..economy import CIVIL_SERVANTS, civil_servant_pay, gig_profile, price_of
@@ -1104,6 +1107,8 @@ def _phase_reflect_batched(sim, step: int, sim_min: int, workers: int) -> None:
     isl_on = _interstitial_on(sim)
     mt = int(sim.cfg.model.reflect_max_tokens)
     think = bool(sim.cfg.model.reflect_think)
+    rfx_tag = reflect_timing_mod.context_tag_on(sim)     # RFX-O(既定 OFF=payload 不変)
+    rfx_sleepy = bool(reflect_timing_mod.cfg_of(sim)["sleep_task_rewrite"])
 
     due: list[dict] = []
     for agent in _reflect_due(sim, step, sim_min):  # DPH-B(OFF は sim.agents=不変)
@@ -1124,7 +1129,7 @@ def _phase_reflect_batched(sim, step: int, sim_min: int, workers: int) -> None:
 
     if agentic_pull:                     # ラウンド1: recall(常に+1呼=R1)
         rreqs = [reflection_mod.build_recall_request(
-                     d["agent"], step=step, place_name="自宅",
+                     d["agent"], step=step, place_name=_reflect_place(sim, d["agent"]),
                      date_line=date_line, weather_line=weather_line,
                      city_name=city) for d in due]
         rres = sim.llm.generate_many(rreqs, workers=workers)
@@ -1136,12 +1141,16 @@ def _phase_reflect_batched(sim, step: int, sim_min: int, workers: int) -> None:
             d["sink"] = sink
 
     reqs = [reflection_mod.build_reflect_request(   # ラウンド2: 内省本体
-                d["agent"], step=step, sim_min=sim_min, place_name="自宅",
+                d["agent"], step=step, sim_min=sim_min,
+                place_name=_reflect_place(sim, d["agent"]),
                 date_line=date_line, weather_line=weather_line,
                 reflect_cfg=rcfg, reflect_variety=variety,
                 interstitial_digest=d["digest"], interstitial=isl_on,
                 city_name=city, max_tokens=mt, think=think,
-                recalled=d["recalled"], recall_fail=d["recall_fail"])
+                recalled=d["recalled"], recall_fail=d["recall_fail"],
+                # RFX-A / RFX-O(既定 OFF=None/False=従来定数とバイト一致)
+                moment=reflect_timing_mod.when_of(d["agent"]),
+                sleepy=rfx_sleepy, tag=rfx_tag)
             for d in due]
     results = sim.llm.generate_many(reqs, workers=workers)
     for d, req, (response, call_id, cached) in zip(due, reqs, results):
@@ -1153,6 +1162,18 @@ def _phase_reflect_batched(sim, step: int, sim_min: int, workers: int) -> None:
             response=response, call_id=call_id, cached=cached,
             discard=d["discard"],
             gt_extras=gt_extras_mod.enabled(sim))   # G7-②(既定 OFF=キーなし)
+
+
+def _reflect_place(sim, agent) -> str:
+    """内省を書かせるときの場所名。**既定 mode では常に "自宅"**(従来とバイト一致)。
+
+    RFX-A で夕方の路上・在宅メディア中に発火した個体は自宅に居るとは限らないので、
+    そのときだけ実在の場所名(`_place_of`)を渡す。「眠りにつく前に」というタスク文と
+    同じく、場所名が嘘になるのを避けるための 1 点(reflection-leisure-plan §2.5)。
+    """
+    if reflect_timing_mod.when_of(agent) is None:
+        return "自宅"
+    return _place_of(sim, agent)
 
 
 def _reflect_due(sim, step: int, sim_min: int):
@@ -1195,6 +1216,9 @@ def _phase_wake_and_returns(sim, step: int, sim_min: int) -> None:
                                  kind="wake_up", x=agent.x, y=agent.y,
                                  payload={"slept_steps": agent.sleep_steps}))
             _schedule_plan(sim, agent, step, sim_min)   # 起床 → 朝の計画を予約
+            # RFX-A(既定 mode="sleep" では no-op): 起床 → 「今日ぶんの内省」を 1 枚 armed に。
+            # 予約の起点を務めの終わりへ前倒しするための唯一の据え付け点。
+            reflect_timing_mod.on_wake(sim, agent, sim_min)
         if agent.loc == "outside" and step >= agent.return_at:
             via_station = (agent.return_gateway == sim.city.station_node)
             if via_station and not sim.transit.has_service(sim_min):
@@ -1433,7 +1457,8 @@ def _try_exit(sim, agent, step: int, sim_min: int) -> None:
             else:
                 agent.return_at = (step + agent.sleep_steps
                                    + sim.clock.dur_steps(int(rng.integers(0, 7))))
-            agent.reflect_step = step + 1          # 帰路の電車で今日を内省(k 処置)
+            reflect_timing_mod.arm(sim, agent, step)   # 帰路の電車で今日を内省(k 処置)。
+            #                                            RFX-A: 早期発火済みならこの 1 回を見送る
         else:
             span = sim.cfg.world.outside_steps
             agent.return_at = step + int(rng.integers(int(span[0]), int(span[1])))
@@ -2605,13 +2630,17 @@ def _phase_drive(sim, step: int, sim_min: int) -> None:
                                               sim_min, sim.logger,
                                               gt_extras=_gt_extras_on)
 
+    age_cog_on = age_cog_mod.enabled(sim)   # AGE-C(既定 OFF=以下の 1 行を通らない)
+
     def _eff_thr(a):
-        """実効閾値(E2 ドリフト + 覚醒の逆U字変調 + 疲労)。affect/health OFF or gain=0 で恒等=バイト一致。"""
+        """実効閾値(E2 ドリフト + 覚醒の逆U字変調 + 疲労 + 年齢)。OFF or gain=0 で恒等=バイト一致。"""
         d = affect.threshold_delta(a, sim.affectcfg) if affect_on else 0.0
         if health_on:                       # 高疲労→閾値↑(休息へ寄る)。gain=0 で 0=恒等
             d += health_mod.fatigue_threshold_delta(a, sim.healthcfg)
             # 軽症でも出勤している個体の性能デバフ(H1 severity。既定 OFF=0.0=恒等)
             d += health_mod.severity_threshold_delta(a, sim.healthcfg)
+        if age_cog_on:                      # AGE-C: 年齢由来の不透明な delta(既定 OFF=0.0=恒等)
+            d += age_cog_mod.threshold_delta(sim, a)
         return drive.effective_threshold(a, d)
 
     # 発火の関数形(B段 seam)。fixed=閾値ゲート+個人重み抽選(現行)。
@@ -3159,7 +3188,8 @@ def _apply_action(sim, agent, action: dict, step: int, sim_min: int) -> None:
         agent.sleeping = True
         agent.activity = ""
         agent.sleep_until = step + agent.sleep_steps
-        agent.reflect_step = step + 1              # 就寝直後に記憶整理(内省)
+        reflect_timing_mod.arm(sim, agent, step)   # 就寝直後に記憶整理(内省)。
+        #                                            RFX-A: 早期発火済みならこの 1 回を見送る
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                              kind="sleep_start", x=agent.x, y=agent.y,
                              payload={"until_step": agent.sleep_until,
@@ -5165,7 +5195,7 @@ def _lodging_checkin(sim, agent, step: int, sim_min: int) -> None:
     agent.activity = ""
     agent.sleep_until = step + _steps_until_tod(sim_min, int(cfg["checkout_hour"]) * 60,
                                                 sim.clock.step_minutes)
-    agent.reflect_step = step + 1                  # 就寝直後の内省(自宅就寝・帰路退出と同格の k 処置。
+    reflect_timing_mod.arm(sim, agent, step)       # 就寝直後の内省(自宅就寝・帰路退出と同格の k 処置。
     #                                                lodging の抽選は k を読まない=呼数の k 不変は保たれる)
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                          kind="sleep_start", x=agent.x, y=agent.y,
@@ -5745,6 +5775,8 @@ def run_step(sim, step: int) -> None:
     _phase_inner_life(sim, step, sim_min)          # 起動後1回: 長期目標・趣味の付与(既定OFF=no-op。H6)
     _phase_calendar_weather(sim, step, sim_min)    # 日次境界: 当日の日付・天気(既定OFF=no-op)
     _phase_annual(sim, step, sim_min)              # 日次境界: 年中行事の確定・記録(既定OFF=no-op)
+    aging_mod.phase_day(sim, step, sim_min)        # 日次境界 AGE-F: 誕生日 → age+1(既定OFF=no-op)。
+                                                   # ★_phase_calendar_weather の後=当日の実日付が確定してから読む
     _phase_schedule_gc(sim, step, sim_min)         # 日次境界: 過去予定の GC(既定OFF=no-op)
     _phase_relations_day(sim, step, sim_min)       # 日次境界: 関係の断絶/評判の風化(既定OFF=no-op)
     _phase_household(sim, step, sim_min)           # 日次境界: パートナー形成(既定OFF=no-op。後続波 H2)
@@ -5928,7 +5960,15 @@ def run_step(sim, step: int) -> None:
     if _roster is not None:
         _roster.on_step(sim, step, sim_min)
 
+    # RFX-A(既定 mode="sleep" は即 return=バイト一致): 内省的瞬間を迎えた個体の予約を
+    # **この step で満期にする**。新しい発火点は 1 つも足していない —— 立てた予約は
+    # 「後で立つはずだった予約の前倒し」で、`reflect_suppress_arm` がその夜の予約を
+    # 1 回見送らせる(= 1 予約 1 発火)。内省ループの**直前**に置く。
+    reflect_timing_mod.arm_moments(sim, step, sim_min)
+
     _bl = (sim.cfg.get("engine", {}) or {}).get("batch_llm", {}) or {}
+    _rfx_tag = reflect_timing_mod.context_tag_on(sim)   # RFX-O(既定 OFF=payload 不変)
+    _rfx_sleepy = bool(reflect_timing_mod.cfg_of(sim)["sleep_task_rewrite"])
     if ablate_mod.llm_off(sim):
         pass                                       # ablate.llm_off(第78): 夜の内省も撃たない
     elif bool(_bl.get("enabled", False)):
@@ -5940,7 +5980,7 @@ def run_step(sim, step: int) -> None:
                 maybe_reflect(agent, step=step, sim_min=sim_min,
                               writeback=str(sim.cfg.k.writeback),
                               alpha=float(sim.cfg.k.degraded_alpha), llm=sim.llm,
-                              place_name="自宅",
+                              place_name=_reflect_place(sim, agent),
                               city_name=getattr(sim, "place_name", ""),
                               rng=sim.hub.stream("writeback", agent.id, step),
                               logger=sim.logger,
@@ -5956,7 +5996,10 @@ def run_step(sim, step: int) -> None:
                               interstitial=_interstitial_on(sim),
                               interstitial_digest=_isl_take(sim, agent),
                               # G7-②(既定 OFF=payload にキーを 1 つも足さない)
-                              gt_extras=gt_extras_mod.enabled(sim))
+                              gt_extras=gt_extras_mod.enabled(sim),
+                              # RFX-A / RFX-O(既定 OFF=None/False=従来定数とバイト一致)
+                              moment=reflect_timing_mod.when_of(agent),
+                              sleepy=_rfx_sleepy, tag=_rfx_tag)
 
     # 行間補間(P2 S2): この step で新規に記録されたイベントを各個体のバッファへ振り分ける
     # (OFF は _isl_idx=-1 で完全 no-op=バッファも作らない=バイト一致)。発火時の _isl_take が

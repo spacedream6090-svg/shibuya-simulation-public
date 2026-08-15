@@ -18,6 +18,9 @@ shibuya　バックアップ/
 data/plateau/
 # ペルソナ100万プール(数百MB級・build_persona_pool.py が再生成。議員名簿と統計サマリのみコミット)
 data/persona_pool/
+# ペルソナプール v2(同上・build_persona_pool.py --v2 が再生成。旧プールは残す=退路)
+data/persona_pool_v2/
+data/persona_pool_v2_smoke/
 # Jülich 歩行者動力学アーカイブの生軌跡(CC BY 4.0・146MB。派生CSVのみ reference/physics_bench/data/ にコミット・取得手順は同 README.md)
 data/juelich_ped/
 # 解析スクリプトの実験出力(runs/ と同格・再生成可能)

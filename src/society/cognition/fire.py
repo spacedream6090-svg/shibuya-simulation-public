@@ -93,6 +93,7 @@ import heapq
 import math
 
 from ..observer.schema import Event
+from . import age_cog as _age_cog
 from . import channels as _channels
 
 SCHEMA = 1
@@ -372,6 +373,7 @@ def _period_min(sim, agent, ctx: str, step: int) -> int:
         cv = float(row.get("cv", 0.0)) * cfg["period_cv_scale"]
     if getattr(agent, "sleeping", False):
         mean *= cfg["sleep_period_mult"]
+    mean *= _age_cog.period_mult(sim, agent)   # AGE-C(既定 OFF=厳密に 1.0=恒等)
     mean = max(1.0, mean)
     if cv <= 0.0:
         return int(round(mean))

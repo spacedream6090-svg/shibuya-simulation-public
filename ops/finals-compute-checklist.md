@@ -134,3 +134,77 @@ R1・決定論の制約下で **可能なこと**:
 
 現状: seam 未実装(src/society は本バッチ変更禁止)。本メモは着手時の設計制約の固定用。
 実装は主エージェント(agent-core 担当)が scheduler に集約点を1つ入れる形が素直。
+
+---
+
+## E2 進捗報告(Discord)の運用手順(第116 レーン・2026-08-15)
+
+正典: [progress-reporting-plan.md](../docs/plans/progress-reporting-plan.md)(レーン1+2 を実装)。
+実装: [scripts/report_progress.py](../scripts/report_progress.py) / ラッパ: [report-progress.ps1](report-progress.ps1) /
+テスト: `tests/test_report_progress.py`。
+
+**性質**: run-dir を**読むだけ**のサイドカー。ラン本体にも watchdog にも 1 行も触らない。
+書くのは `<run>/_progress/` 配下だけ・**終了コードは常に 0**・L1 は 1 バイトも読まない。
+`live_viewer.py` と併走してよい(どちらも `_open_shared` = 共有読み)。
+
+### E2-0 ★事前準備(ユーザー作業・1 回だけ)
+
+1. Discord で**投稿先チャンネルを 1 本**作る(非公開でよい)。
+2. チャンネル設定 → 連携サービス → ウェブフック → 新規作成 → **URL をコピー**。
+3. 環境変数へ入れる(**URL はリポジトリにもチャットにも貼らない**):
+
+       [Environment]::SetEnvironmentVariable('SHIBUYA_DISCORD_WEBHOOK','<URL>','User')
+
+   退路: `%USERPROFILE%\.shibuya\discord_webhook.txt`(1 行・リポジトリ外)に置くと
+   `ops/report-progress.ps1` が読んで子プロセスの環境変数としてだけ渡す。
+4. **失効させたくなったら**: チャンネル設定でウェブフックを削除 → 旧 URL は即死。
+   新規発行 → 環境変数を差し替え → レポーターを再起動(`reporter_state.json` の
+   `disabled` が `true` なら `false` へ戻す)。
+
+### E2-1 疎通(投稿の前に必ず通す)
+
+    # ① 投稿せず本文だけ確認(runs/ のどのランでもよい。診断ランでも過去ランでもよい)
+    python scripts/report_progress.py runs/<run> --dry-run
+    #    → <run>/_progress/dryrun/*.json に「送るはずだった JSON」が出る。中身を目視。
+    # ② 本番投稿 1 回(環境変数が入っていれば投稿する)
+    python scripts/report_progress.py runs/<run>
+    # ③ 常駐(Linux/tmux)  または  タスクスケジューラ(Windows)
+    python scripts/report_progress.py runs/<run> --interval 900
+
+**★8/15 に確認すること**: GPU 機から `discord.com:443` へ出られるか。
+出られない場合は `backup_run.py --dest` で**ローカル PC へ日次 pull した先**を `--run-dir` に
+指して**ローカル側から投稿**する(報告が 1 日遅れになるだけで機構は同一)。
+
+### E2-2 出るもの(3 系統)
+
+| 系統 | 形 | 頻度 |
+|---|---|---|
+| ハートビート | **1 通を編集し続ける**(チャンネルを汚さない) | 既定 10 分ごと(`--heartbeat-min`) |
+| 日次ダイジェスト | 新規 embed + `rollup.html` 添付(≤8MB) | **シミュ日の境界**(本選 = 実時間 7〜16 h おき・全 10 通強) |
+| アラート | 新規 embed | 状態が**遷移したときだけ**(state / 進捗停止 / ディスク / LLM fallback / 再起動回数 / 退行判定) |
+
+抑制(クールダウン 30 分・毎時 6 通・ヒステリシス)で送らなかった件数は、**次の日次ダイジェストに
+必ず数を出す**(silent cap 禁止)。重大(failed / disk critical / 進捗停止)は抑制を跨いで必ず通る。
+
+### E2-3 途中取り出し(ビューアに落とす)
+
+    python scripts/report_progress.py runs/<run> --extract --day 3
+    #  → <run>/_progress/day-03/{l2_metrics.parquet, digest.json, summary.json, rollup.html}
+
+- `--day` は **0 始まり**(`make_viewer.py --daily-rollup` / `analyze_structure` と同定義)。
+- `digest.json` は **確報**(最新 checkpoint の mtime 以前の part 由来)と **速報**を別の節に
+  分けて残す。投稿本文は速報で、必ず「暫定」と確報 step を明記する。
+- `day-NN/` の `config.yaml` と `l1_events.parquet` は **report_progress.py が置いた合成物**
+  (`make_viewer` に真の start_min / Δt を渡すためだけの足場。同 dir の `_SHIMS.txt` に明記)。
+  L1 の中身は 1 バイトも含まない。
+- 地図つきのライブ画面が要るときは `scripts/live_viewer.py`(別プロセス・併走可)。
+
+### E2-4 事故時の切り分け
+
+| 症状 | 見るところ |
+|---|---|
+| 何も投稿されない | `<run>/_progress/reporter.log`(1 行/サイクル)。環境変数未設定なら「dryrun へ書く」と出る |
+| 404 で止まった | webhook が削除/再生成された。環境変数を差し替え → `reporter_state.json` の `disabled` を `false` へ |
+| 日次が飛んだ | `reporter_state.json` の `posted_days` から該当 day を消せば次サイクルで再投稿 |
+| ハートビートが増殖 | `heartbeat_id` が消えている(メッセージが削除された)。実害なし・1 通に収束する |
+| ランに影響が出た? | **構造的に出ない**。それでも疑うなら止めてよい(止めてもランは何も変わらない) |

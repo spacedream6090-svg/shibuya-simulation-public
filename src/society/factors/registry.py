@@ -211,6 +211,76 @@ def needs_profile(traits: dict[str, float], age: int, occupation: str,
     return profile
 
 
+# --------------------------------------------------------------------------- #
+# 年齢 → 思考/推論の「量」の個体係数(AGE-C。第116バッチ 2026-08-15・**既定 OFF**)
+#
+# 正典: docs/plans/age-diversity-plan.md §4-4(AGE-C)。
+#
+# 越えてはいけない線(§4-1): **年齢は「誰が撃てるか」を決めてはならない**。
+#   `LodBudget.take()` と `requesters.sort(key=(-drive, id))` は 1 行も触らない。
+#   年齢が変えてよいのは「本人がどれくらい撃ちたくなるか」= 個体の drive 分布だけで、
+#   量は行動から創発する(高齢は閾値が僅かに高く周期が僅かに長い → ゲージの立ち上がりが
+#   遅い → 上位に来る頻度が下がる → **結果として**呼が減る。誰も除外していない)。
+#
+# 文献が課す 3 制約(§4-4):
+#   1. **「単一の年齢係数」は誤り**(Hartshorne & Germine 2015・N=48,537: 処理速度 19-22 /
+#      感覚探求 19 / 自己制御 23-26 / 結晶性 50-65 とピークがばらける)。
+#      → 周期と閾値を**別々の曲線**にする(1 本の age_factor を作らない)。
+#   2. 加齢は「1 つの選択肢に時間がかかる」方向に効き、「選択肢の数を減らす」方向には
+#      一貫しない(Queen 2012: 1 セルあたり処理時間 1,084→1,418→1,773 ms = +63% だが
+#      開いたセル割合は .78/.85/.85 で落ちない)。→ **周期を伸ばすのは可・閲覧幅は削らない**。
+#   3. 大きさは conf で調律する(`base_period` 自体が「暫定・人間データ未較正」と自己申告
+#      している層なので、符号+桁は文献・微調整は conf = `needs_profile` と同じ作法)。
+#
+# **乱数を 1 draw も引かない純関数**(media.profile_for と同じ零 draw 型)= 呼び出し位置に
+# 関係なく draw 順不変 = RNG バイト一致が自明に保たれる。
+# --------------------------------------------------------------------------- #
+def _piecewise(age: float, knots) -> float:
+    """折れ線(x 昇順の [x, y] 列)を age で評価する。範囲外は端の値で平ら(外挿しない)。"""
+    pts = [(float(x), float(y)) for x, y in knots]
+    if not pts:
+        return 0.0
+    if age <= pts[0][0]:
+        return pts[0][1]
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if age <= x1:
+            span = x1 - x0
+            if span <= 0.0:
+                return y1
+            return y0 + (y1 - y0) * (age - x0) / span
+    return pts[-1][1]
+
+
+def age_cognition_params(age: int, cfg: dict) -> dict[str, float]:
+    """年齢 → 思考の**量**に関する個体係数(**決定論・乱数ゼロ**)。
+
+    返す量(cognition 側はこのキー名しか知らない = no-fingerprint):
+      period_mult … 定期発火の基本周期にかける個体倍率(>1 = 思考の間隔が長い)
+      theta_delta … 発火申請の実効閾値に足す不透明な delta(>0 = 撃ちたくなりにくい)
+
+    どちらも `ref_age` で恒等(1.0 / 0.0)になるよう正規化してから gain を掛ける。
+    ⇒ **人口の中心年齢では現行較正どおり**で、若年/高齢だけが両側へ振れる(対称)。
+    これが「小規模 = cap 非拘束のランでも呼数が概ね相殺する」根拠(§4-2)。
+    """
+    a = float(int(age))
+    ref = float(cfg.get("ref_age", 38.0))
+    # ---- 周期(熟慮時間の年齢曲線。Queen 2012)。ref_age で 1.0 になるよう規格化 ----
+    pk = cfg.get("period_knots") or []
+    base = _piecewise(a, pk)
+    base_ref = _piecewise(ref, pk) or 1.0
+    gain = float(cfg.get("period_gain", 1.0))
+    mult = 1.0 + gain * (base / base_ref - 1.0)
+    mult = min(float(cfg.get("period_max", 1.8)),
+               max(float(cfg.get("period_min", 0.7)), mult))
+    # ---- 閾値(感覚探求 19 歳ピーク / 自己制御 23-26 台地。Steinberg 2018)----
+    tk = cfg.get("theta_knots") or []
+    delta = (_piecewise(a, tk) - _piecewise(ref, tk)) * float(cfg.get("theta_gain", 1.0))
+    clip = abs(float(cfg.get("theta_clip", 0.08)))
+    delta = min(clip, max(-clip, delta))
+    return {"period_mult": round(float(mult), 6),
+            "theta_delta": round(float(delta), 6)}
+
+
 def opinion_params(traits: dict[str, float],
                    rng: np.random.Generator) -> float:
     """traits → Friedkin-Johnsen 感受性 s(社会的影響の受けやすさ)。drive_params と同格。

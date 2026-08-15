@@ -111,7 +111,7 @@ def test_group_join_sets_priority_and_founder_post_reaches_member(tmp_path):
 
     # タイムラインを別著者で溢れさせても founder の新着は必ず載る
     other = sim.agents[3].id
-    sim.net.follows[joiner.id].add(other)
+    sim.net.follow(joiner.id, other)
     pid = sim.net.post(founder.id, "founderの告知", [], 2)
     for i in range(sim.net.feed_size + 3):
         sim.net.post(other, f"n{i}", [], 2)

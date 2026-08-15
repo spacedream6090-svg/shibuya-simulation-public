@@ -68,13 +68,13 @@ def test_status_reflects_materials(tmp_path):
     sim = _sim(tmp_path, "score", n=6, steps=1, **{"hierarchy.enabled": "true"})
     agents = sorted(sim.agents, key=lambda a: a.id)
     for a in agents:                                   # 被フォロー数を決定論制御(全消し→再構成)
-        sim.net.follows[a.id] = set()
+        sim.net.set_follows(a.id, set())   # ★逆索引つきの正規経路(follows 直接代入は索引が古くなる)
     for rank, a in enumerate(agents):                  # rank が大きいほど全材料で上位
         a._reputation = float(rank)
         a.money = float(rank) * 1000.0
         a.account = 0.0
         for follower in agents[:rank]:                 # rank 人に a をフォローさせる=follower_count=rank
-            sim.net.follows[follower.id].add(a.id)
+            sim.net.follow(follower.id, a.id)
     sim._status_day = -1                               # 日次ガードを外して再計算を強制
     status.phase_day(sim, step=0, sim_min=0)
     statuses = [a.status for a in agents]
@@ -130,11 +130,11 @@ def test_feed_exposure_prefers_hubs(tmp_path):
     agents = sorted(sim.agents, key=lambda a: a.id)
     hub, small = agents[0], agents[1]
     for a in agents:
-        sim.net.follows[a.id] = set()
+        sim.net.set_follows(a.id, set())
     hub.status = small.status = 0.0
     for follower in agents[2:]:                        # hub を 4 人がフォロー、small は 1 人
-        sim.net.follows[follower.id].add(hub.id)
-    sim.net.follows[agents[2].id].add(small.id)
+        sim.net.follow(follower.id, hub.id)
+    sim.net.follow(agents[2].id, small.id)
     w_hub = status.feed_exposure_weight(sim, hub.id)
     w_small = status.feed_exposure_weight(sim, small.id)
     assert w_hub > w_small, "被フォロー数の多い投稿者の露出重みが大きくない(優先的選択が効いていない)"

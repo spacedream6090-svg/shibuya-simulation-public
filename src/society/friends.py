@@ -52,12 +52,35 @@ DEFAULTS = {
     "friend_max": 12,          # 友人層の追加次数上限
     "acq_extra": 20,           # 知人層(tier1)の追加次数(弱い紐帯を薄く)
     "margin": 0.5,             # 注入 closeness の上乗せ(閾値+margin=その tier に確実に載る)
+    # ---- AGE-D: 次数の年齢曲線(第116バッチ 2026-08-15・**既定 OFF**)----
+    # 正典: docs/plans/age-diversity-plan.md §4-6。
+    # 現状の穴: `w_age` で「誰と繋がるか」は年齢に依るのに、**次数(何人と繋がるか)は
+    #   年齢非依存**だった(15 歳も 75 歳も同じ 3-5 + 7-12 + 20)。
+    # 較正(Bhattacharya, Ghosh, Monsivais, Dunbar & Kaski 2016 *R. Soc. Open Sci.* 3:160097。
+    #   携帯 CDR **660 万ユーザー・年齢性別既知 320 万**): 月間 alter 数は **25 歳前後で最大の
+    #   15-20 人** → 45 歳まで減少 → **45-55 は台地** → 55 以降また減少。
+    #   Dunbar 2020 *Proc. R. Soc. A* 476:20200446 も「**年齢の逆 J 字関数・20-30 代ピーク**」。
+    # ★重要な形の制約(4 つの独立ソースが一致): **加齢が削るのは外層(周辺・同僚)であって
+    #   内核ではない**。親友は年齢不変(Bruine de Bruin: 周辺 r=−.13 / **親友 r=.01**)、
+    #   内核はむしろ増える(English & Carstensen 2014: 内核 6.21→7.75 / 周辺 7.35→7.06)、
+    #   家族ネットワークは規模が安定(Wrzus 2013 メタ分析 277 研究 177,635 人)。
+    #   ⇒ 実装は「目標次数を年齢で縮める」ではなく **「弱紐帯(tier2 友人 / tier1 知人)の
+    #   生成数だけを年齢で縮め、強紐帯(tier3 親友)は 1 人も触らない」**。
+    "age_degree": False,       # ★これが AGE-D の唯一のトグル(既定 OFF=現行と完全同一)
+    "age_degree_ref": 25.0,    # この年齢で倍率 1.0(= 現行較正値がピーク年齢に対応する)
+    # 月間 alter 数 / ピーク(25 歳 ≈ 17.5 人)。45-55 の台地と 55 以降の再減少を折れ線で。
+    "age_degree_knots": [[15.0, 0.75], [25.0, 1.00], [40.0, 0.66],
+                         [45.0, 0.60], [55.0, 0.60], [70.0, 0.45], [85.0, 0.35]],
+    "age_degree_min": 0.20,
+    "age_degree_max": 1.20,
 }
 
-_BOOL_KEYS = ("enabled",)
+_BOOL_KEYS = ("enabled", "age_degree")
 _INT_KEYS = ("seed", "close_min", "close_max", "friend_min", "friend_max", "acq_extra")
 _FLOAT_KEYS = ("w_age", "w_occ", "w_same_work", "w_same_school", "w_same_area",
-               "age_scale", "noise", "margin")
+               "age_scale", "noise", "margin", "age_degree_ref",
+               "age_degree_min", "age_degree_max")
+_KNOT_KEYS = ("age_degree_knots",)
 
 
 def build_cfg(raw) -> dict:
@@ -66,7 +89,7 @@ def build_cfg(raw) -> dict:
     if OmegaConf.is_config(raw):
         raw = OmegaConf.to_container(raw, resolve=True)
     raw = dict(raw or {})
-    cfg = dict(DEFAULTS)
+    cfg = {k: (list(v) if isinstance(v, list) else v) for k, v in DEFAULTS.items()}
     for k, v in raw.items():
         if k not in DEFAULTS:
             continue
@@ -76,6 +99,9 @@ def build_cfg(raw) -> dict:
             cfg[k] = int(v)
         elif k in _FLOAT_KEYS:
             cfg[k] = float(v)
+        elif k in _KNOT_KEYS:
+            cfg[k] = sorted(([float(x), float(y)] for x, y in (v or [])),
+                            key=lambda p: p[0])
     return cfg
 
 
@@ -139,6 +165,31 @@ def _degree(cfg: dict, pid: str, lo_key: str, hi_key: str, salt: str) -> int:
     return lo + int(u * (hi - lo + 1))
 
 
+def age_degree_mult(age, cfg: dict) -> float:
+    """年齢 → **弱紐帯の次数**にかける倍率(AGE-D。決定論・乱数ゼロ・OFF は常に 1.0)。
+
+    折れ線(`age_degree_knots`)を `age_degree_ref` で規格化する。範囲外は端の値で平ら
+    (外挿しない = 6 歳や 82 歳へ曲線を伸ばして偽の精度を作らない)。"""
+    if not cfg.get("age_degree", False):
+        return 1.0
+    knots = cfg.get("age_degree_knots") or []
+    if not knots:
+        return 1.0
+
+    def at(x: float) -> float:
+        if x <= knots[0][0]:
+            return knots[0][1]
+        for (x0, y0), (x1, y1) in zip(knots, knots[1:]):
+            if x <= x1:
+                span = x1 - x0
+                return y1 if span <= 0.0 else y0 + (y1 - y0) * (x - x0) / span
+        return knots[-1][1]
+
+    ref = at(float(cfg["age_degree_ref"])) or 1.0
+    m = at(float(int(age or 0))) / ref
+    return min(float(cfg["age_degree_max"]), max(float(cfg["age_degree_min"]), m))
+
+
 def _inject(a, b, tier: int, closeness: float) -> None:
     """a→b の関係を tier/closeness へ確定注入(直接代入=二重辺でも closeness を膨らませない)。
 
@@ -174,6 +225,13 @@ def build_friend_graph(sim) -> None:
         n_close = _degree(cfg, pid, "close_min", "close_max", "close")
         n_friend = _degree(cfg, pid, "friend_min", "friend_max", "friend")
         n_acq = int(cfg["acq_extra"])
+        # AGE-D: 年齢曲線は**弱紐帯(友人 tier2 / 知人 tier1)だけ**を伸縮させ、
+        # 親友(tier3=内核)は 1 人も触らない(加齢が削るのは外層という 4 ソース一致の所見)。
+        # 既定 OFF では mult が厳密に 1.0 = 下の 2 行は恒等 = バイト一致。
+        mult = age_degree_mult(getattr(a, "age", 0), cfg)
+        if mult != 1.0:
+            n_friend = max(0, int(round(n_friend * mult)))
+            n_acq = max(0, int(round(n_acq * mult)))
         ranked = sorted((b for b in residents if b.id != a.id),
                         key=lambda b: (-_score(a, b, cfg), b.id))
         for rank, b in enumerate(ranked):

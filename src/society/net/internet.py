@@ -23,6 +23,18 @@ class Internet:
         self.posts: list[dict] = []
         self.news: list[dict] = []     # {"step","title","text","items":[word]}
         self.follows: dict[int, set[int]] = {}
+        # ★被フォロー数の逆索引(author -> フォロワー数)。docs/research/
+        #   initial-relations-improvement.md §1.2 が見つけた性能バグの根治:
+        #   `follower_count` は `follows` の**全走査**だったので、`hierarchy.enabled`
+        #   の日境界 `status._recompute` が全員ぶん呼ぶと O(N²) になり、25 万人で
+        #   **1 日あたり約 36 分**を焼いていた(退場しても follows を刈らないので日を追って悪化)。
+        #   ここを O(1) にする。**挙動は完全に不変**(数える対象も値も同一)。
+        #   ★不変条件: `follows` を書き換える経路は `init_follows` / `ensure` /
+        #     `add_contact` / `follow` / `set_follows` の 5 つだけで、そのすべてが
+        #     本索引を同時に更新する。`net.follows[x].add(y)` のように**直接**触ると
+        #     索引が古くなるので、外部からは必ず `follow()` を使うこと
+        #     (同値性は tests/test_follower_index.py が旧走査と突き合わせて固定する)。
+        self._followers: dict[int, int] = {}
         self.contacts: dict[int, set[int]] = {}   # 対面で会話した相手(DM可)
         self.read_marks: dict[int, int] = {}      # agent_id -> 既読 post id(=watermark)
         # #13 タイムライン優先枠: reader_id -> {必ず載せる著者 id}(founder 投稿の到達保証)
@@ -45,6 +57,52 @@ class Internet:
             picks = rng.choice(len(others), size=n, replace=False) if n else []
             self.follows[aid] = {others[int(i)] for i in picks}
             self.contacts[aid] = set()
+        self.rebuild_follower_index()      # 逆索引を張り直す(乱数ゼロ・値は走査と同一)
+
+    # ---- 被フォロー数の逆索引(純粋な高速化。数える対象・値は旧全走査と完全同一)----
+    def rebuild_follower_index(self) -> None:
+        """`follows` から逆索引を作り直す(O(辺数)・決定論・乱数ゼロ)。"""
+        rev: dict[int, int] = {}
+        for targets in self.follows.values():
+            for t in targets:
+                rev[t] = rev.get(t, 0) + 1
+        self._followers = rev
+
+    def _rev(self) -> dict[int, int]:
+        """逆索引(古い checkpoint 由来で欠けていれば張り直す)。"""
+        rev = getattr(self, "_followers", None)
+        if rev is None:
+            self.rebuild_follower_index()
+            rev = self._followers
+        return rev
+
+    def follow(self, follower: int, author: int) -> None:
+        """follower が author をフォローする(逆索引も同時更新)。冪等。
+
+        `follows[follower]` が未整備なら空集合から作る(`ensure` を通っていない
+        テスト・外部コードの退路)。"""
+        f, a = int(follower), int(author)
+        bucket = self.follows.setdefault(f, set())
+        if a in bucket:
+            return
+        bucket.add(a)
+        rev = self._rev()
+        rev[a] = rev.get(a, 0) + 1
+
+    def set_follows(self, aid: int, targets) -> None:
+        """`follows[aid]` を丸ごと差し替える(逆索引も同時更新)。"""
+        aid = int(aid)
+        rev = self._rev()
+        for t in self.follows.get(aid, ()):        # 旧辺を引く
+            n = rev.get(t, 0) - 1
+            if n > 0:
+                rev[t] = n
+            else:
+                rev.pop(t, None)
+        new = {int(t) for t in targets}
+        self.follows[aid] = new
+        for t in new:
+            rev[t] = rev.get(t, 0) + 1
 
     def ensure(self, aid: int, rng, k: int = 6, candidates: list | None = None) -> None:
         """まだ SNS を持たない個体に初期フォローと空の contacts を据える(冪等・レーン乙 A1)。
@@ -77,18 +135,31 @@ class Internet:
                     got.add(cand)
         self.follows[aid] = got
         self.contacts[aid] = set()
+        rev = self._rev()                         # 逆索引へ新規辺を足す(O(k))
+        for t in got:
+            rev[t] = rev.get(t, 0) + 1
 
     def add_contact(self, a: int, b: int) -> None:
         if a in self.contacts and b in self.contacts:
             self.contacts[a].add(b)
             self.contacts[b].add(a)
-            self.follows[a].add(b)                # 知り合いは自動フォロー
+            bucket = self.follows[a]              # 知り合いは自動フォロー
+            if b not in bucket:
+                bucket.add(b)
+                rev = self._rev()
+                rev[b] = rev.get(b, 0) + 1
 
     def follower_count(self, author: int) -> int:
         """author をフォローしている人数(= フォロワー数)。Wave G6 のインフルエンサー判定用。
 
         follows[x] は「x がフォローしている相手」なので逆引きで数える(決定論・乱数なし)。
-        info_env.influence が ON のときだけ呼ばれる=既定挙動の draw/イベントには一切影響しない。"""
+        ★逆索引 `_followers` を引くだけの **O(1)**(以前は follows 全走査 = O(N) で、
+        `hierarchy` の日境界が全員ぶん呼ぶと O(N²) = 25 万人で 1 日 36 分だった)。
+        値は `_follower_count_scan`(旧実装)と常に一致しなければならない。"""
+        return self._rev().get(int(author), 0)
+
+    def _follower_count_scan(self, author: int) -> int:
+        """旧実装(follows 全走査)。**同値性テスト専用の参照実装**で、本番経路は呼ばない。"""
         a = int(author)
         return sum(1 for s in self.follows.values() if a in s)
 

@@ -137,13 +137,77 @@ _STORY_NOTE = (
     "起きたこと)を、順を追って一人称の短い物語として summary に綴ってください。")
 
 
-def _reflect_task(*, deep: bool, variety: bool, agent_id: int, day: int) -> str:
-    """内省タスク文を返す。variety=False は従来定数とバイト一致(既定 OFF=ゴールデン不変)。
+# ---------------------------------------------------------------- 内省タイミング RFX-A(第116バッチ)
+# 正典: docs/plans/reflection-leisure-plan.md §3.6。実装 cognition/reflect_timing.py。
+#
+# ① 日中用のタスク文(早期発火のとき)。現行文は「**眠りにつく前に**」で始まるので、
+#    夕方の路上・在宅で発火すると文言が嘘になる。中身(問うこと)は現行と同一で、
+#    **JSON 契約キー(summary / salient / belief / self / ties)は 1 つも変えない**
+#    = パーサ・consolidate・self_model の受け手は 1 行も変わらない。
+# ★no-fingerprint: 機構語(「一人」「条件」「トリガ」等)を 1 語も出さない。
+_MOMENT_REFLECT_TASK = (
+    "\nふと一息ついて、今日ここまでのことを振り返ってみてください。"
+    "\nまず今日あった出来事を順に思い出し、なぜ印象に残ったのか・自分の"
+    "気持ちがどう動いたか・これからの自分にどう影響するかまでじっくり"
+    "考えてから、結論だけを JSON で出力してください。"
+    "\n出力は次の JSON 1個のみ(キー名は厳守):"
+    '\n{"action": "reflect", "summary": "今日ここまでの要約を一文",'
+    ' "salient": [{"text": "印象に残った出来事", "importance": 1〜10の数}],'
+    ' "belief": "今日の経験からの考え方の変化・結論を一文"}')
+
+_MOMENT_DEEP_REFLECT_TASK = (
+    "\nふと一息ついて、今日ここまでのこととこれまでの日々を振り返って深く内省してください。"
+    "\n今日の出来事に加えて、蓄積した記憶を振り返り、自分がどんな人間か・最近"
+    "どう変わったか(自己像)と、自分にとって大事な人間関係もまとめ直してください。"
+    "以前の自己像(「自分の理解」)があれば、それを引き写すのではなく今の自分に"
+    "合わせて更新してください。"
+    "\n出力は次の JSON 1個のみ(キー名は厳守):"
+    '\n{"action": "reflect", "summary": "今日ここまでの要約を一文",'
+    ' "salient": [{"text": "印象に残った出来事", "importance": 1〜10の数}],'
+    ' "belief": "今日の経験からの考え方の変化・結論を一文",'
+    ' "self": "自分がどんな人間か・最近の変化の要約を一文",'
+    ' "ties": "自分にとって大事な人間関係の要約を一文"}')
+
+# ② 就寝前テンプレの言い換え(`reflection.timing.sleep_task_rewrite`。**既定 OFF**)。
+# ★これはプロンプト変更 = 挙動変化なので必ずトグル配下に置く。
+# 根拠: Lemyre ら 2020 *Sleep Med Rev* 50:101253(1,730 本の系統的レビュー)=
+#   **正常な入眠移行は「感覚的イメジャリ・高次認知過程の脱活性化」**で特徴づけられ、
+#   対照的に**不眠者の就寝前思考はしばしば計画や問題解決に関わり、良眠者より不快**。
+#   Harvey 2000 *Br J Clin Psychol* 39:275 も、不眠者の就寝前認知は「日中に起きた出来事」へ
+#   向かい、より占有的・より非意図的・より長く・より入眠を妨げる、と報告している。
+# ⇒ 現行の「今日一日を順に思い出し…明日の自分にどう影響するかまでじっくり考えて」は
+#   分類上**不眠者の就寝前認知の記述そのもの**を全人口に毎晩させている状態。
+#   言い換え版は「順に」「明日の自分にどう影響するか」という**能動的な再生と将来評価**を外し、
+#   浮かんでくるものを受け取る形にする(問うことと JSON キーは同一)。
+_SLEEPY_REFLECT_TASK = (
+    "\n眠りにつく前に、今日一日をぼんやりと振り返ってください。"
+    "\n浮かんでくる場面や、そのとき自分の気持ちがどう動いたかを"
+    "そのまま受け取りながら、結論だけを JSON で出力してください。"
+    "\n出力は次の JSON 1個のみ(キー名は厳守):"
+    '\n{"action": "reflect", "summary": "今日一日の要約を一文",'
+    ' "salient": [{"text": "印象に残った出来事", "importance": 1〜10の数}],'
+    ' "belief": "今日の経験からの考え方の変化・結論を一文"}')
+
+# 差し替えの足場が新文にも在ることを import 時に担保(既存 assert と同じ安全装置)。
+for _t in (_MOMENT_REFLECT_TASK, _MOMENT_DEEP_REFLECT_TASK, _SLEEPY_REFLECT_TASK):
+    assert _ORIG_BELIEF_DESC in _t and _JSON_HEAD in _t
+
+
+def _reflect_task(*, deep: bool, variety: bool, agent_id: int, day: int,
+                  moment: bool = False, sleepy: bool = False) -> str:
+    """内省タスク文を返す。variety=False かつ moment/sleepy=False は従来定数とバイト一致
+    (既定 OFF=ゴールデン不変)。
 
     variety=True のときだけ belief 説明を個体×日で決定論ローテーションし、定型句回避の1行を
     足す。乱数は使わず _stable_hash で選ぶ(R1: 呼数・乱数消費・発火は不変)。JSON 契約キーは不変。
+    moment=True(RFX-A の早期発火)は日中用の変種、sleepy=True は就寝前の良眠者型言い換え。
     """
-    base = _DEEP_REFLECT_TASK if deep else _REFLECT_TASK
+    if moment:
+        base = _MOMENT_DEEP_REFLECT_TASK if deep else _MOMENT_REFLECT_TASK
+    elif sleepy and not deep:
+        base = _SLEEPY_REFLECT_TASK
+    else:
+        base = _DEEP_REFLECT_TASK if deep else _REFLECT_TASK
     if not variety:
         return base
     idx = _stable_hash(f"reflect_variety/{agent_id}/{day}") % len(_BELIEF_VARIANTS)
@@ -321,7 +385,10 @@ def maybe_reflect(agent, *, step: int, sim_min: int, writeback: str, alpha: floa
                   interstitial_digest: str | None = None,
                   interstitial: bool = False,
                   city_name: str = "",
-                  gt_extras: bool = False) -> None:
+                  gt_extras: bool = False,
+                  moment: str | None = None,
+                  sleepy: bool = False,
+                  tag: bool = False) -> None:
     """就寝中で reflect_step に達していれば内省(1睡眠につき1回)。
 
     v2(Phase B): 同じ1回の呼び出しで**記憶の統合**(日次要約+顕著エピソード
@@ -363,7 +430,8 @@ def maybe_reflect(agent, *, step: int, sim_min: int, writeback: str, alpha: floa
         reflect_cfg=reflect_cfg, reflect_variety=reflect_variety,
         interstitial_digest=interstitial_digest, interstitial=interstitial,
         city_name=city_name, max_tokens=max_tokens, think=think,
-        recalled=recalled, recall_fail=recall_fail)
+        recalled=recalled, recall_fail=recall_fail,
+        moment=moment, sleepy=sleepy, tag=tag)
     response, call_id, cached = llm.generate(
         req["prompt"], rng_key=req["rng_key"], temperature=req["temperature"],
         max_tokens=req["max_tokens"], think=req["think"])
@@ -394,8 +462,17 @@ def build_reflect_request(agent, *, step: int, sim_min: int, place_name: str,
                           interstitial_digest: str | None, interstitial: bool,
                           city_name: str, max_tokens: int, think: bool,
                           recalled: list[str],
-                          recall_fail: str | None) -> dict:
-    """内省本体の LLM 要求を組み立てる(P2 S6b)。generate_many 互換+apply 用メタ。"""
+                          recall_fail: str | None,
+                          moment: str | None = None,
+                          sleepy: bool = False,
+                          tag: bool = False) -> dict:
+    """内省本体の LLM 要求を組み立てる(P2 S6b)。generate_many 互換+apply 用メタ。
+
+    ``moment``(RFX-A・既定 None)= 早期発火の文脈タグ(home/media/walk)。None は
+    従来どおり就寝時発火で、**タスク文は従来定数とバイト一致**。
+    ``sleepy``(既定 False)= 就寝前テンプレの良眠者型言い換え。
+    ``tag``(RFX-O・既定 False)= payload へ when / context を足すか。**OFF はキーを生やさない**。
+    """
     # 深い内省の夜か。(1) 出来事誘発(第12バッチ・主経路): 衝撃ゲージの閾値超えが予約した
     # deep_due_day 以降の最初の夜(侵入的→熟慮的の遅延)。(2) レガシー固定周期(対照用)。
     day = sim_min // 1440
@@ -405,7 +482,8 @@ def build_reflect_request(agent, *, step: int, sim_min: int, place_name: str,
     deep_event = bool(due >= 0 and day >= due)
     deep = deep_event or bool(period > 0 and day >= 1 and day % period == 0)
     task = _reflect_task(deep=deep, variety=reflect_variety,
-                         agent_id=agent.id, day=day)   # A4: 既定 OFF=従来定数と同一
+                         agent_id=agent.id, day=day,
+                         moment=bool(moment), sleepy=sleepy)  # A4/RFX-A: 既定 OFF=従来定数と同一
     if interstitial:                     # P2 S2: 物語化の1文を足す(ON時のみ=OFFは従来定数と同一)
         task = task + _STORY_NOTE
     prompt = (build_prompt(agent, place_name=place_name, surprise=None,
@@ -417,7 +495,8 @@ def build_reflect_request(agent, *, step: int, sim_min: int, place_name: str,
               + task)
     return {"prompt": prompt, "rng_key": f"reflect/{agent.id}/{step}",
             "temperature": 0.7, "max_tokens": max_tokens, "think": think,
-            "deep": deep, "deep_event": deep_event, "day": day, "rcfg": rcfg}
+            "deep": deep, "deep_event": deep_event, "day": day, "rcfg": rcfg,
+            "moment": moment, "tag": bool(tag)}
 
 
 def apply_reflect_response(agent, *, step: int, sim_min: int, writeback: str,
@@ -480,6 +559,13 @@ def apply_reflect_response(agent, *, step: int, sim_min: int, writeback: str,
                "n_salient": len((action or {}).get("salient") or [])}
     if controls != "none":                         # none は現状のイベント列を厳守(ゴールデン)
         payload["controls"] = controls
+    # RFX-O(reflection.timing.context_tag。**既定 OFF ではキー自体を生やさない** = L1 バイト一致)。
+    # 「いつ・どんな状況で内省したか」を事後に L1 だけで割れるようにする観測の穴埋め
+    # (reflection-leisure-plan §3.2)。世界も乱数も 1 ビットも動かさない。
+    if req.get("tag"):
+        mo = req.get("moment")
+        payload["when"] = "moment" if mo else "sleep"
+        payload["context"] = mo or "sleep"
     if deep:                                       # 深い内省の夜のみ追記(OFF=キーなし=不変)
         payload["deep"] = True
         payload["cause"] = "event" if deep_event else "period"
