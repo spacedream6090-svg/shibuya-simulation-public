@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import hashlib
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -39,6 +40,16 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 GOLDEN_OPEN = "36603ed8e1f750d5b3208c358dd594424f65845506971443a683ec9d7023d983"
 GOLDEN_INDOOR = "fb96c5945ae79ff5e3ae6a981ba53af59e96ed9323f4db15131c65002354dae5"
 GOLDEN_WALLFORCE = "4215dd19fc8a071b7a04e8fb6378e6247cc467ed3c3d8f9fd27e2196dc622fc6"
+
+# ★上の 3 定数は Windows(開発機=正典)で採ったバイト列。Linux は libm の float 丸め差で
+#   軌跡バイトが変わるため照合しない(2026-08-16 gpu-server フルゲート実測=不一致は
+#   この定数照合の 4 assert のみ・宣言済み例外・docs/plans/pre-production-gate.md A1)。
+#   **Linux 値で GOLDEN を上書きしない**。プラットフォーム非依存の不変量(引数無視の
+#   バイト一致・ハッシュ枝刈りのビット一致・非貫通・同 seed 再現)は全 OS で検収を維持する。
+_WINDOWS = sys.platform == "win32"
+requires_windows_golden = pytest.mark.skipif(
+    not _WINDOWS,
+    reason="SFM 軌跡ゴールデンは Windows 正典(Linux は float 差でバイト不一致=宣言済み例外)")
 
 
 def _sha(*arrs) -> str:
@@ -214,6 +225,7 @@ def _golden_open_scenario(**kw):
     return c
 
 
+@requires_windows_golden
 def test_open_core_matches_pre_batch_golden_bytes():
     """walls を渡さない既存の呼び出しは竹-3 以前と **バイト一致**(完全後方互換)。"""
     c = _golden_open_scenario()
@@ -226,11 +238,14 @@ def test_walls_none_ignores_wall_parameters():
     base = _golden_open_scenario()
     weird = _golden_open_scenario(walls=None, wall_a=9.9e4, wall_b=1.5,
                                   wall_range=50.0, wall_hash=False)
-    assert _sha(weird.pos, weird.vel) == _sha(base.pos, base.vel) == GOLDEN_OPEN
+    assert _sha(weird.pos, weird.vel) == _sha(base.pos, base.vel)
     # 空リストも「壁なし」扱い(旧 WallCrowd の `if segs:` と同じ判定)
     empty = _golden_open_scenario(walls=[])
     assert empty.wall_field is None
-    assert _sha(empty.pos, empty.vel) == GOLDEN_OPEN
+    assert _sha(empty.pos, empty.vel) == _sha(base.pos, base.vel)
+    # ゴールデン定数との照合だけ Windows 正典に限定(引数無視の不変量は上で全 OS 検収済み)
+    if _WINDOWS:
+        assert _sha(base.pos, base.vel) == GOLDEN_OPEN
 
 
 # ═══════════════════════════ (D) 壁非貫通(合成コリドー) ═══════════════════════════
@@ -353,6 +368,7 @@ def test_wallcrowd_equals_core_crowd_with_same_arguments():
     assert a.tobytes() == b.tobytes()
 
 
+@requires_windows_golden
 def test_wallcrowd_forces_match_pre_batch_golden_bytes():
     """壁あり 120 体の合力が竹-3 以前(HEAD の密な N×M 実装)と **バイト一致**。"""
     walls = vision.building_walls(_office(), 1)
@@ -365,6 +381,7 @@ def test_wallcrowd_forces_match_pre_batch_golden_bytes():
     assert _sha(c.forces()) == GOLDEN_WALLFORCE
 
 
+@requires_windows_golden
 def test_indoor_transition_matches_pre_batch_golden_bytes():
     """屋内の遷移積分(実レイアウト)の軌跡・接触が竹-3 以前と **バイト一致**。"""
     bld = _office()
