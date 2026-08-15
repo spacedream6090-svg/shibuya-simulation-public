@@ -2,6 +2,7 @@
 
 使い方:  python viz/make_viewer3d.py runs/<name> [--no-traffic] [--tracks-binary]
                                      [--lateral-offset] [--street-only|--no-street-only]
+                                     [--plateau-tran]
 
   --lateral-offset : 街路上の人を中心線から横へ散らす(I-1 λ)。λ=hash(agent_id, edge) の
     純関数で、道路クラス既定の帯を建物フットプリントで clamp した幅へ写す。中心線に
@@ -13,6 +14,11 @@
     既定で描かない」)。屋内データを持たない旧ランは OFF のままなので生成 HTML は従来と
     バイト同一。フラグは両方向の明示上書き。
   --lateral-offset は既定 OFF=フラグ無しでは λ の JS は 1 バイトも入らない。
+  --plateau-tran : PLATEAU 道路 LOD3(車道/歩道/交通島の実測面)を新規レイヤとして描く
+    (A5)。data/plateau/tran_lod3.{json,npz}(scripts/plateau_tran_extract.py 産)を読む。
+    **既定 OFF**=フラグ無しでは HTML は 1 バイトも変わらない。ON にしても
+    レイヤーパネルのチェックは**外れた状態**で出る(= 現行の見た目と同等)。
+    約 +1.9MB(三角形 79,673 枚・非索引 int16)なので、常時同梱はしない。
 生成物:  runs/<name>/viewer3d.html
   自己完結の単一 HTML。three.js(r128, MIT)本体・OrbitControls・シーンデータを埋め込み。
   ブラウザで開けば即グリグリ(OrbitControls)+ 再生 + 昼夜 + クリックで人物情報。
@@ -48,6 +54,33 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 VENDOR = REPO_ROOT / "viz" / "vendor"
+
+# ============================================================ PLATEAU 出典(A5)
+# ビューアが描く建物 LOD2.2 / 地下街 LOD4.1 / 道路 LOD3 の一次データ。
+#
+# 版の来歴(2026-08-16 に一次ソースで再確認):
+#   2023年度版 `plateau-13113-shibuya-ku-2023`(旧調査時点の最新)
+#     → **2025年度版 `plateau-13113-shibuya-ku-2025`(標準製品仕様書 第5版 = V5)**
+#   本リポの data/plateau/* は 2025年度版 CityGML
+#   (`13113_shibuya-ku_pref_2025_citygml_1_op`)から抽出済みなので、
+#   ビューア側で差し替えるべき URL は無い(**3D Tiles をネットワーク配信で
+#   ストリーミングしていない**=file:// 単体で開ける自己完結ビューアが設計要件)。
+#   ここで持つのは「どの版の何を加工したか」を画面に出すための出典情報だけで、
+#   タイル実体はリポにもビューアにも同梱しない。
+# 2025年度版の収録 LOD(配信ページ記載):建築物 LOD0/1/2.0/2.2・道路 LOD1/2/3.0・
+#   地下街 LOD1/4.1。ビューアが使うのはこのうち LOD2.2 / LOD3 / LOD4.1。
+PLATEAU_DATASET = "3D都市モデル(Project PLATEAU)渋谷区(2025年度)"
+PLATEAU_DATASET_ID = "plateau-13113-shibuya-ku-2025"
+PLATEAU_DATASET_URL = (
+    "https://www.geospatial.jp/ckan/dataset/plateau-13113-shibuya-ku-2025")
+PLATEAU_SPEC = "3D都市モデル標準製品仕様書 第5版(V5)"
+PLATEAU_CREDIT = "国土交通省 都市局"          # 配信ページが求めるクレジット表記
+PLATEAU_LICENSE = "PLATEAU Site Policy(CC BY 4.0 相当・商用可・改変可)"
+PLATEAU_LICENSE_URL = "https://www.mlit.go.jp/plateau/site-policy/"
+# 旧版(来歴のみ・現在は不使用): https://www.geospatial.jp/ckan/dataset/plateau-13113-shibuya-ku-2023
+
+TRAN3_ATTRIBUTION = ("道路面: 国土交通省 Project PLATEAU "
+                     "3D都市モデル(渋谷区 2025年度)CityGML(udx/tran・LOD3)を加工")
 
 
 def _load_export3d():
@@ -201,7 +234,9 @@ def build_html(run_name: str, scene_json: str, tracks_json: str,
                plateau_tex_src: str | None = None,
                tex_note: bool = False,
                lateral: bool = False,
-               street_only: bool | None = None) -> str:
+               street_only: bool | None = None,
+               tran3_json: str | None = None,
+               tran3_src: str | None = None) -> str:
     three_js, orbit_js, lic = _read_vendor()
     html = _TEMPLATE
     html = html.replace("__RUN_NAME__", run_name)
@@ -221,6 +256,14 @@ def build_html(run_name: str, scene_json: str, tracks_json: str,
         html = _inject_plateau_tex(html, plateau_tex_src)
     elif tex_note:                      # 埋め込み版は注記だけ(80MB ゲート)
         html = _inject_tex_note(html)
+    if tran3_json is not None or tran3_src is not None:   # A5: 道路 LOD3(既定 OFF)
+        html = _inject_tran3(html, tran3_json, tran3_src)
+    # 出典表示(A5): PLATEAU 由来の形状を 1 つでも描くなら常時出す。
+    # PLATEAU を持たない旧ランでは 1 バイトも変わらない。
+    if (plateau_json is not None or plateau_src is not None
+            or plateau_tex_src is not None
+            or tran3_json is not None or tran3_src is not None):
+        html = _inject_credits(html)
     if terrain_json is not None:        # terrain_web.json(地形起伏+接地)
         html = _inject_terrain(html, terrain_json)
     if mode_legend:                     # tracks.meta.mode_legend(移動手段)
@@ -741,6 +784,204 @@ _EXTRAS_WIRE = r"""// 地下街/歩道橋トグルの配線(applyLayers を触�
   applyExtras();
 })();
 """
+
+
+# ============================================================ 道路 LOD3(A5)
+# scripts/plateau_tran_extract.py が 2025年度版 CityGML(udx/tran)から抽出した
+# data/plateau/tran_lod3.{json,npz} を **ビューア側で** 読む。
+# export_3d を経由しないのは、A5 レーンの触ってよい範囲が viz/make_viewer3d.py に
+# 限られているため(scripts/export_3d.py は別レーンの担当)。将来 export_3d が
+# scene3d/tran3_web.json を書くようになったら、そちらを優先する分岐に寄せればよい。
+TRAN3_CLASS_NAMES = ("walk", "road", "island", "other")
+
+
+def _load_tran3(plateau_dir: Path | None = None) -> dict | None:
+    """tran_lod3.json + tran_lod3.npz を読む。片方でも無ければ None(=注入しない)。"""
+    d = plateau_dir or (REPO_ROOT / "data" / "plateau")
+    json_p, npz_p = d / "tran_lod3.json", d / "tran_lod3.npz"
+    if not (json_p.exists() and npz_p.exists()):
+        return None
+    import numpy as np                       # 重い依存はここでだけ読む
+    meta = json.loads(json_p.read_text(encoding="utf-8"))
+    if meta.get("schema") != "plateau_tran_lod3/1":
+        raise SystemExit(f"[make_viewer3d] tran_lod3.json の schema 未対応: "
+                         f"{meta.get('schema')!r}(期待 'plateau_tran_lod3/1')")
+    z = np.load(npz_p)
+    for key in ("xy", "origin_q", "poly_offsets", "poly_class"):
+        if key not in z:
+            raise SystemExit(f"[make_viewer3d] tran_lod3.npz に '{key}' が無い")
+    return {"meta": meta, "npz": {k: np.asarray(z[k]) for k in
+                                  ("xy", "origin_q", "poly_offsets", "poly_class", "poly_z")}}
+
+
+def build_tran3_web(tran: dict) -> dict:
+    """道路 LOD3 を「絶対 int16×quant_scale の非索引三角形」へ直して base64 化する。
+
+    抽出器の出力は **全ポリゴンがちょうど 3 頂点**(counts.polys_raw = n_vertices/3)。
+    索引を持たせず 1 三角形 = 9 float で書くほうが小さくなるのでそうする。
+    z は面ごとの [z_min, z_max](ground0 基準)の**中点**を 3 頂点に与える平板近似。
+      → 面内の z 幅は平均 0.14m しかないので、道路面としては視覚的に無害。
+        これは抽出器が頂点ごとの z を保持していない(帯だけ持つ)ことに由来する
+        近似で、ビューア側で回復はできない = 既知の限界として payload にも書き残す。
+    """
+    import base64
+    import numpy as np
+    meta, z = tran["meta"], tran["npz"]
+    quant = float(meta.get("quant_scale", 0.05))
+    off = z["poly_offsets"].astype(np.int64)
+    n_per = np.diff(off)
+    ntri = int(len(n_per))
+    if ntri and (int(n_per.min()) != 3 or int(n_per.max()) != 3):
+        raise SystemExit("[make_viewer3d] tran_lod3: 3 頂点でないポリゴンがある"
+                         f"(min={int(n_per.min())} max={int(n_per.max())})。"
+                         "扇状分割が要る=抽出器の契約が変わった。")
+    xy = z["xy"].astype(np.int64) + z["origin_q"].astype(np.int64)   # 絶対量子化値
+    if xy.size and int(np.abs(xy).max()) > 32767:
+        raise SystemExit("[make_viewer3d] tran_lod3: 絶対量子化値が int16 に収まらない"
+                         f"(max={int(np.abs(xy).max())})")
+    pz = z["poly_z"].astype(np.float64).reshape(-1, 2)
+    zq = np.clip(np.round(pz.mean(axis=1) / quant), -32767, 32767).astype(np.int64)
+    P = np.empty((ntri * 3, 3), dtype="<i2")
+    P[:, 0] = xy[:, 0]
+    P[:, 1] = xy[:, 1]
+    P[:, 2] = np.repeat(zq, 3)
+    return {
+        "schema": "plateau_tran_web/1",
+        "quant_scale": quant,
+        "class_names": list(TRAN3_CLASS_NAMES),
+        "n_triangles": ntri,
+        "n_vertices": ntri * 3,
+        "origin_latlon": meta.get("origin_latlon"),
+        "ground0": meta.get("ground0"),
+        "lod": meta.get("lod", "lod3MultiSurface"),
+        "area_m2_by_class": meta.get("area_m2_by_class", {}),
+        "n_polygons_by_class": meta.get("n_polygons_by_class", {}),
+        "z_note": "面ごとの z は [z_min,z_max] の中点(平板近似・面内 z 幅の平均 0.14m)",
+        "dataset": PLATEAU_DATASET,
+        "dataset_url": PLATEAU_DATASET_URL,
+        "spec": PLATEAU_SPEC,
+        "license": PLATEAU_LICENSE,
+        "attribution": meta.get("attribution") or TRAN3_ATTRIBUTION,
+        "positions_b64": base64.b64encode(
+            np.ascontiguousarray(P).tobytes()).decode("ascii"),
+        "tri_class_b64": base64.b64encode(
+            np.ascontiguousarray(z["poly_class"].astype("<u1")).tobytes()).decode("ascii"),
+    }
+
+
+def tran3_web_json(plateau_dir: Path | None = None) -> str | None:
+    """道路 LOD3 の payload を JSON 文字列で返す(データ無しなら None)。"""
+    tran = _load_tran3(plateau_dir)
+    if tran is None:
+        return None
+    return json.dumps(build_tran3_web(tran), ensure_ascii=False, separators=(",", ":"))
+
+
+def _inject_tran3(html: str, tran3_json: str | None, tran3_src: str | None) -> str:
+    """道路 LOD3 面を新規トグルレイヤ(既定=チェック外し)として注入する。
+
+    ①データブロック ②レイヤーパネルのトグル ③構築+配線 の 3 箇所を一意置換。
+    既存の X 線トグル(buildingMats だけを触る)・接近フェード(userData.plateau の
+    マテリアルだけを触る)とは**共有状態を持たない**ので、共存は構造的に保証される
+    (tran3 のマテリアルは buildingMats に push しない)。"""
+    if tran3_src is not None:
+        data_tag = f'<script src="{tran3_src}"></script>'
+    else:
+        data_tag = ('<script type="application/json" id="plateau-tran-data">'
+                    + _json_for_script(tran3_json) + "</script>")
+    anchor_data = '<script type="application/json" id="scene-data">'
+    html = _replace_once(html, anchor_data, data_tag + "\n" + anchor_data, "tran3-data")
+    anchor_panel = ('      <label class="chk"><input type="checkbox" id="lyRoad" checked>'
+                    ' 道路</label>')
+    html = _replace_once(html, anchor_panel, anchor_panel + "\n" + _TRAN3_TOGGLE,
+                         "tran3-panel")
+    anchor_build = "// ---------- ループ"
+    html = _replace_once(html, anchor_build, _TRAN3_BUILD + anchor_build, "tran3-build")
+    return html
+
+
+# 既定はチェック無し = 現行の見た目と同等(ON にして初めて道路面が出る)
+_TRAN3_TOGGLE = ('      <label class="chk"><input type="checkbox" id="lyTran3">'
+                 ' 道路面 LOD3(車道/歩道)</label>')
+
+_TRAN3_BUILD = r"""// ---------- 道路面 LOD3(PLATEAU udx/tran・非索引三角形・種別で塗り分け)
+// 既定 visible=false。X線/接近フェードは buildingMats しか触らないので相互作用なし。
+const tran3Meshes = [];
+(function buildTran3(){
+  const T = (()=>{ try {
+    const el = document.getElementById('plateau-tran-data');
+    if(el) return JSON.parse(el.textContent);
+    if(typeof PLATEAU_TRAN !== 'undefined') return PLATEAU_TRAN;
+  } catch(e){ console.warn('PLATEAU tran parse failed', e); } return null; })();
+  if(!T || !T.positions_b64) return;
+  const b64 = s => { const bin=atob(s); const u=new Uint8Array(bin.length);
+    for(let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i); return u; };
+  const q = T.quant_scale || 0.05;
+  const pi = new Int16Array(b64(T.positions_b64).buffer);
+  const pos = new Float32Array(pi.length);
+  for(let i=0;i<pi.length;i+=3){          // local-m (e,n,up) -> three (e,up,-n)
+    pos[i] = pi[i]*q; pos[i+1] = pi[i+2]*q; pos[i+2] = -pi[i+1]*q; }
+  const cls = b64(T.tri_class_b64);
+  const names = T.class_names || ['walk','road','island','other'];
+  const STY = { walk:0x8c96a8, road:0x4d5666, island:0x9c8f6a, other:0x707a8a };
+  const nt = (pos.length/9)|0;
+  const cnt = new Int32Array(256);
+  for(let ti=0; ti<nt; ti++) cnt[cls[ti]]++;
+  const bufs = {}, fill = {};
+  for(let k=0;k<256;k++) if(cnt[k]){ bufs[k] = new Float32Array(cnt[k]*9); fill[k] = 0; }
+  for(let ti=0; ti<nt; ti++){ const k = cls[ti], b = bufs[k]; let f = fill[k];
+    const o = ti*9; for(let j=0;j<9;j++) b[f+j] = pos[o+j]; fill[k] = f+9; }
+  for(let k=0;k<256;k++){
+    if(!cnt[k]) continue;
+    const bg = new THREE.BufferGeometry();
+    bg.setAttribute('position', new THREE.BufferAttribute(bufs[k], 3));
+    bg.computeVertexNormals();                     // 非索引=フラット法線(路面向き)
+    const mat = new THREE.MeshLambertMaterial({ color:(STY[names[k]] !== undefined
+        ? STY[names[k]] : STY.other), side:THREE.DoubleSide,
+      polygonOffset:true, polygonOffsetFactor:-2, polygonOffsetUnits:-2 });
+    const mesh = new THREE.Mesh(bg, mat);
+    mesh.renderOrder = -2;                         // 地形(-3)の後・建物より先
+    mesh.visible = false;                          // 既定 OFF(現行の見た目と同等)
+    mesh.userData.tran3 = names[k] || 'other';
+    tran3Meshes.push(mesh); scene.add(mesh);
+  }
+  function applyTran3(){ const e = document.getElementById('lyTran3');
+    const on = e ? e.checked : false;
+    for(const m of tran3Meshes) m.visible = on; }
+  const e0 = document.getElementById('lyTran3');
+  if(e0) e0.addEventListener('change', applyTran3);   // applyLayers の onchange と共存
+  applyTran3();
+  console.info('道路面 LOD3:', nt, '三角形 /', T.lod || 'lod3MultiSurface');
+})();
+
+"""
+
+
+# ============================================================ 出典表示(A5)
+def _inject_credits(html: str) -> str:
+    """PLATEAU 由来の形状を 1 つでも描く時、画面に出典・版・ライセンスを常時出す。
+
+    `#osmAttr` に相乗りしない理由: あれは「OSM地図(地面)」トグルで display:none に
+    なる(applyLayers)。出典表示がレイヤー操作で消えるのは帰属表示として不適切なので、
+    独立した要素にして常に出す。CSS はテンプレートを触らずインラインで持つ
+    (テンプレートに手を入れると PLATEAU 無しランの出力が変わってしまうため)。"""
+    anchor = '<div id="osmAttr">© OpenStreetMap contributors</div>'
+    block = (anchor + "\n" + _PLATEAU_ATTR_HTML)
+    return _replace_once(html, anchor, block, "credits")
+
+
+_PLATEAU_ATTR_HTML = (
+    '<div id="plateauAttr" style="position:fixed; left:10px; bottom:24px; z-index:3;'
+    ' font-size:10px; line-height:1.55; color:#8a93a3; opacity:.82;'
+    # max-width は左半分に収める(#ctrl が bottom:12px / left:50% で中央に居るため)
+    ' text-shadow:0 1px 2px rgba(0,0,0,.6); max-width:min(560px,44vw);">'
+    '出典: ' + PLATEAU_CREDIT + '「' + PLATEAU_DATASET + '」(' + PLATEAU_SPEC + ')を加工して作成'
+    ' ・ ライセンス: <a href="' + PLATEAU_LICENSE_URL + '" target="_blank"'
+    ' rel="noopener noreferrer" style="color:#9fb4d6">' + PLATEAU_LICENSE + '</a>'
+    ' ・ 配信: <a href="' + PLATEAU_DATASET_URL + '" target="_blank"'
+    ' rel="noopener noreferrer" style="color:#9fb4d6">G空間情報センター '
+    + PLATEAU_DATASET_ID + '</a>'
+    '</div>')
 
 
 # ============================================================ 移動手段(mode_legend)
@@ -1618,16 +1859,27 @@ def main(argv: list) -> int:
     indoor_json = _ensure_indoor(run_dir, tracks_json)
     # 告知用に auto を解決する(build_html 側と同じ規則。判定の正典は build_html)。
     street_eff = (indoor_json is not None) if street_only is None else street_only
+    # A5: 道路 LOD3(明示フラグ時のみ読む=フラグ無しなら data/plateau も触らない)
+    tran3_json = tran3_web_json() if "--plateau-tran" in flags else None
+    if "--plateau-tran" in flags and tran3_json is None:
+        print("  [warn] --plateau-tran: data/plateau/tran_lod3.{json,npz} が無いので"
+              "道路 LOD3 は注入しない(scripts/plateau_tran_extract.py を実行)。")
     html = build_html(run_dir.name, scene_json, tracks_json,
                       plateau_json=plateau_json, terrain_json=terrain_json,
                       has_extras=has_extras, mode_legend=mode_legend,
                       notable_json=notable_json, indoor_json=indoor_json,
                       tracks_binary=tracks_binary, has_ubld4=has_ubld4,
-                      tex_note=has_tex, lateral=lateral, street_only=street_only)
+                      tex_note=has_tex, lateral=lateral, street_only=street_only,
+                      tran3_json=tran3_json)
     out = run_dir / "viewer3d.html"
     out.write_text(html, encoding="utf-8")
     mb = out.stat().st_size / 1024 / 1024
     print(f"  {out}  ({mb:.2f} MB)")
+    if tran3_json is not None:
+        _t3 = json.loads(tran3_json)
+        print(f"  A5: 道路LOD3 {_t3['n_triangles']:,} 三角形"
+              f"({'/'.join(f'{k}={v:,}' for k, v in _t3['n_polygons_by_class'].items() if v)})"
+              f"  ← レイヤー「道路面 LOD3(車道/歩道)」・既定 OFF")
     if lateral or street_eff:
         auto = "" if street_only is not None else "(既定=屋内データ有り)"
         print(f"  I-1: λ横オフセット={'ON' if lateral else 'OFF'} "
@@ -1651,17 +1903,26 @@ def main(argv: list) -> int:
         side.write_text("PLATEAU_MESH = "
                         + (_slim_plateau_for_tex(plateau_json) if has_tex else plateau_json)
                         + ";", encoding="utf-8")
+        # A5: 分離版は道路 LOD3 もサイドカー参照にする(HTML を膨らませない)
+        tran3_side = None
+        if tran3_json is not None:
+            tran3_side = run_dir / "plateau_tran.js"
+            tran3_side.write_text("PLATEAU_TRAN = " + tran3_json + ";", encoding="utf-8")
         lite = build_html(run_dir.name, scene_json, lite_tracks_json,
                           plateau_src="plateau_mesh.js", terrain_json=terrain_json,
                           has_extras=has_extras, mode_legend=mode_legend,
                           notable_json=notable_json, indoor_json=indoor_json,
                           tracks_binary=lite_binary, has_ubld4=has_ubld4,
                           plateau_tex_src=("plateau_tex.js" if has_tex else None),
-                          lateral=lateral, street_only=street_only)
+                          lateral=lateral, street_only=street_only,
+                          tran3_src=("plateau_tran.js" if tran3_side else None))
         lite_p = run_dir / "viewer3d_lite.html"
         lite_p.write_text(lite, encoding="utf-8")
         print(f"  {lite_p}  ({lite_p.stat().st_size/1024/1024:.2f} MB)"
               f"  + {side.name}  ({side.stat().st_size/1024/1024:.2f} MB)")
+        if tran3_side is not None:
+            print(f"  + {tran3_side.name}  "
+                  f"({tran3_side.stat().st_size/1024/1024:.2f} MB)  ← 道路LOD3(分離版)")
         chunk_bytes = 0
         if lite_binary and not tracks_binary:      # 分離版だけバイナリ = ここで書き出す
             n_chunks, chunk_bytes = _write_tracks_chunks(run_dir)
@@ -1672,12 +1933,18 @@ def main(argv: list) -> int:
                               for p in (run_dir / "tracks_bin").glob("chunk_*.js"))
         if has_tex:
             tex_mb = tex_p.stat().st_size / 1024 / 1024
+            # A5: 道路 LOD3 サイドカーもゲート会計に入れる(足したものは必ず数える)
+            tran3_bytes = tran3_side.stat().st_size if tran3_side is not None else 0
             total = (lite_p.stat().st_size + side.stat().st_size
-                     + tex_p.stat().st_size + chunk_bytes) / 1024 / 1024
+                     + tex_p.stat().st_size + chunk_bytes + tran3_bytes) / 1024 / 1024
             gate = "以内" if total <= 80 else "超過"
             print(f"  + {tex_p.name}  ({tex_mb:.2f} MB)"
                   f"  ← 分離版合計 {total:.2f} MB(80MB ゲート{gate}"
                   f"・埋め込み版にテクスチャは入れない)")
+            if total > 80 and tran3_bytes:
+                print(f"  [warn] --plateau-tran の {tran3_bytes/1024/1024:.2f} MB を"
+                      "足したことで 80MB ゲートを超えた。道路 LOD3 を外すか"
+                      "(フラグを落とす)、plateau_tran.js を別配布にすること。")
     return 0
 
 
