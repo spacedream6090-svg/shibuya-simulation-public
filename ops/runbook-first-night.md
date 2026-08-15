@@ -34,12 +34,16 @@ python scripts/check_llm_backends.py --backend openai_compat --base-url http://l
 ```
 ※ speculative/prefix-cache は E1 手順(greedy でバイト一致→採否)。**今夜は prefix cache のみONで可**(specは時間があれば)。
 
-### 0-4. 環境確認5点
+### 0-4. 環境確認5点+運用4点(8/16監査反映)
 1. `nvidia-smi`: 7 GPU 認識・VRAM
 2. ディスク空き: **今夜は50GB以上あれば可**(本番10日ランは~70GB+バックアップ先。E0=checkpoint剪定禁止を忘れない)
 3. `date`(シム start_date="auto" が実日付を拾う)
 4. `curl -sI https://discord.com -o /dev/null -w "%{http_code}\n"`(Discord疎通・任意)
 5. ODPT キーは**GPU機では不要**(RW取得はローカルPCのタスクのみ)
+6. **`ulimit -n` を上げる**(実測1024=本番不足): ランを張る tmux シェルで `ulimit -n 65535`(vLLM7本+parquet+sockets)
+7. `nvidia-smi topo -m` と `numactl --hardware` の出力を保存(2 NUMA機・偏りが大きい時だけ affinity を検討=盲目的pinningはしない)
+8. vLLM `/metrics` を全7ポートで30〜60秒間隔保存(prefix hit・queue・KV使用率・TTFT→run artifactへ)
+9. **持続試験**: 30〜60分連続推論で req/s のドリフト(熱/クロック)を確認——最初35で1時間後25なら壁時計見積りが壊れる
 
 ---
 
