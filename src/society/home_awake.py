@@ -41,6 +41,7 @@ no-fingerprint: 本モジュールは traits/因子を 1 つも読まない(年�
 """
 from __future__ import annotations
 
+import hashlib
 import math
 
 from omegaconf import OmegaConf
@@ -53,7 +54,26 @@ _DEFAULTS: dict = {
     # 帰宅トリガの前倒し[分]。0 = 既存の帰宅トリガ(bedtime_reached)のまま = スコープ最小。
     # >0 にすると就寝時刻の lead_min 前から帰路につく(= 帰宅 19:15 / 就寝 23:39 の
     # 現実へ寄せる LSR-H 相当。既定 0 なので ON にしても帰宅時刻は動かない)。
+    # ★lead.mode="per_agent" ではこの一律値は使わず、個体別の前倒しを組む(下記 "lead")。
     "lead_min": 0,
+    # ---- 帰宅前倒しの個体分布(ユーザー決定 2026-08-16)----------------------- #
+    "lead": {
+        "mode": "fixed",        # fixed(既定=lead_min の一律値) | per_agent
+        "jitter_min": 30,       # 日次ジッター ±[分](既存 stream "home_awake")
+        # 就業状態 → 前倒しの基準[分]。詳細な出典は _SEG_SOURCE(下)に書く。
+        "segment_base": {"worker": 195, "student": 225,
+                         "non_working": 255, "night_worker": 90},
+        # 年齢帯 → 基準への加算[分]。★uncalibrated parameter(下記 _SEG_SOURCE 参照)。
+        "age_delta": {"youth": 0, "mid": -25, "senior": 10, "elder": 40},
+        # 個体差[分]の分位テーブル(blake2b の分位で引く = 乱数 stream を 1 本も消費しない)。
+        # 右裾の長い形(少数が大きく早く帰る)。★合計 0 = セグメント基準が母平均になる。
+        # ★uncalibrated parameter(分布の形の公表値は無い)。
+        "spread_quantiles": [-78, -56, -40, -26, -13, 1, 16, 34, 60, 102],
+    },
+    # ---- 同居人どうしの夜の自宅会話(ユーザー決定 2026-08-16)。既定 OFF ------- #
+    "evening_talk": {
+        "enabled": False,       # ON で「同一世帯 かつ 両者 HOME_AWAKE」のペアだけ発話を開く
+    },
     # 帰宅後に起きていられる上限[分]。到達したら必ず就寝する(ハザードの裾を切る安全弁)。
     "max_awake_min": 200,
     # 「翌日早出」の判定: 勤務開始がこの分 of day より早ければ早出(既定 480 = 08:00)。
@@ -79,6 +99,9 @@ _DEFAULTS: dict = {
 # 在宅活動ラベル(8 種)。順序は決定論(抽選の正準順序)。
 ACTS: tuple[str, ...] = ("meal", "bath", "housework", "family_talk",
                          "media", "hobby", "study", "rest")
+
+# 帰宅前倒しの決め方。fixed = 全体一律(既定・後方互換)。per_agent = 個体別。
+LEAD_MODES: tuple[str, ...] = ("fixed", "per_agent")
 
 # --------------------------------------------------------------------------- #
 # 活動の 1 セッション長[step](正準 Δt=10 分基準)。
@@ -162,6 +185,46 @@ _WORK_MULT: dict[str, dict[str, float]] = {
 # 学生とみなす職業語(名簿の職業語彙。地名は含めない)。
 _STUDENT_OCCS = ("大学生", "学生", "高校生", "中学生", "小学生", "専門学校生", "院生")
 
+# --------------------------------------------------------------------------- #
+# 帰宅前倒し(lead)の出典と、どこまでが較正済みでどこからが未較正か
+# --------------------------------------------------------------------------- #
+_SEG_SOURCE = """
+segment_base / age_delta / spread_quantiles の来歴(捏造しないための明示):
+
+★較正済み(直接アンカーが在る)= worker
+  data/ground_truth/registry.yaml の `tu_home_to_sleep_gap_min` = **264 分**
+  (社会生活基本調査 令和3年・東京都・有業者・平日: 帰宅 19:15 → 就寝 23:39)。
+  本シムの就寝は「帰宅 = bedtime_min − lead」から**ハザードの期待遅延 D** だけ後ろに
+  出る。既定係数での D は 60 体 x 3 日 mock の実測で **中央値 100 分 / 平均 100 分**
+  (lead=0 のときの帰宅→就寝 gap がそのまま D)。第一近似は
+      base_worker ≈ 264 − D = 165 分
+  だが、前倒しを入れると**就寝時刻より前の窓でもハザードが小さく効く**ので実測 gap は
+  lead + D より短くなる(worker セグメント実測 **222.2 分** @ base=165)。そこで
+  **較正を 1 回だけ回した**: 局所感度 Δgap/Δlead ≈ 0.81(= (222.2−100)/150)から
+      base_worker = 165 + (264 − 222.2)/0.81 ≈ 195 分
+  として全セグメントへ同じ +30 を平行移動した(相対順序は設計どおり保つ)。
+  ★これは「264 という公表値」と「本シムの実測」だけから引いた値で、新しい数字を
+    発明していない(derived + 1 回の較正反復)。60 体 mock での較正なので、
+    本選規模での再確認は V1(reality_score)レーンの仕事。
+
+★uncalibrated parameter(公表値が無い。方向だけ文献に接地し、値は仮置き)
+  - student(195): 社基調に**学生の帰宅時刻**の公表値は無い。通学の終わりは退勤より
+    早く、学習・自己啓発が長い(9.1% × 長時間)ことから worker より長めに置いた仮置き。
+  - non_working(225): 通勤・通学の行動者率は 39.7% しかない(= 6 割は「帰宅」という
+    事象を持たない)。3 次活動は退職世帯で最長(表5-1)。よって最も長く在宅と置いたが、
+    「何分前に家に居るか」の公表値は無い。
+  - night_worker(60): 夜勤は位相が反転しており、夕方に出勤する。前倒しは小さいはず、
+    という定性のみ。公表値なし。
+  - age_delta: **社基調の公表表に年齢帯別の帰宅時刻は無い**(帰宅時刻は有業者平均のみ)。
+    ここでは 3 次活動(自由行動)のライフステージ差 —— 独身期35歳未満 363 分 /
+    全国総数 376 分 / 末子就学前の子育て世帯 202 分(表5-1)—— を
+    「自由時間が短い帯は帰宅が遅い」の**代理**として使った。代理仮定そのものが未検証。
+    ★年齢帯別の就寝時刻(20-24 歳 24:10 等)は **bedtime_min 側(AGE-B の U 字)が
+      既に担っている**ので、ここで二重に効かせない(age_delta は帰宅側だけの小さな差)。
+  - spread_quantiles: 個体差の分布形の公表値は無い。右裾の長い形(少数が大きく早く
+    帰る = 短時間勤務・在宅勤務)を仮置きし、合計 0 = セグメント基準を母平均に保った。
+"""
+
 
 # --------------------------------------------------------------------------- #
 # conf
@@ -176,12 +239,27 @@ def cfg_of(cfg) -> dict:
     out = dict(_DEFAULTS)
     out["hazard"] = dict(_DEFAULTS["hazard"])
     out["engaged_acts"] = list(_DEFAULTS["engaged_acts"])
+    out["lead"] = {k: (dict(v) if isinstance(v, dict) else list(v) if isinstance(v, list)
+                       else v) for k, v in _DEFAULTS["lead"].items()}
+    out["evening_talk"] = dict(_DEFAULTS["evening_talk"])
     for k, v in raw.items():
         if k == "hazard" and isinstance(v, dict):
             for hk, hv in v.items():
                 if hk in out["hazard"]:
                     out["hazard"][hk] = float(hv)
-        elif k in out and k != "hazard":
+        elif k == "lead" and isinstance(v, dict):
+            for lk, lv in v.items():
+                if lk not in out["lead"]:
+                    continue
+                if isinstance(out["lead"][lk], dict) and isinstance(lv, dict):
+                    out["lead"][lk] = {**out["lead"][lk], **lv}
+                else:
+                    out["lead"][lk] = lv
+        elif k == "evening_talk" and isinstance(v, dict):
+            for tk, tv in v.items():
+                if tk in out["evening_talk"]:
+                    out["evening_talk"][tk] = tv
+        elif k in out and k not in ("hazard", "lead", "evening_talk"):
             out[k] = v
     out["enabled"] = bool(out["enabled"])
     out["lead_min"] = max(0, int(out["lead_min"]))
@@ -189,7 +267,27 @@ def cfg_of(cfg) -> dict:
     out["early_start_min"] = int(out["early_start_min"])
     out["engaged_acts"] = tuple(str(a) for a in out["engaged_acts"])
     out["family_talk_boost"] = float(out["family_talk_boost"])
+    lead = out["lead"]
+    lead["mode"] = str(lead["mode"]).strip().lower()
+    if lead["mode"] not in LEAD_MODES:
+        raise ValueError(f"daily.home_awake.lead.mode='{lead['mode']}' は未知"
+                         f"(有効値: {', '.join(LEAD_MODES)})。既定 fixed = 一律 lead_min。")
+    lead["jitter_min"] = max(0, int(lead["jitter_min"]))
+    lead["segment_base"] = {str(k): int(v) for k, v in lead["segment_base"].items()}
+    lead["age_delta"] = {str(k): int(v) for k, v in lead["age_delta"].items()}
+    lead["spread_quantiles"] = tuple(int(x) for x in lead["spread_quantiles"]) \
+        or (0,)
+    out["evening_talk"]["enabled"] = bool(out["evening_talk"]["enabled"])
     return out
+
+
+def settings(sim) -> dict:
+    """sim へ一度だけキャッシュした home_awake 設定(以後は再解析しない。media と同型)。"""
+    hcfg = getattr(sim, "_home_awake_settings", None)
+    if hcfg is None:
+        hcfg = cfg_of(sim.cfg)
+        sim._home_awake_settings = hcfg
+    return hcfg
 
 
 # --------------------------------------------------------------------------- #
@@ -279,17 +377,144 @@ def session_steps(act: str, rng, clock=None) -> int:
 # --------------------------------------------------------------------------- #
 # 就寝ハザード
 # --------------------------------------------------------------------------- #
-def muted(agent) -> bool:
-    """いま在宅覚醒中か(= 欲求発火の対象外にする述語)。
+# --------------------------------------------------------------------------- #
+# 帰宅前倒し(lead)= 個体分布(ユーザー決定 2026-08-16)
+#   lead_i = segment_base[就業状態] + age_delta[年齢帯] + 個体差(blake2b の分位)
+#            + 日次ジッター(stream "home_awake")
+#   ★個体差は **乱数 stream を 1 本も消費しない**(blake2b の安定ハッシュ。economy.stable_unit /
+#     aging の誕生日と同流儀 = 別ラン・resume でも同じ人が同じ位置)。
+# --------------------------------------------------------------------------- #
+def _stable_unit(salt: str, key: str) -> float:
+    """(用途 salt, 安定キー)→ [0,1)。乱数 stream 無風・プロセス跨ぎ安定。"""
+    h = hashlib.blake2b(f"{salt}\x1f{key}".encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(h, "big") / float(1 << 64)
 
-    OFF では `_home_awake_since` が誰にも生えないので **常に False**(getattr 既定 -1)
-    = 既存の active リストと 1 ビットも変わらない。ON では「自宅の中で覚醒している
-    個体」だけが True になり、睡眠中と同じ扱いで `_phase_drive` から外れる。
-    """
+
+def is_night_worker(agent) -> bool:
+    """夜勤か。既存の勤務時刻だけで判定する(日跨ぎ勤務 or 夕方以降の始業)。"""
+    start = int(getattr(agent, "work_start_min", -1))
+    if start < 0:
+        return False
+    end = int(getattr(agent, "work_end_min", 0))
+    return end < start or start >= 18 * 60
+
+
+def lead_segment(agent) -> str:
+    """就業状態のセグメント(segment_base のキー)。夜勤は就業状態より優先する。"""
+    if is_night_worker(agent):
+        return "night_worker"
+    band = _work_band(agent)
+    return {"worker": "worker", "student": "student"}.get(band, "non_working")
+
+
+def base_lead_min(agent, hcfg: dict) -> int:
+    """個体固定の帰宅前倒し[分](日次ジッター前)。決定論・乱数 stream ゼロ。"""
+    lead = hcfg["lead"]
+    seg = lead_segment(agent)
+    base = int(lead["segment_base"].get(seg, 0))
+    base += int(lead["age_delta"].get(_age_band(int(getattr(agent, "age", 40))), 0))
+    q = lead["spread_quantiles"]
+    idx = min(len(q) - 1,
+              int(_stable_unit("home_awake_lead", str(int(getattr(agent, "id", 0))))
+                  * len(q)))
+    return max(0, base + int(q[idx]))
+
+
+def lead_min_for(agent, sim, sim_min: int, hcfg: dict) -> int:
+    """今日の帰宅前倒し[分]。mode=fixed は一律 lead_min(= 既定 0 で従来どおり)。
+
+    per_agent では 1 日 1 回だけ決めて agent へ持たせる(= 毎 step 引き直さない・
+    checkpoint には agent の属性として自然に載る)。ジッターの stream キーは
+    ("home_awake", agent.id, "lead", day) で、毎 step のハザード draw と衝突しない。"""
+    lead = hcfg["lead"]
+    if lead["mode"] != "per_agent":
+        return int(hcfg["lead_min"])
+    day = int(sim_min) // 1440
+    if int(getattr(agent, "_home_lead_day", -1)) == day:
+        return int(getattr(agent, "_home_lead_min", 0))
+    minutes = base_lead_min(agent, hcfg)
+    jit = int(lead["jitter_min"])
+    if jit > 0:
+        rng = sim.hub.stream("home_awake", int(agent.id), "lead", day)
+        minutes += int(rng.integers(-jit, jit + 1))
+    minutes = max(0, minutes)
+    agent._home_lead_day = day
+    agent._home_lead_min = minutes
+    return minutes
+
+
+# --------------------------------------------------------------------------- #
+# LLM 経路のゲート(muted / evening_talk)
+# --------------------------------------------------------------------------- #
+def home_awake_now(agent) -> bool:
+    """いま自宅の中で覚醒中か。
+
+    OFF では `_home_awake_since` が誰にも生えないので **常に False**(getattr 既定 -1)。"""
     if int(getattr(agent, "_home_awake_since", -1)) < 0:
         return False
     home = getattr(agent, "home_building", "")
     return bool(home) and getattr(agent, "building", None) == home
+
+
+def _housemate_ids(agent) -> frozenset[int]:
+    return frozenset(int(o) for o in (getattr(agent, "housemates", None) or ()))
+
+
+def has_awake_housemate(agent, sim) -> bool:
+    """同一世帯の誰かが「同じ自宅の中で在宅覚醒中」か(在場述語 present_agent 経由)。"""
+    for oid in _housemate_ids(agent):
+        other = sim.present_agent(oid)
+        if other is None or int(other.id) == int(agent.id):
+            continue
+        if home_awake_now(other) and not other.sleeping:
+            return True
+    return False
+
+
+def talk_enabled(sim) -> bool:
+    hcfg = settings(sim)
+    return bool(hcfg["enabled"] and hcfg["evening_talk"]["enabled"])
+
+
+def muted(agent, sim) -> bool:
+    """在宅覚醒中で、かつ evening_talk の条件を満たさない = 睡眠中と同じ扱い。
+
+    OFF では `home_awake_now` が常に False なので **常に False** = 既存経路と 1 ビットも
+    変わらない。evening_talk ON かつ**在宅覚醒中の同居人が居る**個体だけは、夜の自宅の
+    団らんのために発火の対象へ戻す(相手が同居人であることは `pair_open` が別途固定する)。"""
+    if not home_awake_now(agent):
+        return False
+    if not talk_enabled(sim):
+        return True
+    return not has_awake_housemate(agent, sim)
+
+
+def pair_open(speaker, partner, sim) -> bool:
+    """speaker → partner に返答権を渡してよいか(在宅覚醒がからむときの追加条件)。
+
+    partner が在宅覚醒中でなければ常に True = 従来経路。在宅覚醒中なら
+    **evening_talk ON かつ「同一世帯 かつ 両者 HOME_AWAKE」**のときだけ開く
+    (= 同居人以外・来客・外部への経路は閉じたまま)。"""
+    if not home_awake_now(partner):
+        return True
+    if not talk_enabled(sim):
+        return False
+    return home_awake_now(speaker) and int(speaker.id) in _housemate_ids(partner)
+
+
+def reply_open(agent, sim) -> bool:
+    """保留中の返答を **いま** 消費してよいか。
+
+    在宅覚醒中でなければ従来どおり True。在宅覚醒中は、その返答をくれた相手が
+    「在宅覚醒中の同居人」であるときだけ開く(路上で受け取った返答権は預かったまま
+    起床後へ持ち越す = 返事を落とさない)。"""
+    if not home_awake_now(agent):
+        return True
+    rt = getattr(agent, "_reply_to", None)
+    if rt is None:
+        return False
+    speaker = sim.present_agent(int(rt[0]))
+    return speaker is not None and pair_open(speaker, agent, sim)
 
 
 def hours_since_bedtime(agent, sim_min: int) -> float:

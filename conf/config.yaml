@@ -2984,9 +2984,38 @@ media:
 daily:
   home_awake:
     enabled: false              # ★本選 ON は縦煙後にユーザー判断(finals conf の 1 行)
-    lead_min: 0                 # 帰宅トリガの前倒し[分]。0=既存の帰宅時刻のまま(スコープ最小)。
+    lead_min: 0                 # lead.mode=fixed のときの一律前倒し[分]。0=既存の帰宅時刻のまま。
                                 # >0 にすると就寝時刻の lead_min 前から帰路につく(帰宅を
                                 # 19:15 側へ寄せる LSR-H 相当)。120 で 21 時台の在宅覚醒が立つ。
+    # ---- 帰宅前倒しの個体分布(ユーザー決定 2026-08-16)----
+    # per_agent では lead_i = segment_base[就業状態] + age_delta[年齢帯] + 個体差 + 日次ジッター。
+    #  ・個体差は blake2b(agent_id) の分位 = **乱数 stream を 1 本も消費しない**(別ラン・
+    #    resume でも同じ人が同じ位置)。ジッターだけが既存 stream "home_awake" を使う。
+    #  ・値の来歴は src/society/home_awake.py の _SEG_SOURCE に全部書いてある。
+    #    worker=165 だけが較正済み(registry の tu_home_to_sleep_gap_min=264 分 − ハザードの
+    #    実測期待遅延 100 分)。student / non_working / night_worker / age_delta /
+    #    spread_quantiles は **uncalibrated parameter**(公表値が無く、方向だけ文献接地)。
+    lead:
+      mode: fixed               # fixed(既定=一律 lead_min・後方互換) | per_agent
+      jitter_min: 30            # 日次ジッター ±[分](stream "home_awake"・ON 時のみ)
+      segment_base:             # 就業状態 → 前倒しの基準[分]
+        worker: 195             # ★較正済み(アンカー 264 分へ mock で 1 回較正。_SEG_SOURCE)
+        student: 225            # uncalibrated parameter
+        non_working: 255        # uncalibrated parameter
+        night_worker: 90        # uncalibrated parameter(夜勤は位相が反転)
+      age_delta:                # 年齢帯 → 基準への加算[分]。全て uncalibrated parameter
+        youth: 0                # <30(就寝の遅さは bedtime_min=AGE-B 側が担うので中立)
+        mid: -25                # 30-49(子育て期を含む=3 次活動 202 分の帯)
+        senior: 10              # 50-64
+        elder: 40               # 65+(3 次活動が最長)
+      # 個体差[分]の分位テーブル(合計 0 = セグメント基準が母平均)。uncalibrated parameter
+      spread_quantiles: [-78, -56, -40, -26, -13, 1, 16, 34, 60, 102]
+    # ---- 同居人どうしの夜の自宅会話(ユーザー決定 2026-08-16)----
+    # ON にすると「同一世帯 かつ 両者 HOME_AWAKE」のペアだけ、在宅覚醒で閉じている
+    # 発話・返答経路を開ける(同居人以外・来客・外部=SNS/DM への経路は閉じたまま)。
+    # 返答は既存の reply レーン(DPH-B の返事保証)にそのまま入る=新しい予算経路は作らない。
+    evening_talk:
+      enabled: false            # ★呼数が増える方向の唯一のノブ。ON は縦煙後の判断
     max_awake_min: 200          # 帰宅後に起きていられる上限[分](ハザードの裾を切る安全弁)。
                                 # ★起点は**帰宅**なので lead_min を上げるなら同じだけ足すこと
                                 #   (lead_min=120 のまま 200 だと就寝時刻の +80 分で頭打ち=

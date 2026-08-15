@@ -406,6 +406,19 @@ TABLE: tuple[tuple[str, str, str], ...] = (
      "比のほうは Δt 非依存(小さい p では logit 差 ≒ log ハザード比)"),
     ("daily.home_awake.hazard.b3", INVARIANT, "翌日早出項。b2 と同じ理由で Δt 非依存"),
     ("daily.home_awake.hazard.b4", INVARIANT, "在宅活動への没入項。b2 と同じ理由で Δt 非依存"),
+    # ---- 帰宅前倒しの個体分布(lead)= すべて[分]か無次元 = Δt 非依存 ----
+    ("daily.home_awake.lead.mode", INVARIANT,
+     "前倒しの決め方(fixed / per_agent)= 語彙であって量ではない"),
+    ("daily.home_awake.lead.jitter_min", INVARIANT,
+     "日次ジッターの幅 ±[分]。実時間の長さ(1 日 1 回だけ引く量で per-step ではない)"),
+    ("daily.home_awake.lead.segment_base.*", INVARIANT,
+     "就業状態セグメントごとの帰宅前倒し[分]。実時間の長さなので Δt 非依存"),
+    ("daily.home_awake.lead.age_delta.*", INVARIANT,
+     "年齢帯ごとの前倒しへの加算[分]。実時間の長さなので Δt 非依存"),
+    ("daily.home_awake.lead.spread_quantiles", INVARIANT,
+     "個体差の分位テーブル[分]。実時間の長さの列で、step 数ではない"),
+    ("daily.home_awake.evening_talk.enabled", INVARIANT,
+     "同居人どうしの夜の自宅会話の機構トグル(量ではない)"),
     # Wave 4 III-1(夜間開放)。**どれも step 量ではない**ので不変で正しい:
     #   hours は「分 of day の時刻帯」(indoor.meeting.window_min と同族)、max_stay_min は
     #   分(実時間。step 換算は呼び出し側の clock.min_to_steps が Δt 込みで行う = A1 の経路)、

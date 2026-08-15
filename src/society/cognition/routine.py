@@ -776,12 +776,8 @@ def _media_action(agent, sim, sim_min: int, step: int) -> dict | None:
 # 0 分(実測 n=1,512)。ON では入館と就寝の間に**就寝ハザード**を挟み、その間の各 step で
 # 在宅活動ラベル(8 種)を抽選する。乱数は新 stream "home_awake" だけ・LLM 呼はゼロ。
 def _home_awake_settings(sim) -> dict:
-    """home_awake 設定を sim に一度だけキャッシュ(以後は再解析しない。media と同型)。"""
-    hcfg = getattr(sim, "_home_awake_settings", None)
-    if hcfg is None:
-        hcfg = _home_awake.cfg_of(sim.cfg)
-        sim._home_awake_settings = hcfg
-    return hcfg
+    """home_awake 設定(sim に一度だけキャッシュ。実体は home_awake.settings)。"""
+    return _home_awake.settings(sim)
 
 
 def _can_home_awake(agent, sim) -> bool:
@@ -815,14 +811,17 @@ def _home_awake_engaged(agent, hcfg: dict) -> bool:
 def _home_awake_sleeps(agent, sim, sim_min: int, step: int, hcfg: dict, rng) -> bool:
     """就寝ハザードを 1 回引く。True = この step で寝る。
 
-    ★上限 max_awake_min に達していたら**先に**必ず寝る(裾を切る安全弁)。乱数は
-      分岐に依らず必ず 1 本引く(引く/引かないが状態で変わると再現性の追跡が難しくなる)。"""
+    ★上限に達していたら**先に**必ず寝る(裾を切る安全弁)。乱数は分岐に依らず必ず 1 本
+      引く(引く/引かないが状態で変わると再現性の追跡が難しくなる)。
+    ★上限は `max_awake_min + 今日の前倒し分`: 上限の起点が**帰宅**なので、前倒しした
+      ぶんを足さないと「就寝時刻の直後で頭打ち」になる(lead=0 では厳密に従来と同値)。"""
     p = _home_awake.sleep_prob(agent, sim, sim_min, hcfg,
                                engaged=_home_awake_engaged(agent, hcfg))
     fired = float(rng.random()) < p
     since = int(getattr(agent, "_home_awake_since", -1))
-    if since >= 0 and (step - since) * sim.clock.step_minutes \
-            >= int(hcfg["max_awake_min"]):
+    cap = int(hcfg["max_awake_min"]) \
+        + int(_home_awake.lead_min_for(agent, sim, sim_min, hcfg))
+    if since >= 0 and (step - since) * sim.clock.step_minutes >= cap:
         return True
     return fired
 
@@ -890,11 +889,14 @@ def _home_awake_window(agent, sim, sim_min: int, hcfg: dict) -> bool:
 
     ① 在宅覚醒が始まっている個体は bedtime_reached の 4 時間窓を出ても分岐に留まる
        (窓を出た瞬間に夜中の街へ歩き出す、という現象を作らない)。
-    ② lead_min>0 のときだけ帰宅トリガを就寝時刻の lead_min 分前へ前倒しする
-       (現実の帰宅 19:15 / 就寝 23:39 へ寄せる LSR-H 相当。既定 0 = 帰宅時刻は動かない)。"""
+    ② 帰宅トリガを就寝時刻の lead 分前へ前倒しする(現実の帰宅 19:15 / 就寝 23:39 へ
+       寄せる LSR-H 相当)。lead は mode=fixed なら一律 `lead_min`(既定 0 = 帰宅時刻は
+       動かない)、mode=per_agent なら個体別(年齢帯 × 就業状態 × 夜勤 + 個体差 + ジッター)。"""
     if int(getattr(agent, "_home_awake_since", -1)) >= 0:
         return True
-    lead = int(hcfg["lead_min"])
+    if not _can_home_awake(agent, sim):
+        return False                          # 前倒しの対象外(来街者・自宅建物なし)
+    lead = int(_home_awake.lead_min_for(agent, sim, sim_min, hcfg))
     if lead <= 0:
         return False
     return ((int(agent.bedtime_min) - int(sim_min)) % 1440) <= lead

@@ -24,9 +24,11 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
+import pytest
 
 from society import home_awake as HA
 from society import registry as R
+from society import timeconv as T
 from society.cognition import routine
 from society.config import load_config
 from society.engine import checkpoint, scheduler
@@ -119,7 +121,7 @@ def test_off_never_touches_home_awake_state(tmp_path):
     sim = _sim(tmp_path, "ha_off_state", steps=200)
     sim.run()
     assert all(int(getattr(a, "_home_awake_since", -1)) < 0 for a in sim.agents)
-    assert not any(HA.muted(a) for a in sim.agents)
+    assert not any(HA.muted(a, sim) for a in sim.agents)
 
 
 # ---------------------------------------------- (2) 帰宅 → 就寝の分離(本体)
@@ -153,7 +155,7 @@ def test_on_enters_home_without_sleeping(tmp_path):
     assert not a.sleeping, "ON なのに入館と同時に寝てしまった"
     assert a.building == a.home_building, "自宅建物に入っていない"
     assert [e.kind for e in sim.logger.events if e.agent_id == a.id] == ["enter_building"]
-    assert HA.muted(a), "在宅覚醒中なのに muted でない(発火対象から外れていない)"
+    assert HA.muted(a, sim), "在宅覚醒中なのに muted でない(発火対象から外れていない)"
 
 
 def test_on_home_activity_sessions_then_sleep(tmp_path):
@@ -290,13 +292,13 @@ def test_muted_excludes_home_awake_from_drive_active(tmp_path):
     a = next(x for x in sim.agents
              if x.home_building and sim.city.has_building(x.home_building))
     _home_at_night(sim, a, 0)
-    assert not HA.muted(a)                       # まだ路上 = 通常どおり発火対象
+    assert not HA.muted(a, sim)                       # まだ路上 = 通常どおり発火対象
     scheduler._apply(sim, a, routine.decide(a, 0, sim, "home", _rng(sim, a, 0),
                                             has_company=False),
                      0, sim.clock.sim_min(0))
-    assert HA.muted(a)                           # 在宅覚醒 = 睡眠中と同じ扱い
+    assert HA.muted(a, sim)                           # 在宅覚醒 = 睡眠中と同じ扱い
     active = [x for x in sim.agents if x.loc != "outside" and not x.sleeping
-              and not HA.muted(x)]
+              and not HA.muted(x, sim)]
     assert a not in active
 
 
@@ -458,6 +460,249 @@ def test_resume_matches_straight_with_home_awake(tmp_path):
     checkpoint.save(sim1, 80, resumed / "checkpoint" / "ckpt-000080.pkl.gz")
     sim1.logger.flush_segment()
     Simulation(cfg("ha_resume", 160, **every), out_dir=resumed).run(resume_from=resumed)
+
+    assert rows(straight, "l1_events") == rows(resumed, "l1_events")
+    for stem in ("l2_metrics", "l3_snapshots"):
+        assert rows(straight, stem) == rows(resumed, stem), f"{stem} 不一致"
+
+
+# --------------------------------------------------------------------------- #
+# (10) 帰宅前倒しの個体分布(lead.mode=per_agent。ユーザー決定 2026-08-16)
+# --------------------------------------------------------------------------- #
+def test_lead_mode_default_is_fixed_and_zero():
+    """既定は fixed かつ lead_min=0 = 帰宅時刻を 1 分も動かさない(後方互換)。"""
+    cfg = HA.cfg_of(load_config([]))
+    assert cfg["lead"]["mode"] == "fixed"
+    assert cfg["lead_min"] == 0
+    assert set(cfg["lead"]["segment_base"]) == {"worker", "student",
+                                                "non_working", "night_worker"}
+    assert sum(cfg["lead"]["spread_quantiles"]) == 0, \
+        "分位テーブルの合計が 0 でない = セグメント基準が母平均にならない"
+
+
+def test_lead_mode_unknown_raises():
+    with pytest.raises(ValueError):
+        HA.cfg_of(load_config(["daily.home_awake.lead.mode=weekly"]))
+
+
+def test_lead_segment_covers_worker_student_nonworking_nightshift():
+    """セグメントは 就業状態 × 夜勤有無。夜勤は就業状態より優先する。"""
+    assert HA.lead_segment(_house(occupation="会社員", work_start_min=540,
+                                  work_end_min=1080)) == "worker"
+    assert HA.lead_segment(_house(occupation="大学生", work_start_min=-1)) == "student"
+    assert HA.lead_segment(_house(occupation="無職", work_start_min=-1)) == "non_working"
+    # 日跨ぎ勤務(22:00→06:00)も夕方始業(18:00→)も夜勤
+    assert HA.lead_segment(_house(occupation="警備員", work_start_min=1320,
+                                  work_end_min=360)) == "night_worker"
+    assert HA.lead_segment(_house(occupation="会社員", work_start_min=1080,
+                                  work_end_min=1380)) == "night_worker"
+
+
+def test_lead_individual_offset_is_stable_and_consumes_no_stream():
+    """個体差は blake2b の分位 = 決定論・プロセス跨ぎ安定・乱数 stream をゼロ消費。"""
+    cfg = HA.cfg_of(load_config(["daily.home_awake.lead.mode=per_agent"]))
+    vals = {i: HA.base_lead_min(_house(id=i, occupation="会社員",
+                                       work_start_min=540, work_end_min=1080), cfg)
+            for i in range(200)}
+    assert vals == {i: HA.base_lead_min(_house(id=i, occupation="会社員",
+                                               work_start_min=540, work_end_min=1080), cfg)
+                    for i in range(200)}, "同じ個体で値が揺れる(決定論でない)"
+    assert len(set(vals.values())) >= 8, "個体差が効いていない(分位が 1 つに潰れている)"
+    mean = sum(vals.values()) / len(vals)
+    base = cfg["lead"]["segment_base"]["worker"]
+    assert base - 55 <= mean <= base + 25, \
+        f"worker セグメントの平均が基準 {base} から外れすぎ: {mean}"
+
+
+def test_lead_segments_are_ordered_as_designed():
+    """非就業 > 学生 > 有業 > 夜勤 の順(= 出典コメントの向きどおり)。"""
+    cfg = HA.cfg_of(load_config(["daily.home_awake.lead.mode=per_agent"]))
+    b = cfg["lead"]["segment_base"]
+    assert b["non_working"] > b["student"] > b["worker"] > b["night_worker"]
+
+
+def test_lead_per_agent_moves_home_time_but_not_bedtime(tmp_path):
+    """per_agent は帰宅時刻だけを前倒しし、bedtime_min(AGE-B の U 字)は 1 分も触らない。"""
+    sim = _sim(tmp_path, "ha_lead", steps=1, n=20,
+               extra=["daily.home_awake.enabled=true",
+                      "daily.home_awake.lead.mode=per_agent"])
+    before = {a.id: a.bedtime_min for a in sim.agents}
+    hcfg = HA.settings(sim)
+    leads = [HA.lead_min_for(a, sim, sim.clock.sim_min(0), hcfg) for a in sim.agents]
+    assert {a.id: a.bedtime_min for a in sim.agents} == before, \
+        "lead の計算が bedtime_min を書き換えている"
+    assert max(leads) > 0 and len(set(leads)) > 1, "個体別になっていない"
+
+
+def test_lead_is_decided_once_per_day(tmp_path):
+    """lead は 1 日 1 回だけ決めて持ち回す(毎 step 引き直さない = 日中に帰宅時刻が揺れない)。"""
+    sim = _sim(tmp_path, "ha_lead1", steps=1, n=10,
+               extra=["daily.home_awake.enabled=true",
+                      "daily.home_awake.lead.mode=per_agent"])
+    hcfg = HA.settings(sim)
+    a = sim.agents[0]
+    day0 = [HA.lead_min_for(a, sim, 600 + i, hcfg) for i in range(5)]
+    assert len(set(day0)) == 1, "同じ日のうちに lead が変わる"
+    day1 = HA.lead_min_for(a, sim, 600 + 1440, hcfg)
+    assert isinstance(day1, int)               # 翌日は引き直す(値は同じでも構わない)
+
+
+def test_fixed_mode_ignores_per_agent_table(tmp_path):
+    """mode=fixed では segment_base を何に変えてもイベント列が動かない(回帰アンカー)。"""
+    a = _sim(tmp_path, "ha_fx_a", steps=200,
+             extra=["daily.home_awake.enabled=true"])
+    a.run()
+    b = _sim(tmp_path, "ha_fx_b", steps=200,
+             extra=["daily.home_awake.enabled=true",
+                    "daily.home_awake.lead.segment_base.worker=999",
+                    "daily.home_awake.lead.jitter_min=120"])
+    b.run()
+    assert _events(a) == _events(b), "fixed なのに per_agent 用のノブが効いている"
+
+
+# --------------------------------------------------------------------------- #
+# (11) 同居人どうしの夜の自宅会話(evening_talk。ユーザー決定 2026-08-16)
+# --------------------------------------------------------------------------- #
+def test_evening_talk_default_off_and_regression_anchor(tmp_path):
+    """既定 OFF。かつ evening_talk を明示 false にしても ON 挙動が一致(回帰アンカー)。"""
+    assert HA.cfg_of(load_config([]))["evening_talk"]["enabled"] is False
+    a = _sim(tmp_path, "ha_et_a", steps=200, n=20,
+             extra=["household.enabled=true", "daily.home_awake.enabled=true"])
+    a.run()
+    b = _sim(tmp_path, "ha_et_b", steps=200, n=20,
+             extra=["household.enabled=true", "daily.home_awake.enabled=true",
+                    "daily.home_awake.evening_talk.enabled=false"])
+    b.run()
+    assert _events(a) == _events(b)
+
+
+def test_evening_talk_opens_only_household_pairs(tmp_path):
+    """ON: 同一世帯 かつ 両者 HOME_AWAKE のペアだけ開き、非世帯ペアは muted のまま。"""
+    sim = _sim(tmp_path, "ha_et_pair",
+               extra=["household.enabled=true",
+                      "daily.home_awake.enabled=true",
+                      "daily.home_awake.evening_talk.enabled=true",
+                      "daily.home_awake.hazard.p0=1e-12"])
+    a, mate, stranger = sim.agents[0], sim.agents[1], sim.agents[2]
+    for x in (a, mate, stranger):
+        _home_at_night(sim, x, 0)
+    a.housemates, mate.housemates = [mate.id], [a.id]
+    stranger.housemates = []
+    # 3 人とも同じ建物の中で在宅覚醒にする(位置は同一 = hearers_of の文脈が揃う)
+    bld = a.home_building or "b0"
+    for x in (a, mate, stranger):
+        x.home_building = bld
+        x.building = bld
+        x._home_awake_since = 0
+    assert HA.home_awake_now(a) and HA.home_awake_now(mate)
+    # 世帯ペア: 双方 muted を解かれ、返答権も開く
+    assert not HA.muted(a, sim) and not HA.muted(mate, sim)
+    assert HA.pair_open(a, mate, sim) and HA.pair_open(mate, a, sim)
+    # 非世帯: 在宅覚醒中の同居人が居ないので muted のまま・返答権も閉じたまま
+    assert HA.muted(stranger, sim)
+    assert not HA.pair_open(a, stranger, sim)
+    assert not HA.pair_open(stranger, a, sim)
+    # 同居人が寝たら閉じる
+    mate.sleeping = True
+    assert HA.muted(a, sim)
+
+
+def test_evening_talk_off_keeps_household_pairs_muted(tmp_path):
+    """evening_talk OFF なら同一世帯でも閉じたまま(前回実装と同一の性質)。"""
+    sim = _sim(tmp_path, "ha_et_off",
+               extra=["household.enabled=true", "daily.home_awake.enabled=true",
+                      "daily.home_awake.hazard.p0=1e-12"])
+    a, mate = sim.agents[0], sim.agents[1]
+    for x in (a, mate):
+        _home_at_night(sim, x, 0)
+        x._home_awake_since = 0
+        x.building = x.home_building = a.home_building or "b0"
+    a.housemates, mate.housemates = [mate.id], [a.id]
+    assert HA.muted(a, sim) and HA.muted(mate, sim)
+    assert not HA.pair_open(a, mate, sim)
+
+
+def test_reply_open_holds_street_replies_but_passes_housemate_replies(tmp_path):
+    """保留中の返答は「在宅覚醒中の同居人から」のときだけ消費される(外部は預かったまま)。"""
+    sim = _sim(tmp_path, "ha_et_reply",
+               extra=["household.enabled=true", "daily.home_awake.enabled=true",
+                      "daily.home_awake.evening_talk.enabled=true",
+                      "daily.home_awake.hazard.p0=1e-12"])
+    a, mate, stranger = sim.agents[0], sim.agents[1], sim.agents[2]
+    for x in (a, mate, stranger):
+        _home_at_night(sim, x, 0)
+    a.housemates, mate.housemates = [mate.id], [a.id]
+    bld = a.home_building or "b0"
+    for x in (a, mate):
+        x.home_building = bld
+        x.building = bld
+        x._home_awake_since = 0
+    a._reply_to = (stranger.id, "路上でかけられた声")
+    assert not HA.reply_open(a, sim), "路上で受けた返答権が在宅覚醒中に消費されている"
+    a._reply_to = (mate.id, "同居人の声")
+    assert HA.reply_open(a, sim)
+    a._reply_to = None
+    assert not HA.reply_open(a, sim)
+
+
+def test_evening_talk_registry_and_timeconv_declared():
+    """新 conf キーは registry(第72)と timeconv(Δt 分類)の両方に載る。"""
+    for fid in ("daily.home_awake.lead.mode",
+                "daily.home_awake.evening_talk.enabled"):
+        assert fid in R.BY_ID, f"{fid} が registry に未宣言"
+    assert R.BY_ID["daily.home_awake.lead.mode"].off_value == "fixed"
+    assert R.BY_ID["daily.home_awake.evening_talk.enabled"].affects_k is True, \
+        "evening_talk は generate() の呼び出し点を増やすので affects_k=True"
+    assert R.undeclared_toggles(load_config()) == []
+    for key in ("daily.home_awake.lead.mode",
+                "daily.home_awake.lead.jitter_min",
+                "daily.home_awake.lead.segment_base.worker",
+                "daily.home_awake.lead.age_delta.youth",
+                "daily.home_awake.lead.spread_quantiles",
+                "daily.home_awake.evening_talk.enabled"):
+        assert T.covers(key), f"{key} が timeconv.TABLE に未分類"
+
+
+def test_home_activity_label_is_not_a_conversation_record():
+    """二重計上の確認: home_activity は時間配分の記録で、発話は既存の会話系 kind。
+
+    両者は別の層(ラベル抽選はルールベース・発話は drive 由来)で、同じ出来事を
+    2 回数えることはない = home_activity は会話 kind の語彙に 1 つも含まれない。"""
+    assert "home_activity" in S.EVENT_KINDS
+    for talk_kind in ("speak", "hear", "conversation", "dm"):
+        assert talk_kind in S.EVENT_KINDS
+        assert talk_kind != "home_activity"
+    # family_talk はあくまで在宅活動ラベルの 1 つ(会話イベントの発生条件ではない)
+    assert "family_talk" in HA.ACTS
+
+
+def test_resume_matches_straight_with_lead_and_talk(tmp_path):
+    """per_agent + evening_talk で resume==straight(日次 lead と在宅覚醒が跨いで復元)。"""
+    ov = {"run.seed": 42, "run.n_agents": 20, "model.backend": "mock",
+          "household.enabled": "true", "government.enabled": "false",
+          "daily.home_awake.enabled": "true",
+          "daily.home_awake.lead.mode": "per_agent",
+          "daily.home_awake.evening_talk.enabled": "true"}
+
+    def cfg(name, n_steps, **extra):
+        dot = [f"{k}={v}" for k, v in {**ov, **extra}.items()]
+        dot += [f"run.n_steps={n_steps}", f"run.name={name}"]
+        return load_config(dot)
+
+    def rows(run_dir, stem):
+        return pq.read_table(Path(run_dir) / f"{stem}.parquet").to_pylist()
+
+    straight = tmp_path / "ha2_straight"
+    Simulation(cfg("ha2_straight", 160), out_dir=straight).run()
+
+    resumed = tmp_path / "ha2_resume"
+    every = {"observer.checkpoint_every": 80}
+    sim1 = Simulation(cfg("ha2_resume", 80, **every), out_dir=resumed)
+    for step in range(80):
+        scheduler.run_step(sim1, step)
+    checkpoint.save(sim1, 80, resumed / "checkpoint" / "ckpt-000080.pkl.gz")
+    sim1.logger.flush_segment()
+    Simulation(cfg("ha2_resume", 160, **every), out_dir=resumed).run(resume_from=resumed)
 
     assert rows(straight, "l1_events") == rows(resumed, "l1_events")
     for stem in ("l2_metrics", "l3_snapshots"):

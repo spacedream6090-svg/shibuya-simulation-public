@@ -1554,6 +1554,18 @@ FEATURES: tuple[Feature, ...] = (
        "を挟み、在宅活動ラベル 8 種をルールベース抽選する。★affects_k=False: LLM の"
        "呼び出し点を 1 つも足さない(在宅覚醒中は睡眠中と同じく _phase_drive の対象外)。"
        "乱数は新 stream \"home_awake\" のみ・プロンプトに機構語ゼロ"),
+    _f("daily.home_awake.lead.mode", "strict", False, "none",
+       "帰宅前倒しの決め方。fixed(既定)= 全体一律 lead_min = 従来どおり。per_agent = "
+       "年齢帯 × 就業状態(worker/student/non_working)× 夜勤有無のセグメント基準 + "
+       "blake2b の個体差(乱数 stream 消費ゼロ)+ 日次ジッター(stream \"home_awake\")。"
+       "帰宅時刻だけを動かす = LLM の呼び出し点は 1 つも足さない",
+       off_value="fixed"),
+    _f("daily.home_awake.evening_talk.enabled", "strict", True, "none",
+       "同居人どうしの夜の自宅会話。ON のとき「同一世帯 かつ 両者 HOME_AWAKE」のペアに"
+       "限り、在宅覚醒で閉じている発話・返答経路を開ける(同居人以外・来客・SNS/DM への"
+       "経路は閉じたまま)。★affects_k=True: 在宅覚醒中の個体を _phase_drive の対象へ"
+       "戻すので **generate() の呼び出し点が増える**(唯一、呼数が増える方向のノブ)。"
+       "返答は既存の reply レーンに入る = 新しい予算経路は作らない"),
     _f("organizations.enabled", "strict", False, "none",
        "組織(職場・学校)台帳の配属"),
     _f("organizations.commute_to_poi", "strict", False, "none",

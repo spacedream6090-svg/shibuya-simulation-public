@@ -2618,7 +2618,7 @@ def _phase_drive(sim, step: int, sim_min: int) -> None:
     # 「その時間に家に居るか路上に居るか」だけに絞られる。
     active = [a for a in sim.agents if a.loc != "outside" and not a.sleeping
               and step >= getattr(a, "detained_until", 0)
-              and not home_awake_mod.muted(a)]
+              and not home_awake_mod.muted(a, sim)]
     affect_on = _affect_on(sim)
     health_on = _health_on(sim)
     # 離散感情ラベル(内面 H6): affect ON 前提で core affect(mood_valence × arousal)から離散ラベルを
@@ -2695,6 +2695,14 @@ def _phase_drive(sim, step: int, sim_min: int) -> None:
                       and step >= a.refractory_until]
     requesters.sort(key=lambda a: (-a.drive, a.id))
     for agent in requesters:
+        # evening_talk(β9・既定 OFF=home_awake_now は常に False=この行は無風): 在宅覚醒中の
+        # 個体をこの phase に入れているのは **同居人との対面会話のためだけ**なので、同席者が
+        # 居ない / 会話クールダウン中なら申請そのものを持たせない(= SNS 投稿・DM・独り言と
+        # いった外部への経路は閉じたまま。muted 側で同居人の在宅覚醒は確認済み)。
+        if home_awake_mod.home_awake_now(agent) and not (
+                step >= agent.conv_cooldown_until
+                and hearers_of(agent, _percept(sim), radius)):
+            continue
         stats["requests"] += 1
         req_drive = agent.drive
         reason = drive.top_reason(agent)
@@ -2832,11 +2840,12 @@ def _decide(sim, agent, step: int, sim_min: int) -> dict:
     agent._heard_unknown = False
 
     # 返答保証: 話しかけられたら抽選なしで必ずLLMで返答(予算があれば)。
-    #  ★在宅覚醒(HOME_AWAKE β9・既定 OFF=muted は常に False=従来経路): 睡眠中と同じ扱いで
-    #    ここを素通りする。`_reply_to` は**消さずに預かったまま**にするので、OFF で就寝中に
-    #    保留された返事が起床後に撃たれるのと同じ挙動になる(返事を落とさない = DPH-B の
-    #    「返事保証 100%」を壊さない)。これで在宅覚醒は LLM 呼を 1 本も足さない。
-    if agent._reply_to is not None and not home_awake_mod.muted(agent):
+    #  ★在宅覚醒(HOME_AWAKE β9・既定 OFF=reply_open は常に True=従来経路): 睡眠中と同じ
+    #    扱いでここを素通りする。`_reply_to` は**消さずに預かったまま**にするので、OFF で
+    #    就寝中に保留された返事が起床後に撃たれるのと同じ挙動になる(返事を落とさない =
+    #    DPH-B の「返事保証 100%」を壊さない)。evening_talk ON のときは「在宅覚醒中の
+    #    同居人からの返答権」だけがここで開く(相手が誰かを見て決める = 外部経路は閉じたまま)。
+    if agent._reply_to is not None and home_awake_mod.reply_open(agent, sim):
         # ---- 第87バッチ: 関係の薄い相手からの定型接触は 1 ターンのテンプレで流す(§8 突入 2)。
         #  **LLM を 1 本も呼ばず・予算も取らず**返す = ENGAGED に突入しない = この後
         #  _apply(speak) の handoff_ok が返答権を渡さないので、やりとりは 1 ターンで終わる。
@@ -3422,12 +3431,12 @@ def _apply_action(sim, agent, action: dict, step: int, sim_min: int) -> None:
         if hearers:
             partner = _select_partner(sim, agent, hearers)
             if (not partner.sleeping and partner.conv_turns_left > 0
-                    # 在宅覚醒(HOME_AWAKE β9・既定 OFF=muted は常に False=従来経路)。
-                    # 睡眠中と同じ扱いで返答権を渡さない = この機能が **返事の LLM 呼を
-                    # 1 本も足さない**ことを構造で保証する(R1)。★代償として「同居人どうしが
-                    # 夜の自宅で話す」発話は成立しない(現行 OFF でも両者は就寝中なので
-                    # 失うものは無いが、開けるなら conf ではなくこの 1 行の判断)。
-                    and not home_awake_mod.muted(partner)
+                    # 在宅覚醒(HOME_AWAKE β9・既定 OFF=pair_open は常に True=従来経路)。
+                    # 在宅覚醒中の相手には睡眠中と同じ扱いで返答権を渡さない = この機能が
+                    # **返事の LLM 呼を 1 本も足さない**ことを構造で保証する(R1)。
+                    # evening_talk ON のときだけ「同一世帯 かつ 両者 HOME_AWAKE」の
+                    # ペアに限って開く(同居人以外・来客・外部への経路は閉じたまま)。
+                    and home_awake_mod.pair_open(agent, partner, sim)
                     and step >= partner.conv_cooldown_until
                     # 第87: **会話は両者 ENGAGED が成立条件**(§8 補助規則 2)。話者が
                     # AUTOPILOT(通りすがりの独り言・定型で流した側)なら返答権を渡さない
