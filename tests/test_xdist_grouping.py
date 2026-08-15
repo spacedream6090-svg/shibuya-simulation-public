@@ -23,7 +23,10 @@
 """
 from __future__ import annotations
 
-import tomllib
+try:  # Python 3.11+
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10(GPUサーバー=Ubuntu 22.04.5 実測)は stdlib に無い
+    import tomli as tomllib  # type: ignore[no-redef]
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]

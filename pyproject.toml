@@ -11,7 +11,13 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8.0"]
+# tomli = tests/test_xdist_grouping.py の tomllib フォールバック(Python 3.10 = GPU サーバー実測)。
+# pytest-xdist = フルゲート常用の -n auto / loadgroup 分配(addopts 参照)に必須。
+dev = [
+    "pytest>=8.0",
+    "pytest-xdist>=3.8",
+    "tomli>=2.0; python_version < '3.11'",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
