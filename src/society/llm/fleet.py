@@ -34,6 +34,19 @@ def _stable_int(value: str) -> int:
     return int.from_bytes(hashlib.sha256(value.encode("utf-8")).digest()[:8], "big")
 
 
+# 第131: 「リクエスト自体の不良」を表す HTTP コード(vllm.py が
+# "__vllm_error__: HTTP <code> <reason>" の形で返す)。他サーバーへ持ち込んでも
+# 同じ結果なので failover の対象にしない。404 は VllmBackend 内で chat へ切替済み・
+# 408/429/5xx はサーバー側の事象なので従来どおり hop する。
+_CLIENT_REJECT_PREFIXES = ("__vllm_error__: HTTP 400",
+                           "__vllm_error__: HTTP 413",
+                           "__vllm_error__: HTTP 422")
+
+
+def _is_client_reject(resp: str) -> bool:
+    return resp.startswith(_CLIENT_REJECT_PREFIXES)
+
+
 class FleetLLM(LLMBackend):
     def __init__(self, servers: list[str], model: str, *,
                  timeout_s: float = 120.0,
@@ -139,6 +152,15 @@ class FleetLLM(LLMBackend):
                 if i > 0:
                     log.info("fleet recover: %s served %s after failover",
                              url, rng_key)
+                return resp
+            if _is_client_reject(resp):
+                # 第131: 400/413/422 は「リクエスト自体の不良」(典型=プロンプト+max_tokens が
+                # max_model_len 超過)。どのサーバーへ持ち込んでも同じ結果なので、
+                # (a) 他サーバーへ hop しない(2k×144 実測: 1 リクエストが 6 hop→ALL DOWN)
+                # (b) 健全なサーバーを cooldown に入れない(後続の別リクエストが避けてしまう)。
+                # 429(過負荷)や 5xx・接続断はサーバー側の事象なので従来どおり hop する。
+                log.warning("fleet client-reject (no failover): %s for %s (%s)",
+                            url, rng_key, resp[:60])
                 return resp
             self._cooldown[url] = now + self.cooldown_s
             nxt = candidates[i + 1] if i + 1 < len(candidates) else "ALL DOWN"

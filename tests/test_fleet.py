@@ -39,6 +39,13 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b'{"error": "down"}')
             return
+        if getattr(srv, "reject", False):
+            # 第131: 400 = リクエスト自体の不良(典型: プロンプト+max_tokens が
+            # max_model_len 超過)。サーバーは健全のまま断る。
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b'{"error": "prompt too long"}')
+            return
         # どのサーバが応答したか分かるよう tag を JSON に載せる
         content = json.dumps({"action": "wander", "_server": srv.tag},
                              ensure_ascii=False)
@@ -58,6 +65,7 @@ def _start_stub(tag: str):
     srv = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     srv.hits = []
     srv.fail = False
+    srv.reject = False
     srv.tag = tag
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{srv.server_address[1]}"
@@ -134,6 +142,29 @@ def test_failover_and_cooldown_recovery(stubs):
     # A 復旧 + cooldown 経過 → sticky 先の A へ戻る
     srv_a.fail = False
     clock.advance(6.0)
+    assert _route(fleet, agent) == "A"
+
+
+def test_client_reject_400_does_not_failover_nor_cooldown(stubs):
+    """第131: 4xx(リクエスト不良)は hop しない・健全サーバーを cooldown で汚さない。
+
+    実測(2k×144・2026-08-16): プロンプト超過らしき 1 リクエストが 6 hop→ALL DOWN を
+    起こし、tier 全サーバーが cooldown 入りしていた。5xx の failover(上のテスト)は不変。"""
+    srv_a, url_a = stubs("A")
+    srv_b, url_b = stubs("B")
+    clock = _Clock()
+    fleet = FleetLLM([url_a, url_b], "qwen3-8b", cooldown_s=5.0, now=clock)
+    agent = next(a for a in range(50) if _route(fleet, a) == "A")
+    b_hits0 = len(srv_b.hits)
+
+    srv_a.reject = True
+    resp = fleet.generate("こんにちは", rng_key=f"deliberate/{agent}/1",
+                          temperature=0.0, max_tokens=8)
+    assert resp.startswith("__vllm_error__: HTTP 400")
+    # B へ hop していない(リクエスト不良は他サーバーでも同じ結果)
+    assert len(srv_b.hits) == b_hits0
+    # A は cooldown に入っていない = 直後の健全リクエストが時計を進めずに A へ届く
+    srv_a.reject = False
     assert _route(fleet, agent) == "A"
 
 
