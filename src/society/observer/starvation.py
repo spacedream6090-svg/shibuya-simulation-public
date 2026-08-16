@@ -96,7 +96,10 @@ def state(sim) -> dict:
               "wrap_clipped": 0, "plan_expired_awake_steps": 0,
               "plan_expired_awake_agent_days": 0, "wrap_tail_lost": 0,
               "plan_skipped": {}, "budget": {},
-              "step_budget": _step_budget_zero()}
+              "step_budget": _step_budget_zero(),
+              # ★B9: 「個体×日」の重複排除の印(**observer 側**に持つ。下記 `_expired_seen`)。
+              #   当日ぶんだけを持ち、日が変わったら捨てる = 保持は 1 日分で有界。
+              "plan_expired_seen_day": -1, "plan_expired_seen": {}}
         sim._starvation_state = st
     return st
 
@@ -158,20 +161,52 @@ def note_wrap_clipped(sim, n: int = 1) -> None:
     state(sim)["wrap_clipped"] += int(n)
 
 
+def _expired_seen(sim, day: int) -> dict:
+    """★B9(第117 レーンE): 「今日この個体を既に数えたか」の印を **observer 側**で持つ。
+
+    旧実装は `agent._plan_expired_day` を**個体へ書いて**いた。これは
+    `checkpoint.save` の `agents` pickle に自然同梱されるので、**観測 ON/OFF で
+    checkpoint のバイト列が変わる**(R1「観測は世界を 1 バイトも変えない」の文言違反)。
+    エンジンは 1 行もこの属性を読まないので動力学は無傷だったが、
+    「観測を入れたら保存物が変わる」は約束の破れそのものである。
+
+    そこで印を `sim._starvation_state`(= observer 名前空間・checkpoint が
+    `runtime["starvation_state"]` として**既に**中央管理している)へ移す。
+    保持は**当日ぶんだけ**で、日が変わったら丸ごと捨てる:
+      - `note_plan_expired_awake` の呼び出しは `sim_min` 単調増加の日境界処理なので、
+        「前日の印」を残す必要がない = 旧属性方式と**厳密に同じ重複排除**になる。
+      - したがってメモリ/checkpoint は「1 日に 1 度でも失効覚醒した個体数」で上限が付く
+        (旧コメントが恐れた 25 万体ぶんの恒久集合にはならない)。
+    値は set ではなく素の dict(`{agent_id: 1}`)で持つ = 本 state の
+    「int と素の dict のみ」規約(module docstring)を保ち、pickle の集合反復順
+    非保存の影響も受けない(membership しか使わない)。
+    """
+    st = state(sim)
+    if int(st.get("plan_expired_seen_day", -1)) != int(day):
+        st["plan_expired_seen_day"] = int(day)
+        st["plan_expired_seen"] = {}
+    seen = st.get("plan_expired_seen")
+    if seen is None:                               # 旧 checkpoint から復元した state
+        seen = {}
+        st["plan_expired_seen"] = seen
+    return seen
+
+
 def note_plan_expired_awake(sim, agent, sim_min: int) -> None:
     """★深夜 0 時の無条件失効で「計画なしのまま覚醒していた」個体×step を数える。
 
     `個体×step` と `個体×日`(初回だけ数える)の 2 本を持つ。後者の重複排除は
-    **agent の属性 1 つ**(`_plan_expired_day`)で行う = 集合を持たない
-    (25 万体で set を抱えるとメモリと checkpoint が跳ねる)。
+    **observer 側の日別の印**(`_expired_seen`)で行う = agent には 1 バイトも書かない。
     """
     if not enabled(sim):
         return
     st = state(sim)
     st["plan_expired_awake_steps"] += 1
     day = int(sim_min) // 1440
-    if int(getattr(agent, "_plan_expired_day", -1)) != day:
-        agent._plan_expired_day = day
+    seen = _expired_seen(sim, day)
+    aid = int(getattr(agent, "id", -1))
+    if aid not in seen:
+        seen[aid] = 1
         st["plan_expired_awake_agent_days"] += 1
 
 

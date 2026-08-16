@@ -14,6 +14,19 @@ mock でも同じ経路を通す(配線を常時検証するため)。
   - `journal`(= LlmJournal)… 全呼び出しの**プロンプト全文**を per-run に残す観測 sink。
       generate / generate_many の**両方**を通す(どちらも通らない経路を作らない)。
       記録は書くだけで、キャッシュ判定にも決定論にも一切関与しない(R1)。
+
+第122バッチ 2026-08-16 の追加(B1 = **障害応答をキャッシュへ書かない**):
+  バックエンドは D16 の流儀で「例外を投げず `"__*_error__: ..."` 文字列を返す」。この文字列は
+  **通常の戻り値**として cache 層まで上がってくるので、素朴に保存すると **vLLM が落ちていた
+  1 分間の障害文字列が、以後そのプロンプトの「正解」として cached=True で永久に再生される**
+  (サーバが復旧しても直らない)。10 日ランでは vLLM の再起動が想定内なので、これは
+  「静かにランを壊す」級の事故になる。対策は 3 点だけで、**呼び出し側への返却は不変**
+  (= 上位の fallback 経路も呼数も 1 ビットも変わらない):
+    ① generate の保存経路で、応答が障害センチネルなら `_mem` にもファイルにも書かない。
+    ② generate_many のフェーズ3(保存)でも同じ判定を通す。
+    ③ 起動時のロードで、旧ランの `llm_cache.jsonl` に**既に混入している**障害行を読み飛ばす
+       (後方互換。読み飛ばした件数は `skipped_error_rows` に残す)。
+  結果として障害呼は「キャッシュに残らない = 次の step で普通に再試行される」。
 """
 from __future__ import annotations
 
@@ -25,6 +38,19 @@ from .base import LLMBackend
 from ..truth_ledger import check_prompt as _check_ledger_leak
 
 CACHE_MODES = ("free", "replay")
+
+# 各バックエンドが「例外の代わりに返す」障害センチネルの接頭辞(D16 の流儀)。
+#   vllm.py:190-194 / fleet.py:144 / openai_compat.py:99-110 / ollama.py:66 / anthropic.py:77-90
+# 本選の配線は vllm + fleet だが、同じ契約の他バックエンドも同じ理由で保存してはならない。
+# ★判定は**接頭辞一致のみ**(正常応答を誤って捨てる余地を作らない)。ここに無い文字列は
+#   従来どおり通常の応答として保存される。
+ERROR_PREFIXES = ("__vllm_error__", "__fleet_error__", "__api_error__",
+                  "__ollama_error__", "__anthropic_error__")
+
+
+def is_error_response(response) -> bool:
+    """応答がバックエンドの障害センチネルか(= キャッシュへ**書いてはならない**か)。"""
+    return isinstance(response, str) and response.startswith(ERROR_PREFIXES)
 
 
 class CachedLLM:
@@ -49,9 +75,15 @@ class CachedLLM:
         self._mem: dict[str, str] = {}
         self.calls = 0
         self.hits = 0
+        # B1 ③: 旧ラン(この修正より前)の jsonl に混入した障害行を読み飛ばした件数。
+        # 0 でない = そのキャッシュは障害を焼き込んでいた、という運用上の手がかりになる。
+        self.skipped_error_rows = 0
         if path and path.exists():
             for line in path.read_text(encoding="utf-8").splitlines():
                 row = json.loads(line)
+                if is_error_response(row["response"]):
+                    self.skipped_error_rows += 1   # B1 ③(後方互換): 障害行は載せない
+                    continue
                 self._mem[row["key"]] = row["response"]
 
     def _key(self, prompt: str, temperature: float, max_tokens: int,
@@ -120,7 +152,8 @@ class CachedLLM:
         response = self.backend.generate(prompt, rng_key=rng_key,
                                          temperature=temperature,
                                          max_tokens=max_tokens, think=think)
-        if self.enabled:
+        # B1 ①: 障害センチネルは保存しない(返却はそのまま = 上位の fallback は従来どおり)。
+        if self.enabled and not is_error_response(response):
             self._mem[key] = response
             if self.path:
                 with self.path.open("a", encoding="utf-8") as f:
@@ -145,6 +178,12 @@ class CachedLLM:
         cache_mode=replay では**フェーズ1(逐次)の時点で**未命中を検出して即例外にする
         (並行発行に入る前なので、どの要求で落ちるかが決定論的=ミス列挙の順序に依存しない)。
         ジャーナルはフェーズ3の後に**要求順**で書く(逐次 generate と同じ並びになる)。
+
+        ★B1(障害応答を保存しない)の唯一の非対称: 束内に**同一プロンプトが2件以上あり、
+        かつ その応答が障害だった**場合、逐次 generate なら 2 回とも backend を叩く
+        (1 回目が保存されないため)が、一括では初出の障害応答を束内で共有する
+        (cached=True・hits は逐次と 1 ずれる)。落ちているサーバへ同 step 内で再送しても
+        意味が無いのでこちらを採る。**正常応答のときは従来どおり完全一致**。
         """
         n = len(requests)
         for r in requests:                  # 第73 Part B: 台帳漏洩の実行時アサーション(既定はゼロコスト)
@@ -185,9 +224,12 @@ class CachedLLM:
         else:
             responses = [_gen(i) for i in miss_order]
         # --- フェーズ3(逐次): 格納(初出順=決定論)と結果充填 ---
+        produced: dict[str, str] = {}       # この一括発行で生成した応答(障害含む)
         for i, response in zip(miss_order, responses):
             key = keys[i]
-            if self.enabled:
+            produced[key] = response
+            # B1 ②: 障害センチネルは保存しない(判定は generate と同一の 1 関数)。
+            if self.enabled and not is_error_response(response):
                 self._mem[key] = response
                 if self.path:
                     with self.path.open("a", encoding="utf-8") as f:
@@ -196,7 +238,13 @@ class CachedLLM:
             results[i] = (response, key[:16], False)
         for i, key in enumerate(keys):
             if results[i] is None:          # 重複キーの2個目以降
-                results[i] = (self._mem[key], key[:16], True)
+                # ★障害応答は _mem に載らないので `produced` から拾う(load しない = 次 step
+                #   では再試行される)。同一 step 内で同じプロンプトを叩き直す意味は無い
+                #   (落ちているサーバへの再送)ので、束内では初出の応答を共有する。
+                if key in self._mem:
+                    results[i] = (self._mem[key], key[:16], True)
+                else:
+                    results[i] = (produced[key], key[:16], True)
         # --- ジャーナル(要求順=逐次 generate と同じ並び。書くだけ・判定に不参加) ---
         if self.journal is not None:
             for i, r in enumerate(requests):

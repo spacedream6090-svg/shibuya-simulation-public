@@ -32,6 +32,8 @@ R1 呼数不変: どの機構も generate() を1本も足さない。営業時�
 """
 from __future__ import annotations
 
+import math
+
 from . import devices as devices_mod
 from . import night as night_mod          # 夜間経済(第101 III-1)。night 側は commerce を
 #                                           module 直下で import しない = 循環しない
@@ -58,6 +60,9 @@ DEFAULTS = {
     "stock_threshold": 6,        # これ以上の在館で品切れ/行列(0 以下=在庫機構 無効)
     "stock_grievance": 0.02,     # 品切れ/行列に遭遇 → 不満(factors 経由。0.0=観測のみ=grievance 不変)
 }
+
+# 在館数の打ち切りが効かない(= 全走査する)ことを表す番兵。demand_cap / count_at_node で使う。
+_NO_CAP = 1 << 62
 
 _BOOL_KEYS = ("enabled",)
 _FLOAT_KEYS = ("price_sensitivity", "price_min", "price_max", "stock_grievance")
@@ -198,12 +203,88 @@ def tick_shop_state(sim, step: int, sim_min: int) -> None:
 
 
 # ---------------------------------------------------------------- 需要(在館数)= 観測量
-def occupancy(sim, node: str) -> int:
+def occupancy(sim, node: str, counts: dict | None = None) -> int:
     """そのノードに居るアクティブな agent 数=需要の観測量(物理位置由来=k 非依存・決定論)。
 
-    範囲外(loc=outside)・睡眠中は需要に数えない。全対全の軽い走査(呼び出しは購入時のみ=低頻度)。"""
+    範囲外(loc=outside)・睡眠中は需要に数えない。
+
+    ``counts`` を渡すと ``node_counts`` が作った「ノード→人数」表を **O(1)** で引くだけになる
+    (値は全走査と完全同一)。渡さないときは従来どおりその場で全走査する。★表を渡してよいのは
+    「その表を作ってから引くまでの間に誰の node/loc/sleeping も動かない」と**呼び出し側が
+    証明できる**場所だけ(例: tools._vc_review の審査ループ=読むだけ)。"""
+    if counts is not None:
+        return int(counts.get(node, 0))
     return sum(1 for a in sim.agents
                if a.node == node and a.loc != "outside" and not a.sleeping)
+
+
+def node_counts(sim) -> dict:
+    """全 agent を **1 回**走査して「ノード → 在場・覚醒人数」表を作る(occupancy と同じ述語)。
+
+    ``occupancy`` を B 回呼ぶと O(B×N)(25 万体では 1 回 25 万比較)。同一時点の在館数を複数
+    ノードぶん要る場所(VC 審査=開店中の全 venture)では、この表を 1 回作って引く=O(N+B)。
+    値は ``occupancy(sim, node)`` と常に一致しなければならない(tests/test_commerce_occupancy.py)。"""
+    counts: dict = {}
+    for a in sim.agents:
+        if a.loc != "outside" and not a.sleeping:
+            nd = a.node
+            counts[nd] = counts.get(nd, 0) + 1
+    return counts
+
+
+def demand_cap(cfg: dict) -> int:
+    """在館数の**打ち切り点**: これ以上数えても on_purchase の結論が 1 ビットも変わらない値。
+
+    ★なぜ要るか(レーンP A4): 購入 1 件ごとの ``occupancy`` は 25 万体の全走査で、本選では
+      購入数 × 25 万 = 数十億比較になる。ところが在館数 occ の使い道は 2 つしかない:
+        (1) ``is_stock_out``  … occ >= stock_threshold か(閾値との大小のみ)
+        (2) ``price_coef``    … clip(1 + sens×(occ - demand_ref), price_min, price_max)
+      (1) が真なら on_purchase は **その場で return** するので (2) は評価されない。よって
+      stock_threshold>0 のときは「閾値に達した時点で数えるのをやめてよい」。stock_threshold<=0
+      (在庫機構 無効)のときは (2) の頭打ち点まで数えれば同じ値になる。どちらも**同値変換**
+      (返す係数・品切れ判定・イベントとも完全同一)で、走査を早期に打ち切るぶんだけ速い。
+
+    戻り値: 打ち切り点(この数に達したら数え終えてよい)。0 = occ を一切使わない(数えなくてよい)。
+    """
+    thr = int(cfg["stock_threshold"])
+    if thr > 0:
+        return thr                                   # 閾値到達 = 品切れ確定(価格は評価されない)
+    sens = float(cfg["price_sensitivity"])
+    if sens == 0.0:
+        return 0                                     # 係数は恒等 1.0 = occ を使わない
+    ref = int(cfg["demand_ref"])
+    lo, hi = float(cfg["price_min"]), float(cfg["price_max"])
+    if not (lo <= hi):                               # 逆さまの clip 幅(min>max)/NaN は
+        return _NO_CAP                               # 単調飽和しない = 打ち切らない(全走査)
+    target = hi if sens > 0 else lo                  # 単調なので片側で頭打ちになる
+    try:
+        c = ref + max(0, int(math.ceil((target - 1.0) / sens)))
+        for _ in range(64):                          # 浮動小数の丸めを安全側へ 1〜2 段ずらす
+            v = 1.0 + sens * (c - ref)
+            if (sens > 0 and v >= target) or (sens < 0 and v <= target):
+                return c if c > 0 else 0
+            c += 1
+    except (OverflowError, ValueError):              # 病的な config は打ち切らない(全走査)
+        return _NO_CAP
+    return _NO_CAP                                   # 収束しない config も全走査(安全側)
+
+
+def count_at_node(sim, node: str, cap: int) -> int:
+    """在館数を **cap で打ち切って**数える(= min(真の在館数, cap))。決定論(id 昇順)。
+
+    cap は ``demand_cap`` が出した「これ以上は結論が変わらない」点。cap 未満で走査が終わった
+    ときは真の在館数そのもの(=``occupancy`` と同値)を返す。"""
+    if cap <= 0:
+        return 0
+    if cap >= _NO_CAP:
+        return occupancy(sim, node)
+    n = 0
+    for a in sim.agents:
+        if a.node == node and a.loc != "outside" and not a.sleeping:
+            n += 1
+            if n >= cap:
+                return n
+    return n
 
 
 # ---------------------------------------------------------------- 動的価格・在庫(購入時)
@@ -243,7 +324,10 @@ def on_purchase(sim, agent, cat: str, base_amount: float, step: int,
     (stock_grievance)だけを渡す。magnitude=0.0 なら _bump が state を触らず記録もしない=grievance 不変
     (stock_out イベントのみ)。grievance は drive(発火系)には接続しない(R1: 呼数を1本も動かさない)。"""
     cfg = sim.commercecfg
-    occ = occupancy(sim, agent.node)
+    # 在館数は「品切れ判定」と「価格係数」にしか使わない。どちらも頭打ちがあるので、結論が
+    # 変わらなくなる点(demand_cap)で走査を打ち切る=**同値のまま**購入 1 件あたりの比較を減らす
+    # (既定 conf では cap=6 = stock_threshold)。cap に届かなければ真の在館数そのもの。
+    occ = count_at_node(sim, agent.node, demand_cap(cfg))
     if is_stock_out(cfg, occ):                        # 品切れ/行列 → 購入抑制 + 不満
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                              kind="stock_out", x=agent.x, y=agent.y,

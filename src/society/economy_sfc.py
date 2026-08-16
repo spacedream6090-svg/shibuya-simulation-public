@@ -123,6 +123,10 @@ analyze_accounting.MONEY_KINDS``)が落ちる = 会計検査の網羅性を将�
 正直な限界(出力にも残す)
 --------------------------
 - **消費税の按分**。内税(価格に含まれる)なので受け手 org には ``実支払 − 消費税`` が入る。
+  ★消費税の**課税標準も実支払**である(第117 レーンE B6)。名目に課税すると床クリップ時に
+  ``税 > 実支払`` となり受け手の net が負に落ちる(= 客が払えなかったぶん店から金を奪う)ので、
+  ``_consumption_tax`` も行政計上(``scheduler._record_consumption_tax``)も同じ ``actual`` を
+  課税標準にする。両者は同一式・同一引数なので実現税額は厳密に一致する。
   一方 ``venture``(屋台)は既存実装が売上**全額**を店主へ渡すため、消費税ぶんが世界に
   無いところから出る。この穴は ``tax_gap`` チャネルとして RoW が埋める(**改名して隠さない**)。
 - **床クリップの差額**。``_spend`` は残高を 0 未満にしないので、名目より実際の支払が
@@ -618,12 +622,19 @@ def resolve_payee_at_node(sim, node: str, cat: str) -> str | None:
 # --------------------------------------------------------------------------- #
 # 記帳の口(scheduler / tools はこの 4 つしか呼ばない)
 # --------------------------------------------------------------------------- #
-def _consumption_tax(sim, nominal: float, cat: str) -> float:
-    """内税の消費税額(**読むだけ**・行政の残高は動かさない)。行政 OFF なら 0。"""
+def _consumption_tax(sim, paid: float, cat: str) -> float:
+    """内税の消費税額(**読むだけ**・行政の残高は動かさない)。行政 OFF なら 0。
+
+    ★B6(第117 レーンE): 課税標準は**実支払**(``actual``)である。名目ではない。
+      内税式 ``tax = paid × rate/(1+rate)`` は ``rate > 0`` なら常に ``tax < paid`` なので、
+      ここが返す額は必ず ``0 ≤ tax ≤ 実支払`` を満たす = 受け手の net が負に落ちない。
+      行政計上側(``scheduler._record_consumption_tax``)も**同じ actual** を渡すので、
+      実現税額は ``gov.consumption_tax`` の同一式・同一引数から出る = 厳密に一致する。
+    """
     gov = getattr(sim, "government", None)
     if gov is None or not gov.cfg.get("enabled"):
         return 0.0
-    national, local, _rate = gov.consumption_tax(float(nominal), str(cat))
+    national, local, _rate = gov.consumption_tax(float(paid), str(cat))
     return float(national) + float(local)
 
 
@@ -643,7 +654,14 @@ def on_spend(sim, agent, nominal: float, actual: float, cat: str,
     if not enabled(sim):
         return None
     amt = float(actual)
-    tax = _consumption_tax(sim, nominal, cat)
+    # ★B6(第117 レーンE): 課税標準は **実支払**(amt)。名目(nominal)ではない。
+    #   旧実装は nominal 課税だったので、床クリップ(残高不足で名目より少なくしか払えない)
+    #   のとき ``tax > 実支払`` になり、``net = amt − tax`` が**負**に転落していた。
+    #   credit_org / row_out は符号を検査しないので、そのまま「受け手から金を奪う」
+    #   (= 客が払えなかったのに店の預金が減る)。行政計上も同じ actual を課税標準にする
+    #   (scheduler._record_consumption_tax)ので、実現税額は両者で厳密に一致する。
+    #   クリップが無い(actual == nominal)ランでは 1 円たりとも従来と変わらない。
+    tax = _consumption_tax(sim, amt, cat)
     st = _state(sim)
     if str(cat) == "venture":                          # 屋台は既存の保存経路(店主=家計へ全額)
         st["payee"]["venture"] += 1

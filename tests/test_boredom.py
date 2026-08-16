@@ -253,3 +253,78 @@ def test_explore_reuses_gumbel_when_s4_on(tmp_path):
         assert len(got) >= 2, f"Gumbel 再利用で行き先が多様化しない: {got}"
         return
     assert False, "候補4つ以上の個体が見つからない"
+
+
+# =========================================================================== #
+# B5(第118 レーンC): 回転搬送されたゲージを初回分岐が踏み潰さない
+#
+#   pool の dehydrate/hydrate は `_boredom` を運ぶ(world/pool.py の _MISC_FIELDS)が、
+#   節 `_bore_node` は**意図的に運ばない**(再入場時の現在地から観測し直す)。よって
+#   再来街の個体は必ず「初回観測」分岐を通り、そこの無条件 `_boredom = 0.0` が
+#   搬送値を毎回捨てていた = 退屈ゲージの搬送が**恒久 no-op**(街を出入りするだけで
+#   退屈が消える)。初回に初期化してよいのは「比較先の節」と「不応期」だけ。
+# =========================================================================== #
+def _bore_cfg(**ov):
+    base = {"enabled": True, "accrual": 0.3, "decay": 0.1, "novelty_relief": 0.2,
+            "threshold": 0.6, "cooldown_steps": 5}
+    base.update(ov)
+    return drive.build_cfg({"boredom": base})
+
+
+def test_carried_gauge_survives_the_first_tick_after_a_rotation():
+    """★dehydrate → hydrate → 初回 tick でゲージが残る(節と不応期だけが初期化される)。"""
+    from society.agents.agent import Agent
+    from society.agents.memory import MemoryStore
+    from society.world import pool as P
+
+    def _agent(aid=7):
+        return Agent(id=aid, name=f"人{aid}", age=30, occupation="会社員",
+                     persona="p", traits={"openness": 0.25}, states={},
+                     mem=MemoryStore())
+
+    cfg = _bore_cfg()
+    a = _agent()
+    a.node, a.route = "n1", None
+    drive.boredom_tick(a, cfg, 0)                 # 初回観測
+    for s in range(1, 4):                         # 長居で 0.9 まで溜める
+        drive.boredom_tick(a, cfg, s)
+    assert abs(a._boredom - 0.9) < 1e-9
+    state = P.dehydrate(a)
+    assert abs(state["misc"]["_boredom"] - 0.9) < 1e-9, "搬送に載っていない(前提が崩れた)"
+
+    back = _agent()                               # 再来街(節は運ばれない)
+    P.hydrate(back, state)
+    assert not hasattr(back, "_bore_node"), "節が運ばれている(仕様の前提が変わった)"
+    back.node, back.route = "n9", None
+    drive.boredom_tick(back, cfg, 100)            # ★ここが搬送を殺していた
+    assert abs(back._boredom - 0.9) < 1e-9, "回転でゲージが 0 へ踏み潰された"
+    assert back._bore_node == "n9", "比較先の節が現在地に据えられていない"
+    assert back._bore_cooldown == 0, "不応期が初期化されていない"
+    # 搬送されたゲージがそのまま**発火の資格**として効く(no-op でない証拠)
+    assert drive.boredom_ready(back, cfg, 100)
+
+
+def test_a_brand_new_agent_still_starts_from_zero():
+    """新規個体(属性不在)は従来どおり 0.0 から始まる(既存挙動を 1 ビットも変えない)。"""
+    class A:
+        pass
+
+    a = A()
+    a.node, a.route = "n1", None
+    cfg = _bore_cfg()
+    drive.boredom_tick(a, cfg, 0)
+    assert a._boredom == 0.0 and a._bore_node == "n1" and a._bore_cooldown == 0
+    assert not drive.boredom_ready(a, cfg, 0)
+
+
+def test_first_tick_is_still_a_noop_when_disabled():
+    """OFF は搬送値が在っても 1 バイトも触らない(基底のバイト一致)。"""
+    class A:
+        pass
+
+    a = A()
+    a.node, a.route = "n1", None
+    a._boredom = 0.9                              # 搬送されてきた体で
+    cfg = drive.build_cfg({})                     # 既定 OFF
+    drive.boredom_tick(a, cfg, 0)
+    assert a._boredom == 0.9 and not hasattr(a, "_bore_node")

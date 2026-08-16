@@ -13,6 +13,74 @@ E1-1〜E1-4 / 起動スクリプト [launch-vllm-finals.ps1](launch-vllm-finals.
 
 ---
 
+## E4 ★本選の正準起動手順 — 「conf を1枚に凍結してから起動する」(A8・2026-08-16)
+
+**結論から**: 本選は `conf/finals_observe.yaml` を `--profile` に直接渡して起動**しない**。
+`finals_observe.yaml`(用途=世界)と `conf/profiles/finals-vllm7.yaml`(用途=配線)を
+[`scripts/freeze_config.py`](../scripts/freeze_config.py) で**解決済みの1枚**へ落とし、
+**その1枚だけ**を `--profile` に渡す。理由は 2 つ:
+
+1. **正準コマンドは、そのままでは起動できない(仕様)。** `finals_observe.yaml` は
+   `model.backend` を基底の `mock` のまま残してある(縦煙とドライランをそのまま通すため)。
+   一方 `run.n_agents: 250000` なので、**β6 の mock fail-fast ガード**
+   (`scripts/run.py::check_mock_production`: `n_agents >= 10,000` ∧ `backend == "mock"` ∧
+   `allow_mock_production == false` → **起動時 RuntimeError**)に必ず当たる。
+   これは**バグではなく設計**で、「配線を忘れたまま 25 万体を mock で回す」事故を潰す保険。
+   したがって `--profile conf/finals_observe.yaml` 単独起動は**常に失敗するのが正しい**。
+2. **起動条件を事後に再構成できないから。** 実際の設定は「基底 < env < profile < dotlist」の
+   4 段重ねで決まる。dotlist を人間が正確に覚えていない限り、何で回したかは事後に復元できない。
+   凍結すると sha256 が付き、`run_manifest` / 進捗報告と突き合わせられる。
+
+### 手順(本番直前に 1 回)
+
+```bash
+# ① 世界(finals_observe)と 配線(finals-vllm7)を合流した「解決済み1枚」を作る。
+#    ★freeze_config は --profile を 1 本しか取らない(load_config の仕様)。合流は下の
+#      どちらかで行う。両者の出力は sha256 まで一致することを 2026-08-16 に実測確認済み。
+#
+#  (推奨) 事前合流: 2 ファイルを OmegaConf で重ねた中間 profile を作り、それを凍結する
+python - <<'PY'
+from omegaconf import OmegaConf
+m = OmegaConf.merge(OmegaConf.load("conf/finals_observe.yaml"),
+                    OmegaConf.load("conf/profiles/finals-vllm7.yaml"))
+open("/tmp/finals_merged_profile.yaml", "wb").write(OmegaConf.to_yaml(m).encode("utf-8"))
+PY
+python scripts/freeze_config.py --profile /tmp/finals_merged_profile.yaml
+
+#  (別解) dotlist で model ブロックを流し込む(13 個。URL 配列も dotlist で通る)
+python scripts/freeze_config.py --profile conf/finals_observe.yaml \
+  model.backend=vllm model.cache=true model.format=json model.temperature=0.7 \
+  model.timeout_s=120 model.max_tokens=320 model.plan_max_tokens=448 \
+  model.reflect_max_tokens=768 model.reflect_think=false model.name=qwen3:8b \
+  'model.servers=[http://localhost:8000,http://localhost:8001,http://localhost:8002,http://localhost:8003,http://localhost:8004,http://localhost:8005,http://localhost:8006]' \
+  'model.tiers.reflect=[http://localhost:8000]' \
+  'model.tiers.default=[http://localhost:8001,http://localhost:8002,http://localhost:8003,http://localhost:8004,http://localhost:8005,http://localhost:8006]'
+
+# ② 出た1枚を目視 → sha256 を控える(既定 conf/finals_<YYYYMMDD>_frozen.yaml + .sha256)
+#    確認するのは最低この 5 行: model.backend / model.servers の本数 /
+#    run.n_agents / pool.present_cap / world.calendar.start_date
+grep -nE "backend:|n_agents:|present_cap:|start_date:" conf/finals_*_frozen.yaml
+
+# ③ 本選はこの1行だけで起動する(dotlist を 1 つも打たない = 打ち間違いようがない)
+python scripts/run.py --profile conf/finals_<YYYYMMDD>_frozen.yaml run.name=finals1
+```
+
+### 注意(踏むと痛い順)
+
+- **凍結ファイルはコミットしない。** 本番直前に生成する運用成果物であって正典ではない
+  (正典は 基底 conf + profile)。公開ミラーの除外域でもないのでコミットすると公開される。
+- **Δt≠10 の凍結ファイルを `--profile` で使わない。** `--profile` は基底へ重ねてから
+  **もう一度** `apply_dt` を通す。正準の `run.dt_min: 10` では恒等パスなので 1 バイトも
+  変わらないが、Δt≠10 だと二重変換になる(根拠と同値性テストは `tests/test_launch_guard.py` の
+  β6 節 — freeze_config.py の docstring が挙げる `tests/test_freeze_config.py` は**存在しない**
+  ファイル名で、実体はこちら)。
+- **`world.calendar.start_date` が `auto` でないこと**を ② で必ず見る。`auto` は
+  `load_config` が**凍結を作った日**へ解決するので、凍結日と起動日がずれると
+  曜日・給料日・generated 天候が意図と変わる(本選 conf は `2026-08-22` 固定にしてある)。
+- **watchdog 経由でも同じ1枚を渡す**(下の E3 のコマンドの `--profile` を凍結ファイルへ差し替える)。
+
+---
+
 ## E0 ★checkpoint / dormant 世代の剪定禁止(第114 G2・2026-08-14 確定)
 
 **本選ランの `checkpoint/` は 1 世代も消さない。** `ckpt-NNNNNN.pkl.gz` と同 step の

@@ -223,8 +223,15 @@ def boredom_tick(agent, cfg: dict, step: int) -> None:
         return
     node = getattr(agent, "node", None)
     last = getattr(agent, "_bore_node", _BORE_UNSET)
-    if last is _BORE_UNSET:                     # 初回: ゲージ0で観測開始(まだ蓄積しない)
-        agent._boredom = 0.0
+    if last is _BORE_UNSET:                     # 初回観測(まだ蓄積しない: 比較先の節が無い)
+        # ★B5(第118 レーンC): **搬送済みのゲージを踏み潰さない**。
+        #   pool の dehydrate/hydrate は `_boredom` を運ぶ(world/pool.py の _MISC_FIELDS)が
+        #   `_bore_node` は運ばない(意図的=節は再入場時の現在地から観測し直す)。
+        #   よって再入場個体はここを必ず通り、旧実装の無条件 `= 0.0` が搬送値を毎回捨てて
+        #   いた = 退屈ゲージの搬送が**恒久 no-op** だった(街を出入りするだけで退屈が消える)。
+        #   初回に初期化するのは「比較先の節」と「連続探索の不応期」だけにする。
+        #   新規個体(属性不在)は getattr 既定 0.0 = 従来と 1 ビットも変わらない。
+        agent._boredom = float(getattr(agent, "_boredom", 0.0))
         agent._bore_node = node
         agent._bore_cooldown = 0
         return

@@ -149,28 +149,98 @@ def _top_share(values, pct: float) -> float:
     return sum(vals[:k]) / total
 
 
-def _kendall_tau(a, b):
-    """Kendall τ-b を O(n²) で自作(tie 補正込み。measure._kendall_tau と同式・純Python)。
+def _tie_pairs(sorted_vals) -> int:
+    """**ソート済み**列の「同値ペア」総数 Σ c(c-1)/2(c=同値ランの長さ)。O(n)。
 
-    長さ<2 は None。片側定数(分母0)は 0.0(measure 仕様に一致)。"""
+    同値は `==` で判定する(明示二重ループの `da == 0` と同じ述語。-0.0 と 0.0、int と float の
+    混在も `==` の意味のまま=旧実装と同じ分類になる)。"""
+    total = 0
+    run = 1
+    for i in range(1, len(sorted_vals)):
+        if sorted_vals[i] == sorted_vals[i - 1]:
+            run += 1
+        else:
+            total += run * (run - 1) // 2
+            run = 1
+    return total + run * (run - 1) // 2
+
+
+def _inversions(seq) -> int:
+    """列の反転数(i<j かつ seq[i] > seq[j] のペア数)をマージソートで数える。O(n log n)。
+
+    ボトムアップ(非再帰)なので n=25 万でも再帰上限に触れない。入力列は破壊しない。"""
+    buf = list(seq)
+    n = len(buf)
+    if n < 2:
+        return 0
+    tmp = [None] * n
+    inv = 0
+    width = 1
+    while width < n:
+        for lo in range(0, n, 2 * width):
+            mid = lo + width
+            if mid >= n:
+                break                      # 右半分が無い=そのまま(整列済み)
+            hi = min(lo + 2 * width, n)
+            i, j, k = lo, mid, lo
+            while i < mid and j < hi:
+                if buf[j] < buf[i]:        # 右が小さい = 左の残り(mid-i 個)すべてと反転
+                    inv += mid - i
+                    tmp[k] = buf[j]
+                    j += 1
+                else:
+                    tmp[k] = buf[i]
+                    i += 1
+                k += 1
+            while i < mid:
+                tmp[k] = buf[i]
+                i += 1
+                k += 1
+            while j < hi:
+                tmp[k] = buf[j]
+                j += 1
+                k += 1
+            buf[lo:hi] = tmp[lo:hi]
+        width *= 2
+    return inv
+
+
+def _kendall_tau(a, b):
+    """Kendall τ-b を **O(n log n)** で自作(tie 補正込み。measure._kendall_tau と同値・純Python)。
+
+    長さ<2 は None。片側定数(分母0)は 0.0(measure 仕様に一致)。
+
+    ★なぜ書き換えたか(レーンP A3): 旧実装は明示二重ループ = **O(n²)** で、本選 25 万体では
+      1 日境界あたり 312 億回の比較(= ハング級)。τ-b の値は「同値ペア数」と「反転数」だけで
+      決まるので、tie を別集計し、残りの concord/discord を**マージソートの反転数**から出す。
+      pandas/numpy を持ち込まない方針は据え置き(engine 経路は純Python)。
+
+    ★同値性(旧 O(n²) 実装との一致):
+        n0        = 全ペア数 n(n-1)/2
+        tie_a     = a が同値のペア数(b がどうであれ数える)      … 旧: `if da == 0: tie_a += 1`
+        tie_b     = b が同値のペア数                              … 旧: `if db == 0: tie_b += 1`
+        tie_ab    = a も b も同値のペア数(包除の交わり)
+        concord+discord = n0 - (tie_a + tie_b - tie_ab)           … 旧: tie でも s>0/s<0 でもない
+        discord   = a 昇順(同値 a 内は b 昇順)に並べた b 列の反転数
+      並べ替えで a[i]<a[j] のペアだけが残り、同値 a のランの中は b 昇順なのでランの内側からは
+      反転が出ない = 反転数はちょうど「a が増えて b が減るペア」= discord に一致する。
+      返り値の式(int 差 / float の denom)は旧実装と同一なので浮動小数の丸めまで同じ値になる。
+
+    ★契約の外(旧実装と一致しない入力): NaN/±inf、および |da|×|db| が
+      アンダーフローして 0 になるほど極端な差(両側とも ~1e-154 未満)。旧実装は積 `da*db` の
+      符号で分類するのでそこだけ分類が変わる。wealth = money + account は有限の実数額なので
+      本経路では起こらない(tests/test_assets_tau_scale.py が有限入力での完全一致を固定する)。
+    """
     n = len(a)
     if n < 2:
         return None
-    concord = discord = tie_a = tie_b = 0
-    for i in range(n):
-        for j in range(i + 1, n):
-            da = a[i] - a[j]
-            db = b[i] - b[j]
-            s = da * db
-            if s > 0:
-                concord += 1
-            elif s < 0:
-                discord += 1
-            else:
-                if da == 0:
-                    tie_a += 1
-                if db == 0:
-                    tie_b += 1
+    pairs = sorted(zip(a, b))                       # a 昇順・同値 a 内は b 昇順
+    n0_int = n * (n - 1) // 2
+    tie_a = _tie_pairs([p[0] for p in pairs])
+    tie_b = _tie_pairs(sorted(b))
+    tie_ab = _tie_pairs(pairs)                      # (a,b) ともに同値なペア(包除の交わり)
+    discord = _inversions([p[1] for p in pairs])
+    concord = n0_int - tie_a - tie_b + tie_ab - discord
     n0 = n * (n - 1) / 2.0
     denom = math.sqrt((n0 - tie_a) * (n0 - tie_b))
     if denom == 0:

@@ -3037,9 +3037,14 @@ daily:
     evening_talk:
       enabled: false            # ★呼数が増える方向の唯一のノブ。ON は縦煙後の判断
     max_awake_min: 200          # 帰宅後に起きていられる上限[分](ハザードの裾を切る安全弁)。
-                                # ★起点は**帰宅**なので lead_min を上げるなら同じだけ足すこと
-                                #   (lead_min=120 のまま 200 だと就寝時刻の +80 分で頭打ち=
-                                #   実測 p50 が上限に貼りつく。lead_min=120 なら 320 が目安)
+                                # ★**この値は lead を上げても触らない**(実装が自動で足す)。
+                                #   起点は帰宅だが、実効上限は
+                                #     cap = max_awake_min + lead_min_for(agent, ...)
+                                #   (src/society/cognition/routine.py `_home_awake_sleeps`)= 前倒し
+                                #   したぶんは**既に加算済み**。lead_min=120 なら実効 320 に自動でなる。
+                                #   ここを 320 に書き換えると二重加算(実効 440)になり、裾を切る
+                                #   安全弁として機能しなくなる。lead.mode=per_agent でも同じ
+                                #   (個体ごとの lead_i が個体ごとに加算される)。
     early_start_min: 480        # 「翌日早出」の判定境界(分 of day。480 = 08:00)
     family_talk_boost: 3.0      # 同居人も在宅覚醒中なら family_talk の重み ×(世帯シナジー最小)
     engaged_acts: [media, hobby, study, family_talk]   # b4(没入 → 就寝を遅らせる)の対象

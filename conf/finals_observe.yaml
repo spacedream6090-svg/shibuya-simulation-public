@@ -7,6 +7,13 @@
 # (zones_shibuya.yaml の合成作法「physics: ブロックと world.map 行を相手へ貼る」に従う)。
 #
 #   python scripts/run.py --profile conf/finals_observe.yaml run.name=obs_finals
+#   ★この行は「このプロファイルが何を意味するか」を示すだけで、**そのままでは起動できない**
+#     (仕様): model.backend が基底の mock のままかつ run.n_agents=250000 なので、β6 の
+#     mock fail-fast ガード(scripts/run.py::check_mock_production)が RuntimeError を出す。
+#     本選は **freeze_config.py で下の finals-vllm7.yaml と合流した「解決済み1枚」を作り、
+#     その1枚だけを --profile に渡す**。手順は ops/finals-compute-checklist.md §E4。
+#     縮小の縦煙で使うときは model.backend=<実LLM> か run.allow_mock_production=true を明示し、
+#     さらに **pool.present_cap を run.n_agents と対で**下げること(在場は present_cap 側が効く)。
 #
 # ★これは**候補**である。承認は OBS-U1/U3(PENDING §3)= 8/14。承認前に本ランは開始しない。
 # ★本選のバックエンド配線(vLLM 艦隊)は入れていない。conf/profiles/finals-vllm7.yaml の
@@ -76,6 +83,19 @@ pool:
   #   dir: data/persona_pool_v2
   #
   # ---- 切り替えると何が変わるか(seed 42・fraction 1.0 の実測)-----------------
+  # ★★この表の出所は `data/persona_pool_v2/meta.json` である。**切替直前に meta から再計算して
+  #   この表を更新すること**(プールを再生成すると層別件数は動きうる。過去に triage B13 で
+  #   「conf と meta が食い違う」が上がったのは、その時点の meta が古い生成物だったため)。
+  #   再計算は 1 行で足りる:
+  #     python -c "import json;m=json.load(open('data/persona_pool_v2/meta.json',encoding='utf-8'));print(m['fraction'],m['total_generated'],m['layer_counts'])"
+  #   照合済み(2026-08-16 / 生成 2026-08-15): fraction 1.0 / total 1,000,000 /
+  #     L1 30,000 · L2 138,759 · L3 36,690 · L4 793,259 · L5 1,292(Σ=1,000,000)= **下の表と一致**。
+  #   ★★未解決(2026-08-16 第133): v2 プールが 2 系統に分岐している。上の照合は**ローカル
+  #     8/15 12:44 生成**の meta。GPU サーバー側 8/16 15:11 生成は L2 157,715 / L4 774,303
+  #     (差はちょうど 18,956 人の L4→L2 シフト。157,715/224,240 = 0.703 ≠ 設計の出勤率 0.62)。
+  #     本選はサーバーのプールで走るため、切替前に (1) 現 HEAD から決定論再生成してどちらが
+  #     再現されるか確定 (2) 生成条件差(コード版 / --orgs 入力 / フラグ)を特定 (3) この表と
+  #     tier_quota を正典 meta で引き直す。どちらが正かは**未決**(triage B13 参照)。
   #   層別件数   L1 30,000(不変)/ L2 224,240 → **138,759**(出勤率 0.62)
   #              L3 36,690(不変)/ L4 707,778 → **793,259**(L2 の空き枠が残余へ移る)
   #              L5 1,292(不変)/ 総数 1,000,000(不変 = 総量保存)
@@ -96,12 +116,39 @@ pool:
   #   年齢 HARD gate、tools の voter_age_min: 18(v1 は 1 人も落とせていなかった)、
   #   policy_cache のキー濃度(age//10*10)が**実際に効き始める**。
   #   ⇒ 行動が変わる = **呼数とメモリが動く**。切替の前に fraction 0.1 で縦煙を焚くこと。
+  #   ★★縦煙の出力先を必ず `--out` で分けること。`--v2` は **--out を省略すると
+  #     `data/persona_pool_v2` へ吐く**(build_persona_pool.py:1938-1939)= 完成済みの本選
+  #     プールと同じ場所である。そこへ fraction 0.1 + `--clean` を撃つと、
+  #       ① 各層の part-0000 が 0.1 サイズの内容で**上書き**され、
+  #       ② 今回書き直されなかった残りの part(L4 は 16 本中 15 本)が stale と判定されて
+  #          `--clean` に**削除**され、③ meta.json が 0.1 の値で書き直される。
+  #     = 本選プールの破壊(復旧はフル再生成 28 秒だが、台帳 2 本が揃っている機でしか出来ない)。
+  #     `--clean` は「幽霊 part が llm_targets を汚す」ので縮小生成では外せない
+  #     → **逃げ道は --out だけ**:
+  #       python scripts/build_persona_pool.py --v2 --fraction 0.1 \
+  #           --orgs data/organizations_shibuya_census.json \
+  #           --childcare data/organizations_shibuya_childcare.json \
+  #           --clean --out data/persona_pool_v2_smoke        # ★--out を必ず付ける
+  #       # 縦煙は pool.dir=data/persona_pool_v2_smoke を dotlist で指して回す
+  #     (既存の `data/persona_pool_v2_smoke` は fraction 0.02 の生成物。上書きしてよい)
   #
   # ---- 語彙の互換(壊れないことの根拠)---------------------------------------
   #   visit_purpose は 7 語のまま(presence の曜日プロファイル表・雨弾性表と完全一致)。
-  #   occupation は v1 186 語の上位集合で、新語は 5 語だけ(未就学児 / 保育士 / 調理員 /
+  #   occupation は v1 186 語 → v2 188 語。新語は 5 語(未就学児 / 保育士 / 調理員 /
   #   幼稚園教諭 / 年金生活者)。5 語とも economy.WAGE_CAT・MONEY_INIT・OCC_GROUP_RULES・
   #   persona._WORK_CAT へ登録済み(tests/test_persona_pool_v2.py が全数で固定)。
+  #   ★**上位集合ではない**(2026-08-16 に meta.json 同士を全数突合して判明): v1 にあって
+  #     v2 に**無い**語が 3 つある — バンドマン(v1 917人)/ 写真家(871)/ **配達員(1,124)**。
+  #     このうち **配達員は `delivery.courier_occupation`(config.yaml)が名指ししている語**で、
+  #     `delivery.enabled: true`(下の delivery ブロック)の本セットでは効く:
+  #       v2 に切り替えると `_select_courier` が誰も選べず、全注文が
+  #       **agent_id=-1 の抽象トリップ**へ graceful degradation する
+  #       (= 配達は届くが**配達員の gig 収入と物理配車が 1 件も出ない**。src/society/delivery.py
+  #        の「正直な穴」経路)。バンドマン / 写真家 は conf からも src からも名指しされていない
+  #       ので実害なし(persona.py の生成フォールバック語彙にあるだけ)。
+  #     ⇒ 切替時の判断: (a) このまま(配達は抽象トリップで出る)/ (b) v2 生成側へ配達員職を
+  #        足す / (c) courier_occupation を v2 に在る語(例: 宅配ドライバー 830人)へ寄せる。
+  #        **(c) は 1 行だが「誰が配達しているか」の意味が変わる**ので黙って倒さないこと。
   #   下の facility_devices / incidents_env が名指しする語(設備保守員・警備員・常駐警備・
   #   警察官)は v2 でも生える(台帳の SV 業種由来なので不変)。
   #
@@ -172,7 +219,15 @@ world:
 
   calendar:
     enabled: true
-    start_date: "auto"     # 実行当日を初日に(本選は 8/16)。weather.mode=generated が月を読む
+    start_date: "2026-08-22"   # ★本選初日 = 8/22 に**固定**(順延したらこの 1 行を書き換える)。
+                               # auto は「起動した日」がラン内世界へ漏れる = 曜日(weekday_work・
+                               # presence の曜日プロファイル)・給料日(WAGE の 25 日等)・
+                               # weather.mode=generated が読む月(8月較正)が起動タイミング次第で
+                               # 変わる。本選では使わない(Codex レビュー P1)。
+                               # ★2026-08-22 は**土曜**。10 日ラン = 8/22(土)〜8/31(月) で
+                               # 週末 2 回(8/22-23・8/29-30)を含む。初日は週末プロファイル側の
+                               # 資格者数(v1 135,157 / v2 184,765)が効く = present_cap 25万は
+                               # 初日は binding しない。日別の在場数を読むときはここを踏まえる。
     weekday_work: true
 
   # ---- 夜間解禁(Wave 4 III-1)。1つのクランプ修正が夜の街全体を開ける ----
@@ -1157,7 +1212,14 @@ llm:
 # (14) 意図的に入れなかったもの(全部ここに理由を残す=「忘れていた」と区別する)
 # ============================================================================
 # ● ユーザー/台帳の判断待ち
-#   cognition.fire / watch / g_update / engaged  … OBS-U3「認知 ON の 8/14 留保」
+#   cognition.fire / watch / engaged             … OBS-U3「認知 ON の 8/14 留保」。判断は
+#                                                  decision-dashboard D1(b案 = 8/15 診断で
+#                                                  呼数実測 → 許容なら fire+watch+engaged を ON)
+#   ★cognition.g_update は**この節の対象ではない**(= 入れなかったものではない): 上の
+#     `cognition.g_update` ブロックで `enabled: true` を宣言済み(OBS-U3 で 8/14 承認)。ただし
+#     `cognition.fire` が OFF の間は plasticity が 1 行も走らない = **no-op の宣言**であり、
+#     cognition_g.parquet は生えない。実効になるのは D1 で fire を開けたときだけ
+#     (経緯と根拠は上の「認知スタック本体(OBS-U3)」節にある)。
 #   cognition.policy_cache.enabled               … PENDING §3(resume で空になる問題が未決)
 #   model.mind.enabled                           … DP-U2 案C の最終判定が 8/15(vLLM 同居性能の実測)
 #   lod.n_proportional.enabled                   … DP-U4(呼数)の決定待ち

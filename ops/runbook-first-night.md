@@ -37,7 +37,9 @@ python scripts/check_llm_backends.py --backend openai_compat --base-url http://l
 ### 0-4. 環境確認5点+運用4点(8/16監査反映)
 1. `nvidia-smi`: 7 GPU 認識・VRAM
 2. ディスク空き: **今夜は50GB以上あれば可**(本番10日ランは~70GB+バックアップ先。E0=checkpoint剪定禁止を忘れない)
-3. `date`(シム start_date="auto" が実日付を拾う)
+3. `date`(機の時計。★本選 conf の `world.calendar.start_date` は **`2026-08-22` 固定**にしたので、
+   ラン内の暦は機の日付に**依らない**。今夜の縮小ランで `--profile conf/finals_observe.yaml` を
+   使うと初日が 8/22 = **土曜**になる点だけ意識する。`auto` を使う他 profile では実日付を拾う)
 4. `curl -sI https://discord.com -o /dev/null -w "%{http_code}\n"`(Discord疎通・任意)
 5. ODPT キーは**GPU機では不要**(RW取得はローカルPCのタスクのみ)
 6. **`ulimit -n` を上げる**(実測1024=本番不足): ランを張る tmux シェルで `ulimit -n 65535`(vLLM7本+parquet+sockets)
@@ -51,16 +53,23 @@ python scripts/check_llm_backends.py --backend openai_compat --base-url http://l
 
 ### 1-1. 配線スモーク(5分)
 ```bash
-python scripts/run.py --profile conf/profiles/finals-vllm7.yaml run.n_agents=6 run.n_steps=20
+python scripts/run.py --profile conf/profiles/finals-vllm7.yaml \
+  run.n_agents=6 pool.present_cap=6 run.n_steps=20
 ```
 完走+`l1b_llm.parquet` に実呼が出ればOK。
+(このプロファイルは `model:` ブロックだけ = `pool.enabled` は基底の false なので `present_cap` は
+不活性だが、**規模指定は常に対で書く**運用にしておく=打ち間違いの型を作らない。)
 
 ### 1-2. 実測スモーク(★今夜の最重要計測・約30-40分)
 ```bash
 python scripts/run.py --profile conf/finals_observe.yaml \
-  run.seed=42 run.n_agents=2000 run.n_steps=144 run.name=night0_smoke \
+  run.seed=42 run.n_agents=2000 pool.present_cap=2000 run.n_steps=144 run.name=night0_smoke \
   model.backend=<finals-vllm7のmodelブロック or dotlist>
 ```
+★`pool.present_cap` は `run.n_agents` と**必ず対で**下げる。finals_observe は `pool.enabled: true`
+なので**在場人口は present_cap 側が効く**。付け忘れると 2,000 体のつもりで 25 万体ぶんを組み立て、
+**CPU高負荷・RSS 2.5GB・GPU 0%・run dir が空**のまま進まない(2026-08-16 に実地で踏んだ事故。
+起動バナー2行目の `present_cap=` が nominal N と一致しているかを1秒で目視すること)。
 記録するもの(summary.json と経過時刻から):
 - **R_eff**(呼/秒・実効スループット)と **c**(エンジン秒/体/step)——**初の実機値**(いままで±50%誤差の外挿だった)
 - fallback率・cache hit・peak RSS
@@ -78,8 +87,8 @@ fire は Phase 1 の判定が **GO なら3行解凍**(conf の cognition ブロ�
 
 ```bash
 python scripts/run.py --profile conf/finals_observe.yaml \
-  run.seed=42 run.n_agents=10000 run.n_steps=144 run.name=scale1_10k \
-  model.backend=<vllm7> &
+  run.seed=42 run.n_agents=10000 pool.present_cap=10000 run.n_steps=144 run.name=scale1_10k \
+  model.backend=<vllm7> &                                # ★present_cap は n_agents と対指定
 # 併走(別ターミナル・すべて読み取り専用):
 python scripts/watchdog.py --run-dir runs/scale1_10k
 python scripts/report_progress.py runs/scale1_10k --dry-run          # 初回は必ずdry-run

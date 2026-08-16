@@ -1276,6 +1276,13 @@ class Tools:
             return
         sim._vc_review_day = day
         fund = self._vc_fund(sim, vccfg)
+        # ★在館数(market 代理)は venture ごとに commerce.occupancy を呼ぶと O(店舗数×人口)
+        #   (25 万体では審査 1 回で数千万比較)。下の審査ループは **読むだけ**(present_agent /
+        #   vc_score / len(relations))で誰の node・loc・sleeping も動かさないので、同じ時点の
+        #   在館数表を 1 回作って引ける = O(人口 + 店舗数)。値は全走査と完全同一
+        #   (tests/test_commerce_occupancy.py が同値性と「1 審査 1 走査」を機械固定する)。
+        #   ★1 軒も無い日は表も作らない(旧経路と同じ「走査ゼロ」)。
+        occ_counts = commerce_mod.node_counts(sim) if self.ventures else {}
         scored = []
         for owner in sorted(self.ventures):
             v = self.ventures[owner]
@@ -1286,7 +1293,7 @@ class Tools:
             agent = sim.present_agent(owner)            # ★店主が街に居ない屋台は審査しない
             if agent is None:
                 continue
-            occ = commerce_mod.occupancy(sim, v["node"])           # market 代理(在館数)
+            occ = commerce_mod.occupancy(sim, v["node"], occ_counts)  # market 代理(在館数)
             deg = len(agent.mem.relations)                          # network 代理(関係次数)
             s = commerce_mod.vc_score(v.get("sales_total", 0.0), occ, deg, vccfg)
             scored.append((owner, s))

@@ -583,7 +583,15 @@ def _withhold_wage(sim, agent, gross: float, step: int, sim_min: int,
 
 def _record_consumption_tax(sim, agent, price: float, cat: str,
                             step: int, sim_min: int) -> None:
-    """消費税の内訳計上(価格は名目不変=内税)。国分→nation / 地方分→metro に歳入計上+tax 記録。"""
+    """消費税の内訳計上(価格は名目不変=内税)。国分→nation / 地方分→metro に歳入計上+tax 記録。
+
+    ★B6(第117 レーンE): ``price`` は **実支払**(``_spend`` の床クリップ後に実際に減った額)
+      であって名目ではない。名目に課税すると「残高不足で 100 円しか払えなかった客から
+      120 円ぶんの税を取る」ことになり、``economy_sfc.on_spend`` が受け手へ配る
+      ``実支払 − 消費税`` が負に落ちる(受け手の預金を減らす)。課税標準を実支払に揃えると
+      ``sim.government.consumption_tax`` の同一式・同一引数から実現税額が出るので、
+      **行政の歳入計上と受け手の配分が厳密に同額**になる。クリップの無い支払
+      (実支払 == 名目 = ほぼ全件)では従来と 1 円も変わらない。"""
     national, local, _rate = sim.government.consumption_tax(price, cat)
     if national > 0:
         sim.government.collect("nation", national)
@@ -703,7 +711,9 @@ def _spend(sim, agent, amount: float, cat: str, step: int, sim_min: int,
     if amount <= 0:
         return
     sfc_on = sfc_mod.enabled(sim)
-    before = (agent.money + float(getattr(agent, "account", 0.0) or 0.0)) if sfc_on else 0.0
+    # ★B6(第117 レーンE): 残高スナップは **sfc の ON/OFF に依らず**取る。消費税の課税標準を
+    #   実支払へ揃えるのに `before` が要るからで、算術だけ = 世界も L1 も 1 バイトも動かない。
+    before = agent.money + float(getattr(agent, "account", 0.0) or 0.0)
     if not _accounts_on(sim):
         agent.money = max(0.0, agent.money - amount)
         payload = {"amount": round(float(amount), 1),
@@ -712,8 +722,9 @@ def _spend(sim, agent, amount: float, cat: str, step: int, sim_min: int,
             payload["chosen"] = True
         if item is not None:
             payload["item"] = item
-        if sfc_on:                              # 受け手へ入金(実支払=床クリップ後の実際の減少額)
-            actual = before - (agent.money + float(getattr(agent, "account", 0.0) or 0.0))
+        # 実支払 = 床クリップ後の実際の減少額(名目 amount とは残高不足のときだけ食い違う)
+        actual = before - (agent.money + float(getattr(agent, "account", 0.0) or 0.0))
+        if sfc_on:                              # 受け手へ入金(実支払を基準に配る)
             payee = sfc_mod.on_spend(sim, agent, amount, actual, cat, step, sim_min,
                                      payee_node=payee_node)
             if payee is not None:
@@ -722,8 +733,8 @@ def _spend(sim, agent, amount: float, cat: str, step: int, sim_min: int,
                 payload["paid"] = round(actual, 1)
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                              kind="spend", x=agent.x, y=agent.y, payload=payload))
-        if _government_on(sim):                 # 消費税を内訳計上(価格は名目不変)
-            _record_consumption_tax(sim, agent, amount, cat, step, sim_min)
+        if _government_on(sim):                 # 消費税を内訳計上(★課税標準=実支払。B6)
+            _record_consumption_tax(sim, agent, actual, cat, step, sim_min)
         return
     acc = sim.economy["accounts"]
     method = None
@@ -750,8 +761,9 @@ def _spend(sim, agent, amount: float, cat: str, step: int, sim_min: int,
         payload["chosen"] = True
     if item is not None:                        # 物流②: 買った物(会計不変=金額は変えない)
         payload["item"] = item
-    if sfc_on:                                  # IF-E2: 受け手へ入金(現金+口座の実減少額が実支払)
-        actual = before - (agent.money + float(getattr(agent, "account", 0.0) or 0.0))
+    # 実支払 = 現金 + 口座の実減少額(ATM 引き出しは内部移動なので相殺されて効かない)
+    actual = before - (agent.money + float(getattr(agent, "account", 0.0) or 0.0))
+    if sfc_on:                                  # IF-E2: 受け手へ入金(実支払を基準に配る)
         payee = sfc_mod.on_spend(sim, agent, amount, actual, cat, step, sim_min,
                                  payee_node=payee_node)
         if payee is not None:
@@ -760,8 +772,8 @@ def _spend(sim, agent, amount: float, cat: str, step: int, sim_min: int,
             payload["paid"] = round(actual, 1)
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                          kind="spend", x=agent.x, y=agent.y, payload=payload))
-    if _government_on(sim):                     # 消費税を内訳計上(価格は名目不変)
-        _record_consumption_tax(sim, agent, amount, cat, step, sim_min)
+    if _government_on(sim):                     # 消費税を内訳計上(★課税標準=実支払。B6)
+        _record_consumption_tax(sim, agent, actual, cat, step, sim_min)
 
 
 def _settle_work(sim, agent, step: int, sim_min: int) -> None:
@@ -3219,14 +3231,20 @@ def _decide_rounds(sim, active: list, step: int, sim_min: int, workers: int,
 # ---------------------------------------------------------------- 検索エンジン
 def _search_index(sim, query: str) -> list[str]:
     """シミュ内検索エンジン(世界内データベース)。実APIは使わない(D13 再現性
-    +架空世界の閉性)。索引 = 語彙の来歴 / ニュース / 実在 POI(OSM)。"""
+    +架空世界の閉性)。索引 = 語彙の来歴 / ニュース / 実在 POI(OSM)。
+
+    ★A9(第117 レーンE): 拡散回数は ``Item.transmissions_count``(int)から読む。
+      以前は ``len(item.transmissions)`` = **観測用の明細台帳**を直接読んでいたので、
+      台帳の実装(上限を掛ける・明細を外へ出す)を変えるとプロンプトが動いてしまった。
+      counter は ``provenance.transmit`` が list と同じ 1 箇所で更新するので
+      **値は常に len と同値** = 生成される文字列は 1 バイトも変わらない。"""
     results: list[str] = []
     item = sim.labels.text_to_item.get(query)
     if item is not None:
         src = "メディア発表" if item.creator == -1 else \
             f"{sim.agent_by_id[item.creator].name}が言い始めた"
         results.append(f"「{query}」: 最近使われ始めた言葉({src}、"
-                       f"{len(item.transmissions)}回拡散)")
+                       f"{int(getattr(item, 'transmissions_count', 0))}回拡散)")
     for article in reversed(sim.net.news[-8:]):
         if query in article["title"] or query in article["text"]:
             results.append(f"ニュース: {article['title']} — {article['text'][:40]}")
@@ -3900,6 +3918,19 @@ def _log_rent(sim, agent, amount: float, paid: float, step: int, sim_min: int,
                          kind="rent", x=agent.x, y=agent.y, payload=payload))
 
 
+# --------------------------------------------------------- 死者の除外規約(★B7・第117 レーンE)
+# `health._die` は **sim.agents から個体を抜かない**(他レーンが持つ反復の前提を壊さないため)。
+# 死は `dead=True` + `loc="outside"` + 実質無限の `return_at` で表現され、`sick` は
+# `_clear_severity` で False に戻る。したがって「病気だから飛ばす」系の門は死者を素通しし、
+# 経済 5 フェーズ(月給まとめ・家賃引落・WAGE 日次清算・日銭/利息/固定費・公務員給与・困窮者給付)
+# は死者の口座を動かし続けていた(相続で空にした財布へ給料が振り込まれる)。
+# 除外規約は `_work_office_output` / `_phase_work_service`(レーン甲)と同じ `dead` 判定を使う。
+#
+# ★**除外条件は `dead` だけ**である。`loc == "outside"` を足してはならない:
+#   プール回転で街の外に居る個体へ、戻った最初の清算日に給料日を遡って払う
+#   **不在時キャッチアップ支給**(第112 WAGE の `_wage_fires` 区間判定)が設計仕様であり、
+#   「振込は在不在に関わらず着金する」という現実の意味論そのものだからである。
+#   在場を条件にした瞬間、通勤者・回転層の給与が構造的に消える。
 def _phase_accounts_day(sim, step: int, sim_min: int) -> None:
     """口座 E5 の暦日境界(1日=144step、run開始日=1日として day%30)。
 
@@ -3922,6 +3953,8 @@ def _phase_accounts_day(sim, step: int, sim_min: int) -> None:
     rent_dom = payday % 30 + 1                      # 給料日の翌日
     share = float(acc["rent_share"])
     for agent in sim.agents:
+        if getattr(agent, "dead", False):
+            continue                            # ★B7: 死者(_die は sim.agents から抜かない)
         if agent.visitor:
             continue
         if agent.rent_due > 0.0 and agent.account > 0.0:   # 繰越家賃をまず回収
@@ -4239,6 +4272,8 @@ def _phase_wage_profile(sim, step: int, sim_min: int) -> None:
         return
     sim._wage_day = day
     for agent in sim.agents:                           # id 昇順(sim.agents の順)= 決定論
+        if getattr(agent, "dead", False):
+            continue                                   # ★B7: 死者に給料日は来ない
         role = _role_plan(sim, agent)                  # §ROLE(第114 1a)を先に見る
         if role is not None:
             _role_settle(sim, agent, role, cfg, day, step, sim_min)
@@ -4281,6 +4316,8 @@ def _phase_daily(sim, step: int, sim_min: int) -> None:
     bank_on = _bank_on(sim)                                          # E-W1 預金利息(既定 OFF=付与なし)
     bcfg = sim.economy["bank"]
     for agent in sim.agents:
+        if getattr(agent, "dead", False):
+            continue                # ★B7: 死者に日銭も利息も固定費も生活圧も発生しない
         # 相対的剥奪: 参照中央値を下回る量(正規化差)に応じた不満。当日の稼ぎ・固定費控除の前の
         # 所持金で判定=中央値と同一基準(rd_coef==0 なら ref_median=None でこのブロックごとスキップ)。
         # ここは grievance state の**個体差復活**のみを目的とする(飽和を破り R²(k) 測定に分散を戻す)。
@@ -4336,6 +4373,8 @@ def _gov_payroll(sim, gov, step: int, sim_min: int) -> None:
     行政のペイロールとして日次で予算から直接支給する(WAGE_CAT 外=gig/本業と二重にならない)。
     sim.agents は id 昇順・乱数なし(決定論)。通勤(来街)公務員もこの街で働く扱いで支給。"""
     for agent in sim.agents:
+        if getattr(agent, "dead", False):
+            continue                               # ★B7: 死者は公務員名簿から外れる
         pay = civil_servant_pay(agent.occupation, sim.economy)
         if pay is None:
             continue
@@ -4354,6 +4393,8 @@ def _gov_benefits(sim, gov, step: int, sim_min: int) -> None:
         return
     accounts_on = _accounts_on(sim)
     for agent in sim.agents:
+        if getattr(agent, "dead", False):
+            continue                               # ★B7: 死者は給付の対象ではない
         if agent.visitor:
             continue
         total = agent.money + (agent.account if accounts_on else 0.0)

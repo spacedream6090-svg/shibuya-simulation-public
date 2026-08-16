@@ -903,3 +903,150 @@ def test_collapse_does_not_add_a_morning_plan_call(tmp_path):
         sim.run()
         calls.append(sim.llm.calls)
     assert calls[0] == calls[1], f"倒れた個体の起床が LLM 呼を増やした: {calls}"
+
+
+# =========================================================================== #
+# B4(第118 レーンC): ``_co_state`` を checkpoint で運ぶ
+#
+#   救急の 1 日上限(``calls_by_day``)と夜間清掃の「1 棟 1 晩 1 件」(``cleaned_night``)、
+#   役割バインドの日次追随(``day`` / ``bind`` / ``bind_by_day``)は **世界側の状態**で、
+#   agents pickle には載らない。未保存だったため resume 直後にどちらのガードも 0 へ戻り、
+#   同じ日に上限ぶんもう一度出動し、同じ棟の ``night_cleaning`` がもう 1 件出ていた
+#   (第80 W2 と同型。ただし状態の本体が sim 側にあるので trace_state 族の中央管理)。
+# =========================================================================== #
+def _ckpt(sim, tmp_path, name, step=100):
+    from society.engine import checkpoint
+    return checkpoint.save(sim, step,
+                           tmp_path / name / "checkpoint" / f"ckpt-{step:06d}.pkl.gz")
+
+
+def _ems_cap_stage(tmp_path, name):
+    """全員が病人・上限 1 件の舞台(既存 ``test_calls_are_capped_per_day`` と同じ作り)。"""
+    sim = _sim(tmp_path, name, n_steps=1, n_agents=40,
+               **{**ON, **HEALTH_ON, "city_ops.ems.max_calls_per_day": "1",
+                  "city_ops.ems.collapse_per_10k": "10000"})
+    node = sorted(sim.city.graph.nodes)[0]
+    CO.bind(sim)
+    for a in sorted(sim.agents, key=lambda x: int(x.id)):
+        a.occupation = "会社員"
+        a.sick = True
+        _place(sim, a, node)
+    return sim
+
+
+#: 07:00 開始なので step 102 で暦日が変わる(= 同じ日に残っている step の上限)。
+_DAY_END_STEP = 102
+
+
+def _collapse_slots(sim) -> list[int]:
+    """全員の「その日の何 step 目に倒れるか」(実装と同じ純関数を素で再現・昇順)。"""
+    spd = max(1, int(sim.clock.steps_per_day))
+    return sorted(CO._stable_hash(f"collapse_slot/{int(a.id)}/0") % spd
+                  for a in sim.agents)
+
+
+def test_ems_daily_cap_survives_a_checkpoint(tmp_path):
+    """★① 昼のうちに上限へ達した日は、resume しても追加の出動が出ない。"""
+    from society.engine import checkpoint
+
+    src = _ems_cap_stage(tmp_path, "co_cap_src")
+    slots = _collapse_slots(src)
+    split = slots[0] + 1                        # 上限に達した**直後**で checkpoint
+    rest = [s for s in slots[1:] if split <= s < _DAY_END_STEP]
+    assert rest, "同じ日に 2 人目が倒れない舞台(n_agents/split の再調整が要る)"
+    for step in range(split):
+        CO.phase(src, step, 420 + step * 10)
+    assert len(_kind(src, "ems_call")) == 1, "上限に達していない(舞台の前提が崩れた)"
+    day_cap = dict(src._co_state["calls_by_day"])
+    p = _ckpt(src, tmp_path, "co_cap_src", step=split)
+
+    dst = _ems_cap_stage(tmp_path, "co_cap_dst")
+    assert checkpoint.load(dst, p) == split
+    assert dict(dst._co_state["calls_by_day"]) == day_cap, "日次カウンタが戻っていない"
+    for step in range(split, _DAY_END_STEP):    # ★同じ暦日の残り(2 人目の slot を含む)
+        CO.phase(dst, step, 420 + step * 10)
+    assert not _kind(dst, "ems_call"), "resume 後に同じ日の出動が二重に出ている"
+
+    # 負の対照: カウンタを捨てれば必ずもう 1 件出る(= この検査は空回りしていない)
+    naive = _ems_cap_stage(tmp_path, "co_cap_naive")
+    checkpoint.load(naive, p)
+    naive._co_state["calls_by_day"] = {}
+    for step in range(split, _DAY_END_STEP):
+        CO.phase(naive, step, 420 + step * 10)
+    assert _kind(naive, "ems_call"), "対照が発火しない(舞台/step 範囲の再調整が要る)"
+
+
+def test_night_cleaning_guard_survives_a_checkpoint(tmp_path):
+    """★② 夜帯(22:00-05:00)の途中で resume しても同じ棟の再清掃が出ない。"""
+    from society.engine import checkpoint
+
+    src, worker = _clean_stage(tmp_path, "co_nc_src")
+    CO.phase(src, 0, 22 * 60)
+    assert len(_kind(src, "night_cleaning")) == 1, "1 件目が出ていない(舞台の前提が崩れた)"
+    night_id = int(22 * 60) // 1440
+    assert str(worker.city_ops_clean_building) in src._co_state["cleaned_night"][night_id]
+    p = _ckpt(src, tmp_path, "co_nc_src", step=1)
+
+    dst, _w = _clean_stage(tmp_path, "co_nc_dst")
+    assert checkpoint.load(dst, p) == 1
+    for i in range(1, 8):                       # 同じ晩の残り(22:10〜23:10)
+        CO.phase(dst, i, 22 * 60 + i * 10)
+    assert not _kind(dst, "night_cleaning"), "resume 後に同じ晩の清掃が二重に出ている"
+    CO.phase(dst, 200, 1440 + 22 * 60)          # 翌晩は別の晩 = ちゃんと出る
+    assert len(_kind(dst, "night_cleaning")) == 1, "翌晩まで抑止されている(過剰抑止)"
+
+    # 負の対照: 1 晩ガードを捨てれば必ずもう 1 件出る
+    naive, _w2 = _clean_stage(tmp_path, "co_nc_naive")
+    checkpoint.load(naive, p)
+    naive._co_state["cleaned_night"] = {}
+    CO.phase(naive, 1, 22 * 60 + 10)
+    assert len(_kind(naive, "night_cleaning")) == 1
+
+
+def test_co_state_roundtrips_including_the_bind_ledger(tmp_path):
+    """束ねの日次追随(day / bind / bind_by_day / rebinds)も往復で戻る。"""
+    from society.engine import checkpoint
+
+    src = _sim(tmp_path, "co_rt_src", n_steps=1, n_agents=12, **ON)
+    CO.phase(src, 0, 420)
+    st = src._co_state
+    assert st["bound"] and st["bind_by_day"], "束ねが走っていない(前提が崩れた)"
+    st["calls_by_day"][3] = 7                   # 実ランで出にくい欄も表で押さえる
+    st["cleaned_night"][2] = {"bldg-9": 1}
+    st["rounds_by_kind"]["ward"] = 5
+    p = _ckpt(src, tmp_path, "co_rt_src", step=9)
+
+    dst = _sim(tmp_path, "co_rt_dst", n_steps=1, n_agents=12, **ON)
+    assert checkpoint.load(dst, p) == 9
+    assert dst._co_state == st, "_co_state が 1 件でも欠けている"
+    # ★集合を 1 つも持たない(= pickle の集合反復順非保存の影響を受けない)ことの機械固定
+    def _no_set(obj, path="_co_state"):
+        assert not isinstance(obj, (set, frozenset)), f"{path} に集合が混ざった"
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                _no_set(v, f"{path}[{k!r}]")
+        elif isinstance(obj, (list, tuple)):
+            for i, v in enumerate(obj):
+                _no_set(v, f"{path}[{i}]")
+    _no_set(dst._co_state)
+
+
+def test_old_checkpoint_without_co_state_keeps_legacy_behaviour(tmp_path):
+    """``co_state`` を持たない旧 checkpoint でも落ちず、従来どおり遅延生成へ落ちる。"""
+    import gzip
+    import pickle
+
+    from society.engine import checkpoint
+
+    src = _sim(tmp_path, "co_old_src", n_steps=1, n_agents=12, **ON)
+    CO.phase(src, 0, 420)
+    p = _ckpt(src, tmp_path, "co_old_src", step=4)
+    with gzip.open(p, "rb") as f:
+        blob = pickle.loads(f.read())
+    blob["runtime"].pop("co_state", None)
+    with gzip.open(p, "wb") as f:
+        f.write(pickle.dumps(blob, protocol=pickle.HIGHEST_PROTOCOL))
+
+    dst = _sim(tmp_path, "co_old_dst", n_steps=1, n_agents=12, **ON)
+    assert checkpoint.load(dst, p) == 4
+    assert getattr(dst, "_co_state", None) is None      # 旧 ckpt = 従来どおり

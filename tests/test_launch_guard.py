@@ -125,6 +125,90 @@ def test_banner_is_read_only():
 
 
 # --------------------------------------------------------------------------- #
+# A7(第118 レーンC): 使用済み run dir への fresh 起動を拒否
+#
+#   同名 (`run.name`) の再実行は、前回の `*.part-*.parquet` を finalize が黙って結合し
+#   (observer/finalize.py の glob は無条件)、前回の `llm_cache.jsonl` を再生する
+#   (llm/cache.py が起動時に丸ごと読む)= **2 つのランが混ざった成果物**。しかも L1 は
+#   完全に正常な形をしているので事後に気づけない。起動口で落とす。
+# --------------------------------------------------------------------------- #
+def _dirty_cfg(tmp_path, name="dirty", **ov):
+    dot = ["model.backend=mock", "run.n_agents=4", "run.n_steps=2",
+           f"run.name={name}", f"run.out_dir={tmp_path.as_posix()}"]
+    dot += [f"{k}={v}" for k, v in ov.items()]
+    return load_config(dot)
+
+
+def test_out_dir_resolution_matches_the_simulation(tmp_path):
+    """★起動口の run dir 計算が Simulation.__init__ と同一(ずれたらガードが空振りする)。"""
+    cfg = _dirty_cfg(tmp_path, "resolv")
+    assert RUN.resolve_out_dir(cfg) == Simulation(cfg).out_dir
+
+
+def test_clean_or_missing_out_dir_passes(tmp_path):
+    """存在しない dir / 無関係なファイルしか無い dir は素通り(既定の起動は無風)。"""
+    RUN.check_dirty_outdir(_dirty_cfg(tmp_path, "never_used"))
+    used = tmp_path / "harmless"
+    used.mkdir()
+    for stem in ("config.yaml", "run.out.log", "agents.json", "summary.json"):
+        (used / stem).write_text("x", encoding="utf-8")
+    RUN.check_dirty_outdir(_dirty_cfg(tmp_path, "harmless"))
+
+
+@pytest.mark.parametrize("rel", [
+    "l1_events.part-0000.parquet",          # finalize の glob が無条件に結合する
+    "l2_metrics.part-0003.parquet",
+    "l1_events.parquet",                    # 完走済みの成果物を黙って上書きしない
+    "checkpoint/ckpt-000144.pkl.gz",        # --resume の意図だった可能性
+    "checkpoint/dormant-000144.pkl.gz",
+    "llm_cache.jsonl",                      # 起動時に丸ごと読み戻される
+    "llm_cache.rank0.jsonl",
+])
+def test_fresh_start_rejects_a_used_out_dir(tmp_path, rel):
+    d = tmp_path / "used"
+    (d / rel).parent.mkdir(parents=True, exist_ok=True)
+    (d / rel).write_bytes(b"x")
+    with pytest.raises(RuntimeError) as exc:
+        RUN.check_dirty_outdir(_dirty_cfg(tmp_path, "used"))
+    msg = str(exc.value)
+    assert Path(rel).name in msg, f"当たったファイル名が案内に無い:\n{msg}"
+    assert "--resume" in msg and "run.name" in msg, "取るべき手が案内されていない"
+    assert "run.allow_dirty_outdir=true" in msg, "逃し弁の名前が案内に無い"
+
+
+def test_escape_hatch_allows_writing_into_a_used_dir(tmp_path):
+    """`run.allow_dirty_outdir=true` = 「承知の上で重ねて書く」の明示 → 通す。"""
+    d = tmp_path / "hatch"
+    d.mkdir()
+    (d / "l1_events.part-0000.parquet").write_bytes(b"x")
+    with pytest.raises(RuntimeError):
+        RUN.check_dirty_outdir(_dirty_cfg(tmp_path, "hatch"))
+    RUN.check_dirty_outdir(_dirty_cfg(tmp_path, "hatch",
+                                      **{"run.allow_dirty_outdir": "true"}))
+
+
+def test_dirty_check_is_read_only(tmp_path):
+    """検査はファイルを 1 つも作らない/消さない(観測が世界を変えない)。"""
+    d = tmp_path / "ro"
+    d.mkdir()
+    (d / "l1_events.part-0000.parquet").write_bytes(b"x")
+    before = sorted(p.name for p in d.iterdir())
+    with pytest.raises(RuntimeError):
+        RUN.check_dirty_outdir(_dirty_cfg(tmp_path, "ro"))
+    assert sorted(p.name for p in d.iterdir()) == before
+    assert RUN.dirty_outdir_hits(tmp_path / "does_not_exist") == []
+
+
+def test_dirty_hits_are_bounded(tmp_path):
+    """案内は有界(part が 1000 本あってもエラーメッセージが暴れない)。"""
+    d = tmp_path / "many"
+    d.mkdir()
+    for i in range(30):
+        (d / f"l1_events.part-{i:04d}.parquet").write_bytes(b"x")
+    assert len(RUN.dirty_outdir_hits(d)) == 6
+
+
+# --------------------------------------------------------------------------- #
 # β6 (3) scripts/freeze_config.py
 # --------------------------------------------------------------------------- #
 def test_frozen_config_reresolves_identically(tmp_path):

@@ -30,6 +30,18 @@ seed の自動採取(第54バッチ 2026-07-23。純観察=不確実性許容モ
       - `print_banner()` … backend / モデル名 / servers 数 / pool dir / present_cap /
         lod.max_llm_per_step を stdout へ 1 回だけ出す(目視 1 秒で条件を確かめられる)。
     どちらも **世界へは 1 バイトも触らない**(Simulation はこの 2 関数の存在を知らない)。
+
+使用済み run dir への fresh 起動を拒否(A7。第118 レーンC 2026-08-16):
+    `--resume` **なし**の起動で、出力先に前回ランの痕跡(`*.part-*.parquet` /
+    `l1_events.parquet` / `checkpoint/*.pkl.gz` / `llm_cache*.jsonl`)が在れば
+    `check_dirty_outdir()` が起動時に RuntimeError を出す。理由は 2 つとも「静かに
+    壊れる」型である:
+      - finalize は `glob("<stem>.part-*.parquet")` を無条件に結合するので、前回の
+        part が残っていると**別の世界のイベントが今回の canonical に混ざる**。
+      - `llm_cache.jsonl` は起動時に丸ごと読み戻されるので、新しいランのつもりが
+        前回の応答の再生になり得る。
+    逃し弁は `run.allow_dirty_outdir=true`(既定 false)。これも起動口だけの制御フラグで
+    世界は 1 度も読まない(`run.seed_auto` / `run.allow_mock_production` と同じ族)。
 """
 from __future__ import annotations
 
@@ -47,6 +59,72 @@ from society.engine.simulation import Simulation  # noqa: E402
 
 #: β6: 「本番規模」とみなす名目エージェント数の下限(監査 E0-4 の推奨線)。
 MOCK_PRODUCTION_MIN_AGENTS = 10_000
+
+#: A7(第118 レーンC): 「この run dir は既に使われている」ことを示す痕跡の glob。
+#: どれも **fresh 起動で踏むと出力が壊れる** ものだけを挙げる:
+#:   - `*.part-*.parquet` … finalize は `glob(f"{stem}.part-*.parquet")` を**無条件に**
+#:     結合する(observer/finalize.py)。前回ランの part が残っていれば、別の世界の
+#:     イベントが今回の canonical へ**そのまま混入**する(検出手段は無い)。
+#:   - `l1_events.parquet` … 完走済みの成果物。fresh 起動は黙って上書きする。
+#:   - `checkpoint/*.pkl.gz` … 前回の世代。--resume の意図だった可能性が高い。
+#:   - `llm_cache*.jsonl` … 起動時に丸ごと読み戻される(llm/cache.py)。前回ランの
+#:     応答が今回の別プロンプトに当たることは無いが、**同じプロンプトには必ず当たる**
+#:     ので「新しいランのつもりが前回の応答の再生」になり得る。
+DIRTY_OUTDIR_GLOBS = (
+    "*.part-*.parquet",
+    "l1_events.parquet",
+    "checkpoint/ckpt-*.pkl.gz",
+    "checkpoint/dormant-*.pkl.gz",
+    "llm_cache*.jsonl",
+)
+
+
+def resolve_out_dir(cfg) -> Path:
+    """cfg から run dir を求める(Simulation.__init__ と**同じ式**。読むだけ)。"""
+    from society.config import REPO_ROOT
+    name = cfg.run.get("name", None) or f"seed{cfg.run.get('seed', '')}"
+    return REPO_ROOT / str(cfg.run.get("out_dir", "runs")) / str(name)
+
+
+def dirty_outdir_hits(out_dir: Path | str, limit: int = 6) -> list[str]:
+    """`out_dir` にある「使用済みの痕跡」(相対パス)。無ければ空 list(純粋な読み取り)。"""
+    root = Path(out_dir)
+    if not root.is_dir():
+        return []
+    hits: list[str] = []
+    for pat in DIRTY_OUTDIR_GLOBS:
+        for p in sorted(root.glob(pat)):
+            hits.append(p.relative_to(root).as_posix())
+            if len(hits) >= limit:
+                return hits
+    return hits
+
+
+def check_dirty_outdir(cfg) -> None:
+    """非 resume 起動が**既に使われている run dir** を踏むのを拒否する(A7)。
+
+    同名 (`run.name`) の再実行は、前回の `*.part-*.parquet` を finalize が黙って
+    結合し、前回の `llm_cache.jsonl` を再生する = **2 つのランが混ざった成果物**を
+    作る。しかも L1 は完全に正常な形をしているので事後に気づけない。ここで落とす。
+
+    逃し弁は `run.allow_dirty_outdir=true`(「同じ dir へ重ねて書くのが目的」の明示)。
+    ★シム本体はこのキーを 1 度も読まない(`run.seed_auto` /
+      `run.allow_mock_production` と同じ **起動口だけの制御フラグ**)= ON/OFF で
+      世界も L1 も 1 バイトも変わらない。conf 未搭載なので既定は false。
+    """
+    if bool(cfg.run.get("allow_dirty_outdir", False)):
+        return
+    out_dir = resolve_out_dir(cfg)
+    hits = dirty_outdir_hits(out_dir)
+    if hits:
+        raise RuntimeError(
+            f"出力先 {out_dir} は既に使われています(前回ランの痕跡: "
+            f"{', '.join(hits)})。このまま新規起動すると、前回の part parquet が"
+            " finalize で今回の成果物へ混入し、前回の llm_cache が再生されます。\n"
+            "  - 続きを回すつもりなら: python scripts/run.py --resume "
+            f"{out_dir}\n"
+            "  - 別のランなら: run.name=<別の名前> を指定してください。\n"
+            "  - 承知の上で重ねて書くなら: run.allow_dirty_outdir=true")
 
 
 def check_mock_production(cfg) -> None:
@@ -188,6 +266,7 @@ def main() -> None:
         print(f"[seed] auto-sampled run.seed={sampled} "
               f"(OS エントロピー採取。config.yaml/summary.json に記録=同 seed で完全再現可)")
     check_mock_production(cfg)                     # β6: 起動ガード(構築の前に落とす)
+    check_dirty_outdir(cfg)                        # A7: 使用済み run dir への fresh 起動を拒否
     print_banner(cfg)
     sim = Simulation(cfg)
     summary = sim.run()

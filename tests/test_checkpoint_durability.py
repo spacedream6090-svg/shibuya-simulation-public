@@ -156,3 +156,131 @@ def test_torn_checkpoint_without_guard_would_fail(tmp_path):
     sim = Simulation(_cfg("proof", 40), out_dir=tmp_path / "proof")
     with pytest.raises((gzip.BadGzipFile, EOFError, OSError, pickle.UnpicklingError)):
         checkpoint.load(sim, torn)             # マーカー無しを直に読ませればこうなる
+
+
+# =========================================================================== #
+# A6(第118 レーンC): COMPLETE マーカーを**世代トランザクションの最後**へ
+#
+#   1 世代 = ① checkpoint 本体 ② pool サイドカー(pool ON) ③ 全 flush_segment。
+#   旧順序は①の直後にマーカーを置いていたので、「マーカーは在るが②③が無い」世代が
+#   生まれ得た(= latest() が完成扱いで掴み、L1 が最大 checkpoint 間隔ぶん欠落する)。
+#   ここでは engine の順序そのものと、障害注入 3 窓(①後 / マーカー後 / 全完了)を固定する。
+# =========================================================================== #
+def test_save_without_complete_flag_leaves_no_marker(tmp_path):
+    """`save(..., complete=False)` は本体だけを置く(= まだ latest() の候補にならない)。
+
+    ★既存の後方互換規則(マーカーが**1 つも無い**ディレクトリは全候補を許す)は
+      1 バイトも変えていないので、判定は「完成した世代が 1 つでもある dir」で見る。
+    """
+    sim = _sim_at(tmp_path, "nc", 12)
+    ck = tmp_path / "nc" / "checkpoint"
+    old = checkpoint.save(sim, 6, ck / "ckpt-000006.pkl.gz")            # 完成した世代
+    path = checkpoint.save(sim, 12, ck / "ckpt-000012.pkl.gz", complete=False)
+    assert path.exists(), "本体が置かれていない"
+    assert not checkpoint.complete_marker(path).exists(), "マーカーが書かれている"
+    assert checkpoint.latest(tmp_path / "nc") == old, "未コミット世代を latest が拾った"
+    assert checkpoint.complete_generations(tmp_path / "nc") == [old]
+    # 明示コミットで初めて候補になる(= 世代のコミット点が 1 点に集まっている)
+    checkpoint.write_complete_marker(path)
+    assert checkpoint.latest(tmp_path / "nc") == path
+    assert checkpoint.complete_generations(tmp_path / "nc") == [old, path]
+
+
+def test_engine_commits_the_marker_after_the_flush(tmp_path, monkeypatch):
+    """★順序の直接証明: マーカーが書かれる瞬間、その世代の part は**もう在る**。
+
+    旧順序(本体 rename → マーカー → sidecar → flush)ではここが空になる = このテストは
+    順序が戻れば必ず落ちる(空回りしない)。
+    """
+    seen: list[list[str]] = []
+    real = checkpoint.write_complete_marker
+
+    def _spy(path):
+        out_dir = Path(path).parent.parent
+        seen.append(sorted(p.name for p in out_dir.glob("l1_events.part-*.parquet")))
+        return real(path)
+
+    monkeypatch.setattr(checkpoint, "write_complete_marker", _spy)
+    d = tmp_path / "order"
+    Simulation(_cfg("order", 40, **{"observer.checkpoint_every": 20}),
+               out_dir=d).run()
+    assert len(seen) == 2, f"checkpoint が 2 世代ぶん走っていない: {seen}"
+    assert seen[0] == ["l1_events.part-0000.parquet"], \
+        "1 世代目のマーカーが flush より前に書かれている"
+    assert seen[1] == ["l1_events.part-0000.parquet", "l1_events.part-0001.parquet"], \
+        "2 世代目のマーカーが flush より前に書かれている"
+
+
+def test_resume_falls_back_from_an_uncommitted_generation(tmp_path):
+    """障害注入①: 本体は完全に書けたがマーカー前に停止 → **一つ前の完全世代**から再開。
+
+    ★`test_latest_skips_unmarked_generation` との違い: あちらの新しい世代は**壊れて**
+      いるが、こちらは中身が完全に正しい checkpoint である。それでも「まだコミット
+      されていない」= sidecar も part も無い世代なので掴んではいけない。
+    """
+    straight = tmp_path / "unc_straight"
+    Simulation(_cfg("unc_straight", 40), out_dir=straight).run()
+
+    d = tmp_path / "unc"
+    every = {"observer.checkpoint_every": 20}
+    sim1 = Simulation(_cfg("unc", 20, **every), out_dir=d)
+    for step in range(20):
+        scheduler.run_step(sim1, step)
+    checkpoint.save(sim1, 20, d / "checkpoint" / "ckpt-000020.pkl.gz")   # 完成した世代
+    sim1.logger.flush_segment()
+    for step in range(20, 30):                       # ★次の世代の本体だけ書いて停止
+        scheduler.run_step(sim1, step)
+    uncommitted = checkpoint.save(sim1, 30, d / "checkpoint" / "ckpt-000030.pkl.gz",
+                                  complete=False)
+    assert uncommitted.exists() and not checkpoint.complete_marker(uncommitted).exists()
+    assert checkpoint.latest(d).name == "ckpt-000020.pkl.gz", "未コミット世代を選んだ"
+
+    sim2 = Simulation(_cfg("unc", 40, **every), out_dir=d)
+    assert sim2._pick_resume_checkpoint(d).name == "ckpt-000020.pkl.gz"
+    sim2.run(resume_from=d)
+    assert _rows(d) == _rows(straight), "未コミット世代へ戻った resume が straight と不一致"
+
+
+def test_resume_uses_the_generation_once_it_is_committed(tmp_path):
+    """障害注入③(対照): 全部書き終わった世代は、その世代からそのまま再開する。"""
+    straight = tmp_path / "cmt_straight"
+    Simulation(_cfg("cmt_straight", 40), out_dir=straight).run()
+
+    d = tmp_path / "cmt"
+    every = {"observer.checkpoint_every": 10}
+    Simulation(_cfg("cmt", 30, **every), out_dir=d).run()   # 30 step で正常終了
+    marks = sorted(p.name for p in (d / "checkpoint").glob("*.complete"))
+    assert marks == ["ckpt-000010.pkl.gz.complete", "ckpt-000020.pkl.gz.complete",
+                     "ckpt-000030.pkl.gz.complete"], f"世代のコミットが欠けている: {marks}"
+
+    sim2 = Simulation(_cfg("cmt", 40, **every), out_dir=d)
+    assert sim2._pick_resume_checkpoint(d).name == "ckpt-000030.pkl.gz", \
+        "完全世代なのに前へ戻った(過剰な後退)"
+    sim2.run(resume_from=d)
+    assert _rows(d) == _rows(straight)
+
+
+def test_resume_refuses_when_later_segments_are_already_on_disk(tmp_path):
+    """世代より**先**の part が残っていれば落とす(黙って L1 を二重にしない)。
+
+    マーカーを最後に置く順序では「flush は済んだがマーカー前に停止」した世代が
+    ありうる。そこで一つ前へ戻ると、確定済みの区間を再実行して finalize が同じ
+    イベントを 2 回結合してしまう。checkpoint が運ぶ `log_seg` でこれを検出する。
+    """
+    d = tmp_path / "seg"
+    every = {"observer.checkpoint_every": 20}
+    sim1 = Simulation(_cfg("seg", 20, **every), out_dir=d)
+    for step in range(20):
+        scheduler.run_step(sim1, step)
+    checkpoint.save(sim1, 20, d / "checkpoint" / "ckpt-000020.pkl.gz")
+    sim1.logger.flush_segment()                       # part-0000(= 世代 20 の対)
+    for step in range(20, 30):                        # ★次の世代は flush まで済んで
+        scheduler.run_step(sim1, step)                #   マーカー前に停止した、という状態
+    sim1.logger.flush_segment()
+    assert sorted(p.name for p in d.glob("l1_events.part-*.parquet")) == [
+        "l1_events.part-0000.parquet", "l1_events.part-0001.parquet"]
+
+    sim2 = Simulation(_cfg("seg", 40, **every), out_dir=d)
+    with pytest.raises(RuntimeError) as exc:
+        sim2.run(resume_from=d)
+    assert "part-0001" in str(exc.value) and "二重" in str(exc.value)

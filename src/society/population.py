@@ -274,6 +274,9 @@ def _state(sim) -> dict:
             "money_exported": 0.0,      # 転出者が域外へ持ち出した現金 + 口座の累計
             "money_frozen": 0.0,        # ★org 会計 OFF のランで凍結したまま置いた額
             "considered": {"emigrate": 0, "settle": 0, "birth": 0},   # 走査した候補数
+            # ★B8: 資格を満たしたのに機構が受理しなかった候補の理由別内訳(正直開示)。
+            #   候補は `considered` に数えたうえで、なぜ落としたかを 1 行残す。
+            "skipped": {},
         }
         sim._pop_state = st
     return st
@@ -825,6 +828,27 @@ def _couple_of(sim, agent, spouses: bool):
     return _hh.spouse_of(sim, agent)
 
 
+def _note_skip(st: dict, lane: str, reason: str) -> None:
+    """「資格は満たしたが受理しなかった」理由を台帳に 1 件積む(観測専用・L1 は増やさない)。
+
+    旧 checkpoint から復元した台帳にはキーが無いので ``setdefault`` で生やす。
+    """
+    sk = st.setdefault("skipped", {})
+    key = f"{lane}:{reason}"
+    sk[key] = int(sk.get(key, 0)) + 1
+
+
+def _split_household(lo, hi) -> bool:
+    """両親が**別々の世帯に所属している**か(= 出生を受理できないペアか)。
+
+    ``household_id`` が**両方とも非 None かつ異なる**ときだけ True。片方 None(未所属)は
+    既存世帯への合流で閉じられるので False、両方 None は新設で閉じられるので False。
+    """
+    a = getattr(lo, "household_id", None)
+    b = getattr(hi, "household_id", None)
+    return bool(a) and bool(b) and str(a) != str(b)
+
+
 def _births_day(sim, st: dict, day: int, step: int, sim_min: int) -> None:
     cfg = cfg_of(sim)["births"]
     seed = int(cfg["seed"])
@@ -846,6 +870,16 @@ def _births_day(sim, st: dict, day: int, step: int, sim_min: int) -> None:
             continue
         seen.add(pair)
         st["considered"]["birth"] += 1
+        # ★B8(第117 レーンE): **別世帯どうしの夫婦は出生の対象にしない**。
+        #   到達経路は `partner_id`(household.bond() は関係を張るだけで世帯を統合しない)。
+        #   `_birth` は hh_id を lo 側優先で 1 つだけ選び、**両親双方**の housemates に
+        #   子を足すので、lo=hh_A / hi=hh_B のペアからは「2 つの世帯に同時に属する子」が
+        #   生まれ、世帯サイズの合計が実人数を超える(人口会計 Σ が壊れる)。
+        #   世帯統合は住居・家賃・続柄を伴う別レーンの決定なので、ここでは**やらない**:
+        #   受理しないことを理由つきで台帳に残す(片方 None は下の合流で正しく閉じる)。
+        if _split_household(lo, hi):
+            _note_skip(st, "birth", "split_household")
+            continue
         # (i) パートナー継続日数(初観測日を起点にする = cohabit_day と同じ流儀。
         #     既定 -1 = 未観測 = pool の退避表 ``_MISC_FIELDS`` の既定値と厳密に一致)
         since = int(getattr(lo, "pop_pair_since", -1))   # ★`or -1` は day0 を潰すので書かない
@@ -891,12 +925,24 @@ def _birth(sim, st: dict, lo, hi, together: int, day: int, step: int,
         st["next_child"] = _child_base(sim)
     child = int(st["next_child"])
     st["next_child"] = child + 1
+    # ★B8(第117 レーンE): ここへ来るペアは `_births_day` の門で
+    #   「両方非 None かつ異なる」= 別世帯の組が既に落とされている。したがって残るのは
+    #     ① 両方 None      … 新しい世帯を 1 つ建てる(従来どおり)
+    #     ② 片方だけ None  … 既存世帯へ合流する。**None 側の household_id も合流先へ揃える**
+    #        (揃えないと親の一方が世帯無所属のまま子だけが housemates に載り、
+    #         「子は世帯 A の一員だが母は誰の世帯にも属さない」という不整合が残る)
+    #   これで子の所属世帯は**必ず 1 つ**になる。
     hh_id = getattr(lo, "household_id", None) or getattr(hi, "household_id", None)
     if not hh_id:
         hh_id = f"pb{int(lo.id)}_{int(hi.id)}"
         for m in (lo, hi):
             m.household_id = hh_id
             m.household_kind = "family"
+    else:
+        for m in (lo, hi):                         # ② 未所属の親を合流先へ揃える
+            if not getattr(m, "household_id", None):
+                m.household_id = hh_id
+                m.household_kind = "family"
     for m in (lo, hi):                             # 世帯サイズ +1(同居人 id に子を足す)
         mates = set(int(x) for x in (getattr(m, "housemates", None) or []))
         other = hi if m is lo else lo
@@ -942,6 +988,9 @@ def provenance(sim) -> dict | None:
         "counts": counts,
         "per_day": {k: round(v / days, 4) for k, v in counts.items()},
         "considered": dict(st["considered"]),
+        # ★B8: 資格は満たしたが機構が受理しなかった候補(理由別)。0 件でもキーは出す
+        #   = 「起きなかった」と「数えていない」を出力上で区別する。
+        "skipped": {k: int(v) for k, v in sorted((st.get("skipped") or {}).items())},
         # ★人口会計(Σ 整合): 台帳の行数とイベント件数が必ず一致する
         "ledger": {"gone": len(st["gone"]), "settled": len(st["settled"]),
                    "births": len(st["births"])},

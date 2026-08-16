@@ -26,6 +26,24 @@
   書く。`latest()` はマーカーのある checkpoint だけを最新候補にする = 書き込み途中で
   プロセスが死んだ世代を resume が掴まない。**後方互換**: マーカーが 1 つも無い
   checkpoint ディレクトリ(第117 以前のラン)は従来どおり全候補を許す。
+
+「世代」の単位(A6。第118 レーンC 2026-08-16)
+--------------------------------------------
+- checkpoint 本体だけでは 1 世代は**完成しない**。同じ step に対して
+  ① 本体 `ckpt-NNNNNN.pkl.gz` ② pool サイドカー `dormant-NNNNNN.pkl.gz`(pool ON のみ)
+  ③ L1 と各サイドカーの `flush_segment`(= part parquet)が揃って初めて
+  「その step まで完全に書けた」と言える。よって **COMPLETE マーカーは①②③の全部が
+  終わった後**に置く(= 世代トランザクションのコミット点)。
+  そのため `save()` はマーカーを**書かない**呼び方(`complete=False`)を持ち、
+  engine 側(`Simulation.run`)が最後に `write_complete_marker()` を呼ぶ。
+  ★`save()` を直に呼ぶ道具/テストは従来どおり(既定 `complete=True`)= 1 行も変えなくてよい。
+- 旧順序(本体 rename の直後にマーカー)では「マーカーは在るが sidecar と part が無い」
+  世代が生まれ得た。`latest()` はそれを完成扱いで選び、pool の復元は sidecar 欠落を
+  **黙って素通り**していたので、resume が L1 最大 checkpoint 間隔ぶんの欠落と
+  「ドーマント/退場者参照が消えた世界」を静かに引き継いだ。
+- `runtime["log_seg"]` は「この世代に対応する part セグメント番号」(= 保存直後の
+  `logger._seg`)。resume 側はこれを使って「掴もうとしている世代より**先**の part が
+  既にディスク上にある」= 再実行すると L1 が二重になる状況を検出して落とす。
 - 決定論: set は原則 membership / sorted 反復のみ(全ファイル監査済み)。順序安定の
   ため scenario.closed は sorted list で直列化して復元する。pickle はプロセス内でも
   set の反復順を保存しない(dict は保存する)ため、反復順が観測に効く箇所は sorted で
@@ -96,6 +114,10 @@ def _write_complete_marker(path: Path) -> Path:
     中身を持たせない(= 書き終わったこと自体が唯一の情報)。checkpoint 本体が
     `os.replace` で最終名に現れた**後**に作るので、マーカーの存在は「本体が完結して
     いる」ことしか意味しない。
+
+    ★A6(第118 レーンC): engine 経由の保存では、これは本体だけでなく
+      **pool サイドカーと全 flush_segment まで終わった後**に呼ばれる(= マーカーの
+      存在が「世代トランザクションがコミットされた」ことを意味する)。
     """
     marker = complete_marker(path)
     with open(marker, "wb") as f:
@@ -104,8 +126,23 @@ def _write_complete_marker(path: Path) -> Path:
     return marker
 
 
-def save(sim, step: int, path: str | Path) -> Path:
-    """シミュレーションの完全状態を pickle+gzip で保存する(原子的 rename + COMPLETE)。"""
+def write_complete_marker(path: str | Path) -> Path:
+    """世代トランザクションのコミット点(公開口。A6)。
+
+    `save(..., complete=False)` で本体を置き、pool サイドカー + 全 flush_segment を
+    終えた**最後**に呼ぶ。ここで初めて `latest()` の候補になる。
+    """
+    return _write_complete_marker(Path(path))
+
+
+def save(sim, step: int, path: str | Path, *, complete: bool = True) -> Path:
+    """シミュレーションの完全状態を pickle+gzip で保存する(原子的 rename + COMPLETE)。
+
+    `complete=False` は **COMPLETE マーカーを置かない**(A6。第118 レーンC)。
+    engine(`Simulation.run`)はこの形で本体だけを置き、pool サイドカーと全
+    `flush_segment` を終えた最後に `write_complete_marker()` を呼ぶ = 世代の
+    完成を 1 点でコミットする。既定 `True` は従来どおり(単体で呼ぶ道具/テストは無風)。
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     blob = {
@@ -217,11 +254,16 @@ def save(sim, step: int, path: str | Path) -> Path:
             # (load は .get で旧 checkpoint 互換)。
             "dayplan_state": getattr(sim, "_dayplan_state", None),
             # DPH-O 観測 4 点(observer.starvation): 返事の枯渇 / 日跨ぎの圧潰 / 計画の欠落 /
-            # purpose 別の予算許可・拒否の累積タリー(int と素の dict のみ)。**個体側の印**
-            # (agent._plan_expired_day / plan_due_step / reflect_due_step)は agents pickle に
-            # 自然同梱されるので、ここで中央管理するのは summary.starvation の材料だけ
+            # purpose 別の予算許可・拒否の累積タリー(int と素の dict のみ)。**エンジン側の印**
+            # (plan_due_step / reflect_due_step)は agents pickle に自然同梱されるので、
+            # ここで中央管理するのは summary.starvation の材料だけ
             # (第86 day_plan / 第94 IF-B と同じ型)。保存しないと mid-day resume で
             # summary の累積値が straight と食い違う。既定 OFF では state 自体が生えない。
+            # ★B9(第117 レーンE): 以前は「個体×日」の重複排除の印を **観測が agent へ書いて**
+            #   いた(agent._plan_expired_day)ため、観測 ON/OFF で上の "agents" pickle の
+            #   バイト列が変わっていた(R1「観測は世界を 1 バイトも変えない」の文言違反)。
+            #   印は observer 名前空間の本 state 内(plan_expired_seen / _seen_day・当日ぶんのみ)
+            #   へ移したので、**観測 ON/OFF で agents の __dict__ キー集合は完全に一致する**。
             "starvation_state": getattr(sim, "_starvation_state", None),
             # V3 決定モード(observer.decision_mode): 日中熟慮レーンの「決定点 / LLM /
             # 再利用 / ルール(理由 × 出所)」の日別累積タリー(int と素の dict のみ)。
@@ -566,6 +608,40 @@ def save(sim, step: int, path: str | Path) -> Path:
             # journal OFF のランでは {} = 挙動不変(load は .get で旧 checkpoint 互換)。
             "llm_journal": (sim._journal_marks()
                             if hasattr(sim, "_journal_marks") else {}),
+            # A6(第118 レーンC): この世代に対応する **part セグメント番号**。
+            # 保存の直後に走る flush_segment がこの番号で part を書く(= 世代 N を
+            # 掴んだ resume から見て「ディスク上に在ってよい part の最大番号」)。
+            # これより先の part が在る = その区間は既に確定済みなのに再実行される
+            # = L1 が二重になる、という状況を resume 側が検出して落とすための材料。
+            # 旧 checkpoint(キー無し)= None = 検出しない(従来どおり)。
+            "log_seg": (int(getattr(sim.logger, "_seg", 0))
+                        if getattr(sim, "logger", None) is not None else None),
+            # ---- 物流(commerce.inventory)の店舗在庫 ------------------------------
+            # ★B3(第118 レーンC): 卸台帳 `_b2b` は保存されているのに、**小売の棚**
+            #   (`_goods_stock`)と**到着待ちの発注**(`_goods_pending`)だけが
+            #   保存されていなかった(非対称な既存欠陥)。goods.py は「棚が無ければ
+            #   容量 S から始める」遅延初期化なので、保存しないと resume 直後に
+            #   全 POI の在庫が**満杯へ回復**し、品切れ・(s,S) レビュー・到着待ちの
+            #   発注が丸ごと消える(発注済みの品は二度と届かず、翌日もう一度発注される)。
+            #   キーは (node, cat) のタプル = JSON を経由しない pickle なのでそのまま戻る。
+            #   反復は goods.py 側が全経路 `sorted(...)`(決定論監査済み)。
+            #   inventory OFF のランでは空 dict = 挙動不変(load は .get で旧 ckpt 互換)。
+            "goods_stock": getattr(sim, "_goods_stock", None),
+            "goods_pending": getattr(sim, "_goods_pending", None),
+            # ---- 都市運営(city_ops)の世界側カウンタ ------------------------------
+            # ★B4(第118 レーンC): 救急の 1 日上限(calls_by_day)と夜間清掃の
+            #   「1 棟 1 晩 1 件」ガード(cleaned_night)、役割バインドの日次追随
+            #   (day / bind / bind_by_day)、summary の材料(rounds / cleanings /
+            #   collapses / calls / dispatches …)が**まるごと未保存**だった。
+            #   保存しないと resume 直後に上限も 1 晩ガードも 0 に戻り、同じ日に
+            #   救急が上限ぶん**もう一度**出動し、同じ棟の night_cleaning がもう 1 件出る
+            #   (第80 W2 と同型。ただし状態の本体が sim 側にあるので trace_state 族)。
+            # 決定論: `_co_state` は **集合を 1 つも持たない**(dict / list / int / str だけ。
+            #   cleaned_night は night_id → {building: 1} の dict、calls_by_day は
+            #   day → int)。dict の反復順は pickle が保存し、summary 側は
+            #   `sorted(...)` で読む = 反復順が観測に効く箇所は無い(第98 の流儀)。
+            # 既定 OFF(city_ops OFF)では state 自体が生えない → None=挙動不変。
+            "co_state": getattr(sim, "_co_state", None),
         },
         # --- scenario は config から再構築される。封鎖の進行だけを直列化(順序安定) ---
         "scenario": {
@@ -591,7 +667,8 @@ def save(sim, step: int, path: str | Path) -> Path:
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
-    _write_complete_marker(path)
+    if complete:                     # A6: engine 経路は世代の最後に別途コミットする
+        _write_complete_marker(path)
     return path
 
 
@@ -837,6 +914,19 @@ def load(sim, path: str | Path) -> int:
     if _b2b:                                    # 未構築の空 dict は素通り(simulation の初期値のまま)
         sim._b2b = _b2b
     sim._b2b_total = int(rt.get("b2b_total", 0))
+    # B3(第118 レーンC): 小売の棚と到着待ちの発注(**_b2b と同じ流儀**=空 dict は素通り)。
+    # 旧 checkpoint / inventory OFF では素通り = 従来どおり遅延初期化(棚は容量 S から)。
+    _gs = rt.get("goods_stock")
+    if _gs:
+        sim._goods_stock = _gs
+    _gp = rt.get("goods_pending")
+    if _gp:
+        sim._goods_pending = _gp
+    # B4(第118 レーンC): 都市運営の世界側カウンタ(救急の日次上限・夜間清掃の 1 晩ガード・
+    # 役割バインドの日次追随)。旧 checkpoint / OFF では素通り = 従来どおり遅延生成。
+    _cos = rt.get("co_state")
+    if _cos is not None:
+        sim._co_state = _cos
     _dpn = rt.get("delivery_pending")
     if _dpn is not None:
         sim._delivery_pending = _dpn
@@ -915,6 +1005,11 @@ def load(sim, path: str | Path) -> int:
         sim._dinner_logged = {tuple(x) for x in _dnl}
     if hasattr(sim, "_journal_rewind"):         # 第71: LLM ジャーナルを確定点まで巻き戻す
         sim._journal_rewind(rt.get("llm_journal"))
+    # A6: この世代に対応する part セグメント番号(engine が「先の part が残っていないか」を
+    # 検査する材料)。ここで sim へ置くのは、**本体をもう一度 unpickle しないため**
+    # (25 万体の checkpoint を 2 度読むと resume の所要とピーク RAM が二重になる)。
+    # 旧 checkpoint では None = 検査しない(従来どおり)。
+    sim._ckpt_log_seg = rt.get("log_seg")
 
     # scenario: __init__ で config から再構築済み。封鎖の進行を復元し city へ再適用。
     sc = blob["scenario"]
@@ -935,28 +1030,40 @@ def load(sim, path: str | Path) -> int:
     return int(blob["step"])
 
 
-def latest(run_dir: str | Path) -> Path | None:
-    """run_dir/checkpoint/ 内の最新(step 最大)の checkpoint パス。無ければ None。
+def step_of(path: str | Path) -> int:
+    """`ckpt-000144.pkl.gz` → 144(名前から step を読む。読めなければ -1)。"""
+    name = Path(path).name
+    try:
+        return int(name[len("ckpt-"):].split(".")[0])
+    except ValueError:
+        return -1
+
+
+def complete_generations(run_dir: str | Path) -> list[Path]:
+    """run_dir/checkpoint/ の**完成扱いの世代**を step 昇順で返す(空なら [])。
 
     第117 β7: **COMPLETE マーカー(`<名前>.complete`)のある世代だけ**を候補にする
     = 書き込み途中でプロセスが死んだ checkpoint を resume が掴まない。
     ★後方互換: マーカーが**1 つも無い**ディレクトリ(第117 以前のラン・バックアップから
       戻したディレクトリ)は従来どおり全候補を許す(既存 checkpoint を読めなくしない)。
+
+    A6(第118 レーンC): `latest()` が「最新の 1 本」しか返せないと、pool サイドカーが
+    欠けた世代を弾いたときに**一つ前へ戻れない**。選び直しの材料として列を返す口を
+    分けた(`latest()` はこの列の末尾を返すだけ = 意味論は 1 バイトも変わらない)。
     """
     ckpt_dir = Path(run_dir) / "checkpoint"
     if not ckpt_dir.is_dir():
-        return None
+        return []
     cands = sorted(ckpt_dir.glob("ckpt-*.pkl.gz"))
     if not cands:
-        return None
+        return []
     marked = [p for p in cands if complete_marker(p).exists()]
     if marked:                      # 1 つでもマーカーがあれば「マーカー運用中」とみなす
         cands = marked
+    return sorted(cands, key=lambda p: (step_of(p), p.name))
 
-    def _step(p: Path) -> int:
-        try:
-            return int(p.name[len("ckpt-"):].split(".")[0])
-        except ValueError:
-            return -1
 
-    return max(cands, key=_step)
+def latest(run_dir: str | Path) -> Path | None:
+    """run_dir/checkpoint/ 内の最新(step 最大)の checkpoint パス。無ければ None。"""
+    gens = complete_generations(run_dir)
+    return gens[-1] if gens else None

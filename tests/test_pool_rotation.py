@@ -1003,3 +1003,96 @@ def test_finals_like_all_on_resume_matches_straight(small_pool, tmp_path):
         f"L1 行数不一致: straight={len(a)} resume={len(b)} / 差分 kind="
         f"{Counter(r['kind'] for r in b) - kinds}")
     assert a == b, "全ON相当の resume が straight と byte 不一致"
+
+
+# ===================================================== A6(第118 レーンC): 世代の完全性と pool sidecar
+# pool ON では 1 世代 = **checkpoint 本体 + dormant サイドカー**。旧順序(本体 rename の
+# 直後に COMPLETE マーカー)は「マーカーは在るがサイドカーが無い」世代を作り得て、
+# `_restore_pool_resume` はサイドカー欠落を**黙って素通り**していた(= ドーマント退避と
+# 退場者参照を失った世界でそのまま続行し、L1 が一気通しと食い違っても気づけない)。
+def _mkdir_ckpt(rs: Path) -> Path:
+    d = rs / "checkpoint"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def test_resume_skips_a_generation_without_its_pool_sidecar(small_pool, tmp_path):
+    """★障害注入②(新しく塞いだ窓): マーカー後・sidecar 前に停止 → 前の完全世代へ戻る。
+
+    旧順序が現実に作っていた姿(マーカーだけ在ってサイドカーが無い世代)を直に置き、
+    ① `latest()` はそれを最新候補として返す ② それでも resume はサイドカーの揃った
+    一つ前の世代を選ぶ ③ 結果の L1 が一気通しと byte 一致する、を同時に固定する。
+    """
+    import pyarrow.parquet as pq
+    from society.engine import checkpoint, scheduler
+
+    def rows(d):
+        return pq.read_table(Path(d) / "l1_events.parquet").to_pylist()
+
+    st = tmp_path / "sc_st"
+    Simulation(_pool_cfg("sc_st", small_pool, n_steps=48), out_dir=st).run()
+
+    rs = tmp_path / "sc_rs"
+    every = {"observer.checkpoint_every": 24}
+    s1 = Simulation(_pool_cfg("sc_rs", small_pool, n_steps=24, **every), out_dir=rs)
+    for step in range(24):
+        scheduler.run_step(s1, step)
+    checkpoint.save(s1, 24, _mkdir_ckpt(rs) / "ckpt-000024.pkl.gz")   # 完成した世代
+    s1._save_pool_sidecar(24)
+    s1.logger.flush_segment()
+    for step in range(24, 36):                    # ★次の世代: 本体 + マーカーだけ置いて停止
+        scheduler.run_step(s1, step)
+    checkpoint.save(s1, 36, rs / "checkpoint" / "ckpt-000036.pkl.gz")
+    assert not (rs / "checkpoint" / "dormant-000036.pkl.gz").exists()
+    assert checkpoint.latest(rs).name == "ckpt-000036.pkl.gz", \
+        "latest はマーカーだけを見る(= 世代の不完全さは resume 側が見抜く)"
+
+    s2 = Simulation(_pool_cfg("sc_rs", small_pool, n_steps=48, **every), out_dir=rs)
+    assert s2._pick_resume_checkpoint(rs).name == "ckpt-000024.pkl.gz", \
+        "sidecar の無い世代を掴んでいる(= 黙って素通りしている)"
+    s2.run(resume_from=rs)
+    assert rows(st) == rows(rs), "sidecar 欠落世代を飛ばした resume が straight と不一致"
+
+
+def test_resume_raises_when_no_generation_has_a_pool_sidecar(small_pool, tmp_path):
+    """完全な世代が 1 つも無ければ**明示エラー**(旧挙動の「黙って素通り」を廃止)。
+
+    ★pool ON の旧 checkpoint(サイドカーという概念が無かった世代)にも同じ物差しを
+      当てる = 「pool 有効ならサイドカーの無い世代は不完全」で一貫させる、の機械固定。
+    """
+    from society.engine import checkpoint, scheduler
+
+    rs = tmp_path / "sc_none"
+    every = {"observer.checkpoint_every": 24}
+    s1 = Simulation(_pool_cfg("sc_none", small_pool, n_steps=24, **every), out_dir=rs)
+    for step in range(24):
+        scheduler.run_step(s1, step)
+    checkpoint.save(s1, 24, _mkdir_ckpt(rs) / "ckpt-000024.pkl.gz")   # sidecar を書かない
+    s1.logger.flush_segment()
+
+    s2 = Simulation(_pool_cfg("sc_none", small_pool, n_steps=48, **every), out_dir=rs)
+    with pytest.raises(RuntimeError) as exc:
+        s2.run(resume_from=rs)
+    msg = str(exc.value)
+    assert "sidecar" in msg and "ckpt-000024" in msg, msg
+
+
+def test_pool_off_resume_never_looks_for_a_sidecar(tmp_path):
+    """pool OFF のランは新しい分岐に**入らない**(= 従来と 1 バイトも変わらない)。"""
+    from society.engine import checkpoint, scheduler
+
+    def _cfg(n_steps):
+        return load_config(["run.seed=42", "run.n_agents=10", f"run.n_steps={n_steps}",
+                            "run.name=nopool", "model.backend=mock",
+                            "observer.checkpoint_every=20"])
+
+    d = tmp_path / "nopool"
+    s1 = Simulation(_cfg(20), out_dir=d)
+    for step in range(20):
+        scheduler.run_step(s1, step)
+    checkpoint.save(s1, 20, _mkdir_ckpt(d) / "ckpt-000020.pkl.gz")
+    s1.logger.flush_segment()
+    assert not list((d / "checkpoint").glob("dormant-*.pkl.gz"))
+    s2 = Simulation(_cfg(40), out_dir=d)
+    assert s2._pool is None
+    assert s2._pick_resume_checkpoint(d).name == "ckpt-000020.pkl.gz"

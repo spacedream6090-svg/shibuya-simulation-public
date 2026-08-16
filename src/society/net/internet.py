@@ -50,12 +50,43 @@ class Internet:
         self.n_reshares_total = 0
 
     def init_follows(self, agent_ids: list[int], rng, k: int = 6) -> None:
+        """起動時 1 回: 全員へ「自分以外から重複なし k 人」の初期フォローを配る。
+
+        ★O(N²) だった理由と直し方(レーンP C1): 旧実装は 1 人ぶんごとに
+          ``others = [x for x in ids if x != aid]``(= N-1 件の実体リスト)を作り直していたので、
+          25 万人では 625 億回の比較 = **実測 0.011 秒 × 25 万人 ≒ 45 分**を起動時に焼いていた。
+          抽選 ``rng.choice(n_pop, size=n, replace=False)`` は numpy Generator の Floyd 法で、
+          **母集団の大きさ n_pop と本数 n だけ**から乱数を引く(``others`` の中身は見ない)。
+          よって「添字 → 実 id」の写像を『自分の位置以上なら添字+1』で与えれば、
+          **引かれる乱数列も選ばれる集合も 1 ビットも変えずに** O(N·k) になる。
+          (同値性・乱数消費列の一致は tests/test_internet_entry_scale.py が旧実装と突き合わせる。)
+        ★``ids`` に重複があるときだけ旧経路へ退避する(``others`` の長さが N-1 にならないので
+          写像が成り立たない)。実運用の agent id は一意なのでこの枝は通らない。
+        """
         ids = list(agent_ids)
+        pos_of: dict[int, int] = {}
+        for i, x in enumerate(ids):
+            if x in pos_of:
+                pos_of = {}                # 重複あり = 写像が使えない → 旧経路(下の分岐)
+                break
+            pos_of[x] = i
+        unique = bool(pos_of) or not ids
         for aid in ids:
-            others = [x for x in ids if x != aid]
-            n = min(k, len(others))
-            picks = rng.choice(len(others), size=n, replace=False) if n else []
-            self.follows[aid] = {others[int(i)] for i in picks}
+            if not unique:                 # 退避経路(重複 id): 旧実装そのまま
+                others = [x for x in ids if x != aid]
+                n = min(k, len(others))
+                picks = rng.choice(len(others), size=n, replace=False) if n else []
+                self.follows[aid] = {others[int(i)] for i in picks}
+            else:
+                pos = pos_of.get(aid)      # None = aid が名簿に無い(others = ids そのもの)
+                n_pop = len(ids) - 1 if pos is not None else len(ids)
+                n = min(k, n_pop)
+                picks = rng.choice(n_pop, size=n, replace=False) if n else []
+                if pos is None:
+                    self.follows[aid] = {ids[int(i)] for i in picks}
+                else:                      # 自分の位置以上の添字は 1 つ後ろへずらす
+                    self.follows[aid] = {ids[int(i) + 1] if int(i) >= pos else ids[int(i)]
+                                         for i in picks}
             self.contacts[aid] = set()
         self.rebuild_follower_index()      # 逆索引を張り直す(乱数ゼロ・値は走査と同一)
 
@@ -135,6 +166,15 @@ class Internet:
                     got.add(cand)
         self.follows[aid] = got
         self.contacts[aid] = set()
+        # ★既読 watermark を「入場時点」に据える(レーンP A5)。据えないと read_marks[aid] は
+        #   引くたびに 0 = **街に来る前の全投稿**が未読扱いになり、初回閲覧の
+        #   `timeline_for` / `ranked_*` が posts 全履歴を舐める(25 万体・30 日ランでは
+        #   途中入場 20.9 万人 × 数十万投稿の走査)。意味の面でも「入場前のタイムラインを
+        #   遡って読む」のは現実の挙動ではない(スマホを開いた時点の新着から読む)。
+        #   値は `timeline_for` が既読を進めるときと**同じ式**(offset + 件数 = 次に付く post id)。
+        #   ★冪等: 既に read_marks を持つ個体(= 再入場・checkpoint 復元)には触れない。
+        if aid not in self.read_marks:
+            self.read_marks[aid] = self._post_offset + len(self.posts)
         rev = self._rev()                         # 逆索引へ新規辺を足す(O(k))
         for t in got:
             rev[t] = rev.get(t, 0) + 1

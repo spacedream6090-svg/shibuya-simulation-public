@@ -2113,11 +2113,111 @@ class Simulation:
             os.fsync(fh.fileno())
         os.replace(tmp, path)
 
+    def _read_pool_sidecar(self, step: int) -> dict:
+        """pool サイドカーを読む(壊れていれば例外を投げる)。A6 の候補検証と復元の共通口。"""
+        import gzip
+        import pickle
+        with gzip.open(self._pool_sidecar_path(step), "rb") as f:
+            blob = pickle.load(f)
+        if not isinstance(blob, dict):
+            raise ValueError(f"pool sidecar の中身が dict でない: {type(blob).__name__}")
+        return blob
+
+    def _pool_sidecar_defect(self, step: int) -> str | None:
+        """その世代の pool サイドカーの欠陥を述べる(健全なら None。読めた blob は握っておく)。
+
+        ★A6(第118 レーンC): pool ON では **本体 + サイドカー**で 1 世代なので、
+          サイドカーが欠落/破損している世代は「完成していない」= resume が掴んではいけない。
+          ここで実際に読んで検証し、成功した blob を `_pool_sidecar_blob` に残す
+          (= 採用世代のサイドカーはこの後 1 度も読み直さない = 読み込みは 1 回のまま)。
+        """
+        path = self._pool_sidecar_path(step)
+        self._pool_sidecar_blob = None
+        if not path.exists():
+            return "pool sidecar 欠落"
+        try:
+            self._pool_sidecar_blob = (int(step), self._read_pool_sidecar(step))
+        except Exception as e:                      # gzip 破損 / 途中終端 / pickle 不整合
+            self._pool_sidecar_blob = None
+            return f"pool sidecar 破損({type(e).__name__})"
+        return None
+
+    def _pick_resume_checkpoint(self, run_dir: Path) -> Path:
+        """resume で掴む checkpoint 世代を選ぶ(A6。第118 レーンC)。
+
+        **挙動変更(resume の意味論)**:
+          - 従来: `checkpoint.latest()` が返した最新世代を無条件に掴み、pool サイドカーが
+            無ければ**黙って素通り**していた(= ドーマント/退場者参照が消えた世界で続行し、
+            L1 が straight と食い違っても誰も気づけない)。
+          - 以後: pool 有効なら「本体 + サイドカー」が揃った世代だけを完全とみなし、
+            欠落/破損の世代は飛ばして**一つ前の完全世代**へ戻る。1 つも無ければ
+            明示エラー(黙って素通りしない)。★これは **pool ON の旧 checkpoint**
+            (マーカーだけあってサイドカーが無い世代)にも同じ物差しを当てる =
+            「pool 有効なら不完全扱い」で一貫させる。
+          - pool OFF のランは分岐に入らない(= 従来と 1 バイトも変わらない)。
+        """
+        gens = checkpoint.complete_generations(run_dir)
+        if not gens:
+            raise FileNotFoundError(
+                f"resume 元に checkpoint が無い: {run_dir / 'checkpoint'}")
+        if self._pool is None:
+            return gens[-1]
+        rejected: list[str] = []
+        for path in reversed(gens):
+            why = self._pool_sidecar_defect(checkpoint.step_of(path))
+            if why is None:
+                if rejected:
+                    import logging
+                    logging.getLogger("society.engine").warning(
+                        "resume: 不完全な世代を飛ばした(%s)→ %s から再開",
+                        " / ".join(rejected), path.name)
+                return path
+            rejected.append(f"{path.name}: {why}")
+        raise RuntimeError(
+            "pool 有効なランで、pool サイドカー(dormant-*.pkl.gz)が揃った checkpoint 世代が"
+            " 1 つもありません(= 完全な世代が無い)。黙って素通りすると、ドーマント退避と"
+            " 退場者参照を失った世界で続行して L1 が一気通しと食い違います。\n  "
+            + "\n  ".join(rejected)
+            + f"\n  checkpoint dir: {run_dir / 'checkpoint'}\n"
+            "  復旧: (a) 対の dormant-*.pkl.gz を退避先(backup_run)から戻す"
+            " (b) 対の無い ckpt-*.pkl.gz を退避してもう一度 --resume する"
+            "(それより古い完全世代へ戻る) (c) どの世代も対が無いなら新しい run.name で"
+            " 起動し直す。")
+
+    def _assert_no_future_segments(self, ckpt: Path) -> None:
+        """掴む世代より**先**の part がディスクに在る = 再実行すると L1 が二重になる(A6)。
+
+        世代 N の checkpoint は `log_seg`(= 保存直後の flush が使う part 番号)を運ぶので、
+        「ディスク上に在ってよい part の最大番号」は `log_seg` である。それより先の part が
+        在るのは (a) 完成前の世代へ戻った (b) `flush_every_steps` 由来の flush が checkpoint
+        より先に走った、のどちらかで、どちらも**確定済みの区間を再実行する**= finalize が
+        同じイベントを 2 回結合する。黙って二重化するより落とす方が正しい。
+        ★`checkpoint.load` の直後に呼ぶ(本体を 2 度 unpickle しないため)。まだ 1 バイトも
+          書いていない時点なので、ここで落ちても run dir は resume 前のまま。
+        旧 checkpoint(`log_seg` 無し)では検査しない(従来どおり)。
+        """
+        seg = getattr(self, "_ckpt_log_seg", None)
+        if seg is None or getattr(self, "logger", None) is None:
+            return
+        on_disk = int(getattr(self.logger, "_seg", 0)) - 1   # 既存 part の最大番号(無ければ -1)
+        if on_disk > int(seg):
+            raise RuntimeError(
+                f"resume 元に、掴む世代({ckpt.name} = part-{int(seg):04d} まで)より先の"
+                f" part セグメント(part-{on_disk:04d})が残っています。このまま再開すると"
+                " 確定済みの区間を再実行して L1 が二重になります。先の part を退避(改名/移動)"
+                " してから再開するか、より新しい完全世代を用意してください。")
+
     def _restore_pool_resume(self, start: int) -> None:
         """resume 時に pool の状態を復元する(pool ON 時のみ)。sim.agents は checkpoint.load が復元済み。
 
-        sidecar があれば: ドーマントストア・日境界・退場者参照を復元 → straight run と同じ状態で続行
-        (退場者参照が全て解決=reply/造語作者名などの reference が落ちない)。無ければラン内一貫性のみ。"""
+        ドーマントストア・日境界・退場者参照を復元 → straight run と同じ状態で続行
+        (退場者参照が全て解決=reply/造語作者名などの reference が落ちない)。
+
+        ★A6(第118 レーンC)で**挙動が変わった**: 従来は sidecar が無ければ黙って
+          素通りし「ラン内一貫性のみ」で続行していたが、pool 有効な世代は sidecar と
+          対で 1 つなので、欠落は**不完全世代**として扱う(世代選びの
+          `_pick_resume_checkpoint` が既に弾いているので、ここに来る時点で健全。
+          直接呼ばれた場合の保険として読み直し、それも駄目なら明示エラー)。"""
         if self._pool is None:
             return
         from collections import OrderedDict
@@ -2125,17 +2225,22 @@ class Simulation:
         self.invalidate_present_index()           # 在場 = checkpoint が復元した present 個体
         prev_min = self.clock.sim_min(max(0, int(start) - 1))
         self._pool_day = prev_min // 1440 if start > 0 else 0
-        path = self._pool_sidecar_path(start)
-        if path.exists():
-            import gzip
-            import pickle
-            with gzip.open(path, "rb") as f:
-                blob = pickle.loads(f.read())
-            self._dormant = pool_mod.DormantStore(cap=int(blob.get("dormant_cap", 0)))
-            self._dormant._d = OrderedDict(blob.get("dormant", {}))
-            self._pool_day = int(blob.get("pool_day", self._pool_day))
-            for aid, agent in blob.get("departed", {}).items():
-                self.agent_by_id.setdefault(aid, agent)   # 退場者参照を復元(present は上書きしない)
+        cached = self.__dict__.pop("_pool_sidecar_blob", None)  # 候補検証で読んだものを使う
+        # ★同じ step のものだけを使う(世代選びと復元で step がずれたら読み直す)
+        blob = cached[1] if cached and int(cached[0]) == int(start) else None
+        if blob is None:
+            path = self._pool_sidecar_path(start)
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"pool 有効なランの resume に pool sidecar がありません: {path}"
+                    "(checkpoint 本体と対で 1 世代です。黙って素通りすると"
+                    " ドーマント退避と退場者参照を失った世界で続行します)")
+            blob = self._read_pool_sidecar(start)
+        self._dormant = pool_mod.DormantStore(cap=int(blob.get("dormant_cap", 0)))
+        self._dormant._d = OrderedDict(blob.get("dormant", {}))
+        self._pool_day = int(blob.get("pool_day", self._pool_day))
+        for aid, agent in blob.get("departed", {}).items():
+            self.agent_by_id.setdefault(aid, agent)   # 退場者参照を復元(present は上書きしない)
         self._pool_update_budget()
 
     def run(self, resume_from: Path | str | None = None) -> dict:
@@ -2151,11 +2256,11 @@ class Simulation:
         flush_every = int(self.cfg.observer.get("flush_every_steps", 0) or 0)
         start = 0
         if resume_from is not None:
-            ckpt = checkpoint.latest(Path(resume_from))
-            if ckpt is None:                          # 誤って完走済み/空 dir を上書きしない
-                raise FileNotFoundError(
-                    f"resume 元に checkpoint が無い: {Path(resume_from) / 'checkpoint'}")
+            # A6(第118 レーンC): 「本体 + pool サイドカー + 全 flush」が揃った世代だけを
+            # 完全とみなして選ぶ(欠けていれば一つ前へ戻る。1 つも無ければ明示エラー)。
+            ckpt = self._pick_resume_checkpoint(Path(resume_from))
             start = checkpoint.load(self, ckpt)
+            self._assert_no_future_segments(ckpt)   # load 済み値を読むだけ(再 unpickle しない)
             self.invalidate_present_index()       # 在場索引は load 済みの sim.agents から引き直す
             self._restore_pool_resume(start)      # pool ON 時のみ: ドーマント/日境界の復元
             # 第57バッチ タスクC: 分割実行で clean finalize しても前チャンクの canonical を失わない
@@ -2197,9 +2302,14 @@ class Simulation:
                 self.state_hash.update(self, step)
             did_flush = False
             if every > 0 and (step + 1) % every == 0:
-                checkpoint.save(self, step + 1,
-                                self.out_dir / "checkpoint"
-                                / f"ckpt-{step + 1:06d}.pkl.gz")
+                # ★A6(第118 レーンC): COMPLETE マーカーは**この世代の書き物が全部
+                #   終わった後**に置く(下の write_complete_marker まで下ろした)。
+                #   本体 rename の直後に置いていた旧順序では、「マーカーは在るが
+                #   pool サイドカーも part も無い」世代が生まれ、latest() がそれを
+                #   完成扱いで掴んで L1 が最大 checkpoint 間隔ぶん欠落していた。
+                _ckpt_path = (self.out_dir / "checkpoint"
+                              / f"ckpt-{step + 1:06d}.pkl.gz")
+                checkpoint.save(self, step + 1, _ckpt_path, complete=False)
                 self._save_pool_sidecar(step + 1)  # pool ON 時のみ: ドーマント退避の対保存
                 _wv_mod.absorb_before_flush(self)  # 第98 W4-A: worldview 未走査区間の吸い上げ
                 self.logger.flush_segment()
@@ -2219,6 +2329,9 @@ class Simulation:
                     self.memory_sc.flush_segment()
                 if self.relations_sc is not None:   # G5: 関係台帳の日次差分も同様
                     self.relations_sc.flush_segment()
+                # ★世代トランザクションのコミット点(A6)。ここまで来て初めて
+                #   「step {step+1} まで完全に書けた」= latest() の候補になる。
+                checkpoint.write_complete_marker(_ckpt_path)
                 did_flush = True
             if flush_every > 0 and not did_flush \
                     and (step + 1) % flush_every == 0:

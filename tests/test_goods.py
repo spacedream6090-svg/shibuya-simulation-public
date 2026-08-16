@@ -499,3 +499,115 @@ def test_b2b_flow_aggregation(tmp_path):
     assert out["amount_total"] == 17000.0
     assert out["by_org"]["co_ap_01"] == {"qty": 40, "amount": 12000.0}
     assert out["by_org"]["co_ca_06"] == {"qty": 20, "amount": 5000.0}
+
+
+# =========================================================================== #
+# B3(第118 レーンC): 棚と到着待ちの発注を checkpoint で運ぶ
+#
+#   卸台帳 `_b2b` は保存されているのに、**小売の棚**(`_goods_stock`)と**到着待ちの
+#   発注**(`_goods_pending`)だけが未保存だった(非対称な既存欠陥)。goods.py は
+#   「棚が無ければ容量 S から始める」遅延初期化なので、保存しないと resume 直後に
+#   全 POI の在庫が満杯へ回復し、品切れも進行中の発注も丸ごと消える。
+# =========================================================================== #
+#: 棚を薄く(S=3 / s=2)して品切れを起こしやすくし、リードタイムを長く(12 step)して
+#  「到着待ちの発注が checkpoint を跨ぐ」状態を必ず作る。日次レビューは 1 日 1 回なので
+#  split=127 は「レビュー直後 = 61 件が到着待ち」のど真ん中(下で空回り防止を検査する)。
+_INV_THIN = {"commerce.inventory.enabled": "true",
+             "commerce.inventory.capacity": "{food: 3, cafe: 3, shop: 3, nightlife: 3}",
+             "commerce.inventory.reorder_point": "{food: 2, cafe: 2, shop: 2, nightlife: 2}",
+             "commerce.inventory.default_capacity": "3",
+             "commerce.inventory.default_reorder_point": "2",
+             "commerce.inventory.lead_time_steps": "12"}
+_INV_SPLIT, _INV_TOTAL = 127, 144
+
+
+def _cfg_of(name, n_steps, every=0):
+    ov = dict(_INV_THIN)
+    if every:
+        ov["observer.checkpoint_every"] = str(every)
+    dot = ["run.seed=42", "run.n_agents=30", f"run.n_steps={n_steps}",
+           f"run.name={name}", "model.backend=mock"]
+    dot += [f"{k}={v}" for k, v in ov.items()]
+    return load_config(dot)
+
+
+def _inv_rows(run_dir):
+    return pq.read_table(run_dir / "l1_events.parquet").to_pylist()
+
+
+def _purse(sim):
+    return [round(float(a.money), 6) for a in sim.agents]
+
+
+def test_resume_carries_the_shelf_and_the_pending_orders(tmp_path):
+    """★分割走行 == 一気通し: 減耗中・品切れ中・到着待ち中の 3 状態を跨いで一致する。
+
+    L1(全行)・棚・到着待ち・全員の所持金まで一致させる。保存が無ければ resume 直後に
+    棚が満杯へ戻り、品切れ(stock_out)が消え、発注が宙に消えて翌日もう一度発注される。
+    """
+    from society.engine import checkpoint
+
+    st_dir = tmp_path / "inv_st"
+    straight = Simulation(_cfg_of("inv_st", _INV_TOTAL), out_dir=st_dir)
+    straight.run()
+
+    d = tmp_path / "inv_rs"
+    s1 = Simulation(_cfg_of("inv_rs", _INV_SPLIT, every=_INV_SPLIT), out_dir=d)
+    for step in range(_INV_SPLIT):
+        scheduler.run_step(s1, step)
+    # ---- 空回り防止: 3 状態が **同時に** 立っていること ----
+    cap = goods_mod._capacity(s1.goodscfg, "food")
+    assert any(v == 0 for v in s1._goods_stock.values()), "品切れ中の棚が 1 つも無い"
+    assert any(0 < v < cap for v in s1._goods_stock.values()), "減耗中の棚が 1 つも無い"
+    assert s1._goods_pending, "到着待ちの発注が 1 件も無い(split 位置の再調整が要る)"
+    checkpoint.save(s1, _INV_SPLIT,
+                    d / "checkpoint" / f"ckpt-{_INV_SPLIT:06d}.pkl.gz")
+    s1.logger.flush_segment()
+
+    s2 = Simulation(_cfg_of("inv_rs", _INV_TOTAL, every=_INV_SPLIT), out_dir=d)
+    s2.run(resume_from=d)
+
+    assert _inv_rows(d) == _inv_rows(st_dir), "inventory ON の resume が straight と不一致"
+    assert s2._goods_stock == straight._goods_stock, "棚が一気通しと食い違う"
+    assert s2._goods_pending == straight._goods_pending, "到着待ちが一気通しと食い違う"
+    assert _purse(s2) == _purse(straight), "所持金が一気通しと食い違う"
+
+
+def test_checkpoint_roundtrips_the_shelf_and_pending(tmp_path):
+    """棚と発注が往復で **1 件残らず** 戻る(タプルキーのまま = sorted の決定論を保つ)。"""
+    from society.engine import checkpoint
+
+    src = _sim(tmp_path, "shelf_src", **{"commerce.inventory.enabled": "true"})
+    node = _food_node(src)
+    src._goods_stock = {(node, "food"): 0, (node, "cafe"): 7}
+    src._goods_pending = {(node, "food"): 41}
+    p = checkpoint.save(src, 5, tmp_path / "shelf_src" / "checkpoint" / "ckpt-000005.pkl.gz")
+
+    dst = _sim(tmp_path, "shelf_dst", **{"commerce.inventory.enabled": "true"})
+    assert checkpoint.load(dst, p) == 5
+    assert dst._goods_stock == {(node, "food"): 0, (node, "cafe"): 7}
+    assert dst._goods_pending == {(node, "food"): 41}
+    assert all(isinstance(k, tuple) for k in dst._goods_stock), "キーがタプルで戻っていない"
+
+
+def test_old_checkpoint_without_the_shelf_keys_still_loads(tmp_path):
+    """新キーを持たない旧 checkpoint でも落ちず、従来どおり遅延初期化へ落ちる。"""
+    import gzip
+    import pickle
+
+    from society.engine import checkpoint
+
+    src = _sim(tmp_path, "shelf_old_src", **{"commerce.inventory.enabled": "true"})
+    src._goods_stock = {(_food_node(src), "food"): 1}
+    p = checkpoint.save(src, 3,
+                        tmp_path / "shelf_old_src" / "checkpoint" / "ckpt-000003.pkl.gz")
+    with gzip.open(p, "rb") as f:
+        blob = pickle.loads(f.read())
+    for k in ("goods_stock", "goods_pending"):
+        blob["runtime"].pop(k, None)
+    with gzip.open(p, "wb") as f:
+        f.write(pickle.dumps(blob, protocol=pickle.HIGHEST_PROTOCOL))
+
+    dst = _sim(tmp_path, "shelf_old_dst", **{"commerce.inventory.enabled": "true"})
+    assert checkpoint.load(dst, p) == 3
+    assert dst._goods_stock == {} and dst._goods_pending == {}   # 従来の既定
