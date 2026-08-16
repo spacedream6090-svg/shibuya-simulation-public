@@ -1311,33 +1311,29 @@ def _assets_top_share(vals: list[float], pct: float) -> float:
     return round(sum(v[:k]) / total, 6)
 
 
+_OBS_ASSETS = None
+
+
+def _load_obs_assets():
+    """observer/assets.py を場所非依存で読み込む(_load_run_dt と同じ流儀・stdlib のみに依存)。"""
+    global _OBS_ASSETS
+    if _OBS_ASSETS is None:
+        spec = importlib.util.spec_from_file_location(
+            "obs_assets", REPO_ROOT / "src" / "society" / "observer" / "assets.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _OBS_ASSETS = mod
+    return _OBS_ASSETS
+
+
 def _assets_tau(cur: dict, prev: dict | None):
-    """現/前日 wealth の共通 id 上の前日比 Kendall τ-b(measure._kendall_tau と同式)。未定義は None。"""
-    if not prev:
-        return None
-    common = sorted(set(cur) & set(prev))
-    if len(common) < 2:
-        return None
-    a = [cur[i] for i in common]
-    b = [prev[i] for i in common]
-    concord = discord = tie_a = tie_b = 0
-    for i in range(len(a)):
-        for j in range(i + 1, len(a)):
-            s = (a[i] - a[j]) * (b[i] - b[j])
-            if s > 0:
-                concord += 1
-            elif s < 0:
-                discord += 1
-            else:
-                if a[i] == a[j]:
-                    tie_a += 1
-                if b[i] == b[j]:
-                    tie_b += 1
-    n0 = len(a) * (len(a) - 1) / 2.0
-    denom = ((n0 - tie_a) * (n0 - tie_b)) ** 0.5
-    if denom == 0:
-        return 0.0
-    return round((concord - discord) / denom, 6)
+    """現/前日 wealth の共通 id 上の前日比 Kendall τ-b(measure._kendall_tau と同式)。未定義は None。
+
+    第133 ウェーブ2: 旧・明示二重ループ(O(n²)=25万体で1日あたり約1.5時間)を
+    observer/assets.py の O(n log n) 実装(レーンP A3・旧実装と丸めまで一致を機械固定済み)の
+    呼び出しへ差し替え。common-id 抽出規約(id 昇順・<2 は None)は rank_tau が同一。"""
+    tau = _load_obs_assets().rank_tau(cur, prev or {})
+    return None if tau is None else round(tau, 6)
 
 
 def build_assets_data(run_dir: Path, agents_meta: list, start_min: int,

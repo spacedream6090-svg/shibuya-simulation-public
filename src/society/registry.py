@@ -1894,6 +1894,10 @@ ALLOWLIST: dict[str, str] = {
     "run.allow_mock_production":
         "本番規模(n_agents>=10,000)の mock ランを明示的に許す起動制御フラグ"
         "(既定 false=起動口で RuntimeError。世界の挙動には一切関与しない)",
+    "run.allow_dirty_outdir":
+        "使用済み run dir へ重ねて書くことを明示的に許す起動制御フラグ(第133 A7)"
+        "(既定 false=起動口で RuntimeError。シム本体は 1 度も読まない"
+        "= ON/OFF で L1 が 1 バイトも変わらない。run.seed_auto と同じ族)",
     # 第82バッチ: watch 機能**内部**の形の指定であって独立した機能トグルではない
     # (cognition.watch.enabled が OFF なら 1 バイトも効かない)。ON のときこの行を
     # 落とすと「watch 節はあるが驚き発火の 1 行が無い」対照条件になる=解析用の内部レバー。

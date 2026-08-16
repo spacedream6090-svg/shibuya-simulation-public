@@ -25,6 +25,18 @@ checkpoint / resume(D16)はエンジン側に実装済み。本モジュール�
 - **連続即死**(起動 `--min-uptime-sec` 秒以内に進捗なく死ぬ)→ 指数バックオフ。
 - **破損対策**: 同一 checkpoint からの再開失敗が2回続く / checkpoint が読めない →
   1世代前(バックアップ)へ巻き戻して再開。
+- **完全世代だけを掴む**(第133 レーンR2): 再開元・進捗・バックアップの基準になる
+  「最新 checkpoint」は **COMPLETE マーカーのある世代だけ**から選ぶ
+  (= `society.engine.checkpoint.complete_generations` と同一規則。society を import
+  できない環境では同一規則の stdlib 版 `complete_ckpts_stdlib` へ後退する)。
+  書き込み途中で死んだ未コミット世代を掴んで、engine 側の明示エラーで即死する経路を塞ぐ。
+- **fresh 再起動前の退避**(第133 レーンR2): checkpoint が 1 つも無い状態からの再起動
+  (= `--resume` を付けない起動)は、run.py の A7 ガード(使用済み run dir の拒否)に
+  弾かれて**再起動ループ**になる。そこで fresh 起動の直前に、run dir が既に使われて
+  いれば **`<run-dir>.crash-<連番>` へ丸ごと rename して退避**し(同一ボリューム rename
+  = 一瞬・1 バイトも消さない)、空の run dir から始める。`<run-dir>_backup` に世代が
+  残っていれば同じ連番で一緒に退避する(前のランの世代を新しいランへ混ぜない)。
+  **rename に失敗したら停止**する(黙って `run.allow_dirty_outdir` で重ね書きしない)。
 - **バックアップ**: checkpoint が進むたび(または `--backup-every-min`)、checkpoint/ +
   config.yaml + l1 parts を `--backup-dir`(既定 `<run-dir>_backup`)へ世代コピー(直近3世代)。
 
@@ -76,8 +88,8 @@ LLM 健全性の監視(P0バッチ 2026-07-29 追加)
 - `<run-dir>/status.json`: {state, restarts, last_progress, llm_health, ...}。
 - `<run-dir>/run.out.log`: 子プロセスの stdout/stderr(障害解析用)。
 
-Windows 対応・標準ライブラリのみ(society を import しない。pyarrow だけは
-LLM 健全性監視のために関数内で任意 import し、無ければ監視を諦める)。
+Windows 対応・標準ライブラリのみ(society は**任意** import = 失敗しても watchdog は
+死なない。pyarrow も LLM 健全性監視のために関数内で任意 import し、無ければ監視を諦める)。
 """
 from __future__ import annotations
 
@@ -105,9 +117,95 @@ PART_GLOB = "*.part-*.parquet"
 COMPLETE_SUFFIX = ".complete"
 GB = float(1 << 30)
 
+#: A7(第133 レーンR2): `scripts/run.py` の「非 resume 起動が**使用済み** run dir を踏むのを
+#: 拒否する」ガードが見る痕跡の glob。`run.DIRTY_OUTDIR_GLOBS` と**同値**で、本 module は
+#: stdlib 限定なので値だけを写している(tests/test_watchdog.py が run.py 側との一致を機械固定
+#: する = run.py に glob が増えたらこちらが赤くなる)。
+DIRTY_OUTDIR_GLOBS = (
+    "*.part-*.parquet",
+    "l1_events.parquet",
+    "checkpoint/ckpt-*.pkl.gz",
+    "checkpoint/dormant-*.pkl.gz",
+    "llm_cache*.jsonl",
+)
+#: 退避先の名前。`runs/prod1` → `runs/prod1.crash-001`(既存を絶対に上書きしない連番)。
+CRASH_SUFFIX_FMT = ".crash-{:03d}"
+
 
 def _now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+# --------------------------------------------------------------------------- #
+# 「完全世代」の判定(第133 レーンR2)
+#
+#   第133 で COMPLETE マーカーは「本体 + pool サイドカー + 全 flush」が終わった後の
+#   **世代トランザクションのコミット点**になった。resume 側(engine)はマーカーのある世代
+#   しか掴まないので、watchdog が未コミット世代を「最新」とみなすと、
+#     - `--resume` の起動が engine の明示エラーで即死する
+#     - その世代をバックアップ世代としてコピーしてしまう
+#   の 2 つが起きる。**判定規則を engine と 1 つにする**のが唯一の正しい直し方。
+#
+#   本体(`society.engine.checkpoint.complete_generations`)を任意 import して使い、
+#   import できない環境(society 側の依存が壊れている等)では同一規則の stdlib 版へ
+#   後退する。**watchdog 自身は絶対に死なない**が最優先(監督者が落ちるのが最悪)。
+#   両者の一致は tests/test_watchdog.py が機械固定する。
+# --------------------------------------------------------------------------- #
+_CK_MOD: object | None = None
+_CK_TRIED = False
+
+
+def _checkpoint_module():
+    """`society.engine.checkpoint` を任意 import(1 回だけ試す。失敗は None)。"""
+    global _CK_MOD, _CK_TRIED
+    if not _CK_TRIED:
+        _CK_TRIED = True
+        try:
+            src = str(REPO_ROOT / "src")
+            if src not in sys.path:
+                sys.path.append(src)       # 末尾へ = watchdog 自身の import 解決を変えない
+            from society.engine import checkpoint as _ck
+            _CK_MOD = _ck
+        except Exception:                  # 依存欠落・構文エラー等でも監督は続ける
+            _CK_MOD = None
+    return _CK_MOD
+
+
+def complete_ckpts_stdlib(ckpt_dir: Path) -> list[Path]:
+    """`checkpoint/` 内の**完全世代**を step 昇順で返す(stdlib 版・純関数)。
+
+    `checkpoint.complete_generations` と同一規則:
+      - COMPLETE マーカー(`<名前>.complete`)のある本体だけを候補にする。
+      - ★後方互換: マーカーが **1 つも無い**ディレクトリ(第117 以前のラン・
+        バックアップから戻した dir)は従来どおり全候補を許す。
+    """
+    d = Path(ckpt_dir)
+    if not d.is_dir():
+        return []
+    cands = [p for p in d.glob(CKPT_GLOB) if _ckpt_step(p) is not None]
+    if not cands:
+        return []
+    marked = [p for p in cands if p.with_name(p.name + COMPLETE_SUFFIX).exists()]
+    if marked:                             # 1 つでもあれば「マーカー運用中」とみなす
+        cands = marked
+    return sorted(cands, key=lambda p: (_ckpt_step(p), p.name))
+
+
+def dirty_outdir_hits(run_dir: Path, limit: int = 6) -> list[str]:
+    """run dir に残る「使用済みの痕跡」(相対パス)。無ければ空 list(読むだけ)。
+
+    `run.dirty_outdir_hits` と同型(向こうは cfg 経由・こちらは Path 直)。
+    """
+    root = Path(run_dir)
+    if not root.is_dir():
+        return []
+    hits: list[str] = []
+    for pat in DIRTY_OUTDIR_GLOBS:
+        for p in sorted(root.glob(pat)):
+            hits.append(p.relative_to(root).as_posix())
+            if len(hits) >= limit:
+                return hits
+    return hits
 
 
 # --------------------------------------------------------------------------- #
@@ -246,7 +344,16 @@ class Watchdog:
         with self.log_path.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
         if echo:
-            print(f"[watchdog] {msg}", flush=True)
+            # ★第133 レーンR2: コンソールが cp932(日本語 Windows の既定)だと、記録には
+            #   問題なく書ける文字(em dash 等)が print で UnicodeEncodeError を投げる。
+            #   例外は log() の呼び出し元へ伝播して**監督者ごと落とす** = 最悪の事故。
+            #   ファイル(utf-8)への記録は既に済んでいるので、表示だけ落として続ける。
+            try:
+                print(f"[watchdog] {msg}", flush=True)
+            except UnicodeEncodeError:
+                enc = getattr(sys.stdout, "encoding", None) or "ascii"
+                print(f"[watchdog] {msg}".encode(enc, "replace").decode(enc, "replace"),
+                      flush=True)
 
     def write_status(self, state: str, pid: int | None = None) -> None:
         data = {
@@ -286,14 +393,33 @@ class Watchdog:
     def _ckpt_dir(self, root: Path | None = None) -> Path:
         return (root or self.run_dir) / "checkpoint"
 
-    def _latest_ckpt(self, root: Path | None = None) -> Path | None:
+    def _complete_ckpts(self, root: Path | None = None) -> list[Path]:
+        """`<root>/checkpoint/` の**完全世代**(COMPLETE マーカー付き)を step 昇順で返す。
+
+        判定規則は engine と 1 つ(`_checkpoint_module` の解説を参照)。society を
+        import できた場合は本体の `complete_generations` を、できない場合は同一規則の
+        stdlib 版を使う。どちらの経路でも「名前から step が読めないファイル」は
+        従来どおり候補にしない(= `_ckpt_step` フィルタは残す)。
+        """
         d = self._ckpt_dir(root)
         if not d.is_dir():
-            return None
-        cands = [p for p in d.glob(CKPT_GLOB) if _ckpt_step(p) is not None]
-        if not cands:
-            return None
-        return max(cands, key=lambda p: _ckpt_step(p))
+            return []
+        ck = _checkpoint_module()
+        if ck is None:
+            return complete_ckpts_stdlib(d)
+        try:
+            gens = [p for p in ck.complete_generations(root or self.run_dir)
+                    if _ckpt_step(p) is not None]
+        except Exception as e:                 # 本体側が落ちても監督は続ける
+            self.log(f"complete_generations failed ({e}); using stdlib mirror",
+                     echo=False)
+            return complete_ckpts_stdlib(d)
+        return sorted(gens, key=lambda p: (_ckpt_step(p), p.name))
+
+    def _latest_ckpt(self, root: Path | None = None) -> Path | None:
+        """最新の**完全世代**(未コミット世代は掴まない。第133 レーンR2)。"""
+        gens = self._complete_ckpts(root)
+        return gens[-1] if gens else None
 
     def _ckpt_step_now(self) -> int | None:
         return _ckpt_step(self._latest_ckpt())
@@ -607,6 +733,78 @@ class Watchdog:
                  "next attempt will restart from scratch")
 
     # ------------------------------------------------------------------ #
+    # fresh 再起動の前の退避(第133 レーンR2 = run.py の A7 ガードとの整合)
+    # ------------------------------------------------------------------ #
+    def _crash_dest(self) -> tuple[Path, int]:
+        """退避先 `<run-dir>.crash-<連番>` と連番。**既存を絶対に上書きしない**。"""
+        n = 1
+        while True:
+            dest = self.run_dir.with_name(self.run_dir.name + CRASH_SUFFIX_FMT.format(n))
+            if not dest.exists():
+                return dest, n
+            n += 1
+
+    def _prepare_fresh_outdir(self) -> bool:
+        """`--resume` を付けない起動の直前に run dir を空にする。続行可なら True。
+
+        ★なぜ要るか: 完全世代の checkpoint が 1 つも無いクラッシュ(= 最初の世代を
+          書き切る前に死んだ)からの復旧は `--resume` を付けられない。しかし前回の
+          `*.part-*.parquet` や `llm_cache.jsonl` は残っているので、run.py の A7 ガードが
+          `RuntimeError` で即死させる → watchdog が再起動 → また即死、の**再起動ループ**に
+          なる(第133 の新ガードと watchdog の不整合)。
+
+        ★直し方: 逃し弁(`run.allow_dirty_outdir=true`)で**混ぜて通す**のは最悪手
+          (2 つのランのイベントが 1 本の canonical に結合され、事後に検出できない)。
+          run dir を丸ごと `<name>.crash-<連番>` へ **rename して退避**し、空の dir から
+          始める。同一ボリュームの rename なので 25 万体ぶんの part があっても一瞬で、
+          **1 バイトも消さない**(事後解析に全部残る)。
+
+        ★rename に失敗したら **False = 停止**。「退避できないから重ねて書く」は
+          静かにデータを壊す方向なので、判断を人間へ返す。
+        """
+        hits = dirty_outdir_hits(self.run_dir)
+        if not hits:
+            return True
+        dest, n = self._crash_dest()
+        bdest = (self.backup_dir.with_name(self.backup_dir.name
+                                           + CRASH_SUFFIX_FMT.format(n))
+                 if self.backup_dir.is_dir() and any(self.backup_dir.glob("gen-*"))
+                 else None)
+        self.log("fresh restart into a used run dir "
+                 f"(痕跡: {', '.join(hits)}) - quarantining to {dest.name}"
+                 + (f" (+ backup → {bdest.name})" if bdest else ""))
+        # ★バックアップを先に動かす: ここで失敗しても run dir は 1 バイトも動いていない
+        #   (= 世界の状態が中途半端にならない)。
+        if bdest is not None:
+            try:
+                os.rename(self.backup_dir, bdest)
+            except OSError as e:
+                self.log(f"*** STOP *** backup dir の退避に失敗: {self.backup_dir} "
+                         f"→ {bdest}: {e}。前のランの世代を新しいランへ混ぜないため"
+                         "ここで停止する(run dir は動かしていない)。手動で退避するか "
+                         "--backup-dir を別の場所にして再実行すること")
+                return False
+        try:
+            os.rename(self.run_dir, dest)
+        except OSError as e:
+            self.log(f"*** STOP *** run dir の退避に失敗: {self.run_dir} → {dest}: {e}。"
+                     "run.allow_dirty_outdir で重ねて書くと前回の part が今回の成果物へ"
+                     "結合され、事後に検出できない。ここで停止する"
+                     + (f"(backup は既に {bdest.name} へ退避済み)" if bdest else ""))
+            return False
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        # ここから先のログは**新しい空の run dir** へ書かれる(退避前のログは crash dir 側に
+        # 丸ごと残っている)。両方に痕跡が残るよう、退避の事実をもう一度書く。
+        self.log(f"quarantined previous run dir → {dest} "
+                 + (f"(backup → {bdest}) " if bdest else "")
+                 + "; starting fresh from an empty dir")
+        self.last_backup_step = None
+        self.last_backup_time = 0.0
+        self.last_failed_ckpt_step = None
+        self.same_ckpt_fail = 0
+        return True
+
+    # ------------------------------------------------------------------ #
     # 子プロセスの起動・監視
     # ------------------------------------------------------------------ #
     def _build_cmd(self, resume: bool) -> list[str]:
@@ -709,6 +907,10 @@ class Watchdog:
         self.log(f"watchdog start. run_dir={self.run_dir} "
                  f"backup_dir={self.backup_dir} max_restarts={self.max_restarts} "
                  f"stall={self.stall_sec:.0f}s")
+        self.log("complete-generation rule: "
+                 + ("society.engine.checkpoint.complete_generations"
+                    if _checkpoint_module() is not None
+                    else "stdlib mirror (society import unavailable)"), echo=False)
         if self.disk_check_sec > 0:                 # 起動直後に残量の基準線を 1 行残す
             self.check_disk(tag="watchdog start")
             self._disk_next_t = time.monotonic() + max(self.disk_check_sec, 30.0)
@@ -730,6 +932,12 @@ class Watchdog:
                         self.write_status("failed")
                         return 1
                     resume = self._latest_ckpt() is not None
+
+            # 第133 レーンR2: `--resume` を付けない起動は、使用済み run dir を踏むと
+            # run.py の A7 ガードに弾かれて再起動ループになる。退避してから始める。
+            if not resume and not self._prepare_fresh_outdir():
+                self.write_status("failed")
+                return 1
 
             outcome = self._run_once(resume)
 

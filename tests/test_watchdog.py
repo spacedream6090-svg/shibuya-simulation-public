@@ -82,8 +82,8 @@ def write_summary(run_dir):
         '{"n_steps": 1, "dummy": true}', encoding="utf-8")
 
 
-def bump(run_dir):
-    f = run_dir / "_attempts.txt"
+def bump(state_dir):
+    f = state_dir / "_attempts.txt"
     n = (int(f.read_text()) if f.exists() else 0) + 1
     f.write_text(str(n))
     return n
@@ -100,11 +100,14 @@ def main():
     ap.add_argument("--sleep", type=float, default=0.4)
     ap.add_argument("--final-sleep", type=float, default=0.6)
     ap.add_argument("--stall-sleep", type=float, default=30.0)
+    # 試行回数の置き場(既定=run-dir)。run-dir が退避(rename)される検査では
+    # **run-dir の外**に置かないと数え直しになるので別に取れるようにする。
+    ap.add_argument("--counter", default=None)
     a = ap.parse_args()
     run_dir = Path(a.run_dir)
     ckpt_dir = run_dir / "checkpoint"
     run_dir.mkdir(parents=True, exist_ok=True)
-    attempt = bump(run_dir)
+    attempt = bump(Path(a.counter) if a.counter else run_dir)
 
     if a.mode == "always_crash":
         sys.exit(1)                              # 進捗なく即死
@@ -124,6 +127,20 @@ def main():
             time.sleep(a.stall_sleep)            # 以後進捗なし → watchdog が kill
             sys.exit(0)                          # (到達しない: kill される)
         write_ckpt(ckpt_dir, latest_step(ckpt_dir) + a.inc)
+        write_summary(run_dir)
+        sys.exit(0)
+
+    if a.mode == "dirty_crash_then_ok":
+        # 1 回目: checkpoint を 1 つも書かずに死ぬ(= part と llm_cache だけが残る)。
+        # 2 回目以降: 空の run-dir を前提に最初から回して完走する。
+        if attempt == 1:
+            write_part(run_dir, 1)
+            (run_dir / "llm_cache.jsonl").write_text("{}\n", encoding="utf-8")
+            sys.exit(1)
+        if (run_dir / "l1_events.part-0001.parquet").exists():
+            sys.exit(3)                          # 退避されていない = 前回の痕跡が残っている
+        write_ckpt(ckpt_dir, a.inc)
+        write_part(run_dir, 1)
         write_summary(run_dir)
         sys.exit(0)
 
@@ -552,6 +569,88 @@ def test_clear_run_state_leaves_no_orphan_markers(tmp_path):
         "★本体を消したのにマーカーが残った(孤児マーカー)"
 
 
+def test_uncommitted_generation_is_never_picked_as_latest(tmp_path):
+    """★第133: マーカーの無い(= 書き込み途中で死んだ)世代を `_latest_ckpt` が掴まない。
+
+    第133 でマーカーは「本体 + pool サイドカー + 全 flush」が終わった後のコミット点に
+    なった。engine の resume は完全世代しか掴まないので、watchdog がここで未コミット
+    世代を選ぶと `--resume` が起動直後に明示エラーで死ぬ(= 監督者が用意した再開点が
+    必ず失敗する)。
+    """
+    wd = _wd(tmp_path)
+    _put_ckpt(wd.run_dir, 100)                     # 完全世代
+    _put_ckpt(wd.run_dir, 200, marker=False)       # 書き込み途中で死んだ世代
+    latest = wd._latest_ckpt()
+    assert latest is not None and latest.name == "ckpt-000100.pkl.gz", latest
+    assert wd._ckpt_step_now() == 100
+    assert [p.name for p in wd._complete_ckpts()] == ["ckpt-000100.pkl.gz"]
+    # 未コミット世代がコミットされたら、その瞬間から最新になる
+    (wd.run_dir / "checkpoint" / ("ckpt-000200.pkl.gz" + WD.COMPLETE_SUFFIX)).write_bytes(b"")
+    assert wd._latest_ckpt().name == "ckpt-000200.pkl.gz"
+
+
+def test_legacy_dir_without_any_marker_is_unchanged(tmp_path):
+    """★後方互換: マーカーが 1 つも無い dir(第117 以前・バックアップ復元)は全候補許可。"""
+    wd = _wd(tmp_path)
+    _put_ckpt(wd.run_dir, 100, marker=False)
+    _put_ckpt(wd.run_dir, 200, marker=False)
+    assert wd._latest_ckpt().name == "ckpt-000200.pkl.gz"
+
+
+def test_complete_ckpts_stdlib_matches_the_engine_rule(tmp_path):
+    """★stdlib 版(society が import できないときの後退経路)が engine 本体と完全一致。
+
+    watchdog は society を任意 import する。import できた環境では
+    `checkpoint.complete_generations` をそのまま使うので、固定すべきは
+    「**後退経路が同じ答えを返す**」= 環境で挙動が割れないこと。
+    """
+    from society.engine import checkpoint as ck
+
+    cases = {
+        "empty": [],                                        # checkpoint dir 自体が無い
+        "legacy": [(100, False), (200, False)],
+        "all_marked": [(100, True), (200, True)],
+        "tail_uncommitted": [(100, True), (200, False)],
+        "head_uncommitted": [(100, False), (200, True)],
+        "single_uncommitted": [(100, False)],
+    }
+    for name, gens in cases.items():
+        root = tmp_path / name
+        for step, marker in gens:
+            _put_ckpt(root, step, marker=marker)
+        ref = sorted((p for p in ck.complete_generations(root)
+                      if WD._ckpt_step(p) is not None),
+                     key=lambda p: (WD._ckpt_step(p), p.name))
+        assert WD.complete_ckpts_stdlib(root / "checkpoint") == ref, name
+    # 名前から step が読めないファイルは**どちらの経路でも**候補にしない
+    weird = tmp_path / "weird"
+    _put_ckpt(weird, 100)
+    (weird / "checkpoint" / "ckpt-xx.pkl.gz").write_bytes(b"junk")
+    assert [p.name for p in WD.complete_ckpts_stdlib(weird / "checkpoint")] == \
+        ["ckpt-000100.pkl.gz"]
+
+
+def test_falls_back_to_the_stdlib_rule_when_society_is_unavailable(tmp_path, monkeypatch):
+    """society が import できない環境でも同じ答えを返す(監督者は絶対に死なない)。"""
+    assert WD._checkpoint_module() is not None, "本リポジトリでは本体を使えるはず"
+    wd = _wd(tmp_path)
+    _put_ckpt(wd.run_dir, 100)
+    _put_ckpt(wd.run_dir, 200, marker=False)
+    with_engine = wd._latest_ckpt()
+    monkeypatch.setattr(WD, "_checkpoint_module", lambda: None)
+    assert wd._latest_ckpt() == with_engine
+    # 本体側が例外を投げても後退して答えを返す(監督ループを止めない)
+
+    class _Boom:
+        @staticmethod
+        def complete_generations(_):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(WD, "_checkpoint_module", lambda: _Boom)
+    assert wd._latest_ckpt() == with_engine
+    assert "using stdlib mirror" in _log(wd)
+
+
 def test_marker_is_invisible_to_progress_and_latest(tmp_path):
     """マーカーは進捗指紋にも `_latest_ckpt` にも掛からない(既存挙動が無風)。"""
     wd = _wd(tmp_path)
@@ -568,3 +667,190 @@ def test_marker_is_invisible_to_progress_and_latest(tmp_path):
     assert not list((wd.run_dir / "checkpoint").glob(WD.CKPT_GLOB)) == []
     assert all(not p.name.endswith(WD.COMPLETE_SUFFIX)
                for p in (wd.run_dir / "checkpoint").glob(WD.CKPT_GLOB))
+
+
+# --------------------------------------------------------------------------- #
+# fresh 再起動前の退避(第133 レーンR2 = run.py の A7 ガードとの整合)
+#
+#   第133 の run.py は「非 resume 起動 × 使用済み run dir」を RuntimeError で拒否する。
+#   完全世代の checkpoint が 1 つも無いクラッシュからの復旧は `--resume` を付けられない
+#   ので、watchdog がそのまま再起動すると**必ず**弾かれる = 再起動ループ。
+#   逃し弁(run.allow_dirty_outdir)で混ぜるのは最悪手なので、run dir を退避して空から
+#   始める。**1 バイトも消さない**(rename だけ)。
+# --------------------------------------------------------------------------- #
+def _dirty(run_dir: Path, *, part: bool = True, cache: bool = True) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    if part:
+        (run_dir / "l1_events.part-0001.parquet").write_bytes(b"PAR1-old")
+    if cache:
+        (run_dir / "llm_cache.jsonl").write_text("{}\n", encoding="utf-8")
+
+
+def test_log_survives_a_cp932_console(tmp_path, monkeypatch):
+    """★コンソールが cp932 でも `log()` は例外を投げない(監督者が print で死なない)。
+
+    日本語 Windows の既定コンソールは cp932 で、em dash(U+2014)のように**記録には
+    書けるのに print できない**文字がある。例外は log() の呼び出し元へ伝播して
+    watchdog ごと落とすので、表示側だけを落として続ける。
+    """
+    class _Cp932Stdout:
+        encoding = "cp932"
+
+        def __init__(self):
+            self.chunks = []
+
+        def write(self, s):
+            s.encode("cp932")          # 表示できない文字なら UnicodeEncodeError
+            self.chunks.append(s)
+            return len(s)
+
+        def flush(self):
+            pass
+
+    wd = _wd(tmp_path)
+    fake = _Cp932Stdout()
+    monkeypatch.setattr(sys, "stdout", fake)
+    wd.log("dash — here")          # 落ちないこと自体が検査(em dash は cp932 に無い)
+    wd.log("plain ascii")
+    shown = "".join(fake.chunks)
+    assert "dash" in shown and "plain ascii" in shown, shown
+    assert "—" not in shown, "表示できない文字がそのまま print されている"
+    # 記録側(utf-8)は 1 文字も落とさない
+    assert "dash — here" in _log(wd)
+
+
+def test_dirty_outdir_globs_mirror_run_py():
+    """★痕跡 glob は run.py 側と同値(向こうに増えたらこちらが赤くなる)。"""
+    import importlib.util as _ilu
+    spec = _ilu.spec_from_file_location("run_entry_for_wd", SCRIPTS / "run.py")
+    run_mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(run_mod)
+    assert tuple(WD.DIRTY_OUTDIR_GLOBS) == tuple(run_mod.DIRTY_OUTDIR_GLOBS)
+
+
+def test_dirty_outdir_hits_reads_only(tmp_path):
+    wd = _wd(tmp_path)
+    assert WD.dirty_outdir_hits(wd.run_dir) == []          # watchdog.log だけの dir は clean
+    assert WD.dirty_outdir_hits(tmp_path / "nope") == []   # 無い dir も clean
+    _dirty(wd.run_dir)
+    _put_ckpt(wd.run_dir, 10)
+    hits = WD.dirty_outdir_hits(wd.run_dir)
+    assert "l1_events.part-0001.parquet" in hits
+    assert "llm_cache.jsonl" in hits
+    assert "checkpoint/ckpt-000010.pkl.gz" in hits
+
+
+def test_clean_run_dir_is_not_quarantined(tmp_path):
+    """痕跡が無ければ 1 つも動かさない(既存の正常系が無風)。"""
+    wd = _wd(tmp_path)
+    assert wd._prepare_fresh_outdir() is True
+    assert list(tmp_path.glob("run.crash-*")) == []
+
+
+def test_fresh_restart_quarantines_the_used_run_dir(tmp_path):
+    """★使用済み run dir は `<name>.crash-001` へ rename され、空の dir から始まる。"""
+    wd = _wd(tmp_path)
+    _dirty(wd.run_dir)
+    (wd.run_dir / "run.out.log").write_bytes(b"old child log")
+    assert wd._prepare_fresh_outdir() is True
+    crash = tmp_path / "run.crash-001"
+    assert crash.is_dir(), sorted(p.name for p in tmp_path.iterdir())
+    # 1 バイトも消さない: 退避先に前回の成果物が丸ごと残っている
+    assert (crash / "l1_events.part-0001.parquet").read_bytes() == b"PAR1-old"
+    assert (crash / "llm_cache.jsonl").exists()
+    assert (crash / "run.out.log").exists()
+    # 新しい run dir は run.py の A7 ガードを通る状態(痕跡ゼロ)
+    assert wd.run_dir.is_dir()
+    assert WD.dirty_outdir_hits(wd.run_dir) == []
+    # 退避の事実が**両方**のログに残る(退避前=crash 側 / 退避後=新 dir 側)
+    assert "quarantining to run.crash-001" in (crash / "watchdog.log").read_text(
+        encoding="utf-8")
+    assert not any(p.name.startswith("l1_events.part-") for p in wd.run_dir.iterdir())
+    assert "quarantined previous run dir" in _log(wd)
+
+
+def test_quarantine_never_overwrites_an_existing_crash_dir(tmp_path):
+    """連番は既存を避けて増える(2 回目のクラッシュで 001 を潰さない)。"""
+    wd = _wd(tmp_path)
+    for n in (1, 2, 3):
+        _dirty(wd.run_dir)
+        (wd.run_dir / "marker.txt").write_text(str(n), encoding="utf-8")
+        assert wd._prepare_fresh_outdir() is True
+    for n in (1, 2, 3):
+        assert (tmp_path / f"run.crash-{n:03d}" / "marker.txt").read_text() == str(n)
+
+
+def test_quarantine_moves_the_backup_generations_too(tmp_path):
+    """★前のランのバックアップ世代を新しいランへ持ち越さない(同じ連番で一緒に退避)。"""
+    wd = _wd(tmp_path)
+    _dirty(wd.run_dir)
+    gen = wd.backup_dir / "gen-000010-x"
+    gen.mkdir(parents=True)
+    (gen / "config.yaml").write_text("old", encoding="utf-8")
+    assert wd._prepare_fresh_outdir() is True
+    assert (Path(str(wd.backup_dir) + ".crash-001") / "gen-000010-x" /
+            "config.yaml").read_text() == "old"
+    assert wd._gens() == [], "退避したのに前のランの世代が見えている"
+
+
+def test_quarantine_failure_stops_instead_of_mixing(tmp_path, monkeypatch):
+    """★rename できないなら**停止**する(黙って allow_dirty_outdir で重ねて書かない)。"""
+    wd = _wd(tmp_path)
+    _dirty(wd.run_dir)
+
+    def _boom(src, dst):
+        raise OSError("locked by another process")
+
+    monkeypatch.setattr(WD.os, "rename", _boom)
+    assert wd._prepare_fresh_outdir() is False
+    log = _log(wd)
+    assert "*** STOP ***" in log
+    assert "allow_dirty_outdir" in log, "混ぜない理由がログに無い"
+    # 世界は 1 バイトも動いていない(退避先は作られていない・痕跡はそのまま)
+    assert list(tmp_path.glob("run.crash-*")) == []
+    assert (wd.run_dir / "l1_events.part-0001.parquet").exists()
+
+
+def test_quarantine_stops_when_only_the_backup_rename_fails(tmp_path, monkeypatch):
+    """バックアップ側で失敗しても run dir は動かさない(中途半端な状態を作らない)。"""
+    wd = _wd(tmp_path)
+    _dirty(wd.run_dir)
+    (wd.backup_dir / "gen-000010-x").mkdir(parents=True)
+    real = WD.os.rename
+
+    def _boom_on_backup(src, dst):
+        if "_backup" in str(src):
+            raise OSError("nope")
+        return real(src, dst)
+
+    monkeypatch.setattr(WD.os, "rename", _boom_on_backup)
+    assert wd._prepare_fresh_outdir() is False
+    assert "backup dir の退避に失敗" in _log(wd)
+    assert list(tmp_path.glob("run.crash-*")) == []
+    assert (wd.run_dir / "l1_events.part-0001.parquet").exists()
+
+
+def test_crash_without_any_checkpoint_restarts_fresh_after_quarantine(tmp_path):
+    """★監督ループ全体: checkpoint 皆無のクラッシュ → 退避 → fresh 再起動 → 完走。
+
+    差し替え前はここで run.py の A7 ガードに弾かれ続け、`--max-restarts` を使い切って
+    status=failed になっていた(= 再起動ループ)。
+    """
+    run_dir = tmp_path / "run"
+    dummy = _dummy(tmp_path)
+    child = ["--run-dir", str(run_dir), "--mode", "dirty_crash_then_ok",
+             "--inc", "10", "--counter", str(tmp_path)]
+    rc = _run_watchdog(run_dir, _cmd_str(dummy), child,
+                       poll_sec=0.1, stall_min=999, min_uptime_sec=0,
+                       backoff_base_sec=0)
+    assert rc == 0
+    st = _status(run_dir)
+    assert st["state"] == "done" and st["restarts"] == 1, st
+    assert (run_dir / "summary.json").exists()
+    crash = tmp_path / "run.crash-001"
+    assert (crash / "l1_events.part-0001.parquet").exists(), "前回の part が退避されていない"
+    assert (crash / "llm_cache.jsonl").exists()
+    log = (run_dir / "watchdog.log").read_text(encoding="utf-8")
+    assert "quarantined previous run dir" in log
+    assert "--resume" not in log.split("quarantined")[-1], \
+        "退避後の起動に --resume が付いている(空 dir から始まっていない)"

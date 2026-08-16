@@ -119,34 +119,107 @@ class PoolStore:
 
 
 class DormantStore:
-    """退場者のスリム状態を退避する有界ストア(上限 + LRU。persona-pool §3.3)。
+    """退場者のスリム状態を退避する**二層**ストア(レーン R1 A2)。
 
-    cap>0 のとき「リッチな記憶を持てる母集団」に上限を設け、超過分は最も古い個体から退避
-    (evict = 保存状態を捨てる。再来街時はプールから素で再構築)。cap=0 は無制限。
+    層 1 ``rich``  … 記憶・信念・関係・可塑性など。上限 + LRU(persona-pool §3.3)。
+                     cap>0 のとき「リッチな記憶を持てる母集団」に上限を設け、超過分は
+                     最も古い個体から捨てる。cap=0 は無制限(= 出荷時の既定)。
+    層 2 ``vital`` … **金銭・債権・人口会計**。容量に依らず**絶対に捨てない**。
+
+    ★なぜ分けるか(見つかった破れ): 旧実装は LRU 超過で退避状態を**丸ごと**捨てていた。
+      捨てられた個体が再来街すると ``pop`` が None を返し、``build_agent`` が
+      **初期所持金で新規鋳造**する。つまり退場時の残高・預金・家賃債権・未清算の勤務実績が
+      **真に消え、同時に無から現金が湧いていた**。しかもどの保存チャネル(L1 / finance /
+      provenance)にも痕跡が残らないので、総マネー保存の検査でも検出できなかった。
+      vital は 1 体あたり数百バイト(既定値の欄はキーを作らない)なので、100 万体の
+      プールでも数百 MB に収まる = 上限を掛ける動機がそもそも無い。
+
+    ★挙動不変の範囲: cap=0(出荷時の既定)では rich が 1 件も捨てられないので、
+      ``pop`` は従来どおり rich を返し、vital は 1 度も使われない = 完全にバイト一致。
+      挙動が変わるのは「cap>0 で実際に LRU 破棄が起きたランの、その個体の再来街」だけ。
     """
 
     def __init__(self, cap: int = 0):
         self.cap = int(cap)
         self._d: "OrderedDict[str, dict]" = OrderedDict()
+        #: pid -> vital 台帳(容量非依存)。挿入順は save 順(決定論)。
+        self._vital: dict[str, dict] = {}
 
+    # ---- 退避 -----------------------------------------------------------------
     def save(self, pid: str, state: dict) -> None:
+        """退避(rich は LRU つき・vital は容量非依存)。vital は rich から**派生**する。"""
+        vital = vital_of(state)
+        if vital:
+            self._vital[pid] = vital
+        else:
+            self._vital.pop(pid, None)      # 全欄が既定値 = 運ぶものが無い(キーを作らない)
         self._d[pid] = state
         self._d.move_to_end(pid)
         if self.cap > 0:
             while len(self._d) > self.cap:
-                self._d.popitem(last=False)     # LRU 退避
+                self._d.popitem(last=False)     # LRU 退避(★vital は道連れにしない)
 
+    # ---- 取り出し -------------------------------------------------------------
     def pop(self, pid: str) -> dict | None:
-        return self._d.pop(pid, None)
+        """rich を取り出す(vital を**上書きマージ**して返す)。rich が無ければ None。
+
+        vital は rich から派生した写しなので、健全なら上書きは恒等(= バイト一致)。
+        マージを明示するのは「金銭・債権の真実源は vital」という順序を実装で示すため。
+        rich が LRU で捨てられている場合は ``pop_vital`` が拾う(呼び出し側の分岐)。
+        """
+        rich = self._d.pop(pid, None)
+        if rich is None:
+            return None                      # ★vital は消費しない(pop_vital に残す)
+        vital = self._vital.pop(pid, None)
+        if vital:
+            _merge_vital(rich, vital)
+        return rich
+
+    def pop_vital(self, pid: str) -> dict | None:
+        """恒久台帳だけを取り出す(rich が LRU 破棄済みの個体の再来街で使う)。"""
+        return self._vital.pop(pid, None)
 
     def peek(self, pid: str) -> dict | None:
         return self._d.get(pid)
 
+    def peek_vital(self, pid: str) -> dict | None:
+        return self._vital.get(pid)
+
+    # ---- 観測(economy_sfc の hh_dormant 列が読む)------------------------------
+    def vital_money_total(self) -> float:
+        """退避中(街に居ない)個体の**現金 + 口座**の総額。決定論(dict の値の和)。"""
+        return float(sum(float(v.get("money", 0.0)) + float(v.get("account", 0.0))
+                         for v in self._vital.values()))
+
+    def vital_claims_total(self) -> float:
+        """退避中の個体が抱える**家賃債権**(未払い残)の総額。"""
+        return float(sum(float((v.get("econ") or {}).get("rent_due", 0.0))
+                         for v in self._vital.values()))
+
+    def rebuild_vital(self) -> None:
+        """rich から vital を作り直す(**旧 pool サイドカー**の互換口)。
+
+        vital 層より前に書かれたサイドカーには vital が無い。resume でそのまま続けると
+        「rich が LRU で消えた個体だけ台帳も無い」状態になるので、読める分だけ復元する
+        (rich まで捨てられていた個体は元から復元不能 = 旧ランの既知の欠落として残る)。
+        """
+        for pid, state in self._d.items():
+            if pid in self._vital:
+                continue
+            vital = vital_of(state)
+            if vital:
+                self._vital[pid] = vital
+
     def __contains__(self, pid: str) -> bool:
-        return pid in self._d
+        # ★vital だけが残っている個体も「退避されている」= True(rich は LRU で捨てられうる)。
+        return pid in self._d or pid in self._vital
 
     def __len__(self) -> int:
-        return len(self._d)
+        return len(self._d)                  # リッチ層の件数(従来の意味を変えない)
+
+    def __repr__(self):
+        return (f"<DormantStore rich={len(self._d)} vital={len(self._vital)}"
+                f" cap={self.cap}>")
 
 
 # ---- スリム状態の往復(dehydrate/hydrate)----------------------------------------
@@ -795,3 +868,98 @@ def hydrate(agent, state: dict) -> None:
     sat = state.get("sat")                        # 第114 OBS: 価値 4 軸の充足(多日スケール)
     if sat:
         agent.sat = {str(k): float(v) for k, v in sat.items()}
+
+
+# --------------------------------------------------------------------------- #
+# 恒久台帳(vital)= 金銭・債権・人口会計。**LRU の対象外**(レーン R1 A2)
+#
+# 何を vital に入れるかの基準(この 3 つを全部満たすものだけ):
+#   ① 捨てると**総量が保存しない**(現金が消える / 無から湧く)、または名簿の増減が壊れる。
+#   ② 再来街時に決定論で組み直せない(build_agent は初期値を鋳造するので**別の値**になる)。
+#   ③ 1 体あたりのバイト数が小さい(既定値の欄はキーを作らないので、多くの個体で数十バイト)。
+# 逆に「記憶・信念・関係・可塑性・評判」は ① を満たさない(捨てても総量は保存する)ので
+# rich のまま = 上限 + LRU の対象。
+#
+# 実物の全数列挙(``dehydrate`` の実装から採る。推測で書かない):
+#   money                       … agent.money(現金)          … dehydrate の "money"
+#   account                     … agent.account(口座残高)    … dehydrate の "account"
+#   econ(= _ECON_FIELDS 一式)  … dehydrate の "econ"
+#     rent_due                  … 家賃債権(未払い残)
+#     arrears_days              … 滞納の連続日数(立退きの左辺)
+#     period_income             … 前回家賃日からの入金累計
+#     work_days                 … 給料日までに完遂した本業勤務日数(= 未払賃金の元)
+#     last_salary               … 直近の月給支給額
+#     evicted / bankrupt_until  … 立退き / 破産の継続状態
+#     wp_days                   … WAGE の未清算な勤務実績(= 未払賃金の元)
+#     wp_settled_day            … 最後に清算した日(二重支給/取りこぼしの境界)
+#     wp_bonus_pending          … 持ち越した賞与
+#     rp_settled_day            … L5 役割職の最終清算日(議員報酬の二重払い防止)
+#   pop(= _POP_FIELDS 一式)    … dehydrate の "misc" の中の人口会計
+#     pop_stress / pop_days / pop_settled / pop_emigrated / pop_pair_since
+# --------------------------------------------------------------------------- #
+
+#: 人口会計(存在の内生化 POP)の欄名。``_MISC_FIELDS`` から**同じ実体**を切り出す
+#  (二重の真実源を作らないため、名前だけをここに書いて型/既定値はあちらから引く)。
+_VITAL_POP_NAMES: tuple[str, ...] = ("pop_stress", "pop_days", "pop_settled",
+                                     "pop_emigrated", "pop_pair_since")
+_POP_FIELDS = tuple(f for f in _MISC_FIELDS if f[0] in _VITAL_POP_NAMES)
+
+
+def vital_of(state: dict) -> dict:
+    """退避スリム状態(rich)→ 恒久台帳(vital)。**rich からの派生**(独立の真実源ではない)。
+
+    ★``money`` / ``account`` は ``dehydrate`` が**必ず**書く欄なので、0 円でもキーを作る
+      (「0 円で街を出た」と「台帳が無い」を区別できないと、再鋳造との違いが立たない)。
+    ★``econ`` / ``pop`` は非既定の欄しか無いので、機構 OFF のランでは丸ごとキーが生えない。
+    """
+    out: dict = {}
+    if "money" in state:
+        out["money"] = float(state["money"])
+    if "account" in state:
+        out["account"] = float(state["account"])
+    econ = state.get("econ")
+    if econ:
+        out["econ"] = dict(econ)
+    misc = state.get("misc") or {}
+    pop = {k: misc[k] for k in _VITAL_POP_NAMES if k in misc}
+    if pop:
+        out["pop"] = pop
+    return out
+
+
+def _merge_vital(rich: dict, vital: dict) -> None:
+    """vital を rich へ**上書き**マージする(金銭・債権の真実源は vital 側)。
+
+    健全な状態では両者は同値なので**1 バイトも動かない**(値が一致する欄は代入すらしない
+    = 退避辞書のオブジェクト同一性まで保つ)。マージを明示するのは、将来 vital 側だけを
+    更新する経路が生えたときに順序が決まっていることを実装で示すため。
+    """
+    for key in ("money", "account"):
+        if key in vital and rich.get(key) != vital[key]:
+            rich[key] = vital[key]
+    econ = vital.get("econ")
+    if econ and (rich.get("econ") or {}) != econ:
+        rich["econ"] = {**(rich.get("econ") or {}), **econ}
+    pop = vital.get("pop")
+    if pop and not all((rich.get("misc") or {}).get(k) == v for k, v in pop.items()):
+        rich["misc"] = {**(rich.get("misc") or {}), **pop}
+
+
+def overlay_vital(agent, vital: dict) -> None:
+    """恒久台帳だけを再来街エージェントへ当てる(``build_pool_agent`` の**後**に呼ぶ)。
+
+    ``hydrate`` との違い: 記憶・信念・関係・状態・可塑性には**1 バイトも触らない**。
+    リッチな退避状態が LRU 上限で捨てられた個体は「記憶を失って街へ戻る」= 設計どおりだが、
+    **財布まで失う**のは設計ではなく破れ(無からの創出 + 真の消失)なので、ここだけを戻す。
+    キー欠落は許容する(旧サイドカー / 機構 OFF のランでは属性を 1 つも生やさない)。
+    """
+    if "money" in vital:
+        agent.money = float(vital["money"])
+    if "account" in vital:
+        agent.account = float(vital["account"])
+    econ = vital.get("econ")
+    if econ:
+        _fields_apply(agent, econ, _ECON_FIELDS)
+    pop = vital.get("pop")
+    if pop:
+        _fields_apply(agent, pop, _POP_FIELDS)

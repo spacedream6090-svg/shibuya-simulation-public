@@ -10,6 +10,7 @@ from pathlib import Path
 from omegaconf import DictConfig, OmegaConf
 
 from ..agents.persona import build_agent
+from ..agents.ref import to_ref as _to_ref
 from ..cognition.lod import LodBudget
 from ..config import REPO_ROOT, save_config
 from ..labeling.labels import LabelSystem
@@ -2080,10 +2081,11 @@ class Simulation:
         """checkpoint と対で、pool の状態を同 step の sidecar に保存する(pool ON 時のみ)。
 
         checkpoint.py 本体は触らず(掟)、pool 固有の状態だけを持たせる:
-          - ドーマント退避ストア(再来街の記憶源)。
+          - ドーマント退避ストア(再来街の記憶源)= リッチ層 + **恒久台帳 vital**(A2)。
           - 日境界の進行(_pool_day)。
           - **退場済み個体**(agent_by_id にあり sim.agents に無い個体)= 造語の作者名・DM 送信者名等
             の**過去参照**の解決先。checkpoint は present 個体しか保存しないので、ここで補完する。
+            ★A1 以後、ここに載るのは軽量参照(``agents/ref.AgentRef``)= サイドカーも自然に縮む。
         presence 自体は純関数=保存不要(day から再計算)。"""
         if self._pool is None:
             return
@@ -2091,10 +2093,13 @@ class Simulation:
         import os
         import pickle
         present_ids = {a.id for a in self.agents}
-        departed = {aid: a for aid, a in self.agent_by_id.items()
+        departed = {aid: _to_ref(a) for aid, a in self.agent_by_id.items()
                     if aid not in present_ids}
         blob = {"pool_day": int(self._pool_day),
                 "dormant": self._dormant._d,
+                # ★A2: 恒久台帳(金銭・債権・人口会計)。旧サイドカーには無いので
+                #   復元側は欠落を許容し、rich から作り直す(rebuild_vital)。
+                "dormant_vital": self._dormant._vital,
                 "dormant_cap": self._dormant.cap,
                 "departed": departed}
         path = self._pool_sidecar_path(step)
@@ -2238,9 +2243,16 @@ class Simulation:
             blob = self._read_pool_sidecar(start)
         self._dormant = pool_mod.DormantStore(cap=int(blob.get("dormant_cap", 0)))
         self._dormant._d = OrderedDict(blob.get("dormant", {}))
+        # ★A2: 恒久台帳(vital)。**旧サイドカー互換** = キーが無ければ rich から作り直す
+        #   (rich まで LRU で捨てられていた個体は旧ランでは元から復元不能 = 既知の欠落)。
+        self._dormant._vital = dict(blob.get("dormant_vital", {}))
+        if "dormant_vital" not in blob:
+            self._dormant.rebuild_vital()
         self._pool_day = int(blob.get("pool_day", self._pool_day))
         for aid, agent in blob.get("departed", {}).items():
-            self.agent_by_id.setdefault(aid, agent)   # 退場者参照を復元(present は上書きしない)
+            # ★A1: **旧サイドカー互換** = departed にフル Agent が入っていても、ここで
+            #   軽量参照へ揃える(straight run と同じ軽さ・同じ読み口で続行する)。
+            self.agent_by_id.setdefault(aid, _to_ref(agent))
         self._pool_update_budget()
 
     def run(self, resume_from: Path | str | None = None) -> dict:

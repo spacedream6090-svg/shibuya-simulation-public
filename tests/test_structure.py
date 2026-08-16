@@ -7,7 +7,10 @@
   (churn)observe の当日タリー=formed(relation_tier{tier==1})/broken(break{cause!=absence})/
          decayed(break{cause==absence})の計数が合成イベントで正しい + 暦日境界リセット + idempotent。
   (母数) edge_churn_rate の母数=活性関係数(tier≥1 の live 台帳)= churn/max(active,1)。
-  (τ)    Kendall τ 自前実装(measure._kendall_tau 再利用)の単体=既知ケース(同一=1 / 逆順=-1 / 定数=None)。
+  (τ)    Kendall τ 自前実装の単体=既知ケース(同一=1 / 逆順=-1 / 定数=None)。
+  (τ/N)  第133 レーンR2: τ の実体を凍結 measure._kendall_tau(O(N²))から
+         assets._kendall_tau(O(N log N))へ差し替えた同値性=境界/乱数/tie で完全一致・
+         rank_stability の出力が差し替え前後でまるごと一致・n=250,000 完走スモーク。
   (固着) _stagnant_intervals の区間出力=閾値以下で連続 N 日の区間化。
   (再構成)reconstruct_churn が L1 relation イベントから日次 churn を in-sim と同一定義で再構成。
   (k)    compute_matched 下で k=free と k=off の generate 呼数が完全一致(観測のみ=自明だが1本)。
@@ -17,12 +20,16 @@
 from __future__ import annotations
 
 import json
+import math
+import random
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "viz"))
@@ -30,6 +37,7 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from society.config import load_config                        # noqa: E402
 from society.engine.simulation import Simulation              # noqa: E402
+from society.observer import measure as m                     # noqa: E402
 from society.observer import structure as st                  # noqa: E402
 from society.observer.schema import Event                     # noqa: E402
 
@@ -198,6 +206,111 @@ def test_kendall_tau_known_cases():
     assert abs(ast.kendall_tau([1, 2, 3, 4], [1, 2, 4, 3]) - (4 / 6)) < 1e-6
     assert ast.kendall_tau([1], [1]) is None                       # n<2
     assert ast.kendall_tau([5, 5, 5], [1, 2, 3]) == 0.0            # 片側定数=τ-b 分母0→0.0(measure 仕様)
+
+
+# --------------------------------------------------------------------------- #
+# (τ O(N log N) 化・第133 レーンR2)
+#
+#   `analyze_structure.kendall_tau` の実体を 凍結 `measure._kendall_tau`(明示二重ループ
+#   = O(N²))から `assets._kendall_tau`(マージソート反転数 = O(N log N))へ差し替えた。
+#   ★凍結ファイル measure.py は 1 バイトも触っていない = 下の参照は「置き換え前の
+#     kendall_tau そのもの」であり、これと新実装が完全一致することを機械固定する。
+#   実測(2026-08-16 本機): n=250,000 で 0.60-0.74 秒。旧実装は同 n で外挿 1.5 時間/回
+#   (n=500/1000/2000 の実測から n² 外挿)= 前日比+前週比×30日で数日級だった。
+# --------------------------------------------------------------------------- #
+def _tau_frozen(a, b):
+    """差し替え前の `analyze_structure.kendall_tau`(凍結 measure 実装を呼ぶ形)。"""
+    if len(a) < 2 or len(b) < 2:
+        return None
+    t = m._kendall_tau(a, b)
+    if t is None or (isinstance(t, float) and math.isnan(t)):
+        return None
+    return round(float(t), 6)
+
+
+def test_kendall_tau_matches_frozen_measure_implementation():
+    """境界・tie なし・tie 多発・実データ相当(0円の塊)で凍結実装と完全一致。"""
+    # --- 境界 ---
+    for a, b in ([[1], [1]], [[], []],
+                 [[1.0, 2.0], [1.0, 2.0]], [[1.0, 2.0], [2.0, 1.0]],
+                 [[5.0] * 8, [5.0] * 8], [[5.0] * 8, [float(i) for i in range(8)]],
+                 [list(range(30)), list(range(29, -1, -1))],
+                 [[1, 2, 3, 4], [1, 2, 4, 3]]):
+        assert ast.kendall_tau(a, b) == _tau_frozen(a, b), (a, b)
+    # --- tie なし乱数 ---
+    rnd = random.Random(20260816)
+    for case in range(20):
+        n = rnd.randint(2, 120)
+        a = [float(v) for v in rnd.sample(range(10 ** 6), n)]
+        b = [float(v) for v in rnd.sample(range(10 ** 6), n)]
+        assert ast.kendall_tau(a, b) == _tau_frozen(a, b), f"no-tie case{case}"
+    # --- tie 多発(値域を狭める)---
+    for case in range(20):
+        n = rnd.randint(2, 150)
+        span = rnd.choice([1, 2, 3, 5])
+        a = [float(rnd.randint(0, span)) for _ in range(n)]
+        b = [float(rnd.randint(0, span)) for _ in range(n)]
+        assert ast.kendall_tau(a, b) == _tau_frozen(a, b), f"tie case{case}"
+    # --- 実データ相当(status / reputation の連続値 + 同値の塊)---
+    for case in range(10):
+        n = rnd.randint(50, 200)
+        a = [0.0 if rnd.random() < 0.3 else rnd.uniform(0, 100.0) for _ in range(n)]
+        b = [v * rnd.uniform(0.8, 1.2) if rnd.random() < 0.9 else 0.0 for v in a]
+        assert ast.kendall_tau(a, b) == _tau_frozen(a, b), f"real-like case{case}"
+
+
+def _rep_events(days, vals_by_day):
+    """`reputation_update` の合成 L1(rank_stability の評判経路を踏ませる)。"""
+    by_day = {}
+    for d in days:
+        by_day[d] = [{"kind": "reputation_update", "agent_id": aid,
+                      "step": d * ast.STEPS_PER_DAY, "payload": {"new": v}}
+                     for aid, v in sorted(vals_by_day[d].items())]
+    return by_day
+
+
+def test_rank_stability_output_is_identical_after_the_swap(tmp_path, monkeypatch):
+    """差し替え前後で `rank_stability` の出力が**まるごと**一致する(τ 系列も race も)。
+
+    ★L3 が無い run dir なので評判経路(`_reputation_by_day`)を通る = 前日比 τ と
+      前週比 τ の両方が実際に計算される日数(10 日)を用意する。
+    """
+    rnd = random.Random(31)
+    days = list(range(10))
+    vals = {}
+    base = {aid: rnd.uniform(0, 50.0) for aid in range(40)}
+    for d in days:                       # 日ごとに少しだけ順位が動く + 同値の塊も混ぜる
+        base = {aid: (0.0 if rnd.random() < 0.2 else v + rnd.uniform(-3, 3))
+                for aid, v in base.items()}
+        vals[d] = dict(base)
+    by_day = _rep_events(days, vals)
+    run_dir = str(tmp_path)              # l3_snapshots.parquet も agents.json も無い
+
+    got = ast.rank_stability(run_dir, by_day, days, top_k=10)
+    monkeypatch.setattr(ast, "_tau_impl", m._kendall_tau)   # 凍結実装へ戻す
+    ref = ast.rank_stability(run_dir, by_day, days, top_k=10)
+    assert got == ref, "τ 実装の差し替えで rank_stability の出力が変わった"
+    assert got["source"] == "reputation", got["source"]
+    assert any(t is not None for t in got["tau_prev_day"]), "前日比 τ が 1 つも出ていない"
+    assert got["tau_prev_week"][7] is not None, "前週比 τ が出ていない(検査の前提が崩れた)"
+
+
+@pytest.mark.slow
+def test_kendall_tau_scales_to_the_finals_population():
+    """★本選規模 n=250,000 の完走スモーク(旧 O(N²) 実装ならここで数時間かかる)。
+
+    値の正しさは上の同値性テストが担保するので、ここは完走時間と粗い健全性だけを見る。
+    """
+    n = 250_000
+    rnd = random.Random(5)
+    a = [rnd.uniform(0, 5_000_000.0) for _ in range(n)]
+    b = list(a)
+    b[10], b[20] = b[20], b[10]                    # 1 ペアだけ反転
+    t0 = time.perf_counter()
+    tau = ast.kendall_tau(a, b)
+    elapsed = time.perf_counter() - t0
+    assert 0.999 < tau < 1.0, tau
+    assert elapsed < 60.0, f"n=250,000 に {elapsed:.1f}s(O(N log N) になっていない)"
 
 
 # --------------------------------------------------------------------------- #

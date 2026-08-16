@@ -1046,7 +1046,10 @@ FINANCE_BALANCE = {
     EXTERNAL:   lambda r: _f(r, "row_out") - _f(r, "row_in"),
     OTHER:      lambda r: _f(r, "k5_other"),
     GOVERNMENT: lambda r: _f(r, "gov_balance") + _f(r, "escrow"),
-    HOUSEHOLD:  lambda r: _f(r, "household_balance") + _f(r, "lost_property_held"),
+    HOUSEHOLD:  lambda r: (_f(r, "household_balance") + _f(r, "lost_property_held")
+                           # 第133 ウェーブ2 A2: pool 回転で退場中の家計残高(dormant vital)。
+                           # 列が無い旧ランは _f が 0.0 を返す=後方互換。
+                           + _f(r, "hh_dormant")),
 }
 
 

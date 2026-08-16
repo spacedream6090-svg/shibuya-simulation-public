@@ -96,9 +96,11 @@ SPECS = [
          _rows_table),
     Spec("finance", ("finance",),
          lambda d: economy_mod.FinanceLedger(d),
+         # 第134: hh_dormant 列(COLUMNS 末尾 16 列目)ぶんの 1 要素を追加
          lambda sc, i: sc.add_rows([(i // 2, i, 1.0 * i, i, 0, -1.0 * i, 2.0 * i,
                                      3.0 * i, 4.0 * i, 5.0 * i, 6.0 * i,
-                                     7.0 * i, 8.0 * i, f"ch{i}", 9.0 * i)]),
+                                     7.0 * i, 8.0 * i, f"ch{i}", 9.0 * i,
+                                     10.0 * i)]),
          _rows_table),
     Spec("channels", ("channels",),
          lambda d: channels_mod.ChannelsSidecar(d, ("alpha", "beta")),

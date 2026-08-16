@@ -69,6 +69,7 @@ from .. import truth_ledger as truth_ledger_mod
 from .. import work as work_mod
 from .. import worldview as worldview_mod
 from ..net import infoenv as infoenv_mod
+from ..agents.ref import AgentRef
 from ..cognition import deliberate, drive, planning, routine
 from ..cognition import age_cog as age_cog_mod
 from ..cognition import day_plan as day_plan_mod
@@ -5696,7 +5697,9 @@ def _phase_pool_rotation(sim, step: int, sim_min: int) -> None:
     old_ids = set(cur)
     exits = old_ids - new_ids
     enters = new_ids - old_ids
+    departed_now = []                               # ★A1: この日の退場者(下で軽量参照へ)
     for pid in sorted(exits):                       # 退場者 → ドーマント化(コストゼロ・記憶保持)
+        departed_now.append(cur[pid])
         sim._dormant.save(pid, pool_mod.dehydrate(cur[pid]))
     kept = [a for a in sim.agents if getattr(a, "pool_pid", None) in new_ids]
     entered = []
@@ -5705,6 +5708,17 @@ def _phase_pool_rotation(sim, step: int, sim_min: int) -> None:
         saved = sim._dormant.pop(pid)
         if saved is not None:
             pool_mod.hydrate(agent, saved)
+        else:
+            # ★レーン R1 A2(**意図的な挙動変更**): リッチな退避状態が LRU 上限
+            #   (pool.dormant_cap)で捨てられていても、金銭・債権の恒久台帳(vital)は
+            #   容量に依らず残る。ここでオーバレイして所持金・口座・家賃債権・未清算の
+            #   勤務実績・人口会計の**連続性**を回復する。
+            #   旧挙動 = 何もしない = build_agent の**初期所持金で新規鋳造** =
+            #   退場時の残高が真に消え、同時に無から現金が湧いていた(どの保存チャネルにも
+            #   痕跡が残らない破れ)。vital が無い個体(= 一度も退場していない)は None。
+            vital = sim._dormant.pop_vital(pid)
+            if vital:
+                pool_mod.overlay_vital(agent, vital)
         kept.append(agent)
         entered.append(agent)
     sim.agents = kept
@@ -5712,6 +5726,16 @@ def _phase_pool_rotation(sim, step: int, sim_min: int) -> None:
     # agent_by_id は「これまで実体化した全個体」の id→参照(退場者を消さない)。造語の作者名・
     # DM 送信者名・関係台帳など**過去の参照**が退場後も解決できるようにする(present 個体は
     # hydrate 済みの最新実体で上書き)。tick(計算)対象は sim.agents(present)だけ=コストは在場分。
+    # ★レーン R1 A1(RAM の本丸): 退場者の参照は**軽量参照へ差し替える**。過去の参照の解決に
+    #   要るのは名前などの数十バイトなのに、これまでは統合エピソード 120 + 未統合 30 +
+    #   関係台帳 + 信念 + persona 文を抱えたフル Agent を**累計ぶん**掴み続けていた
+    #   (本選 = 累計 45.9 万体)。運ぶ欄/落とす欄は agents/ref.py の表が唯一の源。
+    # ★差し替えは**入場者の実体化が全て終わった後**に置く: 実体化中は sim.agents がまだ
+    #   前日の名簿なので present 述語が退場者を「在場」と答える窓があり(_link_colocated の
+    #   顔なじみ張りがそこを通る)、その窓の中では従来どおりフル Agent を見せる = 差し替えが
+    #   その日の入場処理を 1 バイトも動かさない。
+    for gone in departed_now:
+        sim.agent_by_id[gone.id] = AgentRef(gone)
     for a in kept:
         sim.agent_by_id[a.id] = a
     # 片側パートナーの清算(レーン丙 5。household.pool_bind 配下=既定 OFF は 1 行も通らない)。

@@ -13,7 +13,8 @@
      再構成(in-sim L2 と同一定義=formed=relation_tier{tier==1} / broken=break{cause!=absence} /
      decayed=break{cause==absence})。母数=当日開始時の活性関係数(tier≥1 の有向台帳を累積再構成)。
   2. 順位固着(Kendall τ): 地位(L3 status)or 評判(L1 reputation_update)ランキングの日次系列の
-     前日比・前週比 Kendall τ(τ-b=observer/measure._kendall_tau を再利用=numpy・小N exact)。
+     前日比・前週比 Kendall τ(τ-b=observer/assets._kendall_tau を再利用=O(N log N)・
+     凍結 measure._kendall_tau と同値)。
      τ が高い=順位が入れ替わらない=ヒエラルキーの固着。上位K人の順位推移(レースチャート素材)も出す。
   3. 中心性入れ替わり: 会話グラフ(speak/dm=observer/measure._conversation_adj を再利用)の次数中心性
      上位K の日次入れ替わり率(turnover)。低い=同じ人が中心=固着。
@@ -23,7 +24,9 @@
   5. 固着検知: 中心性 turnover(低=固着)・edge churn(低=固着)・順位 τ(高=固着)が閾値側で連続
      N 日続いた区間を「構造固着期間」として出力(JSON + テキスト。観測記録=介入しない)。
 
-計算量: O(days × (N² τ + N log N ソート + E LPA))級=30日ランでも軽い(全て純Python/numpy・乱数なし)。
+計算量: O(days × (N log N τ + N log N ソート + E LPA))級(全て純Python/numpy・乱数なし)。
+  ★第133 レーンR2: τ だけが O(N²) で残っていた(25万人 = 1 回 312 億ペア × 日 2 回 = 数日級)。
+    observer/assets の O(N log N) 実装へ差し替え済み(値は 1 ビットも変わらない)。
 決定論: ノード・エッジ・順位のタイは常に id 昇順で解決。出力 JSON は sort_keys=True でバイト同一。
 
 出力:
@@ -52,6 +55,7 @@ if _HERE not in sys.path:                # 同ディレクトリの run_dt を i
     sys.path.insert(0, _HERE)
 
 import run_dt                            # noqa: E402  (W2-3: ランの Δt の単一の源)
+from society.observer import assets as _assets  # noqa: E402  (τ の O(N log N) 実装)
 from society.observer import measure as m  # noqa: E402
 
 # --------------------------------------------------------------------------- #
@@ -69,15 +73,29 @@ _BREAK_ABSENCE = "absence"   # relation_break の風化(decay)cause(observer/str
 
 
 # --------------------------------------------------------------------------- #
-# 順位相関 Kendall τ(measure._kendall_tau を再利用=numpy・小N exact な τ-b)
+# 順位相関 Kendall τ(observer/assets の O(N log N) τ-b を再利用)
 # --------------------------------------------------------------------------- #
-def kendall_tau(a, b):
-    """2 系列の Kendall τ-b(タイ補正込み)。長さ<2 or 定数系列は None を返す。
+#: τ-b の実体。`observer/assets._kendall_tau` は「同値ペア数(O(n))+ マージソートの
+#: 反転数(O(n log n))」から τ-b を出す純Python 実装で、凍結 `measure._kendall_tau`
+#: (明示二重ループ = O(n²))と**有限入力で完全に同値**(float のビットまで一致。
+#: tests/test_assets_tau_scale.py が旧 O(n²) 参照実装との一致を機械固定している)。
+#:
+#: ★なぜ差し替えたか(第133 レーンR2): `rank_stability` は**全ランク住民**の τ を
+#:   1 日あたり 2 回(前日比・前週比)呼ぶ。25 万人では 1 回あたり 312 億ペアの
+#:   純Python 二重ループ = 数時間、30 日ランで数日級になり事後解析が回らなかった。
+#:   値は 1 ビットも変えず、計算量だけを O(N log N) へ落とす差し替え。
+#: ★凍結ファイル `observer/measure.py` は 1 バイトも触っていない(m._kendall_tau は
+#:   そのまま在る)。ここが選ぶ実装を変えただけ。
+_tau_impl = _assets._kendall_tau
 
-    observer/measure._kendall_tau をそのまま再利用(自前実装=numpy・O(n²)=小Nで正確)。"""
+
+def kendall_tau(a, b):
+    """2 系列の Kendall τ-b(タイ補正込み)。長さ<2 は None・片側定数は 0.0。
+
+    返り値の丸め(6桁)と None 規約は差し替え前と同一。"""
     if len(a) < 2 or len(b) < 2:
         return None
-    t = m._kendall_tau(a, b)
+    t = _tau_impl(a, b)
     if t is None or (isinstance(t, float) and math.isnan(t)):
         return None
     return round(float(t), 6)
@@ -461,7 +479,8 @@ def analyze(run_dir: str, top_k: int = TOP_K, min_days: int = MIN_DAYS,
                    "centrality_churn_low": cent_low, "edge_churn_low": edge_low,
                    "tau_high": tau_high, "steps_per_day": spd,
                    "detector": "measure.communities (deterministic LPA on speak/dm graph)",
-                   "tau": "measure._kendall_tau (tau-b, numpy, exact small-N)"},
+                   "tau": "assets._kendall_tau (tau-b, O(N log N), "
+                          "identical to measure._kendall_tau)"},
         "churn": churn,
         "rank": rank,
         "centrality": cent,

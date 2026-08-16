@@ -984,6 +984,32 @@ def city_total(sim) -> float:
     return total
 
 
+def dormant_total(sim) -> float:
+    """**街に居ない**(プール回転で退場した)個体が抱える現金 + 口座の総額(レーン R1 A2)。
+
+    ★``city_total`` の意味は**変えない**: あちらは「街の中に実在する残高」で、在場者だけを
+      数えるのが仕様である(退場者は世界の外に居るので、街の中の総額に足したら二重計上に
+      なる)。日境界で ``city_total`` が O(10^10) 円跳ぶのは、その仕様の**帰結**であって
+      破れではない —— ただし「跳んだぶんがどこへ行ったか」を誰も記録していなかったので、
+      「回転で消えた」と「本当に消えた」の区別がつかなかった。ここが**その受け皿**である。
+    ★真実源は ``DormantStore`` の恒久台帳(vital)。リッチな退避状態は LRU で捨てられるが
+      vital は捨てられないので、この総額は「退場中の金の全額」を正しく数える。
+    pool OFF のラン(``sim._dormant`` が None)では常に 0.0 = 従来と完全同一。
+    """
+    store = getattr(sim, "_dormant", None)
+    if store is None:
+        return 0.0
+    return float(store.vital_money_total())
+
+
+def dormant_claims(sim) -> float:
+    """退場中の個体が抱える家賃債権(未払い残)の総額。pool OFF は 0.0。"""
+    store = getattr(sim, "_dormant", None)
+    if store is None:
+        return 0.0
+    return float(store.vital_claims_total())
+
+
 def row_net(sim) -> float:
     """RoW が**正味で吸収した**額(街 → RoW − RoW → 街)。街の外に残高は無い(SNA §26.6)。"""
     st = state_of(sim)
@@ -1028,7 +1054,11 @@ def _finance_row(sim, st: dict, day: int, step: int) -> tuple:
             json.dumps({k: {"in": round(v["in"], 3), "out": round(v["out"], 3)}
                         for k, v in sorted(st["row"].items())},
                        ensure_ascii=False, sort_keys=True),
-            round(sum((st.get("k5") or {}).values()), 6))
+            round(sum((st.get("k5") or {}).values()), 6),
+            # レーン R1 A2: 退場中(街に居ない)個体の現金 + 口座。``household_balance``
+            # (在場者だけ)の**対**で、日境界の回転で家計残高が跳ぶ量の行き先を示す。
+            # pool OFF のランでは常に 0.0 = 既存 15 列の値は 1 バイトも変わらない。
+            round(dormant_total(sim), 6))
 
 
 def _emit(sim, st: dict, day: int, step: int, sim_min: int,
@@ -1168,6 +1198,11 @@ COLUMNS: tuple[str, ...] = (
     # 第98バッチ: K5(取引でない資産変動。窃盗の未記録な受け取り側)の累計。
     # 末尾に足す(既存 14 列は順序含め不変 = 会社UI/解析の契約を壊さない)。
     "k5_other",
+    # レーン R1 A2: 退場中(プール回転で街を出た)個体の現金 + 口座の総額。
+    # ``household_balance`` は**在場者だけ**(city_total と同じ仕様)なので、
+    # 日境界で家計残高が跳ぶ量の行き先がこれまでどの列にも無かった。末尾に足す
+    # (既存 15 列は順序含め不変)。pool OFF のランでは常に 0.0。
+    "hh_dormant",
 )
 
 
@@ -1203,6 +1238,7 @@ class FinanceLedger(FinalizeStreamMixin):
             "row_out":           pa.array([r[12] for r in rows], pa.float64()),
             "row_channels":      pa.array([r[13] for r in rows], pa.string()),
             "k5_other":          pa.array([r[14] for r in rows], pa.float64()),
+            "hh_dormant":        pa.array([r[15] for r in rows], pa.float64()),
         })
 
     def _next_seg(self) -> int:
