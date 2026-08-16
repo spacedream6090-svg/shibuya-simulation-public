@@ -309,3 +309,25 @@ def test_batched_deliberate_resume_equals_straight(tmp_path):
         return pq.read_table(run_dir / "l1_events.parquet").to_pylist()
 
     assert _rows(d) == _rows(straight)
+
+
+def test_batch_decide_stats_exported_to_summary(tmp_path):
+    """第130: batch ON の summary.json に `batch_decide`(deferred_fallback=厳密一致の
+    証人)が出る。OFF では属性が生えない=キー自体を出さない(既存 summary と同形)。"""
+    on = _run(tmp_path, "stats_on", steps=144,
+              **{"engine.batch_llm.enabled": "true",
+                 "engine.batch_llm.workers": "4"})
+    s_on = json.loads((tmp_path / "stats_on" / "summary.json").read_text(encoding="utf-8"))
+    bd = s_on["batch_decide"]
+    assert set(bd) == {"batched", "serial_llm", "no_llm", "rounds",
+                       "requests", "steps", "max_batch", "deferred_fallback"}
+    assert bd["deferred_fallback"] == 0          # mock は常にパース成立=同値の証人
+    assert bd["batched"] + bd["serial_llm"] > 0  # LLM を撃つ個体が実在した
+    assert bd["batched"] == bd["requests"]       # 一括発行された呼数と整合
+    # 属性そのものと一致(丸めや取りこぼしがない)
+    assert bd == {k: int(v) for k, v in on._batch_decide_stats.items()}
+
+    off = _run(tmp_path, "stats_off", steps=144)
+    s_off = json.loads((tmp_path / "stats_off" / "summary.json").read_text(encoding="utf-8"))
+    assert "batch_decide" not in s_off
+    assert not hasattr(off, "_batch_decide_stats")

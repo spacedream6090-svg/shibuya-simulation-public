@@ -2376,6 +2376,13 @@ class Simulation:
         peak_rss = _peak_rss_mb()
         if peak_rss is not None:
             summary["peak_rss_mb"] = peak_rss
+        # ---- deliberate batch 第130: 一括発行の実績(batch OFF=属性が無い=キー自体を出さない)----
+        # deferred_fallback は「応答適用を遅延した個体にパース不成立の後退経路が現れた回数」。
+        # **0 のあいだ batch 経路は逐次経路と機械的に同値**(scheduler の設計注記⑤)なので、
+        # ラン後の厳密一致判定はこの整数 1 個を見る。他キーは batch 率の観測用。
+        _bd = getattr(self, "_batch_decide_stats", None)
+        if _bd is not None:
+            summary["batch_decide"] = {k: int(v) for k, v in _bd.items()}
         # ---- A1 第67バッチ 2026-07-29: 環境条件の追加キー(既定 OFF ではキー自体を出さない)----
         # world_mod: 適用したプロファイル名と適用実績(予約=未消費フィールドも正直に残す)。
         # building_heights: 実高さの付与実測(plateau 実測 / levels 推定 / 不明 の内訳)。
