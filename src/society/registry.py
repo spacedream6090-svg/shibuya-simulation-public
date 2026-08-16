@@ -414,6 +414,31 @@ FEATURES: tuple[Feature, ...] = (
        "SFM のまま = JuPedSim の Collision-Free Speed Model と同じ発想の最小適用。"
        "repro_tier=strict / affects_k=false / fingerprint_risk=none は far_field と同じ理由。"
        "★既定 OFF では V(s) を 1 度も評価しない = golden L1 バイト一致"),
+    # ---- physics 痩身 第二段B/C(認知の二層を物理へ写す。既定 OFF)----
+    _f("physics.cognitive.enabled", "strict", False, "none",
+       "対人斥力(SFM)と ORCA の**近傍選抜**を距離最近傍 k 体から**認知的近傍**へ差し替える"
+       "(① 前方視野円錐 ② 方位セクタごとに最前の 1 体 = 遮蔽の一次近似 ③ 距離昇順 k 体)。"
+       "力の式・異方性 w・距離カットオフ・合算順序は 1 バイトも変えない=変わるのは"
+       "『誰が見えているか』だけ。文献: Wirth et al. 2023 PNAS Nexus(metric/topological/"
+       "visual の直接比較で visual が最良・topological は棄却)/ Dachner et al. 2022"
+       "(距離減衰の主因は遮蔽)/ Kitazawa & Fujiyama 2010(情報処理空間は前方円錐)。"
+       "repro_tier=strict: 位置と向きだけの純関数で乱数も LLM も 1 本も増えない"
+       "(ORCA の希望方向は goal−pos から作るので pref_noise の draw 順も不変)。"
+       "affects_k=false: generate() の呼び出し点を足さない/減らさない。"
+       "fingerprint_risk=none: プロンプトの語彙・欄が 1 つも増減しない(物理層)。"
+       "★実際に力を及ぼす相手は min(neighbors, sectors) 体以下 = **密度に依らず有界**。"
+       "★既定 OFF では visual_neighbors を 1 度も呼ばない = golden L1 バイト一致"),
+    _f("physics.density_far.enabled", "strict", False, "none",
+       "較正 far 項(physics.sfm.far_field)の**ペア和を密度場由来の連続体力へ置換**する。"
+       "f = −c_drag·ρ·e − c_grad·∇ρ で、接続係数はペア版と同じカーネルから解析的に導く"
+       "(û の 3 次モーメントが 0 なので異方性 λ は 2 係数へ厳密に畳み込まれる)= "
+       "一様密度ではペア版と同じ合力 = 基本図の作業点が保存される。認知側の根拠は"
+       "ensemble perception(Whitney & Yamanashi Leib 2018)、工学側の前例は"
+       "Hughes 2002 / Treuille 2006 / Narain 2009。"
+       "repro_tier=strict: 格子は整数カウントの bincount + 固定順序の箱平滑 = 決定論。"
+       "affects_k=false / fingerprint_risk=none は far_field と同じ理由。"
+       "★far_field が OFF のときは完全 no-op(置換する当の項が無い)。"
+       "★既定 OFF では密度格子を 1 度も作らない = golden L1 バイト一致"),
 
     # ---- economy ----
     _f("economy.enabled", "strict", False, "none",

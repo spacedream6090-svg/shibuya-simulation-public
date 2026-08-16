@@ -104,6 +104,40 @@ P4-3 = `calib_p43_results.json`)。本体の `_CalibratedCrowd` はベンチの
   - `phase` … `_by_id` の全体 sort を **1 step 1 回**に(ゾーン数×2 回 → 1 回。走査順は不変)
 検収は tests/test_physics_hash.py(旧実装を参照実装として保持し全サブステップを突合)。
 
+物理痩身 第二段B/C(2026-08-17。docs/research/crowd-attention-physics.md「案B」「案C」)
+------------------------------------------------------------------------------------
+第一段A が「意味論を変えない痩身」だったのに対し、第二段は**認知の二層をそのまま物理へ写す**:
+
+  B 認知的近傍(`physics.cognitive.enabled`。既定 OFF)
+    対人斥力(SFM)と ORCA の近傍選抜を「距離最近傍 k 体」から
+    **視野円錐 + セクタ遮蔽 + 上限 k**(= 見えている少数近傍)へ差し替える。
+    実装は `world/sfm_core.visual_neighbors` の 1 本で、SFM/ORCA はそれを呼ぶだけ。
+    本 module は conf を読んでエンジンへ引数を渡す配線しか持たない。
+
+  C 遠方場の密度場化(`physics.density_far.enabled`。既定 OFF・far_field ON が前提)
+    較正 far 項 `_far_forces`(体表間 4.725 m のペア和)を**密度場由来の連続体力**へ置換する。
+    遠方の群衆は個体の列挙ではなく**アンサンブル統計(密度・流れ)として知覚される**
+    (Whitney & Yamanashi Leib 2018)という認知の主張の、最も文字通りの実装であり、
+    工学側の前例は Hughes 2002 / Treuille 2006 / Narain 2009。
+    ★接続係数は**解析的に導く**(捏造しない)。ペア版の far 項を密度 ρ(x) の連続体で書くと
+
+        f_far(x) = −∫ ρ(x+u)·K(|u|)·w(e·û)·û du,   K(r) = m·a2·exp((rr−r)/b2)·taper(r)
+
+    で、ρ を 1 次まで展開し û の角度積分を実行すると **2 項ちょうど**残る:
+
+        f_drag = −(1−λ)·(π/2)·I₁·ρ(x)·e      … 一様密度でも残る「混雑の抵抗」
+        f_grad = −(1+λ)·(π/2)·I₂·∇ρ(x)       … 混んでいる方から押し返される勾配力
+        I₁ = ∫₀^R K(r)·r dr,  I₂ = ∫₀^R K(r)·r² dr    (R = rr + far_cutoff)
+
+    (û の 3 次モーメントが 0 なので、異方性 λ は上の 2 つの係数へ**厳密に**畳み込まれる。)
+    → 一様流ではペア版と同じ合力になる = 基本図の作業点が保存される。これが
+      「現行 far 項の役割(混雑回避のバイアス)を保存する最小構成」の中身である。
+    格子は物理 step より粗い周期(`update_every` サブステップ)で作り直し、
+    各サブステップでは**現在位置で双線形サンプル**する(場は粗く、読み出しは細かく)。
+
+R1: どちらのトグルも既定 OFF で、OFF のときは新しい関数が 1 度も呼ばれない
+    = `_build_engine` は第一段A までと 1 バイト同じ呼び出しをする(golden 無風)。
+
 R1(既定 OFF = 完全 no-op)
 ---------------------------
 `physics.zones_enabled: false`(既定)または `physics.zones: []`(既定)のとき:
@@ -395,7 +429,8 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict, ordered=None) -> Non
     # ★P4-2/P4-3 の較正(既定は空 dict = 従来の sfm_core.Crowd 経路そのまま)。
     #   SFM ゾーンにだけ効く(ORCA ゾーンでは _build_engine が無視する)。
     calib = _calib_kwargs(sim)
-    engine = _build_engine(zone, members, rng, calib) if members else None
+    cog = _cog_kwargs(sim)
+    engine = _build_engine(zone, members, rng, calib, cog) if members else None
     cont = st["cont"]
     cont["dt_sub"] = dt
     occ_sum = 0
@@ -410,7 +445,7 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict, ordered=None) -> Non
                 _writeback(members, engine)   # 入場の占有判定は**最新の位置**で行う
             if _admit(sim, zone, waiting, members, signal, base_sec + t, t,
                       step, sim_min, st):
-                engine = _build_engine(zone, members, rng, calib)
+                engine = _build_engine(zone, members, rng, calib, cog)
         if not members:
             if not waiting:
                 break                                 # ゾーンが空 = その場で打ち切り
@@ -437,7 +472,7 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict, ordered=None) -> Non
                 _release(sim, zone, rec["agent"], step, sim_min, st,
                          reason="gate", elapsed_s=rec["elapsed_s"], rec=rec,
                          used_s=used)
-            engine = _build_engine(zone, members, rng, calib) if members else None
+            engine = _build_engine(zone, members, rng, calib, cog) if members else None
         if engine is None and not waiting:
             break
 
@@ -657,6 +692,27 @@ def _graph_speed(sim, agent) -> float:
 # sfm_core の既定値と同値なので、空 dict になる。
 _EXP_ARG_MAX = 4.0        # sfm_core と同じ安全弁(深い重なりの overflow 防止)
 
+# ---- 第二段C(遠方場の密度場化)の既定値 ----
+FIELD_CELL_M_DEFAULT = 1.0        # 密度格子の一辺 [m](far カットオフ 4.7 m の 1/5 弱)
+FIELD_BLUR_DEFAULT = 2            # 3×3 箱平滑の回数(2 回 ≈ σ≈1.15 セルの Gauss 近似)
+FIELD_UPDATE_EVERY_DEFAULT = 10   # 格子を作り直すサブステップ周期(10×0.05s = 0.5 s。
+#                                   対人固視の実測時定数 ~0.5 s = Fotios et al. 2015 と同桁)
+_FIELD_QUAD_N = 4096              # 接続係数 I₁/I₂ の数値積分の分点数(決定論・構築時 1 回)
+
+
+def _box3(a):
+    """3×3 箱平滑(ゼロ詰め境界)。加算順序を式で固定 = 決定論。
+
+    ゼロ詰めにするのは物理的に正しいから: 群衆の外側には誰も居ない。境界で密度が
+    落ちるので群衆の縁には外向きの勾配が立つ = ペア版で「内側にしか相手が居ない」ときに
+    外へ押される挙動と同じ向き。
+    """
+    p = np.zeros((a.shape[0] + 2, a.shape[1] + 2), dtype=np.float64)
+    p[1:-1, 1:-1] = a
+    return (p[:-2, :-2] + p[:-2, 1:-1] + p[:-2, 2:]
+            + p[1:-1, :-2] + p[1:-1, 1:-1] + p[1:-1, 2:]
+            + p[2:, :-2] + p[2:, 1:-1] + p[2:, 2:]) / 9.0
+
 
 class _CalibratedCrowd(_sfm.Crowd):
     """`sfm_core.Crowd` + 長距離 social 項 + Tordeux 型 V(s)(較正 ON のときだけ作る)。
@@ -677,7 +733,10 @@ class _CalibratedCrowd(_sfm.Crowd):
     """
 
     def __init__(self, *args, far_a2=0.0, far_b2=1.890, far_cutoff_factor=2.5,
-                 far_taper_m=1.0, v_of_s=False, vos_T=0.482, vos_l=0.297, **kw):
+                 far_taper_m=1.0, v_of_s=False, vos_T=0.482, vos_l=0.297,
+                 far_mode="pair", field_cell_m=FIELD_CELL_M_DEFAULT,
+                 field_blur=FIELD_BLUR_DEFAULT,
+                 field_update_every=FIELD_UPDATE_EVERY_DEFAULT, **kw):
         super().__init__(*args, **kw)
         self.far_a2 = float(far_a2)
         self.far_b2 = float(far_b2)
@@ -688,6 +747,21 @@ class _CalibratedCrowd(_sfm.Crowd):
         self.vos_l = float(vos_l)
         if self.v_of_s and not (self.vos_T > 0.0):
             raise ValueError("v_of_s は T > 0 が必要")
+        # ── (3) 遠方場の密度場化(第二段C。far_mode="pair" が既定 = 従来のペア和)──
+        if far_mode not in ("pair", "field"):
+            raise ValueError("far_mode は 'pair' か 'field'")
+        self.far_mode = far_mode
+        self.field_cell_m = float(field_cell_m)
+        self.field_blur = int(field_blur)
+        self.field_update_every = max(1, int(field_update_every))
+        if self.far_mode == "field" and not (self.field_cell_m > 0.0):
+            raise ValueError("density_far.cell_m は > 0 が必要")
+        self._field_tick = 0
+        self._field_grid = None           # (rho, gx, gy, ox, oy) 粗い周期で作り直す
+        # 接続係数(class docstring の I₁ / I₂)。半径は不変なので **構築時に 1 度だけ**。
+        self._c_drag, self._c_grad = (self._far_field_coeffs()
+                                      if (self.far_mode == "field"
+                                          and self.far_a2 > 0.0) else (0.0, 0.0))
 
     # -- (1) 長距離 social 項 --------------------------------------------- #
     def _far_forces(self):
@@ -758,6 +832,105 @@ class _CalibratedCrowd(_sfm.Crowd):
         contrib[~valid] = 0.0
         return contrib.sum(axis=1)
 
+    # -- (3) 遠方場の密度場化(第二段C)------------------------------------ #
+    def _far_field_coeffs(self):
+        """接続係数 (c_drag, c_grad) を **ペア版の同じカーネルから** 解析+数値で導く。
+
+        c_drag = (1−λ)·(π/2)·∫₀^R K(r)·r  dr
+        c_grad = (1+λ)·(π/2)·∫₀^R K(r)·r² dr
+        K(r) = m·a2·exp(clip((rr−r)/b2))·smoothstep_taper(r) は
+        `_far_forces` が 1 ペアに与える力の大きさそのもの(同じ clip・同じ taper)。
+        rr は体表間隔の基準で、ここでは全体の平均体径 2·r̄ を使う(半径のばらつきは
+        0.25–0.35 m と狭く、係数への効きは 1 次で数 % = 正直な近似)。
+        積分は中点則の固定分点(乱数ゼロ・同一入力 → 同一 float)。
+        """
+        rr = 2.0 * float(self.radius.mean())
+        big_r = rr + self.far_cutoff
+        q = _FIELD_QUAD_N
+        dr = big_r / q
+        r = (np.arange(q, dtype=np.float64) + 0.5) * dr
+        gap = r - rr
+        arg = np.clip(-gap / self.far_b2, a_min=None, a_max=_EXP_ARG_MAX)
+        kern = self.mass * self.far_a2 * np.exp(arg)
+        if self.far_taper > 0.0:
+            u = np.clip((self.far_cutoff - gap) / self.far_taper, 0.0, 1.0)
+            kern = kern * (u * u * (3.0 - 2.0 * u))
+        kern = np.where(gap <= self.far_cutoff, kern, 0.0)
+        i1 = float((kern * r).sum() * dr)
+        i2 = float((kern * r * r).sum() * dr)
+        half_pi = 0.5 * math.pi
+        return ((1.0 - self.lam) * half_pi * i1,
+                (1.0 + self.lam) * half_pi * i2)
+
+    def _density_grid(self):
+        """密度場 ρ と勾配 (∂ρ/∂x, ∂ρ/∂y) の格子。`update_every` サブステップに 1 度作る。
+
+        構築は O(N + G)(G = 格子セル数): セル index の `np.bincount`(整数カウント =
+        加算順序に依らず厳密)→ 3×3 箱平滑 `field_blur` 回 → 中心差分。
+        """
+        cell = self.field_cell_m
+        pad = self.field_blur + 2                   # 平滑がゼロ詰め境界を跨がない余白
+        pos = self.pos
+        ox = float(pos[:, 0].min()) - pad * cell
+        oy = float(pos[:, 1].min()) - pad * cell
+        nx = int(math.floor((float(pos[:, 0].max()) - ox) / cell)) + pad + 1
+        ny = int(math.floor((float(pos[:, 1].max()) - oy) / cell)) + pad + 1
+        nx, ny = max(nx, 3), max(ny, 3)
+        ci = np.clip(np.floor((pos[:, 0] - ox) / cell), 0, nx - 1).astype(np.int64)
+        cj = np.clip(np.floor((pos[:, 1] - oy) / cell), 0, ny - 1).astype(np.int64)
+        sel = self.active
+        cnt = np.bincount((ci * ny + cj)[sel], minlength=nx * ny)
+        rho = cnt.reshape(nx, ny).astype(np.float64) / (cell * cell)
+        for _ in range(self.field_blur):
+            rho = _box3(rho)
+        gx = np.zeros_like(rho)
+        gy = np.zeros_like(rho)
+        gx[1:-1, :] = (rho[2:, :] - rho[:-2, :]) / (2.0 * cell)
+        gy[:, 1:-1] = (rho[:, 2:] - rho[:, :-2]) / (2.0 * cell)
+        return rho, gx, gy, ox, oy
+
+    def _sample_field(self, grid):
+        """格子 → 個体位置での (ρ_i, ∇ρ_i)。セル中心格子の双線形補間。"""
+        rho, gx, gy, ox, oy = grid
+        cell = self.field_cell_m
+        nx, ny = rho.shape
+        fx = (self.pos[:, 0] - ox) / cell - 0.5     # セル中心を格子点とする座標
+        fy = (self.pos[:, 1] - oy) / cell - 0.5
+        i0 = np.clip(np.floor(fx), 0, nx - 2).astype(np.int64)
+        j0 = np.clip(np.floor(fy), 0, ny - 2).astype(np.int64)
+        tx = np.clip(fx - i0, 0.0, 1.0)
+        ty = np.clip(fy - j0, 0.0, 1.0)
+        i1, j1 = i0 + 1, j0 + 1
+        w00 = (1.0 - tx) * (1.0 - ty)
+        w10 = tx * (1.0 - ty)
+        w01 = (1.0 - tx) * ty
+        w11 = tx * ty
+
+        def _bi(a):
+            return (a[i0, j0] * w00 + a[i1, j0] * w10
+                    + a[i0, j1] * w01 + a[i1, j1] * w11)
+
+        return _bi(rho), np.stack([_bi(gx), _bi(gy)], axis=1)
+
+    def _far_forces_field(self):
+        """遠方場 = 密度場の連続体力(**ペア和 `_far_forces` の置換**。第二段C)。
+
+        f = −c_drag·ρ·e_i − c_grad·∇ρ   (係数の導出は class docstring と
+        `_far_field_coeffs`)。一様密度ではペア版と同じ合力になる = FD の作業点が保存される。
+        計算量は O(N + G) で **密度に対して平坦**(ペア版は O(N·k̄), k̄ = ρπR²)。
+        """
+        n = self.pos.shape[0]
+        if n < 2 or self.far_a2 <= 0.0:
+            return np.zeros_like(self.pos)
+        if self._field_grid is None or (self._field_tick % self.field_update_every) == 0:
+            self._field_grid = self._density_grid()
+        self._field_tick += 1
+        rho, grad = self._sample_field(self._field_grid)
+        e, _ = self._desired_dir()
+        out = -(self._c_drag * rho)[:, None] * e - self._c_grad * grad
+        out[~self.active] = 0.0
+        return out
+
     # -- (2) 前方間隔 s と V(s) -------------------------------------------- #
     def front_spacing(self):
         """進行方向の最近前方者までの中心間距離 s_i [m](前方に誰も居なければ inf)。
@@ -797,17 +970,22 @@ class _CalibratedCrowd(_sfm.Crowd):
     def _forces_with_far(self):
         f = super().forces()
         if self.far_a2 > 0.0:
-            f = f + self._far_forces()
+            # far_mode="pair"(既定)は第一段A までと 1 バイト同じ経路
+            f = f + (self._far_forces_field() if self.far_mode == "field"
+                     else self._far_forces())
             f[~self.active] = 0.0
         return f
 
 
 def _calib_kwargs(sim) -> dict:
-    """`physics.sfm` の較正 3 機能 → `_CalibratedCrowd` の追加引数。
+    """`physics.sfm` の較正 3 機能(+ 第二段C の密度場)→ `_CalibratedCrowd` の追加引数。
 
-    **既定(3 機能とも OFF/現行値)では空 dict** を返す = 従来の `sfm_core.Crowd` 経路。
+    **既定(全部 OFF/現行値)では空 dict** を返す = 従来の `sfm_core.Crowd` 経路。
+    ★`physics.density_far` は **far_field が ON のときだけ**効く(置換する当の項が
+      無ければ意味がない)。OFF のまま far_field だけ立てれば第一段A までと同じペア和。
     """
-    s = (getattr(sim, "physcfg", None) or {}).get("sfm")
+    cfg = getattr(sim, "physcfg", None) or {}
+    s = cfg.get("sfm")
     if not s:
         return {}
     kw: dict = {}
@@ -815,6 +993,10 @@ def _calib_kwargs(sim) -> dict:
     if ff["enabled"]:
         kw.update(far_a2=ff["a2"], far_b2=ff["b2"],
                   far_cutoff_factor=ff["cutoff_factor"], far_taper_m=ff["taper_m"])
+        df = cfg.get("density_far") or {}
+        if df.get("enabled"):
+            kw.update(far_mode="field", field_cell_m=df["cell_m"],
+                      field_blur=df["blur"], field_update_every=df["update_every"])
     vs = s["v_of_s"]
     if vs["enabled"]:
         kw.update(v_of_s=True, vos_T=vs["T"], vos_l=vs["l"])
@@ -825,9 +1007,22 @@ def _calib_kwargs(sim) -> dict:
     return kw
 
 
+def _cog_kwargs(sim) -> dict:
+    """`physics.cognitive` → SFM/ORCA 共通の認知的近傍の引数(第二段B)。
+
+    **既定 OFF では空 dict** = `_build_engine` の呼び出しは第一段A までと 1 バイト同じ。
+    """
+    c = (getattr(sim, "physcfg", None) or {}).get("cognitive")
+    if not c or not c["enabled"]:
+        return {}
+    return {"cognitive": True, "cog_neighbors": int(c["neighbors"]),
+            "cog_sectors": int(c["sectors"]), "cog_fov_deg": float(c["fov_deg"])}
+
+
 def calib_describe(sim) -> dict:
     """ON の較正だけを要約する(既定 OFF なら空 dict = manifest にキーが生えない)。"""
-    s = (getattr(sim, "physcfg", None) or {}).get("sfm")
+    cfg = getattr(sim, "physcfg", None) or {}
+    s = cfg.get("sfm")
     if not s:
         return {}
     out: dict = {}
@@ -838,13 +1033,19 @@ def calib_describe(sim) -> dict:
     if (s["wall"]["a"] != _sfm.WALL_A_DEFAULT
             or s["wall"]["b"] != _sfm.WALL_B_DEFAULT):
         out["wall"] = dict(s["wall"])
+    cg = cfg.get("cognitive") or {}
+    if cg.get("enabled"):
+        out["cognitive"] = dict(cg)
+    df = cfg.get("density_far") or {}
+    if df.get("enabled"):
+        out["density_far"] = dict(df)
     return out
 
 
 # --------------------------------------------------------------------------- #
 # エンジン構築 / 積分 / 計測
 # --------------------------------------------------------------------------- #
-def _build_engine(zone, members, rng, calib=None):
+def _build_engine(zone, members, rng, calib=None, cog=None):
     pos = np.array([r["pos"] for r in members], dtype=np.float64)
     vel = np.array([r["vel"] for r in members], dtype=np.float64)
     goal = np.array([r["wp_xy"] for r in members], dtype=np.float64)
@@ -859,16 +1060,18 @@ def _build_engine(zone, members, rng, calib=None):
             wall_range=float(o["wall_range_m"]), v_max_factor=zone.v_max_factor,
             arrive_radius=zone.arrive_radius_m, pref_noise=float(o["pref_noise"]),
             rng=rng, radius_margin=float(o["radius_margin_m"]),
-            separation_iters=int(o["separation_iters"]))
+            separation_iters=int(o["separation_iters"]),
+            **(cog or {}))
     s = zone.sfm
-    # ★較正が全部既定なら calib は空 dict = 下の呼び出しは P4 以前と 1 バイト同一。
+    # ★較正・認知的近傍が全部既定なら calib も cog も空 dict = 下の呼び出しは
+    #   P4 以前(および第一段A)と 1 バイト同一。
     cls = _sfm.Crowd if not calib else _CalibratedCrowd
     return cls(
         pos, vel, goal, v0, radius=radius, rng=rng, noise=float(s["noise"]),
         arrive_radius=zone.arrive_radius_m,
         walls=(zone.walls or None), wall_range=float(s["wall_range_m"]),
         neighbor_cap=zone.neighbor_cap, v_max_factor=zone.v_max_factor,
-        **(calib or {}))
+        **(calib or {}), **(cog or {}))
 
 
 def _writeback(members, engine) -> None:

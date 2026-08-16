@@ -133,6 +133,18 @@ neighbor_dist=10 m を素直にセル化すると候補が πR²ρ で膨らむ�
 `min_gap` だけはカットオフを持たない量なので、探索半径 R で得た最小すき間 g が
 g ≤ R − 2·r_max を満たすまで R を倍にする(満たせば g が全ペアの最小そのもの)。
 
+認知的近傍(物理痩身 第二段B。2026-08-17)
+------------------------------------------
+`cognitive=True`(既定 False)にすると近傍選抜が
+「距離最近傍 k 体」→「**視野円錐内でセクタごとに最前の相手**を距離昇順 k 体」
+(`sfm_core.visual_neighbors`)へ変わる。RVO2 の `maxNeighbors` は距離最近傍だが、
+人の群衆では topological(固定 k 体)が実証的に棄却され visual が最良である
+(Wirth et al. 2023)。★正直な限界: ORCA は責任折半(0.5·u)を前提とする**相互**回避なので、
+片方が相手を「見ていない」と責任が片側に寄る。既定 OFF なのはそのためで、
+ON にしたときの重なり率・最小すき間は必ず実測して確かめること
+(事後分離パスがあるので破綻はしないが、分離の仕事量は増える)。
+既定 OFF では `visual_neighbors` は 1 度も呼ばれず、選抜も軌跡も 1 バイト変わらない。
+
 決定論
 ------
 乱数は `pref_noise > 0` かつ `rng` が渡されたときだけ引く(それ以外は 1 本も引かない)。
@@ -518,6 +530,10 @@ class OrcaCrowd:
         separation_iters: 事後分離パスの最大反復(0 で無効化=reference と同一挙動)
         pref_noise: 希望速度への微小ゆらぎ [m/s](対称性の破れ)。>0 なら rng 必須
         rng: numpy.random.Generator(**外から渡す**。内部 seed 禁止)
+        cognitive: True で近傍選抜を**認知的近傍**(視野円錐+セクタ遮蔽+上限 k)にする
+                (第二段B。冒頭 docstring「認知的近傍」節)。既定 False = 従来の距離最近傍。
+        cog_neighbors / cog_sectors / cog_fov_deg: その k(None = neighbor_cap)/
+                セクタ数 / 視野全角 [deg]
     """
 
     def __init__(self, pos, vel, goal, v0, radius, walls=None,
@@ -527,7 +543,10 @@ class OrcaCrowd:
                  arrive_radius=0.5, pref_noise=0.0, rng=None,
                  radius_margin=RADIUS_MARGIN_DEFAULT,
                  separation_iters=SEPARATION_ITERS_DEFAULT,
-                 pair_hash=True):
+                 pair_hash=True,
+                 cognitive=False, cog_neighbors=None,
+                 cog_sectors=_sfm.COG_SECTORS_DEFAULT,
+                 cog_fov_deg=_sfm.COG_FOV_DEG_DEFAULT):
         self.pos = np.asarray(pos, dtype=np.float64).reshape(-1, 2).copy()
         self.vel = np.asarray(vel, dtype=np.float64).reshape(-1, 2).copy()
         self.goal = np.asarray(goal, dtype=np.float64).reshape(-1, 2).copy()
@@ -546,6 +565,12 @@ class OrcaCrowd:
         # 近傍選抜・重なり検出・min_gap の候補列挙を空間ハッシュで行うか。
         # False = 全ペア(検証用の参照経路)。**結果は両者でビット一致**。
         self.pair_hash = bool(pair_hash)
+        # ── 認知的近傍(第二段B)。既定 False = 属性が増えるだけで選抜は不変 ──
+        self.cognitive = bool(cognitive)
+        self.cog_neighbors = (int(self.neighbor_cap) if cog_neighbors is None
+                              else int(cog_neighbors))
+        self.cog_sectors = int(cog_sectors)
+        self.cog_fov_deg = float(cog_fov_deg)
         segs = list(walls or [])
         if segs:
             self._wp1 = np.array([[s[0][0], s[0][1]] for s in segs], dtype=np.float64)
@@ -593,7 +618,20 @@ class OrcaCrowd:
 
         # 近傍(距離昇順・index 昇順タイブレーク = 決定論)
         k = min(self.neighbor_cap, max(m - 1, 1))
-        if self.pair_hash and m > _sfm._ALL_PAIRS_MAX_N:
+        if self.cognitive:
+            # ★第二段B: 選抜だけを「見えている近傍」へ差し替える(LP も半平面構成も不変)。
+            #   希望方向は goal − pos から作る = `_pref_velocity` の乱数を 1 本も消費しない
+            #   (pref_noise の draw 順は 1 ビットも動かない)。
+            gd = self.goal - self.pos
+            gn = np.linalg.norm(gd, axis=1)
+            e = np.zeros_like(gd)
+            nz = gn > 1e-9
+            e[nz] = gd[nz] / gn[nz, None]
+            kc = min(int(self.cog_neighbors), max(m - 1, 1))
+            order, nb_valid = _sfm.visual_neighbors(
+                self.pos, all_pos, e, kc, self.neighbor_dist,
+                sectors=self.cog_sectors, fov_deg=self.cog_fov_deg)
+        elif self.pair_hash and m > _sfm._ALL_PAIRS_MAX_N:
             # ★セル法の拡大リング探索。全体 argsort(O(N² log N))を廃す。
             #   有効近傍の集合も順序も全ペア版と完全一致する(sfm_core.knn_neighbors)。
             #   無効枠の index は 0 で埋める(build_agent_lines の該当要素は

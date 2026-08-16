@@ -54,6 +54,49 @@
     tests/test_physics_hash.py が両経路のバイト一致を密度 3 水準×形状 3 種×seed 3 本で固定)。
 ────────────────────────────────────────────────────────────────────────
 
+────────────────────────────────────────────────────────────────────────
+認知的近傍(物理痩身 第二段B。2026-08-17。docs/research/crowd-attention-physics.md 案B):
+  第一段A は「意味論を 1 ビットも変えない」痩身だった。第二段B は**意味論を文献に合わせる**:
+  対人相互作用の相手を「距離最近傍 k 体」ではなく **視覚的近傍**(視野内・遮蔽されていない
+  少数近傍)にする。`visual_neighbors()` が唯一の実装で、3 段の選抜からなる:
+
+    ① 前方視野円錐   … 希望方向 e_i から測った方位 φ が |φ| ≤ fov/2 の相手だけを見る。
+                       (Kitazawa & Fujiyama 2010: 歩行者の情報処理空間は半円ではなく
+                        **前方の円錐**)
+                       ★**既定は fov=360°(= 硬い円錐を掛けない)**。角度の重み付けは
+                         SFM の異方性 w = λ+(1−λ)(1+cosφ)/2 が既に担っており、その上に
+                         硬い円錐を重ねると (a) 異方性を二重に掛ける (b) **真後ろの
+                         最近傍**という最も大きい寄与だけが片側からしか働かなくなる
+                         (i は j を見ないが j は i を見る)= 作用反作用が壊れる。
+                         実測(scripts/bench_crowd_cognition.py の FOV 掃引・周期通路
+                         20×3 m・ρ=0.5–3.0):
+                           fov=360: v=1.072/0.952/0.582/0.724/0.898・最小すき間 +0.130 m
+                                    ・壁クリアランス +0.117 m(OFF とほぼ同一)
+                           fov=270: ±20% 帯 0.75→0.25・最小すき間 −0.153 m・壁 −0.023 m
+                           fov=200: ±20% 帯 0.75→0.50・最小すき間 −0.198 m・壁 **−0.151 m**
+                                    (= 壁を貫通する)
+                         → 円錐は**アブレーション用の口**として残し、既定では λ に任せる。
+    ② セクタ遮蔽近似 … 視野を `sectors` 個の方位セクタに割り、各セクタで**最も近い 1 体**
+                       だけを残す(それより奥は手前の人体に隠れて見えない)。
+                       (Wirth et al. 2023 PNAS Nexus: metric / topological / visual の
+                        直接比較で **visual(距離+遮蔽)が最良**・topological は棄却。
+                        Dachner et al. 2022: 距離減衰の主因は遮蔽)
+    ③ 近傍数上限 k   … 残った相手を距離昇順に k 体まで(既定 12 = 現行 neighbor_cap と同値)。
+                       (Ballerini et al. 2008 の 6–7 体 / RVO2 の maxNeighbors)
+
+  ★**高密度でも 1 体あたりの計算量が有界**になるのが本節の要点。実装は拡大リング探索で、
+    「覆えた半径 R の中で **min(k, sectors) 個のセクタが埋まった**行はそこで確定」する。
+    これは近似ではなく ②③の定義からの厳密な早期終了である: あるセクタに R 以内の相手が
+    居れば R より遠い同セクタの相手は最前になれず、min(k, sectors) 個の最前が既に
+    R 以内にあれば、R より遠い最前は距離昇順 k 位以内に入れない。密度が上がるほど
+    1 巡目でセクタが埋まるので探索半径が縮む = **混むほど実効近傍が縮む**という
+    Dachner 2022 の主張がそのまま計算量の上界になる。
+
+  ★既定 OFF(`cognitive=False`)では `visual_neighbors` は 1 度も呼ばれず、
+    forces() は第一段A までの経路を 1 バイトも変えずに通る(tests/test_physics_hash.py の
+    ビット一致検査群がそのまま緑 = 旧経路が固定されていることの証拠)。
+────────────────────────────────────────────────────────────────────────
+
 決定論について:
   乱数は numpy.random.Generator を引数で受け取り、コア内部では seed しない。
   揺らぎ項 ξ(既定 noise=0.0 で無効)を有効化したときだけ Generator を消費する。
@@ -486,6 +529,189 @@ def _knn_fill(order, valid, ii, jj, d, k, m, max_dist):
     valid[rows, :kk] = ok
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 認知的近傍(第二段B)— 視野円錐 + セクタ遮蔽 + 近傍数上限
+# ─────────────────────────────────────────────────────────────────────────────
+COG_NEIGHBORS_DEFAULT = 12    # k(既定 = 現行 neighbor_cap と同値の出発点)
+COG_SECTORS_DEFAULT = 16      # 方位セクタ数(遮蔽の一次近似。12–16 が文献の粒度)
+COG_FOV_DEG_DEFAULT = 360.0   # 視野円錐の**全角** [deg]。既定 360 = 硬い円錐を掛けない
+#                               (角度重みは SFM の異方性 λ が担う。冒頭「認知的近傍」①の実測)
+_RING_MAX_CAP = 8             # リング探索の上限(退化配置で ring_max が発散しない安全弁)
+
+
+def visual_neighbors(qpos, points, edir, k, max_dist,
+                     sectors=COG_SECTORS_DEFAULT, fov_deg=COG_FOV_DEG_DEFAULT,
+                     exclude_self=True):
+    """各 query の「見えている近傍」= 視野円錐 → セクタごと最前 → 距離昇順 k 体。
+
+    戻り値 (order, valid) は `knn_neighbors` と同形 (nq, k)。valid は**先頭詰め**で、
+    有効分は **距離昇順**(同値は点 index 昇順)に並ぶ。
+
+    引数:
+      qpos    (nq,2) 見る側の位置 / points (m,2) 見られる側(ゴースト込みでよい)
+      edir    (nq,2) 見る側の希望方向(正規化不要)。長さ 0 の行は +x 向きとみなす
+              (目標に到達済み等で方向が定義できない個体の決定論的な既定値)。
+      k       近傍数上限 / max_dist 距離カットオフ [m](これ以上は列挙しない)
+      sectors 方位セクタ数(視野円錐を等分割する)/ fov_deg 視野の全角 [deg]
+
+    計算量: 2 つの体制を自動で選ぶ。
+      (a) **一括**: 密度から決まる「occlusion horizon」が max_dist より外なら、
+          遮蔽で切れるものが無いので `neighbor_pairs` と同じ粒度(cell = max_dist/2)で
+          1 回だけ列挙する = 候補列挙のコストは第一段A と同じ。
+      (b) **拡大リング**: horizon が max_dist の内側(= 混んでいる/カットオフが遠い)なら
+          ring = 1, 2, 4, … と広げ、**覆えた半径 R の中で min(k, sectors) 個の
+          セクタが埋まった行はそこで確定**する。これは近似ではなく定義からの厳密な
+          早期終了である: あるセクタに R 以内の相手が居れば、R より遠い同セクタの相手は
+          決して最前になれず、min(k, sectors) 個の最前が既に R 以内にあれば、
+          R より遠い最前は距離昇順 k 位以内に入れない。
+      → 密度が上がるほど探索半径が縮む(Dachner et al. 2022 の「遮蔽が距離減衰の主因」が
+        そのまま計算量の上界になる)。
+
+    決定論: 乱数ゼロ。並べ替えは (行, セクタ) → 距離 → index 昇順の安定ソートで、
+    距離が厳密に同値でもタイブレークが一意に決まる。
+    ★1 段目の並べ替えは (行·セクタ, 距離) を 1 本の float64 へ詰めた合成キーの
+      **安定 argsort** 1 回で行う(lexsort 3 本ぶんを 1 本に畳む)。詰め方は
+      `key·max_dist + d` で、d < max_dist なのでキー間の順序は厳密に保たれる。
+      厳密同値の距離は合成キーも厳密同値になり、安定ソートが (i,j) 昇順を残す
+      = タイブレークは exact lexsort と一致する。**正直な限界**: 合成キーの
+      float64 分解能(nq·sectors·max_dist のオーダーで ~1e-10 m)より近い 2 つの距離は
+      順位が入れ替わりうる(決定論は保たれる)。
+    """
+    qpos = np.asarray(qpos, dtype=np.float64).reshape(-1, 2)
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    edir = np.asarray(edir, dtype=np.float64).reshape(-1, 2)
+    nq = qpos.shape[0]
+    m = points.shape[0]
+    k = int(k)
+    sectors = max(1, int(sectors))
+    order = np.zeros((nq, max(k, 0)), dtype=np.int64)
+    valid = np.zeros((nq, max(k, 0)), dtype=bool)
+    max_dist = float(max(max_dist, 0.0))
+    if nq == 0 or m == 0 or k <= 0 or max_dist <= 0.0:
+        return order, valid
+    need = min(k, sectors)                      # 確定に要るセクタ数(上の (b) の証明)
+    half = min(max(0.5 * math.radians(float(fov_deg)), 1e-6), math.pi)
+    cos_half = math.cos(half)
+    en = np.linalg.norm(edir, axis=1)
+    e = np.where(en[:, None] > 1e-12,
+                 edir / np.maximum(en, 1e-12)[:, None],
+                 np.array([1.0, 0.0]))
+    small = m <= _ALL_PAIRS_MAX_N               # 小規模は全ペアの方が安い(結果は同一)
+    field = None
+    if small:
+        cell = max_dist
+        ring_max = 1
+        expand = False
+    else:
+        lo = points.min(axis=0)
+        hi = points.max(axis=0)
+        area = max(float(hi[0] - lo[0]), 1e-9) * max(float(hi[1] - lo[1]), 1e-9)
+        # occlusion horizon = 「need 個のセクタを埋めるのに十分な相手が入る半径」の目安。
+        # 視野が狭いほど円内の相手のうち使えるのは half/π 倍なので、その逆数で嵩上げする。
+        target = max(k, sectors) * (math.pi / half)
+        horizon = math.sqrt(max(2.0 * target * area / m, 1e-12) / math.pi)
+        expand = horizon < max_dist             # 遮蔽が距離カットオフより内側で効くか
+        cell = horizon if expand else max_dist / _POINT_CELL_DIV
+        # ★下限クリップ。退化配置(点が 1 直線・bbox がほぼ 0)では horizon が 0 に潰れ、
+        #   ring_max = max_dist/cell が発散してリング探索がメモリを食い尽くす。
+        #   cell ≥ max_dist/_RING_MAX_CAP なら最悪でも (2·8+1)² = 289 セル止まり
+        #   (全面被覆の面積比は π max_dist² に対して 1.4 倍 = 許容範囲)。
+        cell = min(max(cell, max_dist / _RING_MAX_CAP), max_dist)
+        field = PointField(points, cell)
+        ring_max = max(1, min(int(math.ceil(max_dist / field.cell)), _RING_MAX_CAP))
+    todo = np.arange(nq, dtype=np.int64)
+    ring = 1 if expand else ring_max
+    first_pass = True
+    while todo.size:
+        r = min(ring, ring_max)
+        cover = (r >= ring_max)                 # max_dist 以内を完全に覆えた
+        if small:
+            src = np.repeat(todo, m)
+            pt = np.tile(np.arange(m, dtype=np.int64), todo.shape[0])
+        else:
+            qrow, pt = field.candidates(qpos[todo], r)
+            src = todo[qrow]
+        if exclude_self:
+            keep = ~((src == pt) & (pt < nq))
+            src, pt = src[keep], pt[keep]
+        if src.shape[0] == 0:
+            if cover:
+                break
+            ring *= 2
+            first_pass = False
+            continue
+        flat = np.sort(src * m + pt)            # (i, j) 辞書順(= タイブレークの基準列)
+        ii, jj = flat // m, flat % m
+        du = points[jj] - qpos[ii]              # i → j
+        d = np.linalg.norm(du, axis=1)
+        inv = np.where(d > 1e-12, 1.0 / np.maximum(d, 1e-12), 0.0)
+        ux, uy = du[:, 0] * inv, du[:, 1] * inv
+        cs = e[ii, 0] * ux + e[ii, 1] * uy
+        # ★視野の外と距離カットオフの外はここで落とす(以降の arctan2・整列の対象を減らす)。
+        #   |φ| ≤ half ⟺ cos φ ≥ cos(half)(half ∈ (0, π])= 三角関数を 1 度も呼ばない判定。
+        seen = (cs >= cos_half) & (d < max_dist)
+        if not seen.any():
+            if cover:
+                break
+            ring *= 2
+            first_pass = False
+            continue
+        ii, jj, d = ii[seen], jj[seen], d[seen]
+        sn = e[ii, 0] * uy[seen] - e[ii, 1] * ux[seen]
+        phi = np.arctan2(sn, cs[seen])          # e_i から測った相手の方位 [-half, half]
+        sec = np.clip(np.floor((phi + half) / (2.0 * half) * sectors),
+                      0, sectors - 1).astype(np.int64)
+        if cover:
+            done_mask = np.ones(todo.shape[0], dtype=bool)
+        else:
+            # 覆えた半径 R の中で need 個のセクタが埋まった行は確定(ソート不要の走査)
+            insel = d <= r * cell
+            hit = np.zeros(nq * sectors, dtype=bool)
+            hit[ii[insel] * sectors + sec[insel]] = True
+            filled = hit.reshape(nq, sectors).sum(axis=1)
+            done_mask = filled[todo] >= need
+        rows = todo[done_mask]
+        if rows.size:
+            if first_pass and cover:
+                take = slice(None)               # 一括体制の 1 巡目 = 全行が対象
+            else:
+                pick = np.zeros(nq, dtype=bool)
+                pick[rows] = True
+                take = pick[ii]
+            _visual_fill(order, valid, ii[take], jj[take], d[take], sec[take],
+                         k, sectors, max_dist)
+        todo = todo[~done_mask]
+        if cover:
+            break
+        ring *= 2
+        first_pass = False
+    return order, valid
+
+
+def _visual_fill(order, valid, ii, jj, d, sec, k, sectors, max_dist):
+    """セクタごと最前 → 行ごと距離昇順 k 体、を order/valid へ書き込む。"""
+    if ii.shape[0] == 0:
+        return
+    nq = order.shape[0]
+    key = ii * sectors + sec
+    # (行·セクタ, 距離) を 1 本へ詰めた合成キーの安定 argsort(docstring の註)
+    o = np.argsort(key * max_dist + d, kind="stable")
+    ks = key[o]
+    first = np.empty(ks.shape[0], dtype=bool)
+    first[0] = True
+    first[1:] = ks[1:] != ks[:-1]
+    s = o[first]                               # 各セクタの最前 1 体 = 見えている相手
+    ri, rj, rd = ii[s], jj[s], d[s]
+    o2 = np.lexsort((rj, rd, ri))              # 行昇順 → 距離昇順 → index 昇順
+    ri, rj = ri[o2], rj[o2]
+    cnt = np.bincount(ri, minlength=nq)
+    starts = np.concatenate([np.zeros(1, dtype=np.int64), np.cumsum(cnt)[:-1]])
+    rank = np.arange(ri.shape[0], dtype=np.int64) - starts[ri]
+    keep = rank < k
+    order[ri[keep], rank[keep]] = rj[keep]
+    valid[ri[keep], rank[keep]] = True
+
+
 def wall_forces_from_pairs(pos, radius, field, ai, si,
                            wall_a=WALL_A_DEFAULT, wall_b=WALL_B_DEFAULT,
                            wall_range=WALL_RANGE_M):
@@ -550,6 +776,10 @@ class Crowd:
         pair_hash: True(既定)= 対人斥力の候補列挙を空間ハッシュ(PointField)で行う。
                 False = 全ペア(検証用の参照経路)。**結果は両者でビット一致**
                 (tests/test_physics_hash.py が固定)。
+        cognitive: True で対人斥力の相手を**認知的近傍**(視野円錐+セクタ遮蔽+上限 k)
+                にする(第二段B。本 module 冒頭「認知的近傍」節)。**既定 False = 従来経路を
+                1 バイトも変えない**。ON は力が変わる(非同値。文献に近づく方向の変更)。
+        cog_neighbors / cog_sectors / cog_fov_deg: 認知的近傍の k / セクタ数 / 視野全角 [deg]。
     """
 
     def __init__(self, pos, vel, goal, v0, radius=None, active=None,
@@ -558,7 +788,9 @@ class Crowd:
                  rng=None, noise=0.0, arrive_radius=0.5,
                  walls=None, wall_a=WALL_A_DEFAULT, wall_b=WALL_B_DEFAULT,
                  wall_range=WALL_RANGE_M, wall_hash=True, wall_cell=None,
-                 neighbor_cap=None, pair_hash=True):
+                 neighbor_cap=None, pair_hash=True,
+                 cognitive=False, cog_neighbors=COG_NEIGHBORS_DEFAULT,
+                 cog_sectors=COG_SECTORS_DEFAULT, cog_fov_deg=COG_FOV_DEG_DEFAULT):
         self.pos = np.asarray(pos, dtype=np.float64).reshape(-1, 2).copy()
         n = self.pos.shape[0]
         self.vel = np.asarray(vel, dtype=np.float64).reshape(-1, 2).copy()
@@ -592,6 +824,11 @@ class Crowd:
                            if walls is not None and len(walls) else None)
         self.neighbor_cap = None if neighbor_cap is None else int(neighbor_cap)
         self.pair_hash = bool(pair_hash)
+        # ── 認知的近傍(第二段B)。既定 False = 属性が増えるだけで経路は不変 ──
+        self.cognitive = bool(cognitive)
+        self.cog_neighbors = int(cog_neighbors)
+        self.cog_sectors = int(cog_sectors)
+        self.cog_fov_deg = float(cog_fov_deg)
 
     # ── 希望方向 e_i(目標へ向かう単位ベクトル) ──
     def _desired_dir(self):
@@ -633,8 +870,11 @@ class Crowd:
         f = self.mass * (self.v0[:, None] * e - self.vel) / self.tau
 
         if n > 1:
-            f = f + (self._repulsion_hash(e) if self.pair_hash
-                     else self._repulsion_dense(e))
+            if self.cognitive:
+                f = f + self._repulsion_cognitive(e)
+            else:
+                f = f + (self._repulsion_hash(e) if self.pair_hash
+                         else self._repulsion_dense(e))
 
         # 対壁斥力 f_iW = A_w·exp((r_i − d_iW)/B_w)·n_iW(walls 未指定なら評価しない)
         if self.wall_field is not None:
@@ -713,6 +953,53 @@ class Crowd:
             contrib = (w * mag)[:, None] * nij
             contrib[~valid] = 0.0
             # 合算は (i, j) 昇順の逐次加算(np.bincount)= 行和とビット一致
+            f[_r0:_r1, 0] = np.bincount(si - _r0, weights=contrib[:, 0],
+                                        minlength=_r1 - _r0)
+            f[_r0:_r1, 1] = np.bincount(si - _r0, weights=contrib[:, 1],
+                                        minlength=_r1 - _r0)
+        return f
+
+    def _repulsion_cognitive(self, e):
+        """**認知的近傍**(視野円錐 + セクタ遮蔽 + 上限 k)だけからの対人斥力(第二段B)。
+
+        力の式・異方性 w・距離カットオフ `d ≤ r_i+r_j+CUTOFF_M`・合算順序((i,j) 昇順の
+        bincount)は `_repulsion_hash` と**同一**。違うのは「誰が寄与するか」だけ:
+        距離最近傍 k 体 → 見えている k 体(手前の人体に隠れた相手は寄与しない)。
+        ★寄与する相手は必ず min(k, sectors) 体以下 = 密度に依らず有界。
+        """
+        n = self.pos.shape[0]
+        f = np.zeros((n, 2), dtype=np.float64)
+        k = min(int(self.cog_neighbors), n - 1)
+        if k <= 0:
+            return f
+        reach = 2.0 * float(self.radius.max()) + CUTOFF_M
+        order, valid = visual_neighbors(self.pos, self.pos, e, k, reach,
+                                        sectors=self.cog_sectors,
+                                        fov_deg=self.cog_fov_deg)
+        vr = valid.ravel()
+        if not vr.any():
+            return f
+        ii = np.repeat(np.arange(n, dtype=np.int64), k)[vr]
+        jj = order.ravel()[vr]
+        flat = np.sort(ii * n + jj)                        # (i, j) 辞書順 = 合算順序
+        ii, jj = flat // n, flat % n
+        for _r0, _r1, p0, p1 in pair_blocks(ii, n):
+            if p1 <= p0:
+                continue
+            si, sj = ii[p0:p1], jj[p0:p1]
+            diff = self.pos[si] - self.pos[sj]             # j → i
+            d = np.linalg.norm(diff, axis=1)
+            rr = self.radius[si] + self.radius[sj]
+            arg = np.clip((rr - d) / self.b, a_min=None, a_max=_EXP_ARG_MAX)
+            mag = self.a * np.exp(arg)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                nij = diff / d[:, None]
+            nij = np.nan_to_num(nij)
+            cosphi = -(e[si, 0] * nij[:, 0] + e[si, 1] * nij[:, 1])
+            w = self.lam + (1.0 - self.lam) * (1.0 + cosphi) / 2.0
+            valid_p = self.active[sj] & (d <= rr + CUTOFF_M)
+            contrib = (w * mag)[:, None] * nij
+            contrib[~valid_p] = 0.0
             f[_r0:_r1, 0] = np.bincount(si - _r0, weights=contrib[:, 0],
                                         minlength=_r1 - _r0)
             f[_r0:_r1, 1] = np.bincount(si - _r0, weights=contrib[:, 1],

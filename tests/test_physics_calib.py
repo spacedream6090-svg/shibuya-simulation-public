@@ -235,8 +235,9 @@ def test_the_zone_engine_class_follows_the_conf(monkeypatch):
     seen: list[type] = []
     orig = P._build_engine
 
-    def spy(zone, members, rng, calib=None):
-        eng = orig(zone, members, rng, calib)
+    def spy(zone, members, rng, calib=None, cog=None):
+        # cog = 第二段B(認知的近傍)の引数。既定 OFF では常に空 dict。
+        eng = orig(zone, members, rng, calib, cog)
         seen.append(type(eng))
         return eng
 

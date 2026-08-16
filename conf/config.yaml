@@ -4377,6 +4377,59 @@ physics:
     #   true にすると ext.crowd_local の値が「同席人数」から「実測近傍人数」へ変わるので、
     #   第80 の σ 較正をやり直す必要がある(だから既定は false)。
     channels: false
+  # ==== 認知的近傍(物理痩身 第二段B。2026-08-17。**既定 OFF = 現行挙動と完全に恒等**)====
+  # 正典: docs/research/crowd-attention-physics.md 「案B: 認知的近傍への明示的制限」
+  # 実装: src/society/world/sfm_core.py の `visual_neighbors`(SFM/ORCA が共用する 1 本)
+  #
+  # 何が変わるか(ON のとき): 対人斥力(SFM)と ORCA の**相互作用相手の選び方だけ**が
+  #   「距離最近傍 k 体」→「① 前方視野円錐 ② 方位セクタごとに最前の 1 体(遮蔽の一次近似)
+  #     ③ 距離昇順 k 体」へ変わる。力の式・異方性 w・距離カットオフ・合算順序は不変。
+  # 文献:
+  #   Wirth, Dachner, Rio & Warren (2023) PNAS Nexus 2(5):pgad118 — metric/topological/visual
+  #     の直接比較で **visual(距離+遮蔽)が最良・topological(固定 k 体)は棄却**。
+  #   Dachner et al. (2022) Proc. R. Soc. B 289:20212089 — 距離減衰の主因は**遮蔽**
+  #     (近い人が遠い人を隠す)。したがって混むほど実効近傍は縮む。
+  #   Kitazawa & Fujiyama (2010) PED2008 — 歩行者の情報処理空間は半円ではなく**前方の円錐**。
+  #   Ballerini et al. (2008) PNAS 105:1232 / RVO2 maxNeighbors — 相互作用相手は 1 桁。
+  # ★計算量: 実際に力を及ぼす相手は必ず min(neighbors, sectors) 体以下 = **密度に依らず有界**。
+  #   探索は「min(neighbors, sectors) 個のセクタが埋まった行はそこで確定」する拡大リング探索で、
+  #   これは近似ではなく ②③の定義からの厳密な早期終了(同セクタのより遠い相手は最前になれず、
+  #   その個数の最前が既に確定していれば、より遠い最前は距離昇順 k 位以内に入れない)。
+  # ★ON は力が変わる(非同値)。P4 の較正は「全ペア + cap12」を前提に取った値なので、
+  #   ON にするときは基本図・ボトルネック流量を測り直すこと(scripts/bench_crowd_cognition.py)。
+  cognitive:
+    enabled: false
+    neighbors: 12             # k。既定 12 = 現行 neighbor_cap と同値の出発点
+    sectors: 16               # 方位セクタ数。実質の近傍上限は min(neighbors, sectors)
+    fov_deg: 360.0            # 視野円錐の**全角** [deg]。★既定 360 = **硬い円錐を掛けない**。
+                              #   角度の重み付けは SFM の異方性 w=λ+(1−λ)(1+cosφ)/2 が既に
+                              #   担っており、その上に硬い円錐を重ねると (a) 異方性の二重掛け
+                              #   (b) **真後ろの最近傍**という最大の寄与だけが片側からしか
+                              #   働かなくなる(作用反作用が壊れる)。実測(FOV 掃引・周期通路):
+                              #     fov=360 → 基本図・最小すき間・壁クリアランスとも OFF と同等
+                              #     fov=270 → ±20% 帯 0.75→0.25・最小すき間 −0.153 m
+                              #     fov=200 → ±20% 帯 0.75→0.50・**壁クリアランス −0.151 m**(貫通)
+                              #   → 円錐はアブレーション用の口として残し、既定は λ に任せる
+  # ==== 遠方場の密度場化(物理痩身 第二段C。**既定 OFF = far 項はペア和のまま**)========
+  # 正典: docs/research/crowd-attention-physics.md 「案C: 近接=個体 / 遠方=密度場」
+  # 実装: src/society/physics.py の `_CalibratedCrowd._far_forces_field`
+  #
+  # 何が変わるか(ON のとき): 較正 far 項(physics.sfm.far_field)の**ペア和**が
+  #   密度場 ρ(x) 由来の連続体力へ置き換わる。遠方の群衆は個体の列挙ではなく
+  #   **アンサンブル統計(密度・流れ)として知覚される**(Whitney & Yamanashi Leib 2018
+  #   Annu. Rev. Psychol. 69:105)の物理層への翻訳で、工学の前例は
+  #   Hughes (2002) / Treuille et al. (2006) Continuum Crowds / Narain et al. (2009)。
+  #   接続係数はペア版と同じカーネルから**解析的に**導く(f = −c_drag·ρ·e − c_grad·∇ρ)ので、
+  #   一様密度ではペア版と同じ合力 = 基本図の作業点が保存される。
+  # ★`physics.sfm.far_field.enabled` が false のときは完全 no-op(置換する項が無い)。
+  # ★計算量は O(N + 格子セル数) = **密度に対して平坦**(ペア版は O(N·ρπR²))。
+  density_far:
+    enabled: false
+    cell_m: 1.0               # 密度格子の一辺 [m]
+    blur: 2                   # 3×3 箱平滑の回数(2 回 ≈ σ≈1.15 セルの Gauss 近似)
+    update_every: 10          # 格子を作り直すサブステップ周期(10×0.05s = 0.5 s。
+                              #   対人固視の実測時定数 ~0.5 s = Fotios et al. 2015 と同桁)。
+                              #   ★読み出し(双線形サンプル)は毎サブステップ行う
   # ゾーン宣言。**空 = 既定 = 物理 OFF**。
   zones: []
   # ★★ 実配置は conf/zones_shibuya.yaml にある(第100バッチ Wave4 I-2。2026-08-06)★★

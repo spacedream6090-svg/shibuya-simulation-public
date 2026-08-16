@@ -105,6 +105,27 @@ SFM_DEFAULTS = {
     "wall": {"a": 2000.0, "b": 0.08},
 }
 
+# `physics.cognitive`(第二段B。2026-08-17。docs/research/crowd-attention-physics.md 案B)。
+# 対人斥力(SFM)と ORCA の**近傍選抜だけ**を「距離最近傍 k 体」から
+# 「視野円錐 → 方位セクタごとに最前の 1 体 → 距離昇順 k 体」へ差し替える。
+# 既定 OFF = `sfm_core.visual_neighbors` が 1 度も呼ばれない = 従来経路とバイト一致。
+COGNITIVE_DEFAULTS = {
+    "enabled": False,
+    "neighbors": 12,      # k。既定 12 = 現行 neighbor_cap と同値の出発点
+    "sectors": 16,        # 方位セクタ数(遮蔽の一次近似)。実質の近傍上限は min(k, sectors)
+    "fov_deg": 360.0,     # 視野円錐の**全角** [deg]。既定 360 = 硬い円錐なし(角度重みは
+                          #   SFM の異方性 λ が担う)。200 等に絞ると前方円錐のアブレーション
+}
+
+# `physics.density_far`(第二段C。同メモ 案C)。較正 far 項のペア和を密度場の連続体力へ。
+# ★`physics.sfm.far_field.enabled` が ON のときだけ意味を持つ(置換する当の項が無ければ no-op)。
+DENSITY_FAR_DEFAULTS = {
+    "enabled": False,
+    "cell_m": 1.0,        # 密度格子の一辺 [m]
+    "blur": 2,            # 3×3 箱平滑の回数
+    "update_every": 10,   # 格子を作り直すサブステップ周期(サンプルは毎サブステップ)
+}
+
 ZONE_DEFAULTS = {
     "id": "",
     "polygon": (),                # [(x,y), …] 地図ローカル m。3 点以上。
@@ -402,7 +423,8 @@ def build_cfg(raw, repo_root: Path | None = None,
     """
     raw = dict(raw or {})
     repo_root = repo_root or Path(".")
-    unknown = sorted(set(raw) - {"sfm", "zones_enabled", "zones", "perception"})
+    unknown = sorted(set(raw) - {"sfm", "zones_enabled", "zones", "perception",
+                                 "cognitive", "density_far"})
     if unknown:
         raise KeyError(f"physics: 未知のキー {unknown}")
     enabled = bool(raw.get("zones_enabled", False))
@@ -411,13 +433,43 @@ def build_cfg(raw, repo_root: Path | None = None,
     perception["contact_gap_m"] = float(perception["contact_gap_m"])
     perception["channels"] = bool(perception["channels"])
     sfm = _build_sfm(raw.get("sfm"))
+    cognitive = _build_cognitive(raw.get("cognitive"))
+    density_far = _build_density_far(raw.get("density_far"))
     zones: list[Zone] = []
     if enabled:
         for spec in (raw.get("zones", ()) or ()):
             zones.append(_build_zone(dict(spec), repo_root, step_seconds))
     _check_disjoint(zones)
     return {"zones_enabled": enabled, "zones": tuple(zones), "perception": perception,
-            "sfm": sfm}
+            "sfm": sfm, "cognitive": cognitive, "density_far": density_far}
+
+
+def _build_cognitive(raw) -> dict:
+    """`physics.cognitive` の正準化(第二段B)。既定 = OFF = 従来経路と完全に恒等。"""
+    out = _merge(COGNITIVE_DEFAULTS, raw)
+    out["enabled"] = bool(out["enabled"])
+    out["neighbors"] = int(out["neighbors"])
+    out["sectors"] = int(out["sectors"])
+    out["fov_deg"] = float(out["fov_deg"])
+    if out["enabled"] and not (out["neighbors"] >= 1 and out["sectors"] >= 1
+                               and 0.0 < out["fov_deg"] <= 360.0):
+        raise ValueError("physics.cognitive: neighbors>=1 / sectors>=1 /"
+                         " 0<fov_deg<=360 が必要")
+    return out
+
+
+def _build_density_far(raw) -> dict:
+    """`physics.density_far` の正準化(第二段C)。既定 = OFF = far 項はペア和のまま。"""
+    out = _merge(DENSITY_FAR_DEFAULTS, raw)
+    out["enabled"] = bool(out["enabled"])
+    out["cell_m"] = float(out["cell_m"])
+    out["blur"] = int(out["blur"])
+    out["update_every"] = int(out["update_every"])
+    if out["enabled"] and not (out["cell_m"] > 0.0 and out["blur"] >= 0
+                               and out["update_every"] >= 1):
+        raise ValueError("physics.density_far: cell_m>0 / blur>=0 /"
+                         " update_every>=1 が必要")
+    return out
 
 
 def _build_sfm(raw) -> dict:
