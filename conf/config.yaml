@@ -2506,6 +2506,26 @@ observer:
   #   summary.json の starvation ブロック。実装 src/society/observer/starvation.py。
   starvation:
     enabled: false
+  # ---- V3 決定モード印字(外部監査トリアージ §3.2・**既定 OFF**)----------------------
+  # 正典: docs/plans/external-audit-triage.md §3.2 V3 / 実装 src/society/observer/decision_mode.py
+  # 「その行動を決めたのは LLM か・ルールか・再利用か」を事後に数えられるようにする。
+  # ★3 レーンのうち **2 本は既に L1 だけで完全に可視**なので何も足さない:
+  #     朝の計画 = plan_created.payload.src ∈ {llm, prev_day, skeleton} + plan_skipped
+  #     夜の内省 = l1b_llm.purpose=="reflect" + reflect_dropped
+  #   埋めるのは **日中熟慮レーンの分母**だけ。_decide は毎 step 在場覚醒の全個体へ必ず
+  #   1 行動を返すのに、ルール層(routine.decide)が決めた分は L1 にも l1b にも痕跡が無く、
+  #   「LLM 被覆率 = LLM が決めた決定 / 全決定」の**分母が原理的に計算できなかった**
+  #   (0.173 回/人日は呼数 ÷ 人日であって決定に占める割合ではない)。
+  # ON で summary.json に decision_mode ブロックが 1 つ増える。日ごとに
+  #   points(決定点) / llm / reuse / rule と share・rule の理由 × 出所の 2 軸内訳・
+  #   用途別の呼と parse 不成立(fallback には trigger が載らないのでここにしか無い)。
+  #   不変式 points == llm + reuse + rule の破れは residual に出す(黙って合わせない)。
+  # ★L1 の kind も payload も 1 件も増やさない・L2 へ列も足さない(aggregate.py は
+  #   metrics_spec の凍結対象)= 出口は summary のキー 1 つだけ。
+  # 記録専用: 分岐ゼロ・乱数ゼロ・LLM 呼数不変・プロンプト 1 バイト不変。
+  # 事後解析は scripts/decision_modes.py(3 レーンを 1 表にまとめる)。
+  decision_mode:
+    enabled: false
   snapshot_every: 12            # L3 スナップショット間隔(=2時間ごと)
   checkpoint_every: 0           # D16: この step ごとに完全状態を保存+ログを part 化(0=無効)。
                                 # >0 で --resume 可能に。既定0=part を作らず出力・挙動は従来と完全同一。

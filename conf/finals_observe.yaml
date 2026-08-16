@@ -1069,6 +1069,18 @@ observer:
   # 分岐も乱数も呼数も 1 つも動かさないのでリスクはゼロ、規模も L1 の新 kind 3 種だけ。
   starvation:
     enabled: true
+  # ---- V3 決定モード印字(外部監査トリアージ §3.2・2026-08-16 ユーザー承認)----------
+  # ON の理由: DPH-B(tiers)ON の本ランでは **ほぼ全員の計画と行動が骨格へ落ちる**のに、
+  #   「その行動を決めたのが LLM かルールか」の**分母がどこにも記録されていない**。
+  #   0.173 回/人日(→ cap 再導出後 0.86-1.44)は呼数 ÷ 人日であって決定に占める割合では
+  #   ないので、cap 再導出(A1/β8)の効果も「rule vs LLM の行動品質比較」も、この 1 枚が
+  #   無いと事後に測れない。朝の計画(plan_created.src)と夜の内省(purpose=reflect +
+  #   reflect_dropped)は既に L1 だけで可視なので、増えるのは日中熟慮レーンの分母だけ。
+  # ★L1 の kind も payload も 1 件も増えない(出口は summary.json のキー 1 つ)= ディスク
+  #   増分ゼロ・記録専用(分岐ゼロ・乱数ゼロ・呼数不変・プロンプト不変)。
+  #   外すときは下の 1 行を false にするだけ(ラン結果には L1 1 バイトも影響しない)。
+  decision_mode:
+    enabled: true
   causality:
     enabled: true          # cause_type / actor_id / device_id(「世界を変えた人」の測定に必須)
   llm_link: true           # 行為 → 思考の PROV リンク

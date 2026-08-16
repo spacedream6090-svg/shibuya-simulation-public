@@ -43,6 +43,7 @@ from .. import physics as physics_mod
 from .. import population as population_mod
 from .. import provlink as provlink_mod
 from ..observer import causality as causality_mod
+from ..observer import decision_mode as decmode_mod
 from ..observer import gt_extras as gt_extras_mod
 from ..observer import starvation as starvation_mod
 from .. import reject as reject_mod
@@ -2545,6 +2546,9 @@ def _llm_speak_g(sim, agent, trigger: str, step: int, sim_min: int, *,
         "max_tokens": int(sim.cfg.model.max_tokens)}
     sim.logger.log_llm_call({"llm_call_id": call_id, "agent_id": agent.id,
                              "purpose": trigger, "step": step, "cached": cached})
+    # V3 決定モード(observer.decision_mode。既定 OFF は即 return=1 バイトも動かない)。
+    # ★ここは `log_llm_call` と**同じ位置**なので、数える呼は l1b_llm の行と 1:1 になる。
+    decmode_mod.note_llm_call(sim, sim_min, trigger)
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                          kind="llm_deliberate", x=agent.x, y=agent.y,
                          llm_call_id=call_id, payload={"trigger": trigger}))
@@ -2567,6 +2571,9 @@ def _llm_speak_g(sim, agent, trigger: str, step: int, sim_min: int, *,
     watch_mod.apply(sim, agent, response, step, sim_min)
     _model_revision_beliefs(sim, agent, step, sim_min, trigger)
     if action is None:                             # D16: 壊れたら沈黙して続行
+        # V3: `fallback{reason:"parse_error"}` には trigger が載らない(用途別の内訳が
+        # 既存 L1 から復元できない)ので、ここでだけ用途つきで数える。既定 OFF は no-op。
+        decmode_mod.note_llm_unparsed(sim, sim_min, trigger)
         _log_reject(sim, agent, response, trigger, step, sim_min)
     else:
         deliberate.store_action(sim, agent, step, sim_min, trigger, action)
@@ -2880,8 +2887,14 @@ def _decide(sim, agent, step: int, sim_min: int) -> dict:
 
 
 def _decide_g(sim, agent, step: int, sim_min: int):
+    # V3 決定モード(observer.decision_mode。既定 OFF は note_* が即 return)。
+    #   `_why` = 「LLM がこの決定を決めなかった理由」。ルール層へ落ちた**その 1 度だけ**
+    #   `note_rule` が消費する = 決定 1 回につき記録も 1 件(不変式 points == llm+reuse+rule)。
+    #   ★逐次経路と一括発行経路は同じ `_decide_g` を回すので、batch ON/OFF で記録は同一。
+    _why = "no_fire"
     # 勾留(制度深化2・既定 0=フラグ立たず不変): 拘束中は行動しない(返答・発火・移動なし)。
     if step < getattr(agent, "detained_until", 0):
+        decmode_mod.note_rule(sim, sim_min, "detained")
         return {"type": "stay"}
     rng = sim.hub.stream("decide", agent.id, step)
     radius = float(sim.cfg.world.perception_radius_m)
@@ -2906,6 +2919,7 @@ def _decide_g(sim, agent, step: int, sim_min: int):
             agent.conv_turns_left -= 1
             if agent.conv_turns_left <= 0:
                 agent.conv_cooldown_until = step + sim.drivecfg["conv_cooldown_steps"]
+            decmode_mod.note_rule(sim, sim_min, "template")
             return engaged_mod.template_reply(sim, agent, step, sim_min)
         speaker_id, said = agent._reply_to
         agent._reply_to = None
@@ -2915,6 +2929,7 @@ def _decide_g(sim, agent, step: int, sim_min: int):
         _reply_ok = sim.budget.take("reply")
         if not _reply_ok:
             starvation_mod.note_reply_dropped(sim, agent, step, sim_min, speaker_id)
+            _why = "reply_starved"                 # V3(記録用の局所変数。分岐に使わない)
         if _reply_ok:
             speaker = sim.agent_by_id.get(speaker_id)
             reply_to = (speaker.name, said) if speaker is not None else None
@@ -2932,7 +2947,8 @@ def _decide_g(sim, agent, step: int, sim_min: int):
                 agent.conv_cooldown_until = step + sim.drivecfg["conv_cooldown_steps"]
             sim.drive_stats["replies"] = sim.drive_stats.get("replies", 0) + 1
             if action is not None:
-                return action
+                return action                      # V3: LLM / 再利用が決めた(内側で計上済み)
+            _why = "reply_unparsed"                # 撃ったが行動にならなかった(or ablate.llm_off)
 
     if agent._fire_reason:                         # 欲求フェーズで発火権を得た
         reason = agent._fire_reason
@@ -2940,10 +2956,15 @@ def _decide_g(sim, agent, step: int, sim_min: int):
         agent._last_fire_reason = reason           # 造語の発生きっかけの記録用
         action = yield from _fire_llm_g(sim, agent, reason, step, sim_min, rng)
         if action is not None:
-            return action
+            return action                          # V3: LLM / 再利用が決めた(内側で計上済み)
+        _why = "fire_unparsed"
 
     action = routine.decide(agent, step, sim, _place_of(sim, agent), rng,
                             has_company=bool(company))
+    # V3: ここから先の行動は**ルール層**が決めたもの(スマホ行動も含む)。`routine.decide`
+    #   の中で朝の計画のブロックが立ったなら、その来歴が出所として一緒に記録される。
+    #   既定 OFF は即 return = 世界も L1 も 1 バイト不変。
+    decmode_mod.note_rule(sim, sim_min, _why)
     if action["type"] == "stay" and agent.has_phone and not agent.sleeping:
         phone_action = _phone(sim, agent, step, sim_min)
         if phone_action is not None:
@@ -6216,6 +6237,11 @@ def run_step(sim, step: int) -> None:
 
     active = [a for a in sim.agents
               if a.loc != "outside" and not a.sleeping]   # 外・睡眠中=計算しない
+    # V3 決定モード(observer.decision_mode。既定 OFF は即 return)。**決定点の分母**は
+    #   ここでしか判らない: `_decide` は必ず 1 個体 1 行動を返すのに、ルール層が決めた分は
+    #   L1 にも l1b にも 1 バイトも残らない = 「LLM 被覆率」の分母が原理的に無かった。
+    #   逐次経路も一括発行経路も同じ `active` を回すので、この 1 行で両経路が同じ値になる。
+    decmode_mod.note_points(sim, sim_min, len(active))
     # 日中熟慮の一括発行(engine.batch_llm。既定 OFF=下の内包表記=従来と 1 命令も同じ)。
     if _deliberate_batch_on(sim):
         actions = _phase_decide_batched(

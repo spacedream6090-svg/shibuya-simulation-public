@@ -122,6 +122,7 @@ from __future__ import annotations
 
 import math
 
+from ..observer import decision_mode as _dec_mode
 from ..observer import starvation as _starvation
 from ..observer.schema import Event
 from . import plan_boundary as _bnd
@@ -1614,6 +1615,8 @@ def plan_action(agent, sim, sim_min: int, step: int, rng, scfg=None):
               "node": at_node, "block": index, "boundary": "plan",
               "gateway": str(b["boundary"].get("gateway") or "")})
         _clear_why(sim, agent)                   # 第94 IF-B: 計画が動いた=侵入は止まる
+        if out:                                  # V3: 計画のブロックがこの step の行動を決めた
+            _dec_mode.note_plan_driven(sim, plan.get("src"))
         return out or None                       # {} = 既に縁に居る(移動不要)
     if b["place"] == "street":                   # 戸外・特定しない = 行き先は習慣ポリシーへ委ねる
         b["state"] = "done"                      # (消化そのものは起きたので黙って消さず数える)
@@ -1669,6 +1672,10 @@ def plan_action(agent, sim, sim_min: int, step: int, rng, scfg=None):
     # 無いので stamp は即 return = 一時キーを積まない = バイト一致。
     from .. import provlink as _provlink
     _provlink.stamp(sim, out, plan.get("call_id"), "plan")
+    # V3 決定モード: この step の行動は「朝の計画のブロック」が決めた = ルール層の中でも
+    # **間接的に LLM 由来**(plan の src が llm / skeleton / prev_day のどれか)。
+    # 既定 OFF は即 return = 一時スロットも積まない = バイト一致。
+    _dec_mode.note_plan_driven(sim, plan.get("src"))
     return out
 
 

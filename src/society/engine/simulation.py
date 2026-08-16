@@ -2412,6 +2412,14 @@ class Simulation:
         _stprov = _starv_prov.provenance(self)
         if _stprov is not None:
             summary["starvation"] = _stprov
+        # ---- V3 決定モード(observer.decision_mode.enabled=false = 既定 OFF はキーなし)----
+        # 「その行動を決めたのは LLM / ルール / 再利用のどれか」の日別内訳。朝の計画
+        # (plan_created.src)と夜の内省(l1b purpose=reflect + reflect_dropped)は既に
+        # L1 だけで可視なので、ここが埋めるのは**日中熟慮レーンの分母**だけである。
+        from ..observer import decision_mode as _decmode_prov
+        _dmprov = _decmode_prov.provenance(self)
+        if _dmprov is not None:
+            summary["decision_mode"] = _dmprov
         # ---- engaged モード 第87バッチ(cognition.engaged.enabled=false = 既定 OFF はキーなし)----
         # 原文書 §8 補助規則 3 が「全エピソードのログ(トリガー種別・滞在時間・ターン数・
         # 脱出理由・モデルID)を記録し思考量の個体差の観測量とする」と明記しているので、

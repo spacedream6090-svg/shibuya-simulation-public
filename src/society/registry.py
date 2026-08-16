@@ -1466,6 +1466,25 @@ FEATURES: tuple[Feature, ...] = (
        "drive_request{granted:false} しか無く用途が判らない)。"
        "★L2 へ列は足さない(observer/aggregate.py は metrics_spec の凍結対象)= 出口は"
        "L1 の新 kind 3 種と summary.json の starvation ブロック。OFF は新 kind 0 件"),
+    # V3 決定モード印字(docs/plans/external-audit-triage.md §3.2)。
+    # strict の根拠: 数えるのは既存の分岐が既に出した結果(呼を撃ったか・パースが通ったか・
+    #   ルール層へ落ちたか)だけで、LLM の自由文を 1 バイトも読まない。
+    # affects_k=False: **記録専用**。generate() の呼び出し点を足しも減らしもしない
+    #   (tests が呼数・乱数消費・行動列の完全一致を機械固定する)。
+    # fingerprint_risk=none: プロンプトを 1 バイトも変えない。
+    _f("observer.decision_mode.enabled", "strict", False, "none",
+       "各行動を決めたのが LLM / ルール / 方針キャッシュ再利用のどれかを日別に数える(V3)。"
+       "★朝の計画(plan_created.src)と夜の内省(l1b purpose=reflect + reflect_dropped)は"
+       "既に L1 だけで可視なので何も足さない。埋めるのは**日中熟慮レーンの分母**だけで、"
+       "_decide は在場覚醒の全個体へ毎 step 必ず 1 行動を返すのに **ルール層が決めた分は"
+       "L1 にも l1b にも痕跡が無く**、「LLM 被覆率 = LLM が決めた決定 / 全決定」の分母が"
+       "原理的に計算できなかった(0.173 回/人日は呼数 ÷ 人日であって割合ではない)。"
+       "副産物として ① fallback{parse_error} に載らない**用途別**の parse 不成立 "
+       "② 予算切れで LLM へ到達しなかった決定 ③ 朝の計画のブロックが決めた行動と"
+       "純粋な習慣の分離(rule の中の間接 LLM 由来)が出る。"
+       "★L1 の kind も payload も増やさず L2 へ列も足さない(aggregate.py は"
+       " metrics_spec の凍結対象)= 出口は summary.json の decision_mode ブロック 1 つ。"
+       "OFF では state が生えず summary にキーも出ない"),
     _f("cognition.channels.sat_columns", "strict", False, "none",
        "channels.parquet の末尾に価値 4 軸の充足 sat を 4 列足す(G6)。values.py の "
        "agent.sat(「いま何が満たされていないか」= 復元実験の直接の正解ラベル)は writer が"

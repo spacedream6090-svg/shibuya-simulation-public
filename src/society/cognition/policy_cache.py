@@ -30,6 +30,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass, fields
 
+from ..observer import decision_mode as _dec_mode
 from ..observer.schema import Event
 from ..world import calendar as _calendar
 
@@ -265,6 +266,10 @@ def _gate_and_log(sim, cache: PolicyCache, cfg: dict, agent, step: int,
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                          kind="policy_reuse", x=agent.x, y=agent.y,
                          payload={"kind": kind, "relax": stage, "saved": 1}))
+    # V3 決定モード(observer.decision_mode。既定 OFF は即 return)。`policy_reuse` は
+    # L1 に既に出ているが、決定モードの内訳を summary 1 枚で閉じるためここでも数える
+    # (L1 を読み直さずに「LLM / rule / reuse」のシェアが出せる)。
+    _dec_mode.note_reuse(sim, sim_min, kind)
     return _copy(output)
 
 

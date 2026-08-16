@@ -223,6 +223,13 @@ def save(sim, step: int, path: str | Path) -> Path:
             # (第86 day_plan / 第94 IF-B と同じ型)。保存しないと mid-day resume で
             # summary の累積値が straight と食い違う。既定 OFF では state 自体が生えない。
             "starvation_state": getattr(sim, "_starvation_state", None),
+            # V3 決定モード(observer.decision_mode): 日中熟慮レーンの「決定点 / LLM /
+            # 再利用 / ルール(理由 × 出所)」の日別累積タリー(int と素の dict のみ)。
+            # 一時スロット(sim._decision_mode_pending)は 1 決定の中で必ず消費されるので
+            # 保存しない。保存しないと mid-day resume で summary.decision_mode の累積値が
+            # straight と食い違う(第86 day_plan / DPH-O starvation と同じ型)。
+            # 既定 OFF では state 自体が生えない → None=挙動不変。
+            "decision_mode_state": getattr(sim, "_decision_mode_state", None),
             # 第87バッチ engaged モード: エピソード数/ターン/滞在分/脱出理由の累積タリー
             # (int と素の dict のみ)。**エピソードそのもの**(agent._engaged)と不応期
             # (agent._engaged_refr)は agents pickle に自然同梱されるので、ここで中央管理
@@ -685,6 +692,9 @@ def load(sim, path: str | Path) -> int:
         if getattr(sim, "budget", None) is not None \
                 and getattr(sim.budget, "counters", None) is not None:
             sim.budget.counters = sts.setdefault("budget", {})
+    dms = rt.get("decision_mode_state")         # V3 決定モード(旧 ckpt 互換=無ければ素通り)
+    if dms is not None:
+        sim._decision_mode_state = dms
     egs = rt.get("engaged_state")               # 第87 engaged(旧 ckpt 互換=無ければ素通り)
     if egs is not None:
         sim._engaged_state = egs
