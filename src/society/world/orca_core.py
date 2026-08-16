@@ -120,6 +120,19 @@ Game AI Pro 3 ch.19)。同章は **参照実装が論文どおりではなく、
    (壁のある領域・通路・対向流は SFM = P2 決定の割当規則)。壁は「ゾーンの縁を
    越えさせない柵」程度の軽い用途にとどめること。
 
+候補列挙の空間ハッシュ化(物理痩身 第一段A。2026-08-16)
+--------------------------------------------------------
+本家 RVO2 は `maxNeighbors` + `neighborDist` を **kd-tree** で選抜する。本 module は
+cap=12 を持ちながら選抜を全体 argsort(O(N² log N))でやっていたので、
+`sfm_core.knn_neighbors`(拡大リングのセル探索)へ置換した。
+neighbor_dist=10 m を素直にセル化すると候補が πR²ρ で膨らむため、
+**cap=12 が効いている事実**を使って「ring·cell 以内に k 体見つかった行から確定」する。
+同じ空間ハッシュを (a) 事後分離パスの重なり検出 (b) `min_gap` にも使う。
+いずれも **有効近傍の集合・順序・値は全ペア版と完全一致**する(`pair_hash=False` で
+旧経路が残り、tests/test_physics_hash.py がバイト一致を機械固定する)。
+`min_gap` だけはカットオフを持たない量なので、探索半径 R で得た最小すき間 g が
+g ≤ R − 2·r_max を満たすまで R を倍にする(満たせば g が全ペアの最小そのもの)。
+
 決定論
 ------
 乱数は `pref_noise > 0` かつ `rng` が渡されたときだけ引く(それ以外は 1 本も引かない)。
@@ -131,6 +144,8 @@ from __future__ import annotations
 import math
 
 import numpy as np
+
+from . import sfm_core as _sfm     # PointField(点集合の空間ハッシュ)を共用する
 
 RVO_EPSILON = 1e-5          # RVO2 の RVO_EPSILON と同値(平行判定のしきい値)
 
@@ -147,6 +162,7 @@ SEPARATION_ITERS_DEFAULT = 64  # 事後分離パスの最大反復回数(P2 決�
 #   逐次補正でも収束に 32〜64 反復要る(8 反復では −1.8 cm 残る)。重なりが無ければ
 #   ループは 1 回目の検出で即 break するので、上限を上げても既定経路のコストは増えない。
 SEPARATION_SLACK_M = 1e-6    # 分離後に残す極小の余白 [m](float 誤差で gap<0 に戻らないため)
+MIN_GAP_SEED_M = 0.5         # min_gap のセル探索の初期余裕 [m](密な群衆なら 1 巡で確定)
 PREF_NOISE_DEFAULT = 0.05    # 対称性の破れ [m/s]。RVO2 examples/Blocks.cc の実務に倣う
 
 
@@ -347,10 +363,8 @@ def wall_lines(pos, radius, wall_p1, wall_p2, tau_obst, wall_range):
 # ─────────────────────────────────────────────────────────────────────────────
 # 事後分離パス(P2 決定 条件3(b))— 決定論を壊さない重なり解消
 # ─────────────────────────────────────────────────────────────────────────────
-def min_gap(pos, radius) -> float:
-    """体表間の最小すき間 [m]。負なら重なっている(= min(d_ij − r_i − r_j))。
-
-    2 体未満なら +inf(重なりの概念が無い)。"""
+def min_gap_dense(pos, radius) -> float:
+    """全ペア triu の最小すき間(**参照実装**。min_gap とビット一致)。"""
     n = pos.shape[0]
     if n < 2:
         return float("inf")
@@ -359,8 +373,69 @@ def min_gap(pos, radius) -> float:
     return float((d - (radius[iu] + radius[ju])).min())
 
 
+def min_gap(pos, radius, pair_hash=True) -> float:
+    """体表間の最小すき間 [m]。負なら重なっている(= min(d_ij − r_i − r_j))。
+
+    2 体未満なら +inf(重なりの概念が無い)。
+
+    ★空間ハッシュ経路でも **値は全ペア版とビット一致**(min は順序非依存・厳密):
+      半径 R のセル探索で得た最小すき間 g が g ≤ R − 2·r_max を満たすなら、
+      列挙されなかったペアは d > R すなわち gap > R − 2·r_max ≥ g なので、
+      g は全ペアの最小そのもの。満たさないときは R を倍にして繰り返す
+      (= 群衆が疎で「最も近いペアすら遠い」ときだけ探索半径が伸びる)。
+    """
+    n = pos.shape[0]
+    if n < 2:
+        return float("inf")
+    if not pair_hash or n <= _sfm._ALL_PAIRS_MAX_N:
+        return min_gap_dense(pos, radius)
+    pos = np.asarray(pos, dtype=np.float64)
+    radius = np.asarray(radius, dtype=np.float64)
+    rr_max = 2.0 * float(radius.max())
+    span = float(max(pos[:, 0].max() - pos[:, 0].min(),
+                     pos[:, 1].max() - pos[:, 1].min()))
+    reach = rr_max + MIN_GAP_SEED_M
+    while True:
+        ii, jj = _sfm.neighbor_pairs(pos, reach)
+        up = ii < jj                            # triu と同じペア集合(min は対称)
+        ii, jj = ii[up], jj[up]
+        if ii.shape[0]:
+            d = np.linalg.norm(pos[ii] - pos[jj], axis=1)
+            g = float((d - (radius[ii] + radius[jj])).min())
+            if g <= reach - rr_max:
+                return g                        # 未列挙のペアは必ずこれより大きい
+        if reach >= span + rr_max:              # もう全ペアを覆っている
+            return min_gap_dense(pos, radius)
+        reach *= 2.0
+
+
+def _overlap_pairs(out, radius, slack, pair_hash):
+    """重なりペア (i<j) を **辞書順昇順**で返す + 各ペアの必要間隔 rr。
+
+    全ペア triu 経路と **同じ集合・同じ順序**(候補は上位集合 → dist < rr で厳密に絞る)。
+    rr の計算順序も (r_i + r_j) + slack で同一なのでビット一致。
+    """
+    n = out.shape[0]
+    if pair_hash and n > _sfm._ALL_PAIRS_MAX_N:
+        reach = 2.0 * float(radius.max()) + float(slack)
+        # reach が体径ぶん(~0.7 m)しかない = 候補は元々少ないので、格子は粗く(cell=reach・
+        # リング 1 周 = 9 セル)して**問い合わせ回数**を減らす方が速い。分離パスは 1 サブ
+        # ステップで最大 64 回呼ばれるため、ここの定数が効く(結果は cell に依存しない)。
+        ii, jj = _sfm.neighbor_pairs(out, reach, cell=reach)
+        up = ii < jj
+        ii, jj = ii[up], jj[up]
+    else:
+        ii, jj = np.triu_indices(n, k=1)
+    if ii.shape[0] == 0:
+        return ii, jj, np.zeros(0), np.zeros(0)
+    rr = radius[ii] + radius[jj] + float(slack)
+    dist = np.linalg.norm(out[ii] - out[jj], axis=1)
+    hit = dist < rr
+    return ii[hit], jj[hit], rr[hit], dist[hit]
+
+
 def separate_positions(pos, radius, max_iters=SEPARATION_ITERS_DEFAULT,
-                       slack=SEPARATION_SLACK_M, vel=None):
+                       slack=SEPARATION_SLACK_M, vel=None, pair_hash=True):
     """重なりを **決定論的に** 解消する位置ベースの事後パス(in-place ではない)。
 
     重なりペア (i<j) を辞書順昇順に列挙し、めり込み量 (r_i+r_j+slack − d) の半分ずつを
@@ -379,31 +454,32 @@ def separate_positions(pos, radius, max_iters=SEPARATION_ITERS_DEFAULT,
     out = np.array(pos, dtype=np.float64, copy=True)
     if n < 2 or max_iters <= 0:
         return out, 0, 0.0
-    iu, ju = np.triu_indices(n, k=1)
-    rr = radius[iu] + radius[ju] + float(slack)
-    # 退化ペア用の決定論的な押し出し方向(i の速度の法線 → 無ければ +x)
-    if vel is not None:
-        vv = np.asarray(vel, dtype=np.float64).reshape(-1, 2)
-        perp = np.stack([-vv[iu, 1], vv[iu, 0]], axis=1)
-        plen = np.linalg.norm(perp, axis=1)
-        fallback = np.where(plen[:, None] > 1e-12, perp / np.maximum(plen, 1e-12)[:, None],
-                            np.array([1.0, 0.0]))
-    else:
-        fallback = np.tile(np.array([1.0, 0.0]), (iu.shape[0], 1))
+    radius = np.asarray(radius, dtype=np.float64)
+    vv = (np.asarray(vel, dtype=np.float64).reshape(-1, 2)
+          if vel is not None else None)
     start = out.copy()
     used = 0
     for _ in range(int(max_iters)):
-        diff = out[iu] - out[ju]                        # j → i
-        dist = np.linalg.norm(diff, axis=1)
-        idx = np.nonzero(dist < rr)[0]                  # 重なりペア(辞書順昇順)
-        if idx.size == 0:
+        # ★検出だけ空間ハッシュ化(候補は上位集合 → dist < rr で厳密に絞る)。
+        #   重なりペアは体径 + slack 以内にしか居ないので、探索半径は 2·r_max + slack。
+        iu, ju, rr, _d = _overlap_pairs(out, radius, slack, pair_hash)
+        if iu.size == 0:
             break
         used += 1
+        # 退化ペア用の決定論的な押し出し方向(i の速度の法線 → 無ければ +x)
+        if vv is not None:
+            perp = np.stack([-vv[iu, 1], vv[iu, 0]], axis=1)
+            plen = np.linalg.norm(perp, axis=1)
+            fallback = np.where(plen[:, None] > 1e-12,
+                                perp / np.maximum(plen, 1e-12)[:, None],
+                                np.array([1.0, 0.0]))
+        else:
+            fallback = np.tile(np.array([1.0, 0.0]), (iu.shape[0], 1))
         # ★ 検出はベクトル化・**解消は逐次(Gauss-Seidel)**。全ペア同時補正(Jacobi)は
         #   連鎖する重なりで収束が遅く、実測で「16 体の密集で 8 反復では −1.2 cm 残る」
         #   (32 反復でようやく −2.5 µm)。逐次なら数反復で消える。ペア順は (i,j) 昇順に
         #   固定してあるので、逐次でも **同一入力 → 同一 float64 配列**(決定論は不変)。
-        for p in idx:
+        for p in range(iu.shape[0]):
             i, j = int(iu[p]), int(ju[p])
             dx = out[i, 0] - out[j, 0]
             dy = out[i, 1] - out[j, 1]
@@ -450,7 +526,8 @@ class OrcaCrowd:
                  wall_range=WALL_RANGE_DEFAULT, v_max_factor=V_MAX_FACTOR,
                  arrive_radius=0.5, pref_noise=0.0, rng=None,
                  radius_margin=RADIUS_MARGIN_DEFAULT,
-                 separation_iters=SEPARATION_ITERS_DEFAULT):
+                 separation_iters=SEPARATION_ITERS_DEFAULT,
+                 pair_hash=True):
         self.pos = np.asarray(pos, dtype=np.float64).reshape(-1, 2).copy()
         self.vel = np.asarray(vel, dtype=np.float64).reshape(-1, 2).copy()
         self.goal = np.asarray(goal, dtype=np.float64).reshape(-1, 2).copy()
@@ -466,6 +543,9 @@ class OrcaCrowd:
         self.wall_range = float(wall_range)
         self.arrive_radius = float(arrive_radius)
         self.separation_iters = int(separation_iters)
+        # 近傍選抜・重なり検出・min_gap の候補列挙を空間ハッシュで行うか。
+        # False = 全ペア(検証用の参照経路)。**結果は両者でビット一致**。
+        self.pair_hash = bool(pair_hash)
         segs = list(walls or [])
         if segs:
             self._wp1 = np.array([[s[0][0], s[0][1]] for s in segs], dtype=np.float64)
@@ -512,12 +592,20 @@ class OrcaCrowd:
         m = all_pos.shape[0]
 
         # 近傍(距離昇順・index 昇順タイブレーク = 決定論)
-        diff = self.pos[:, None, :] - all_pos[None, :, :]
-        dist = np.linalg.norm(diff, axis=2)
-        dist[np.arange(n), np.arange(n)] = np.inf
         k = min(self.neighbor_cap, max(m - 1, 1))
-        order = np.argsort(dist, axis=1, kind="stable")[:, :k]
-        nb_valid = np.take_along_axis(dist, order, axis=1) < self.neighbor_dist
+        if self.pair_hash and m > _sfm._ALL_PAIRS_MAX_N:
+            # ★セル法の拡大リング探索。全体 argsort(O(N² log N))を廃す。
+            #   有効近傍の集合も順序も全ペア版と完全一致する(sfm_core.knn_neighbors)。
+            #   無効枠の index は 0 で埋める(build_agent_lines の該当要素は
+            #   nb_valid=False で必ず捨てられるので、何を入れても結果に影響しない)。
+            order, nb_valid = _sfm.knn_neighbors(self.pos, all_pos, k,
+                                                 self.neighbor_dist)
+        else:
+            diff = self.pos[:, None, :] - all_pos[None, :, :]
+            dist = np.linalg.norm(diff, axis=2)
+            dist[np.arange(n), np.arange(n)] = np.inf
+            order = np.argsort(dist, axis=1, kind="stable")[:, :k]
+            nb_valid = np.take_along_axis(dist, order, axis=1) < self.neighbor_dist
 
         a_lines, a_valid = build_agent_lines(self.pos, self.vel, self.r_plan,
                                              all_pos, all_vel, all_rad,
@@ -548,7 +636,8 @@ class OrcaCrowd:
         # ---- 事後分離パス(P2 決定 条件3(b)。iters=0 なら何もしない=reference と同一)----
         if self.separation_iters > 0:
             self.pos, self.last_sep_iters, self.last_sep_moved_m = separate_positions(
-                self.pos, self.radius, max_iters=self.separation_iters, vel=self.vel)
+                self.pos, self.radius, max_iters=self.separation_iters, vel=self.vel,
+                pair_hash=self.pair_hash)
         else:
             self.last_sep_iters = 0
             self.last_sep_moved_m = 0.0
@@ -560,4 +649,4 @@ class OrcaCrowd:
 
     def min_gap(self) -> float:
         """体表間の最小すき間 [m](負 = 重なり)。分離パス後は >= 0 が期待値。"""
-        return min_gap(self.pos, self.radius)
+        return min_gap(self.pos, self.radius, pair_hash=self.pair_hash)

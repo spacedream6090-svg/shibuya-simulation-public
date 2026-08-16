@@ -913,11 +913,13 @@ METRO_EXEC_SCALE = 7.23 / 14.22       # ≈ 0.508
 METRO_SELF_SCALE = 7.96 / 11.54       # ≈ 0.690
 
 
-def employment_of(rng_u: float, age: int, metro: bool = False) -> str:
-    """就業者の従業上の地位。年齢別の非正規率(U 字)と役員数(単調増加)で条件づける。
+def employment_probs(age: int, metro: bool = False) -> tuple[float, float, float, float]:
+    """年齢 → (役員, 自営業主, 家族従業者, 非正規)の**確率そのもの**。
 
-    ``rng_u`` は [0,1) の一様乱数 1 本。返り値は EMPLOYMENT_STATUS のラベル。
-    ``metro=True`` は来街者向け(東京都平均へ縮める。上の補正の理由を参照)。
+    ``employment_of`` は 1 draw でラベルを返す実装だが、継承アンカー(下の
+    ``gig_anchor``)の正規化定数は「その年齢帯で非正規/自営系になる確率」を
+    閉じた式で要る。両者が式を二重に持つと静かにずれるので、``employment_of``
+    は本関数の返り値だけを読む(= 式は 1 か所)。
     """
     lo = int(band_lo(np.array([int(age)]))[0])
     # 役員: その帯の役員実数 / 労働力人口(住基人口 × 労働力率)
@@ -931,15 +933,27 @@ def employment_of(rng_u: float, age: int, metro: bool = False) -> str:
         p_exec *= METRO_EXEC_SCALE
         p_self *= METRO_SELF_SCALE
         p_fam *= METRO_SELF_SCALE
+    # 残りが雇用者。その内訳を年齢別非正規率で割る。
+    rest = max(0.0, 1.0 - (p_exec + p_self + p_fam))
+    return p_exec, p_self, p_fam, rest * NONREGULAR_RATE.get(lo, 0.25)
+
+
+def employment_of(rng_u: float, age: int, metro: bool = False) -> str:
+    """就業者の従業上の地位。年齢別の非正規率(U 字)と役員数(単調増加)で条件づける。
+
+    ``rng_u`` は [0,1) の一様乱数 1 本。返り値は EMPLOYMENT_STATUS のラベル。
+    ``metro=True`` は来街者向け(東京都平均へ縮める。上の補正の理由を参照)。
+    """
+    p_exec, p_self, p_fam, _p_non = employment_probs(age, metro)
     if rng_u < p_exec:
         return "役員"
     if rng_u < p_exec + p_self:
         return "自営業主"
     if rng_u < p_exec + p_self + p_fam:
         return "家族従業者"
-    # 残りが雇用者。その内訳を年齢別非正規率で割る。
     rest = 1.0 - (p_exec + p_self + p_fam)
     r = (rng_u - (p_exec + p_self + p_fam)) / max(1e-9, rest)
+    lo = int(band_lo(np.array([int(age)]))[0])
     return "非正規" if r < NONREGULAR_RATE.get(lo, 0.25) else "正規"
 
 
@@ -947,6 +961,121 @@ def employment_of(rng_u: float, age: int, metro: bool = False) -> str:
 EMPLOYMENT_RANK: dict[str, str] = {
     "役員": "役員", "自営業主": "自営業主", "家族従業者": "家族従業者",
 }
+
+
+# --------------------------------------------------------------------------- #
+# 12-b. v1 継承アンカー(配達員 / バンドマン / 写真家)
+#       ユーザー決定 2026-08-16「再生成に 3 職業追加」
+# --------------------------------------------------------------------------- #
+# ★なぜ v2 で消えたか(機構):
+#   v1 の L1 住民は職業を ``data/shibuya_population.json`` の ``occupations`` 12 語
+#   (会社員 .30 / … / 配達員 .04 / バンドマン .03 / 写真家 .03 / 無職 .07)から IPF で
+#   引いていた。v2 はその 12 語表を丸ごと捨て、**組織台帳のロール × 産業×職業クロス**
+#   (`RESIDENT_INDUSTRY_SHARE` → `_LEDGER_ROLES` → `occupation_for`)で職業名を解決する。
+#   台帳にロールを持たない 3 語は、それだけで生成経路から落ちた(v1 1,124/917/871 → v2 0/0/0)。
+#   「写真家」はさらに二重に落ちている: v1 の職業名対応表が ("LS","写真スタジオ") の
+#   スタイリスト → **カメラマン** と明示的に振り替えている(economy.WAGE_CAT が
+#   「写真家 = 自営」と宣言しているので、スタジオの被用者に出来高収入を付けないため)。
+#   結果 v2 は カメラマン 198 人を持つが 写真家 0 人になった。
+#
+# ★実害: ``delivery.courier_occupation``(conf/config.yaml)が「配達員」を名指ししており、
+#   finals は ``delivery.enabled: true``。配達員 0 人だと ``delivery._select_courier`` が
+#   誰も選べず、全注文が agent_id=-1 の抽象トリップへ graceful degradation する
+#   (= 宅配は届くが gig 収入も物理配車も 1 件も出ない)。
+#
+# ★人数の根拠 = **一次統計ではない「v1 からの継承アンカー」**:
+#   出所は v1 プールの実測(data/persona_pool/meta.json・fraction 1.0・L1 30,000)。
+#   さらに遡ると ``shibuya_population.json`` の share で、当のファイルが meta.status に
+#   「occupations=暫定」と自己申告している**設計値**である。
+#   v2 の一次統計から導けない理由: 国勢調査 第10-3表は**職業大分類**までしか無く、
+#   「配達員 / 音楽家 / 写真家」はいずれも職業小分類。市区町村レベルの小分類クロスは
+#   公表が存在しない(§7-b と同じ穴)。台帳整合だけで置くと
+#   「自営業主 × 運搬清掃/輸送」= L1 30,000 に対し 49 人にしかならず、宅配の担い手として
+#   機能しない水準になる。⇒ 規律②(語彙は v1 の上位集合。削除しない)を満たす方を採り、
+#   v1 の水準をそのまま継承する。★この 3 行の share だけが v2 で唯一「一次統計に紐づかない
+#   人数」なので、動かすときはここ 1 か所を書き換えれば全層に伝播する。
+#
+# ★v2 の既存規則との整合(何を動かし、何を動かさないか):
+#   従業上の地位  動かさない。アンカーは ``employment_of`` が引いたラベルの上に**乗るだけ**で、
+#                 対象は 自営業主 / 家族従業者 / 非正規 に限る(economy.WAGE_CAT は 3 語とも
+#                 「自営」= 出来高、economy.PART_TIME_OCC はバンドマンにバイトを持たせる)。
+#                 ⇒ 国勢調査 第3-1表の周辺分布は 1 人も動かない。
+#   年齢          動かさない。労働力率(第1-2表)が立つ年齢だけに当たる。窓は職の実態で切る。
+#   産業・職業大分類  **動く**(ここだけが較正コスト)。3 語は日本標準産業分類で
+#                 H 運輸業,郵便業 / N 生活関連サービス業,娯楽業(793 写真業・80 娯楽業)に
+#                 属するので TR / LS / AM へ移す。就業者内の実測(N=120,000 の同一乱数で
+#                 アンカー ON/OFF を突き合わせた値)は
+#                   TR  2.45% → 7.69%(センサス 2.41%)
+#                   LS  3.51% → 7.40%(センサス 3.46%)
+#                   AM  1.59% → 5.96%(センサス 1.49%)
+#                 で、残りの業種はどれも相対 15% ほど薄まる(IT 15.98% → 13.59%)。
+#                 industry_key は record 専用欄(src 側は組織台帳の industry_key しか読まない)
+#                 なのでランタイムの挙動は変わらないが、観測統計としては過大になる。
+#                 ★水準を下げたいときに触るのは下の share 3 行だけ(他は追随する)。
+#   presence      L1 = resident(v1 と同じ層)。★L2 = workday_shift には置かない: L2 は
+#                 組織台帳の従業者枠から作る層で、台帳に無いギグ職を足すと規律③
+#                 「台帳に無い業種の職業は発明しない」を破る。resident は平日/週末を問わず
+#                 在場資格を持つので、宅配の担い手としてはむしろ workday_shift より強い。
+#   来街者(L3/L4) 触らない。v1 でも ``_L4_OCCS`` 9 語に 3 語は無く、L1 だけの語だった。
+
+#: アンカーが乗ってよい従業上の地位(= 3 語がギグ/ひとり自営であることの表現)。
+GIG_ANCHOR_EMPLOYMENT: tuple[str, ...] = ("自営業主", "家族従業者", "非正規")
+
+#: (職業名, 産業キー, 職業大分類, 年齢下限, 年齢上限, L1 総数に占める目標割合)。
+#: 割合の分子は v1 プール実測の人数、分母は v1 の L1 総数 30,000。
+V1_ANCHOR_GIG: tuple[tuple[str, str, str, int, int, float], ...] = (
+    # 配達員: フード/宅配のギグ。二輪・自転車の稼働年齢に合わせて 18-69。
+    ("配達員", "TR", "運搬清掃", 18, 69, 1124 / 30000),
+    # バンドマン: 音楽家(娯楽業)。実演で食う層は若年に寄るので 18-59。
+    ("バンドマン", "AM", "専門技術", 18, 59, 917 / 30000),
+    # 写真家: 写真業(N-793)のひとり自営。機材と顧客が要るぶん立ち上がりが遅い 22-74。
+    ("写真家", "LS", "専門技術", 22, 74, 871 / 30000),
+)
+
+
+def _anchor_base_share(lo_age: int, hi_age: int) -> float:
+    """住基 × 労働力率 × 従業上の地位 から「就業 ∧ 年齢窓内 ∧ 自営系/非正規」の人口比。
+
+    アンカーの条件付き確率 p = 目標割合 / 本関数 とすることで、
+    P(当たる) = P(就業 ∧ 窓 ∧ 地位) × p = 目標割合 が**構成上厳密**に成り立つ
+    (= fraction を変えても L1 に占める割合が動かない)。帯内の年齢は一様
+    (`resident_age_gender` がそう引く)なので、窓と帯の重なりは長さ比で按分する。
+    """
+    tot = float(sum(b[2] + b[3] for b in AGE_BANDS))
+    acc = 0.0
+    for lo, hi, m_n, f_n in AGE_BANDS:
+        overlap = min(hi, hi_age) - max(lo, lo_age) + 1
+        if overlap <= 0:
+            continue
+        n = (m_n + f_n) * (overlap / (hi - lo + 1))
+        _p_exec, p_self, p_fam, p_non = employment_probs(lo)
+        acc += n * LABOUR_FORCE_RATE.get(lo, 0.0) * (p_self + p_fam + p_non)
+    return acc / tot
+
+
+#: V1_ANCHOR_GIG に条件付き確率 p を足した表(モジュール読込時に 1 度だけ計算)。
+GIG_ANCHOR_P: tuple[tuple[str, str, str, int, int, float, float], ...] = tuple(
+    (occ, ikey, major, lo, hi, share, share / max(1e-9, _anchor_base_share(lo, hi)))
+    for occ, ikey, major, lo, hi, share in V1_ANCHOR_GIG)
+
+
+def gig_anchor(rng_u: float, age: int, employment: str):
+    """v1 継承アンカー 3 職業の判定(1 draw・純関数・決定論)。
+
+    当たれば ``(職業名, 産業キー, 職業大分類)``、当たらなければ ``None``。
+    3 職の帯域は [0,1) 上で**互いに素**に積む(``off``)ので二重当選が起きない。
+    年齢窓を外れた個体は「その職に当たらない」だけで帯域の位置はずらさない
+    (= 年齢と職業の対応が seed に依存しない)。
+    """
+    if employment not in GIG_ANCHOR_EMPLOYMENT:
+        return None
+    a = int(age)
+    off = 0.0
+    for occ, ikey, major, lo, hi, _share, p in GIG_ANCHOR_P:
+        if lo <= a <= hi and off <= rng_u < off + p:
+            return occ, ikey, major
+        off += p
+    return None
 
 
 # =========================================================================== #

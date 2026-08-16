@@ -1055,12 +1055,16 @@ def _v2_common(rec: dict, age: int, industry_key: str, occ_major: str,
 
 
 def _v2_worker_attrs(u_state: float, u_emp: float, u_ind: float, u_role: float,
-                     u_rank: float, age: int, industries, ind_w):
+                     u_rank: float, age: int, industries, ind_w,
+                     u_gig: float = 1.0):
     """年齢 → 就業状態 → (業種, ロール, 職業大分類, 役職, 従業上の地位)。
 
     3 段階すべてに一次データがある(§3-3):
       ① 年齢別労働力率(渋谷区)で就業/非就業 → ② 非労働力の内訳で学生/家事/引退
       → ③ 産業構成 × 産業×職業クロス × 年齢別非正規率・役員率
+
+    ``u_gig`` は v1 継承アンカー(配達員/バンドマン/写真家)専用の 1 draw。
+    既定 1.0 = **絶対に当たらない**(= アンカー無しの挙動)ので、旧い呼び出しは無害。
     """
     state = PV2.labour_state(u_state, age)
     if state != "就業":
@@ -1082,6 +1086,13 @@ def _v2_worker_attrs(u_state: float, u_emp: float, u_ind: float, u_role: float,
             "サービス", "一般", "非正規"
     # --- 従業上の地位 → 役職 ---
     emp = PV2.employment_of(u_emp, age)
+    # ★v1 継承アンカー(persona_v2.V1_ANCHOR_GIG)。**従業上の地位を引いた後**に置くのが肝で、
+    #   自営業主/家族従業者/非正規 の上に職業名を載せるだけ = 第3-1表の周辺分布を動かさない。
+    #   ここを通ると台帳ロールの解決(下の roles ループ)を飛ばす = ギグは org に属さない。
+    hit = PV2.gig_anchor(u_gig, age, emp)
+    if hit is not None:
+        occ_g, ikey_g, major_g = hit
+        return state, ikey_g, "", occ_g, major_g, PV2.EMPLOYMENT_RANK.get(emp, "一般"), emp
     if emp == "役員" and u_rank < PV2.EXEC_AS_MANAGER and age >= PV2.MANAGER_AGE_MIN:
         # 管理的職業従事者 5.79% のうち 79.7% が役員 ⇒ 役員の 32.4% だけが「管理」
         return state, ikey, "", "経営者", "管理", "役員", emp
@@ -1143,6 +1154,9 @@ def gen_L1_v2(writer: ShardWriter, n: int, seed: int, families: list[str]) -> No
         ton = np.array(_TONES, object)[rng.integers(0, len(_TONES), m)]
         u_state = rng.random(m); u_emp = rng.random(m); u_ind = rng.random(m)
         u_role = rng.random(m); u_rank = rng.random(m)
+        # ★v1 継承アンカー専用の draw(業種・役職と**共用しない**: 共用すると
+        #   「配達員だけ役職の抽選に偏りが乗る」ような相関が静かに付く)。
+        u_gig = rng.random(m)
         scope_i = rng.choice(len(scopes), size=m, p=sw / sw.sum())
         mode_i = rng.choice(len(modes), size=m, p=mw / mw.sum())
         hh = PV2.build_households(age, gender, rng)
@@ -1158,7 +1172,8 @@ def gen_L1_v2(writer: ShardWriter, n: int, seed: int, families: list[str]) -> No
             a = int(age[i])
             (_st, ikey, role, occ, major, rank, emp) = _v2_worker_attrs(
                 float(u_state[i]), float(u_emp[i]), float(u_ind[i]),
-                float(u_role[i]), float(u_rank[i]), a, industries, iw)
+                float(u_role[i]), float(u_rank[i]), a, industries, iw,
+                float(u_gig[i]))
             scope = str(scopes[scope_i[i]]) if emp != "非就業" else "none"
             mode = str(modes[mode_i[i]]) if scope == "out_area" else (
                 "walk" if scope == "in_area" else "none")
@@ -1816,6 +1831,16 @@ def build_pool(out_dir: Path, seed: int, fraction: float,
             "foreign_share_visitor": PV2.FOREIGN_SHARE_VISITOR,
             "visit_rate_mix": [list(x) for x in PV2.VISIT_RATE_MIX],
             "family_names": len(families),
+            # ---- v1 継承アンカー(配達員/バンドマン/写真家。ユーザー決定 2026-08-16)----
+            # ★v2 で唯一「一次統計に紐づかない人数」。ここに全部書き出しておくと、
+            #   本番直前の再生成物と meta 同士を突合するだけで水準の変化が分かる。
+            "v1_anchor_gig": [
+                {"occupation": occ, "industry_key": ikey, "occupation_major": major,
+                 "age_min": lo, "age_max": hi, "share_of_L1": round(share, 6),
+                 "conditional_p": round(p, 6),
+                 "v1_count_at_L1_30000": int(round(share * 30000))}
+                for occ, ikey, major, lo, hi, share, p in PV2.GIG_ANCHOR_P],
+            "v1_anchor_gig_employment": list(PV2.GIG_ANCHOR_EMPLOYMENT),
             "schema_extensions_v2": [
                 "industry_key", "industry_major", "occupation_major", "rank",
                 "employment", "birth_year", "school_stage", "workplace_scope",
@@ -1838,7 +1863,12 @@ def build_pool(out_dir: Path, seed: int, fraction: float,
                 "(c) 来訪目的の年齢弾性(PT 調査の該当表は図中画像で未取得) "
                 "(d) 名前のコホート割当(明治安田生命ランキングの世代傾向による分類で"
                 "年次表そのものではない) (e) 大学・専門学校の職員比(未取得・高校値を借用) "
-                "(f) 保育所の年齢別定員内訳 (g) 80歳以上の役員実数(外挿)。"
+                "(f) 保育所の年齢別定員内訳 (g) 80歳以上の役員実数(外挿) "
+                "(h) v1 継承アンカー 3 職(配達員/バンドマン/写真家)の人数="
+                "v1 プール実測(1,124/917/871 @L1 30,000)をそのまま継承した設計値。"
+                "国勢調査 第10-3表は職業大分類までしか無く小分類の区別クロスが公表に無いため"
+                "一次統計からは導けない。従業上の地位と年齢の周辺分布は動かさないが、"
+                "産業構成は TR/AM/LS が実数より過大になる(v1_anchor_gig 参照)。"
                 "★俗説(スクランブル交差点 26万/39万/50万)は出典が無いので使っていない。"),
         } if v2 else None),
         "elapsed_sec": round(time.time() - t0, 2),

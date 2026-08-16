@@ -134,21 +134,32 @@ pool:
   #
   # ---- 語彙の互換(壊れないことの根拠)---------------------------------------
   #   visit_purpose は 7 語のまま(presence の曜日プロファイル表・雨弾性表と完全一致)。
-  #   occupation は v1 186 語 → v2 188 語。新語は 5 語(未就学児 / 保育士 / 調理員 /
-  #   幼稚園教諭 / 年金生活者)。5 語とも economy.WAGE_CAT・MONEY_INIT・OCC_GROUP_RULES・
-  #   persona._WORK_CAT へ登録済み(tests/test_persona_pool_v2.py が全数で固定)。
-  #   ★**上位集合ではない**(2026-08-16 に meta.json 同士を全数突合して判明): v1 にあって
-  #     v2 に**無い**語が 3 つある — バンドマン(v1 917人)/ 写真家(871)/ **配達員(1,124)**。
-  #     このうち **配達員は `delivery.courier_occupation`(config.yaml)が名指ししている語**で、
-  #     `delivery.enabled: true`(下の delivery ブロック)の本セットでは効く:
-  #       v2 に切り替えると `_select_courier` が誰も選べず、全注文が
-  #       **agent_id=-1 の抽象トリップ**へ graceful degradation する
-  #       (= 配達は届くが**配達員の gig 収入と物理配車が 1 件も出ない**。src/society/delivery.py
-  #        の「正直な穴」経路)。バンドマン / 写真家 は conf からも src からも名指しされていない
-  #       ので実害なし(persona.py の生成フォールバック語彙にあるだけ)。
-  #     ⇒ 切替時の判断: (a) このまま(配達は抽象トリップで出る)/ (b) v2 生成側へ配達員職を
-  #        足す / (c) courier_occupation を v2 に在る語(例: 宅配ドライバー 830人)へ寄せる。
-  #        **(c) は 1 行だが「誰が配達しているか」の意味が変わる**ので黙って倒さないこと。
+  #   occupation は v1 186 語 → v2 188 語(2026-08-15 生成物の実測)。新語は 5 語
+  #   (未就学児 / 保育士 / 調理員 / 幼稚園教諭 / 年金生活者)。5 語とも economy.WAGE_CAT・
+  #   MONEY_INIT・OCC_GROUP_RULES・persona._WORK_CAT へ登録済み
+  #   (tests/test_persona_pool_v2.py が全数で固定)。
+  #   ★2026-08-16 の 3 職業追加(下記)で **191 語見込み**。確定値は再生成後の meta で見る。
+  #   ★2026-08-16 に meta.json 同士を全数突合して「v1 にあって v2 に無い語が 3 つある」
+  #     — バンドマン(v1 917人)/ 写真家(871)/ **配達員(1,124)** — と判明した。
+  #     うち **配達員は `delivery.courier_occupation`(config.yaml)が名指ししている語**で、
+  #     `delivery.enabled: true`(下の delivery ブロック)の本セットでは効いてしまう:
+  #       0 人だと `_select_courier` が誰も選べず、全注文が **agent_id=-1 の抽象トリップ**へ
+  #       graceful degradation する(= 配達は届くが**配達員の gig 収入と物理配車が 1 件も
+  #       出ない**。src/society/delivery.py の「正直な穴」経路)。
+  #     ⇒ **ユーザー決定(2026-08-16)= 再生成に 3 職業追加(実装済み)**。
+  #        正典 = **本番直前に現 HEAD から再生成**する(その際 meta を照合しこの表を更新)。
+  #        実装: scripts/persona_v2.py の `V1_ANCHOR_GIG` / `gig_anchor()`。L1 住民の
+  #        従業上の地位(自営業主/家族従業者/非正規)の上に職業名を載せるだけなので
+  #        国勢調査 第3-1表の周辺分布は動かない。人数は**一次統計ではなく v1 実測の継承
+  #        アンカー**(1,124 / 917 / 871 @ L1 30,000)で、meta.v2_params.v1_anchor_gig と
+  #        meta.v2_params.honesty(h) に来歴が出る。産業構成は TR/AM/LS が実数より過大に
+  #        なる(industry_key は record 専用欄で src は読まないので挙動は不変)。
+  #        再発防止: tests/test_persona_pool_v2.py の
+  #        `test_conf_named_occupations_exist_in_the_v2_pool`(conf の `*_occupation(s)`
+  #        キーを機械的に全部拾って照合)/ `test_v1_anchor_gig_occupations_are_generated`
+  #        / `test_v1_anchor_gig_is_coherent_and_marginal_free`。
+  #        ★courier_occupation を v2 に在る語(例: 宅配ドライバー 830人)へ寄せる案は
+  #        **採らなかった**: 1 行で済むが「誰が配達しているか」の意味が変わるため。
   #   下の facility_devices / incidents_env が名指しする語(設備保守員・警備員・常駐警備・
   #   警察官)は v2 でも生える(台帳の SV 業種由来なので不変)。
   #

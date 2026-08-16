@@ -91,6 +91,19 @@ RngHub はステートレスなので、新 stream を足しても既存の draw
 P4-3 = `calib_p43_results.json`)。本体の `_CalibratedCrowd` はベンチの
 `ExtendedCrowd` と **バイト一致**する(tests/test_physics_calib.py が固定)。
 
+物理痩身 第一段A(2026-08-16。docs/research/crowd-attention-physics.md「案A」)
+------------------------------------------------------------------------------
+**動力学を 1 ビットも変えない同値変換**だけを入れた(近傍 cap 値の変更・遮蔽・密度場は
+次レーンの仕事で、ここでは一切やらない)。本 module で変えたのは 4 箇所:
+  - `_CalibratedCrowd._far_forces` … 候補列挙をセル法へ(旧全ペア版は `_far_forces_dense`
+    として残す。ベンチ `ExtendedCrowd` とのバイト一致検査がそのまま同値の証拠になる)
+  - `_accumulate` … 全ペア距離行列(O(N²))と個体ごとの Python ループを撤去。
+    集計はカウント・bool・min だけ(順序非依存)で、唯一の浮動小数の累積和 `speed_sum` は
+    加算順序を変えていない
+  - `_admit` … 入口の占有判定 O(W·M)/サブステップ をセル法の一括判定へ(bool の or =順序非依存)
+  - `phase` … `_by_id` の全体 sort を **1 step 1 回**に(ゾーン数×2 回 → 1 回。走査順は不変)
+検収は tests/test_physics_hash.py(旧実装を参照実装として保持し全サブステップを突合)。
+
 R1(既定 OFF = 完全 no-op)
 ---------------------------
 `physics.zones_enabled: false`(既定)または `physics.zones: []`(既定)のとき:
@@ -317,13 +330,19 @@ def phase(sim, step: int, sim_min: int) -> None:
         return
     st = _state(sim)
     st["by_zone"] = {}                      # per-step(累積しない = resume 安全)
+    # ★id 昇順の走査列は **1 step に 1 回**だけ作る(ゾーン数×2 回の全体 sort を廃す)。
+    #   `_run_zone` は sim.agents を増減させないので、全ゾーンで同じ列を使える
+    #   = 走査順は 1 つも変わらない(純粋な同値変換)。
+    ordered = _by_id(sim.agents)
     for zone in sim.physcfg["zones"]:
-        _run_zone(sim, zone, step, sim_min, st)
+        _run_zone(sim, zone, step, sim_min, st, ordered)
 
 
 # --------------------------------------------------------------------------- #
-def _run_zone(sim, zone, step: int, sim_min: int, st: dict) -> None:
+def _run_zone(sim, zone, step: int, sim_min: int, st: dict, ordered=None) -> None:
     graph = sim.city.graph
+    if ordered is None:
+        ordered = _by_id(sim.agents)
     gates = _gate_nodes(sim, zone)
     gate_xy = tuple(sim.city.node_xy(n) for n in gates)
     step_seconds = float(sim.clock.step_seconds)
@@ -334,7 +353,7 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict) -> None:
     waiting: list[dict] = []      # 入場待ち(guarded で弾かれた個体)
 
     # ---- (1) 既に所有している個体を回収 ------------------------------------ #
-    for agent in _by_id(sim.agents):
+    for agent in ordered:
         if getattr(agent, "_phys_zone", None) != zone.id:
             continue
         rec = _record_of(agent)
@@ -348,7 +367,7 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict) -> None:
         (waiting if rec["waiting"] else members).append(rec)
 
     # ---- (2) 新規流入の候補(guarded ゲートの待機列へ)---------------------- #
-    for agent in _by_id(sim.agents):
+    for agent in ordered:
         if getattr(agent, "_phys_zone", None) is not None:
             continue                                  # 他ゾーン所有 or 既に本ゾーン
         if agent.loc != "street" or agent.sleeping or not agent.route:
@@ -482,17 +501,33 @@ def _admit(sim, zone, waiting, members, signal, sim_sec, t_in_step,
         return False
     gap = float(zone.gate["min_gap_m"])
     any_admitted = False
-    for rec in list(waiting):
+    queue = list(waiting)
+    # ★占有判定の候補列挙をセル法化(判定式・比較演算は 1 バイトも変えない)。
+    #   判定は「近傍に 1 体でも居るか」= bool の or なので順序非依存 = 完全同値。
+    #   在場者は入場のたびに増えるが、格子は**呼び出し時点の在場者**だけを載せ、
+    #   この呼び出しで入った個体(`added`)は逐次リストで見る = 集合は常に同じ。
+    blocked = _admit_blocked(queue, members, gap)
+    added: list = []
+    for qi, rec in enumerate(queue):
         px, py = rec["pos"]
-        free = True
-        for other in members:
-            ox, oy = other["pos"]
-            need = rec["radius"] + other["radius"] + gap
-            if (px - ox) ** 2 + (py - oy) ** 2 < need * need:
-                free = False
-                break
+        free = not (blocked is not None and blocked[qi])
+        if free and blocked is None:
+            for other in members:
+                ox, oy = other["pos"]
+                need = rec["radius"] + other["radius"] + gap
+                if (px - ox) ** 2 + (py - oy) ** 2 < need * need:
+                    free = False
+                    break
+        if free and added:
+            for other in added:
+                ox, oy = other["pos"]
+                need = rec["radius"] + other["radius"] + gap
+                if (px - ox) ** 2 + (py - oy) ** 2 < need * need:
+                    free = False
+                    break
         if not free:
             continue                       # 置けなければ移管しない(待たせる)
+        added.append(rec)
         rec["waiting"] = False
         rec["seen_inside"] = zone.contains(px, py)
         waiting.remove(rec)
@@ -516,6 +551,38 @@ def _admit(sim, zone, waiting, members, signal, sim_sec, t_in_step,
                                                       * float(sim.clock.step_seconds), 2),
                                       "waited_steps": int(rec["wait_steps"])}))
     return any_admitted
+
+
+_ADMIT_HASH_MIN = 48      # 在場者がこれ以下なら素の総当たりの方が安い(結果は同一)
+
+
+def _admit_blocked(queue, members, gap):
+    """入場待ち各体について「在場者と重なるか」を一括判定(None = セル法を使わない)。
+
+    `_admit` の内側の総当たり(O(W·M)/サブステップ)を潰すためだけの前計算。
+    判定式 `(px−ox)² + (py−oy)² < need²` も `need = r_i + r_j + gap` の加算順序も
+    素朴経路と同一なので、返す bool は 1 つも変わらない。
+    """
+    if not queue or len(members) <= _ADMIT_HASH_MIN:
+        return None
+    mpos = np.array([m["pos"] for m in members], dtype=np.float64)
+    mrad = np.array([m["radius"] for m in members], dtype=np.float64)
+    wpos = np.array([r["pos"] for r in queue], dtype=np.float64)
+    wrad = np.array([r["radius"] for r in queue], dtype=np.float64)
+    reach = float(wrad.max()) + float(mrad.max()) + gap
+    if not (reach > 0.0):
+        return None
+    field = _sfm.PointField(mpos, reach / 2.0)
+    ring = int(math.ceil(reach / field.cell))
+    qrow, qpt = field.candidates(wpos, ring)
+    out = np.zeros(len(queue), dtype=bool)
+    if qrow.shape[0] == 0:
+        return out
+    dx = wpos[qrow, 0] - mpos[qpt, 0]
+    dy = wpos[qrow, 1] - mpos[qpt, 1]
+    need = wrad[qrow] + mrad[qpt] + gap
+    out[qrow[(dx * dx + dy * dy) < need * need]] = True
+    return out
 
 
 def _admit_record(sim, zone, agent, path, rest, step) -> dict:
@@ -627,6 +694,49 @@ class _CalibratedCrowd(_sfm.Crowd):
         n = self.pos.shape[0]
         if n < 2 or self.far_a2 <= 0.0:
             return np.zeros_like(self.pos)
+        if not self.pair_hash:
+            return self._far_forces_dense()
+        # 空間ハッシュ経路(**_far_forces_dense とビット一致**)。
+        # 候補 reach = 2·r_max + far_cutoff。valid の条件 gap = d − rr ≤ far_cutoff は
+        # d ≤ rr + far_cutoff ≤ reach と同値以下なので、候補は必ず上位集合になる。
+        # ★ cap は掛けない(class docstring の P4-1 実測。ここでも掛けていない)。
+        e, _ = self._desired_dir()
+        reach = 2.0 * float(self.radius.max()) + self.far_cutoff
+        ii, jj = _sfm.neighbor_pairs(self.pos, reach)
+        out = np.zeros((n, 2), dtype=np.float64)
+        for r0, r1, p0, p1 in _sfm.pair_blocks(ii, n):
+            if p1 <= p0:
+                continue
+            si, sj = ii[p0:p1], jj[p0:p1]
+            diff = self.pos[si] - self.pos[sj]                    # j → i
+            d = np.linalg.norm(diff, axis=1)
+            rr = self.radius[si] + self.radius[sj]
+            with np.errstate(invalid="ignore", divide="ignore"):
+                nij = diff / d[:, None]
+            nij = np.nan_to_num(nij)
+            cosphi = -(e[si, 0] * nij[:, 0] + e[si, 1] * nij[:, 1])
+            gap = d - rr                                          # 体表間隔 [m]
+            arg = np.clip(-gap / self.far_b2, a_min=None, a_max=_EXP_ARG_MAX)
+            mag = self.mass * self.far_a2 * np.exp(arg)           # [N]
+            w = self.lam + (1.0 - self.lam) * (1.0 + cosphi) / 2.0
+            valid = self.active[sj] & (gap <= self.far_cutoff)
+            if self.far_taper > 0.0:
+                u = np.clip((self.far_cutoff - gap) / self.far_taper, 0.0, 1.0)
+                mag = mag * (u * u * (3.0 - 2.0 * u))             # C¹ smoothstep
+            contrib = (w * mag)[:, None] * nij
+            contrib[~valid] = 0.0
+            out[r0:r1, 0] = np.bincount(si - r0, weights=contrib[:, 0],
+                                        minlength=r1 - r0)
+            out[r0:r1, 1] = np.bincount(si - r0, weights=contrib[:, 1],
+                                        minlength=r1 - r0)
+        return out
+
+    def _far_forces_dense(self):
+        """全ペア (N,N) の長距離項(**参照実装**。空間ハッシュ版とビット一致)。
+
+        ★ベンチ `reference/physics_bench/engines.ExtendedCrowd._far_contrib` と同一式・
+          同一合算順序。tests/test_physics_calib.py の バイト一致検査がこの同値を機械固定する。
+        """
         e, _ = self._desired_dir()
         diff = self.pos[:, None, :] - self.pos[None, :, :]        # j → i
         d = np.linalg.norm(diff, axis=2)
@@ -769,35 +879,67 @@ def _writeback(members, engine) -> None:
         rec["agent"].y = rec["pos"][1]
 
 
+def _near_gate_mask(zone, pos, gate_xy):
+    """`zone.near_gate` のベクトル版(同一式・同一比較 = 同一 bool)。"""
+    n = pos.shape[0]
+    out = np.zeros(n, dtype=bool)
+    band = float(zone.gate["band_m"])
+    b2 = band * band
+    for gx, gy in gate_xy:
+        dx = pos[:, 0] - gx
+        dy = pos[:, 1] - gy
+        out |= (dx * dx + dy * dy) <= b2
+    return out
+
+
 def _accumulate(zone, members, engine, prev_pos, prev_vel, dt, gate_xy, cont, st,
                 pcfg) -> None:
-    """境界連続性の指標と、個体別の身体観測をこのサブステップぶん積む。"""
+    """境界連続性の指標と、個体別の身体観測をこのサブステップぶん積む。
+
+    ★物理痩身(第一段A・2026-08-16): 全ペア距離行列(O(N²))と個体ごとの Python ループを
+      セル法+ベクトル化に置換した。**値は 1 ビットも変えていない**:
+        - ヒスト・帯・反転・接触・近傍数はすべて**カウントと bool** = 順序非依存。
+        - 局所密度は「半径 density_radius_m 以内の人数」= カットオフ付きの数え上げなので
+          セル法の候補(上位集合)から厳密な距離判定で数え直せば同じ整数になる。
+        - min_gap は min = 順序非依存(orca_core.min_gap が全ペア版との一致を保証)。
+        - speed_sum だけは浮動小数の累積和なので、**加算順序を変えていない**
+          (個体ごと・サブステップ順の逐次加算のまま)。
+    """
     pos = engine.pos
     vel = engine.vel
+    n = len(members)
     dv = np.linalg.norm(vel - prev_vel, axis=1) / dt
     disp = np.linalg.norm(pos - prev_pos, axis=1)
     cont["jump_max_m"] = max(cont["jump_max_m"], float(disp.max()))
     # ---- 帯の判定(ゲート帯 = 緩和帯 / それ以外 = 内部)----
-    for i, rec in enumerate(members):
-        band = "gate" if zone.near_gate(float(pos[i, 0]), float(pos[i, 1]),
-                                        gate_xy) else "interior"
+    at_gate = _near_gate_mask(zone, pos, gate_xy)
+    # int(dv/_ACC_BIN) と同じ 0 方向切り捨て。先に上端で clip してから整数化するので、
+    # 元の min(idx, _ACC_BINS−1) と同値かつ int64 の桁溢れも起きない(dv ≥ 0)。
+    idx = np.clip(dv / _ACC_BIN, 0.0, float(_ACC_BINS - 1)).astype(np.int64)
+    # 進行方向成分の符号反転。基準は **いま走っている経路区間の向き**(固定ベクトル)。
+    #  - 入場時の向きを基準にすると「道なりに曲がった」だけで反転に数えてしまう。
+    #  - 逆に「いまのゴールへの向き」を基準にすると、向きが個体と一緒に回るので
+    #    符号がほぼ常に正になり **反転が原理的に検出できない**(実測で 0.000 になった)。
+    #  区間の向きなら、ベンチの「通路の x 成分の符号反転」と同じ意味になる。
+    seg = np.array([r["seg_dir"] for r in members], dtype=np.float64).reshape(n, 2)
+    s = vel[:, 0] * seg[:, 0] + vel[:, 1] * seg[:, 1]
+    sign = np.where(s > 0.0, 1, np.where(s < 0.0, -1, 0)).astype(np.int64)
+    prev_sign = np.fromiter((r["sign"] for r in members), dtype=np.int64, count=n)
+    flip = (sign != 0) & (prev_sign != 0) & (sign != prev_sign)
+    for band, mask in (("gate", at_gate), ("interior", ~at_gate)):
+        cnt = int(np.count_nonzero(mask))
+        if not cnt:
+            continue
         b = cont[band]
-        idx = int(dv[i] / _ACC_BIN)
-        b["hist"][min(idx, _ACC_BINS - 1)] += 1
-        b["n"] += 1
-        b["samples"] += 1
-        # 進行方向成分の符号反転。基準は **いま走っている経路区間の向き**(固定ベクトル)。
-        #  - 入場時の向きを基準にすると「道なりに曲がった」だけで反転に数えてしまう。
-        #  - 逆に「いまのゴールへの向き」を基準にすると、向きが個体と一緒に回るので
-        #    符号がほぼ常に正になり **反転が原理的に検出できない**(実測で 0.000 になった)。
-        #  区間の向きなら、ベンチの「通路の x 成分の符号反転」と同じ意味になる。
-        ex, ey = rec["seg_dir"]
-        s = vel[i, 0] * ex + vel[i, 1] * ey
-        sign = 1 if s > 0 else (-1 if s < 0 else 0)
-        if sign and rec["sign"] and sign != rec["sign"]:
-            b["flip"] += 1
-        if sign:
-            rec["sign"] = sign
+        counts = np.bincount(idx[mask], minlength=1)
+        hist = b["hist"]
+        for t in np.nonzero(counts)[0]:
+            hist[int(t)] += int(counts[t])
+        b["n"] += cnt
+        b["samples"] += cnt
+        b["flip"] += int(np.count_nonzero(flip & mask))
+    for i in np.nonzero((sign != 0) & (sign != prev_sign))[0]:
+        members[int(i)]["sign"] = int(sign[i])
     # ---- 重なり(P2 決定 条件3 の検収値)----
     radius = np.array([r["radius"] for r in members], dtype=np.float64)
     gap = _orca.min_gap(pos, radius)
@@ -807,21 +949,29 @@ def _accumulate(zone, members, engine, prev_pos, prev_vel, dt, gate_xy, cont, st
                               int(getattr(engine, "last_sep_iters", 0)))
     # ---- 個体別の身体観測(P3(3))----
     speed = np.linalg.norm(vel, axis=1)
-    if len(members) > 1:
-        d = np.linalg.norm(pos[:, None, :] - pos[None, :, :], axis=2)
-        np.fill_diagonal(d, np.inf)
-        rr = radius[:, None] + radius[None, :]
-    else:
-        d = None
     dens_r = float(pcfg["density_radius_m"])
     gap_m = float(pcfg["contact_gap_m"])
+    if n > 1:
+        # 候補 reach = max(密度半径, 2·r_max + 接触余裕)。どちらの判定も reach 以内にしか
+        # 真を返さないので、セル法の候補は上位集合 = 数え上げは厳密に一致する。
+        reach = max(dens_r, 2.0 * float(radius.max()) + gap_m)
+        ii, jj = _sfm.neighbor_pairs(pos, reach)
+        d = np.linalg.norm(pos[ii] - pos[jj], axis=1)
+        dens_cnt = np.bincount(ii[d < dens_r], minlength=n)
+        touch = np.zeros(n, dtype=bool)
+        hit = d < (radius[ii] + radius[jj] + gap_m)
+        if hit.any():
+            touch[ii[hit]] = True
+    else:
+        dens_cnt = None
+        touch = None
     for i, rec in enumerate(members):
         rec["speed_sum"] += float(speed[i])
         rec["speed_n"] += 1
         rec["step_n"] += 1
-        if d is not None:
-            rec["dens_sum"] += int((d[i] < dens_r).sum())
-            if bool((d[i] < rr[i] + gap_m).any()):
+        if dens_cnt is not None:
+            rec["dens_sum"] += int(dens_cnt[i])
+            if touch[i]:
                 rec["contact_n"] += 1
 
 

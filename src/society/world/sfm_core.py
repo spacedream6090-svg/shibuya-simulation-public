@@ -41,6 +41,19 @@
     速度上限クリップ(v_max)で数値的に抑える(接触項の代替ではない)。
 ────────────────────────────────────────────────────────────────────────
 
+────────────────────────────────────────────────────────────────────────
+対人ペアの候補列挙(物理痩身 第一段A。2026-08-16。docs/research/crowd-attention-physics.md):
+  対人斥力には元から距離カットオフ(体表間 2.0 m)があるのに、候補列挙だけが O(N²) だった。
+  壁項の `WallField` と**同型**の空間ハッシュ `PointField` を点集合に張り、
+  「候補 = カットオフ内を必ず含む上位集合 → 正確な距離判定は従来コード」へ置換した。
+    - 候補は (i, j) 辞書順に整列してから合算する(np.bincount)。現行の `contrib.sum(axis=1)`
+      は軸 1 が最内周でないため**逐次加算**なので、両者の和は厳密に一致する。
+    - 近傍 cap の選抜も「候補 → (距離, index) 昇順で k 選抜」へ置換。行内の候補が既に
+      j 昇順なので、距離の安定ソートが現行 argsort(kind="stable") のタイブレークを再現する。
+  → 力・速度・位置は **1 ビットも変わらない**(pair_hash=False で旧全ペア経路が残る。
+    tests/test_physics_hash.py が両経路のバイト一致を密度 3 水準×形状 3 種×seed 3 本で固定)。
+────────────────────────────────────────────────────────────────────────
+
 決定論について:
   乱数は numpy.random.Generator を引数で受け取り、コア内部では seed しない。
   揺らぎ項 ξ(既定 noise=0.0 で無効)を有効化したときだけ Generator を消費する。
@@ -200,6 +213,279 @@ class WallField:
         return (a, s)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 点集合の空間ハッシュ(PointField)— 対人ペアの候補列挙を O(N²) から外す
+# ─────────────────────────────────────────────────────────────────────────────
+# 設計は WallField と**同型**(docs/research/crowd-attention-physics.md 案A):
+#   「セル法で候補 = 上位集合を出す → 正確な距離判定は従来コードのまま」。
+#   全力項には既に距離カットオフがある(対人 rr+2.0 m・far rr+4.725 m・知覚 2.0 m・
+#   ORCA 10 m)ので、カットオフ外の寄与は**元々ちょうど 0.0**。候補が上位集合であれば
+#   落ちるのは +0.0 の加算だけで、x + 0.0 == x(IEEE754・厳密)。
+#
+# ★ビット一致の要(3 条件。tests/test_physics_hash.py が機械固定する)
+#   (a) 候補は「カットオフ内を必ず含む」上位集合 = 実効近傍集合が完全一致
+#   (b) neighbor_cap 選抜のタイブレークまで一致
+#       (現行 argsort(kind="stable") の (距離, index) 昇順を再現)
+#   (c) 加算順序が現行と同一 — 候補を (i, j) 辞書順に整列してから合算する。
+#       現行の `contrib.sum(axis=1)` は **軸 1 が最内周でないため逐次加算**であり
+#       (numpy は最内周の連続軸を縮約するときだけ pairwise summation を使う)、
+#       `np.bincount`(index 昇順の逐次加算)と厳密に同じ和になる。
+#       ★-0.0 の縮退も起きない: bincount の初期値は +0.0 で、0.0 + (−0.0) = +0.0。
+#       全ペア版の行和も自己ペア(+0.0)を必ず含むので、どちらも −0.0 にはならない。
+_POINT_CELL_DIV = 2       # 格子辺 = reach / これ(リング探索 (2·div+1)² セル)。実測で最速域。
+_ALL_PAIRS_MAX_N = 48     # これ以下は全ペアの方が安い(結果は同一 = 上位集合のまま)
+_PAIR_BLOCK = 1 << 20     # 1 ブロックあたりの候補ペア上限(行境界で切る = 加算順序は不変)
+
+
+class PointField:
+    """点集合 + 一様格子の空間ハッシュ(対人ペアの候補列挙)。`WallField` の点版。
+
+    格子は各点を 1 セルに登録する。点 p から距離 R 以内の点は必ず p のセルから
+    Chebyshev 距離 ceil(R/cell) 以内のセルに居るので、リング探索 (2·ring+1)² セルの
+    合併は **距離 R 以内の全点の上位集合**になる(取りこぼし無し)。
+
+    セル内の登録順は **点 index 昇順**(`kind="stable"` の argsort)。
+    """
+
+    __slots__ = ("pos", "n", "cell", "_ox", "_oy", "_keys", "_start", "_order")
+
+    def __init__(self, pos, cell):
+        self.pos = np.asarray(pos, dtype=np.float64).reshape(-1, 2)
+        self.n = self.pos.shape[0]
+        self.cell = float(cell)
+        if not (self.cell > 0.0):
+            raise ValueError("cell must be > 0")
+        if self.n == 0:
+            self._ox = self._oy = 0.0
+            self._keys = np.zeros(0, dtype=np.int64)
+            self._start = np.zeros(1, dtype=np.int64)
+            self._order = np.zeros(0, dtype=np.int64)
+            return
+        self._ox = float(self.pos[:, 0].min())
+        self._oy = float(self.pos[:, 1].min())
+        key = self._cell_key(self.pos)
+        order = np.argsort(key, kind="stable")      # 同一セル内は点 index 昇順
+        ks = key[order]
+        uniq, start = np.unique(ks, return_index=True)
+        self._order = order
+        self._keys = uniq
+        self._start = np.append(start, ks.shape[0]).astype(np.int64)
+
+    def _cell_key(self, p):
+        ci = np.clip(np.floor((p[:, 0] - self._ox) / self.cell),
+                     -_CELL_CLIP, _CELL_CLIP).astype(np.int64)
+        cj = np.clip(np.floor((p[:, 1] - self._oy) / self.cell),
+                     -_CELL_CLIP, _CELL_CLIP).astype(np.int64)
+        return ci * _KEY_STRIDE + cj
+
+    # ── 候補列挙(行ごとにまとまるが、行内の点 index は昇順ではない)────────── #
+    def candidates(self, qpos, ring):
+        """(query 行 index, 点 index) の候補列。ring セル分のリング探索。"""
+        qpos = np.asarray(qpos, dtype=np.float64).reshape(-1, 2)
+        nq = qpos.shape[0]
+        empty = (np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64))
+        if nq == 0 or self.n == 0:
+            return empty
+        offs = np.arange(-int(ring), int(ring) + 1, dtype=np.int64)
+        di = np.repeat(offs, offs.shape[0])
+        dj = np.tile(offs, offs.shape[0])
+        ai = np.clip(np.floor((qpos[:, 0] - self._ox) / self.cell),
+                     -_CELL_CLIP, _CELL_CLIP).astype(np.int64)
+        aj = np.clip(np.floor((qpos[:, 1] - self._oy) / self.cell),
+                     -_CELL_CLIP, _CELL_CLIP).astype(np.int64)
+        qk = ((ai[:, None] + di[None, :]) * _KEY_STRIDE
+              + (aj[:, None] + dj[None, :])).ravel()
+        qrow = np.repeat(np.arange(nq, dtype=np.int64), di.shape[0])
+        idx = np.searchsorted(self._keys, qk)
+        hit = idx < self._keys.shape[0]
+        hit[hit] = self._keys[idx[hit]] == qk[hit]
+        idx = idx[hit]
+        qrow = qrow[hit]
+        if idx.shape[0] == 0:
+            return empty
+        cnt = self._start[idx + 1] - self._start[idx]
+        total = int(cnt.sum())
+        if total == 0:
+            return empty
+        rep = np.repeat(np.arange(cnt.shape[0], dtype=np.int64), cnt)
+        offs_in = (np.arange(total, dtype=np.int64)
+                   - np.repeat(np.cumsum(cnt) - cnt, cnt))
+        pt = self._order[self._start[idx][rep] + offs_in]
+        return qrow[rep], pt
+
+
+def all_point_pairs(n):
+    """全ペア (i, j)(i≠j)の辞書順昇順 — 空間ハッシュとの同値検証・小規模の参照経路。"""
+    ii = np.repeat(np.arange(n, dtype=np.int64), n)
+    jj = np.tile(np.arange(n, dtype=np.int64), n)
+    keep = ii != jj
+    return ii[keep], jj[keep]
+
+
+def neighbor_pairs(pos, reach, cell=None, hash_ok=True):
+    """距離 reach 以内を必ず含む候補ペア (i, j) を **(i, j) 辞書順昇順**で返す。
+
+    自己ペア (i, i) は含まない。重複も無い(各点はちょうど 1 セルに登録される)。
+    戻り値の並びが辞書順であることが「合算順序 = 現行の行和と同一」の担保
+    (本 module 冒頭 PointField の (c))。
+    """
+    pos = np.asarray(pos, dtype=np.float64).reshape(-1, 2)
+    n = pos.shape[0]
+    if n < 2:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
+    reach = float(max(reach, 0.0))
+    if (not hash_ok) or n <= _ALL_PAIRS_MAX_N or reach <= 0.0:
+        return all_point_pairs(n)
+    c = float(cell) if cell else (reach / _POINT_CELL_DIV)
+    if not (c > 0.0):
+        return all_point_pairs(n)
+    field = PointField(pos, c)
+    ring = int(math.ceil(reach / field.cell))
+    if (2 * ring + 1) ** 2 >= n:      # 安全弁: 探索セル数が点数を超えるなら全ペアが安い
+        return all_point_pairs(n)
+    qrow, pt = field.candidates(pos, ring)
+    keep = qrow != pt
+    qrow, pt = qrow[keep], pt[keep]
+    flat = np.sort(qrow * n + pt)     # (i, j) 辞書順(重複なし = unique 不要)
+    return flat // n, flat % n
+
+
+def pair_blocks(ii, n, max_pairs=_PAIR_BLOCK):
+    """候補ペア列を **行境界で** ブロックに切る [(row_lo, row_hi, p_lo, p_hi), …]。
+
+    行(= 個体 i)を跨いで合算しないので、ブロック分割は加算順序を 1 ビットも変えない。
+    """
+    p = int(ii.shape[0])
+    if p == 0:
+        return [(0, n, 0, 0)]
+    per_row = max(1.0, p / max(n, 1))
+    rows = max(1, int(max_pairs / per_row))
+    if rows >= n:
+        return [(0, n, 0, p)]
+    out = []
+    for lo in range(0, n, rows):
+        hi = min(lo + rows, n)
+        p_lo = int(np.searchsorted(ii, lo, side="left"))
+        p_hi = int(np.searchsorted(ii, hi, side="left"))
+        out.append((lo, hi, p_lo, p_hi))
+    return out
+
+
+def cap_pairs(pos, ii, jj, n, cap):
+    """候補ペアを「各行 (距離, index) 昇順の最近傍 cap 体」へ絞る(辞書順で返す)。
+
+    現行 `argsort(d, kind="stable")` → `rank < cap` と **選抜集合もタイブレークも一致**する:
+      - 行内の候補は既に j 昇順 → 距離の安定ソートは (距離, index) 昇順と同義。
+      - カットオフ外の点が cap 枠を奪うことは無い(距離が遠いので必ず後順位)。
+        逆に候補に混じる「reach 内だが cutoff 外」の点は valid=False で寄与 0 のまま。
+    """
+    if ii.shape[0] == 0:
+        return ii, jj
+    cnt = np.bincount(ii, minlength=n)
+    kmax = int(cnt.max())
+    if kmax <= cap:                    # 誰も cap に掛からない = 絞る必要が無い
+        return ii, jj
+    starts = np.concatenate([np.zeros(1, dtype=np.int64), np.cumsum(cnt)[:-1]])
+    rowpos = np.arange(ii.shape[0], dtype=np.int64) - starts[ii]
+    jm = np.full((n, kmax), n, dtype=np.int64)          # 埋め草 = n(実在しない index)
+    jm[ii, rowpos] = jj
+    dm = np.full((n, kmax), np.inf)
+    diff = pos[ii] - pos[jj]
+    dm[ii, rowpos] = np.linalg.norm(diff, axis=1)
+    order = np.argsort(dm, axis=1, kind="stable")[:, :cap]   # (距離, index) 昇順
+    sel = np.take_along_axis(jm, order, axis=1)
+    sel.sort(axis=1)                                   # 合算順序 = j 昇順へ戻す
+    out_i = np.repeat(np.arange(n, dtype=np.int64), cap)
+    out_j = sel.ravel()
+    keep = out_j != n
+    return out_i[keep], out_j[keep]
+
+
+def knn_neighbors(qpos, points, k, max_dist, exclude_self=True):
+    """各 query 行の「距離 max_dist 未満の近傍のうち (距離, index) 昇順の先頭 k 個」。
+
+    戻り値 (order, valid): どちらも (nq, k)。valid[r] は先頭詰め(True が前)。
+    現行 ORCA の `argsort(dist)[:, :k]` + `dist < neighbor_dist` と **完全一致**する
+    (行の有効分は距離昇順の prefix なので、選抜集合も順序も同じ)。
+
+    実装は**拡大リング探索**: 格子辺 c を密度から選び、ring=1,2,4,… と広げる。
+    ring·c 以内に k 個見つかった行はそこで確定(それより近い点は全部列挙済み)。
+    ring·c ≥ max_dist に達したら、max_dist 以内は完全に覆えているので確定。
+    → ORCA の neighbor_dist=10 m を素直にセル化すると候補が πR²ρ で膨らむ問題を回避する
+      (cap=12 = 認知的近傍が効いている以上、10 m 全部を列挙する必要が無い)。
+    """
+    qpos = np.asarray(qpos, dtype=np.float64).reshape(-1, 2)
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    nq = qpos.shape[0]
+    m = points.shape[0]
+    k = int(k)
+    order = np.zeros((nq, k), dtype=np.int64)
+    valid = np.zeros((nq, k), dtype=bool)
+    if nq == 0 or m == 0 or k <= 0:
+        return order, valid
+    max_dist = float(max(max_dist, 0.0))
+    lo = points.min(axis=0)
+    hi = points.max(axis=0)
+    area = max(float(hi[0] - lo[0]), 1e-9) * max(float(hi[1] - lo[1]), 1e-9)
+    # 半径 c の円に期待 2k 体が入る格子辺(9 セルで ~5.7k 体 = ring 1 でほぼ確定する)
+    cell = math.sqrt(max(2.0 * k * area / m, 1e-12) / math.pi)
+    cell = min(max(cell, 1e-9), max_dist if max_dist > 0.0 else 1.0)
+    field = PointField(points, cell)
+    ring_max = max(1, int(math.ceil(max_dist / field.cell)))
+    todo = np.arange(nq, dtype=np.int64)
+    ring = 1
+    while todo.size:
+        r = min(ring, ring_max)
+        qrow, pt = field.candidates(qpos[todo], r)
+        src = todo[qrow]
+        if exclude_self:
+            keep = ~((src == pt) & (pt < nq))
+            src, pt = src[keep], pt[keep]
+        flat = np.sort(src * m + pt)
+        ii, jj = flat // m, flat % m
+        d = np.linalg.norm(qpos[ii] - points[jj], axis=1)
+        cover = (r >= ring_max)
+        if cover:
+            done_mask = np.ones(todo.shape[0], dtype=bool)
+        else:
+            inside = np.bincount(ii[d <= r * field.cell], minlength=nq)
+            done_mask = inside[todo] >= k
+        done = todo[done_mask]
+        if done.size:
+            sel = np.zeros(nq, dtype=bool)
+            sel[done] = True
+            sub = sel[ii]
+            _knn_fill(order, valid, ii[sub], jj[sub], d[sub], k, m, max_dist)
+        todo = todo[~done_mask]
+        if cover:
+            break
+        ring *= 2
+    return order, valid
+
+
+def _knn_fill(order, valid, ii, jj, d, k, m, max_dist):
+    nq = order.shape[0]
+    keep = d < max_dist
+    ii, jj, d = ii[keep], jj[keep], d[keep]
+    if ii.shape[0] == 0:
+        return
+    cnt = np.bincount(ii, minlength=nq)
+    kmax = int(cnt.max())
+    rows = np.nonzero(cnt)[0]
+    starts = np.concatenate([np.zeros(1, dtype=np.int64), np.cumsum(cnt)[:-1]])
+    rowpos = np.arange(ii.shape[0], dtype=np.int64) - starts[ii]
+    jm = np.full((nq, kmax), m, dtype=np.int64)
+    dm = np.full((nq, kmax), np.inf)
+    jm[ii, rowpos] = jj
+    dm[ii, rowpos] = d
+    kk = min(k, kmax)
+    o = np.argsort(dm[rows], axis=1, kind="stable")[:, :kk]   # (距離, index) 昇順
+    sel = np.take_along_axis(jm[rows], o, axis=1)
+    ok = np.take_along_axis(dm[rows], o, axis=1) < max_dist
+    order[rows, :kk] = np.where(ok, sel, 0)
+    valid[rows, :kk] = ok
+
+
 def wall_forces_from_pairs(pos, radius, field, ai, si,
                            wall_a=WALL_A_DEFAULT, wall_b=WALL_B_DEFAULT,
                            wall_range=WALL_RANGE_M):
@@ -261,6 +547,9 @@ class Crowd:
                 値を変えても結果は不変(探索の粒度が変わるだけ)。
         neighbor_cap: 対人斥力の近傍上限(最近傍 cap 体のみ寄与・距離昇順+index 昇順の
                 決定論選択)。None(既定)= 上限なし=従来どおり全近傍。
+        pair_hash: True(既定)= 対人斥力の候補列挙を空間ハッシュ(PointField)で行う。
+                False = 全ペア(検証用の参照経路)。**結果は両者でビット一致**
+                (tests/test_physics_hash.py が固定)。
     """
 
     def __init__(self, pos, vel, goal, v0, radius=None, active=None,
@@ -269,7 +558,7 @@ class Crowd:
                  rng=None, noise=0.0, arrive_radius=0.5,
                  walls=None, wall_a=WALL_A_DEFAULT, wall_b=WALL_B_DEFAULT,
                  wall_range=WALL_RANGE_M, wall_hash=True, wall_cell=None,
-                 neighbor_cap=None):
+                 neighbor_cap=None, pair_hash=True):
         self.pos = np.asarray(pos, dtype=np.float64).reshape(-1, 2).copy()
         n = self.pos.shape[0]
         self.vel = np.asarray(vel, dtype=np.float64).reshape(-1, 2).copy()
@@ -302,6 +591,7 @@ class Crowd:
         self.wall_field = (WallField(walls, cell=self.wall_cell)
                            if walls is not None and len(walls) else None)
         self.neighbor_cap = None if neighbor_cap is None else int(neighbor_cap)
+        self.pair_hash = bool(pair_hash)
 
     # ── 希望方向 e_i(目標へ向かう単位ベクトル) ──
     def _desired_dir(self):
@@ -343,33 +633,8 @@ class Crowd:
         f = self.mass * (self.v0[:, None] * e - self.vel) / self.tau
 
         if n > 1:
-            # 対人斥力(全ペア)。diff_ij = pos_i − pos_j(j から i へ向かうベクトル)
-            diff = self.pos[:, None, :] - self.pos[None, :, :]     # (N,N,2)
-            d = np.linalg.norm(diff, axis=2)                       # (N,N)
-            np.fill_diagonal(d, np.inf)                            # 自己ペア除外
-            rr = self.radius[:, None] + self.radius[None, :]       # (N,N) 半径和
-            # |f_ij| = A·exp((r_i+r_j − d)/B) — 指数斥力(接触 d=rr で A)
-            arg = np.clip((rr - d) / self.b, a_min=None, a_max=_EXP_ARG_MAX)
-            mag = self.a * np.exp(arg)                             # (N,N)
-            with np.errstate(invalid="ignore", divide="ignore"):
-                nij = diff / d[:, :, None]                         # j→i 単位ベクトル
-            nij = np.nan_to_num(nij)
-            # 異方性 w = λ + (1−λ)(1+cosφ)/2、φ = e_i と (i→j 方向) の成す角
-            #   i→j 方向 = −nij。cosφ = e_i · (−nij)。前方(cosφ=1)で w=1、後方で w=λ。
-            cosphi = -np.einsum("ik,ijk->ij", e, nij)              # (N,N)
-            w = self.lam + (1.0 - self.lam) * (1.0 + cosphi) / 2.0
-            # マスク: 非アクティブ相手 j / カットオフ外 / 自己 は寄与 0
-            valid = self.active[None, :] & (d <= rr + CUTOFF_M)
-            # 近傍 cap(None=上限なし=従来経路): 各個体につき最近傍 cap 体のみ寄与。距離昇順の
-            # 安定ソートで順位を作り(index 昇順でタイブレーク)、cap 位以内だけ残す=決定論選択。
-            if self.neighbor_cap is not None and self.neighbor_cap < n - 1:
-                order = np.argsort(d, axis=1, kind="stable")      # 距離昇順の列 index
-                rank = np.argsort(order, axis=1, kind="stable")   # 各 j の順位
-                valid = valid & (rank < self.neighbor_cap)
-            contrib = (w * mag)[:, :, None] * nij                 # (N,N,2)
-            contrib[~valid] = 0.0
-            f_rep = contrib.sum(axis=1)                           # (N,2)
-            f = f + f_rep
+            f = f + (self._repulsion_hash(e) if self.pair_hash
+                     else self._repulsion_dense(e))
 
         # 対壁斥力 f_iW = A_w·exp((r_i − d_iW)/B_w)·n_iW(walls 未指定なら評価しない)
         if self.wall_field is not None:
@@ -380,6 +645,78 @@ class Crowd:
             f = f + self.mass * self.rng.normal(0.0, self.noise, size=(n, 2))
 
         f[~self.active] = 0.0
+        return f
+
+    # ── 対人斥力 Σ_j f_ij ────────────────────────────────────────────────── #
+    def _repulsion_dense(self, e):
+        """全ペア (N,N) の対人斥力(**参照実装**。空間ハッシュ版と結果はビット一致)。
+
+        ★竹-3 まではこの本体が forces() に直書きされていた。式・マスク・合算順序は
+          1 バイトも変えていない(pair_hash=False で通る経路 = 同値性テストの基準)。
+        """
+        n = self.pos.shape[0]
+        # 対人斥力(全ペア)。diff_ij = pos_i − pos_j(j から i へ向かうベクトル)
+        diff = self.pos[:, None, :] - self.pos[None, :, :]     # (N,N,2)
+        d = np.linalg.norm(diff, axis=2)                       # (N,N)
+        np.fill_diagonal(d, np.inf)                            # 自己ペア除外
+        rr = self.radius[:, None] + self.radius[None, :]       # (N,N) 半径和
+        # |f_ij| = A·exp((r_i+r_j − d)/B) — 指数斥力(接触 d=rr で A)
+        arg = np.clip((rr - d) / self.b, a_min=None, a_max=_EXP_ARG_MAX)
+        mag = self.a * np.exp(arg)                             # (N,N)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            nij = diff / d[:, :, None]                         # j→i 単位ベクトル
+        nij = np.nan_to_num(nij)
+        # 異方性 w = λ + (1−λ)(1+cosφ)/2、φ = e_i と (i→j 方向) の成す角
+        #   i→j 方向 = −nij。cosφ = e_i · (−nij)。前方(cosφ=1)で w=1、後方で w=λ。
+        cosphi = -np.einsum("ik,ijk->ij", e, nij)              # (N,N)
+        w = self.lam + (1.0 - self.lam) * (1.0 + cosphi) / 2.0
+        # マスク: 非アクティブ相手 j / カットオフ外 / 自己 は寄与 0
+        valid = self.active[None, :] & (d <= rr + CUTOFF_M)
+        # 近傍 cap(None=上限なし=従来経路): 各個体につき最近傍 cap 体のみ寄与。距離昇順の
+        # 安定ソートで順位を作り(index 昇順でタイブレーク)、cap 位以内だけ残す=決定論選択。
+        if self.neighbor_cap is not None and self.neighbor_cap < n - 1:
+            order = np.argsort(d, axis=1, kind="stable")      # 距離昇順の列 index
+            rank = np.argsort(order, axis=1, kind="stable")   # 各 j の順位
+            valid = valid & (rank < self.neighbor_cap)
+        contrib = (w * mag)[:, :, None] * nij                 # (N,N,2)
+        contrib[~valid] = 0.0
+        return contrib.sum(axis=1)                            # (N,2)
+
+    def _repulsion_hash(self, e):
+        """空間ハッシュで候補を絞った対人斥力(**_repulsion_dense とビット一致**)。
+
+        候補 reach = 2·r_max + CUTOFF_M。実効カットオフ d ≤ r_i+r_j+CUTOFF_M は
+        必ず reach 以内なので、候補は上位集合 = 落ちるのは寄与 0.0 の加算だけ。
+        """
+        n = self.pos.shape[0]
+        reach = 2.0 * float(self.radius.max()) + CUTOFF_M
+        ii, jj = neighbor_pairs(self.pos, reach)
+        cap = self.neighbor_cap
+        if cap is not None and cap < n - 1:
+            ii, jj = cap_pairs(self.pos, ii, jj, n, cap)
+        f = np.zeros((n, 2), dtype=np.float64)
+        for _r0, _r1, p0, p1 in pair_blocks(ii, n):
+            if p1 <= p0:
+                continue
+            si, sj = ii[p0:p1], jj[p0:p1]
+            diff = self.pos[si] - self.pos[sj]                 # j → i
+            d = np.linalg.norm(diff, axis=1)
+            rr = self.radius[si] + self.radius[sj]
+            arg = np.clip((rr - d) / self.b, a_min=None, a_max=_EXP_ARG_MAX)
+            mag = self.a * np.exp(arg)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                nij = diff / d[:, None]
+            nij = np.nan_to_num(nij)
+            cosphi = -(e[si, 0] * nij[:, 0] + e[si, 1] * nij[:, 1])
+            w = self.lam + (1.0 - self.lam) * (1.0 + cosphi) / 2.0
+            valid = self.active[sj] & (d <= rr + CUTOFF_M)
+            contrib = (w * mag)[:, None] * nij
+            contrib[~valid] = 0.0
+            # 合算は (i, j) 昇順の逐次加算(np.bincount)= 行和とビット一致
+            f[_r0:_r1, 0] = np.bincount(si - _r0, weights=contrib[:, 0],
+                                        minlength=_r1 - _r0)
+            f[_r0:_r1, 1] = np.bincount(si - _r0, weights=contrib[:, 1],
+                                        minlength=_r1 - _r0)
         return f
 
     def step(self, dt=0.1):

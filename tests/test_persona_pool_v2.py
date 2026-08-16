@@ -13,18 +13,24 @@
   - 世帯の年齢整合(親子の年齢差・子どもが世帯に入る)
   - 姓名が出生コホートに条件づく
   - **職業語彙が v1 の上位集合**であり、新語が全部 src の表に登録済み(静かな不発の防止)
+  - **conf が名指しする職業が 1 語残らず名簿に居る**(delivery.courier_occupation=配達員 が
+    v2 で 0 人になっていた 2026-08-16 の再発防止。0 人でも例外は出ず静かに沈む)
+  - v1 継承アンカー 3 職(配達員 / バンドマン / 写真家)が非ゼロで出て、産業・年齢・
+    従業上の地位・層が v2 の既存規則と整合する
   - `visit_purpose` の 7 語が 1 語も変わらない(presence 較正表と結合)
 """
 from __future__ import annotations
 
 import glob
 import json
+import re
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
 import numpy as np
 import pytest
+import yaml
 
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "scripts"))
@@ -480,6 +486,116 @@ def test_v2_occupations_are_superset_of_v1(tmp_path, v2):
     v2_vocab = set(v2["meta"]["occupations"])
     new = v2_vocab - v1_vocab
     assert new <= set(PV2.V2_NEW_OCCUPATIONS), f"未登録の新職業名: {sorted(new)}"
+
+
+# ---------------------------------------------------------------- conf の名指し職業
+#: conf のキー名が「職業を名指ししている」かの判定。**キー名だけ**で決める(値の中身を
+#: 人手で列挙しない)= conf 側に新しい `*_occupations:` が生えたら自動で守備範囲に入る。
+#: `occupation_map` / `occupation_weight` / `occ_cat` は「職業 → 別の何か」の写像であって
+#: 職業の名指しではないので、末尾一致のこの正規表現から自然に外れる。
+_CONF_OCC_KEY = re.compile(r"(^|_)occupations?$")
+
+
+def _conf_named_occupations() -> dict[str, str]:
+    """conf/**/*.yaml を歩いて「名指しされた職業名 → 最初に見つけた場所」を返す。
+
+    拾う 3 形:
+      - スカラ       `courier_occupation: 配達員`
+      - リスト       `guard_occupations: [警備員, 警察官]`
+      - マッピング   `occupations: {タクシー運転手: {...}}`  ← キーが職業(role_pay)
+    """
+    found: dict[str, str] = {}
+
+    def walk(node, path: str, src: str) -> None:
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if isinstance(k, str) and _CONF_OCC_KEY.search(k):
+                    if isinstance(v, str):
+                        vals = [v]
+                    elif isinstance(v, (list, tuple)):
+                        vals = [x for x in v if isinstance(x, str)]
+                    elif isinstance(v, dict):
+                        vals = [x for x in v if isinstance(x, str)]
+                    else:
+                        vals = []
+                    for x in vals:
+                        found.setdefault(x, f"{src}:{path}/{k}")
+                walk(v, f"{path}/{k}", src)
+        elif isinstance(node, (list, tuple)):
+            for i, v in enumerate(node):
+                walk(v, f"{path}[{i}]", src)
+
+    for f in sorted((_ROOT / "conf").rglob("*.yaml")):
+        walk(yaml.safe_load(f.read_text(encoding="utf-8")), "",
+             str(f.relative_to(_ROOT)).replace("\\", "/"))
+    return found
+
+
+def test_conf_named_occupations_exist_in_the_v2_pool(v2):
+    """★再発防止(本レーンの主眼): conf が名指しする職業が v2 名簿に 1 人も居ない、を殺す。
+
+    2026-08-16 に `delivery.courier_occupation: 配達員` が v2 では 0 人だったのが
+    meta 同士の全数突合で見つかった(v1 は 1,124 人)。0 人でも**例外は出ない**:
+    `delivery._select_courier` が誰も選べず、全注文が agent_id=-1 の抽象トリップへ
+    graceful degradation するだけ = 宅配は届くのに配達員の gig 収入も物理配車も
+    永久に 0 件、という静かな沈み方をする。ここで機械的に止める。
+    """
+    named = _conf_named_occupations()
+    assert len(named) >= 15, "conf からの職業の名指しが極端に少ない(正規表現の退化)"
+    # ★語彙は「fraction 0.02 の名簿サンプル」ではなく **生成器が原理的に作りうる集合**で見る。
+    #   台帳由来の稀な職(設備保守員 = 100万人中 314 人)は小 fraction の整数配分で 0 人へ
+    #   丸められるので、サンプルを語彙と見なすと偽陽性が出る。L2 の語彙だけは生成器自身の
+    #   `_build_L2_slots_v2(orgs, 1.0)` を呼んで採る(テスト側で写像を書き写さない)。
+    PV2.load_ledger_roles(v2["orgs"])
+    vocab = set(v2["meta"]["occupations"])
+    vocab |= {s[2] for s in bpp._build_L2_slots_v2(v2["orgs"], 1.0)}
+    missing = {occ: src for occ, src in named.items() if occ not in vocab}
+    assert not missing, f"conf が名指しするのに v2 が 1 人も作らない職業: {missing}"
+
+
+# ---------------------------------------------------------------- v1 継承アンカー
+def test_v1_anchor_gig_occupations_are_generated(tmp_path):
+    """配達員 / バンドマン / 写真家 が **fraction 0.01 の煙生成でも非ゼロ**で出る。
+
+    ユーザー決定 2026-08-16「再生成に 3 職業追加」。人数の根拠は一次統計ではなく
+    v1 プール実測(1,124 / 917 / 871 @ L1 30,000)= 継承アンカー
+    (`persona_v2.V1_ANCHOR_GIG` の先頭コメントに全部書いてある)。
+    """
+    meta, _c, _o = _build_v2(tmp_path / "gig", fraction=0.01)
+    occ = meta["occupations"]
+    for row in PV2.GIG_ANCHOR_P:
+        assert occ.get(row[0], 0) > 0, f"{row[0]} が 0.01 煙生成で 0 人({occ.get(row[0])})"
+    # meta に来歴が残る(本番直前の再生成物と meta 同士で突合できる)
+    anchors = meta["v2_params"]["v1_anchor_gig"]
+    assert {a["occupation"] for a in anchors} == {r[0] for r in PV2.GIG_ANCHOR_P}
+    assert all(a["v1_count_at_L1_30000"] > 0 for a in anchors)
+
+
+def test_v1_anchor_gig_is_coherent_and_marginal_free(v2):
+    """アンカーが v2 の既存規則を壊していないこと(産業・年齢・地位・層・src の表)。
+
+    ★最重要: 従業上の地位は**引いた後**に職業名を載せるだけなので、国勢調査 第3-1表の
+      周辺分布が 1 人も動かない(`test_employment_status_matches_census` と両立する)。
+    """
+    table = {occ: (ikey, PV2.OCC_MAJOR_NAME[major], lo, hi)
+             for occ, ikey, major, lo, hi, _s, _p in PV2.GIG_ANCHOR_P}
+    hits = [r for r in v2["all"] if r["occupation"] in table]
+    assert hits, "アンカー職が 1 人も出ていない"
+    for r in hits:
+        ikey, major, lo, hi = table[r["occupation"]]
+        assert r["layer"] == "L1" and r["presence"] == "resident", r["id"]
+        assert r["industry_key"] == ikey, (r["occupation"], r["industry_key"])
+        assert r["occupation_major"] == major, (r["occupation"], r["occupation_major"])
+        assert lo <= r["age"] <= hi, (r["occupation"], r["age"])
+        assert r["employment"] in PV2.GIG_ANCHOR_EMPLOYMENT, r["employment"]
+        assert not r.get("role"), "ギグは組織台帳のロールを持たない"
+    # 3 職の帯域は [0,1) 上で互いに素 = 二重当選が原理的に起きない
+    assert sum(row[6] for row in PV2.GIG_ANCHOR_P) < 1.0
+    # src 側の表に載っている(= 静かな 0 円・職場なしにならない)
+    for name in table:
+        assert E.WAGE_CAT.get(name) == "自営", name      # 出来高 = gig_profile が払う
+        assert name in E.MONEY_INIT, name
+        assert name in PERS._WORK_CAT and PERS._WORK_CAT[name] is None, name
 
 
 def test_v2_new_occupations_are_registered_in_src_tables():
