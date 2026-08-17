@@ -251,6 +251,16 @@ model:
                         #   router の子は spec の format キーで個別指定可。キャッシュキーは json のとき
                         #   従来と同一(過去ランの llm_cache 再生互換)・none のみ別キー。
   # ---- 本選(backend: vllm)用。mock/ollama では未使用=既定挙動は完全不変 ----
+  api_mode: completions # vLLM の HTTP 経路(vllm のみ。completions | chat)
+                        #   completions(既定)= 従来どおり /v1/completions を優先(404 で chat へ恒久切替)。
+                        #                       送出ボディもキャッシュキーも従来とバイト一致。
+                        #   chat            = 最初から /v1/chat/completions(chat template が当たる)。
+                        #   ★A8 トーナメント実測 2026-08-17: **同一プロンプト束・同一 Qwen3-8B** で
+                        #     completions 経路の parse 成立 58.7% → chat 経路 99.0%。raw completions は
+                        #     チャットテンプレートが適用されず指示追従モードに入らないのが原因。
+                        #   ★本選は chat(conf/finals_observe.yaml / conf/profiles/finals-vllm7.yaml)。
+                        #   ★chat はキャッシュキーが別(cache_extra に {"api":"chat"})= 経路を切り替えても
+                        #     completions 時代の応答を誤再生しない。
   servers: []           # vLLM の base_url リスト。空=vllm 選択時のみエラー。1台マルチGPU/複数ノード両対応。
                         #   単一 (1本):   servers: ["http://localhost:8000"]                     → VllmBackend 直
                         #   1台7GPU:      servers: ["http://localhost:8000", ..., "http://localhost:8006"]  → FleetLLM(艦隊)

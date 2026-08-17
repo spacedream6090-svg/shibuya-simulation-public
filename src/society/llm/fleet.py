@@ -24,7 +24,7 @@ from collections.abc import Callable
 
 from .base import LLMBackend
 from .deadline import DEFAULT_DEADLINE_S
-from .vllm import VllmBackend
+from .vllm import VllmBackend, cache_extra_for
 
 log = logging.getLogger("society.llm.fleet")
 
@@ -55,7 +55,8 @@ class FleetLLM(LLMBackend):
                  now: Callable[[], float] = time.monotonic,
                  format_mode: str = "json",
                  deadline_s: float = DEFAULT_DEADLINE_S,
-                 request_seed: int | None = None):
+                 request_seed: int | None = None,
+                 api_mode: str = "completions"):
         if not servers:
             raise ValueError("FleetLLM には少なくとも1本の server URL が必要。")
         self.name = f"fleet/{model}"          # ★URL 非依存(D13)
@@ -65,7 +66,10 @@ class FleetLLM(LLMBackend):
         self._now = now
         # format ノブ(第33バッチ 計画A)は子 VllmBackend へ透過。キー互換規約も子と同じ。
         self.format_mode = format_mode
-        self.cache_extra = None if format_mode == "json" else {"f": format_mode}
+        # 経路ノブ(A8 実測 2026-08-17。conf model.api_mode)も子へ透過。既定 "completions"
+        # = 子の送出ボディ・キャッシュキーとも従来と 1 バイトも変わらない。
+        self.api_mode = api_mode
+        self.cache_extra = cache_extra_for(format_mode, api_mode)
         # URL ごとに1バックエンド(name は全て同一=キャッシュを共有できる)
         # 絶対時限(M-1)も子へ透過する。艦隊は 1 サーバの張り付きが失敗として
         # 他サーバへ再分配されるべき事象なので、子が時限で "__vllm_error__" を
@@ -77,7 +81,8 @@ class FleetLLM(LLMBackend):
         self.request_seed = None if request_seed is None else int(request_seed)
         self._backend: dict[str, VllmBackend] = {
             u: VllmBackend(model, u, timeout_s=timeout_s, format_mode=format_mode,
-                           deadline_s=deadline_s, request_seed=self.request_seed)
+                           deadline_s=deadline_s, request_seed=self.request_seed,
+                           api_mode=api_mode)
             for u in self.servers}
         # tier プール(purpose → URL リスト)。既定は全 URL の default 1プール。
         self._tiers: dict[str, list[str]] = {}
@@ -89,7 +94,8 @@ class FleetLLM(LLMBackend):
                         u, VllmBackend(model, u, timeout_s=timeout_s,
                                        format_mode=format_mode,
                                        deadline_s=deadline_s,
-                                       request_seed=self.request_seed))
+                                       request_seed=self.request_seed,
+                                       api_mode=api_mode))
                 self._tiers[str(purpose)] = pool
         self._default = self._tiers.get("default", list(self.servers))
         self._cooldown: dict[str, float] = {}

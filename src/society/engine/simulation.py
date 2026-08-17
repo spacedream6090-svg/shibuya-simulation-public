@@ -988,17 +988,22 @@ class Simulation:
             tiers = cfg.model.get("tiers", None)
             tiers = OmegaConf.to_container(tiers, resolve=True) if tiers else None
             fmt = str(cfg.model.get("format", "json"))
+            # A8 実測(2026-08-17): raw completions は chat template 不適用で parse
+            # 成立 58.7%、chat 経路は 99.0%。既定 "completions" = 従来と完全同一。
+            api_mode = str(cfg.model.get("api_mode", "completions"))
             if len(servers) == 1 and not tiers:
                 from ..llm.vllm import VllmBackend
                 raw = VllmBackend(model_name, servers[0], timeout_s=timeout_s,
                                   format_mode=fmt, deadline_s=deadline_s,
-                                  request_seed=request_seed)
+                                  request_seed=request_seed,
+                                  api_mode=api_mode)
             else:
                 from ..llm.fleet import FleetLLM
                 raw = FleetLLM(servers, model_name, timeout_s=timeout_s,
                                tiers=tiers, format_mode=fmt,
                                deadline_s=deadline_s,
-                               request_seed=request_seed)
+                               request_seed=request_seed,
+                               api_mode=api_mode)
         elif backend == "router":
             # 第23バッチ M2: 合成ルータ。purpose(rng_key 先頭)別に子バックエンドへ振り分ける。
             # ★子を各自 CachedLLM で包んでから router に渡す(キャッシュキーは子の name 由来=D13)。
@@ -1520,7 +1525,12 @@ class Simulation:
                                format_mode=str(spec.get("format", "json")),
                                deadline_s=deadline_s,
                                # β11: router / mind の子も同じノブに従う(既定 None=不変)
-                               request_seed=getattr(self, "llm_request_seed", None))
+                               request_seed=getattr(self, "llm_request_seed", None),
+                               # A8(2026-08-17)経路トグル: 子 spec で個別指定でき、
+                               # 無ければ model.api_mode(既定 completions=従来と同一)。
+                               api_mode=str(spec.get(
+                                   "api_mode",
+                                   self.cfg.model.get("api_mode", "completions"))))
         if b == "openai_compat":
             from ..llm.openai_compat import OpenAICompatBackend
             return OpenAICompatBackend(

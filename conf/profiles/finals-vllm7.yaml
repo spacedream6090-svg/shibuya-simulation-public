@@ -41,6 +41,12 @@ model:
   reflect_max_tokens: 768
   reflect_think: false
 
+  # A8 トーナメント実測 2026-08-17: 同一プロンプト束・同一 Qwen3-8B で raw completions 経路の
+  # parse 成立 58.7% → chat 経路(chat template が当たる)99.0%。★この model: ブロックを
+  # finals_observe.yaml へ貼る運用のため、ここに無いと黙って completions(基底の既定)へ戻る
+  # (plan_max_tokens 896 と同じ流儀)。**戻すには `completions`**。
+  api_mode: chat
+
   # --- 艦隊(7本)+ tier 割当の例 ---
   name: "qwen3:8b"         # 既定モデル名(全サーバ同一モデルを想定。混在時は tiers 側で port を分ける)
   servers:

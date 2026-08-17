@@ -835,8 +835,20 @@ def test_matches_head_implementation(tmp_path):
                                       cwd=REPO_ROOT, stderr=subprocess.DEVNULL)
     except Exception:                                    # noqa: BLE001
         pytest.skip("git 不在(HEAD 版を取れない)")
-    head_py = tmp_path / "live_viewer_head.py"
+    # 【第137 追随】live_viewer は viz/notable_events.py を「自分の親の親 = REPO_ROOT」相対で
+    # 読む(kind レジストリの単一化)。HEAD 版をコピーして動かす本テストでも同じ相対配置
+    # (scripts/ の下+隣に viz/)を再現しないと HEAD 側だけ FileNotFoundError で落ちる。
+    # HEAD が旧版(レジストリ不読)なら viz コピーは単に使われないだけで無害。
+    head_py = tmp_path / "scripts" / "live_viewer_head.py"
+    head_py.parent.mkdir(parents=True, exist_ok=True)
     head_py.write_bytes(src)
+    try:
+        nsrc = subprocess.check_output(["git", "show", "HEAD:viz/notable_events.py"],
+                                       cwd=REPO_ROOT, stderr=subprocess.DEVNULL)
+        (tmp_path / "viz").mkdir(exist_ok=True)
+        (tmp_path / "viz" / "notable_events.py").write_bytes(nsrc)
+    except Exception:                                    # noqa: BLE001
+        pass
     # `_load` は REPO_ROOT / rel で解決する。絶対パスを渡せば pathlib がそのまま採る。
     HEADLV = _load("live_viewer_head", str(head_py))
     head_dir = _busy_run(tmp_path, "hd")

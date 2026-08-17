@@ -84,6 +84,12 @@ model:
   plan_max_tokens: 896
   plan_temperature: 0.3
   recall_temperature: 0.2
+  # ★★ A8 トーナメント実測 2026-08-17: 同一プロンプト束・同一 Qwen3-8B で raw completions
+  #    経路の parse 成立 58.7% に対し chat 経路(chat template + chat_template_kwargs)は 99.0%。
+  #    raw completions はチャットテンプレートが当たらず指示追従モードに入らない。
+  #    **戻すには `completions`**(基底 conf の既定値。送出ボディが従来とバイト一致に戻る)。
+  #    ★注意(運用): finals-vllm7.yaml の model: ブロックにも同じ 1 行がある。貼るときに消さないこと。
+  api_mode: chat
 
 # ============================================================================
 # (2) 名簿 = 100万プール(pool)+ 層別クォータ(DP-U3 案A)

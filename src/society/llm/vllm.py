@@ -1,6 +1,14 @@
 """vLLM(OpenAI 互換 HTTP)バックエンド。本選環境の実 LLM。標準ライブラリのみで呼ぶ。
 
-- /v1/completions を優先し、無ければ(HTTP 404)/v1/chat/completions へ恒久フォールバック。
+- 経路は conf `model.api_mode` で選ぶ(既定 "completions" = 従来どおり)。
+    * "completions"(既定): /v1/completions を優先し、無ければ(HTTP 404)
+      /v1/chat/completions へ恒久フォールバック。**送出ボディは従来とバイト一致**。
+    * "chat": 最初から /v1/chat/completions を叩く(404 フォールバックは持たない)。
+  ★A8 トーナメント実測(2026-08-17): 同一プロンプト束・同一 Qwen3-8B で
+    completions 経路の parse 成立 58.7% に対し chat 経路(chat_template_kwargs
+    enable_thinking 併用)は 99.0%。raw completions はチャットテンプレートが
+    適用されないため指示追従モードに入らないことが原因。本選は chat
+    (conf/finals_observe.yaml・conf/profiles/finals-vllm7.yaml)。
 - JSON 強制: response_format={"type":"json_object"}(vLLM 対応)。非対応(HTTP 400)なら
   それを外して再送し、プロンプト規約のみで JSON を得る(ollama の format=json 相当の代替)。
 - qwen3 系の思考制御:
@@ -64,6 +72,22 @@ def split_rng_key(rng_key: str) -> tuple[str, str, str, str]:
     return purpose, agent, step, ordinal
 
 
+def cache_extra_for(format_mode: str, api_mode: str = "completions") -> dict | None:
+    """CachedLLM._key へ足すバックエンド属性(D13 キー安定性の要)。
+
+    ★既定(format=json・api=completions)は **None** = 従来キーと 1 バイトも変わらない。
+    format=none のときの `{"f": "none"}` も従来どおり(api が completions なら合成しない)。
+    api_mode="chat" のときだけ `{"api": "chat"}` を足す(経路が変われば同じプロンプトでも
+    応答分布が変わる = 旧応答の誤再生を防ぐ)。両方効いていれば両方のキーを持つ。
+    """
+    extra: dict = {}
+    if format_mode != "json":
+        extra["f"] = format_mode
+    if api_mode == "chat":
+        extra["api"] = "chat"
+    return extra or None
+
+
 def stable_request_seed(run_seed: int, rng_key: str) -> int:
     """(run_seed, agent_id, step, purpose, ordinal) の安定ハッシュ → 31bit の非負整数。
 
@@ -82,9 +106,13 @@ class VllmBackend(LLMBackend):
     def __init__(self, model: str, base_url: str = "http://localhost:8000",
                  timeout_s: float = 120.0, format_mode: str = "json",
                  deadline_s: float = DEFAULT_DEADLINE_S,
-                 request_seed: int | None = None):
+                 request_seed: int | None = None,
+                 api_mode: str = "completions"):
         if format_mode not in ("none", "json"):
             raise ValueError(f"model.format '{format_mode}' は未対応(none | json)。")
+        if api_mode not in ("completions", "chat"):
+            raise ValueError(
+                f"model.api_mode '{api_mode}' は未対応(completions | chat)。")
         self.name = f"vllm/{model}"          # ★URL 非依存(D13: キャッシュキー安定)
         self.model = model
         self.base_url = base_url.rstrip("/")
@@ -92,10 +120,14 @@ class VllmBackend(LLMBackend):
         # 呼び出し開始からの絶対時限(M-1。llm/deadline.py)。timeout_s では止まらない
         # 「細々と流れ続ける病的生成」をここで切る。0 以下で無効=従来経路。
         self.deadline_s = float(deadline_s)
-        self._mode = "completions"           # 404 を見たら "chat" へ1度だけ切替
+        # 経路トグル(A8 実測 2026-08-17。conf model.api_mode)。
+        #   "completions"(既定)= 従来どおり raw completions 優先・404 を見たら "chat" へ1度だけ切替。
+        #   "chat"            = 最初から chat/completions(chat template が当たる = 指示追従率 99.0%)。
+        self.api_mode = api_mode
+        self._mode = "chat" if api_mode == "chat" else "completions"
         self.format_mode = format_mode
-        # キャッシュキー拡張(CachedLLM._key)。既定 "json"=None=従来キー互換。
-        self.cache_extra = None if format_mode == "json" else {"f": format_mode}
+        # キャッシュキー拡張(CachedLLM._key)。既定 "json"+completions=None=従来キー互換。
+        self.cache_extra = cache_extra_for(format_mode, api_mode)
         # β11: None(既定)= request seed を送らない = 送出ボディが従来とバイト一致。
         #      int  = その値を run_seed として 1 リクエストごとの安定 seed を導出する。
         # ★キャッシュキーには**入れない**(seed はプロンプトでもモデルパラメータでもなく、
