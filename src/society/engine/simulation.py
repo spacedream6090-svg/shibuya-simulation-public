@@ -986,6 +986,11 @@ class Simulation:
             model_name = str(cfg.model.name)
             timeout_s = float(cfg.model.get("timeout_s", 120.0))
             tiers = cfg.model.get("tiers", None)
+            # to_container で素の dict/list へ落とす。tier の値は
+            #   ["http://..."]                              … 現行(モデルは model.name)
+            #   {urls: ["http://..."], model: "qwen3:14b"}  … MIX-1 混合モデル艦隊
+            # の 2 形式。**検証は FleetLLM(llm/fleet.normalize_tiers)の 1 箇所だけ**に置く
+            # (ここで先読みすると規則が二重定義になる)。不正形式は起動時 ValueError。
             tiers = OmegaConf.to_container(tiers, resolve=True) if tiers else None
             fmt = str(cfg.model.get("format", "json"))
             # A8 実測(2026-08-17): raw completions は chat template 不適用で parse

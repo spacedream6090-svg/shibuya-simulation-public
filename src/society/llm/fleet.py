@@ -14,6 +14,13 @@
 - tier seam: tiers={"reflect": [urls], "default": [urls]} を渡すと purpose
   (rng_key 先頭)別にサーバ群を分けられる(重い内省を大モデル1本に寄せる等)。
   既定 tiers=None = 全 URL を1つの default プールに(薄い実装、seam のみ明確化)。
+- 混合モデル艦隊(MIX-1。docs/plans/model-mix-plan.md): tier の値を
+  `{"urls": [...], "model": "qwen3:14b"}` の dict 形式で書くと、**その tier のサーバだけ
+  別のモデル名**で子 VllmBackend を建てる(本選 = 会話 8B×5 + 思考 14B×2)。
+  URL リスト形式(現行 conf)は **1 バイトも挙動が変わらない**(model は艦隊既定)。
+  1 サーバ = 1 モデル(vLLM プロセスは 1 モデルしか載せない)なので、同じ URL へ
+  別モデルが来たら**起動時に ValueError**(黙って片方が勝つ = 「14B のつもりで 8B が
+  走る」を作らない)。
 """
 from __future__ import annotations
 
@@ -47,10 +54,65 @@ def _is_client_reject(resp: str) -> bool:
     return resp.startswith(_CLIENT_REJECT_PREFIXES)
 
 
+# MIX-1: tier を dict 形式で書くときに受理するキー(全数固定)。未知キーを黙って無視すると
+# `models:` のような 1 文字違いが「宣言したつもりで艦隊既定モデルが走る」に化けるため落とす。
+_TIER_KEYS = ("urls", "model")
+
+
+def normalize_tiers(tiers) -> dict[str, tuple[list[str], str | None]]:
+    """conf の `model.tiers` を `{purpose: (urls, model or None)}` へ正規化する(純関数)。
+
+    受理する 2 形式:
+      * URL リスト … `reflect: ["http://localhost:8005"]` = **現行**(model=None=艦隊既定)
+      * dict       … `reflect: {urls: ["http://localhost:8005"], model: "qwen3:14b"}`(MIX-1)
+                     `urls` 必須・`model` 任意(無ければ艦隊既定モデル)。
+    それ以外は ValueError。**黙って既定へ後退させない**のがこの関数の存在理由。
+    """
+    out: dict[str, tuple[list[str], str | None]] = {}
+    for purpose, value in (tiers or {}).items():
+        name = str(purpose)
+        model: str | None = None
+        if isinstance(value, dict):
+            unknown = sorted(str(k) for k in value if str(k) not in _TIER_KEYS)
+            if unknown:
+                raise ValueError(
+                    f"model.tiers['{name}'] に未知のキー {unknown} がある"
+                    f"(受理するのは {' / '.join(_TIER_KEYS)} だけ)。")
+            if "urls" not in value:
+                raise ValueError(
+                    f"model.tiers['{name}'] を dict 形式で書くときは urls が必須"
+                    ' (例: {urls: ["http://localhost:8005"], model: "qwen3:14b"})。')
+            raw_urls = value["urls"]
+            raw_model = value.get("model", None)
+            if raw_model is not None:
+                if not isinstance(raw_model, str) or not raw_model.strip():
+                    raise ValueError(
+                        f"model.tiers['{name}'].model はモデル名の文字列であること"
+                        f"(受理不能: {raw_model!r})。")
+                model = raw_model
+        elif isinstance(value, (list, tuple)):
+            raw_urls = value
+        else:
+            raise ValueError(
+                f"model.tiers['{name}'] は URL リスト または "
+                '{urls: [...], model: "..."} であること'
+                f"(受理不能: {type(value).__name__})。")
+        if isinstance(raw_urls, (str, bytes)) or not isinstance(raw_urls, (list, tuple)):
+            raise ValueError(
+                f"model.tiers['{name}'] の urls は URL のリストであること"
+                f"(受理不能: {type(raw_urls).__name__})。")
+        urls = [str(u).rstrip("/") for u in raw_urls]
+        if model is not None and not urls:
+            raise ValueError(
+                f"model.tiers['{name}'] は model='{model}' を宣言しているのに urls が空。")
+        out[name] = (urls, model)
+    return out
+
+
 class FleetLLM(LLMBackend):
     def __init__(self, servers: list[str], model: str, *,
                  timeout_s: float = 120.0,
-                 tiers: dict[str, list[str]] | None = None,
+                 tiers: dict[str, list[str] | dict] | None = None,
                  cooldown_s: float = 30.0,
                  now: Callable[[], float] = time.monotonic,
                  format_mode: str = "json",
@@ -69,7 +131,6 @@ class FleetLLM(LLMBackend):
         # 経路ノブ(A8 実測 2026-08-17。conf model.api_mode)も子へ透過。既定 "completions"
         # = 子の送出ボディ・キャッシュキーとも従来と 1 バイトも変わらない。
         self.api_mode = api_mode
-        self.cache_extra = cache_extra_for(format_mode, api_mode)
         # URL ごとに1バックエンド(name は全て同一=キャッシュを共有できる)
         # 絶対時限(M-1)も子へ透過する。艦隊は 1 サーバの張り付きが失敗として
         # 他サーバへ再分配されるべき事象なので、子が時限で "__vllm_error__" を
@@ -86,17 +147,49 @@ class FleetLLM(LLMBackend):
             for u in self.servers}
         # tier プール(purpose → URL リスト)。既定は全 URL の default 1プール。
         self._tiers: dict[str, list[str]] = {}
+        # MIX-1: **明示宣言された** tier 別モデル名だけを持つ(宣言ゼロ = 空 = 現行と完全同一)。
+        self.tier_models: dict[str, str] = {}
         if tiers:
-            for purpose, urls in tiers.items():
-                pool = [str(u).rstrip("/") for u in urls]
+            # 1 サーバ = 1 モデルの検算。起点は model.servers(= 艦隊既定モデル)で、
+            # 同じ URL へ別モデル名が来た時点で落とす(どちらが勝ったか判らない状態を作らない)。
+            assigned: dict[str, str] = {u: model for u in self.servers}
+            owner: dict[str, str] = {u: "model.servers" for u in self.servers}
+            for purpose, (pool, tier_model) in normalize_tiers(tiers).items():
+                eff = tier_model if tier_model is not None else model
                 for u in pool:                # tier だけに現れる URL も稼働対象へ登録
-                    self._backend.setdefault(
-                        u, VllmBackend(model, u, timeout_s=timeout_s,
-                                       format_mode=format_mode,
-                                       deadline_s=deadline_s,
-                                       request_seed=self.request_seed,
-                                       api_mode=api_mode))
-                self._tiers[str(purpose)] = pool
+                    prev = assigned.get(u)
+                    if prev is not None and prev != eff:
+                        raise ValueError(
+                            f"model.tiers['{purpose}'] は {u} へモデル '{eff}' を割り当てて"
+                            f"いるが、同じ URL は {owner[u]} で '{prev}' として宣言済み。"
+                            " 1 サーバ = 1 モデル(vLLM プロセスは 1 モデルしか載せない)。"
+                            " 別モデルを載せるサーバは model.servers から外し、tier 側だけで"
+                            "宣言すること。")
+                    assigned[u] = eff
+                    owner.setdefault(u, f"model.tiers['{purpose}']")
+                    if u not in self._backend:
+                        self._backend[u] = VllmBackend(
+                            eff, u, timeout_s=timeout_s,
+                            format_mode=format_mode,
+                            deadline_s=deadline_s,
+                            request_seed=self.request_seed,
+                            api_mode=api_mode)
+                self._tiers[purpose] = pool
+                if tier_model is not None:
+                    self.tier_models[purpose] = tier_model
+        # キャッシュキー拡張(D13)。★tier 別モデルの宣言が 1 つも無ければ第138 の値と
+        # **バイト単位で同一**(= 既存ランの llm_cache がそのまま命中する)。
+        # 宣言があるときだけ静的マップ {"tiers": {purpose: model}} を足す。purpose 別の
+        # プロンプトヘッダがあるので「同じプロンプトが別 tier へ行く」実衝突は実質ゼロだが、
+        # **経路の構成そのものをキーへ刻む**ことで、tier 割当を組み替えたランが旧モデルの
+        # 応答を誤再生することを構造的に防ぐ(D13 の趣旨)。キー順は sorted で決定論。
+        # ★正直な限界: ablate の force_tier(構築後に書き込まれる全 purpose の強制寄せ)は
+        #   このマップに現れない。対照条件の指定であって conf の艦隊構成ではないため。
+        _extra = cache_extra_for(format_mode, api_mode)
+        if self.tier_models:
+            _extra = dict(_extra or {})
+            _extra["tiers"] = dict(sorted(self.tier_models.items()))
+        self.cache_extra = _extra
         self._default = self._tiers.get("default", list(self.servers))
         self._cooldown: dict[str, float] = {}
         # 第78バッチ(認知階層アブレーション ablate.cognitive_tier): None=既定=従来どおり

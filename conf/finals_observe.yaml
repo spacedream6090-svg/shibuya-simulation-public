@@ -90,6 +90,34 @@ model:
   #    **戻すには `completions`**(基底 conf の既定値。送出ボディが従来とバイト一致に戻る)。
   #    ★注意(運用): finals-vllm7.yaml の model: ブロックにも同じ 1 行がある。貼るときに消さないこと。
   api_mode: chat
+  # ---- MIX-1 混合モデル艦隊 5+2(正典 docs/plans/model-mix-plan.md)-------------------
+  # 会話(default)= Qwen3-8B ×5(GPU0-4 / port 8000-8004)= `model.name`
+  # 思考(reflect / plan)= Qwen3-14B ×2(GPU5-6 / port 8005-8006)= 下の `model:` 行
+  # ★このファイルは backend: mock のまま(基底)なので tiers は**読まれない**。本選で
+  #   finals-vllm7.yaml の model: ブロック(backend/name/servers)を貼った瞬間に実効になる。
+  #   両方に同じ tiers を置いてあるのは「貼るときに落として黙って単一モデルへ戻る」を防ぐため
+  #   (plan_max_tokens 896 / api_mode: chat と同じ落とし穴)。
+  # ★1 サーバ = 1 モデル: 14B のポートは `servers:` に書かない(書くと起動時 ValueError)。
+  # ★8B へ戻すのは `model:` 行を消すだけ(URL リスト形式 = 艦隊既定モデル)。
+  # ★ops/launch-vllm-finals.ps1 の GPU→port 割当と同期すること。
+  # ★5+2 は MIX-3 リハーサル(R_eff 実測)で確定する暫定値。縮退線は 6+1(conf 1-2 行)。
+  tiers:
+    reflect:
+      urls:
+        - "http://localhost:8005"
+        - "http://localhost:8006"
+      model: "qwen3:14b"
+    plan:
+      urls:
+        - "http://localhost:8005"
+        - "http://localhost:8006"
+      model: "qwen3:14b"
+    default:
+      - "http://localhost:8000"
+      - "http://localhost:8001"
+      - "http://localhost:8002"
+      - "http://localhost:8003"
+      - "http://localhost:8004"
 
 # ============================================================================
 # (2) 名簿 = 100万プール(pool)+ 層別クォータ(DP-U3 案A)

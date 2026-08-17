@@ -280,6 +280,11 @@ model:
   #   reflect: ["http://localhost:8000"]                       # 内省=重い/大モデル1本に寄せる
   #   default: ["http://localhost:8001", "http://localhost:8002"]  # 会話・投稿=小モデル群
   #   ※ tiers を書くと servers が1本でも FleetLLM が使われる(seam を通す)。
+  #   ※ MIX-1(混合モデル艦隊): 値を `{urls: [...], model: "qwen3:14b"}` の dict 形式で書くと、
+  #      その tier のサーバだけ**別モデル名**で建つ(urls 必須 / model 任意=省略時は model.name)。
+  #      1 サーバ = 1 モデル(vLLM は 1 プロセス 1 モデル)= 別モデルのポートは servers に書かない。
+  #      tier 別モデルを宣言したランはキャッシュキーが別(cache_extra に {"tiers": {...}})=
+  #      艦隊構成を組み替えても旧モデルの応答を誤再生しない。本選例は conf/profiles/finals-vllm7.yaml。
   # ---- 合成ルータ(backend: router のときだけ読む。第23バッチ M2)----
   # 異なるモデル・異なる提供元(ローカル/API)を purpose 別に1ランへ混載する。
   # 子は各自 CachedLLM で包まれ、キャッシュは子の name 別ファイル(llm_cache.<name>.jsonl)=D13維持。

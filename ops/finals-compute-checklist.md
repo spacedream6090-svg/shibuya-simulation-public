@@ -47,14 +47,10 @@ open("/tmp/finals_merged_profile.yaml", "wb").write(OmegaConf.to_yaml(m).encode(
 PY
 python scripts/freeze_config.py --profile /tmp/finals_merged_profile.yaml
 
-#  (別解) dotlist で model ブロックを流し込む(13 個。URL 配列も dotlist で通る)
-python scripts/freeze_config.py --profile conf/finals_observe.yaml \
-  model.backend=vllm model.cache=true model.format=json model.temperature=0.7 \
-  model.timeout_s=120 model.max_tokens=320 model.plan_max_tokens=448 \
-  model.reflect_max_tokens=768 model.reflect_think=false model.name=qwen3:8b \
-  'model.servers=[http://localhost:8000,http://localhost:8001,http://localhost:8002,http://localhost:8003,http://localhost:8004,http://localhost:8005,http://localhost:8006]' \
-  'model.tiers.reflect=[http://localhost:8000]' \
-  'model.tiers.default=[http://localhost:8001,http://localhost:8002,http://localhost:8003,http://localhost:8004,http://localhost:8005,http://localhost:8006]'
+#  (別解=廃止・第139) かつてここにあった「dotlist で model ブロックを流し込む」別解は削除した。
+#    理由: 第137-139 で model ブロックが成長し(plan_max_tokens 896 / plan・recall 温度 /
+#    api_mode: chat / tiers 5+2 の dict 形式)、dotlist の写しが黙って古い値へ戻る事故
+#    (plan_max_tokens 448 事件と同型)の温床になるため。合流は上の(推奨)一本のみ。
 
 # ② 出た1枚を目視 → sha256 を控える(既定 conf/finals_<YYYYMMDD>_frozen.yaml + .sha256)
 #    確認するのは最低この 5 行: model.backend / model.servers の本数 /
