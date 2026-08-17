@@ -31,7 +31,13 @@ model:
   #  2048→768 に下げると 1リクエストの KV 予約が縮み、同時実行スロットが増える=高並列時の
   #  スループット改善に効く(ollama 単一ストリームでは非拘束=無効。効果は本選機で要実測)。
   max_tokens: 320
-  plan_max_tokens: 448
+  # 第137 V-P1: plan は 4-8 ブロック×50-80tok+自由文=350-700tok+ を要求するのに 448 で
+  # 切られていた(実LLMの壊れ67%の第一容疑=予算切断)。finals_observe.yaml と同値の 896 に
+  # 揃える(★この model: ブロックを finals_observe へ貼る運用のため、ここが 448 のままだと
+  # 黙って旧値へ戻る。freeze_config 前に必ず一致確認)。
+  plan_max_tokens: 896
+  plan_temperature: 0.3    # 第137 V-P1(構造出力の安定・deliberate/reply は temperature を維持)
+  recall_temperature: 0.2  # 第137 V-P1
   reflect_max_tokens: 768
   reflect_think: false
 

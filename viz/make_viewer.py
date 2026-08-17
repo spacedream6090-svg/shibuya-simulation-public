@@ -1,11 +1,17 @@
 """実行結果 → HTML ビューア v5(sim⇄viz 疎結合: ログを読むだけ)。
 
 使い方:  python viz/make_viewer.py runs/day80 [--no-traffic] [--start-tod HH:MM]
-                                   [--lateral-offset]
+                                   [--lateral-offset] [--event-feed] [--indoor-v2]
   --start-tod : 壁時計の開始時刻を明示上書き(既定は run の sim_min 列から復元。
                 sim_min 列が無い旧ランのフォールバック値でもある。未指定既定 07:00)。
   --lateral-offset : 街路上の人を中心線から横へ散らす(I-1 λ。表示専用でシミュには
                 非干渉)。既定 OFF=未指定なら生成 HTML は従来とバイト同一。
+  --event-feed : 右ペインにイベントタイムライン(F1・第137)。viz/notable_events.py の
+                単一レジストリ + viz/feed_rank.py のスコア(重要度+自己較正の希少度+
+                magnitude_z + 連鎖 + 初出 − 物語重複)で層化し、L4D 式ペーシングで間引く。
+                クリックでその時刻へシーク+位置へパン+当事者をフォーカス。**観測専用**。
+  --indoor-v2 : 在館者の表示改善(F3・第137)。実フットプリント形状内への散布・sin 微動の
+                撤去・密度表示への切替。既定 OFF=未指定なら生成 HTML は従来とバイト同一。
 生成物(2ファイル分離、ユーザー要望 2026-07-04):
   viewer.html    — 地図ビューア(OSM タイル・レイヤー・再生・フォーカス・フロアビュー)
   dashboard.html — 情報ダッシュボード(出来事 / ネット[X風SNS・LINE風DM・検索] /
@@ -52,6 +58,26 @@ def _load_run_dt():
         spec.loader.exec_module(mod)
         _RUN_DT = mod
     return _RUN_DT
+
+
+_FEED_RANK = None
+
+
+def _load_feed_rank():
+    """viz/feed_rank.py(イベントフィードのランキング純関数)を場所非依存で読む。
+
+    F1・第137。`viz/notable_events.py` の単一レジストリを唯一の正典にしたスコア関数で、
+    **観測専用**(シムにも L1 にも 1 バイトも触らない)。`--event-feed` を明示した時だけ
+    呼ばれるので、未指定のランでは import すら起きない = 旧ラン出力はバイト同一。
+    """
+    global _FEED_RANK
+    if _FEED_RANK is None:
+        spec = importlib.util.spec_from_file_location(
+            "feed_rank", Path(__file__).resolve().parent / "feed_rank.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _FEED_RANK = mod
+    return _FEED_RANK
 
 
 # W2-3 / W4-C: **ラン依存**(run.dt_min)。モジュール定数は正準 Δt=10 のまま据え置き、
@@ -690,7 +716,8 @@ def load_occupancy(run_dir: Path, buildings: list, n_steps: int,
 def build_data(run_dir: Path, include_traffic: bool = True,
                start_min: int | None = None,
                include_moves: bool = False,
-               step_minutes: int | None = None) -> dict:
+               step_minutes: int | None = None,
+               event_feed: bool = False) -> dict:
     # W4-C: **ランを読む入口**。1 step の分数はこのランの run.dt_min(config.yaml →
     # run_manifest.json → 正準 10 を仮定して stderr へ 1 行告知)。Δt=10 のランでは 10 =
     # 従来の直書きと同値なので出力は 1 バイトも変わらない。明示指定は試験用の上書き口。
@@ -1070,6 +1097,14 @@ def build_data(run_dir: Path, include_traffic: bool = True,
     occ = load_occupancy(run_dir, buildings, n_steps, has_indoor_floor=(ind is not None))
     if occ is not None:
         out["occupancy"] = occ
+    # イベントフィード(F1・第137): `--event-feed` を**明示した時だけ**埋め込む。既定 OFF なので
+    # 未指定の生成は out が 1 キーも増えない = 旧ランの viewer.html はバイト同一(λ と同型の後方互換)。
+    # 素材は既に読んである `events`(L1)だけ。ランにも L1 にも一切書かない純観測。
+    if event_feed:
+        feed = _load_feed_rank().build_feed(events, step_minutes=step_minutes,
+                                            start_min=start_min)
+        if feed["events"]:
+            out["evfeed"] = feed
     return out
 
 
@@ -2242,6 +2277,161 @@ function izClickChips(px, py){
 """
 
 
+# ============================================================ F3 在館者の表示改善(第137)
+# `--indoor-v2` を **明示した時だけ** main() が `__INDOOR_JS__` の直後へ足す上書き JS。
+# 未指定なら 1 文字も増えない → 旧ランの viewer.html / dashboard.html はバイト同一
+# (I-1 λ・B5 屋内と同型の後方互換。テンプレートには新トークンを 1 つも足していない)。
+#
+# 直すのはユーザー評価 2026-08-17「四角い塊の不気味な揺れ」の 3 点:
+#   ① 散布が **bbox 由来の矩形**(floorLayout の zones は footprint の外接矩形を分割した
+#      もの)なので、L 字・三角の建物では人が実在しない場所に湧いて「四角い塊」に見えた
+#      → 候補点を **実フットプリント多角形の内側**に落とす(決定論の棄却サンプリング)。
+#   ② `amp*Math.sin(nowT*…)` の微動 → **完全撤去**。位置は連続時刻 t に依存しない純関数に
+#      なる(= 静止した人は本当に静止する。時間を止めれば絵も止まる)。
+#   ③ 個別ドットが重なる密度になったら **密度表示**(区画ごとのヒート円+人数チップ)へ
+#      切替。「低ズームで在館者が閾値超」= 画面上のフットプリント面積がドット面積の総和に
+#      対して足りない、という**画面上の量**で判定する(倍率と人数の両方に効く単一の式)。
+# 幾何(floorLayout / zones / corridor / core)には一切触らないので、シム側の間取り
+# パリティ(vision.building_layout との一致)は不変。
+_SPOT_JS = r"""
+// ---- F3: 在館者の散布を「実フットプリント形状の内側」へ(矩形一様の四角い塊を解消)----
+const SPOT_TRIES = 24;             // 区画内の候補点を試す回数(決定論列)
+const SPOT_PAD = 0.08;             // 区画の内側余白(比率)
+const SPOT_DENSITY_MIN = 12;       // これ未満は必ず個別ドット(少人数で密度表示にしない)
+const SPOT_DENSITY_SLACK = 2.6;    // ドット面積×この係数より画面が狭ければ密度表示へ
+
+// 点が多角形の内側か(clickAt の建物ヒットテストと同じ ray casting)。
+function spotInFP(fp, x, y){
+  let ins=false;
+  for(let i=0,j=fp.length-1;i<fp.length;j=i++){
+    if((fp[i][1]>y)!==(fp[j][1]>y) &&
+       x < (fp[j][0]-fp[i][0])*(y-fp[i][1])/(fp[j][1]-fp[i][1])+fp[i][0]) ins=!ins; }
+  return ins;
+}
+// 矩形 r の中に決定論の点を打ち、**footprint の内側に入るまで**引き直す。
+// 全滅(細長い区画が建物の外にはみ出している等)なら建物重心へ寄せて必ず内側に落とす。
+function spotPointIn(b, f, id, r){
+  const rng=_rng(_hash('p'+id+':'+(b.id||b.name)+':'+f));
+  const w=r[2]-r[0], h=r[3]-r[1], span=1-2*SPOT_PAD;
+  let fx=null, fy=null;
+  for(let k=0;k<SPOT_TRIES;k++){
+    const x=r[0]+w*(SPOT_PAD+rng()*span), y=r[1]+h*(SPOT_PAD+rng()*span);
+    if(k===0){ fx=x; fy=y; }                       // 全滅時の退避(=従来と同じ「区画内の点」)
+    if(spotInFP(b.fp, x, y)) return [x,y];
+  }
+  const cx=b.cx, cy=b.cy;
+  if(cx===undefined || cy===undefined) return [fx,fy];
+  for(let k=1;k<=8;k++){ const g=k/9;
+    const mx=fx+(cx-fx)*g, my=fy+(cy-fy)*g;
+    if(spotInFP(b.fp, mx, my)) return [mx,my]; }
+  return spotInFP(b.fp, cx, cy)? [cx,cy] : [fx,fy];
+}
+
+// 屋内エージェントの位置(**nowT を使わない**= 揺れ無し・時間に依存しない純関数)。
+// 引数は従来と同じ(呼び出し側 drawFloor / izDrawFloorPlan を書き換えないため)。
+var _agentSpot = function(b, f, id, lay, nowT){
+  const z = lay.zones.length? lay.zones[_hash('a'+id)%lay.zones.length] : {r:lay.corridor};
+  return spotPointIn(b, f, id, z.r);
+};
+
+// space_move 由来の実区画内の点も同じ規則で footprint 内へ(izZonePoint の上書き)。
+// 建物は izDrawFloorPlan が直前に置く _spotB から取る(呼び出し側の引数を変えないため)。
+let _spotB=null;
+var izZonePoint = function(r, id){
+  if(_spotB) return spotPointIn(_spotB, 0, id, r);
+  const rr=_rng(_hash('iz'+id)); const mx=(r[2]-r[0])*0.2, my=(r[3]-r[1])*0.2;
+  const u=rr(), v=rr();
+  return [r[0]+mx+u*Math.max(0,(r[2]-r[0]-2*mx)), r[1]+my+v*Math.max(0,(r[3]-r[1]-2*my))];
+};
+
+// ---- F3③: 個別ドットが重なる密度なら「密度表示」へ切替(円サイズ+ヒート)----
+// izDrawFloorPlan の同型上書き。間取りの描画は 1 行も変えず、**エージェント層だけ**を
+// 「個別ドット / 密度」の 2 モードにする。
+var izDrawFloorPlan = function(b, bi, fl, s0, t, pos, dark){
+  const lay=floorLayout(b, fl);
+  const rp=(r)=>{ const [ax,ay]=tf(r[0],r[1]), [bx,by]=tf(r[2],r[3]);
+    return [Math.min(ax,bx),Math.min(ay,by),Math.abs(bx-ax),Math.abs(by-ay)]; };
+  ctx.save();
+  ctx.beginPath(); b.fp.forEach((p,j)=>{ const [x,y]=tf(p[0],p[1]); j?ctx.lineTo(x,y):ctx.moveTo(x,y); }); ctx.closePath();
+  ctx.fillStyle=dark?'rgba(19,26,35,.96)':'rgba(245,247,249,.96)'; ctx.fill(); ctx.clip();
+  ctx.font=`${9.5*devicePixelRatio}px system-ui,sans-serif`; ctx.textAlign='center';
+  for(const z of lay.zones){ const hueV=_ZONE_HUE[z.cat]??210; const [x,y,w,h]=rp(z.r);
+    ctx.fillStyle=`hsla(${hueV} ${dark?42:56}% ${dark?28:80}% / ${dark?.62:.85})`; ctx.fillRect(x,y,w,h);
+    ctx.strokeStyle=dark?'rgba(255,255,255,.1)':'rgba(60,72,90,.28)'; ctx.lineWidth=1; ctx.strokeRect(x,y,w,h);
+    if(w>34*devicePixelRatio && h>13*devicePixelRatio){
+      ctx.fillStyle=dark?'rgba(232,234,237,.85)':'rgba(40,48,60,.85)';
+      const lb=z.label && z.label.length>8? z.label.slice(0,7)+'…':(z.label||'');
+      ctx.fillText(lb, x+w/2, y+h/2+3*devicePixelRatio); } }
+  { const [x,y,w,h]=rp(lay.corridor); ctx.fillStyle=dark?'rgba(200,210,225,.09)':'rgba(120,135,155,.15)'; ctx.fillRect(x,y,w,h); }
+  { const [x,y,w,h]=rp(lay.core); ctx.fillStyle=dark?'#26313f':'#d7dee6'; ctx.fillRect(x,y,w,h);
+    ctx.strokeStyle=dark?'rgba(255,255,255,.18)':'rgba(60,72,90,.4)'; ctx.strokeRect(x,y,w,h); }
+  ctx.restore();
+  ctx.beginPath(); b.fp.forEach((p,j)=>{ const [x,y]=tf(p[0],p[1]); j?ctx.lineTo(x,y):ctx.moveTo(x,y); }); ctx.closePath();
+  ctx.strokeStyle=dark?'rgba(150,161,178,.65)':'rgba(60,72,90,.55)'; ctx.lineWidth=1.6*devicePixelRatio; ctx.stroke();
+  const w=1000+bi*100+fl;
+  izDrawTracks(w, t);
+  // --- ここから在館者層(F3)---
+  _izScreen={};
+  const here=[]; for(let i=0;i<D.ids.length;i++) if(pos[i][2]===w) here.push(i);
+  if(!here.length){ izDrawContacts(w, s0, t); return; }
+  const [fx0,fy0,fw,fh]=rp([Math.min(...b.fp.map(p=>p[0])), Math.min(...b.fp.map(p=>p[1])),
+                            Math.max(...b.fp.map(p=>p[0])), Math.max(...b.fp.map(p=>p[1]))]);
+  const dotA=Math.PI*Math.pow(5.5*devicePixelRatio,2);
+  const dense = here.length>=SPOT_DENSITY_MIN && (fw*fh) < here.length*dotA*SPOT_DENSITY_SLACK;
+  _spotB=b;
+  if(dense){
+    // 区画ごとの人数 → ヒート円(半径∝√人数)+ 人数チップ。個別ドットは描かない。
+    const byZone={};
+    for(const i of here){ const zi=izZoneOf(i, s0, w);
+      const k=(zi>=0 && zi<lay.zones.length)? zi : -1; byZone[k]=(byZone[k]||0)+1; }
+    const maxN=Math.max(...Object.values(byZone));
+    ctx.save(); ctx.globalCompositeOperation='lighter';
+    for(const k in byZone){
+      const n=byZone[k];
+      const r = (k>=0)? lay.zones[k].r : lay.corridor;
+      const [zx,zy,zw,zh]=rp(r); const cxp=zx+zw/2, cyp=zy+zh/2;
+      const rad=Math.max(6*devicePixelRatio,
+                         Math.min(Math.max(zw,zh)*0.55, Math.sqrt(n)*7*devicePixelRatio));
+      const a=0.16+0.34*(n/maxN);
+      const g=ctx.createRadialGradient(cxp,cyp,0,cxp,cyp,rad);
+      g.addColorStop(0,`rgba(255,150,80,${a.toFixed(3)})`);
+      g.addColorStop(1,'rgba(255,150,80,0)');
+      ctx.fillStyle=g; ctx.beginPath(); ctx.arc(cxp,cyp,rad,0,7); ctx.fill(); }
+    ctx.restore();
+    for(const k in byZone){
+      const n=byZone[k];
+      const r = (k>=0)? lay.zones[k].r : lay.corridor;
+      const [zx,zy,zw,zh]=rp(r); const cxp=zx+zw/2, cyp=zy+zh/2;
+      ctx.font=`${10*devicePixelRatio}px system-ui,sans-serif`; ctx.textAlign='center';
+      ctx.strokeStyle=dark?'rgba(0,0,0,.6)':'rgba(255,255,255,.9)';
+      ctx.lineWidth=3*devicePixelRatio; ctx.strokeText(`${n}`, cxp, cyp+3*devicePixelRatio);
+      ctx.fillStyle=dark?'#ffd166':'#b45309'; ctx.fillText(`${n}`, cxp, cyp+3*devicePixelRatio); }
+    // フロア合計(密度表示中であることを明示する小チップ)
+    ctx.font=`${9.5*devicePixelRatio}px system-ui,sans-serif`; ctx.textAlign='left';
+    const lbl=`👥${here.length}`;
+    ctx.fillStyle=dark?'rgba(20,26,35,.8)':'rgba(255,255,255,.85)';
+    const tw=ctx.measureText(lbl).width+8*devicePixelRatio;
+    ctx.beginPath(); ctx.roundRect(fx0+4*devicePixelRatio, fy0+4*devicePixelRatio,
+                                   tw, 13*devicePixelRatio, 3*devicePixelRatio); ctx.fill();
+    ctx.fillStyle=dark?'#ffd166':'#b45309';
+    ctx.fillText(lbl, fx0+8*devicePixelRatio, fy0+13.5*devicePixelRatio);
+  } else {
+    for(const i of here){
+      const zi=izZoneOf(i, s0, w); let wx, wy;
+      // 実区画が判っている人はその区画内へ・未確定は従来どおり _agentSpot へ退避。
+      // どちらも spotPointIn を通るので footprint の外には出ない。
+      if(zi>=0 && zi<lay.zones.length){ const sp=spotPointIn(b, fl, D.ids[i], lay.zones[zi].r); wx=sp[0]; wy=sp[1]; }
+      else { const sp=_agentSpot(b, fl, D.ids[i], lay, t); wx=sp[0]; wy=sp[1]; }
+      const [x,y]=tf(wx,wy); _izScreen[i]=[x,y];
+      ctx.beginPath(); ctx.arc(x,y,4.5*devicePixelRatio,0,7); ctx.fillStyle=colorOf(i,s0); ctx.fill();
+      ctx.strokeStyle='#ffd166'; ctx.lineWidth=1.3*devicePixelRatio; ctx.stroke(); }
+  }
+  _spotB=null;
+  izDrawContacts(w, s0, t);
+};
+"""
+
+
 # ============================================================ コミュニティ色分け
 # 第18バッチ①: runs/<name>/communities.json が「有る時だけ」注入する追加 JS。
 # communityColor(i, s0) は再生中の step s0 が属する窓の agent→community 対応を引き、
@@ -2263,6 +2453,129 @@ function communityColor(i, s0){
   }
   return '#8a97a5';
 }"""
+
+
+# ============================================================ F1 イベントフィード(第137)
+# `--event-feed` を **明示した時だけ** main() が `__COMMUNITY_JS__` へ追記合成する右ペイン。
+# 未指定なら 1 文字も増えない → 旧ランの viewer.html はバイト同一(I-1 λ と同型の後方互換)。
+# `__COMMUNITY_JS__` は MAP_HTML にしか無いので dashboard.html には構造上入らない。
+#
+# 何を出すか: D.evfeed(viz/feed_rank.build_feed の出力)を時刻順のタイムラインにする。
+#   - 行 = 時刻 / 種別アイコン+ラベル / 当事者名 / payload 要約 / ★重要度 /「+N件」折りたたみ
+#   - クリック = ①その時刻へシーク(再生は一時停止)②その位置へパン ③当事者をフォーカス
+#     (既存の clickAt/renderFocus と同じ機構を使う。focusId を立てれば draw() が
+#      毎フレーム追尾パンするので、地図側のコードには一切触らない)
+#   - ★フィルタ(重要度下限)と折りたたみ表示は**表示制御のみ**。スコアと採否は Python 側で
+#     決定論に決まっており、ブラウザでは並べ替えも再計算もしない(観測の再現性)。
+# パネルは JS で組む(MAP_HTML/CSS は無改変=既存テンプレ無改変テストの前提を壊さない)。
+_FEED_JS = r"""
+(function(){
+  const F = D.evfeed; if(!F || !F.events || !F.events.length) return;
+  const EV = F.events;
+  const stars = n => '★'.repeat(Math.max(0,Math.min(5,n)));
+  const esc = s => String(s==null?'':s).replace(/[&<>"]/g,
+    c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  const tOf = m => `Day${Math.floor(m/1440)} `
+    + String(Math.floor(m/60)%24).padStart(2,'0')+':'+String(m%60).padStart(2,'0');
+
+  const el=document.createElement('div'); el.className='glass'; el.id='feedPane';
+  el.style.cssText='position:fixed;right:14px;top:14px;width:312px;z-index:6;'
+    +'max-height:calc(100vh - 92px);display:flex;flex-direction:column;'
+    +'padding:11px 12px 9px;font-size:12px;';
+  el.innerHTML=
+     '<div id="fdHdr" style="display:flex;align-items:center;gap:6px;cursor:pointer">'
+    +'<b style="font-size:12.5px">🗞 イベント</b>'
+    +'<span id="fdN" style="color:var(--dim);font-size:11px"></span>'
+    +'<span style="flex:1"></span><span id="fdCar" style="color:var(--dim)">▾</span></div>'
+    +'<div id="fdBody" style="display:flex;flex-direction:column;min-height:0">'
+    +'<div style="display:flex;align-items:center;gap:6px;margin:8px 0 6px">'
+    +'<select id="fdMin"><option value="0">すべて</option><option value="3">★3以上</option>'
+    +'<option value="4" selected>★4以上</option><option value="5">★5のみ</option></select>'
+    +'<label style="display:flex;align-items:center;gap:4px;color:var(--dim);font-size:11px;cursor:pointer">'
+    +'<input type="checkbox" id="fdSync" checked>再生に追従</label></div>'
+    +'<div id="fdList" style="overflow-y:auto;min-height:0;max-height:calc(100vh - 210px)"></div>'
+    +'<div id="fdCap" style="color:var(--dim);font-size:10px;margin-top:6px;line-height:1.45"></div>'
+    +'</div>';
+  document.body.appendChild(el);
+  // レイヤーパネルを左へ寄せて重なりを避ける(フィードが出ている時だけ)
+  const ly=document.getElementById('layers'); if(ly) ly.style.right='340px';
+
+  const list=document.getElementById('fdList');
+  const minSel=document.getElementById('fdMin');
+  const sync=document.getElementById('fdSync');
+  let shown=[];                                   // 表示中の EV 添字
+
+  function render(){
+    const lo=Number(minSel.value)||0;
+    shown=[]; let h='';
+    for(let i=0;i<EV.length;i++){
+      const e=EV[i]; if(e.i<lo) continue;
+      shown.push(i);
+      const kd=F.kinds[e.k]||{label:e.k, icon:'•'};
+      const who = e.a<0? '世界' : nameOf(e.a);
+      h+='<div class="fdRow" data-i="'+i+'" style="padding:6px 6px;border-radius:9px;cursor:pointer;'
+        +'border-left:3px solid transparent">'
+        +'<div style="display:flex;align-items:baseline;gap:5px">'
+        +'<span style="color:var(--dim);font-size:10.5px;white-space:nowrap">'+tOf(e.m)+'</span>'
+        +'<span>'+kd.icon+'</span><b style="font-size:11.5px">'+esc(kd.label)+'</b>'
+        +'<span style="flex:1"></span>'
+        +'<span style="color:#e8a33d;font-size:9.5px;letter-spacing:-1px">'+stars(e.i)+'</span></div>'
+        +'<div style="color:var(--dim);font-size:11px;margin-top:1px">'
+        +'<span style="color:'+(e.a<0?'#f43f5e':colOf(e.a))+'">●</span> '+esc(who)
+        +(e.t? ' — '+esc(e.t):'')
+        +(e.n? ' <span style="opacity:.75">+'+e.n+'件</span>':'')+'</div></div>';
+    }
+    list.innerHTML = h || '<div style="color:var(--dim);padding:6px">該当なし</div>';
+    document.getElementById('fdN').textContent=`${shown.length}/${EV.length}件`;
+    const c=F.caps||{};
+    document.getElementById('fdCap').textContent=
+      `母集団 ${c.n_total||0} 件 → 掲載 ${EV.length}(ペーシング除外 ${c.paced||0}`
+      + (c.capped? ` / 上限 ${c.capped}`:'') + ')';
+  }
+
+  function goto(i){
+    const e=EV[i]; if(!e) return;
+    cur=Math.max(0, Math.min(D.nSteps-1, e.s));
+    seek.value=cur;
+    playing=false;                                 // 見逃さないよう一時停止して着地する
+    const pb=document.getElementById('play'); if(pb) pb.textContent='▶';
+    if(e.p){ cam.cx=e.x; cam.cy=e.y; if(cam.s<1.6) cam.s=1.6; }
+    if(e.a>=0 && iOf[e.a]!==undefined){ focusId=e.a; renderFocus(); }
+    mark(i);
+  }
+  function mark(i){
+    for(const r of list.children){ const on=Number(r.dataset.i)===i;
+      r.style.background = on? 'var(--on)':'transparent';
+      r.style.borderLeftColor = on? 'var(--accent)':'transparent'; }
+  }
+  list.addEventListener('click', ev=>{
+    const row=ev.target.closest('.fdRow'); if(row) goto(Number(row.dataset.i)); });
+  minSel.addEventListener('change', render);
+  document.getElementById('fdHdr').onclick=()=>{
+    const b=document.getElementById('fdBody'), off=b.style.display==='none';
+    b.style.display=off?'flex':'none';
+    document.getElementById('fdCar').textContent=off?'▾':'▸'; };
+
+  // 狭い画面では畳んだ状態で始める(地図を隠さない)。ヘッダをクリックすれば開く。
+  if(window.innerWidth < 780){
+    document.getElementById('fdBody').style.display='none';
+    document.getElementById('fdCar').textContent='▸'; }
+
+  // 再生に追従: いま流れている時刻の直近イベント行をハイライト+視界へ入れる
+  let lastMark=-1;
+  setInterval(()=>{
+    if(!sync.checked || !shown.length) return;
+    let best=-1;
+    for(const i of shown){ if(EV[i].s<=cur) best=i; else break; }
+    if(best<0 || best===lastMark) return;
+    lastMark=best; mark(best);
+    const row=list.querySelector('.fdRow[data-i="'+best+'"]');
+    if(row) row.scrollIntoView({block:'nearest'});
+  }, 400);
+
+  render();
+})();
+"""
 
 
 # ============================================================ 移動手段の凡例(mode_legend)
@@ -4471,8 +4784,13 @@ def main() -> None:
     include_traffic = "--no-traffic" not in flags
     # 屋内セマンティックズーム(B5): --indoor-moves で歩行軌跡ポリラインも埋め込む(7日以下・サイズガード)。
     include_moves = "--indoor-moves" in flags
+    # F1/F3(第137): どちらも **明示した時だけ** 効く観測専用の表示層。未指定なら注入文字列が
+    # 1 文字も増えないので、旧ランの再生成は viewer.html / dashboard.html ともバイト同一。
+    event_feed = "--event-feed" in flags
+    spot_v2 = "--indoor-v2" in flags
     data = build_data(run_dir, include_traffic=include_traffic, start_min=start_min,
-                      include_moves=include_moves, step_minutes=step_minutes)
+                      include_moves=include_moves, step_minutes=step_minutes,
+                      event_feed=event_feed)
     payload = json.dumps(data, ensure_ascii=False)
     # 第18バッチ①: communities.json が有る時だけ色分け「コミュニティ」を追加。
     # 無ければ3トークンとも空文字へ→ MAP_HTML はバイト同一(後方互換の合格条件)。
@@ -4544,10 +4862,20 @@ def main() -> None:
     lateral_on = "--lateral-offset" in flags
     if lateral_on:
         comm_js += _LATERAL_2D_JS
+    # F1 イベントフィード: --event-feed を明示し、かつ実際に掲載イベントが在る時だけ右ペインを注入。
+    # λ と同じ __COMMUNITY_JS__ 追記合成なので dashboard.html には構造上入らない。
+    has_feed = "evfeed" in data
+    if has_feed:
+        comm_js += _FEED_JS
     # 屋内セマンティックズーム(B5): floorSpecs(=indoor ラン)が有る時「だけ」JS/フック/クリックを注入。
     # 無ければ3トークンとも空文字→ MAP_HTML/DASH_HTML は従来とバイト同一(後方互換の合格条件)。
     has_indoor = "floorSpecs" in data
     indoor_js = _INDOOR_JS if has_indoor else ""
+    # F3 在館者の表示改善: --indoor-v2 を明示した時だけ __INDOOR_JS__ の直後へ上書き JS を足す
+    # (未指定なら 1 文字も増えない=旧ランはバイト同一)。屋内データが無いランでも
+    # フロア(間取り)モーダルの散布/揺れには効くので、has_indoor とは独立に足す。
+    if spot_v2:
+        indoor_js += _SPOT_JS
     indoor_hook = "  indoorOverlay(t, s0, pos);\n" if has_indoor else ""
     indoor_click = "  if(izClickChips(px,py)) return;\n" if has_indoor else ""
     for name, template in (("viewer.html", MAP_HTML), ("dashboard.html", DASH_HTML)):
@@ -4582,6 +4910,21 @@ def main() -> None:
     if lateral_on:
         print(f"  λ 横オフセット(I-1): ON  edges={len(data['edges'])} "
               f"buildings={len(data['buildings'])}(帯の clamp 材料)")
+    if spot_v2:
+        print("  在館者の表示改善(F3): ON  実フットプリント散布・微動なし・密度切替")
+    if has_feed:
+        fd = data["evfeed"]
+        st, cp = fd["stats"], fd["caps"]
+        top = sorted(fd["events"], key=lambda e: -e["sc"])[:3]
+        print(f"  イベントフィード(F1): 母集団 {st['n_total']} 件 → 掲載 {st['n_kept']} 件"
+              f"(ペーシング除外 {cp['paced']} / 上限 {cp['capped']})"
+              f" kinds={len(fd['kinds'])}")
+        for e in top:
+            print(f"    上位: {fd['kinds'][e['k']]['label']}"
+                  f"(score {e['sc']:.3f} step {e['s']})")
+    elif event_feed:
+        print("  イベントフィード(F1): 掲載対象イベントが 0 件のため注入なし"
+              "(= viewer.html は未指定時とバイト同一)")
     if has_orgs:
         print(f"  会社(B7): {data['orgs']['n_orgs']}社 系列={data['orgs']['source']}")
     # 在館タブは occupancy.parquet が有る時だけ出る。屋内/建物の在館データが在るのに未生成なら案内

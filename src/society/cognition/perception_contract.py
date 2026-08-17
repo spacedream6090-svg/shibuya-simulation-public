@@ -161,6 +161,10 @@ class Perception:
     venture_cost: float = 30000.0
     city_name: str = ""
     variety_hint: bool = False
+    # V-P1(既定 None = 現行のプロンプトとバイト一致)。「このプロンプトはどの用途か」の札で、
+    # 世界(conf)が run 内で決める提示規約の一種なのでここに置く。値そのものは
+    # `prompt_p1.purpose_for(sim, "deliberate")` = ON なら "deliberate" / OFF なら None。
+    p1_purpose: str | None = None
 
     # ---- salience(第80 channels の σ 正規化誤差を再利用。二重計算しない) ---- #
     salience: Mapping[str, float] = field(default_factory=dict)
@@ -309,6 +313,7 @@ _KW_FIELDS: tuple[tuple[str, str, bool], ...] = (
     ("venture_cost", "venture_cost", False),
     ("city_name", "city_name", False),
     ("variety_hint", "variety_hint", False),
+    ("p1_purpose", "p1_purpose", False),
 )
 
 _FIELD_OF_KW: dict[str, str] = {kw: fname for kw, fname, _s in _KW_FIELDS}

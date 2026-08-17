@@ -78,6 +78,7 @@ from ..cognition import fire as fire_mod
 from ..cognition import perception_contract as contract_mod
 from ..cognition import plan_boundary as boundary_mod
 from ..cognition import plasticity as plasticity_mod
+from ..cognition import prompt_p1 as prompt_p1_mod
 from ..cognition import watch as watch_mod
 from ..cognition import reflect_timing as reflect_timing_mod
 from ..cognition import reflection as reflection_mod
@@ -1124,6 +1125,8 @@ def _phase_reflect_batched(sim, step: int, sim_min: int, workers: int) -> None:
     think = bool(sim.cfg.model.reflect_think)
     rfx_tag = reflect_timing_mod.context_tag_on(sim)     # RFX-O(既定 OFF=payload 不変)
     rfx_sleepy = bool(reflect_timing_mod.cfg_of(sim)["sleep_task_rewrite"])
+    p1_on = prompt_p1_mod.enabled(sim)                   # V-P1(既定 OFF=プロンプト不変)
+    p1_recall_t = prompt_p1_mod.recall_temperature(sim)  # 未設定(null)=従来の 0.7
 
     due: list[dict] = []
     for agent in _reflect_due(sim, step, sim_min):  # DPH-B(OFF は sim.agents=不変)
@@ -1146,7 +1149,8 @@ def _phase_reflect_batched(sim, step: int, sim_min: int, workers: int) -> None:
         rreqs = [reflection_mod.build_recall_request(
                      d["agent"], step=step, place_name=_reflect_place(sim, d["agent"]),
                      date_line=date_line, weather_line=weather_line,
-                     city_name=city) for d in due]
+                     city_name=city, p1=p1_on,
+                     temperature=p1_recall_t) for d in due]
         rres = sim.llm.generate_many(rreqs, workers=workers)
         for d, (response, call_id, cached) in zip(due, rres):
             sink = reflection_mod.BufferSink()
@@ -1165,7 +1169,8 @@ def _phase_reflect_batched(sim, step: int, sim_min: int, workers: int) -> None:
                 recalled=d["recalled"], recall_fail=d["recall_fail"],
                 # RFX-A / RFX-O(既定 OFF=None/False=従来定数とバイト一致)
                 moment=reflect_timing_mod.when_of(d["agent"]),
-                sleepy=rfx_sleepy, tag=rfx_tag)
+                sleepy=rfx_sleepy, tag=rfx_tag,
+                p1=p1_on)                        # V-P1(既定 OFF=従来とバイト一致)
             for d in due]
     results = sim.llm.generate_many(reqs, workers=workers)
     for d, req, (response, call_id, cached) in zip(due, reqs, results):
@@ -2390,7 +2395,11 @@ def _gather_material(sim, agent, trigger: str, step: int, sim_min: int, *,
             # =真偽台帳の値・ID・文字列は build_prompt へ到達しない。
             "verify_actions": truth_ledger_mod.verify_actions_on(sim),
             "p2_offers": p2_offers,
-            "dialog_history": dialog_history}
+            "dialog_history": dialog_history,
+            # V-P1(prompts.p1・既定 OFF は None=build_prompt が 1 分岐も踏まない
+            # =バイト一致)。渡すのは「この呼びは熟慮である」という札 1 個だけで、
+            # 世界の情報でも実験条件でもない(= 契約の提示規約の族)。
+            "p1_purpose": prompt_p1_mod.purpose_for(sim, "deliberate")}
 
 
 # --------------------------------------------------------------------------- #
@@ -6384,6 +6393,15 @@ def run_step(sim, step: int) -> None:
     if _roster is not None:
         _roster.on_step(sim, step, sim_min)
 
+    # レーンG 案B 意図収束サイドカー(既定 OFF=sim.gathering_sc is None=分岐 1 回だけ)。
+    # **step 末・roster の直後**に置く理由: 朝の計画(_dayplan.blocks の解決済みノード)も
+    # 予定帳への記入も、この step の _apply の中で確定するので、末尾なら 1 step の遅れが
+    # 出ない。撮るのは 1 日 1 回(capture_min を最初に跨いだ step)だけで、それ以外の
+    # step は int 比較 2 回で戻る。**観測しかしない**(世界も乱数も L1 も 1 バイト不変)。
+    _gathering = getattr(sim, "gathering_sc", None)
+    if _gathering is not None:
+        _gathering.on_step(sim, step, sim_min)
+
     # RFX-A(既定 mode="sleep" は即 return=バイト一致): 内省的瞬間を迎えた個体の予約を
     # **この step で満期にする**。新しい発火点は 1 つも足していない —— 立てた予約は
     # 「後で立つはずだった予約の前倒し」で、`reflect_suppress_arm` がその夜の予約を
@@ -6393,6 +6411,8 @@ def run_step(sim, step: int) -> None:
     _bl = (sim.cfg.get("engine", {}) or {}).get("batch_llm", {}) or {}
     _rfx_tag = reflect_timing_mod.context_tag_on(sim)   # RFX-O(既定 OFF=payload 不変)
     _rfx_sleepy = bool(reflect_timing_mod.cfg_of(sim)["sleep_task_rewrite"])
+    _p1_on = prompt_p1_mod.enabled(sim)                 # V-P1(既定 OFF=プロンプト不変)
+    _p1_recall_t = prompt_p1_mod.recall_temperature(sim)  # 未設定(null)=従来の 0.7
     if ablate_mod.llm_off(sim):
         pass                                       # ablate.llm_off(第78): 夜の内省も撃たない
     elif bool(_bl.get("enabled", False)):
@@ -6423,7 +6443,10 @@ def run_step(sim, step: int) -> None:
                               gt_extras=gt_extras_mod.enabled(sim),
                               # RFX-A / RFX-O(既定 OFF=None/False=従来定数とバイト一致)
                               moment=reflect_timing_mod.when_of(agent),
-                              sleepy=_rfx_sleepy, tag=_rfx_tag)
+                              sleepy=_rfx_sleepy, tag=_rfx_tag,
+                              # V-P1(既定 OFF=False/None=プロンプトも温度も従来と同一)
+                              p1=_p1_on,
+                              recall_temperature=_p1_recall_t)
 
     # 行間補間(P2 S2): この step で新規に記録されたイベントを各個体のバッファへ振り分ける
     # (OFF は _isl_idx=-1 で完全 no-op=バッファも作らない=バイト一致)。発火時の _isl_take が

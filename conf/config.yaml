@@ -210,6 +210,16 @@ model:
   max_tokens: 320       # 発話・投稿・DMの生成上限
   reflect_max_tokens: 1200  # 内省(思考モード)の生成上限(深い振り返り用)
   plan_max_tokens: 0    # 0=max_tokens と同じ(朝の計画のみ上限を分けたい時に設定)
+  # ---- 温度の purpose 分化(V-P1・docs/research/dialogue-coherence-and-model.md §6.1-4)----
+  # null = model.temperature をそのまま使う(= 既定挙動と 1 バイトも変わらない)。
+  # 根拠: Generative Agents の実コード(run_gpt_prompt.py)は「判定・分解・採点=0 /
+  #   生成系=0.5〜1」を使い分けている。本リポは全 purpose 一律 0.7 で、**構造化出力の
+  #   plan** と **検索クエリの recall** まで 0.7 なのは参照実装の流儀に反する。
+  #   発話(deliberate/reply)の 0.7 は妥当なので**触らない**。
+  # ★プロンプト文字列の話(prompts.p1)とは独立の seam にしてある: 1 本のトグルに束ねると
+  #   A/B のときに「文言が効いたのか温度が効いたのか」を分離できなくなるため。
+  plan_temperature: null    # 朝の計画の温度(null=model.temperature。本番候補 0.3)
+  recall_temperature: null  # 内省第1段 recall の温度(null=現行の 0.7。本番候補 0.2)
   reflect_think: true   # 内省を qwen3 の思考モードで回す(thinking/response 分離)
   cache: true           # 応答キャッシュ(D13: 再現性の実体)
   # ---- 第71バッチ 2026-07-31: 実行モードと入出力ジャーナル(dual-mode-observe-verify-plan.md 第71行)----
@@ -1363,6 +1373,24 @@ prompts:
   # OFF 時は1行も足さない=ゴールデン(golden_baseline_l1.json)を守る。切替は主計画者が production 側で行う。
   interstitial:
     enabled: false
+  # ---- V-P1 プロンプト一貫性(正典: docs/research/dialogue-coherence-and-model.md
+  #      §1.3 実ジャーナル解剖 / §6.1 改修候補 P1 / §9-1 段階案の第1段)。既定 OFF=バイト一致 ----
+  # 何を直すか: `deliberate.build_prompt` は発話・計画・内省・recall の**全経路で共有**され、
+  #   冒頭に必ず行動メニュー(「出力は次のいずれかの JSON 1個のみ」+ speak/post/dm/wander)を
+  #   置く。reflect/plan/recall はその後ろに**別の**「出力は次の JSON 1個のみ」を足すので、
+  #   1 プロンプトに**相互排他の出力指示が 2 つ**在る(runs/night_llm_100a3d のジャーナル現物で
+  #   確認済み)。害は (a) 指示追従の予算を無駄に食う (b) 行動メニューの語彙が plan/reflect の
+  #   自由文欄へ混入する誘因になる の 2 つ。
+  # ON で変わること(2 つだけ):
+  #   ① reflect/plan/recall のヘッダから行動メニューを外す(= 出力指示がちょうど 1 つになる)。
+  #      **deliberate のヘッダは 1 バイトも変えない**(行動メニューは deliberate の本体)。
+  #   ② ペルソナ直後に中立の規律 3 行(人物設定の優先・捏造禁止・直前の反復禁止)を足す。
+  #      文言の出所は TinyTroupe の tiny_person.mustache。位置の根拠は Lost in the Middle
+  #      (arXiv:2307.03172)= 守らせたい指示は文脈の先頭か末尾に置く。
+  # ★変わるのは**プロンプト文字列だけ**: LLM 呼数・乱数消費・発火列は ON/OFF で完全一致(R1)。
+  # ★実装 src/society/cognition/prompt_p1.py。検収 tests/test_prompt_p1.py。
+  p1:
+    enabled: false            # ★ON 推奨(本番): true(finals_observe.yaml で ON)
 
 # ---- 交通機関: タクシー+簡易バス(ユーザー要望 2026-07-06)----
 # 電車の高度化(GTFS 実ダイヤ・駅構内)は API 申請待ちのため保留(transit.gtfs_dir 参照)。
@@ -2568,6 +2596,47 @@ observer:
   # 実装 src/society/observer/roster.py(凍結 14 ファイルには含まれない)。
   roster_daily:
     enabled: false              # ★ON 推奨(本番): true(復元実験の名簿保全 + 痩せ A13)
+  # ---- レーンG 案B 意図収束サイドカー gathering_intent.parquet(**既定 OFF**)----------
+  # 正典: docs/research/emergent-events-and-narrative-ui.md §3 案B(assembly ledger)。
+  # 塞ぐ穴: 「集まった事実」を測る器(annual.check_surge の crowd_surge)はあるのに、
+  # **「集まろうとした事実」を測る器が無い**。しかも意図の在り処を調べると、L1 からは
+  # **原理的に復元できない欄**が 3 つある:
+  #   ① 計画ブロックの**解決済みノード** _dayplan.blocks[i].node
+  #      day_plan.repair は場所カテゴリを resolve_place で具体ノードへ解決して焼くが、
+  #      plan_created の payload は {start,end,place,act,aim,priority,flex} しか射影せず
+  #      **node が無い**。plan_block_start.node は schema.py が明記するとおり
+  #      「実行を決めたその瞬間の**現在**ノード(移動前)」= 行き先ではない。
+  #      → 「誰が何時にどのノードへ行くつもりだったか」は L1 に 1 件も残らない。
+  #   ② 予定帳の**相手側の写し** agent.schedule(L1 に出るのは話者視点の appointment 1 件
+  #      だけ。しかも記入は在場者に絞られるので with を素直に読むと過大評価になる)
+  #   ③ イベントの**認知集合** _known_events(= 「招待を知った N 人 → 来た M 人」の分母。
+  #      L1 に出るのは開催宣言と、抽選を通って会場に着いた event_attend だけ)
+  # ON にすると 1 日 1 回(capture_min)在場者を 1 周し、(対象日, 時間帯ビン, 場所)セルへの
+  # 意図数を 1 セル 1 行で gathering_intent.parquet へ追記する。
+  # ★**新しい L1 kind を 1 つも足さない** = ON でも L1 はバイト不変(出口はサイドカー 1 枚)。
+  #   したがって因果台帳 CAUSE_OF_KIND への追加も不要。
+  # ★観測側だけで閉じる: 世界状態を 1 バイトも書かず・乱数を 1 粒も引かず・LLM 呼数を 1 も
+  #   変えず・プロンプトを 1 バイトも変えない(動力学は本サイドカーを 1 度も読まない)。
+  # ★撮る位置が日境界でない理由: 朝の計画は 5-10 時に作られるので 0 時に撮ると当日の計画が
+  #   まだ無い。capture_min(既定 10:00)なら計画は確定済み・大半は未実行 = 「実現する前の
+  #   意図」が撮れる。行には lead_min(セル開始 − 撮影時刻)を持たせてあるので、
+  #   「撮った時点で既に過ぎていたセル」は事後に落とせる(判定を conf に固定しない)。
+  # ★1 日 1 回では足りない実測: tools._host_event は開催を **1-6 時間後**にしか置けないので、
+  #   「10 時に 1 枚」だとその日に生まれる集合の種のほとんどがまだ存在しない
+  #   (60 体 2 日の mock で開催 11 件のうち 10 時前の宣言は 1 件だけ)。repeat_min ごとに
+  #   その日の終わりまで撮り直す。同じセルが複数の cap_min で出るのは仕様(意図が積み上がる
+  #   過程がそのまま残る)。事後解析はセル毎に n_intent 最大の行を採ればピーク意図になる。
+  # 実際に集まったかの突合は事後スクリプト scripts/detect_gatherings.py(案A の集合検知)。
+  # ★規模: 1 日数回 × 閾値超のセルだけなので finals 構成でも数 MB 級(最大の 1 枚ではない)。
+  #   走行費は 1 回あたり在場者 1 周(属性を数個読むだけ)= memory_daily の 1 日ぶんより軽い。
+  # 実装 src/society/observer/gathering.py(凍結 14 ファイルには含まれない)。
+  gathering_intent:
+    enabled: false              # ★ON 推奨(本番): true(意図 → 実現/不発 の対応表の素材)
+    slot_min: 30                # 時間帯ビンの幅(分)。30 = 1 日 48 ビン
+    capture_min: 600            # 毎日この分(0-1439)を最初に跨いだ step で初回を撮る
+    repeat_min: 180             # 以後この間隔で日の終わりまで撮り直す(0=1 日 1 回だけ)
+    min_intent: 2               # この人数未満のセルは行にしない(1 人の予定は「収束」でない)
+    sample_cap: 32              # 行に載せる意図保持者 id の上限(昇順)。n_intent は切らない
   # ==========================================================================
   # GT ロガー(第114 2026-08-14。docs/plans/metaverse-projection-plan.md §4)
   # 「本選前に入れないと **正解ラベルが二度と取れない**」もの。全て observer 側・既定 OFF・

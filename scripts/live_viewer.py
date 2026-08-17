@@ -134,24 +134,33 @@ POS_KINDS = {
 }
 
 # ティッカーに出す「見せ場」イベント。payload を読むのはこの集合だけ。
-HIGHLIGHT_KINDS = {
-    "vocab_coin", "label_coin", "label_adopt", "place_label_bind",
-    "joint_invite", "joint_activity",
-    "undefined_action", "free_action",
-    "belief_update", "belief_transmit", "belief_verify",
-    "institution", "institution_rule", "proposal", "proposal_passed",
-    "group_found", "group_join",
-    "venture_open", "venture_close", "event_host",
-    "flyer_post", "world_event", "scenario_shock",
-    "relation_tier", "relation_break", "relation_dormant", "relation_rekindle",
-    "labor_action", "candidacy", "election_result", "ordinance_vote",
-    "move_home", "long_goal", "chance_event", "fallback",
-}
+#
+# 【F1・第137】以前はここに 35 kind の集合を直書きしていたが、`viz/notable_events.py` の
+# NOTABLE_KINDS(3D 顕著パネル)と**集合も性質も食い違う二重管理**になっていた
+# (docs/research/emergent-events-and-narrative-ui.md §2-2 の指摘)。いまは
+# `viz/notable_events.KIND_REGISTRY` の live=True を畳んだ**単一レジストリ由来**で、
+# kind の追加/重要度の変更は notable_events.py 1 箇所で完結する。
+# ここは観測スクリプトなので viz を import しても依存の向きは壊れない
+# (viz 側は scripts/live_viewer を一切参照しない。l1_stream との循環とは別問題)。
+def _load_kind_registry():
+    """viz/notable_events.py を場所非依存で読む(viz/make_viewer3d._load_notable と同じ流儀)。"""
+    import importlib.util                                       # noqa: PLC0415
 
-# ティッカー本文に使う payload キーの優先順(最初に見つかったものを短く出す)
-_TEXT_KEYS = ("text", "word", "title", "name", "what", "goal", "action",
-              "norm_text", "label", "type", "kind", "verdict", "tier",
-              "claim", "topic", "place", "reason", "demand", "output")
+    path = REPO_ROOT / "viz" / "notable_events.py"
+    spec = importlib.util.spec_from_file_location("notable_events_registry", path)
+    if spec is None or spec.loader is None:                     # pragma: no cover
+        raise ImportError(f"kind レジストリを読めない: {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_KIND_REGISTRY_MOD = _load_kind_registry()
+HIGHLIGHT_KINDS = set(_KIND_REGISTRY_MOD.HIGHLIGHT_KINDS)
+
+# ティッカー本文に使う payload キーの優先順(最初に見つかったものを短く出す)。
+# これもレジストリ側(GENERIC_TEXT_KEYS)を正典にして二重管理を断つ。
+_TEXT_KEYS = tuple(_KIND_REGISTRY_MOD.GENERIC_TEXT_KEYS)
 
 # スパークラインに出す L2 列の候補(存在するものを先頭から --series-max 本)
 SERIES_PREF = [

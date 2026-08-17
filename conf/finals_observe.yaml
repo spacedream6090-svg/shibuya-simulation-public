@@ -58,6 +58,32 @@ model:
   cache_mode: free         # 観察ランは新規推論を許す(再生は llm_cache から replay で行う)
   reflect_think: false     # think=true は内省 JSON が全滅する実測(第34)。本番既定
   reflect_max_tokens: 768  # 右サイズ化(vLLM の KV 予約が縮み高並列が改善)
+  # ---- V-P1 の予算右サイズ化・温度分化(docs/research/dialogue-coherence-and-model.md
+  #      §1.4 / §5.5-1 / §6.1-2 / §6.1-4)----
+  # ★★ plan_max_tokens: 448 → 896。**plan の parse 成功率 33%(壊れ 67%)の第一容疑が
+  #    「スキーマのトークン需要 > 上限」の切断**である(perf2k144・vLLM×Qwen3-8B-AWQ 実測。
+  #    壊れ方は長大化→切断で、応答長 p95 は 8,793 字)。需要の数え直し:
+  #      1 ブロック = 9 欄(reason 自由文 + start/end/place/act/with/aim/priority/flex/note)
+  #                 ≈ JSON 150〜250 字 ≈ 50〜80 tok
+  #      day_plan v1 は min_blocks 4 / max_blocks 8(下の planning.day_plan)→ 200〜640 tok
+  #      + mood / carry(自由文 2 欄)+ if_then(≤3)+ 外枠 → **合計 350〜700 tok 超**
+  #    448 では 5 ブロック以上を書き始めた時点で切断がほぼ確定し、`_loads_lenient` の
+  #    閉じ括弧補完は配列途中の切断を救えない。896 = 需要上限 700 tok に約 1.28 倍の余裕。
+  #    SchemaBench の 7B 素の validation error が 18% であることに照らしても、67% は
+  #    モデル非適合だけでは説明できない(= 切断成分の除去が先)。
+  #    費用: 増えるのは plan 呼(全呼数の約 3.5%)の KV 予約 +448 tok 分だけ。
+  # ★★ 温度: plan 0.3 / recall 0.2(発話 deliberate・reply の 0.7 は**据え置き**)。
+  #    Generative Agents の実コードは「判定・分解・採点=0 / 生成系=0.5〜1」を使い分ける。
+  #    plan は構造化出力、recall は検索クエリなので 0.7 は高すぎる。
+  #    reflect の温度(0.7)と reflect_max_tokens(768)は別判断=このバッチでは触らない。
+  # ★★ 注意(運用): conf/profiles/finals-vllm7.yaml の model: ブロックは **plan_max_tokens: 448**
+  #    のままで、plan_temperature / recall_temperature を持たない。本選は「finals-vllm7 の
+  #    model: をこちらへ貼る」手順なので、**貼るときに下の 3 行を消さないこと**
+  #    (消すと V-P1 の予算・温度だけが無言で元へ戻る)。freeze_config の出力で
+  #    `model.plan_max_tokens` が 896 であることを起動前に必ず目視する。
+  plan_max_tokens: 896
+  plan_temperature: 0.3
+  recall_temperature: 0.2
 
 # ============================================================================
 # (2) 名簿 = 100万プール(pool)+ 層別クォータ(DP-U3 案A)
@@ -1015,6 +1041,24 @@ prompts:
   reply_partner: closeness
   interstitial:
     enabled: true
+  # ---- V-P1 プロンプト一貫性(第137・正典 docs/research/dialogue-coherence-and-model.md
+  #      §1.3 / §6.1 / §9-1)----
+  # ON の理由: **これは新機能ではなく指示矛盾の除去**である。実ジャーナル
+  #   (runs/night_llm_100a3d)で、reflect / plan / recall のプロンプトが
+  #   「出力は次のいずれかの JSON 1個のみ」(共有ヘッダの行動メニュー)と
+  #   「出力は次の JSON 1個のみ」(その purpose のタスク文)の**相互排他な指示 2 つ**を
+  #   同時に載せていることを確認済み。ON にすると前者が reflect/plan/recall から消え、
+  #   各 purpose の出力指示がちょうど 1 つになる(deliberate は 1 バイトも変わらない)。
+  # 併せてペルソナ直後に中立の規律 3 行(人物設定の優先・捏造禁止・直前の反復禁止)を
+  #   常設する。文言は TinyTroupe の tiny_person.mustache 由来、位置は Lost in the Middle
+  #   (arXiv:2307.03172)の「先頭か末尾」に従う。
+  # ★呼数・乱数消費・発火列は ON/OFF で完全一致(変わるのはプロンプト文字列だけ=R1)。
+  # ★APC への影響は reflect/plan/recall(呼数の約 7%)の prefix のみ。deliberate(約 93%)の
+  #   prefix は不変なので prefix cache のヒット率は実質そのまま。
+  # ★既知の限界: ablate.prompt_paraphrase(第92)の凍結置換表は現行ヘッダ定数を置換元に
+  #   持つため、P1 ON のヘッダは言い換え対象に入らない(用途が排他なので本選では無害)。
+  p1:
+    enabled: true
 reflection:
   self_model_days: 0
   deep:
@@ -1184,6 +1228,24 @@ observer:
   # 観測側だけで閉じる(L1・乱数・LLM 呼数・プロンプトはいずれも 1 バイト不変)。
   roster_daily:
     enabled: true
+  # ---- レーンG 案B 意図収束サイドカー(第137)-----------------------------------------
+  # ON の理由: 本ランの観察目的(「世界を変える者の創発」= 集合行為の内生)に対して、
+  #   現状は **「集まった事実」しか残らない**。「集まろうとしたが崩れた」= 不発の
+  #   カスケードは L1 に痕跡がゼロで、事後には「起きなかった」と区別が付かない。
+  #   しかも意図の 3 欄(計画ブロックの**解決済みノード** / 予定帳の**相手側の写し** /
+  #   イベントの**認知集合**)は L1 から**原理的に復元できない** —— 本選が終わってから
+  #   では二度と取れない類のデータである(GT ロガー G1-G7 と同じ性質)。
+  # ★新しい L1 kind を 1 つも足さない = L1 は 1 バイトも変わらない(出口は parquet 1 枚)。
+  #   世界も乱数も LLM 呼数もプロンプトも 1 バイト不変。走行費は 1 日 1 回の在場者 1 周だけ。
+  # ★規模: 閾値超のセルだけを 1 日 1 回書くので数 MB 級(容量計画に影響しない)。
+  # 事後の突合(意図 → 実現/不発・「臨界まであと何人」)は scripts/detect_gatherings.py。
+  gathering_intent:
+    enabled: true
+    # 1 日 5 枚(10:00 / 13:00 / 16:00 / 19:00 / 22:00)。★1 日 1 枚では足りない実測:
+    # tools._host_event は開催を 1-6 時間後にしか置けないので、10 時の 1 枚だけだと
+    # その日に生まれる集合の種のほとんどがまだ存在しない(mock 実測: 開催 11 件のうち
+    # 10 時前の宣言は 1 件だけ)。費用は 1 枚あたり在場者 1 周(属性を数個読むだけ)。
+    repeat_min: 180
   # ---- GT ロガー(第114。docs/plans/metaverse-projection-plan.md §4)------------------
   # ON の共通の理由: **本選前に入れないと復元実験の正解ラベルが二度と取れない**もの。
   # 「観測痕跡だけから内部状態をどこまで復元できるか」という問いは、真値(= 内部状態の

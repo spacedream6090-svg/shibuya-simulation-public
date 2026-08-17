@@ -1050,6 +1050,16 @@ FEATURES: tuple[Feature, ...] = (
        "会話が『毎回はじめまして』にならないための最小の文脈。保持は個体側のリングバッファ"
        "(相手 8 人の LRU)で、追加 LLM 呼はゼロ・乱数ゼロ(呼数不変=R1)。"
        "既定 OFF は状態も増やさずプロンプトが 1 行も変わらない"),
+    # ---- V-P1 プロンプト一貫性(docs/research/dialogue-coherence-and-model.md §6.1)----
+    # affects_k=False: LLM の呼び出し点は 1 つも増減せず、乱数も 1 本も引かない
+    #   (変わるのはプロンプト文字列だけ = 呼数・発火列は ON/OFF で完全一致)。
+    # fingerprint_risk=possible: プロンプト本文が変わる族(prompts.* の既存 3 件と同じ等級)。
+    #   ただし中身は中立(機構語・実験条件語・因子名を 1 語も含まない)。
+    _f("prompts.p1.enabled", "strict", False, "possible",
+       "purpose 別ヘッダ(reflect / plan / recall から行動メニューを外し、出力指示を"
+       "1 プロンプト 1 つにする)+ ペルソナ直後の規律 3 行(人物設定の優先・捏造禁止・"
+       "直前の反復禁止)。deliberate のヘッダは 1 バイトも変えない。"
+       "既定 OFF は 4 purpose すべてのプロンプトが現行とバイト一致"),
 
     # ---- transit_ride(live のみ外部プロセス=none)----
     _f("transit_ride.taxi.enabled", "strict", False, "none",
@@ -1440,6 +1450,26 @@ FEATURES: tuple[Feature, ...] = (
        "1 個体は生涯 1 行(入場した日)= 再来街で 2 行目は作らない。trait 名はコードに書かず"
        "traits_json の 1 列に丸ごと入れる(no-fingerprint 契約)。既定 OFF ではオブジェクトを"
        "作らず 1 ファイルも書かない。★規模: 在場25万×10日で約46万行 = +100MB 前後"),
+    # ---- レーンG 案B 意図収束サイドカー(emergent-events-and-narrative-ui.md §3 案B)----
+    # strict の根拠: 観測側だけで閉じる追記(sim.agents / sim.tools.events の既存属性を
+    #   読むだけ)。LLM の自由文は 1 バイトも読まない(読むのは既にパース済みの構造だけ)。
+    # affects_k=False: generate() の呼び出し点を 1 つも足さない。
+    # fingerprint_risk=none: プロンプトを 1 バイトも変えない。
+    # ★**新しい L1 kind を 1 つも足さない**ので ON でも L1 はバイト不変(出口は parquet 1 枚)。
+    _f("observer.gathering_intent.enabled", "strict", False, "none",
+       "1 日 1 回(capture_min)在場者を 1 周し、(対象日, 時間帯ビン, 場所)セルへの"
+       "「意図の収束」を gathering_intent.parquet へ 1 セル 1 行で追記する(レーンG 案B)。"
+       "本リポには「集まった事実」の器(crowd_surge)はあるのに**「集まろうとした事実」の器が"
+       "無く**、しかも意図の 3 欄は L1 から**原理的に復元できない**: ① 計画ブロックの"
+       "**解決済みノード**(plan_created は place カテゴリしか射影せず、plan_block_start.node は"
+       "「実行時の現在ノード=移動前」で行き先ではない)② 予定帳の**相手側の写し**"
+       "(L1 に出るのは話者視点の appointment 1 件だけ・記入は在場者に絞られるので with を"
+       "素直に読むと過大評価)③ イベントの**認知集合** _known_events(=「招待を知った N 人 →"
+       "来た M 人」の分母)。実際に集まったかの突合は事後 scripts/detect_gatherings.py。"
+       "撮る位置が日境界でないのは、朝の計画が 5-10 時に作られるため(0 時では当日の計画が"
+       "まだ無い)。行の lead_min で「撮影時に既に過ぎていたセル」を事後に落とせる。"
+       "既定 OFF ではオブジェクトを作らず 1 ファイルも書かない。★規模: 閾値超のセルだけ"
+       "なので finals 構成でも数 MB 級"),
 
     # ---- GT ロガー(第114 2026-08-14。metaverse-projection-plan.md §4)----
     # 共通の根拠: 全て観測側だけで閉じる(世界状態を 1 バイトも書かず・L1 を 1 件も出さず・

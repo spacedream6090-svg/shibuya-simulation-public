@@ -1373,6 +1373,25 @@ class Simulation:
         _rostercfg = _roster_mod.cfg_of_config(cfg)
         self.roster_sc = (_roster_mod.RosterDaily(self.out_dir)
                           if _rostercfg["enabled"] else None)
+        # ---- レーンG 案B: 意図収束サイドカー(observer.gathering_intent・既定 OFF)----
+        # 塞ぐ穴: 「集まった事実」は crowd_surge / L1 の在場で測れるが、**「集まろうと
+        # した事実」がどこにも残らない**。しかも意図の 3 欄は L1 から原理的に復元できない:
+        #   ① 計画ブロックの**解決済みノード**(plan_created は place カテゴリしか射影せず、
+        #      plan_block_start.node は「実行時の現在ノード」= 行き先ではない)
+        #   ② 予定帳の**相手側の写し**(L1 に出るのは話者視点の 1 件だけ)
+        #   ③ イベントの**認知集合**(_known_events = 参加率の分母)
+        # 新しい L1 kind を 1 つも足さない(出口はサイドカー parquet 1 枚)= ON でも
+        # L1 はバイト不変。観測側だけで閉じる(世界も乱数も LLM 呼数も 1 バイト不変)。
+        from ..observer import gathering as _gathering_mod
+        _gathcfg = _gathering_mod.cfg_of_config(cfg)
+        self.gathering_sc = (
+            _gathering_mod.GatheringIntent(
+                self.out_dir, slot_min=_gathcfg["slot_min"],
+                capture_min=_gathcfg["capture_min"],
+                repeat_min=_gathcfg["repeat_min"],
+                min_intent=_gathcfg["min_intent"],
+                sample_cap=_gathcfg["sample_cap"])
+            if _gathcfg["enabled"] else None)
         # ---- G4/G5(第114 GT ロガー): 記憶ストリーム / 関係台帳の日次サイドカー ----------
         # どちらも観測側だけで閉じる(世界を 1 バイトも書かず・L1 を 1 件も出さず・乱数ゼロ・
         # LLM 呼数不変)。既定 OFF ではオブジェクトを作らず 1 ファイルも書かない。
@@ -1395,7 +1414,7 @@ class Simulation:
         # = バイト一致。配り漏れ(新サイドカー追加時)は tests が Simulation の属性を走査して検出する。
         for _sc in (self.indoor_tracks, self.org_ledger_sc, self.finance_sc,
                     self.channels_sc, self.cognition_g_sc, self.roster_sc,
-                    self.memory_sc, self.relations_sc):
+                    self.memory_sc, self.relations_sc, self.gathering_sc):
             if _sc is not None:
                 _finalize_mod.apply_cfg(_sc, self._finalize_cfg)
         # ---- レーン D1(第109): 「起動時セグメント」の終端印 ------------------------
@@ -2298,11 +2317,17 @@ class Simulation:
             #   (day0 の朝はまだ誰も何も覚えていない)を撮り直してしまうため。
             # ★変数名に `sc` を含めない(tests/test_indoor_invariance.py の静的検査が
             #   局所変数名の部分一致でサイドカー参照を拾うため)。
-            _prev_day = int(self.clock.sim_min(max(0, start - 1))) // 1440
+            _prev_min = int(self.clock.sim_min(max(0, start - 1)))
+            _prev_day = _prev_min // 1440
             for _daily_log in (self.memory_sc, self.relations_sc):
                 if _daily_log is not None:
                     _daily_log._resumed = True
                     _daily_log._day = _prev_day
+            # ---- レーンG 案B: 意図収束サイドカーは**日境界ではなく capture_min** で
+            #      撮るので、「前チャンクがその日ぶんを撮り終えていたか」は時刻で決まる。
+            #      判定は本体側(resume_at)に置く = 据え方の規則を 1 箇所に閉じる。
+            if self.gathering_sc is not None:
+                self.gathering_sc.resume_at(_prev_min)
         if every > 0:
             save_config(self.cfg, self.out_dir)   # 途中再開に備え config を先出しする
         for step in range(start, int(self.cfg.run.n_steps)):
@@ -2341,6 +2366,8 @@ class Simulation:
                     self.memory_sc.flush_segment()
                 if self.relations_sc is not None:   # G5: 関係台帳の日次差分も同様
                     self.relations_sc.flush_segment()
+                if self.gathering_sc is not None:   # レーンG: 意図収束も対でセグメント化
+                    self.gathering_sc.flush_segment()
                 # ★世代トランザクションのコミット点(A6)。ここまで来て初めて
                 #   「step {step+1} まで完全に書けた」= latest() の候補になる。
                 checkpoint.write_complete_marker(_ckpt_path)
@@ -2369,6 +2396,8 @@ class Simulation:
                     self.memory_sc.flush_segment()
                 if self.relations_sc is not None:
                     self.relations_sc.flush_segment()
+                if self.gathering_sc is not None:
+                    self.gathering_sc.flush_segment()
         return self.finalize()
 
     def _agents_json_records(self) -> list:
@@ -2448,6 +2477,8 @@ class Simulation:
             self.memory_sc.finalize()
         if self.relations_sc is not None:         # G5: 関係台帳の日次差分を結合
             self.relations_sc.finalize()
+        if self.gathering_sc is not None:         # レーンG: 意図収束セルを結合
+            self.gathering_sc.finalize()
         # B4 item#4: 会社観測(indoor_fields/ledger)ON かつ org 配属があるランは agents.json を再出力し
         # org_id/org_role を載せる(org 配属は run 中の遅延初期化=__init__ 時点では未付与のため)。
         # OFF は再出力しない=既存 agents.json とバイト一致(ゴールデン非該当)。

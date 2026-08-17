@@ -449,6 +449,12 @@ _NON_PROMPT_WORLD_READER_MODULES = frozenset({
     # 読むのが本務。プロンプトは一切組まない(タスク文は reflection.py が持つ)。
     # 乱数ゼロ・LLM 呼び出しゼロ。engaged.py / routine.py と同じ位置づけ。P3 で契約経路へ。
     "reflect_timing.py",
+    # 第137バッチ V-P1(プロンプト一貫性): sim から読むのは **conf ブロック 2 つだけ**
+    # (`prompts.p1` と `model.plan_temperature` / `model.recall_temperature`)で、
+    # world(在場・座標・POI・時刻)には 1 度も触らない。ヘッダと規律行を組む関数
+    # (header / discipline_lines / audit)は sim を受け取らない純関数である。
+    # age_cog.py / calib.py と同じ「cfg を読むだけ」の位置づけ。
+    "prompt_p1.py",
 })
 
 
@@ -525,7 +531,9 @@ def test_deliberate_imports_stay_minimal():
     top = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
     mods = {(n.module or "") for n in top if isinstance(n, ast.ImportFrom)}
     mods |= {a.name for n in top if isinstance(n, ast.Import) for a in n.names}
-    assert mods <= {"json", "__future__", "factors.mood"}, \
+    # V-P1(第137)で `prompt_p1` が加わった。**同じ認知層の純関数だけの隣人**で、
+    # world も sim も見ず、cfg と文字列しか触らない(factors.mood と同じ位置づけ)。
+    assert mods <= {"json", "__future__", "factors.mood", "prompt_p1"}, \
         f"deliberate が余計な層を import している: {sorted(mods)}"
 
 

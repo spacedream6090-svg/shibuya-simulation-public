@@ -7,6 +7,9 @@ from __future__ import annotations
 import json
 
 from ..factors.mood import mood_text
+# V-P1: 同じ認知層の**純関数だけ**の隣人(cfg と文字列しか触らない・sim も world も見ない)。
+from .prompt_p1 import discipline_lines as _p1_discipline
+from .prompt_p1 import header as _p1_header
 
 # ヘッダは run 内固定(labeling_mode は run を通して不変)なので APC の prefix 一致は保たれる。
 # constrained(既定)の文言は現行と一字一句同一に保つ(既定の再現性=キャッシュ整合のため)。
@@ -161,7 +164,8 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
                  revision_line: str | None = None,
                  engaged_section: str | None = None,
                  reject_line: str | None = None,
-                 trace_line: str | None = None) -> str:
+                 trace_line: str | None = None,
+                 p1_purpose: str | None = None) -> str:
     """個別文脈(時刻・場所・活動・気分・記憶・直近発話)を渡し、内容の固定化を防ぐ。
 
     pull_query が渡された時だけ(agentic_pull=true)、その文で決定論の記憶想起を
@@ -172,7 +176,13 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
     (open_actions と完全同型の seam。既定 OFF ではヘッダがバイト一致)。
     verify_actions(第73バッチ・既定 False)は「確かめる」の1行だけをヘッダ末尾に足す
     (同型 seam)。**真偽台帳の中身はここへ一切渡らない**(bool 1 個だけ。台帳 module は
-    cognition から import されないことを tests/test_beliefs.py が静的に固定する)。"""
+    cognition から import されないことを tests/test_beliefs.py が静的に固定する)。
+
+    p1_purpose(V-P1・既定 None)は「このプロンプトはどの用途か」の札で、**None のときは
+    どの分岐にも入らない**(= 出力はバイト一致 = ゴールデン維持)。値が入ると
+    cognition/prompt_p1.py が (a) reflect/plan/recall のヘッダから行動メニューを外し
+    (deliberate のヘッダは 1 バイトも変えない)、(b) ペルソナ直後へ規律 3 行を足す。
+    LLM の呼び出し点も乱数も 1 つも増減しない(R1: 変わるのはプロンプト文字列だけ)。"""
     # 入力解像度LOD(第30バッチ・lod.input_res)。OFF=属性なし → 既定値=現行定数で
     # バイト一致。ON でも変わるのは注入の「件数」だけ(呼数・乱数・発火は不変=R1)。
     # beliefs(k の行動流入路 D7)と全員共通行は解像度の対象外(docs/plans/input-resolution-lod.md §2)。
@@ -182,9 +192,17 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
     _recent_n = int(_ir.get("recent_n", 4))
     _retrieve_n = int(_ir.get("retrieve_n", 3))
     _feed_n = int(_ir.get("feed_n", 3))
-    lines = [_header(labeling_mode, open_actions, city_name, explicit_nothing,
-                     verify_actions),
-             agent.persona]
+    _head = _header(labeling_mode, open_actions, city_name, explicit_nothing,
+                    verify_actions)
+    # V-P1(既定 None = この 2 分岐に一度も入らない = 出力バイト一致)。
+    # ★ヘッダ差し替えは reflect/plan/recall のみ(deliberate は base をそのまま返す)。
+    # ★規律 3 行は**ペルソナ直後**に置く(Lost in the Middle: 守らせたい指示は先頭か末尾)。
+    #   ペルソナは従来どおり lines[1] のままなので ablate の persona_swap も無傷。
+    if p1_purpose is not None:
+        _head = _p1_header(p1_purpose, base=_head, city_name=city_name)
+    lines = [_head, agent.persona]
+    if p1_purpose is not None:
+        lines += _p1_discipline()
     # 群のオントロジー(文化圏×経験の「経験の事実」1行。ontology 有効時のみ agent に設定される。
     # 文言は config 由来=基盤に文化名リテラルなし。OFF は属性なし=行なし=バイト一致)。
     onto = getattr(agent, "ontology_line", None)
@@ -309,8 +327,15 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
         lines.append(f"昨日までの日記: {agent.mem.day_summaries[-1]}")
     if agent.said:
         lines.append(f"あなたがさっき言ったこと: {' / '.join(agent.said[-2:])}")
-        lines.append("注意: さっきと同じ話題・言い回しを繰り返さない。"
-                     "今の時刻・場所・気分・出来事に根ざした新しい内容を話す。")
+        # ★この 1 行は**発話専用の書式指示**(「…新しい内容を話す」)なのに、共有経路のせいで
+        #   朝の計画・夜の内省・recall のプロンプトにも載っていた(= §1.3 の混入の一例)。
+        #   V-P1 ON かつ非 deliberate では出さない: 同じ規範は上の規律 3 行目
+        #   「直前に自分が言った・書いたことと同じ話題や言い回しをなぞらない」が
+        #   **用途に依らない中立の言い方**で既に担っている(重複でも矛盾でもなくなる)。
+        #   OFF(p1_purpose is None)は従来どおり必ず出す=バイト一致。
+        if p1_purpose is None or p1_purpose == "deliberate":
+            lines.append("注意: さっきと同じ話題・言い回しを繰り返さない。"
+                         "今の時刻・場所・気分・出来事に根ざした新しい内容を話す。")
     if feed_texts:
         lines.append(f"タイムライン: {' / '.join(feed_texts[:_feed_n])}")
     # 対話履歴の注入(会話強化・prompts.dialog_history=true のときだけ scheduler が渡す)。

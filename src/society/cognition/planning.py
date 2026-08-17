@@ -21,6 +21,7 @@ from ..observer.schema import Event
 from . import day_plan as _dayplan
 from . import plan_schema as _pf
 from . import policy_cache as _policy_cache
+from . import prompt_p1 as _p1
 from .deliberate import build_prompt, parse_action
 
 
@@ -52,7 +53,8 @@ def build_plan_prompt(agent, *, place_name: str, sim_min: int, step: int,
                       interstitial_digest: str | None = None,
                       city_name: str = "",
                       framework: dict | None = None,
-                      day_plan: dict | None = None) -> str:
+                      day_plan: dict | None = None,
+                      p1: bool = False) -> str:
     """build_prompt の文脈(ペルソナ・記憶・日記・信念)+ 所持金 + 計画タスク。
 
     ★ build_prompt の出力は既存の呼び出し(発話・内省)と共有するため一切変えない。
@@ -65,13 +67,18 @@ def build_plan_prompt(agent, *, place_name: str, sim_min: int, step: int,
     day_plan は day_plan v1 設定(第86)。None=既定 OFF=従来と完全一致。有効時は
     **従来の計画タスクを置き換えて** day_plan v1 のスキーマ指示だけを載せる(出力の形が
     別物なので併記しない)。framework とは排他(day_plan が優先)。
+    p1(V-P1・既定 False)は purpose 別ヘッダ+規律 3 行。False は build_prompt へ
+    p1_purpose=None を渡す=従来とバイト一致。True のとき**冒頭の行動メニューが消える**
+    ので、この関数が後ろに足す計画の出力指示が「そのプロンプト唯一の出力指示」になる
+    (docs/research/dialogue-coherence-and-model.md §1.3 の矛盾の解消点そのもの)。
     """
     base = build_prompt(agent, place_name=place_name, surprise=None,
                         nearby_names=[], sim_min=sim_min, step=step,
                         city_name=city_name,
                         date_line=date_line, weather_line=weather_line,
                         schedule_line=schedule_line,
-                        interstitial_digest=interstitial_digest)
+                        interstitial_digest=interstitial_digest,
+                        p1_purpose="plan" if p1 else None)
     money_line = f"\n今の所持金: 約{int(getattr(agent, 'money', 0.0))}円"
     if day_plan is not None:                     # 第86: day_plan v1(従来タスクを置換)
         return base + money_line + _dayplan.schema_prompt(day_plan)
@@ -150,13 +157,29 @@ def build_plan_request(sim, agent, step: int, sim_min: int, place_name: str,
                               weather_line=getattr(sim, "today_weather_line", None),
                               schedule_line=_today_schedule_line(sim, agent, sim_min),
                               interstitial_digest=interstitial_digest,
-                              framework=framework, day_plan=dpcfg)
+                              framework=framework, day_plan=dpcfg,
+                              p1=_p1.enabled(sim))
     # 朝の計画だけ上限を分けられる seam(model.plan_max_tokens)。
     # 未設定 or 0/null は model.max_tokens にフォールバック=既定挙動は完全不変。
+    #
+    # ★V-P1 の「予算の右サイズ化」(dialogue-coherence-and-model.md §1.4 / §6.1-2)。
+    #   day_plan v1 のスキーマ需要を数え直すと:
+    #     1 ブロック = 9 欄(reason 自由文 + start/end/place/act/with/aim/priority/flex/note)
+    #                ≈ JSON 150〜250 字 ≈ 50〜80 tok
+    #     min_blocks 4 〜 max_blocks 8 → 200〜640 tok
+    #     + mood / carry(自由文 2 欄)+ if_then(≤3)+ 外枠 → **合計 350〜700 tok 超**
+    #   これに対し finals の実測値は 448 tok = **5 ブロック以上を書き始めた時点で切断が
+    #   ほぼ確定**する(perf2k144 で plan の parse 成功率 33% / p95 8,793 字)。
+    #   `_loads_lenient` の閉じ括弧補完は配列途中の切断を救えないので、上限側を
+    #   896(= 700 tok の需要に約 1.28 倍の余裕)へ広げるのが最小の手当て。
+    #   ★conf 側の値は conf/finals_observe.yaml が持つ(ここは読むだけ)。
     _plan_mt = int(sim.cfg.model.get("plan_max_tokens", 0) or 0)
     plan_max_tokens = _plan_mt if _plan_mt > 0 else int(sim.cfg.model.max_tokens)
+    # 温度の purpose 分化(§6.1-4)。未設定(null)は model.temperature=既定挙動と完全不変。
+    _plan_temp = _p1.plan_temperature(sim)
     return {"prompt": prompt, "rng_key": f"plan/{agent.id}/{step}",
-            "temperature": float(sim.cfg.model.temperature),
+            "temperature": (float(sim.cfg.model.temperature)
+                            if _plan_temp is None else _plan_temp),
             "max_tokens": plan_max_tokens,
             "framework": framework, "max_items": max_items,
             "day_plan": dpcfg}
@@ -208,9 +231,10 @@ def _make_plan_framework(sim, agent, step: int, sim_min: int, prompt: str,
     降格写像し、要約を day_plan_compiled(ON のみ・1日1件)へ記録する。"""
     items, path = _parse_plan_items(response, framework, max_items), "llm"
     if items is None:                                # 修復しても不成立 → 再試行1回
+        _rt = _p1.plan_temperature(sim)      # 未設定(null)は従来どおり model.temperature
         retry, rcall_id, rcached = sim.llm.generate(
             prompt, rng_key=f"plan/{agent.id}/{step}/retry",
-            temperature=float(sim.cfg.model.temperature),
+            temperature=(float(sim.cfg.model.temperature) if _rt is None else _rt),
             max_tokens=plan_max_tokens)
         sim.logger.log_llm_call({"llm_call_id": rcall_id, "agent_id": agent.id,
                                  "purpose": "plan_retry", "step": step,

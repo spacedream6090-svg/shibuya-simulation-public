@@ -304,16 +304,28 @@ class BufferSink:
 def build_recall_request(agent, *, step: int, place_name: str,
                          date_line: str | None = None,
                          weather_line: str | None = None,
-                         city_name: str = "") -> dict:
-    """agentic pull 第1段の LLM 要求(P2 S6b: build/resolve 分割)。generate_many 互換。"""
+                         city_name: str = "",
+                         p1: bool = False,
+                         temperature: float | None = None) -> dict:
+    """agentic pull 第1段の LLM 要求(P2 S6b: build/resolve 分割)。generate_many 互換。
+
+    p1(V-P1・既定 False)= purpose 別ヘッダ+規律 3 行。False は従来とバイト一致。
+    True では冒頭の行動メニューが落ちるので、この関数が足す
+    「出力は次の JSON 1個のみ」がプロンプト唯一の出力指示になる。
+    temperature(既定 None)= 未設定なら従来の 0.7。recall は「何を思い出したいか」を
+    1 語ずつ選ぶ**検索クエリ**の生成なので、参照実装(Generative Agents の実コードは
+    判定・分解を 0、生成系を 0.5〜1)の流儀では発話と同じ 0.7 は高すぎる。
+    """
     prompt = (build_prompt(agent, place_name=place_name, surprise=None,
                            nearby_names=[], step=step, city_name=city_name,
-                           date_line=date_line, weather_line=weather_line)
+                           date_line=date_line, weather_line=weather_line,
+                           p1_purpose="recall" if p1 else None)
               + "\n今日の内省を始める前に、まず今日のことで思い出したいことを一つ挙げてください。"
               + "\n出力は次の JSON 1個のみ:"
               + '\n{"action": "recall", "query": "思い出したい事柄を短く"}')
     return {"prompt": prompt, "rng_key": f"recall/{agent.id}/{step}",
-            "temperature": 0.7, "max_tokens": 100, "think": False}
+            "temperature": 0.7 if temperature is None else float(temperature),
+            "max_tokens": 100, "think": False}
 
 
 def resolve_recall(agent, *, step: int, sim_min: int, response: str,
@@ -355,7 +367,10 @@ def resolve_recall(agent, *, step: int, sim_min: int, response: str,
 def _recall_query(agent, *, step: int, sim_min: int, llm, place_name: str,
                   logger: ObserverLogger, date_line: str | None = None,
                   weather_line: str | None = None,
-                  city_name: str = "") -> tuple[list[str], str | None]:
+                  city_name: str = "",
+                  p1: bool = False,
+                  recall_temperature: float | None = None
+                  ) -> tuple[list[str], str | None]:
     """agentic pull 第1段: 何を思い出したいかを LLM に出させ、mem.query で想起する。
 
     LLM 呼び出しを1本足す(R1: writeback 条件に依らず一定)。想起自体は決定論。
@@ -365,7 +380,8 @@ def _recall_query(agent, *, step: int, sim_min: int, llm, place_name: str,
     """
     req = build_recall_request(agent, step=step, place_name=place_name,
                                date_line=date_line, weather_line=weather_line,
-                               city_name=city_name)
+                               city_name=city_name, p1=p1,
+                               temperature=recall_temperature)
     response, call_id, cached = llm.generate(
         req["prompt"], rng_key=req["rng_key"], temperature=req["temperature"],
         max_tokens=req["max_tokens"], think=req["think"])
@@ -388,7 +404,9 @@ def maybe_reflect(agent, *, step: int, sim_min: int, writeback: str, alpha: floa
                   gt_extras: bool = False,
                   moment: str | None = None,
                   sleepy: bool = False,
-                  tag: bool = False) -> None:
+                  tag: bool = False,
+                  p1: bool = False,
+                  recall_temperature: float | None = None) -> None:
     """就寝中で reflect_step に達していれば内省(1睡眠につき1回)。
 
     v2(Phase B): 同じ1回の呼び出しで**記憶の統合**(日次要約+顕著エピソード
@@ -408,6 +426,9 @@ def maybe_reflect(agent, *, step: int, sim_min: int, writeback: str, alpha: floa
     v5(A4 第20バッチ検収): reflect_variety=True のとき内省タスク文の belief 説明を個体×日で
     決定論ローテーション(_reflect_task)+定型句回避の1行を足す。belief の雛形復唱対策。
     既定 OFF はプロンプト・呼数・乱数消費とも従来と完全同一(R1・ゴールデン不変)。
+
+    v6(V-P1): p1=True で purpose 別ヘッダ+規律 3 行(recall / reflect の両方に効く)。
+    recall_temperature は第1段の温度(None=従来の 0.7)。どちらも既定は従来と完全同一。
     """
     st = begin_reflect(agent, step=step, writeback=writeback, controls=controls)
     if st is None:
@@ -422,7 +443,8 @@ def maybe_reflect(agent, *, step: int, sim_min: int, writeback: str, alpha: floa
             agent, step=step, sim_min=sim_min, llm=llm,
             place_name=place_name, logger=logger,
             date_line=date_line, weather_line=weather_line,
-            city_name=city_name)
+            city_name=city_name, p1=p1,
+            recall_temperature=recall_temperature)
 
     req = build_reflect_request(
         agent, step=step, sim_min=sim_min, place_name=place_name,
@@ -431,7 +453,7 @@ def maybe_reflect(agent, *, step: int, sim_min: int, writeback: str, alpha: floa
         interstitial_digest=interstitial_digest, interstitial=interstitial,
         city_name=city_name, max_tokens=max_tokens, think=think,
         recalled=recalled, recall_fail=recall_fail,
-        moment=moment, sleepy=sleepy, tag=tag)
+        moment=moment, sleepy=sleepy, tag=tag, p1=p1)
     response, call_id, cached = llm.generate(
         req["prompt"], rng_key=req["rng_key"], temperature=req["temperature"],
         max_tokens=req["max_tokens"], think=req["think"])
@@ -465,13 +487,18 @@ def build_reflect_request(agent, *, step: int, sim_min: int, place_name: str,
                           recall_fail: str | None,
                           moment: str | None = None,
                           sleepy: bool = False,
-                          tag: bool = False) -> dict:
+                          tag: bool = False,
+                          p1: bool = False) -> dict:
     """内省本体の LLM 要求を組み立てる(P2 S6b)。generate_many 互換+apply 用メタ。
 
     ``moment``(RFX-A・既定 None)= 早期発火の文脈タグ(home/media/walk)。None は
     従来どおり就寝時発火で、**タスク文は従来定数とバイト一致**。
     ``sleepy``(既定 False)= 就寝前テンプレの良眠者型言い換え。
     ``tag``(RFX-O・既定 False)= payload へ when / context を足すか。**OFF はキーを生やさない**。
+    ``p1``(V-P1・既定 False)= purpose 別ヘッダ+規律 3 行。False は従来とバイト一致。
+    True では冒頭の行動メニューが落ち、下でタスク文が足す
+    「出力は次の JSON 1個のみ(キー名は厳守)」がプロンプト唯一の出力指示になる
+    (= 相互排他の指示が 2 つ在る状態の解消。§1.3)。JSON 契約キーは 1 つも変えない。
     """
     # 深い内省の夜か。(1) 出来事誘発(第12バッチ・主経路): 衝撃ゲージの閾値超えが予約した
     # deep_due_day 以降の最初の夜(侵入的→熟慮的の遅延)。(2) レガシー固定周期(対照用)。
@@ -489,7 +516,8 @@ def build_reflect_request(agent, *, step: int, sim_min: int, place_name: str,
     prompt = (build_prompt(agent, place_name=place_name, surprise=None,
                            nearby_names=[], step=step, city_name=city_name,
                            date_line=date_line, weather_line=weather_line,
-                           interstitial_digest=interstitial_digest)
+                           interstitial_digest=interstitial_digest,
+                           p1_purpose="reflect" if p1 else None)
               + (f"\n思い出したこと: {' / '.join(recalled)}" if recalled else "")
               + (f"\n{recall_fail}" if recall_fail else "")   # ACT-R OFF は None=1行も足さない
               + task)
