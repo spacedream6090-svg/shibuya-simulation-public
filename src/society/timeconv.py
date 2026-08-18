@@ -569,6 +569,16 @@ TABLE: tuple[tuple[str, str, str], ...] = (
     ("drive.boredom.novelty_relief", INVARIANT, "新奇到達 1 回あたりの追加減衰(出来事単位)"),
     ("net.like_prob", INVARIANT, "閲覧した投稿 1 件あたりの反応確率(出来事単位)"),
     ("net.reshare_prob", INVARIANT, "同上"),
+    # 第117 SNC v2。**どれも時間量ではない**ので Δt を変えても意味が変わらない。
+    ("net.contact_formation.follow_like_p", INVARIANT,
+     "いいね 1 件あたりのフォロー確率(出来事単位。like_prob と同型)"),
+    ("net.contact_formation.encounter_promote_k", INVARIANT,
+     "顔なじみ昇格までの遭遇**回数**(件数)。Δt を細かくしても『5 回会えば顔なじみ』の"
+     "意味は変わらない(engaged.turn_cap と同じ理由)"),
+    ("net.contact_formation.encounter_track_max", INVARIANT,
+     "遭遇回数を覚えておく相手の上限(件数)"),
+    ("net.contact_formation.contacts_max", INVARIANT, "知り合いの上限(人数)"),
+    ("net.contact_formation.follows_max", INVARIANT, "フォローの上限(人数)"),
     ("lodging.prob", INVARIANT, "夜の退出前 1 回の判定(1日1回)"),
     ("indoor.meeting.prob", INVARIANT, "会合の日次発生確率(1日1回判定)"),
     ("transit_ride.taxi.prob", INVARIANT, "移動 1 回あたりのタクシー選択確率(トリップ単位)"),

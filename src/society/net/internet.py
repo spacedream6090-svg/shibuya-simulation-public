@@ -30,10 +30,17 @@ class Internet:
         #   **1 日あたり約 36 分**を焼いていた(退場しても follows を刈らないので日を追って悪化)。
         #   ここを O(1) にする。**挙動は完全に不変**(数える対象も値も同一)。
         #   ★不変条件: `follows` を書き換える経路は `init_follows` / `ensure` /
-        #     `add_contact` / `follow` / `set_follows` の 5 つだけで、そのすべてが
-        #     本索引を同時に更新する。`net.follows[x].add(y)` のように**直接**触ると
-        #     索引が古くなるので、外部からは必ず `follow()` を使うこと
+        #     `add_contact` / `follow` / `set_follows` / `unfollow` の 6 つだけで、
+        #     そのすべてが本索引を同時に更新する。`net.follows[x].add(y)` のように
+        #     **直接**触ると索引が古くなるので、外部からは必ず `follow()` /
+        #     `unfollow()` を使うこと
         #     (同値性は tests/test_follower_index.py が旧走査と突き合わせて固定する)。
+        #   ★`add_contact(..., auto_follow=False)` は上の 6 経路のうち **follows を
+        #     書かない**呼び方である(第117 SNC v2 の C1/C3。契約は「触らない」なので
+        #     索引も動かない = 不変条件は保たれる)。既定 True は現行どおり書く。
+        #   ★`unfollow` は SNC v2(net.contact_formation)の**上限の押し出し専用**として
+        #     第117 で足した 6 本目の経路である(自然なアンフォロー = 関係の消滅は
+        #     本選後の別件。設計 docs/plans/sns-contact-redesign.md §2)。
         self._followers: dict[int, int] = {}
         self.contacts: dict[int, set[int]] = {}   # 対面で会話した相手(DM可)
         self.read_marks: dict[int, int] = {}      # agent_id -> 既読 post id(=watermark)
@@ -120,6 +127,42 @@ class Internet:
         rev = self._rev()
         rev[a] = rev.get(a, 0) + 1
 
+    def unfollow(self, follower: int, author: int) -> None:
+        """follower が author のフォローを外す(逆索引も同時更新)。冪等。
+
+        ★`follows` を書き換える **6 本目の登録経路**(第117 SNC v2)。用途は
+          `net.contact_formation` の `follows_max` 押し出しだけで、シムの中で
+          「飽きてフォローを外す」という挙動は**まだ実装していない**(設計書 §2:
+          アンフォローは本選後。OASIS も減衰なしで 10 日では影響小)。
+        ★索引の減算は `set_follows` と同じ規則(0 になったらキーごと落とす)。
+          これで `follower_count` は `_follower_count_scan` と常に一致し続ける。
+        """
+        f, a = int(follower), int(author)
+        bucket = self.follows.get(f)
+        if not bucket or a not in bucket:
+            return
+        bucket.discard(a)
+        rev = self._rev()
+        n = rev.get(a, 0) - 1
+        if n > 0:
+            rev[a] = n
+        else:
+            rev.pop(a, None)
+
+    def drop_contact(self, a: int, b: int) -> None:
+        """contacts の相互リンクを外す(第117 SNC v2 の `contacts_max` 押し出し用)。冪等。
+
+        ★`follows` には**触らない**: フォローの上限は別建て(`follows_max`)で管理する
+          という設計なので、ここで連鎖して外すと 2 つの上限が絡んで挙動が読めなくなる。
+        ★contacts は逆索引を持たない(`follower_count` は follows 側の話)ので、
+          ここで壊れる索引は無い。
+        """
+        x, y = int(a), int(b)
+        for lo, hi in ((x, y), (y, x)):
+            bucket = self.contacts.get(lo)
+            if bucket is not None:
+                bucket.discard(hi)
+
     def set_follows(self, aid: int, targets) -> None:
         """`follows[aid]` を丸ごと差し替える(逆索引も同時更新)。"""
         aid = int(aid)
@@ -179,10 +222,23 @@ class Internet:
         for t in got:
             rev[t] = rev.get(t, 0) + 1
 
-    def add_contact(self, a: int, b: int) -> None:
+    def add_contact(self, a: int, b: int, auto_follow: bool = True) -> None:
+        """a と b を知り合いにする(contacts は双方向)。
+
+        `auto_follow=True`(既定 = 現行挙動でバイト不変): さらに a → b の片方向フォローを
+        張る(「知り合いは自動フォロー」という初期からの意味づけ)。
+        `auto_follow=False`(第117 SNC v2 の C1/C3 が使う): **contacts だけ**を張り、
+        `follows` にも `_followers` 逆索引にも 1 バイトも触らない。
+        ★理由: 設計 docs/plans/sns-contact-redesign.md §2 は「フォローは**宣言した側だけ**が
+          片方向・相互化は自動にしない(全網の相互フォロー率 22.1% を事後検算アンカーにする)」
+          と定めている。自動フォローが混ざると『知り合いになった=片方は必ずフォロー』に
+          なってしまい、そのアンカーが構造的に測れなくなる。
+        """
         if a in self.contacts and b in self.contacts:
             self.contacts[a].add(b)
             self.contacts[b].add(a)
+            if not auto_follow:                   # SNC v2: contacts だけ(follows は不触)
+                return
             bucket = self.follows[a]              # 知り合いは自動フォロー
             if b not in bucket:
                 bucket.add(b)

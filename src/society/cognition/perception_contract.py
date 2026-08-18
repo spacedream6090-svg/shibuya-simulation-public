@@ -150,6 +150,9 @@ class Perception:
     revision_line: str | None = None
     engaged_section: str | None = None
     reject_line: str | None = None
+    #: SNC v2(第117・net.contact_formation)。返答のプロンプトにだけ載る判定の説明 2 行。
+    #: 既定 OFF は None = 1 行も足さない(engaged_section / reject_line と完全同型の seam)。
+    snc_section: str | None = None
     pull_query: str | None = None
 
     # ---- 提示規約(世界がプロンプトの**形**を決める定数。run 内で不変) ------- #
@@ -303,6 +306,7 @@ _KW_FIELDS: tuple[tuple[str, str, bool], ...] = (
     ("revision_line", "revision_line", False),
     ("engaged_section", "engaged_section", False),
     ("reject_line", "reject_line", False),
+    ("snc_section", "snc_section", False),
     ("pull_query", "pull_query", False),
     # 提示規約
     ("labeling_mode", "labeling_mode", False),

@@ -98,6 +98,14 @@ register_event_kind("reward",        "採用報酬(D9 過正当化 ablation。�
 register_event_kind("opinion_shift", "意見の更新(Friedkin-Johnsen。source が聞き手の意見を動かした){source, old, new}")
 register_event_kind("sns_like",      "SNS 投稿へのいいね {post_id, author}")
 register_event_kind("sns_reshare",   "SNS 投稿のリシェア(RT。フォロワーへ自然再配信){post_id, author}")
+# ---- SNS・知り合い形成 v2(SNC。第117・net.contact_formation 既定 OFF=0件)----
+#  ★新 kind を足したら observer/causality.py の CAUSE_OF_KIND にも同時に登録すること
+#    (2 箇所登録。片方だけだと本選 conf の causality ON で logger.log が KeyError で即死する)。
+#  via = reply(C1/F2 = 返答の LLM 宣言)/ encounter(C3 = k 回目の遭遇)/ timeline(F3 = いいね)
+register_event_kind("acquaint",      "知り合いの成立(双方向 contacts。SNC v2)"
+                                     "{other, via: reply|encounter}")
+register_event_kind("sns_follow",    "フォローの成立(片方向 follows。SNC v2)"
+                                     "{author, via: reply|timeline}")
 # ---- 第6バッチ(ユーザー要望 2026-07-06: 行政・税/娯楽メディア/職場・学校の実態)----
 register_event_kind("tax",           "税の徴収(所得税・住民税・消費税など){tax, amount, to, base?, balance?}")
 register_event_kind("civic_service", "行政サービスの利用・給付(区/都/国){service, level, amount?, detail?}")

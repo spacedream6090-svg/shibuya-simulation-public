@@ -42,6 +42,7 @@ from .. import party as party_mod
 from .. import physics as physics_mod
 from .. import population as population_mod
 from .. import provlink as provlink_mod
+from ..net import contact_formation as contact_mod
 from ..observer import causality as causality_mod
 from ..observer import decision_mode as decmode_mod
 from ..observer import gt_extras as gt_extras_mod
@@ -2548,6 +2549,10 @@ def _llm_speak_g(sim, agent, trigger: str, step: int, sim_min: int, *,
     # 第94 IF-B: 再計画エピソード中だけに載る「予定が果たせなかった理由」1 行
     # (既定 rejection_notify=silent は None=1行も足さない=バイト一致)。
     material["reject_line"] = reject_mod.why_line(sim, agent)
+    # 第117 SNC v2: 返答のときだけ載る判定の説明 2 行(relate / follow をJSONに足してよい)。
+    # 既定 net.contact_formation.enabled=false は None=1行も足さない=バイト一致
+    # (engaged_section / reject_line と完全同型の seam)。
+    material["snc_section"] = contact_mod.prompt_section(sim, trigger)
     # ---- 第85バッチ: 契約経路(既定 OFF)------------------------------------- #
     #  ON では world → Perception → prompt に一本化する。**プロンプト文字列は 1 バイトも
     #  変わらない**(prompt_kwargs() が material と完全に等しい dict を返す)= P1(3)
@@ -2964,6 +2969,12 @@ def _decide_g(sim, agent, step: int, sim_min: int):
             action = yield from _llm_speak_g(sim, agent, "reply", step, sim_min,
                                              reply_to=reply_to,
                                              partner_id=speaker_id)
+            # SNC v2 の C1/F2(第117・既定 OFF は即 return=1 バイトも動かない)。
+            # **返答イベントの因果の中**(同じ step/sim_min・返答を出した当人の直後)で、
+            # 返答 JSON の relate / follow を読んで関係を結ぶ。欄が無ければ false=何もしない
+            # (mock は 2 欄を出さないので mock ランでは 1 件も成立しない)。
+            # LLM 呼は 1 本も増えない(この 1 行は既に返ってきた応答を読むだけ)。
+            contact_mod.on_reply(sim, agent, speaker_id, action, step, sim_min)
             agent.conv_turns_left -= 1
             if agent.conv_turns_left <= 0:         # セッション上限 → クールダウン
                 agent.conv_cooldown_until = step + sim.drivecfg["conv_cooldown_steps"]
@@ -3358,6 +3369,12 @@ def _phone(sim, agent, step: int, sim_min: int) -> dict | None:
                 reshare = react_rng.random() < reshare_prob
                 if like:
                     _sns_react(sim, agent, post, "like", "sns_like", step, sim_min)
+                    # SNC v2 の F3(タイムライン発見。第117・既定 OFF は即 return =
+                    # **乱数を 1 粒も引かない**=バイト一致)。いいねした投稿の著者を
+                    # 確率 follow_like_p でフォローする。乱数は用途別の新 named stream
+                    # "snc_follow" を (agent, step, post) で引くので、既存の draw 列
+                    # (phone / sns_react)は 1 粒も動かない。
+                    contact_mod.on_like(sim, agent, post, step, sim_min)
                 if reshare:
                     _sns_react(sim, agent, post, "reshare", "sns_reshare",
                                step, sim_min)
@@ -3832,6 +3849,10 @@ def _apply_action(sim, agent, action: dict, step: int, sim_min: int) -> None:
         if hearers and _relations_on(sim):
             relations_mod.gain_reputation(agent, sim.relationscfg["rep_mention"],
                                           "mention", step, sim_min, sim.logger)
+        # SNS・知り合い形成 v2(SNC。第117・net.contact_formation)。**既定 OFF は False**
+        # = 下の分岐は 1 度も通らず従来経路がそのまま走る(バイト一致)。step ごとに
+        # 何度も conf を辿らないよう、聞き手ループの外で 1 度だけ引く。
+        _snc_on = contact_mod.enabled(sim)
         v_text = valence(action["text"])
         for hearer in hearers:
             sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=hearer.id,
@@ -3849,7 +3870,17 @@ def _apply_action(sim, agent, action: dict, step: int, sim_min: int) -> None:
                                 kind="heard",
                                 importance_bonus=_imp_bonus(
                                     sim, hearer, novelty=(1.0 if words else 0.0)))
-            sim.net.add_contact(agent.id, hearer.id)   # 対面で知り合い→DM可・フォロー
+            # ★SNC v2(第117)の唯一の置換点。**既定 OFF ではこの 1 行がそのまま走る**
+            #   (= 聞こえた全員と知り合い + 自動フォロー。10k×2 日で follows/contacts が
+            #   実質完全グラフ 19,738×約19,400 → RSS 100GiB → 25 万で OOM 死する当のバグ)。
+            #   ON では**傍聴者に contacts も follows も生やさない**。代わりに遭遇回数だけを
+            #   有界に数え、同一相手と k 回目で挨拶級の知り合いへ昇格する(C3)。
+            #   ★上の `hearer.remember`(聞いた内容の記憶)は ON/OFF で**不変**なので、
+            #     新語・情報の対面伝播は 1 ビットも死なない(設計書 §2「消すもの・変えないもの」)。
+            if _snc_on:
+                contact_mod.note_encounter(sim, hearer, agent, step, sim_min)
+            else:
+                sim.net.add_contact(agent.id, hearer.id)  # 対面で知り合い→DM可・フォロー
             # 関係台帳(Wave G2 の交流符号=発話の感情価)。OFF は従来の record_contact と完全同一。
             # 第65バッチ: 交流の**量**に載る係数を(話者,聞き手)1組につき1回だけ算出し両方向へ
             # 同じ値で渡す(既定 OFF=1.0=従来と同値)。算出は society 層=engine は運ぶだけ。

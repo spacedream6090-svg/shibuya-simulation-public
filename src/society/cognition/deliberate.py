@@ -164,6 +164,7 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
                  revision_line: str | None = None,
                  engaged_section: str | None = None,
                  reject_line: str | None = None,
+                 snc_section: str | None = None,
                  trace_line: str | None = None,
                  p1_purpose: str | None = None) -> str:
     """個別文脈(時刻・場所・活動・気分・記憶・直近発話)を渡し、内容の固定化を防ぐ。
@@ -374,6 +375,15 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
             if variety_hint:             # 改善 P3(既定 OFF): 返答もオウム返し・定型を避ける
                 lines.append("返事の注意: 相手の言葉のオウム返しや決まり文句を避け、"
                              "自分の経験・予定・意見を一つ足して返す。")
+            # SNC v2(第117・net.contact_formation 有効時のみ。既定 OFF は None=1 行も
+            # 足さない=バイト一致)。**返答のときだけ**載る判定の説明 2 行で、中身は
+            # 「本文のあとに relate / follow を書いてよい」だけ(net/contact_formation.py の
+            # JUDGMENT_LINES)。機構語も実験条件語も因子名も 1 文字も出さない。
+            # ★注入点がここ 1 つで prompts.p1 の ON/OFF 両方を覆う: P1 が差し替えるのは
+            #   reflect/plan/recall のヘッダだけで、deliberate(発話・返答)のヘッダは
+            #   1 バイトも変えない(prompt_p1.header の分岐)。
+            if snc_section:
+                lines.append(snc_section)
     elif surprise == "post":
         lines.append("状況: スマホでSNSを開いた。いま感じていること、目にした光景、"
                      "タイムラインへの反応など、何か一つを短くつぶやく(post で)。"
@@ -564,12 +574,32 @@ def parse_action(response: str) -> dict | None:
             out["end"] = True
         return out
 
+    def _snc_flags(out: dict) -> dict:
+        """SNS・知り合い形成 v2(SNC。第117)の二値 2 欄。**キーが無ければ触らない**。
+
+        `relate` = この相手と知り合いになるか / `follow` = この相手の投稿を購読するか。
+        設計は docs/plans/sns-contact-redesign.md §2(C1 / F2)。OASIS 方式で、
+        既存の reply 呼の構造化出力に相乗りするので **LLM 呼は 1 本も増えない**。
+
+        ★受理は `_end_flag` と同じ流儀で ON/OFF に関わらず常に寛容(= 消費する側の
+          トグルが OFF なら「読んだが使わない」だけ)。逆に **欠落は false**(安全側):
+          mock バックエンドは 2 欄を出さないので mock ランでは 1 件も成立しない。
+        ★`true` そのものだけを見る(文字列 "true" や 1 は受けない)= LLM が
+          「関係を作れ」と言っていないのに縁ができることを構造的に無くす。
+        """
+        if data.get("relate") is True:
+            out["relate"] = True
+        if data.get("follow") is True:
+            out["follow"] = True
+        return out
+
     if kind == "speak":
         text = _text_of("text", "content", "message", "say", "speech")
         if text:
-            return _end_flag({"type": "speak", "text": text,
-                              "use_items": [t for t in data.get("use_terms", [])
-                                            if isinstance(t, str)]})
+            return _snc_flags(_end_flag(
+                {"type": "speak", "text": text,
+                 "use_items": [t for t in data.get("use_terms", [])
+                               if isinstance(t, str)]}))
         return None
     if kind == "coin_label":
         word = _text_of("word", "label", "name")

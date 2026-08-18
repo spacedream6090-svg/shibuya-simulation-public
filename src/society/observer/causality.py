@@ -189,6 +189,21 @@ CAUSE_OF_KIND: dict[str, str] = {
     "sns_read":      AGENT,
     "sns_like":      AGENT,
     "sns_reshare":   AGENT,
+    # ---- SNS・知り合い形成 v2(SNC。第117・net.contact_formation 既定 OFF=0 件)------ #
+    #  どちらも **その個体の出力・その個体の付き合い**なので agent。
+    #  ★分類は kind 単位なので、複数チャネルを 1 語へ畳む(payload["via"] で内訳は残る):
+    #    acquaint   … via=reply は返答 JSON の `relate` 欄 = LLM の宣言そのもの
+    #                 (watch_spec「読めなかったことも含めて個体の出力」と同族)。
+    #                 via=encounter は「同じ相手と 5 回すれ違った」の閾値到達だが、
+    #                 すれ違いを作ったのは当人の居場所選択であり、蓄積の閾値でも
+    #                 agent を取る先例が同じ表にある(label_adopt =「聞き手がその語を
+    #                 自分のものにした = 個体の採用」)。device 側の relation_tier は
+    #                 **他人の closeness 台帳を第三者的に読み直す**日境界処理で、
+    #                 当人が何もしていない点が違う。
+    #    sns_follow … via=reply は同じく LLM の宣言。via=timeline は「いいねした投稿の
+    #                 著者を購読する」= sns_like(agent)の直後の同種の行為。
+    "acquaint":      AGENT,
+    "sns_follow":    AGENT,
     "news_read":     AGENT,
     "search":        AGENT,
     "media_use":     AGENT,

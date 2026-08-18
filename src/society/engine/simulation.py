@@ -455,6 +455,7 @@ class Simulation:
             max_log=int(tcfg.get("max_log", 120)),
             step_minutes=self.dt_min)
         # インターネット層(SNS/ニュース/検索/DM)
+        from ..net import contact_formation as _contact_formation_mod
         from ..net.internet import Internet
         ncfg = cfg.get("net", {})
         self.netcfg = {
@@ -464,6 +465,12 @@ class Simulation:
             # #14 SNS 反応(既定で有効: 非LLM の追加挙動で対照性は壊さない)
             "like_prob": float(ncfg.get("like_prob", 0.15)),
             "reshare_prob": float(ncfg.get("reshare_prob", 0.03)),
+            # SNS・知り合い形成 v2(SNC。第117・既定 OFF=現行挙動と 1 バイトも変わらない)。
+            # 正準化を**ここ 1 回**だけ行い、以後は net/contact_formation.cfg_of が
+            # この dict を引くだけにする(発話ハンドラの聞き手ループから毎回 conf を
+            # 辿らせない = O(N²) を塞ぐ機能が自分で重くならないようにする)。
+            "contact_formation": _contact_formation_mod.build_cfg(
+                ncfg.get("contact_formation", None)),
         }
         self.net = Internet(feed_size=int(ncfg.get("feed_size", 6)),
                             posts_max=int(ncfg.get("posts_max", 0) or 0))

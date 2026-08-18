@@ -163,6 +163,13 @@ def recall_temperature(sim) -> float | None:
 
 # --------------------------------------------------------------------------- #
 # ヘッダ・規律の組み立て(純関数。副作用・乱数ゼロ)
+#
+# ★第117 SNC v2 の判定 2 行(relate / follow)は**ここには無い**。理由: 本 module が
+#   ヘッダを差し替えるのは reflect / plan / recall だけで、発話・返答(deliberate)の
+#   ヘッダは `header()` が `base` をそのまま返す = 1 バイトも変えないからである。
+#   したがって「返答のときだけ 2 行足す」は `deliberate.build_prompt` の reply 枝
+#   (`snc_section`)に置いてある。注入点がそこ 1 つで P1 の ON/OFF 両方を覆う。
+#   文面の正典は src/society/net/contact_formation.py の JUDGMENT_LINES。
 # --------------------------------------------------------------------------- #
 def header(purpose: str, *, base: str, city_name: str = "") -> str:
     """purpose 別のヘッダ 1 行を返す。

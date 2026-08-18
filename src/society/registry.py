@@ -568,6 +568,31 @@ FEATURES: tuple[Feature, ...] = (
     # ---- net / drive / conversation / planning / routine / prompts ----
     _f("net.enabled", "strict", False, "none",
        "インターネット層(SNS 閲覧・ニュース・フォロー・いいね/リシェア)"),
+    # 第117 SNC v2(設計 docs/plans/sns-contact-redesign.md / 実装 src/society/net/
+    # contact_formation.py)。**journal 等級**の根拠: C1/F2 は返答の**自由文 JSON**の
+    #   relate/follow 欄を読むので、事後再生には llm_cache / llm_journal が要る
+    #   (cognition.engaged が `end` 欄を読むために journal を取っているのと同型)。
+    # affects_k=False の根拠: **generate() の呼び出しサイトを 1 つも増やさない**
+    #   (追加 LLM 呼ゼロ = OASIS 方式で既存 reply 呼の出力に相乗りする)。予算も
+    #   発火判断も 1 バイトも触らない。変わるのは reply の**出力**が 2 欄ぶん伸びること
+    #   (+20-40 tok/呼)と、contacts/follows の**張られ方**だけ。
+    # fingerprint_risk=possible を正直に宣言する: ON のとき**返答のプロンプトにだけ**
+    #   「本文のあとに relate / follow を書いてよい」の 2 行が増える(= 宣言路そのもので、
+    #   設計が要求したものなので隠さない)。機構語(発火・閾値・グラフ・上限・
+    #   シミュレーション)も実験条件語も因子名も 1 文字も出さない。
+    _f("net.contact_formation.enabled", "journal", False, "possible",
+       "SNS・知り合い形成 v2(SNC)。現行の『発話が聞こえた**全員**と add_contact』"
+       "(= 傍聴者まで知り合い+相互フォロー)を、対話が成立したペア(C1/F2 = 返答の "
+       "LLM 宣言 relate/follow)・顔なじみ(C3 = 同一相手と k 回目の遭遇)・"
+       "タイムライン発見(F3 = いいねからの確率フォロー)の 3 経路へ置き換え、"
+       "contacts 200 / follows 500 の上限を掛ける。"
+       "★塞ぐバグ: 現行は 10k×2 日で follows/contacts が実質**完全グラフ**"
+       "(19,738 個体 × 約 19,400 辺)= RSS 100GiB で、25 万では本番が OOM 死する。"
+       "★`hearer.remember`(聞いた内容の記憶)は ON/OFF で不変なので、新語・情報の"
+       "対面伝播は 1 ビットも死なない(切るのは『知り合いになる』だけ)。"
+       "★C3 の遭遇カウンタは 1 個体あたり encounter_track_max 件の LRU に有界化して"
+       "あり、**塞ぎに来た O(N²) をメモリ側で再発させない**ことがこの機能の要である。"
+       "★乱数は F3 の新 named stream \"snc_follow\" だけ(OFF では 1 粒も引かない)"),
     _f("drive.boredom.enabled", "strict", False, "none",
        "退屈ゲージ(同じことの反復で発火閾値が下がる)"),
     _f("drive.drift.enabled", "strict", False, "none",

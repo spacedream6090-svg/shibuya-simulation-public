@@ -708,14 +708,16 @@ def test_contract_round_trip_keeps_the_trace_line(tmp_path):
     percept = scheduler.build_perception(sim, later, material)
     assert percept.trace_line == T.sentence("gathering")
     # 無損失(契約の中心)。material は _gather_material の生の出力なので、_llm_speak が
-    # 後から足す 5 欄は比較の対象外にする(tests/test_physics_zones.py:666 と同じ流儀)。
+    # 後から足す 6 欄は比較の対象外にする(tests/test_physics_zones.py:666 と同じ流儀)。
     # ★trace_line は **_gather_material が集める側**(場所ラベル行と同じ族)なので、
-    #   後から足す 5 欄には**含まれない**= 契約列挙の集合は IF-B から変わらない。
+    #   後から足す 6 欄には**含まれない**= 契約列挙の集合は IF-B から変わらない。
+    # ★snc_section は第117 SNC v2(net.contact_formation)で 6 欄目に加わった
+    #   (engaged_section / reject_line と完全同型の seam。返答のときだけ載る)。
     kw = percept.prompt_kwargs()
     assert {k: v for k, v in kw.items() if k in material} == material
     assert set(kw) - set(material) == {"interstitial_digest", "watch_section",
                                        "revision_line", "engaged_section",
-                                       "reject_line"}
+                                       "reject_line", "snc_section"}
     assert T.sentence("gathering") in percept.text_blob()
 
 
