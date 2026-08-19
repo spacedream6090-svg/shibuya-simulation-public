@@ -410,6 +410,33 @@ world:
   # 効くもの: hear の L1 件数・記憶・関係台帳・drive・意見更新・SNC 遭遇カウンタが
   #   すべて「絞った聴衆」に揃う(= §2 表の #2 #3 #5 #10 #11 に掛かる乗数を下げる)。
   attention_hearers_max: 0
+
+  # ---- ATT 層A(第143): 自律的注意機構の**顕著性 top-k 選抜**。既定 OFF=現行と完全同一 ----
+  # 正典: docs/plans/attention-mechanism-plan.md §2(層A)・§6.5(個体差)・§6.6(実装決定)。
+  # 文献: Cherry 1953 / Wood & Cowan 1995(非注意の発話は記憶に残らない)・Cowan 2001(k=4±1)・
+  #   Dunbar 1995(会話上限 4 人)・Conway 2001(自己名貫通 p≈0.33・個体差 0.20-0.65)・
+  #   Wolfe GS6 2021(priority = w_bu·顕著性 + w_td·目標関連 + w_h·履歴 + w_v·価値)。
+  # ★★層3 = **世界の力学に触る**(S15 と同じ)。伝播トポロジーが変わるので ON はユーザーの
+  #   事前登録が要る。挿入点は S15 と同一の 1 点(speak ハンドラの hearers)だけ。
+  # 何が変わるか: mode=salience のとき、聞こえた全員から priority 上位 k_i 人(+ 自己名の
+  #   貫通)だけが hear の L1 / 記憶 / 関係台帳 / 覚醒 / 意見更新 / SNC 遭遇 / 噂 を受ける。
+  #   **非通過者には何も起きない**(群衆の集約記憶も入れない = Cherry 準拠)。
+  # 乱数: 1 粒も引かない(k_i・p_break_i・貫通判定はすべて blake2b の安定ハッシュ)。
+  attention:
+    enabled: false              # 既定 OFF=下の分岐へ 1 度も入らない=L1 バイト一致
+    mode: distance              # distance=第141 S15 と完全同一(縮退線)/ salience=層A
+    k_base: 4                   # 深処理容量の基底(Cowan 2001 の 4±1)
+    k_span: 2                   # 個体差の振れ幅(実効帯は [2, 7] へクランプ)
+    theta_ignition: 0.0         # 点火閾値。0=閾値なし(k だけが効く)。>0 で「静かな街では 1-2 人」
+    p_break_base: 0.33          # 自己名の貫通率の基底(個体は 0.20-0.65 帯へ決定論分散)
+    w_bu: 1.0                   # 顕著性(ボトムアップ)
+    w_td: 0.5                   # 目標関連(トップダウン)
+    w_h: 0.3                    # 履歴(プライミング)
+    w_v: 0.5                    # 価値(関係台帳 closeness/tier + contacts 在籍)
+    alpha_nov: 0.5              # 顕著性: 新奇語(この聞き手がまだ知らない語)
+    alpha_emo: 0.3              # 顕著性: |情動価|
+    alpha_addr: 1.0             # 顕著性: 宛先性(自分の名前が出てくる)
+    w_slot: 0.8                 # 層B 結合: 宣言済みの相手への持続ボーナス
   edge_capacity: 20             # 混雑=この人数を超えると減速(grievance 源)
   elevation:                    # 3D Phase 0: 標高 z 列(3d-movement.md §7)。ON で move_segment/arrive payload に z[m](DEM 双一次・export_3d と同値)を追加
     enabled: false              # 既定 OFF=イベント不変(バイト一致)。表示・観測専用=移動判定・認知・LLM 呼数は不変
@@ -1829,6 +1856,21 @@ cognition:
                   [40.0, 0.000], [65.0, 0.015], [82.0, 0.030]]
     theta_gain: 1.0
     theta_clip: 0.08          # delta の絶対値上限(閾値の定義域は [0.30, 0.85])
+  # ---- ATT 層B(第143): LLM 自律宣言の注意ブロック。既定 OFF=現行と完全同一 ----
+  # 正典: docs/plans/attention-mechanism-plan.md §3。実装: src/society/attention.py。
+  # 何を置くか: 「いま何を気にしているか」を **LLM 自身が構造化出力で編集する**有限スロット
+  #   (kind = person|place|topic|goal・K=7 は Cowan 4±1 と Lost in the Middle 回避の 5-9 帯)。
+  #   発火時は既存の deliberate 呼の JSON へ `attend` を相乗りさせる(**追加 LLM 呼ゼロ**・
+  #   SNC の relate/follow と同じ流儀・mock は出さないので mock ランでは 1 件も動かない)。
+  #   非発火時は日境界の減衰 + イベント駆動 boost(自分宛ての発話)だけ = 乱数ゼロ。
+  # ★本選 ON の判断は**プローブ後**(宣言率・スロット内容の質を 8B/14B で実測してから。
+  #   第140 SNS 完全グラフの教訓 = 較正なしで開けない)。
+  attention_block:
+    enabled: false          # 既定 OFF=agent に attention_slots 属性を 1 つも生やさない
+    slots_max: 7            # スロット上限(超過分は宣言の先頭から採る)
+    decay_per_day: 0.15     # 日境界の減衰(salience ×= 1 - この値)
+    boost_addressed: 0.3    # 自分宛ての発話を受けた step の加点(上限 1.0)
+    min_salience: 0.05      # 日境界でこれを下回ったスロットは消える
   policy_cache:
     enabled: false
     reuse_rate_cap: 0.6   # 再利用の確率ゲート兼ハード上限(多様性の下限を保証)

@@ -394,6 +394,17 @@ _HH_FIELDS = (("household_id", str, ""), ("household_kind", str, ""),
 _HOME_FIELDS = (("home_building", str, ""), ("home_node", str, ""),
                 ("home_floor", int, 1))
 
+#: ATT(第143)。層B の注意ブロック(有限スロット)と層A の注意履歴(プライミング)。
+#  判定基準 3 つ(① 個体固有 ② 日を跨いで持続 ③ 行動 or L1 の発火可否を変える)を満たす:
+#  スロットはプロンプトの「いま気にしていること」節そのもので、層A の priority にも
+#  w_slot で効く。履歴は層A の history 項(直近この話者を注意した割合)。
+#  ★属性名は `society.attention.SLOTS_KEY` / `HISTORY_KEY` と同一でなければならないが、
+#    `_RUMOR_KEY` と同じ理由(world/ は下層 = society 直下の機構 module を import すると
+#    依存の向きが逆流する)で写しを持つ。一致は tests/test_attention.py が機械固定する。
+#  ★ATT OFF のランではどちらの属性も**生えない**ので退避 dict は 1 バイトも変わらない。
+_ATTN_SLOTS_KEY = "attention_slots"
+_ATTN_HIST_KEY = "_attn_hist"
+
 _VISITS_KEY = "visits"            # EPR preferential return(node -> 訪問回数)
 _SELF_DEV_KEY = "self_dev"        # T4 自助努力(skill/fitness の累積ストック)
 _SCHEDULE_KEY = "schedule"        # 14 日先まで持てる約束帳
@@ -733,6 +744,18 @@ def dehydrate(agent, *, ep_cap: int | None = None, rel_cap: int | None = None) -
     sat = getattr(agent, "sat", None)
     if sat:
         state["sat"] = {str(k): float(v) for k, v in sorted(sat.items())}
+    # --- ATT(第143): 注意ブロック(層B)と注意履歴(層A)。**属性が在って非空のときだけ**
+    #     キーを足す = ATT OFF のランでは退避 dict が 1 バイトも変わらない。
+    slots = getattr(agent, _ATTN_SLOTS_KEY, None)
+    if slots:
+        state["attention_slots"] = [
+            {"kind": str(s.get("kind", "")), "target": str(s.get("target", "")),
+             "why": str(s.get("why", "")),
+             "salience": float(s.get("salience", 0.0) or 0.0),
+             "since": int(s.get("since", 0) or 0)} for s in slots]
+    ahist = getattr(agent, _ATTN_HIST_KEY, None)
+    if ahist:
+        state["attn_hist"] = [int(x) for x in ahist]
     # ★**ゾーン所有(_phys_zone と _FIELDS の走行レコード)は意図的に運ばない**。あれは
     #   「いま歩いている経路 agent.route の途中」という**その旅に固有の**状態で、再来街時は
     #   build_pool_agent が別の node / route で個体を組み直すため、復元すると physics._run_zone が
@@ -868,6 +891,16 @@ def hydrate(agent, state: dict) -> None:
     sat = state.get("sat")                        # 第114 OBS: 価値 4 軸の充足(多日スケール)
     if sat:
         agent.sat = {str(k): float(v) for k, v in sat.items()}
+    slots = state.get("attention_slots")          # 第143 ATT 層B: 注意ブロック(有限スロット)
+    if slots:
+        setattr(agent, _ATTN_SLOTS_KEY,
+                [{"kind": str(s.get("kind", "")), "target": str(s.get("target", "")),
+                  "why": str(s.get("why", "")),
+                  "salience": float(s.get("salience", 0.0) or 0.0),
+                  "since": int(s.get("since", 0) or 0)} for s in slots])
+    ahist = state.get("attn_hist")                # 第143 ATT 層A: 注意履歴(プライミング)
+    if ahist:
+        setattr(agent, _ATTN_HIST_KEY, [int(x) for x in ahist])
 
 
 # --------------------------------------------------------------------------- #

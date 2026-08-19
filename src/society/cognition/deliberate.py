@@ -165,6 +165,7 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
                  engaged_section: str | None = None,
                  reject_line: str | None = None,
                  snc_section: str | None = None,
+                 attention_section: str | None = None,
                  trace_line: str | None = None,
                  p1_purpose: str | None = None) -> str:
     """個別文脈(時刻・場所・活動・気分・記憶・直近発話)を渡し、内容の固定化を防ぐ。
@@ -204,6 +205,15 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
     lines = [_head, agent.persona]
     if p1_purpose is not None:
         lines += _p1_discipline()
+    # ATT 層B(第143・cognition.attention_block・既定 OFF は None=1行も足さない=バイト一致)。
+    # 「いま気にしていること」= 自分の注意状態を読める形で持つ節(Attention Schema 理論)。
+    # ★固定位置 = **ペルソナ(+規律)直後の先頭側**(Lost in the Middle 対策。設計 §3)。
+    #   lines[0](ヘッダ)と lines[1](ペルソナ)は動かさないので、ablate の persona_swap /
+    #   prompt_paraphrase の作用点は 1 バイトも変わらない。
+    # ★中身は「気にかけている対象・目の前の人・耳に入っている言葉」と JSON の形だけで、
+    #   機構語も実験条件語も因子名も 1 文字も出さない(society/attention.py 参照)。
+    if attention_section:
+        lines.append(attention_section)
     # 群のオントロジー(文化圏×経験の「経験の事実」1行。ontology 有効時のみ agent に設定される。
     # 文言は config 由来=基盤に文化名リテラルなし。OFF は属性なし=行なし=バイト一致)。
     onto = getattr(agent, "ontology_line", None)
@@ -593,13 +603,30 @@ def parse_action(response: str) -> dict | None:
             out["follow"] = True
         return out
 
+    def _attend_field(out: dict) -> dict:
+        """ATT 層B(第143)の注意ブロック宣言。**キーが無ければ 1 バイトも触らない**。
+
+        設計は docs/plans/attention-mechanism-plan.md §3(MEM1 式の全量再宣言)。
+        `_snc_flags` / `_end_flag` と同じ流儀で **ON/OFF に関わらず常に寛容**に受け、
+        消費する側(society/attention.py)のトグルが OFF なら「読んだが使わない」だけ。
+        ★ここでは**型だけ**を見る(list か否か)。kind の検証・target の正準化・
+          上限の切り詰めは消費側の唯一の受理点 `attention.apply_declaration` が行う
+          (cognition 層は世界状態を作らない、の分担)。
+        ★空 list は「もう何も気にしていない」という**有効な宣言**なので通す
+          (欠落 = 変更なし、とは意味が違う)。
+        """
+        attend = data.get("attend")
+        if isinstance(attend, list):
+            out["attend"] = [a for a in attend if isinstance(a, dict)]
+        return out
+
     if kind == "speak":
         text = _text_of("text", "content", "message", "say", "speech")
         if text:
-            return _snc_flags(_end_flag(
+            return _attend_field(_snc_flags(_end_flag(
                 {"type": "speak", "text": text,
                  "use_items": [t for t in data.get("use_terms", [])
-                               if isinstance(t, str)]}))
+                               if isinstance(t, str)]})))
         return None
     if kind == "coin_label":
         word = _text_of("word", "label", "name")

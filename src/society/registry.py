@@ -184,6 +184,39 @@ FEATURES: tuple[Feature, ...] = (
        "採用にはユーザーの事前登録が必要で、採るなら RESULTS に開示する。"
        "適用は speak ハンドラの hearers **だけ**(同席判定・発火条件・company は不触)",
        off_value=0),
+    # ATT 層A(第143・自律的注意機構)。正典 docs/plans/attention-mechanism-plan.md §2 / §6.5。
+    # ★affects_k=True(S15 と同じ理由を正直に): 聴衆を絞ると聞き手側の drive 加算
+    #   (_arouse / on_ingroup_heard / on_vicarious)が減るので、呼数 cap が binding しない
+    #   構成では発火回数が動きうる。generate() の呼び出しサイトは 1 つも足さない/減らさない。
+    # ★repro_tier=strict: 選抜は blake2b の安定ハッシュ + 台帳の読み取りだけで決まり、
+    #   **LLM の自由文を 1 バイトも読まない**(層B の attend を読むのは別トグル)。
+    _f("world.attention.enabled", "strict", True, "none",
+       "ATT 層A: 顕著性 top-k 選抜(自律的注意機構)。ON かつ mode=salience のとき、1 発話の"
+       "聴衆を priority = w_bu·顕著性 + w_td·目標関連 + w_h·履歴 + w_v·価値 の上位 k_i 人"
+       "(+ 自己名の貫通 p_break_i)へ絞る。通過分だけが hear の L1 / 記憶 / 関係台帳 / 覚醒 /"
+       "意見更新 / SNC 遭遇 / 噂 を受け、**非通過者には何も起きない**(Cherry 1953)。"
+       "k_i ∈ [2,7] と p_break_i ∈ [0.20,0.65] は個体ごとの blake2b 決定論値(乱数ゼロ)。"
+       "★**層3 = 世界の力学に触る**(S15 と同じ): 伝播トポロジーが変わる = k* 研究の条件"
+       "そのものなので、採用にはユーザーの事前登録が必要で RESULTS に開示する。"
+       "適用は speak ハンドラの hearers **だけ**(同席判定・発火条件・company は不触)"),
+    _f("world.attention.mode", "strict", True, "none",
+       "ATT 層A の縮退線。distance(既定)= 第141 S15(距離二乗昇順 → id 昇順の近傍 K 人)と"
+       "**完全同一**で新経路へ 1 度も入らない / salience = 上の顕著性選抜。"
+       "★enabled が false ならどちらの値でも 1 バイトも動かない(二重の門)",
+       off_value="distance"),
+    # ATT 層B(第143)。正典 同 §3 / §6.6。
+    # ★repro_tier=journal: 機能の本体が **LLM の自由文出力(attend 欄)を消費する**。
+    #   単体では非決定だが llm_cache / llm_journal があれば事後に再生できる。
+    # ★affects_k=False: generate() の呼び出し点も本数も 1 つも増減しない(既存 deliberate 呼の
+    #   構造化出力へ相乗りするだけ = SNC の relate/follow と同型)。
+    # ★fingerprint_risk=possible: プロンプトへ「いま気にしていること」節が 1 ブロック増える。
+    _f("cognition.attention_block.enabled", "journal", False, "possible",
+       "ATT 層B: LLM 自律宣言の注意ブロック(有限スロット K=7・kind = person|place|topic|goal)。"
+       "発火時は既存の熟慮呼の JSON に `attend` を相乗りさせて全量再宣言(MEM1 式)= **追加 LLM"
+       "呼ゼロ**。欄が無ければ変更なし(mock は出さないので mock ランでは 1 件も動かない)。"
+       "非発火時は日境界の減衰(decay_per_day)+ 自分宛て発話の boost だけ = 乱数ゼロ。"
+       "宣言済みの相手は層A の priority へ w_slot の持続ボーナス(トップダウン注意の実体)。"
+       "★本選 ON はプローブ(宣言率・スロット内容の質を 8B/14B で実測)後に判断する"),
     _f("world.elevation.enabled", "strict", False, "none",
        "標高 z 列をイベント payload へ付ける(表示・観測専用)"),
     _f("world.heights.enabled", "strict", False, "none",

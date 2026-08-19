@@ -711,13 +711,15 @@ def test_contract_round_trip_keeps_the_trace_line(tmp_path):
     # 後から足す 6 欄は比較の対象外にする(tests/test_physics_zones.py:666 と同じ流儀)。
     # ★trace_line は **_gather_material が集める側**(場所ラベル行と同じ族)なので、
     #   後から足す 6 欄には**含まれない**= 契約列挙の集合は IF-B から変わらない。
-    # ★snc_section は第117 SNC v2(net.contact_formation)で 6 欄目に加わった
-    #   (engaged_section / reject_line と完全同型の seam。返答のときだけ載る)。
+    # ★snc_section は第117 SNC v2(net.contact_formation)で 6 欄目に、
+    #   attention_section は第142 ATT層B(cognition.attention_block)で 7 欄目に加わった
+    #   (engaged_section / reject_line と完全同型の seam。OFF では常に空文字)。
     kw = percept.prompt_kwargs()
     assert {k: v for k, v in kw.items() if k in material} == material
     assert set(kw) - set(material) == {"interstitial_digest", "watch_section",
                                        "revision_line", "engaged_section",
-                                       "reject_line", "snc_section"}
+                                       "reject_line", "snc_section",
+                                       "attention_section"}
     assert T.sentence("gathering") in percept.text_blob()
 
 

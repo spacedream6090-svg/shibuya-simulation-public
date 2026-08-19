@@ -14,6 +14,7 @@ from .. import ablate as ablate_mod
 from .. import aging as aging_mod
 from .. import annual as annual_mod
 from .. import assets as assets_mod
+from .. import attention as attention_mod
 from .. import chance as chance_mod
 from .. import commerce as commerce_mod
 from .. import conversation as conversation_mod
@@ -2595,6 +2596,14 @@ def _llm_speak_g(sim, agent, trigger: str, step: int, sim_min: int, *,
     # 既定 net.contact_formation.enabled=false は None=1行も足さない=バイト一致
     # (engaged_section / reject_line と完全同型の seam)。
     material["snc_section"] = contact_mod.prompt_section(sim, trigger)
+    # ATT 層B(第143・cognition.attention_block): 「いま気にしていること」節 +
+    # 目の前の人・耳に入っている言葉 + attend を書いてよいという 1 行。
+    # 既定 OFF は None=1 行も足さない=バイト一致(snc_section と完全同型の seam)。
+    material["attention_section"] = attention_mod.prompt_section(
+        sim, agent, material.get("nearby_names"))
+    # ATT 層A: この呼びが返答なら「誰へ返すか」を預かる(= 同 step の発話で会話相手を
+    # 優先充当する)。層A の顕著性選抜が OFF なら属性を 1 つも生やさない。
+    attention_mod.note_reply_target(sim, agent, partner_id, step)
     # ---- 第85バッチ: 契約経路(既定 OFF)------------------------------------- #
     #  ON では world → Perception → prompt に一本化する。**プロンプト文字列は 1 バイトも
     #  変わらない**(prompt_kwargs() が material と完全に等しい dict を返す)= P1(3)
@@ -2638,6 +2647,10 @@ def _llm_speak_g(sim, agent, trigger: str, step: int, sim_min: int, *,
     # 行動のパース成否とは独立(行動が壊れていても watch だけ読めることがある)。
     # 既定 OFF は即 return で 1 バイトも触らない。
     watch_mod.apply(sim, agent, response, step, sim_min)
+    # ATT 層B(第143): 構造化出力の `attend` を受理して注意ブロックを全量置換する
+    # (MEM1 式)。**欄が無ければ 1 バイトも触らない**(SNC の relate/follow と同じ流儀・
+    # mock は出さない)。既定 OFF は即 return。追加 LLM 呼ゼロ・乱数ゼロ。
+    attention_mod.apply_declaration(sim, agent, action, step)
     _model_revision_beliefs(sim, agent, step, sim_min, trigger)
     if action is None:                             # D16: 壊れたら沈黙して続行
         # V3: `fallback{reason:"parse_error"}` には trigger が載らない(用途別の内訳が
@@ -3823,7 +3836,22 @@ def _apply_action(sim, agent, action: dict, step: int, sim_min: int) -> None:
 
     if kind == "speak":
         radius = float(sim.cfg.world.perception_radius_m)
-        hearers = _attention_limited(sim, agent, hearers_of(agent, sim.agents, radius))
+        # ---- ATT 層A(第143・`world.attention`)の**唯一の挿入点** = S15 と同一点 ----
+        #  既定(enabled:false / mode:"distance")では `salience_on` が False を返し、
+        #  下の 1 行だけが走る = 第141 S15 と**バイト同一**(ゴールデン維持)。
+        #  ON(mode:"salience")では、聞こえた全員から priority 上位 k_i 人(+ 自己名の
+        #  貫通)だけを選び、その集合が hear の L1 / 記憶 / 関係 / 覚醒 / SNC 遭遇 /
+        #  意見更新 / 噂 へそのまま流れる(= 非通過者には**何も起きない**・Cherry 1953)。
+        _att_all = hearers_of(agent, sim.agents, radius)
+        if attention_mod.salience_on(sim):
+            _att_words = [w for w in action.get("use_items", []) if w in agent.adopted]
+            hearers, _att_crowd = attention_mod.select(
+                sim, agent, _att_all, action["text"], _att_words, step,
+                radius=radius, valence_abs=abs(valence(action["text"])),
+                pref_ids=attention_mod.reply_target_of(agent, step))
+            attention_mod.note_attended(hearers, agent.id)
+        else:
+            hearers = _attention_limited(sim, agent, _att_all)
         # ablate.propagation_off(第78・既定 OFF=False=以下は全て従来経路)。
         # 「発話は通常どおり生成する / 内容は他者の文脈へ一切入らない」を実現するための
         # 唯一の判定。**聞き手集合・イベント・返答権の付与・接触台帳は触らない**
@@ -3832,8 +3860,10 @@ def _apply_action(sim, agent, action: dict, step: int, sim_min: int) -> None:
         # 返答保証: 返答権を渡す相手を決定論選択(既定 nearest=最寄り1人=現行と同一。
         # prompts.reply_partner=closeness で関係加重の宛先へ)。hearer 集合は不変=聞く人は
         # 変わらない・返す人だけが変わる。乱数なし=R1。
+        _att_addressed = -1              # ATT 層B: 「宛先」= 返答権を渡す相手(boost の対象)
         if hearers:
             partner = _select_partner(sim, agent, hearers)
+            _att_addressed = int(partner.id)
             if (not partner.sleeping and partner.conv_turns_left > 0
                     # 在宅覚醒(HOME_AWAKE β9・既定 OFF=pair_open は常に True=従来経路)。
                     # 在宅覚醒中の相手には睡眠中と同じ扱いで返答権を渡さない = この機能が
@@ -3923,6 +3953,11 @@ def _apply_action(sim, agent, action: dict, step: int, sim_min: int) -> None:
                 contact_mod.note_encounter(sim, hearer, agent, step, sim_min)
             else:
                 sim.net.add_contact(agent.id, hearer.id)  # 対面で知り合い→DM可・フォロー
+            # ATT 層B(第143・`cognition.attention_block`・既定 OFF は即 return=1 バイトも
+            # 動かない): **自分宛て**の発話(= 返答権を渡された相手)を受けた step だけ、
+            # その話者の注意スロットの salience を上げる(イベント駆動 boost・乱数ゼロ)。
+            if hearer.id == _att_addressed:
+                attention_mod.note_addressed(sim, hearer, agent.id)
             # 関係台帳(Wave G2 の交流符号=発話の感情価)。OFF は従来の record_contact と完全同一。
             # 第65バッチ: 交流の**量**に載る係数を(話者,聞き手)1組につき1回だけ算出し両方向へ
             # 同じ値で渡す(既定 OFF=1.0=従来と同値)。算出は society 層=engine は運ぶだけ。
@@ -6273,6 +6308,7 @@ def run_step(sim, step: int) -> None:
                                                    # ★_phase_calendar_weather の後=当日の実日付が確定してから読む
     _phase_schedule_gc(sim, step, sim_min)         # 日次境界: 過去予定の GC(既定OFF=no-op)
     _phase_relations_day(sim, step, sim_min)       # 日次境界: 関係の断絶/評判の風化(既定OFF=no-op)
+    attention_mod.phase_day(sim, step, sim_min)    # 日次境界 ATT 層B: 注意スロットの減衰+消滅(既定OFF=no-op)
     _phase_household(sim, step, sim_min)           # 日次境界: パートナー形成(既定OFF=no-op。後続波 H2)
     _phase_joint(sim, step, sim_min)               # 日次境界: 共同行動の編成(既定OFF=no-op。第44バッチ S-R3)
     _phase_commerce(sim, step, sim_min)            # 毎step: 店舗の開閉遷移 shop_state(既定OFF=no-op。後続波 H3)

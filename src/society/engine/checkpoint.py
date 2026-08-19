@@ -462,6 +462,10 @@ def save(sim, step: int, path: str | Path, *, complete: bool = True) -> Path:
             "freedom_day": getattr(sim, "_freedom_day", -1),  # 第17 価値充足の中立回帰(二重減衰)
             "sched_day": getattr(sim, "_sched_day", -1),      # 予定の日次 GC
             "partner_day": getattr(sim, "_partner_day", -1),  # H2 パートナー形成(同日二重成立)
+            # ATT 層B(第143): 注意ブロックの日次減衰(mid-day resume の**二重減衰**)。
+            # ★これを保存しないと、再開直後の step で同じ暦日の減衰がもう一度走り、
+            #   スロットの salience が straight より 1 段低くなる(実測で発覚した)。
+            "attn_block_day": getattr(sim, "_attn_block_day", -1),
             "health_day": getattr(sim, "_health_day", -1),    # G6 発症/受診の日次抽選(二重抽選)
             # 偶発イベント: stream キーが (agent.id, **day**) なので同じ日を引き直すと
             # **同じ当たりがもう一度効く**(windfall の二重入金)= 特に害が大きい。
@@ -869,6 +873,7 @@ def load(sim, path: str | Path) -> int:
     sim._freedom_day = rt.get("freedom_day", -1)
     sim._sched_day = rt.get("sched_day", -1)
     sim._partner_day = rt.get("partner_day", -1)
+    sim._attn_block_day = rt.get("attn_block_day", -1)   # ATT 層B(第143)の二重減衰防止
     sim._health_day = rt.get("health_day", -1)
     sim._chance_day = rt.get("chance_day", -1)
     sim._goods_review_day = rt.get("goods_review_day", -1)

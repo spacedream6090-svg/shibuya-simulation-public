@@ -301,6 +301,21 @@ world:
                                # 初日は binding しない。日別の在場数を読むときはここを踏まえる。
     weekday_work: true
 
+  # ---- ATT 層A(第143): 自律的注意機構の顕著性 top-k 選抜 ----------------------------
+  # 正典: docs/plans/attention-mechanism-plan.md §2 / §6.5 / §6.6。実装 src/society/attention.py。
+  # ON の理由: 現行は「聞こえた全員」を等しく処理する = Cherry 1953 / Wood & Cowan 1995
+  #   (非注意の発話は記憶に残らない)からの乖離であり、同時に記憶・関係・観測の書込が
+  #   O(聴衆数百〜数万)になる RAM/step 時間の主因でもある。容量制限なしでは実 SNS の
+  #   統計則(重尾・Dunbar 飽和・α<2)が出ないという独立 6 実証もある(設計 §1 の柱 4)。
+  # ★★層3 = **世界の力学に触る**(伝播トポロジーが変わる)。S15 と同じ扱いで RESULTS に開示する。
+  # ★値(k_base / theta_ignition / 重み)は **8/20 判定で最終化**する(仮値)。
+  #   mode=distance へ戻せば第141 S15 と完全同一の縮退線に落ちる(1 行で撤退できる)。
+  attention:
+    enabled: true
+    mode: salience            # ★8/20 判定で最終化(distance = S15 縮退線への 1 行撤退路)
+    k_base: 4                 # ★同上(Cowan 4±1。実効帯は個体ごとに [2,7] へ分散)
+    theta_ignition: 0.0       # ★同上(0 = 閾値なし。>0 で「静かな街では 1-2 人」が出る)
+
   # ---- 夜間解禁(Wave 4 III-1)。1つのクランプ修正が夜の街全体を開ける ----
   night_economy:
     enabled: true          # 日跨ぎシフト(close<open)+ 24h コンビニ + 深夜営業 + 終電後の受け皿
@@ -586,6 +601,13 @@ information:
     enabled: true          # 噂オブジェクト+MT型 stifler(既存会話に相乗り=発話本文は非注入)
 
 cognition:
+  # ---- ATT 層B(第143): LLM 自律宣言の注意ブロック ----------------------------------
+  # ★**OFF のまま**(設計 §6.6 のユーザー決定): 層B は LLM の自由文出力を消費する
+  #   (repro_tier=journal)ので、宣言率とスロット内容の質を 8B/14B のプローブで実測して
+  #   較正してからでないと開けない(第140 SNS 完全グラフ / SNC の 68% 問題と同じ教訓)。
+  #   実装は済んでいて、この 1 行を true にするだけで開く(層A は層B なしでも成立する)。
+  attention_block:
+    enabled: false         # ★プローブ後に ON 判断(層3 = 世界の力学に触る)
   channels:
     enabled: true          # 読み取り専用・L1 バイト不変(σ 較正の観測点)
     # G6(第114 GT ロガー): 価値 4 軸の充足 sat を末尾 4 列として足す。
