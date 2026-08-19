@@ -4000,11 +4000,14 @@ beliefs:
   verify_deadline_steps: 36     # 現場確認(go)の有効期限 [step](6 時間)
   net_conf: 0.7                 # ネット裏取りで得る確信度(公開記録=真値だが直接目撃より弱い)
   ask_conf: 0.9                 # 目撃者に聞いて得る確信度の上限
-  # ---- WIT-1 チャネル×注意ゲート(2026-08-20。正典 docs/plans/witness-channel-attention-plan.md)----
+  # ---- WIT-1/2 チャネル×注意ゲート(2026-08-20。正典 docs/plans/witness-channel-attention-plan.md)----
   # 現行の「半径60m×1時間の在場者**全員**が認知」は、実証(POSTAR視認率・店内棚の注視 14.5-27.5%・
   # 街頭事象の目撃 昼72%/夜35%)に対して 1 桁の過大付与になる。ここは「到達(半径)」と
   # 「注意通過(p_notice)」を 2 段に分けるブロック。到達だけでは信念にならない。
-  #   radius_m … その種の目撃半径を上書き(情報の載る面の大きさ=チャネル)
+  #   place    … true = 到達を「距離」ではなく **fact の場所(node)に滞在していたこと**で決める
+  #              (WIT-2 実装A。店内情報は来店者限定 = EpiSimdemics 型の訪問重なり)。
+  #              場所が判らない fact(座標しか無い等)は**黙って広げず** radius_m へ倒す。
+  #   radius_m … その種の目撃半径を上書き(情報の載る面の大きさ=チャネル)。place の後退先も兼ねる
   #   p_notice … 到達したうち実際に気づく割合。判定は blake2b の安定ハッシュ
   #              (salt, fact_id, agent_id)= **乱数 stream を 1 本も引かない**。
   #              キーに step を入れない = 同じ (fact, 個体) は窓の間に 1 回だけ引く
@@ -4016,10 +4019,14 @@ beliefs:
   # 既定 OFF = 半径もゲートも 1 度も評価しない = 現行挙動とバイト一致。finals では ON。
   channels:
     enabled: false              # ★ON は finals_observe.yaml 側(観察ラン)
-    ambient_k: 2                # 環境注意の 1 step あたり上限(**WIT-2 で使用**。本段では未使用)
+    # 環境注意の 1 step あたり上限 [件/step](WIT-2 実装B。MIDSim B_att=10/日と整合)。
+    #   ここに載る種だけを数え、当事者(その fact を起こした本人)と表に無い種(放送)は対象外。
+    #   超過分は**その step で捨てるのではなく翌 step 以降へ持ち越す**(通過抽選は (fact, 個体)
+    #   の 1 回きりなので、上限で弾かれた人は空きが出た step に同じ判定で通る)。<=0 は上限なし。
+    ambient_k: 2
     kinds:
-      price_change: {radius_m: 10.0, p_notice: 0.30}   # 店内(棚・値札)= 立寄者のみ・注視は 3 割弱
-      stock_out:    {radius_m: 10.0, p_notice: 0.30}   # 店内(欠品)
+      price_change: {place: true, radius_m: 10.0, p_notice: 0.30}  # 店内(棚・値札)= 来店者のみ・注視は3割弱
+      stock_out:    {place: true, radius_m: 10.0, p_notice: 0.30}  # 店内(欠品)= 来店者のみ
       flyer_post:   {radius_m: 15.0, p_notice: 0.50}   # 小さな掲示物(屋内減衰は屋外の 2 倍急)
       venture_open: {radius_m: 20.0, p_notice: 0.55}   # 店頭サイン(視角則)
       event_host:   {radius_m: 30.0, p_notice: 0.55}   # 中型掲示(ポスター類の実測 12-35m)

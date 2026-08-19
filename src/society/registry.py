@@ -2109,6 +2109,18 @@ ALLOWLIST: dict[str, str] = {
     "population.immigration.require_job":
         "街に空き定員のある職場が在ることを定着の条件にするかの指定"
         "(population.immigration.enabled が親トグル。organizations が OFF なら ON でも定着 0 件)",
+    # WIT-2(2026-08-20): 目撃チャネル表の**種ごとのデータ欄**であって独立した機能トグル
+    # ではない(beliefs.channels.enabled が OFF なら 1 バイトも効かない)。radius_m /
+    # p_notice と同じ「その種の到達の形」を書く欄で、true = 到達を距離ではなく
+    # 「fact の場所(node)に滞在していたこと」で決める(店内情報は来店者限定)。
+    # ★ここに列挙が要るのは flatten_bools が真偽値リーフを全部拾うためで、新しい種に
+    #   place を足すときは同じように 1 行足すこと(黙って bool が増えないための門番)。
+    "beliefs.channels.kinds.price_change.place":
+        "目撃チャネル表の種別データ欄(beliefs.channels.enabled が親トグル。"
+        "true=同一場所の滞在で到達を決める。単独では何も起きない)",
+    "beliefs.channels.kinds.stock_out.place":
+        "目撃チャネル表の種別データ欄(beliefs.channels.enabled が親トグル。"
+        "true=同一場所の滞在で到達を決める。単独では何も起きない)",
     "population.births.household_spouses":
         "世帯の続柄(household.realistic の夫/妻)も夫婦として数えるかの指定"
         "(population.births.enabled が親トグル。false にすると夫婦の源が partner_id だけになり、"

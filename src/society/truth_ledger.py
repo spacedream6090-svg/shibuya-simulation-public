@@ -78,6 +78,10 @@ WIT-1(2026-08-20。**ユーザー承認による凍結解除**)
    決定論ハッシュ判定をかける。乱数 stream は 1 本も足さない(blake2b のみ)。
    種の表は conf 側の `beliefs.channels.kinds` = **データ駆動**(コードに固有名詞を書かない)。
    表に載らない種(放送に相当するもの)は上書きもゲートも受けない = 現行のまま。
+
+WIT-2(2026-08-20。同じ承認の第 2 段。既定 OFF は引き続きバイト一致)は 3 つだけ足した:
+`place: true` の種を「同一場所(node)に居た者だけ」へ替える in_place チャネル(実装 A)・
+環境注意の 1 step 上限 `ambient_k`(実装 B)・重複曝露の観測量 n_exp / n_src(実装 C)。
 """
 from __future__ import annotations
 
@@ -200,18 +204,20 @@ DEFAULTS = {
     "ask_conf": 0.9,                # 当事者/目撃者に聞いて得られる確信度
 }
 
-# ---- WIT-1: チャネル×注意ゲート(既定 OFF=現行挙動とバイト一致)----
+# ---- WIT-1/2: チャネル×注意ゲート(既定 OFF=現行挙動とバイト一致)----
 #   enabled   … OFF なら半径の上書きもゲートも 1 度も評価しない
-#   ambient_k … 環境注意の 1 step あたり上限(**WIT-2 で使う**。本段では未使用)
-#   kinds     … fact 種 → {radius_m, p_notice | p_notice_day/p_notice_night}
+#   ambient_k … 環境注意の 1 step あたり上限 [件/step](WIT-2 実装 B。<=0 は上限なし)
+#   kinds     … fact 種 → {place, radius_m, p_notice | p_notice_day/p_notice_night}
 #               radius_m を書けば目撃半径を上書き、p_notice を書けば通過確率の判定が付く。
+#               place=true は「到達 = 同一場所(fact の node)に滞在した者だけ」へ替える
+#               (WIT-2 実装 A。店内情報は来店者限定)。場所が判らない fact は radius_m へ倒す。
 #               **書かない種は上書きもゲートも受けない**(= 現行のまま。放送系はここ)。
 _CHANNEL_DEFAULTS = {
     "enabled": False,
     "ambient_k": 2,
     "kinds": {
-        "price_change": {"radius_m": 10.0, "p_notice": 0.30},
-        "stock_out":    {"radius_m": 10.0, "p_notice": 0.30},
+        "price_change": {"place": True, "radius_m": 10.0, "p_notice": 0.30},
+        "stock_out":    {"place": True, "radius_m": 10.0, "p_notice": 0.30},
         "flyer_post":   {"radius_m": 15.0, "p_notice": 0.50},
         "venture_open": {"radius_m": 20.0, "p_notice": 0.55},
         "event_host":   {"radius_m": 30.0, "p_notice": 0.55},
@@ -224,6 +230,11 @@ DEFAULTS["channels"] = _CHANNEL_DEFAULTS
 
 # 通過確率のキー(昼夜を分ける種は day/night の 2 本を持つ)
 _P_KEYS = ("p_notice", "p_notice_day", "p_notice_night")
+# WIT-2: 信念 rec に足す重複曝露の観測量(**channels ON のときだけ生える**)。
+#   n_exp … 到達 × 通過を満たした回数(初回=1。複雑接触 Centola & Macy の exposure_count)
+#   n_src … 伝聞で受け取った相異なる送信者(昇順タプル・上限 _MAX_SOURCES = distinct_sources)
+_EXPOSURE_KEYS = ("n_exp", "n_src")
+_MAX_SOURCES = 8
 # 昼帯 [DAY_FROM, DAY_TO) の分 of day(街頭事象の通過率が昼夜で変わる)
 _DAY_FROM_MIN = 6 * 60
 _DAY_TO_MIN = 18 * 60
@@ -266,6 +277,8 @@ def _channels_cfg(raw) -> dict:
     for k, v in (spec or {}).items():
         src = dict(_to_plain(v) or {})
         one: dict = {}
+        if src.get("place") is not None:        # WIT-2: 到達を「同一場所の滞在」へ替える
+            one["place"] = bool(src["place"])
         if src.get("radius_m") is not None:
             one["radius_m"] = float(src["radius_m"])
         for pk in _P_KEYS:
@@ -312,6 +325,11 @@ def cfg_of(sim) -> dict:
         c = build_cfg(raw)
         sim.beliefscfg = c
     return c
+
+
+def channels_on(cfg: dict) -> bool:
+    """`beliefs.channels.enabled`(WIT-1 以前に作られた cfg でも落ちないよう既定へ倒す)。"""
+    return bool((cfg.get("channels") or _CHANNEL_DEFAULTS)["enabled"])
 
 
 def enabled(sim) -> bool:
@@ -507,9 +525,21 @@ def _put_belief(sim, cfg: dict, agent, fid: str, rec_t: dict, payload_t: dict,
     """雛形から 1 個体ぶんの信念を書く + L1 belief_update。決定論・乱数ゼロ。
 
     ★rec も payload も**必ず複製**する: payload は logger.log が setdefault で
-      書き足す先なので共有すると 2 人目以降に前の個体の値が残る。"""
+      書き足す先なので共有すると 2 人目以降に前の個体の値が残る。
+
+    WIT-2: 曝露カウンタ(n_exp / n_src)は信念の**上書きで消さずに引き継ぐ**。
+    「同じ fact に何回・何人から当たったか」は伝聞の上書き・検証・再考の都合で 0 に
+    戻ってよい量ではない(複雑接触の観測量そのもの)。channels OFF ではキーが 1 つも
+    生えないので、この分岐は 1 度も実体を持たない = 既定バイト一致。"""
     bels = beliefs_of(agent)
     rec = rec_t.copy()
+    if channels_on(cfg):
+        prev = bels.get(fid)
+        if prev is not None:
+            for key in _EXPOSURE_KEYS:
+                val = prev.get(key)
+                if val is not None:
+                    rec[key] = val
     bels[fid] = rec
     cap = int(cfg["max_beliefs_per_agent"])
     if cap > 0 and len(bels) > cap:            # 古い順(取得 step)に捨てる=有界・決定論
@@ -629,6 +659,20 @@ def _u01(salt: str, *parts) -> float:
 _WIT_SALT = "wit"
 
 
+def _add_source(rec: dict, sender: int) -> None:
+    """伝聞の送信者を **重複なし・昇順・上限 _MAX_SOURCES** で数える(distinct_sources)。
+
+    ★集合ではなく**タプル**で持つ: pickle は set の反復順を保存しないので、集合で運ぶと
+      checkpoint / プール退避を跨いだときに並びが揺れうる(本 repo が繰り返し踏んでいる型)。
+      上限に達したら新しい送信者は**落とす** = 値は「相異なる送信者数の下限」になる
+      (メモリを有界にするための正直な打ち切り。信念 1 件あたり最大 8 個の int)。"""
+    cur = rec.get("n_src")
+    ids = tuple(cur) if cur else ()
+    if sender in ids or len(ids) >= _MAX_SOURCES:
+        return
+    rec["n_src"] = tuple(sorted(ids + (int(sender),)))
+
+
 def _p_notice(spec: dict, sim_min: int) -> float | None:
     """チャネル仕様から通過確率を取る(昼夜を分ける種は分 of day で選ぶ)。"""
     if "p_notice_day" in spec or "p_notice_night" in spec:
@@ -657,7 +701,19 @@ def _witness_pass(sim, cfg: dict, step: int, sim_min: int) -> None:
     抽選のキーに step を**入れない**ので、同じ (fact, 個体) は窓の間に 1 回だけ引かれる
     (較正値が「通過あたりの確率」だから)。当事者(actor)は判定を受けない。
     ★上書きが効くのは**この受動的な目撃だけ**。自分で確かめに行く経路(apply_verify /
-      _pending_pass)は fact 自身の半径を使う = 「見に行った人は見える」は変えない。"""
+      _pending_pass)は fact 自身の半径を使う = 「見に行った人は見える」は変えない。
+
+    WIT-2 で足したのは 3 つ(どれも channels ON のときだけ通る):
+      A. **in_place**(`place: true` の種): 到達を距離ではなく「fact の場所(node)に
+         居ること」で決める(EpiSimdemics 型の訪問重なり。店内情報は来店者限定)。
+         場所が判らない fact は**黙って広げず**上書き後の半径判定へ倒す。
+      B. **k_ambient**(`ambient_k`): 1 個体が 1 step に新規認知できる fact 数の上限。
+         判定は表に載る種だけに掛かり(放送系は対象外)、当事者は数えない。
+         ★上限に達した個体は**ゲート判定の前**に弾く。ハッシュは (fact, 個体) の
+         純関数で step を含まないので、弾かれた者は cap に空きが出た step で
+         同じ判定をやり直す = **単発 draw のまま翌 step 以降へ持ち越される**。
+      C. **n_exp**: 既に信念を持つ個体が再び到達 × 通過したときの重複曝露カウンタ。
+         **L1 行は 1 行も作らない**(体積を戻さない)。距離判定は下の候補集合の中だけ。"""
     facts = facts_of(sim)
     if not facts:
         return
@@ -672,19 +728,35 @@ def _witness_pass(sim, cfg: dict, step: int, sim_min: int) -> None:
     chan = cfg.get("channels") or _CHANNEL_DEFAULTS
     chan_on = bool(chan["enabled"])
     chan_kinds = chan["kinds"]
-    xs = ys = grid = idx_by_id = None
+    # 環境注意の残量。**この pass は step 内で完結する**(scheduler._phase_beliefs は 1 step に
+    # 1 回・checkpoint は step 境界でしか取らない = 途中再開が無い)ので、step 内の一時 dict で
+    # 足りる = checkpoint に載せる状態を 1 つも増やさない。<=0 は上限なし(cap>0 の流儀)。
+    ambient_k = int(chan["ambient_k"]) if chan_on else 0
+    used: dict[int, int] = {}
+    xs = ys = grid = idx_by_id = at_node = None
     for fid in open_ids:                       # 挿入順(= fact 生成順)= 決定論
         fact = facts[fid]
         radius = float(fact["radius_m"])
         p_notice = None
+        spec = None
+        in_place = False
         if chan_on:
             spec = chan_kinds.get(fact["kind"])
             if spec is not None:
                 if "radius_m" in spec:
                     radius = float(spec["radius_m"])
                 p_notice = _p_notice(spec, sim_min)
+                # 場所 id を持たない fact(屋外座標だけ等)は半径判定へフォールバックする
+                in_place = bool(spec.get("place")) and bool(fact["node"])
         fx, fy = float(fact["x"]), float(fact["y"])
-        if radius > 0.0 and present:
+        if in_place:
+            if at_node is None:                # 在場者だけの 場所 → 添字(昇順)
+                at_node = {}
+                for i in present:
+                    at_node.setdefault(str(getattr(agents[i], "node", "") or ""),
+                                       []).append(i)
+            cand = list(at_node.get(str(fact["node"]), ()))
+        elif radius > 0.0 and present:
             if grid is None:
                 n = len(agents)
                 xs = np.fromiter((float(a.x) for a in agents),
@@ -715,15 +787,32 @@ def _witness_pass(sim, cfg: dict, step: int, sim_min: int) -> None:
                                       src="direct", parent=-1, hop=0,
                                       cause="witness", verified="witness",
                                       step=step)
+        capped = chan_on and spec is not None and ambient_k > 0
         for i in cand:                         # 昇順 = sim.agents の並び = 決定論
             agent = agents[i]
+            is_actor = int(agent.id) == actor
             # 読むだけの参照は beliefs_of() を使わない(全個体に空 dict を生やさない)
-            if fid in (getattr(agent, "_fact_beliefs", None) or ()):
+            held = getattr(agent, "_fact_beliefs", None)
+            if held and fid in held:
+                # 既知 fact への再到達 = 重複曝露。当事者は「再び曝露された」のではないので
+                # 数えない(起こした本人であることは n_exp の意味ではない)。
+                if chan_on and not is_actor and (
+                        p_notice is None
+                        or _u01(_WIT_SALT, fid, int(agent.id)) < p_notice):
+                    rec = held[fid]
+                    rec["n_exp"] = int(rec.get("n_exp", 0)) + 1
                 continue
-            if p_notice is not None and int(agent.id) != actor \
+            if capped and not is_actor and used.get(i, 0) >= ambient_k:
+                continue                       # 今 step の環境注意を使い切った(翌 step へ)
+            if p_notice is not None and not is_actor \
                     and _u01(_WIT_SALT, fid, int(agent.id)) >= p_notice:
                 continue                       # 注意が向かなかった
-            _put_belief(sim, cfg, agent, fid, rec_t, payload_t, step, sim_min)
+            rec = _put_belief(sim, cfg, agent, fid, rec_t, payload_t, step,
+                              sim_min)
+            if chan_on:
+                rec["n_exp"] = int(rec.get("n_exp", 0)) + 1
+                if spec is not None and not is_actor:
+                    used[i] = used.get(i, 0) + 1
             stats["witness"] += 1
 
 
@@ -762,10 +851,16 @@ def _receivers(sim, payload: dict, key: str) -> list:
 
 def _transmit_pass(sim, cfg: dict, utterances: list, step: int,
                    sim_min: int) -> None:
-    """この step の発話を走査し、話者が持つ信念のうち話題が一致するものを聞き手へ伝える。"""
+    """この step の発話を走査し、話者が持つ信念のうち話題が一致するものを聞き手へ伝える。
+
+    WIT-2(実装 C): channels ON のときだけ、受け手の信念 rec に**相異なる送信者**
+    (n_src)を足す。伝達するかどうかの規則(TTL・確信度下限・上書き条件・上限件数)は
+    1 行も変えていない = カウンタを増やすだけ。既知 fact を**より弱い確信度で**再受信して
+    上書きされなかった場合も「その人からも聞いた」ことは事実なので数える(複雑接触)。"""
     facts = facts_of(sim)
     if not facts or not utterances:
         return
+    chan_on = channels_on(cfg)
     stats = _stats(sim)
     ttl = int(cfg["fact_ttl_steps"])
     cap = int(cfg["max_facts_per_utterance"])
@@ -812,11 +907,15 @@ def _transmit_pass(sim, cfg: dict, utterances: list, step: int,
                     continue
                 prev = (getattr(other, "_fact_beliefs", None) or {}).get(fid)
                 if prev is not None and float(prev["conf"]) >= conf:
+                    if chan_on:            # 受け取ってはいる(情報源としては数える)
+                        _add_source(prev, int(speaker.id))
                     continue               # 既により確かな信念を持つ=上書きしない
-                _set_belief(sim, cfg, other, fact, value=value, conf=conf,
-                            src="agent", parent=int(speaker.id), hop=hop,
-                            cause="transmit", verified=None,
-                            step=step, sim_min=sim_min)
+                rec = _set_belief(sim, cfg, other, fact, value=value, conf=conf,
+                                  src="agent", parent=int(speaker.id), hop=hop,
+                                  cause="transmit", verified=None,
+                                  step=step, sim_min=sim_min)
+                if chan_on:                # rec は _put_belief が前の rec から
+                    _add_source(rec, int(speaker.id))   # n_exp/n_src を引き継いでいる
                 got.append(int(other.id))
                 stats["transmit"] += 1
             if got:

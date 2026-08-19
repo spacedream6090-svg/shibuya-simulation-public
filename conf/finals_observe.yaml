@@ -1230,15 +1230,16 @@ ontology:
 beliefs:
   enabled: true
   verify_actions: true
-  # WIT-1: 到達(半径)と注意通過(p_notice)を分ける。ON の理由は「重いから切る」ではなく
-  # 「在場者全員が認知する世界は実測と 1 桁ずれていて研究対象(知識の非対称)を壊すから」。
+  # WIT-1/2: 到達(半径 or 同一場所)と注意通過(p_notice)を分ける。ON の理由は「重いから切る」
+  # ではなく「在場者全員が認知する世界は実測と 1 桁ずれていて研究対象(知識の非対称)を壊すから」。
   # 値の出典は docs/research/witness-empirics-ooh-retail.md(config.yaml の同ブロックに註釈)。
+  # ambient_k = 環境注意の 1 step 上限(超過分は捨てずに翌 step 以降へ持ち越す)。
   channels:
     enabled: true
     ambient_k: 2
     kinds:
-      price_change: {radius_m: 10.0, p_notice: 0.30}
-      stock_out:    {radius_m: 10.0, p_notice: 0.30}
+      price_change: {place: true, radius_m: 10.0, p_notice: 0.30}   # 店内=同一 POI ノードの滞在者のみ
+      stock_out:    {place: true, radius_m: 10.0, p_notice: 0.30}
       flyer_post:   {radius_m: 15.0, p_notice: 0.50}
       venture_open: {radius_m: 20.0, p_notice: 0.55}
       event_host:   {radius_m: 30.0, p_notice: 0.55}

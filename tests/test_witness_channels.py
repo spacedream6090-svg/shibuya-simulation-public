@@ -41,14 +41,15 @@ _SRC = _ROOT / "src" / "society" / "truth_ledger.py"
 # 合成ハーネス(実 city / 実 logger を使わずに走査だけを取り出す)
 # =========================================================================== #
 class _Agent:
-    __slots__ = ("id", "x", "y", "sleeping", "loc", "_fact_beliefs")
+    __slots__ = ("id", "x", "y", "sleeping", "loc", "node", "_fact_beliefs")
 
-    def __init__(self, aid, x, y, sleeping, loc):
+    def __init__(self, aid, x, y, sleeping, loc, node=""):
         self.id = aid
         self.x = x
         self.y = y
         self.sleeping = sleeping
         self.loc = loc
+        self.node = node                  # WIT-2: 現在ノード(in_place チャネルの場所 id)
         self._fact_beliefs = None
 
 
@@ -170,7 +171,8 @@ def _both(agents_spec, facts, cfg, steps=(0,)):
     """同じ入力に対して 旧 / 新 を走らせ、(L1, 信念状態) を返す。"""
     out = []
     for pas in (_legacy_witness_pass, TL._witness_pass):
-        agents = [_Agent(a.id, a.x, a.y, a.sleeping, a.loc) for a in agents_spec]
+        agents = [_Agent(a.id, a.x, a.y, a.sleeping, a.loc, a.node)
+                  for a in agents_spec]
         sim = _Sim(agents)
         sim._tl_facts = {k: dict(v) for k, v in facts.items()}
         for st in steps:
@@ -473,7 +475,11 @@ def test_gate_is_drawn_once_per_fact_and_agent(monkeypatch):
         a.sleeping = False
         a.loc = "street"
     facts = _make_facts(rng, 4, 100.0, [1000.0], kinds=("flyer_post",))
-    on = TL.build_cfg({"channels": {"enabled": True, "kinds": {
+    # ambient_k=0(上限なし)で引く: WIT-2 の環境注意の上限は「同じ step に何件まで
+    # 認知するか」の別軸で、超過分を**翌 step へ持ち越す**ので、ここで見たい
+    # 「抽選のキーに step が混ざっていないか」とは分けて固定する
+    # (持ち越しの側は test_ambient_cap_does_not_consume_the_attention_draw)。
+    on = TL.build_cfg({"channels": {"enabled": True, "ambient_k": 0, "kinds": {
         "flyer_post": {"radius_m": 1000.0, "p_notice": 0.5}}}})
     sim = _Sim([_Agent(a.id, a.x, a.y, a.sleeping, a.loc) for a in agents])
     sim._tl_facts = {k: dict(v) for k, v in facts.items()}
@@ -597,6 +603,11 @@ def test_on_resume_matches_a_straight_run(tmp_path):
                 for a in sim.agents}
     assert _bel(straight) == _bel(resumed)
     assert any(_bel(straight).values()), "信念が 1 件も無い(前提が崩れた)"
+    # WIT-2: 曝露カウンタ(agents pickle に自然同梱)も再開後に一致していること。
+    # per-step の環境注意の残量は step 内で完結するので checkpoint には載せない。
+    n_exp = [r["n_exp"] for recs in _bel(straight).values()
+             for r in recs.values() if "n_exp" in r]
+    assert n_exp, "ON なのに n_exp が 1 件も載っていない(前提が崩れた)"
 
 
 def test_no_undeclared_toggles_after_the_new_key():
@@ -649,3 +660,442 @@ def test_module_draws_no_random_stream():
     assert "rng" not in attrs and "random" not in attrs
     names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
     assert "random" not in names
+
+
+# =========================================================================== #
+# 8) WIT-2 実装A: in_place チャネル(店内情報 = 同一場所に滞在した者だけ)
+#
+#    正典 docs/plans/witness-channel-attention-plan.md §2 層E / リサーチ
+#    docs/research/witness-llm-agent-perception.md §3 注意点 2/4/6。
+#    「半径 10m の円」ではなく「その店に居たか」で決めるのが EpiSimdemics 型の訪問重なり。
+# =========================================================================== #
+def _fact_rec(fid, kind, *, x=0.0, y=0.0, node=None, radius=60.0, window=6,
+              actor=-1, topics=(), value=1.0, step=0):
+    """合成 fact(`_record_fact` が作るのと同じ欄を持つ)。"""
+    return {"id": fid, "kind": kind, "step": int(step), "sim_min": 0,
+            "node": node, "place": None, "x": float(x), "y": float(y),
+            "value": float(value), "actor": int(actor), "topics": list(topics),
+            "radius_m": float(radius), "window": int(window),
+            "canary": f"c-{fid}"}
+
+
+def _run_pass(agents, facts, cfg, steps=(0,)):
+    """合成配置に `_witness_pass` を steps ぶん流して sim を返す。"""
+    sim = _Sim(agents)
+    sim._tl_facts = {k: dict(v) for k, v in facts.items()}
+    for st in steps:
+        TL._witness_pass(sim, cfg, st, st * 10)
+    return sim
+
+
+def _got(sim, fid="f00000"):
+    return sorted(int(e.agent_id) for e in sim.logger.events
+                  if e.payload["fact"] == fid)
+
+
+# place=true(店内)の 1 種だけを載せた表。ambient_k=0 = 上限なし(実装Bの干渉を外す)
+_PLACE_ON = {"enabled": True, "ambient_k": 0,
+             "kinds": {"price_change": {"place": True, "radius_m": 10.0,
+                                        "p_notice": 1.0}}}
+
+
+def test_in_place_reaches_only_the_agents_at_the_same_place():
+    """★同一ノードの滞在者だけが認知する: **半径内でも別の場所に居た人は認知しない**。"""
+    # 全員が同一座標(= どの半径でも到達圏)だが、居る場所(node)は 2 つに分かれている
+    def _fresh():                              # ラン間で信念を持ち越さない
+        return [_Agent(i, 0.0, 0.0, False, "street",
+                       "n_shop" if i < 4 else "n_street") for i in range(10)]
+    facts = {"f00000": _fact_rec("f00000", "price_change", node="n_shop")}
+    on = TL.build_cfg({"channels": _PLACE_ON})
+    assert _got(_run_pass(_fresh(), facts, on)) == [0, 1, 2, 3]
+    # 同じ配置でも place を書かなければ現行どおり半径 10m の円 = 全員に届く
+    off_place = TL.build_cfg({"channels": {
+        "enabled": True, "ambient_k": 0,
+        "kinds": {"price_change": {"radius_m": 10.0, "p_notice": 1.0}}}})
+    assert _got(_run_pass(_fresh(), facts, off_place)) == list(range(10))
+
+
+def test_in_place_ignores_agents_who_are_not_present():
+    """同じ場所の id を持っていても、就寝中/圏外の個体は在場でないので認知しない。"""
+    agents = [_Agent(0, 0.0, 0.0, False, "street", "n_shop"),
+              _Agent(1, 0.0, 0.0, True, "street", "n_shop"),    # 就寝中
+              _Agent(2, 0.0, 0.0, False, "outside", "n_shop"),  # 圏外
+              _Agent(3, 0.0, 0.0, False, "street", "n_shop")]
+    facts = {"f00000": _fact_rec("f00000", "price_change", node="n_shop")}
+    on = TL.build_cfg({"channels": _PLACE_ON})
+    assert _got(_run_pass(agents, facts, on)) == [0, 3]
+
+
+def test_in_place_still_lets_the_actor_through():
+    """当事者(その値札を見て買った本人)は場所判定も通り抜ける。"""
+    agents = [_Agent(i, 900.0, 900.0, True, "outside", "n_elsewhere")
+              for i in range(5)]
+    facts = {"f00000": _fact_rec("f00000", "price_change", node="n_shop",
+                                 actor=2)}
+    on = TL.build_cfg({"channels": _PLACE_ON})
+    assert _got(_run_pass(agents, facts, on)) == [2]
+
+
+def test_in_place_falls_back_to_the_radius_when_the_place_is_unknown():
+    """★場所 id を持たない fact は**黙って広げず**上書き後の半径(10m)判定へ倒す。"""
+    def _fresh():                              # ラン間で信念を持ち越さない
+        return [_Agent(0, 0.0, 0.0, False, "street", "n_a"),
+                _Agent(1, 9.0, 0.0, False, "street", "n_b"),
+                _Agent(2, 30.0, 0.0, False, "street", "n_a")]
+    # node=None(座標しか判らない fact)= フォールバック。半径 10m の内側だけ通る
+    facts = {"f00000": _fact_rec("f00000", "price_change", node=None,
+                                 radius=60.0)}
+    on = TL.build_cfg({"channels": _PLACE_ON})
+    assert _got(_run_pass(_fresh(), facts, on)) == [0, 1]
+    # 空文字の場所 id も「判らない」として扱う(黙って全員に配らない)
+    facts2 = {"f00000": _fact_rec("f00000", "price_change", node="")}
+    assert _got(_run_pass(_fresh(), facts2, on)) == [0, 1]
+
+
+def test_in_place_is_combined_with_the_attention_gate():
+    """到達(同一場所)を満たしても、注意ゲートを通らなければ認知しない(2 段のまま)。"""
+    agents = [_Agent(i, 0.0, 0.0, False, "street", "n_shop") for i in range(200)]
+    facts = {"f00000": _fact_rec("f00000", "price_change", node="n_shop")}
+    on = TL.build_cfg({"channels": {
+        "enabled": True, "ambient_k": 0,
+        "kinds": {"price_change": {"place": True, "p_notice": 0.30}}}})
+    got = set(_got(_run_pass(agents, facts, on)))
+    want = {a.id for a in agents
+            if TL._u01(TL._WIT_SALT, "f00000", int(a.id)) < 0.30}
+    assert got == want and 0 < len(got) < 200
+
+
+def test_place_flag_is_data_driven_and_shipped():
+    """conf の `place` が bool へ正準化され、出荷 conf と DEFAULTS が一致している。"""
+    cfg = load_config()
+    shipped = TL.build_cfg(cfg.beliefs)["channels"]["kinds"]
+    assert shipped == TL._CHANNEL_DEFAULTS["kinds"]
+    in_place = {k for k, v in shipped.items() if v.get("place")}
+    assert in_place == {"price_change", "stock_out"}, \
+        "店内チャネル(来店者限定)の種が変わった"
+    for kind in in_place:                     # 場所が取れないときの後退先が必ず在る
+        assert shipped[kind].get("radius_m", 0.0) > 0.0
+    built = TL.build_cfg({"channels": {"enabled": True,
+                                       "kinds": {"crime": {"place": 1}}}})
+    assert built["channels"]["kinds"]["crime"]["place"] is True
+    assert "place" not in TL.build_cfg(
+        {"channels": {"enabled": True, "kinds": {"crime": {"radius_m": 5.0}}}}
+    )["channels"]["kinds"]["crime"]
+
+
+def test_registry_declares_the_place_data_fields():
+    """★`place` は bool リーフなので、未宣言検出(flatten_bools)を素通りさせない。"""
+    from society import registry as R
+    assert R.undeclared_toggles(load_config()) == []
+    for kind in ("price_change", "stock_out"):
+        assert f"beliefs.channels.kinds.{kind}.place" in R.ALLOWLIST
+
+
+# =========================================================================== #
+# 9) WIT-2 実装B: k_ambient(環境注意の 1 step あたり上限)
+#
+#    リサーチ §3 注意点 4「社会的注意と環境注意で k 予算を食い合わせない」。
+#    ★超過分は**捨てずに翌 step へ持ち越す**(通過抽選は (fact, 個体) の 1 回きり)。
+# =========================================================================== #
+def _new_per_step(agents, facts, cfg, n_steps):
+    """step ごとの新規 belief_update を (step → [agent_id...]) で返す。"""
+    sim = _Sim(agents)
+    sim._tl_facts = {k: dict(v) for k, v in facts.items()}
+    out = []
+    for st in range(n_steps):
+        n0 = len(sim.logger.events)
+        TL._witness_pass(sim, cfg, st, st * 10)
+        out.append([(int(e.agent_id), e.payload["fact"])
+                    for e in sim.logger.events[n0:]])
+    return sim, out
+
+
+_K_ON = {"enabled": True, "ambient_k": 2,
+         "kinds": {"flyer_post": {"radius_m": 1000.0, "p_notice": 1.0}}}
+
+
+def test_ambient_k_caps_new_beliefs_and_carries_the_rest_over():
+    """★1 step に 5 件重なっても k=2 件までしか認知せず、残りは翌 step 以降に成立する。"""
+    agents = [_Agent(0, 0.0, 0.0, False, "street"),
+              _Agent(1, 0.0, 0.0, False, "street")]
+    facts = {f"f{i:05d}": _fact_rec(f"f{i:05d}", "flyer_post", radius=1000.0,
+                                    window=6) for i in range(5)}
+    on = TL.build_cfg({"channels": _K_ON})
+    sim, per_step = _new_per_step(agents, facts, on, 4)
+    # 先着 = fact 生成順(f00000, f00001 → f00002, f00003 → f00004)
+    assert [len(rows) for rows in per_step] == [4, 4, 2, 0]
+    assert [f for _a, f in per_step[0]] == ["f00000", "f00000",
+                                            "f00001", "f00001"]
+    assert [f for _a, f in per_step[1]] == ["f00002", "f00002",
+                                            "f00003", "f00003"]
+    assert [f for _a, f in per_step[2]] == ["f00004", "f00004"]
+    # 最終的には 5 件すべてが持ち越しで成立している(cap は「捨てる」ではない)
+    for a in agents:
+        assert sorted(a._fact_beliefs) == sorted(facts)
+
+
+def test_ambient_k_zero_or_negative_means_no_limit():
+    """<=0 は「上限なし」(max_beliefs_per_agent と同じ cap>0 の流儀)。"""
+    facts = {f"f{i:05d}": _fact_rec(f"f{i:05d}", "flyer_post", radius=1000.0)
+             for i in range(5)}
+    for k in (0, -1):
+        agents = [_Agent(0, 0.0, 0.0, False, "street")]   # ラン間で持ち越さない
+        on = TL.build_cfg({"channels": {**_K_ON, "ambient_k": k}})
+        _sim, per_step = _new_per_step(agents, facts, on, 2)
+        assert [len(r) for r in per_step] == [5, 0], f"ambient_k={k}"
+
+
+def test_ambient_k_exempts_the_actor_and_the_broadcast_kinds():
+    """当事者と『表に載らない種』(放送)は上限の対象外。"""
+    on = TL.build_cfg({"channels": _K_ON})
+    # (a) 当事者: 5 件すべてが同じ step に成立する
+    agents = [_Agent(0, 0.0, 0.0, False, "street")]
+    facts = {f"f{i:05d}": _fact_rec(f"f{i:05d}", "flyer_post", radius=1000.0,
+                                    actor=0) for i in range(5)}
+    _sim, per_step = _new_per_step(agents, facts, on, 1)
+    assert len(per_step[0]) == 5, "当事者が環境注意の上限を受けている"
+    # (b) 放送(表に無い種): 上限もゲートも受けない
+    agents = [_Agent(0, 0.0, 0.0, False, "street")]
+    facts = {f"f{i:05d}": _fact_rec(f"f{i:05d}", "disaster", radius=0.0)
+             for i in range(5)}
+    _sim, per_step = _new_per_step(agents, facts, on, 1)
+    assert len(per_step[0]) == 5, "放送系が環境注意の上限を受けている"
+    # (c) 表に載る種と放送が混ざっても、数えるのは表に載る種だけ
+    agents = [_Agent(0, 0.0, 0.0, False, "street")]
+    facts = {}
+    for i in range(6):
+        fid = f"f{i:05d}"
+        facts[fid] = _fact_rec(fid, "disaster" if i % 2 else "flyer_post",
+                               radius=0.0 if i % 2 else 1000.0)
+    _sim, per_step = _new_per_step(agents, facts, on, 1)
+    kinds = [f for _a, f in per_step[0]]
+    assert kinds == ["f00000", "f00001", "f00002", "f00003", "f00005"], \
+        f"放送が上限を消費している: {kinds}"
+
+
+def test_ambient_cap_does_not_consume_the_attention_draw():
+    """★上限で弾かれても抽選は消費されない: 最終的な集合は cap 無しのときと**同一**。
+
+    ゲートは (fact, 個体) の純関数(step を鍵に入れない)なので、cap で弾かれた者は
+    空きが出た step に同じ判定でやり直せる = 「単発 draw」と「持ち越し」が両立する。"""
+    agents = [_Agent(i, 0.0, 0.0, False, "street") for i in range(60)]
+    facts = {f"f{i:05d}": _fact_rec(f"f{i:05d}", "flyer_post", radius=1000.0,
+                                    window=8) for i in range(4)}
+    gated = {"enabled": True, "kinds": {
+        "flyer_post": {"radius_m": 1000.0, "p_notice": 0.5}}}
+    free = TL.build_cfg({"channels": {**gated, "ambient_k": 0}})
+    capped = TL.build_cfg({"channels": {**gated, "ambient_k": 1}})
+    sim_free, steps_free = _new_per_step(agents, facts, free, 8)
+    sim_cap, steps_cap = _new_per_step(agents, facts, capped, 8)
+    assert _state(sim_free).keys() == _state(sim_cap).keys()
+    assert {a: sorted(b) for a, b in _state(sim_free).items()} \
+        == {a: sorted(b) for a, b in _state(sim_cap).items()}, \
+        "cap の有無で最終的に知った fact の集合が変わった(抽選を消費している)"
+    assert len(steps_free[0]) > len(steps_cap[0]), "cap が効いていない"
+    # cap=1 のとき、どの step でも 1 個体あたり新規は 1 件まで
+    for rows in steps_cap:
+        seen = [a for a, _f in rows]
+        assert len(seen) == len(set(seen)), "同じ step に 2 件通っている"
+
+
+# =========================================================================== #
+# 10) WIT-2 実装C: exposure_count(n_exp)/ distinct_sources(n_src)
+#
+#     リサーチ §3 注意点 2「重複除去は複雑接触を殺す」(Centola & Macy)。
+#     ★L1 は 1 行も増やさない(体積を戻さない)= 観測量は belief rec の中だけ。
+# =========================================================================== #
+_EXP_ON = {"enabled": True, "ambient_k": 0,
+           "kinds": {"flyer_post": {"radius_m": 1000.0, "p_notice": 1.0}}}
+
+
+def test_n_exp_grows_with_repeat_exposure_without_new_l1_rows():
+    """★到達が続くと n_exp が単調増加し、L1 のイベント数は初回のまま動かない。"""
+    agents = [_Agent(i, 0.0, 0.0, False, "street") for i in range(3)]
+    facts = {"f00000": _fact_rec("f00000", "flyer_post", radius=1000.0,
+                                 window=6)}
+    on = TL.build_cfg({"channels": _EXP_ON})
+    sim = _Sim(agents)
+    sim._tl_facts = {k: dict(v) for k, v in facts.items()}
+    counts, n_l1 = [], []
+    for st in range(5):
+        TL._witness_pass(sim, on, st, st * 10)
+        counts.append([a._fact_beliefs["f00000"]["n_exp"] for a in agents])
+        n_l1.append(len(sim.logger.events))
+    assert counts == [[1, 1, 1], [2, 2, 2], [3, 3, 3], [4, 4, 4], [5, 5, 5]]
+    assert n_l1 == [3, 3, 3, 3, 3], f"再曝露で L1 行が増えた: {n_l1}"
+
+
+def test_n_exp_stops_when_the_agent_leaves_the_reach():
+    """到達圏から外れた step は増えない(「ずっと 1 だけ増える」ではない)。"""
+    agents = [_Agent(0, 0.0, 0.0, False, "street")]
+    facts = {"f00000": _fact_rec("f00000", "flyer_post", radius=10.0,
+                                 window=6)}
+    on = TL.build_cfg({"channels": {
+        "enabled": True, "ambient_k": 0,
+        "kinds": {"flyer_post": {"radius_m": 10.0, "p_notice": 1.0}}}})
+    sim = _Sim(agents)
+    sim._tl_facts = {k: dict(v) for k, v in facts.items()}
+    TL._witness_pass(sim, on, 0, 0)
+    agents[0].x = 500.0                        # 立ち去った
+    TL._witness_pass(sim, on, 1, 10)
+    assert agents[0]._fact_beliefs["f00000"]["n_exp"] == 1
+    agents[0].x = 0.0                          # 戻ってきた
+    TL._witness_pass(sim, on, 2, 20)
+    assert agents[0]._fact_beliefs["f00000"]["n_exp"] == 2
+
+
+def test_n_exp_respects_the_attention_gate_and_skips_the_actor():
+    """ゲートを通らない個体は再曝露にも数えない。当事者も数えない(再曝露ではない)。"""
+    on = TL.build_cfg({"channels": {
+        "enabled": True, "ambient_k": 0,
+        "kinds": {"flyer_post": {"radius_m": 1000.0, "p_notice": 0.0}}}})
+    agents = [_Agent(0, 0.0, 0.0, False, "street"),
+              _Agent(1, 0.0, 0.0, False, "street")]
+    facts = {"f00000": _fact_rec("f00000", "flyer_post", radius=1000.0,
+                                 actor=1, window=6)}
+    sim = _Sim(agents)
+    sim._tl_facts = {k: dict(v) for k, v in facts.items()}
+    # 0 番は伝聞などで既に信念を持っているが、ゲート(p=0.0)は通らない
+    agents[0]._fact_beliefs = {"f00000": {"value": 1.0, "conf": 0.5,
+                                          "src": "agent", "from": 9, "step": 0,
+                                          "hop": 1, "verified": None,
+                                          "kind": "flyer_post"}}
+    for st in range(3):
+        TL._witness_pass(sim, on, st, st * 10)
+    assert "n_exp" not in agents[0]._fact_beliefs["f00000"], \
+        "注意が向いていないのに曝露を数えている"
+    assert agents[1]._fact_beliefs["f00000"]["n_exp"] == 1, \
+        "当事者の n_exp が窓のあいだ増え続けている"
+
+
+def test_exposure_counters_never_appear_when_channels_are_off():
+    """既定 OFF では n_exp / n_src の経路を 1 度も通らない(rec の欄が増えない)。"""
+    agents = [_Agent(i, 0.0, 0.0, False, "street") for i in range(3)]
+    facts = {"f00000": _fact_rec("f00000", "flyer_post", radius=1000.0)}
+    sim = _Sim(agents)
+    sim._tl_facts = {k: dict(v) for k, v in facts.items()}
+    for st in range(4):
+        TL._witness_pass(sim, _cfg_plain(), st, st * 10)
+    for a in agents:
+        rec = a._fact_beliefs["f00000"]
+        assert "n_exp" not in rec and "n_src" not in rec
+
+
+# --- n_src(伝聞の相異なる送信者)------------------------------------------- #
+def _speak(aid, text, hearers):
+    return (Event(step=0, sim_min=0, agent_id=int(aid), kind="speak",
+                  x=0.0, y=0.0,
+                  payload={"text": text, "hearers": list(hearers)}),
+            "hearers", "face")
+
+
+def _hearsay_sim(n_speakers, *, conf=1.0):
+    """話者 1..n(信念つき)+ 受け手 0 の合成配置。"""
+    agents = [_Agent(i, 0.0, 0.0, False, "street") for i in range(n_speakers + 1)]
+    sim = _Sim(agents)
+    sim._tl_facts = {"f00000": _fact_rec("f00000", "flyer_post",
+                                         topics=("チラシ",))}
+    for a in agents[1:]:
+        a._fact_beliefs = {"f00000": {"value": 1.0, "conf": float(conf),
+                                      "src": "direct", "from": -1, "step": 0,
+                                      "hop": 0, "verified": "witness",
+                                      "kind": "flyer_post"}}
+    return sim, agents
+
+
+def test_n_src_counts_distinct_senders_only():
+    """★異なる送信者で増え、同じ送信者を何度聞いても増えない。"""
+    on = TL.build_cfg({"channels": {"enabled": True}})
+    sim, agents = _hearsay_sim(3)
+    recv = agents[0]
+    TL._transmit_pass(sim, on, [_speak(1, "チラシ見た?", [0])], 0, 0)
+    assert recv._fact_beliefs["f00000"]["n_src"] == (1,)
+    TL._transmit_pass(sim, on, [_speak(1, "チラシの話", [0])], 1, 10)
+    assert recv._fact_beliefs["f00000"]["n_src"] == (1,), "同じ人で増えた"
+    TL._transmit_pass(sim, on, [_speak(2, "チラシの話", [0])], 2, 20)
+    TL._transmit_pass(sim, on, [_speak(3, "チラシの話", [0])], 3, 30)
+    assert recv._fact_beliefs["f00000"]["n_src"] == (1, 2, 3)
+
+
+def test_n_src_is_bounded_at_eight():
+    """相異なる送信者は上限 8 で打ち切る(メモリ有界。値は下限になる)。"""
+    on = TL.build_cfg({"channels": {"enabled": True}})
+    sim, agents = _hearsay_sim(12)
+    recv = agents[0]
+    for i in range(1, 13):
+        TL._transmit_pass(sim, on, [_speak(i, "チラシの話", [0])], i, i * 10)
+    got = recv._fact_beliefs["f00000"]["n_src"]
+    assert len(got) == TL._MAX_SOURCES == 8
+    assert got == tuple(sorted(got)) and len(set(got)) == len(got)
+
+
+def test_n_src_counts_a_sender_even_when_the_belief_is_not_overwritten():
+    """既存の上書き条件は 1 行も変えない: 上書きしない再受信でも情報源としては数える。"""
+    on = TL.build_cfg({"channels": {"enabled": True}})
+    sim, agents = _hearsay_sim(2)
+    recv = agents[0]
+    TL._transmit_pass(sim, on, [_speak(1, "チラシの話", [0])], 0, 0)
+    n_l1 = len(sim.logger.events)
+    before = dict(recv._fact_beliefs["f00000"])
+    TL._transmit_pass(sim, on, [_speak(2, "チラシの話", [0])], 1, 10)
+    rec = recv._fact_beliefs["f00000"]
+    assert rec["n_src"] == (1, 2)
+    for key in ("value", "conf", "src", "from", "hop", "step"):
+        assert rec[key] == before[key], "上書きしない条件が動いた"
+    assert len(sim.logger.events) == n_l1, "上書きしないのに L1 行が出た"
+
+
+def test_exposure_counters_survive_a_belief_overwrite():
+    """伝聞/検証で信念が上書きされても曝露カウンタは 0 に戻らない(引き継ぐ)。"""
+    on = TL.build_cfg({"channels": {"enabled": True}})
+    sim, agents = _hearsay_sim(1)
+    recv = agents[0]
+    recv._fact_beliefs = {"f00000": {"value": 0.5, "conf": 0.1, "src": "agent",
+                                     "from": 7, "step": 0, "hop": 3,
+                                     "verified": None, "kind": "flyer_post",
+                                     "n_exp": 3, "n_src": (7,)}}
+    TL._transmit_pass(sim, on, [_speak(1, "チラシの話", [0])], 1, 10)
+    rec = recv._fact_beliefs["f00000"]
+    assert float(rec["conf"]) > 0.1, "上書きが起きていない(前提が崩れた)"
+    assert rec["n_exp"] == 3 and rec["n_src"] == (1, 7)
+
+
+def test_n_src_is_not_written_when_channels_are_off():
+    sim, agents = _hearsay_sim(2)
+    TL._transmit_pass(sim, _cfg_plain(), [_speak(1, "チラシの話", [0])], 0, 0)
+    TL._transmit_pass(sim, _cfg_plain(), [_speak(2, "チラシの話", [0])], 1, 10)
+    assert "n_src" not in agents[0]._fact_beliefs["f00000"]
+
+
+def test_source_helper_is_deterministic_and_ordered():
+    """`_add_source` は昇順タプル(pickle が集合の反復順を保存しないため)。"""
+    rec: dict = {}
+    for sender in (9, 3, 3, 5):
+        TL._add_source(rec, sender)
+    assert rec["n_src"] == (3, 5, 9)
+    assert isinstance(rec["n_src"], tuple)
+
+
+# =========================================================================== #
+# 11) WIT-2 実ラン: OFF 不変 / ON で観測量が載る / 搬送(resume)
+# =========================================================================== #
+def test_wit2_off_run_carries_no_exposure_counters(tmp_path):
+    """★既定 OFF の実ランでは信念 rec に n_exp / n_src が 1 つも生えない。"""
+    sim = _run(tmp_path, "wit2_off", **{"beliefs.enabled": "true"})
+    recs = [r for a in sim.agents
+            for r in (getattr(a, "_fact_beliefs", None) or {}).values()]
+    assert recs, "信念が 1 件も無い(前提が崩れた)"
+    assert not any("n_exp" in r or "n_src" in r for r in recs)
+
+
+def test_wit2_on_run_records_exposure_counters(tmp_path):
+    """ON の実ランでは目撃した信念に n_exp が載る(L1 の kind は 1 つも増えない)。"""
+    ov = {"beliefs.enabled": "true", "beliefs.channels.enabled": "true"}
+    on = _run(tmp_path, "wit2_on", n_steps=96, n_agents=40, **ov)
+    off = _run(tmp_path, "wit2_on_ref", n_steps=96, n_agents=40,
+               **{"beliefs.enabled": "true"})
+    recs = [r for a in on.agents
+            for r in (getattr(a, "_fact_beliefs", None) or {}).values()]
+    assert any(r.get("n_exp") for r in recs), "n_exp が 1 件も載っていない"
+    assert {e.kind for e in on.logger.events} <= {e.kind for e in off.logger.events}, \
+        "新しい L1 kind が増えている"
