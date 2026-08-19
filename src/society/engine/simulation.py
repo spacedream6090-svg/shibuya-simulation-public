@@ -472,8 +472,14 @@ class Simulation:
             "contact_formation": _contact_formation_mod.build_cfg(
                 ncfg.get("contact_formation", None)),
         }
+        # NET ガード(第142): Internet 水準の hard cap。既定 0 = 無効 = 現行と完全同一。
+        # 設計 docs/plans/ram-rootcause-and-fix-plan.md §3 層1(「点の修正ではなく水準のガード」)。
         self.net = Internet(feed_size=int(ncfg.get("feed_size", 6)),
-                            posts_max=int(ncfg.get("posts_max", 0) or 0))
+                            posts_max=int(ncfg.get("posts_max", 0) or 0),
+                            contacts_hard_max=int(
+                                ncfg.get("contacts_hard_max", 0) or 0),
+                            follows_hard_max=int(
+                                ncfg.get("follows_hard_max", 0) or 0))
         # 情報環境の非対称(現実ギャップ Wave G6 2026-07-07。既定 OFF=現行挙動と完全同一)。
         # 推薦/エコーチェンバー・インフルエンサー非対称/バイラル・フェイク/炎上。決定論・非LLM
         # (推薦の意見参照は opinion.alignment 経由=不透明化)。誤情報判定のみ新 stream "info" を
@@ -1449,6 +1455,37 @@ class Simulation:
         #   tests/test_resume.py::test_init_event_mark_counts_the_startup_segment
         #   が `_init_event_mark == len(logger.events)` で検出する = トリップワイヤー。
         self._init_event_mark = len(self.logger.events)
+        # ---- S12(第142): gc.freeze()。**L1 を 1 件も出さないので上の印より後で良い** ----
+        # 初期化が終わったこの時点の世界(街・住戸・組織・pool 名簿・エージェント本体)は
+        # 以後ほとんど死なない永続オブジェクトなので、世代 GC の走査対象から外す。
+        # 既定 OFF(engine.gc_freeze: false)では 1 行も走らない。
+        self._gc_freeze("init")
+
+    # ------------------------------------------------- S12: GC の凍結(既定 OFF)
+    def _gc_freeze(self, where: str) -> None:
+        """いま生きているオブジェクトを**恒久世代**へ移す(``engine.gc_freeze`` が true のとき)。
+
+        正典: docs/plans/ram-rootcause-and-fix-plan.md §3 層1 S12。
+
+        - 効くもの: ① 毎回の GC 走査が「初期化済みの巨大なオブジェクトグラフ」を舐めなくなる
+          (**step 時間の GC 由来の劣化**に効く) ② 恒久オブジェクトの GC ヘッダが触られなく
+          なるので、copy-on-write と断片化の両方に効く。
+        - 効かないもの(正直に): プール回転で日々入れ替わるオブジェクトは freeze の対象外
+          (freeze は「いま在るもの」を 1 回移すだけ)。**害も無い** —— 凍結された世代は
+          回収されないだけで、参照は通常どおり辿れるし、解放も普通に起こる。
+        - 世界も乱数も L1 も 1 バイトも触らない(= R1 上は完全に無風。ON/OFF で出力同一)。
+        """
+        try:
+            if not bool(self.cfg.get("engine", {}).get("gc_freeze", False)):
+                return
+        except Exception:                          # noqa: BLE001(旧 config 互換)
+            return
+        import gc
+        gc.collect()                               # 若い世代を片付けてから
+        gc.freeze()                                # 残りを恒久世代へ(以後 GC は見ない)
+        # ★``gc.get_objects()`` は数を知るためだけに全オブジェクトのリストを作る
+        #   (25 万体では数千万件 = その場で RAM の山を作る)ので**呼ばない**。
+        self._gc_frozen = where
 
     # ------------------------------------------------- 在場述語(present predicate)
     # ★なぜ要るか: ``agent_by_id`` は「これまで実体化した**全**個体」の索引で、プール回転で
@@ -2350,6 +2387,10 @@ class Simulation:
             #      判定は本体側(resume_at)に置く = 据え方の規則を 1 箇所に閉じる。
             if self.gathering_sc is not None:
                 self.gathering_sc.resume_at(_prev_min)
+            # S12(第142): 復元で作り直した世界も恒久世代へ移す(既定 OFF = no-op)。
+            # checkpoint.load は sim.agents を丸ごと差し替えるので、__init__ 時の freeze
+            # とは**別のオブジェクト集合**になる = ここでもう一度掛ける必要がある。
+            self._gc_freeze("resume")
         if every > 0:
             save_config(self.cfg, self.out_dir)   # 途中再開に備え config を先出しする
         for step in range(start, int(self.cfg.run.n_steps)):

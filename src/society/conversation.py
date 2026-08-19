@@ -37,6 +37,13 @@ from .world.perception import hearers_of
 # 実測較正(mock 24step・n=60)の根拠は最終報告に記す(コードにマジックナンバーの由来を残さない方針)。
 DEFAULTS = {
     "enabled": False,
+    # ---- C3P(第142): すれ違い集計の有界化。既定 0 = 無制限 = 現行と完全同一 ----
+    # 正典: docs/plans/ram-rootcause-and-fix-plan.md §1「準主犯(確定)」。
+    # `_c3_pass` / `_c3_greet` は「今日すれ違った / 会話した**相異なる**相手 id」の集合で、
+    # 密度に比例して育つ(10k・半日で pickled 49.8MB)。消費側は observer/relations.py の
+    # `len()` **だけ**なので、cap を掛けると「その日の相異なる人数」が cap で**飽和**する
+    # (= 数字の解像度が落ちるだけで、世界の力学には一切触らない)。
+    "c3_distinct_cap": 0,
     "c2": {
         "meet_prob": 0.8,        # 同席・会話可能な 1 対あたり毎 step の会話成立確率(c2_meet 抽選)
         "cooldown_steps": 2,     # 会話後にその個体が次の C2 に入れるまでの step 数(連発の抑制)
@@ -65,7 +72,10 @@ def build_cfg(raw) -> dict:
     except Exception:
         pass
     raw = dict(raw or {})
-    cfg = {"enabled": bool(raw.get("enabled", DEFAULTS["enabled"]))}
+    cfg = {"enabled": bool(raw.get("enabled", DEFAULTS["enabled"])),
+           # C3P: 負値は 0(=無制限)へ倒す(「上限 0 件」の破壊的解釈を作らない)。
+           "c3_distinct_cap": max(0, int(raw.get("c3_distinct_cap",
+                                                 DEFAULTS["c3_distinct_cap"]) or 0))}
     c2_raw = dict(raw.get("c2", {}) or {})
     c2 = dict(DEFAULTS["c2"])
     for k, v in c2_raw.items():
@@ -273,7 +283,11 @@ def run_phase(sim, step: int, sim_min: int) -> None:
     """
     if not enabled(sim):
         return
-    cfg = _cfg(sim)["c2"]
+    _full = _cfg(sim)
+    cfg = _full["c2"]
+    # C3P: すれ違い集合の飽和上限。**ホットループの中で conf を辿らない**ため
+    # フェーズ冒頭で 1 度だけ引く(既定 0 = 無制限 = 下の add がそのまま走る)。
+    c3_cap = int(_full["c3_distinct_cap"])
     idx = getattr(sim, "percept_index", None)
     if idx is None:
         return
@@ -299,8 +313,12 @@ def run_phase(sim, step: int, sim_min: int) -> None:
             if b.id <= a.id or b.id in conversed:
                 continue
             # 双方すれ違い(C3): 近くに居た=会話有無に関わらず「すれ違った」1 人に数える。
-            a._c3_pass.add(b.id)
-            b._c3_pass.add(a.id)
+            # C3P: cap>0 では cap 件で**飽和**する(それ以上は数えない)。既定 0 では
+            # 条件式の左が常に真なので add がそのまま走る = バイト一致。
+            if c3_cap <= 0 or len(a._c3_pass) < c3_cap:
+                a._c3_pass.add(b.id)
+            if c3_cap <= 0 or len(b._c3_pass) < c3_cap:
+                b._c3_pass.add(a.id)
             # 双方会話可能か(cooldown 明け・日次上限内)。片方でも不可なら会話は成立しない。
             if step < getattr(a, "_c2_cooldown_until", 0) \
                     or step < getattr(b, "_c2_cooldown_until", 0):
@@ -328,8 +346,10 @@ def run_phase(sim, step: int, sim_min: int) -> None:
             sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=a.id,
                                  kind="conversation", x=a.x, y=a.y,
                                  payload=payload))
-            a._c3_greet.add(b.id)
-            b._c3_greet.add(a.id)
+            if c3_cap <= 0 or len(a._c3_greet) < c3_cap:   # C3P: 会話側も同じ飽和規則
+                a._c3_greet.add(b.id)
+            if c3_cap <= 0 or len(b._c3_greet) < c3_cap:
+                b._c3_greet.add(a.id)
             a._c2_count += 1
             b._c2_count += 1
             a._c2_cooldown_until = step + cooldown

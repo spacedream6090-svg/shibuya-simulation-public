@@ -171,6 +171,19 @@ FEATURES: tuple[Feature, ...] = (
     _f("world.scenario", "strict", False, "possible",
        "摂動カタログ(shock_closure=区間封鎖 / shock_event=定型ニュース注入)",
        off_value="baseline"),
+    # S15(第142・RAM 対策の**層3**)。正典 docs/plans/ram-rootcause-and-fix-plan.md §3 層3。
+    # ★affects_k=True を正直に宣言する: 聴衆を絞ると聞き手側の drive 加算(_arouse /
+    #   on_ingroup_heard / on_vicarious)が減るので、**呼数 cap が binding しない構成では
+    #   発火回数が動きうる**(cap が binding する本選構成では総数は cap 固定)。
+    #   generate() の呼び出しサイトそのものは 1 つも足さない/減らさない。
+    _f("world.attention_hearers_max", "strict", True, "none",
+       "発話 1 件あたりの聴衆上限(注意の有界性)。>0 で聞き手を話者に近い順 K 人へ絞る"
+       "(距離二乗昇順・同値は id 昇順の決定論。乱数ゼロ)。0=無制限=現行と完全同一。"
+       "★**層3 = 世界の力学に触る**: 現実整合の弁護は可能(カクテルパーティ効果=人は"
+       "雑踏の全発話を知覚しない)が、**伝播トポロジーが変わる** = k* 研究の条件そのもの。"
+       "採用にはユーザーの事前登録が必要で、採るなら RESULTS に開示する。"
+       "適用は speak ハンドラの hearers **だけ**(同席判定・発火条件・company は不触)",
+       off_value=0),
     _f("world.elevation.enabled", "strict", False, "none",
        "標高 z 列をイベント payload へ付ける(表示・観測専用)"),
     _f("world.heights.enabled", "strict", False, "none",
@@ -593,12 +606,43 @@ FEATURES: tuple[Feature, ...] = (
        "★C3 の遭遇カウンタは 1 個体あたり encounter_track_max 件の LRU に有界化して"
        "あり、**塞ぎに来た O(N²) をメモリ側で再発させない**ことがこの機能の要である。"
        "★乱数は F3 の新 named stream \"snc_follow\" だけ(OFF では 1 粒も引かない)"),
+    # ---- 第142 RAM 根本原因の修正(GRP / NET ガード)。正典 docs/plans/
+    #      ram-rootcause-and-fix-plan.md §1 主犯 / §3 層1。どれも repro_tier=strict
+    #      (LLM 出力を 1 バイトも読まない)・affects_k=False(generate() の呼び出し点も
+    #      予算も 1 つも動かさない)・fingerprint_risk=none(プロンプトに 1 文字も出ない)。
+    _f("net.contact_formation.group_join_mode", "strict", False, "none",
+       "グループ加入で張る縁の量。all=現行(メンバー全員と相互 add_contact)/ "
+       "bounded=創設者(+group_join_k 人)とだけ contacts を結ぶ(follows は張らない)。"
+       "★塞ぐバグ(実測 10k×2 日): group_join 1,101,718 件・最太個体の知り合い 18,783 人・"
+       "net 2,579MB・step 時間 32 分/step。SNC が塞いだ hear 経路とは**別経路**で"
+       "同じ完全グラフを作っていた。加入は機械抽選なので LLM 無関係に 25 万でも爆発する。"
+       "★bounded でも縁の源泉は消えない(居合わせれば C3・返事をすれば C1 で結ばれる)。"
+       "★乱数を 1 粒も引かない(選抜は id 昇順の決定論)・新 L1 kind 0 件・L1 も増やさない",
+       off_value="all"),
+    _f("net.contact_formation.group_join_k", "strict", False, "none",
+       "bounded 時に創設者へ**追加**で結ぶメンバー数(sorted(members) の先頭 k 人=決定論)。"
+       "0=創設者のみ", off_value=0),
+    _f("net.contacts_hard_max", "strict", False, "none",
+       "Internet 水準の contacts 絶対上限(到達したら以後の挿入を**拒否**する。押し出しはしない)。"
+       "★第140→141 の教訓『点(経路)の修正ではなく水準のガード』の実体で、まだ見つかって"
+       "いない暴走経路も構造的に遮断する保険。拒否件数は net.n_contact_rejects に貯まる"
+       "(新 L1 kind は 1 つも作らない)。0=無効=現行と完全同一", off_value=0),
+    _f("net.follows_hard_max", "strict", False, "none",
+       "Internet 水準の follows 絶対上限(同上・拒否のみ)。0=無効=現行と完全同一",
+       off_value=0),
     _f("drive.boredom.enabled", "strict", False, "none",
        "退屈ゲージ(同じことの反復で発火閾値が下がる)"),
     _f("drive.drift.enabled", "strict", False, "none",
        "欲求パラメータの日次ドリフト"),
     _f("conversation.enabled", "strict", False, "none",
        "会話3層 C2/C3。LLM を1本も使わない構造化会話(Dialogue Act 遷移)で会話密度を作る"),
+    # C3P(第142・層2 = 観測の解像度にだけ触る)。正典 §1「準主犯(確定)」。
+    _f("conversation.c3_distinct_cap", "strict", False, "none",
+       "C3 すれ違い集計(_c3_pass / _c3_greet = その日の**相異なる**相手 id 集合)の飽和上限。"
+       "★塞ぐ肥大: 10k・半日で pickled 49.8MB(密度比例)。消費側は G5 サイドカーの len() "
+       "**だけ**なので、>0 では『その日の相異なる人数』が cap で飽和するだけで、会話の成立・"
+       "関係・意見・語彙・乱数消費は 1 バイトも変わらない(= 観測の解像度のみ・RESULTS に明記)。"
+       "0=無制限=現行と完全同一", off_value=0),
     _f("planning.enabled", "journal", True, "possible",
        "朝の一日計画。LLM に予定 2〜5 件を立てさせ自由文の what/intent を行動の土台にする"),
     _f("planning.framework.enabled", "journal", False, "possible",
@@ -1153,6 +1197,12 @@ FEATURES: tuple[Feature, ...] = (
        "pool.enabled が OFF なら 1 バイトも効かない子トグル"),
     _f("engine.batch_llm.enabled", "journal", False, "none",
        "LLM 一括発行(未命中のみ並行発行→id 順 apply)。LLM 発行経路そのものを差し替える"),
+    # S12(第142・層1)。正典 docs/plans/ram-rootcause-and-fix-plan.md §3 層1 S12。
+    _f("engine.gc_freeze", "strict", False, "none",
+       "初期化完了時と checkpoint 復元完了時に gc.collect() → gc.freeze() を 1 回ずつ呼び、"
+       "その時点の恒久オブジェクト(街・住戸・組織・名簿・エージェント本体)を GC の走査対象から"
+       "外す。狙いは step 時間の GC 由来の劣化と断片化(RAM 実効 ×1.2-1.4)。"
+       "★世界・乱数・L1・LLM 呼数は 1 バイトも動かない = ON/OFF で出力は完全同一"),
     _f("cognition.age.enabled", "strict", False, "none",
        "年齢→思考/推論の量(AGE-C。docs/plans/age-diversity-plan.md §4-4)。年齢から個体の"
        "**基本思考周期の倍率**と**発火申請の実効閾値 delta** を決定論(乱数ゼロ)で決める。"

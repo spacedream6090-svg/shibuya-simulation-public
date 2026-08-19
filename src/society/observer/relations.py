@@ -68,6 +68,7 @@ finals 構成(在場 25 万 × 10 日)で、1 人 1 日あたり動く対は数�
 """
 from __future__ import annotations
 
+import struct
 from pathlib import Path
 
 import pyarrow as pa
@@ -118,6 +119,52 @@ def _value(rel: dict) -> tuple:
             bool(rel.get("dormant", False)))
 
 
+# --------------------------------------------------------------------------- #
+# S9(第142): 差分基準 ``_last`` のメモリ表現を**縮める**(出力行はバイト不変)
+#
+# なぜ要るか(実測・docs/plans/ram-rootcause-and-fix-plan.md §2 の #10)
+#   ``_last`` は「これまでに 1 度でも出た (自分, 相手) の対」ぶんだけ残る **live 専用の**
+#   辞書で、250k×10 日では 10-25GB と推定された。中身は
+#   キー = ``(aid, oid)`` タプル(tuple 56B + int 2 個)/ 値 = 4 要素タプル(88B + 各要素)
+#   で、**実データ 25 バイトぶんの情報に 250-300 バイト払っている**。
+#
+# 何をするか
+#   キー = ``(aid << 32) | (oid & 0xFFFFFFFF)`` の int 1 個。
+#   値   = ``struct`` で 25 バイトに詰めた ``bytes`` 1 個。
+#   どちらも **比較にしか使わない**(復元しない)ので、要求は「等価性が完全に保存される」
+#   ことだけである。出力 ``rows`` は 1 バイトも変えない(``_value`` の 4 つ組をそのまま書く)。
+#
+# 等価性を壊しかねない 2 つの実数の罠(どちらも明示的に潰す)
+#   1. **-0.0**: ``-0.0 == 0.0`` は True なのに ``pack`` は別バイト列になる。
+#      ``round(-1e-5, 4) == -0.0`` は実際に起こり得る(closeness は負にも振れる)ので、
+#      詰める前に **0.0 へ正規化**する(= タプル比較と同じ「等しい」を再現)。
+#   2. **NaN**: ``nan != nan`` なのでタプル比較では**毎回「変化した」**になるが、
+#      ``pack`` すると同じバイト列になり「変化なし」に化ける。そこで NaN を含む値は
+#      **``_last`` に保存しない**(キーを落とす)= 次回の ``.get`` が必ず外れる
+#      = 旧タプル比較と**同じ行**が出る。
+# --------------------------------------------------------------------------- #
+_PACK = struct.Struct("<Bdqq")     # flags / closeness / tier / count = 25 バイト固定
+
+
+def _key(aid: int, oid: int) -> int:
+    """(自分, 相手) → 64bit 相当の int キー(相手 id が負でも単射)。"""
+    return (int(aid) << 32) | (int(oid) & 0xFFFFFFFF)
+
+
+def _pack(val: tuple) -> bytes | None:
+    """``_value`` の 4 つ組 → 比較用 bytes。**NaN を含むときは None**(= 保存しない)。"""
+    clo, tier, count, dormant = val
+    flags = (1 if clo is not None else 0) \
+        | (2 if tier is not None else 0) \
+        | (4 if dormant else 0)
+    c = 0.0
+    if clo is not None:
+        if clo != clo:                             # NaN(比較で常に不一致にしたい)
+            return None
+        c = 0.0 if clo == 0.0 else float(clo)      # -0.0 を +0.0 へ正規化
+    return _PACK.pack(flags, c, 0 if tier is None else int(tier), int(count))
+
+
 class RelationsDaily(FinalizeStreamMixin):
     """関係台帳の日次差分 + C3 すれ違い集計(``observer/roster.py`` と対の設計)。"""
 
@@ -125,7 +172,8 @@ class RelationsDaily(FinalizeStreamMixin):
         self.out_dir = Path(out_dir)
         self.passing = bool(passing)
         self.rows: list[tuple] = []
-        self._last: dict[tuple[int, int], tuple] = {}
+        # S9: キー = int(aid<<32|oid) / 値 = 25 バイトの bytes(上の節を参照。出力は不変)。
+        self._last: dict[int, bytes] = {}
         self._day: int | None = None
         self._n_flushed = 0
         self._seg = self._next_seg()
@@ -149,10 +197,14 @@ class RelationsDaily(FinalizeStreamMixin):
                 if not isinstance(rel, dict):
                     continue
                 val = _value(rel)
-                key = (aid, int(oid))
-                if self._last.get(key) == val:
+                key = _key(aid, oid)
+                packed = _pack(val)                # S9: None = NaN を含む(常に「変化」扱い)
+                if packed is not None and self._last.get(key) == packed:
                     continue                       # 前日から 1 つも動いていない = 行を作らない
-                self._last[key] = val
+                if packed is None:
+                    self._last.pop(key, None)      # 次回の .get を必ず外す = 旧タプル比較と同値
+                else:
+                    self._last[key] = packed
                 self.rows.append((day, aid, int(oid), val[0], val[1], val[2], val[3],
                                   None, None))
                 n += 1
@@ -232,12 +284,17 @@ class RelationsDaily(FinalizeStreamMixin):
                 oid = row["other_id"]
                 if oid is None or int(oid) == SELF_ID:
                     continue                       # すれ違い行は差分の対象ではない
-                self._last[(int(row["agent_id"]), int(oid))] = (
+                packed = _pack((                   # S9: 保存形式は capture と同一
                     None if row["closeness"] is None else round(float(row["closeness"]), 4),
                     None if row["tier"] is None else int(row["tier"]),
                     int(row["count"] or 0),
                     bool(row["dormant"]),
-                )
+                ))
+                key = _key(int(row["agent_id"]), int(oid))
+                if packed is None:                 # NaN は基準に据えない(必ず初出扱い)
+                    self._last.pop(key, None)
+                else:
+                    self._last[key] = packed
 
     # ---- セグメント書き出し(checkpoint 時に呼ぶ)----
     def flush_segment(self) -> None:

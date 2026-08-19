@@ -17,7 +17,24 @@ MEDIA_ID = -1   # 公式・メディアの発信者 ID
 
 
 class Internet:
-    def __init__(self, feed_size: int = 6, posts_max: int = 0):
+    # ---- NET ガード(第142): Internet 水準の安全上限。**既定 0 = 無効 = バイト一致** ----
+    # 正典: docs/plans/ram-rootcause-and-fix-plan.md §3 層1「NET ガード」/§5 教訓。
+    # 第140 は「聞こえた全員と add_contact」という**1 経路**を塞いだが、第141 で
+    # グループ加入という**別経路**が同じ完全グラフを作っていたことが分かった。
+    # 点(経路)ではなく**水準(この層)**でガードを張れば、まだ見つかっていない
+    # 経路も構造的に遮断できる —— それがこの 2 つの hard cap である。
+    # ★意味論: **拒否だけ**を行い、押し出し(evict)は一切しない。押し出しは SNC の
+    #   軟上限(contacts_max / follows_max = closeness 最弱を落とす)の仕事で、
+    #   ここが勝手に縁を消すと「どの上限がその縁を落としたか」が読めなくなる。
+    # ★クラス属性として置くのは、**旧 checkpoint から復元した Internet**(instance の
+    #   __dict__ にこれらのキーが無い)でも属性参照が落ちないようにするため。
+    contacts_hard_max = 0
+    follows_hard_max = 0
+    n_contact_rejects = 0        # cap 到達で contacts の挿入を拒否した回数(片側 1 回で 1)
+    n_follow_rejects = 0         # cap 到達で follows の挿入を拒否した回数
+
+    def __init__(self, feed_size: int = 6, posts_max: int = 0,
+                 contacts_hard_max: int = 0, follows_hard_max: int = 0):
         self.feed_size = int(feed_size)
         # post: {"id","step","author","text","items":[word],"likes":set,"reshares":int}
         self.posts: list[dict] = []
@@ -41,6 +58,9 @@ class Internet:
         #   ★`unfollow` は SNC v2(net.contact_formation)の**上限の押し出し専用**として
         #     第117 で足した 6 本目の経路である(自然なアンフォロー = 関係の消滅は
         #     本選後の別件。設計 docs/plans/sns-contact-redesign.md §2)。
+        #   ★第142 の NET ガード(`follows_hard_max`)は **経路を 1 本も増やさない**:
+        #     既存の `follow` / `add_contact` の中で「入れるか入れないか」を判定するだけで、
+        #     入れたときは従来どおり同じ 2 行で逆索引を更新する(上の 6 経路規約は不変)。
         self._followers: dict[int, int] = {}
         self.contacts: dict[int, set[int]] = {}   # 対面で会話した相手(DM可)
         self.read_marks: dict[int, int] = {}      # agent_id -> 既読 post id(=watermark)
@@ -55,6 +75,11 @@ class Internet:
         # post が消えても総数を保持する。既定(trim なし)では sum(len(likes)) と完全一致。
         self.n_likes_total = 0
         self.n_reshares_total = 0
+        # NET ガード(上のクラス属性の docstring 参照)。0 = 無効 = 現行と完全同一。
+        self.contacts_hard_max = int(contacts_hard_max or 0)
+        self.follows_hard_max = int(follows_hard_max or 0)
+        self.n_contact_rejects = 0
+        self.n_follow_rejects = 0
 
     def init_follows(self, agent_ids: list[int], rng, k: int = 6) -> None:
         """起動時 1 回: 全員へ「自分以外から重複なし k 人」の初期フォローを配る。
@@ -122,6 +147,11 @@ class Internet:
         f, a = int(follower), int(author)
         bucket = self.follows.setdefault(f, set())
         if a in bucket:
+            return
+        # NET ガード: hard cap 到達なら**拒否**(押し出しはしない)。既定 0 で分岐は死ぬ。
+        cap = self.follows_hard_max
+        if cap > 0 and len(bucket) >= cap:
+            self.n_follow_rejects += 1
             return
         bucket.add(a)
         rev = self._rev()
@@ -235,12 +265,34 @@ class Internet:
           なってしまい、そのアンカーが構造的に測れなくなる。
         """
         if a in self.contacts and b in self.contacts:
-            self.contacts[a].add(b)
-            self.contacts[b].add(a)
+            # NET ガード(第142): hard cap 到達側の挿入だけを**拒否**する(押し出しなし)。
+            # ★「追加しようとする側ごとに」判定する: a が満杯でも b が空いていれば
+            #   b 側には入る(= 片側だけの非対称が残る)。contacts は双方向という
+            #   意味づけだが、上限は個体の容量なので**個体ごとに**当たるのが正しい。
+            # ★既定 0 では cap 分岐が 1 度も真にならず、下の 2 行がそのまま走る=バイト一致。
+            cap = self.contacts_hard_max
+            ok_a = ok_b = True
+            if cap > 0:
+                ok_a = b in self.contacts[a] or len(self.contacts[a]) < cap
+                ok_b = a in self.contacts[b] or len(self.contacts[b]) < cap
+                if not ok_a:
+                    self.n_contact_rejects += 1
+                if not ok_b:
+                    self.n_contact_rejects += 1
+            if ok_a:
+                self.contacts[a].add(b)
+            if ok_b:
+                self.contacts[b].add(a)
             if not auto_follow:                   # SNC v2: contacts だけ(follows は不触)
                 return
             bucket = self.follows[a]              # 知り合いは自動フォロー
             if b not in bucket:
+                # 自動フォローは「知り合いになったから」張るものなので、a 側の contacts が
+                # 拒否されたらフォローも張らない(縁が無いのに購読だけ残るのを避ける)。
+                fcap = self.follows_hard_max
+                if not ok_a or (fcap > 0 and len(bucket) >= fcap):
+                    self.n_follow_rejects += 1
+                    return
                 bucket.add(b)
                 rev = self._rev()
                 rev[b] = rev.get(b, 0) + 1

@@ -399,6 +399,17 @@ world:
   #     例) scenario_params: { at_step: 24, title: "駅前で大規模イベント", text: "混雑注意", word: "封鎖祭り" }
   scenario_params: {}           # 既定は空(baseline では読まれない)
   perception_radius_m: 40.0     # この距離内で会話が聞こえる(建物内=同じ階のみ)
+  # ---- S15(第142): 発話 1 件あたりの聴衆上限(注意の有界性)。0=無制限=現行と完全同一 ----
+  # 正典: docs/plans/ram-rootcause-and-fix-plan.md §3 **層3**(= 世界の力学に触る)。
+  # ★★層3 = **世界の力学に触る**。ON 判断はユーザーの事前登録が必要で、採るなら RESULTS に
+  #   開示する。実装だけ先に置く(既定 0 では 1 行も走らない)。
+  # 何が変わるか: >0 のとき、1 つの発話を「聞く」のは話者に近い順 K 人だけになる
+  #   (距離二乗 昇順・同値は id 昇順の**決定論**。乱数は 1 粒も引かない)。
+  #   現実整合の弁護は可能(カクテルパーティ効果 = 人は雑踏の全発話を知覚しない)が、
+  #   **伝播トポロジーが変わる** = k* 研究の条件そのものに手を入れることになる。
+  # 効くもの: hear の L1 件数・記憶・関係台帳・drive・意見更新・SNC 遭遇カウンタが
+  #   すべて「絞った聴衆」に揃う(= §2 表の #2 #3 #5 #10 #11 に掛かる乗数を下げる)。
+  attention_hearers_max: 0
   edge_capacity: 20             # 混雑=この人数を超えると減速(grievance 源)
   elevation:                    # 3D Phase 0: 標高 z 列(3d-movement.md §7)。ON で move_segment/arrive payload に z[m](DEM 双一次・export_3d と同値)を追加
     enabled: false              # 既定 OFF=イベント不変(バイト一致)。表示・観測専用=移動判定・認知・LLM 呼数は不変
@@ -1126,6 +1137,17 @@ net:
   reshare_prob: 0.03            # 閲覧した投稿をリシェアする確率(#14。フォロワーへ自然再配信)
   posts_max: 0                  # B7(スケール): SNS 投稿の保持上限。>0 で古い投稿をエイジアウト
                                 # (id は不変で react/timeline は id ベース=安全)。0=無制限で従来と完全同一。
+  # ---- NET ガード(第142): Internet 水準の安全上限。0=無効=現行と完全同一 ----
+  # 正典: docs/plans/ram-rootcause-and-fix-plan.md §3 層1 / §5 教訓。
+  # 第140 は「聞こえた全員と add_contact」という 1 経路を塞いだが、第141 でグループ加入という
+  # **別経路**が同じ完全グラフを作っていた。ここは経路ではなく**水準**で押さえる最後の砦で、
+  # まだ見つかっていない経路も構造的に遮断する(未知の暴走に対する保険)。
+  # ★**拒否だけ**を行い押し出し(evict)はしない: 押し出しは SNC の軟上限
+  #   (contact_formation.contacts_max / follows_max = closeness 最弱を落とす)の仕事で、
+  #   ここが縁を消すと「どの上限が落としたか」が読めなくなる。拒否件数は
+  #   net.n_contact_rejects / n_follow_rejects に貯まる(新 L1 kind は 1 つも作らない)。
+  contacts_hard_max: 0          # 1 個体の contacts の絶対上限(到達したら以後の挿入を拒否)
+  follows_hard_max: 0           # 1 個体の follows の絶対上限(同上)
   # ---- SNS・知り合い形成 v2(SNC。既定 OFF=現行挙動と 1 バイトも変わらない)----
   # 正典: docs/plans/sns-contact-redesign.md
   # 現行(OFF)は「発話が聞こえた全員と add_contact」= 傍聴者まで無条件に知り合い+相互フォロー。
@@ -1141,6 +1163,17 @@ net:
     follows_max: 500            # 安全弁(重い尾は許容)。超過は決定論規則で押し出し
     follow_like_p: 0.02         # F3: いいね時に著者をフォローする確率
                                 # (較正目標=新規フォロー 0.03-0.3 件/日/人。TRF 実測帯)
+    # ---- GRP(第142): グループ加入で張る縁の量。★RAM 爆発の主犯の根治スイッチ ----
+    # 正典: docs/plans/ram-rootcause-and-fix-plan.md §1「主犯(確定)」/§3 層1。
+    # 現行(all)は tools._group_joins が加入者を**メンバー全員と相互 add_contact**する
+    # (= contacts 双方向 + 自動フォロー両方向)。加入は毎 step の機械抽選なので 10k・2 日で
+    # group_join 1,101,718 件(平均 56 グループ/人)・最太個体の知り合い 18,783 人・
+    # net だけで 2,579MB・step 時間 32 分/step。**LLM 無関係なので 25 万でも確実に爆発する**。
+    # bounded は「加入したその場で結ぶ縁」を創設者(+ 決定論 k 人)に絞る。残りのメンバーとは
+    # 居合わせれば C3(顔なじみ)・返事をすれば C1(relate)で結ばれる = 縁の源泉は消えない。
+    # ★bounded が効くのは contact_formation.enabled=true のときだけ(SNC の上限規律に相乗り)。
+    group_join_mode: all        # all=現行(全員と相互 add_contact) / bounded=創設者(+k人)のみ
+    group_join_k: 0             # bounded 時に創設者へ**追加**で結ぶ人数(id 昇順の決定論・0=創設者のみ)
 
 # ---- 欲求駆動発火(Phase A: 推論タイミングの分散。ユーザー仕様 2026-07-04)----
 # 出来事が欲求ゲージを溜め、個人別閾値で「申請」→ 個人の重みで確率発火 →
@@ -1215,6 +1248,13 @@ drive:
 #   ゼロ(呼数 k 非依存)・no-fingerprint(opinion/relations の不透明値のみ)。production.yaml は触らない。
 conversation:
   enabled: false                # ★ON 推奨(本番): true(記録に残る会話密度=C2 を有効化)
+  # ---- C3P(第142): すれ違い集計の有界化。0=無制限=現行と完全同一 ----
+  # 正典: docs/plans/ram-rootcause-and-fix-plan.md §1「準主犯(確定)」/§3 層2。
+  # _c3_pass / _c3_greet は「今日すれ違った/会話した**相異なる**相手 id」の集合で密度に比例して
+  # 育つ(10k・半日で pickled 49.8MB)。消費側は observer/relations.py の len() **だけ**なので、
+  # >0 にすると「その日の相異なる人数」が cap で**飽和**する(= 観測の解像度だけが落ちる。
+  # 会話の成立・関係・意見・語彙・乱数消費は 1 バイトも変わらない)。
+  c3_distinct_cap: 0
   c2:
     meet_prob: 0.8              # 同席・会話可能な1対あたり毎step の会話成立確率(c2_meet 抽選)
     cooldown_steps: 2           # 会話後にその個体が次の C2 に入れるまでの step 数(連発の抑制)
@@ -1744,6 +1784,15 @@ engine:
   batch_llm:
     enabled: false
     workers: 8                # 並行発行数(実LLM時。mock/1では逐次=同一経路)
+  # ---- S12(第142): gc.freeze()。既定 false=1 行も走らない ----
+  # 正典: docs/plans/ram-rootcause-and-fix-plan.md §3 層1 S12。
+  # true にすると ①初期化完了時 ②checkpoint 復元完了時 の 2 箇所で gc.collect() → gc.freeze()
+  # を 1 回ずつ呼び、その時点で生きているオブジェクト(街・住戸・組織・名簿・エージェント本体)を
+  # **恒久世代**へ移す。以後の世代 GC がその巨大なグラフを毎回舐めなくなる = step 時間の
+  # GC 由来の劣化と断片化の両方に効く。世界・乱数・L1 は 1 バイトも動かない(出力は ON/OFF 同一)。
+  # ★プール回転で日々入れ替わるオブジェクトは freeze の対象外(害は無い=凍結世代は回収され
+  #   ないだけで参照も解放も普通に働く)。
+  gc_freeze: false
 
 # ---- 方針キャッシュ(P2-S7・既定OFF=バイト一致)。docs/research/interstitial-life.md §4.4-b ----
 # 朝計画・日中熟慮の出力を k 非依存の物理量キー(職業/年代/曜日型/時間帯/場所種別/天気/活動cat)で

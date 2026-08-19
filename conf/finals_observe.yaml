@@ -1024,6 +1024,29 @@ env:
 net:
   contact_formation:
     enabled: true
+    # ---- GRP(第142・RAM 根本原因の主犯根治)----
+    # 正典: docs/plans/ram-rootcause-and-fix-plan.md §1「主犯(確定)」。
+    # 実測(10k×2 日・SNC ON): group_join 1,101,718 件(平均 56 グループ/人)・
+    # 最太個体の知り合い 18,783 人・net だけで 240MB → 2,579MB・step 時間 32 分/step。
+    # 原因は `tools._group_joins` が加入者を**メンバー全員と相互 add_contact**していたこと
+    # (SNC が塞いだ hear 経路とは**別の経路**で同じ完全グラフを作っていた)。
+    # bounded = 加入したその場で結ぶのは**創設者のみ**(k=0)。残りのメンバーとは居合わせれば
+    # C3(顔なじみ)・返事をすれば C1(relate)で結ばれる = 縁の源泉は 1 つも消えない。
+    group_join_mode: bounded
+    group_join_k: 0            # 創設者に**追加**で結ぶ人数(0 = 創設者だけ)
+  # ---- NET ガード(第142・層1)----
+  # 「点(経路)の修正ではなく水準のガード」= 第140→141 の教訓(1 経路を塞いだら別経路が残った)。
+  # 到達したら**拒否するだけ**(押し出さない)ので、SNC の軟上限(contacts_max 200 /
+  # follows_max 500)の意味論は侵さない。較正が正しければここに触る個体は出ない
+  # (= 出たら「未知の暴走経路がある」という信号そのもの。net.n_contact_rejects で読める)。
+  contacts_hard_max: 2000
+  follows_hard_max: 4000
+
+# ---- S12(第142・層1): gc.freeze()。初期化完了時と checkpoint 復元完了時に 1 回ずつ ----
+# 世界・乱数・L1 は 1 バイトも動かない(出力は ON/OFF 同一)。狙いは step 時間の GC 由来の
+# 劣化と断片化(§2 表の #13 = 実効 ×1.2-1.4)。
+engine:
+  gc_freeze: true
 
 relations:
   enabled: true
@@ -1093,6 +1116,24 @@ routine:
   # gumbel は入れない(行き先選択の分布形を変える=較正済み既定からの逸脱を本選で混ぜない)
 conversation:
   enabled: true
+  # ---- C3P(第142・層2 = 観測の解像度にだけ触る)----
+  # 正典: docs/plans/ram-rootcause-and-fix-plan.md §1「準主犯(確定)」。
+  # `_c3_pass` / `_c3_greet`(その日すれ違った/会話した**相異なる**相手 id の集合)は
+  # 10k・半日で pickled 49.8MB。消費側は G5 サイドカーの len() だけなので、cap を掛けると
+  # 「その日の相異なる人数」が cap で飽和する(会話の成立・関係・意見・乱数消費は不変)。
+  # ★仮値・8/20 判定で最終化(Step B/C′ の実測 RSS と密度を見て確定する)。
+  #   飽和が起きた個体は「2000 人以上とすれ違った」と読む(RESULTS に明記する)。
+  c3_distinct_cap: 2000
+
+# ---- S15 / S7 / S8 の finals 値は**意図的に入れていない**(層3 = ユーザー判断待ち)----
+#   world.attention_hearers_max(S15)… 聴衆の注意上限。**伝播トポロジーを変える**ので
+#     事前登録なしには使わない。実装済み・既定 0(無制限)で待機。
+#   memory.relations_max(S7)……… 既に conf 化済み(conf/config.yaml の memory ブロック)。
+#     既定 0 = **無制限**で、本プロファイルでも上書きしていない = 関係台帳は現状 in-RAM で
+#     青天井(プール回転で退場する個体だけ pool.relations_cap=60 に切られる)。
+#     値を入れる = 認知容量を絞る力学変更なので、判断はユーザーへ。
+#   truth_ledger.max_beliefs_per_agent(S8)… **既に 32 で有界**(config.yaml で宣言済み・
+#     truth_ledger は凍結 SPEC_FILES)。新しい cap は要らない。
 prompts:
   variety_hint: true
   reflect_variety: false   # 実LLM検収で丸写し(placeholder echo)33% = 正味悪化のため OFF 据え置き

@@ -92,7 +92,13 @@ DEFAULTS: dict = {
     "contacts_max": 200,
     "follows_max": 500,
     "follow_like_p": 0.02,
+    # GRP(第142): グループ加入で張る縁の量。既定 "all" = 現行(メンバー全員と相互 add_contact)。
+    "group_join_mode": "all",
+    "group_join_k": 0,
 }
+
+#: `group_join_mode` の有効値(未知の値は既定 "all" = 現行挙動へ倒す)。
+GROUP_JOIN_MODES = ("all", "bounded")
 
 
 # --------------------------------------------------------------------------- #
@@ -129,6 +135,13 @@ def build_cfg(raw) -> dict:
         "follow_like_p":
             min(1.0, max(0.0, float(_get(raw, "follow_like_p",
                                          DEFAULTS["follow_like_p"])))),
+        # GRP: 未知の文字列は "all"(= 現行挙動)へ倒す。k は 0 以上。
+        "group_join_mode": (
+            str(_get(raw, "group_join_mode", DEFAULTS["group_join_mode"]))
+            if str(_get(raw, "group_join_mode", DEFAULTS["group_join_mode"]))
+            in GROUP_JOIN_MODES else DEFAULTS["group_join_mode"]),
+        "group_join_k":
+            max(0, int(_get(raw, "group_join_k", DEFAULTS["group_join_k"]))),
     }
 
 
@@ -329,6 +342,76 @@ def follow(sim, actor, author_id: int, via: str, step: int, sim_min: int) -> boo
     _evict_follows(sim, aid, cfg_of(sim), keep=author)
     _log(sim, actor, KIND_FOLLOW, step, sim_min, {"author": author, "via": via})
     return True
+
+
+# --------------------------------------------------------------------------- #
+# GRP(第142): グループ加入の有界化 —— **RAM 爆発の主犯を止める唯一の seam**
+#
+# 何が起きていたか(実測・docs/plans/ram-rootcause-and-fix-plan.md §1)
+#   `tools._group_joins` は加入者を **メンバー全員と相互 add_contact**(= contacts 双方向
+#   + 自動フォロー両方向)していた。加入は毎 step の機械抽選なので、10k・2 日で
+#   group_join 1,101,718 件(平均 56 グループ/人)・最太個体の知り合い 18,783 人・
+#   net だけで 2,579MB。加入 1 件のコストが O(|members|) なので step 時間も 32 分/step へ
+#   劣化する。LLM とは無関係の経路なので、**25 万でも確実に爆発する**。
+#
+# 何に置き換えるか
+#   加入者が実際に「その場で結ぶ縁」は **創設者 1 人**(+ 決定論で選ぶ k 人)に絞る。
+#   グループの残りのメンバーとは、居合わせて話せば C3(顔なじみ昇格)で、返事をすれば
+#   C1(relate 宣言)で結ばれる —— つまり縁の源泉を消すのではなく、**加入という 1 イベントで
+#   全員と結ぶのをやめる**(現実の「入会したので会員名簿の全員と連絡先を交換する」の否定)。
+#
+# 設計上の決めごと(正直に)
+#   - **follows は 1 本も張らない**(`auto_follow=False`)。理由は `acquaint` の docstring と
+#     同じ(相互フォロー率 22.1% を事後検算アンカーにする)。現行 "all" は自動フォローを
+#     張るので、bounded は follows も同時に減らす。
+#   - **L1 は 1 件も足さない**。加入は既に `group_join` イベントで記録されており、そこに
+#     `founder` が入っている = 張られた縁は台帳から**決定論で再構成できる**
+#     (k>0 のときの追加 k 人も `sorted(members)` の先頭 k 人という決定論規則)。
+#     ここで `acquaint` を呼ぶと加入 1 件につき `acquaint` が 1 件増え、L1 の体積が
+#     加入件数ぶん膨らむ(10k2 日で 110 万行)ので、上限規律だけを共有して記録はしない。
+#   - 上限の押し出しは `_evict_contacts`(SNC と同一のロジック)を経由する = 上限の規律を
+#     1 箇所に閉じる。
+#   - **乱数は 1 粒も引かない**(選抜は id 昇順の決定論)。
+# --------------------------------------------------------------------------- #
+def on_group_join(sim, joiner_id: int, founder_id: int, members) -> list[int]:
+    """加入者を **創設者 + 決定論 k 人** とだけ contacts で結ぶ(follows 不触)。
+
+    返り値 = 実際に結んだ相手の id 昇順リスト(テストと呼び出し側の検査用)。
+    `members` は加入者自身を含む集合でよい(自分と創設者は候補から除く)。
+    """
+    net = sim.net
+    aid, fid = int(joiner_id), int(founder_id)
+    cfg = cfg_of(sim)
+    targets: list[int] = []
+    if fid != aid:
+        targets.append(fid)
+    k = int(cfg["group_join_k"])
+    if k > 0:
+        extras = 0
+        for m in sorted(int(x) for x in members):   # id 昇順 = 決定論(乱数ゼロ)
+            if extras >= k:
+                break
+            if m == aid or m == fid:
+                continue
+            targets.append(m)
+            extras += 1
+    linked: list[int] = []
+    for oid in targets:
+        if oid in net.contacts.get(aid, ()):        # 既知 = 冪等(押し出しも起こさない)
+            continue
+        if aid not in net.contacts or oid not in net.contacts:
+            continue                                # 片方が SNS 未配線(add_contact と同条件)
+        net.add_contact(aid, oid, auto_follow=False)
+        _evict_contacts(sim, aid, cfg, keep=oid)
+        _evict_contacts(sim, oid, cfg, keep=aid)
+        linked.append(oid)
+    return sorted(linked)
+
+
+def group_join_bounded(sim) -> bool:
+    """グループ加入を有界化するか。**SNC 有効 かつ mode=="bounded" のときだけ True**。"""
+    cfg = cfg_of(sim)
+    return bool(cfg["enabled"]) and str(cfg["group_join_mode"]) == "bounded"
 
 
 # --------------------------------------------------------------------------- #

@@ -1710,6 +1710,48 @@ def _reply_partner_mode(sim) -> str:
         return "nearest"
 
 
+def _attention_cap(sim) -> int:
+    """S15: 発話 1 件あたりの聴衆上限(``world.attention_hearers_max``)。既定 0 = 無制限。
+
+    毎発話 conf を辿らないよう sim に 1 度だけキャッシュする(値は L1 にも乱数にも現れない)。
+    """
+    cap = getattr(sim, "_attn_hearers_max", None)
+    if cap is None:
+        try:
+            cap = max(0, int((sim.cfg.get("world", {}) or {})
+                             .get("attention_hearers_max", 0) or 0))
+        except Exception:                          # noqa: BLE001(旧 config 互換)
+            cap = 0
+        sim._attn_hearers_max = cap
+    return cap
+
+
+def _attention_limited(sim, speaker, hearers):
+    """S15(**層3 = 世界の力学に触る**): 聴衆を話者に近い順 K 人へ絞る。既定 0 では素通し。
+
+    正典: docs/plans/ram-rootcause-and-fix-plan.md §3 層3 S15。
+
+    - 順序規則: **距離二乗の昇順 → id 昇順**(平方根も乱数も使わない完全な決定論)。
+    - 適用範囲: この speak ハンドラが作る ``hearers`` **だけ**。``hearers_of`` の他の
+      用途(同席判定・発火条件・company)には 1 バイトも触らない。ここで絞った集合が
+      そのまま hear / remember / _arouse / _contact / SNC の遭遇 / 噂 / 意見更新 /
+      L1 の ``hearers`` 欄に流れる = ON 時の意味論が 1 つに揃う。
+    - **既定 0 では ``hearers`` を返すだけ**(リストの同一性まで保つ)= バイト一致。
+    """
+    cap = _attention_cap(sim)
+    if cap <= 0 or len(hearers) <= cap:
+        return hearers
+    sx, sy = float(speaker.x), float(speaker.y)
+
+    def _key(h):
+        dx, dy = float(h.x) - sx, float(h.y) - sy
+        return (dx * dx + dy * dy, int(h.id))
+    # ★元の並び(hearers_of の id 昇順)は保ったまま「誰を残すか」だけを近さで決める:
+    #   選抜後に id 昇順へ戻すので、下流の走査順は絞らないときと同じ規則になる。
+    keep = sorted(sorted(hearers, key=_key)[:cap], key=lambda h: int(h.id))
+    return keep
+
+
 def _select_partner(sim, agent, hearers):
     """発話の返答権/宛先を決定論選択する(乱数なし・R1)。hearer 集合は不変=聞く人は
     変わらない。返す人(宛先)だけが変わる。
@@ -3781,7 +3823,7 @@ def _apply_action(sim, agent, action: dict, step: int, sim_min: int) -> None:
 
     if kind == "speak":
         radius = float(sim.cfg.world.perception_radius_m)
-        hearers = hearers_of(agent, sim.agents, radius)
+        hearers = _attention_limited(sim, agent, hearers_of(agent, sim.agents, radius))
         # ablate.propagation_off(第78・既定 OFF=False=以下は全て従来経路)。
         # 「発話は通常どおり生成する / 内容は他者の文脈へ一切入らない」を実現するための
         # 唯一の判定。**聞き手集合・イベント・返答権の付与・接触台帳は触らない**

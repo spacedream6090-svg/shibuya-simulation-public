@@ -26,6 +26,7 @@ from . import status as status_mod
 from .cognition import drive
 from .factors import update as factor_update
 from .lang.sentiment import valence
+from .net import contact_formation as contact_mod
 from .observer.schema import Event
 from .rules import apply_bonus
 from .world.clock import STEP_MINUTES
@@ -1315,6 +1316,10 @@ class Tools:
 
     def _group_joins(self, sim, step, sim_min) -> None:
         prob = self.cfg["group_join_prob"]
+        # GRP(第142): グループ加入の縁を有界にするか。**既定(mode="all" / SNC OFF)は
+        # False = 下の「メンバー全員と相互 add_contact」がそのまま走る = バイト一致**。
+        # 判定は加入ループの外で 1 度だけ引く(1 加入ごとに conf を辿らせない)。
+        bounded_join = contact_mod.group_join_bounded(sim)
         for gid in sorted(self.groups):
             g = self.groups[gid]
             members = g["members"]
@@ -1335,10 +1340,19 @@ class Tools:
                 self.member_of[agent.id].add(gid)
                 # #13: 新メンバーは founder の投稿をタイムライン優先枠に載せる
                 sim.net.set_priority(agent.id, g["founder"])
-                for m in sorted(members):              # 相互フォロー(メンバー全員と)
-                    if m != agent.id:
-                        sim.net.add_contact(agent.id, m)
-                        sim.net.add_contact(m, agent.id)
+                if bounded_join:
+                    # GRP: 創設者(+ 決定論 k 人)とだけ contacts を結ぶ。follows は張らない・
+                    # L1 は増やさない・乱数は 1 粒も引かない(net/contact_formation.py の
+                    # on_group_join に上限の押し出しごと委譲 = SNC の規律を一元化)。
+                    # ★主犯の根治: 旧経路は 1 加入あたり O(|members|) の辺を張るので、
+                    #   10k・2 日で group_join 110 万件 × メンバー数 = net 2,579MB・
+                    #   最太個体の知り合い 18,783 人・step 時間 32 分/step だった。
+                    contact_mod.on_group_join(sim, agent.id, g["founder"], members)
+                else:
+                    for m in sorted(members):          # 相互フォロー(メンバー全員と)
+                        if m != agent.id:
+                            sim.net.add_contact(agent.id, m)
+                            sim.net.add_contact(m, agent.id)
                 self._log(sim, step, sim_min, agent, "group_join",
                           {"group_id": gid, "name": g["name"],
                            "founder": g["founder"]})
