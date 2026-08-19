@@ -362,6 +362,9 @@ TABLE: tuple[tuple[str, str, str], ...] = (
     ("beliefs.witness_window", STEPS, "目撃可能な窓 [step]"),
     ("beliefs.fact_ttl_steps", STEPS, "fact の鮮度 [step]"),
     ("beliefs.verify_deadline_steps", STEPS, "現場確認の有効期限 [step]"),
+    # WIT-1(2026-08-20): 目撃 pass は step 毎に 1 回走るので、この上限は [件/step]。
+    ("beliefs.channels.ambient_k", RATE,
+     "環境注意の点火上限 [件/step](1日あたりの総量を保つ。lod.max_llm_per_step と同型)"),
     ("commerce.inventory.lead_time_steps", STEPS, "発注→到着のリードタイム [step]"),
     ("services.free_steps_ref", STEPS, "daily_rate→per-step 化の基準自由 step 数"),
     ("services.services.*.stay", STEPS, "サービス滞在 [step]"),

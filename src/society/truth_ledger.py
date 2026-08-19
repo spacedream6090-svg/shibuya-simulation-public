@@ -64,10 +64,28 @@ sim 側の台帳(`_tl_facts` / `_tl_keys` / `_tl_stats`)は `engine/checkpoint.p
   は捉えられない。逆に地名が頻出する街では過剰一致しうるので、上限
   (`max_facts_per_utterance`)と鮮度(`fact_ttl_steps`)で抑えてある。
 - net 検証はインターネットを「信頼できる公開記録」としてモデル化する(誤情報の混入はフル版の担当)。
+
+WIT-1(2026-08-20。**ユーザー承認による凍結解除**)
+--------------------------------------------------
+本 module は `observer/metrics_spec.py` の `SPEC_FILES` 14 本の 1 つで、通常は 1 バイトも
+触らない。WIT-1 は「情報目撃のチャネル×注意ゲート再設計」第 1 段としてユーザーが明示承認した
+例外である(正典: docs/plans/witness-channel-attention-plan.md)。入ったのは 2 つだけ:
+
+1. **走査の作り直し(挙動は完全同値)**: `_witness_pass` の判定は現行と 1 件もずれず、
+   L1 の並びも 1 バイト変わらない。速いのは走査の仕方だけ(§`_witness_pass` の docstring)。
+2. **チャネル×注意ゲート**(`beliefs.channels`。**既定 OFF = 現行挙動とバイト一致**):
+   ON のとき fact 種ごとに目撃半径を上書きし、目撃候補へ通過確率 p_notice の
+   決定論ハッシュ判定をかける。乱数 stream は 1 本も足さない(blake2b のみ)。
+   種の表は conf 側の `beliefs.channels.kinds` = **データ駆動**(コードに固有名詞を書かない)。
+   表に載らない種(放送に相当するもの)は上書きもゲートも受けない = 現行のまま。
 """
 from __future__ import annotations
 
+import bisect
+import hashlib
 import math
+
+import numpy as np
 
 from .observer.schema import Event
 
@@ -182,6 +200,34 @@ DEFAULTS = {
     "ask_conf": 0.9,                # 当事者/目撃者に聞いて得られる確信度
 }
 
+# ---- WIT-1: チャネル×注意ゲート(既定 OFF=現行挙動とバイト一致)----
+#   enabled   … OFF なら半径の上書きもゲートも 1 度も評価しない
+#   ambient_k … 環境注意の 1 step あたり上限(**WIT-2 で使う**。本段では未使用)
+#   kinds     … fact 種 → {radius_m, p_notice | p_notice_day/p_notice_night}
+#               radius_m を書けば目撃半径を上書き、p_notice を書けば通過確率の判定が付く。
+#               **書かない種は上書きもゲートも受けない**(= 現行のまま。放送系はここ)。
+_CHANNEL_DEFAULTS = {
+    "enabled": False,
+    "ambient_k": 2,
+    "kinds": {
+        "price_change": {"radius_m": 10.0, "p_notice": 0.30},
+        "stock_out":    {"radius_m": 10.0, "p_notice": 0.30},
+        "flyer_post":   {"radius_m": 15.0, "p_notice": 0.50},
+        "venture_open": {"radius_m": 20.0, "p_notice": 0.55},
+        "event_host":   {"radius_m": 30.0, "p_notice": 0.55},
+        "group_found":  {"radius_m": 25.0, "p_notice": 0.55},
+        "crime":        {"radius_m": 40.0, "p_notice_day": 0.55,
+                         "p_notice_night": 0.35},
+    },
+}
+DEFAULTS["channels"] = _CHANNEL_DEFAULTS
+
+# 通過確率のキー(昼夜を分ける種は day/night の 2 本を持つ)
+_P_KEYS = ("p_notice", "p_notice_day", "p_notice_night")
+# 昼帯 [DAY_FROM, DAY_TO) の分 of day(街頭事象の通過率が昼夜で変わる)
+_DAY_FROM_MIN = 6 * 60
+_DAY_TO_MIN = 18 * 60
+
 _INT_KEYS = ("witness_window", "fact_ttl_steps", "max_facts_per_utterance",
              "max_beliefs_per_agent", "min_topic_len", "verify_deadline_steps")
 _FLOAT_KEYS = ("witness_radius_m", "hop_drift", "conf_decay", "min_conf",
@@ -204,11 +250,38 @@ def _to_plain(raw):
     return raw
 
 
+def _channels_cfg(raw) -> dict:
+    """`beliefs.channels` を正準化する(fact_kinds と同じデータ駆動の流儀)。
+
+    `kinds` を書いたら**丸ごと置き換え**(fact_kinds と同じ規則)。既知キー以外は捨てる
+    = conf の綴り間違いが黙って効くことがない。"""
+    raw = dict(_to_plain(raw) or {})
+    out = {"enabled": bool(raw.get("enabled", _CHANNEL_DEFAULTS["enabled"])),
+           "ambient_k": int(raw.get("ambient_k", _CHANNEL_DEFAULTS["ambient_k"]))}
+    spec = _to_plain(raw.get("kinds")) if "kinds" in raw else None
+    if spec is None:
+        out["kinds"] = {k: dict(v) for k, v in _CHANNEL_DEFAULTS["kinds"].items()}
+        return out
+    kinds: dict[str, dict] = {}
+    for k, v in (spec or {}).items():
+        src = dict(_to_plain(v) or {})
+        one: dict = {}
+        if src.get("radius_m") is not None:
+            one["radius_m"] = float(src["radius_m"])
+        for pk in _P_KEYS:
+            if src.get(pk) is not None:
+                one[pk] = float(src[pk])
+        kinds[str(k)] = one
+    out["kinds"] = kinds
+    return out
+
+
 def build_cfg(raw) -> dict:
     """conf の beliefs ブロックを正準化する(既定 OFF=現行挙動と完全同一)。"""
     raw = dict(_to_plain(raw) or {})
     cfg = dict(DEFAULTS)
     cfg["fact_kinds"] = {k: dict(v) for k, v in DEFAULTS["fact_kinds"].items()}
+    cfg["channels"] = _channels_cfg(None)
     for key, val in raw.items():
         if key in _BOOL_KEYS:
             cfg[key] = bool(val)
@@ -216,6 +289,8 @@ def build_cfg(raw) -> dict:
             spec = _to_plain(val) or {}
             cfg["fact_kinds"] = {str(k): dict(_to_plain(v) or {})
                                  for k, v in spec.items()}
+        elif key == "channels":
+            cfg["channels"] = _channels_cfg(val)
         elif key in _INT_KEYS:
             cfg[key] = int(val)
         elif key in _FLOAT_KEYS:
@@ -410,25 +485,52 @@ def _log(sim, agent, kind: str, payload: dict, step: int, sim_min: int) -> None:
                          kind=kind, x=agent.x, y=agent.y, payload=payload))
 
 
-def _set_belief(sim, cfg: dict, agent, fact: dict, *, value: float, conf: float,
-                src: str, parent: int, hop: int, cause: str,
-                verified: str | None, step: int, sim_min: int) -> dict:
-    """信念を作る/上書きする + L1 belief_update。決定論・乱数ゼロ。"""
-    bels = beliefs_of(agent)
+def _templates(fact: dict, *, value: float, conf: float, src: str, parent: int,
+               hop: int, cause: str, verified: str | None,
+               step: int) -> tuple[dict, dict]:
+    """信念 rec と belief_update payload の雛形。
+
+    同じ (fact, step, 由来) なら中身は全受信者で共通(個体差は Event の agent_id/x/y
+    だけ)なので、1 度組んで配るときに複製する = 目撃 pass の書込みが軽くなる。"""
     rec = {"value": round(float(value), 6), "conf": round(float(conf), 6),
            "src": src, "from": int(parent), "step": int(step), "hop": int(hop),
            "verified": verified, "kind": fact["kind"]}
-    bels[fact["id"]] = rec
+    payload = {"fact": fact["id"], "fact_kind": fact["kind"],
+               "value": rec["value"], "conf": rec["conf"], "src": src,
+               "from": int(parent), "hop": int(hop), "cause": cause,
+               "verified": verified}
+    return rec, payload
+
+
+def _put_belief(sim, cfg: dict, agent, fid: str, rec_t: dict, payload_t: dict,
+                step: int, sim_min: int) -> dict:
+    """雛形から 1 個体ぶんの信念を書く + L1 belief_update。決定論・乱数ゼロ。
+
+    ★rec も payload も**必ず複製**する: payload は logger.log が setdefault で
+      書き足す先なので共有すると 2 人目以降に前の個体の値が残る。"""
+    bels = beliefs_of(agent)
+    rec = rec_t.copy()
+    bels[fid] = rec
     cap = int(cfg["max_beliefs_per_agent"])
     if cap > 0 and len(bels) > cap:            # 古い順(取得 step)に捨てる=有界・決定論
         drop = sorted(bels, key=lambda k: (bels[k]["step"], k))[:len(bels) - cap]
         for k in drop:
             del bels[k]
-    _log(sim, agent, "belief_update",
-         {"fact": fact["id"], "fact_kind": fact["kind"], "value": rec["value"],
-          "conf": rec["conf"], "src": src, "from": int(parent), "hop": int(hop),
-          "cause": cause, "verified": verified}, step, sim_min)
+    sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=int(agent.id),
+                         kind="belief_update", x=agent.x, y=agent.y,
+                         payload=payload_t.copy()))
     return rec
+
+
+def _set_belief(sim, cfg: dict, agent, fact: dict, *, value: float, conf: float,
+                src: str, parent: int, hop: int, cause: str,
+                verified: str | None, step: int, sim_min: int) -> dict:
+    """信念を作る/上書きする + L1 belief_update。決定論・乱数ゼロ。"""
+    rec_t, payload_t = _templates(fact, value=value, conf=conf, src=src,
+                                  parent=parent, hop=hop, cause=cause,
+                                  verified=verified, step=step)
+    return _put_belief(sim, cfg, agent, fact["id"], rec_t, payload_t,
+                       step, sim_min)
 
 
 # --------------------------------------------------------------------------- #
@@ -439,33 +541,189 @@ def _present(agent) -> bool:
             and getattr(agent, "loc", "") != "outside")
 
 
+# --- 走査の作り直し(WIT-1)。**帰結集合も並びも現行と 1 件もずれない** ---------- #
+# 二乗距離 s = dx*dx + dy*dy と半径二乗 t の比較は、numpy と Python で同じ IEEE 演算
+# (引き算・掛け算・足し算)だけを使うのでビット一致する。hypot との判定不一致は境界の
+# 相対 1ulp 帯にしか出ないので、確定しない帯だけ**現行式そのまま**で再判定する。
+#   ★距離そのものは **math.hypot でしか計算しない**: numpy 側の同名関数は結果が違う入力が
+#     実測 17.6% ある(numba#1570)。numexpr / FMA 融合も同じ理由で禁止
+#     (docs/research/witness-vectorization-bench.md。tests が機械固定する)。
+_BAND = 2.0 ** -48
+# 均一グリッドのセル幅 [m]。**速度にしか効かない**(どの幅でも通過集合は同一)。
+# 代表半径の 2 倍あたりが平坦な最適域(60-240m で実測差なし)。
+_CELL_M = 120.0
+
+
+def _build_grid(xs, ys, idx, cell: float) -> dict:
+    """present な個体だけの均一グリッド。セル内は `idx` の並び(=走査順)を保つ。"""
+    gx = np.floor(xs[idx] / cell).astype(np.int64)
+    gy = np.floor(ys[idx] / cell).astype(np.int64)
+    gx0, gx1 = int(gx.min()), int(gx.max())
+    gy0, gy1 = int(gy.min()), int(gy.max())
+    ny = gy1 - gy0 + 1
+    # 鍵は「占有矩形の中でだけ」一意。照会側も同じ矩形へクランプするので衝突は起きない。
+    key = (gx - gx0) * ny + (gy - gy0)
+    order = np.argsort(key, kind="stable")     # stable = セル内の並びを崩さない
+    ks = key[order]
+    head = np.flatnonzero(np.concatenate(([True], ks[1:] != ks[:-1])))
+    return {"idx": idx, "order": order, "uniq": ks[head],
+            "bound": np.concatenate((head, [len(ks)])).astype(np.int64),
+            "cell": float(cell), "gx0": gx0, "gx1": gx1, "gy0": gy0, "gy1": gy1,
+            "ny": ny}
+
+
+def _grid_near(grid: dict, fx: float, fy: float, radius: float):
+    """半径円に触れるセルに居る個体の**グローバル添字**(昇順)。無ければ None。
+
+    セル範囲は上下 1 セルぶん広げてある(座標差の丸めで境界のセルを取り落とさない)。
+    余計に拾っても後段の厳密判定で落ちるだけ = 帰結は変わらない。"""
+    cell = grid["cell"]
+    c0x = max(grid["gx0"], int(math.floor((fx - radius) / cell)) - 1)
+    c1x = min(grid["gx1"], int(math.floor((fx + radius) / cell)) + 1)
+    c0y = max(grid["gy0"], int(math.floor((fy - radius) / cell)) - 1)
+    c1y = min(grid["gy1"], int(math.floor((fy + radius) / cell)) + 1)
+    if c0x > c1x or c0y > c1y:
+        return None
+    ny, gx0, gy0 = grid["ny"], grid["gx0"], grid["gy0"]
+    keys = [(cx - gx0) * ny + (cy - gy0)
+            for cx in range(c0x, c1x + 1) for cy in range(c0y, c1y + 1)]
+    uniq, bound, order = grid["uniq"], grid["bound"], grid["order"]
+    pos = np.searchsorted(uniq, np.array(keys, dtype=np.int64))
+    n_uniq = len(uniq)
+    parts = [order[bound[j]:bound[j + 1]]
+             for j, k in zip(pos.tolist(), keys)
+             if j < n_uniq and int(uniq[j]) == k]
+    if not parts:
+        return None
+    loc = np.concatenate(parts)
+    loc.sort(kind="stable")
+    return grid["idx"][loc]
+
+
+def _inside(xs, ys, cand, fx: float, fy: float, radius: float):
+    """候補のうち現行式 `math.hypot(dx, dy) <= radius` を満たすものだけ(昇順)。"""
+    dx = xs[cand] - fx
+    dy = ys[cand] - fy
+    s = dx * dx + dy * dy
+    t = radius * radius
+    ok = s <= t * (1.0 - _BAND)                       # ここは確実に内側
+    # 「確実に外側」でもない残り(= 境界帯・非有限)だけ現行式で厳密に決める
+    edge = np.flatnonzero(~ok & ~(s >= t * (1.0 + _BAND)))
+    for p in edge.tolist():
+        j = int(cand[p])
+        ok[p] = not (math.hypot(xs[j] - fx, ys[j] - fy) > radius)
+    return cand[ok]
+
+
+def _u01(salt: str, *parts) -> float:
+    """(用途 salt, 安定キー) → [0,1)。attention._u01 / economy.stable_unit と同流儀。
+
+    ★他 module から import せず**ここに同型を置く**: 本 module は凍結ハッシュ
+      (observer/metrics_spec.py)の対象なので、目撃判定に効く式が凍結の外にあると
+      「hash は無風のまま判定だけ変わる」経路ができてしまう。"""
+    key = f"{salt}\x1f" + "\x1f".join(str(p) for p in parts)
+    h = hashlib.blake2b(key.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(h, "big") / 2.0 ** 64
+
+
+_WIT_SALT = "wit"
+
+
+def _p_notice(spec: dict, sim_min: int) -> float | None:
+    """チャネル仕様から通過確率を取る(昼夜を分ける種は分 of day で選ぶ)。"""
+    if "p_notice_day" in spec or "p_notice_night" in spec:
+        tod = int(sim_min) % 1440
+        day = _DAY_FROM_MIN <= tod < _DAY_TO_MIN
+        p = spec.get("p_notice_day" if day else "p_notice_night")
+        if p is not None:
+            return float(p)
+    p = spec.get("p_notice")
+    return None if p is None else float(p)
+
+
 def _witness_pass(sim, cfg: dict, step: int, sim_min: int) -> None:
-    """目撃窓が開いている fact について、条件を満たす個体へ直接目撃の信念を与える。"""
+    """目撃窓が開いている fact について、条件を満たす個体へ直接目撃の信念を与える。
+
+    判定は現行と同じ論理積(fid 既知でない ∧ (actor ∨ (present ∧ 半径内)))で、
+    並びも現行と同じ(fact 生成順 × `sim.agents` の並び)。変わったのは走査の仕方だけ:
+      ・`_present` と座標は fact に依存しないので step 先頭で 1 回だけ読む
+        (この pass の中で sleeping/loc/x/y を書き換える経路が無いのが根拠)。
+      ・radius<=0(市域全体)は距離計算を 1 回もしない。
+      ・radius>0 は均一グリッドで近傍セルだけ見る(結果はセル幅に依存しない)。
+      ・「既知なら飛ばす」は候補にだけ効かせる(全員に対して先に見る必要がない
+        = 4 条件は互いに独立で、順番を変えても通過集合は同じ)。
+
+    `beliefs.channels.enabled` のときだけ、種ごとの半径上書きと通過確率の判定が乗る。
+    抽選のキーに step を**入れない**ので、同じ (fact, 個体) は窓の間に 1 回だけ引かれる
+    (較正値が「通過あたりの確率」だから)。当事者(actor)は判定を受けない。
+    ★上書きが効くのは**この受動的な目撃だけ**。自分で確かめに行く経路(apply_verify /
+      _pending_pass)は fact 自身の半径を使う = 「見に行った人は見える」は変えない。"""
     facts = facts_of(sim)
     if not facts:
         return
-    stats = _stats(sim)
     open_ids = [fid for fid, f in facts.items()
                 if f["step"] <= step < f["step"] + max(1, int(f["window"]))]
     if not open_ids:
         return
+    stats = _stats(sim)
+    agents = sim.agents
+    present = [i for i, a in enumerate(agents) if _present(a)]
+    # WIT-1 以前に作られた cfg(古い checkpoint の cfg キャッシュ)でも落ちないよう既定へ倒す
+    chan = cfg.get("channels") or _CHANNEL_DEFAULTS
+    chan_on = bool(chan["enabled"])
+    chan_kinds = chan["kinds"]
+    xs = ys = grid = idx_by_id = None
     for fid in open_ids:                       # 挿入順(= fact 生成順)= 決定論
         fact = facts[fid]
         radius = float(fact["radius_m"])
+        p_notice = None
+        if chan_on:
+            spec = chan_kinds.get(fact["kind"])
+            if spec is not None:
+                if "radius_m" in spec:
+                    radius = float(spec["radius_m"])
+                p_notice = _p_notice(spec, sim_min)
         fx, fy = float(fact["x"]), float(fact["y"])
-        for agent in sim.agents:               # id 昇順 = 決定論
+        if radius > 0.0 and present:
+            if grid is None:
+                n = len(agents)
+                xs = np.fromiter((float(a.x) for a in agents),
+                                 dtype=np.float64, count=n)
+                ys = np.fromiter((float(a.y) for a in agents),
+                                 dtype=np.float64, count=n)
+                grid = _build_grid(xs, ys, np.array(present, dtype=np.int64),
+                                   _CELL_M)
+            near = _grid_near(grid, fx, fy, radius)
+            cand = [] if near is None else _inside(xs, ys, near, fx, fy,
+                                                   radius).tolist()
+        elif radius > 0.0:
+            cand = []
+        else:
+            cand = list(present)               # 市域全体 = 距離計算をしない
+        actor = int(fact["actor"])
+        if actor >= 0:                         # 当事者は present も半径も通り抜ける
+            if idx_by_id is None:
+                idx_by_id = {int(a.id): i for i, a in enumerate(agents)}
+            ai = idx_by_id.get(actor)
+            if ai is not None:                 # 昇順を保ったまま差し込む
+                at = bisect.bisect_left(cand, ai)
+                if at == len(cand) or cand[at] != ai:
+                    cand.insert(at, ai)
+        if not cand:
+            continue
+        rec_t, payload_t = _templates(fact, value=fact["value"], conf=1.0,
+                                      src="direct", parent=-1, hop=0,
+                                      cause="witness", verified="witness",
+                                      step=step)
+        for i in cand:                         # 昇順 = sim.agents の並び = 決定論
+            agent = agents[i]
             # 読むだけの参照は beliefs_of() を使わない(全個体に空 dict を生やさない)
             if fid in (getattr(agent, "_fact_beliefs", None) or ()):
                 continue
-            is_actor = (fact["actor"] >= 0 and int(agent.id) == fact["actor"])
-            if not is_actor:
-                if not _present(agent):
-                    continue
-                if radius > 0.0 and math.hypot(agent.x - fx, agent.y - fy) > radius:
-                    continue
-            _set_belief(sim, cfg, agent, fact, value=fact["value"], conf=1.0,
-                        src="direct", parent=-1, hop=0, cause="witness",
-                        verified="witness", step=step, sim_min=sim_min)
+            if p_notice is not None and int(agent.id) != actor \
+                    and _u01(_WIT_SALT, fid, int(agent.id)) >= p_notice:
+                continue                       # 注意が向かなかった
+            _put_belief(sim, cfg, agent, fid, rec_t, payload_t, step, sim_min)
             stats["witness"] += 1
 
 

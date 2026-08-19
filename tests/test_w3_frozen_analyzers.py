@@ -12,8 +12,15 @@
   - `scripts/analyze_specialization.py` … Δt(時間換算)の配管だけ
 
 `scripts/diagnose_stationarity.py` と observer 側 9 本 + `truth_ledger.py` は
-引き続きゼロタッチ(`tests/test_run_dt.py::test_frozen_spec_files_touched_only_
-where_the_user_approved` が機械固定する)。
+引き続き **W3-1 の変更に関しては**ゼロタッチ(`tests/test_run_dt.py::test_frozen_spec_
+files_touched_only_where_the_user_approved` が機械固定する)。
+
+追記(2026-08-20 WIT ユーザー承認): `src/society/truth_ledger.py` は WIT-1(目撃の
+チャネル×注意ゲート再設計)として**別途ユーザーが明示承認した 2 度目の凍結解除**の対象に
+なった。承認の中身と機械証明は `tests/test_witness_channels.py` が持つ。本ファイルの
+`test_stationarity_and_observer_side_are_untouched` が固定するのは **W3-1 が持ち込んだ
+2 識別子が入っていないこと**であり、その主張は WIT-1 後も変わらない(WIT-1 は Δt 対応も
+I/O 変更も入れていない)。
 
 ここで固定するもの
 ------------------
@@ -506,11 +513,16 @@ def test_the_three_approved_files_are_still_in_the_frozen_list():
 
 
 def test_stationarity_and_observer_side_are_untouched():
-    """★承認外(diagnose_stationarity + observer 側 9 本 + truth_ledger)はゼロタッチ。
+    """★W3-1 の承認外(diagnose_stationarity + observer 側 9 本 + truth_ledger)はゼロタッチ。
 
     「触っていない」ことをテストで直接証明はできない(HEAD との比較は commit 後に
     腐る)ので、ここでは **W3-1 が持ち込んだ 2 つの識別子**が 1 つも現れないことを
     固定する(= 触っていたら必ずどちらかが出る形の変更しかしていない)。
+
+    ★2026-08-20 WIT ユーザー承認: `truth_ledger.py` は WIT-1 で**別の承認**のもとに
+      変更された。ここで見ているのは W3-1 の識別子なので、この主張は変わらない
+      (WIT-1 は Δt 対応も I/O 変更も入れていない)。WIT-1 側の証拠は
+      `tests/test_witness_channels.py`。
     """
     untouched = [f for f in MS.SPEC_FILES
                  if f not in ("scripts/analyze_beliefs.py",

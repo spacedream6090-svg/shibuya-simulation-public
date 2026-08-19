@@ -1230,6 +1230,20 @@ ontology:
 beliefs:
   enabled: true
   verify_actions: true
+  # WIT-1: 到達(半径)と注意通過(p_notice)を分ける。ON の理由は「重いから切る」ではなく
+  # 「在場者全員が認知する世界は実測と 1 桁ずれていて研究対象(知識の非対称)を壊すから」。
+  # 値の出典は docs/research/witness-empirics-ooh-retail.md(config.yaml の同ブロックに註釈)。
+  channels:
+    enabled: true
+    ambient_k: 2
+    kinds:
+      price_change: {radius_m: 10.0, p_notice: 0.30}
+      stock_out:    {radius_m: 10.0, p_notice: 0.30}
+      flyer_post:   {radius_m: 15.0, p_notice: 0.50}
+      venture_open: {radius_m: 20.0, p_notice: 0.55}
+      event_host:   {radius_m: 30.0, p_notice: 0.55}
+      group_found:  {radius_m: 25.0, p_notice: 0.55}
+      crime:        {radius_m: 40.0, p_notice_day: 0.55, p_notice_night: 0.35}
 labeling:
   mode: open               # LLM が自由に造語できる(自然な語の誕生の観察=natural coinage)
   place_binding:

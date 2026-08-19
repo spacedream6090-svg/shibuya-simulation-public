@@ -1334,6 +1334,11 @@ FEATURES: tuple[Feature, ...] = (
     _f("beliefs.verify_actions", "journal", False, "possible",
        "『確かめる』(現場go/人にask/ネットnet)を行動空間へ追加する。全発火プロンプトへ"
        "中立な 1 行(fact に依存しない固定文字列)を足すので possible"),
+    _f("beliefs.channels.enabled", "journal", False, "none",
+       "直接目撃を『到達(種別の半径)×注意通過(決定論ハッシュの通過確率)』の 2 段にする"
+       "(WIT-1)。判定は blake2b の安定ハッシュだけで乱数 stream は 1 本も引かず、"
+       "プロンプトにも 1 バイト足さない(=fingerprint_risk は none)。等級が journal なのは"
+       "台帳そのもの(beliefs.enabled)と同じ理由=これが効くのは台帳が ON のときだけ"),
 
     # ---- worldview / ontology ----
     _f("worldview.enabled", "strict", False, "possible",

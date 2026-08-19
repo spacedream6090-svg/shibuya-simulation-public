@@ -4000,6 +4000,31 @@ beliefs:
   verify_deadline_steps: 36     # 現場確認(go)の有効期限 [step](6 時間)
   net_conf: 0.7                 # ネット裏取りで得る確信度(公開記録=真値だが直接目撃より弱い)
   ask_conf: 0.9                 # 目撃者に聞いて得る確信度の上限
+  # ---- WIT-1 チャネル×注意ゲート(2026-08-20。正典 docs/plans/witness-channel-attention-plan.md)----
+  # 現行の「半径60m×1時間の在場者**全員**が認知」は、実証(POSTAR視認率・店内棚の注視 14.5-27.5%・
+  # 街頭事象の目撃 昼72%/夜35%)に対して 1 桁の過大付与になる。ここは「到達(半径)」と
+  # 「注意通過(p_notice)」を 2 段に分けるブロック。到達だけでは信念にならない。
+  #   radius_m … その種の目撃半径を上書き(情報の載る面の大きさ=チャネル)
+  #   p_notice … 到達したうち実際に気づく割合。判定は blake2b の安定ハッシュ
+  #              (salt, fact_id, agent_id)= **乱数 stream を 1 本も引かない**。
+  #              キーに step を入れない = 同じ (fact, 個体) は窓の間に 1 回だけ引く
+  #              (較正値が「通過あたりの確率」なので、窓の長さで結果が変わってはいけない)。
+  #   p_notice_day / p_notice_night … 昼(6:00-18:00)と夜で通過率が変わる種だけ 2 本持つ。
+  # ★ここに**書かない種は上書きもゲートも受けない**(= 現行のまま)。disaster を書いていないのは
+  #   放送=全域到達・認知率を保守的に 1.0 のまま置く判断(研究対象なので絞らない)。
+  # ★当事者(その fact を起こした本人)は常に通過する(気づく気づかないの話ではない)。
+  # 既定 OFF = 半径もゲートも 1 度も評価しない = 現行挙動とバイト一致。finals では ON。
+  channels:
+    enabled: false              # ★ON は finals_observe.yaml 側(観察ラン)
+    ambient_k: 2                # 環境注意の 1 step あたり上限(**WIT-2 で使用**。本段では未使用)
+    kinds:
+      price_change: {radius_m: 10.0, p_notice: 0.30}   # 店内(棚・値札)= 立寄者のみ・注視は 3 割弱
+      stock_out:    {radius_m: 10.0, p_notice: 0.30}   # 店内(欠品)
+      flyer_post:   {radius_m: 15.0, p_notice: 0.50}   # 小さな掲示物(屋内減衰は屋外の 2 倍急)
+      venture_open: {radius_m: 20.0, p_notice: 0.55}   # 店頭サイン(視角則)
+      event_host:   {radius_m: 30.0, p_notice: 0.55}   # 中型掲示(ポスター類の実測 12-35m)
+      group_found:  {radius_m: 25.0, p_notice: 0.55}   # 街頭の集まり(可視域)
+      crime:        {radius_m: 40.0, p_notice_day: 0.55, p_notice_night: 0.35}  # 街頭事象(昼夜差)
 
 # ---- 来街者 party の実体化(関係性パッケージ完結 第45バッチ S-R5。ユーザー要望 2026-07-21。既定 OFF=現行挙動と完全同一)----
 # プールの L4 来街者 record に party_size 1-5(build_persona_pool.py=同行人数)が実在するが sim 内で未使用
