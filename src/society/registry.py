@@ -485,6 +485,18 @@ FEATURES: tuple[Feature, ...] = (
        "affects_k=false / fingerprint_risk=none は far_field と同じ理由。"
        "★far_field が OFF のときは完全 no-op(置換する当の項が無い)。"
        "★既定 OFF では密度格子を 1 度も作らない = golden L1 バイト一致"),
+    _f("physics.density_far.carry_grid", "strict", False, "none",
+       "同一ゾーン・同一 step でエンジンを作り直したとき(入場・退場のたびに起きる)、"
+       "密度場 (ρ, ∇ρ) と再構築カウンタを旧エンジンから新エンジンへ引き継ぐ。"
+       "引き継いでよい根拠: 密度場は**空間の関数**であって個体の名簿ではない"
+       "(格子は位置の数え上げで、1 サブステップも進んでいない再構築では位置の集合は"
+       "ほぼ同じ。far 項がこの場から読むのは『自分の周りがどれだけ混んでいるか』だけ)。"
+       "引き継がないと入退場のたびに update_every の周期が 0 へ巻き戻り、"
+       "『粗い周期で作り直す』という第二段C の設計が churn の分だけ無効化される。"
+       "repro_tier=strict: 引き継ぐのは既存の格子そのもの(乱数も LLM も増えない)。"
+       "affects_k=false / fingerprint_risk=none は density_far.enabled と同じ理由。"
+       "★格子はエンジンと同じく step ローカル(checkpoint に載らない)= resume 無風。"
+       "★既定 false = 引き継がない = 現行挙動と 1 バイト同一"),
 
     # ---- economy ----
     _f("economy.enabled", "strict", False, "none",

@@ -124,6 +124,11 @@ DENSITY_FAR_DEFAULTS = {
     "cell_m": 1.0,        # 密度格子の一辺 [m]
     "blur": 2,            # 3×3 箱平滑の回数
     "update_every": 10,   # 格子を作り直すサブステップ周期(サンプルは毎サブステップ)
+    # 同一ゾーン・同一 step でエンジンを作り直すとき(入場・退場のたびに起きる)、
+    # 密度場と再構築カウンタを旧エンジンから引き継ぐか。**既定 false = 引き継がない
+    # = 現行挙動と 1 バイト同一**。false のままだと入退場のたびに `update_every` の
+    # 周期が 0 へ巻き戻る = 粗い周期で作り直すという設計が churn の分だけ効かなくなる。
+    "carry_grid": False,
 }
 
 ZONE_DEFAULTS = {
@@ -465,6 +470,7 @@ def _build_density_far(raw) -> dict:
     out["cell_m"] = float(out["cell_m"])
     out["blur"] = int(out["blur"])
     out["update_every"] = int(out["update_every"])
+    out["carry_grid"] = bool(out["carry_grid"])
     if out["enabled"] and not (out["cell_m"] > 0.0 and out["blur"] >= 0
                                and out["update_every"] >= 1):
         raise ValueError("physics.density_far: cell_m>0 / blur>=0 /"

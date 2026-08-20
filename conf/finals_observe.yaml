@@ -465,6 +465,9 @@ physics:
     enabled: true
   density_far:
     enabled: true
+    update_every: 30    # P1(2026-08-20ユーザー承認): 密度場再構築を0.5s→1.5s周期へ(読み出し=双線形
+                        # サンプルは毎サブステップのまま)。根拠: prof_att火炎図で再構築24.3%(うち
+                        # _box3平滑20.3%)→1/3化=全体−16%目安。base既定10は不触(golden無風)。
 
   zones_enabled: true
   # perception.channels は **false のまま**(true にすると第80 の σ 較正をやり直す必要がある)
@@ -889,6 +892,15 @@ economy:
 commerce:
   enabled: true
   stock_grievance: 0.02
+  # E1(2026-08-20ユーザー承認): 混雑プロキシ廃止=品切れ表現は実在庫(goods)へ一本化。
+  #   12hで13,003件の購入ブロック(現実の欠品遭遇8.3%帯に対し桁違い)を根絶。混雑の不満は
+  #   CRWD(commerce.crowding・行動を止めず負の感情だけ動かす=文献準拠)が後継する。
+  stock_threshold: 0
+  # PRICE-C(同承認): 在館数連動の動的価格を廃止=価格係数は恒等1.0。実店舗の定価改定は
+  #   年0.8回(日銀WP・特売分離後)=数日〜数週間のランでは固定が現実に忠実。
+  #   thr=0×sens=0 で demand_cap=0=購入時の在館数走査そのものが消える(250k の
+  #   「購入×25万比較」レーンを根絶。commerce.py demand_cap docstring 参照)。
+  price_sensitivity: 0.0
   inventory:
     enabled: true
     b2b:
@@ -898,6 +910,12 @@ commerce:
       # すべて空の卸に当たり、all-or-nothing の仕入れ(b2b.py の have<qty)で全店品切れが
       # 波及する。初期条件として正当な「開業時の手持ち在庫」を置いて立ち上がりを渡す。
       initial_stock_days: 3
+      # PRICE-A(2026-08-20ユーザー承認・細部委任): cost-plus較正。売価(economy.prices)は
+      #   渋谷実勢のまま、卸値を業態別値入率の実測(日本政策金融公庫 小企業の経営指標:
+      #   一般飲食0.65/喫茶0.72/衣料物販0.45/酒場・バー0.72)から逆算して整合させる。
+      #   従来の全cat一律300円では暗黙原価率が food33%/shop12%/cafe60% とばらばらだった。
+      #   docs/research/retail-margins-empirics.md 参照。
+      wholesale_price: {food: 315, cafe: 140, shop: 1375, nightlife: 504}
       # 第114 レーン乙: 初期在庫 3 日ぶんは**立ち上がり**しか渡さない。恒常的な需給ギャップ
       # (第113 実測: 生産 42,408 / 需要 44,604 = わずか 5%)に対して all-or-nothing の
       # 仕入れは「あと 1 個足りない」だけで補充を丸ごと失敗させ、翌日も同じ量を要求して

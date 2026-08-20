@@ -682,3 +682,228 @@ def test_zone_run_on_keeps_the_boundary_invariants(tmp_path):
         assert cont["jump_max_m"] < 1.0, f"{name}: 1 サブステップの跳びが大きすぎる"
         assert cont["min_gap_m"] is None or cont["min_gap_m"] > -0.5, \
             f"{name}: 深い重なりが出た {cont['min_gap_m']}"
+
+
+# =========================================================================== #
+# (7) P3 密度場の再構築コスト削減(2026-08-20)
+#     ── `_box3` の同値高速化 と `density_far.carry_grid`(既定 OFF)
+# =========================================================================== #
+def _box3_reference(a):
+    """P3 以前の `_box3` の**逐語コピー**。比較の相手はいつも「修正前の実装そのもの」。"""
+    p = np.zeros((a.shape[0] + 2, a.shape[1] + 2), dtype=np.float64)
+    p[1:-1, 1:-1] = a
+    return (p[:-2, :-2] + p[:-2, 1:-1] + p[:-2, 2:]
+            + p[1:-1, :-2] + p[1:-1, 1:-1] + p[1:-1, 2:]
+            + p[2:, :-2] + p[2:, 1:-1] + p[2:, 2:]) / 9.0
+
+
+def _density_grid_reference(crowd):
+    """P3 以前の `_density_grid` の逐語コピー(作業領域を持ち回らない版)。"""
+    cell = crowd.field_cell_m
+    pad = crowd.field_blur + 2
+    pos = crowd.pos
+    ox = float(pos[:, 0].min()) - pad * cell
+    oy = float(pos[:, 1].min()) - pad * cell
+    nx = int(math.floor((float(pos[:, 0].max()) - ox) / cell)) + pad + 1
+    ny = int(math.floor((float(pos[:, 1].max()) - oy) / cell)) + pad + 1
+    nx, ny = max(nx, 3), max(ny, 3)
+    ci = np.clip(np.floor((pos[:, 0] - ox) / cell), 0, nx - 1).astype(np.int64)
+    cj = np.clip(np.floor((pos[:, 1] - oy) / cell), 0, ny - 1).astype(np.int64)
+    sel = crowd.active
+    cnt = np.bincount((ci * ny + cj)[sel], minlength=nx * ny)
+    rho = cnt.reshape(nx, ny).astype(np.float64) / (cell * cell)
+    for _ in range(crowd.field_blur):
+        rho = _box3_reference(rho)
+    gx = np.zeros_like(rho)
+    gy = np.zeros_like(rho)
+    gx[1:-1, :] = (rho[2:, :] - rho[:-2, :]) / (2.0 * cell)
+    gy[:, 1:-1] = (rho[:, 2:] - rho[:, :-2]) / (2.0 * cell)
+    return rho, gx, gy, ox, oy
+
+
+@pytest.mark.parametrize("seed", (1, 2, 3))
+def test_box3_is_bit_identical_to_the_reference(seed):
+    """★加算順序を 1 つも変えていないことの機械証明(プロパティテスト)。
+
+    `x + y + z` は左結合なので、中間結果を毎回新しい配列に置くか同じ配列へ上書きするかで
+    値は 1 ビットも変わらない ── その前提を実際の値で踏み固める。値は本番と同じ素性:
+    密度格子は `np.bincount` の整数をセル面積で割ったもので、平滑を通ると整数/9.0 になる。
+    形は 3〜300 の**非正方形**も含め、平滑は本番と同じ 2 回反復まで見る。
+    """
+    rng = np.random.default_rng(seed)
+    for _ in range(24):
+        nx = int(rng.integers(3, 301))
+        ny = int(rng.integers(3, 301))
+        kind = int(rng.integers(0, 3))
+        if kind == 0:                     # bincount 由来(整数カウント / セル面積 1.0)
+            a = rng.integers(0, 9, size=(nx, ny)).astype(np.float64)
+        elif kind == 1:                   # それを 1 度平滑した素性(整数 / 9.0)
+            a = rng.integers(0, 40, size=(nx, ny)).astype(np.float64) / 9.0
+        else:                             # 一般の float(丸めの縁を踏ませる)
+            a = rng.normal(0.0, 1e3, size=(nx, ny))
+        pad = np.zeros((nx + 2, ny + 2), dtype=np.float64)
+        acc = np.empty((nx, ny), dtype=np.float64)
+        ref, got = a, a
+        for i in range(2):
+            ref = _box3_reference(ref)
+            got = P._box3(got, pad, acc if i == 0 else None)
+            assert got.shape == ref.shape and got.dtype == ref.dtype
+            assert np.array_equal(got, ref), f"{nx}x{ny} kind={kind} blur={i + 1}"
+        # バッファを渡さない(従来どおりの)呼び方も同じ
+        assert np.array_equal(P._box3(P._box3(a)), ref)
+
+
+@pytest.mark.parametrize("blur", (0, 1, 2, 3))
+def test_density_grid_survives_scratch_reuse(blur):
+    """作業領域を持ち回っても (a) 値がビット一致 (b) **前に返した場が壊れない**。
+
+    (b) は carry_grid が場を次のエンジンへ渡すために要る性質(返す ρ は毎回新品)。
+    格子の形は在場者の外接矩形で決まるので、途中で形が変わる配置を通す。
+    """
+    rng = np.random.default_rng(5)
+    n = 300
+    c = _calib(n, 2.0, "square", 5, far_mode="field", field_blur=blur)
+    base = c.pos.copy()
+    kept = []
+    for k in range(5):
+        c.pos = base + rng.uniform(-1.0, 1.0, size=(n, 2)) * (k + 1)
+        ref = _density_grid_reference(c)
+        got = c._density_grid()
+        for g, r in zip(got[:3], ref[:3]):
+            assert g.shape == r.shape and g.dtype == r.dtype
+            assert np.array_equal(g, r), f"blur={blur} k={k}"
+        assert got[3] == ref[3] and got[4] == ref[4]
+        kept.append((got, ref))
+    for j, (got, ref) in enumerate(kept):
+        for g, r in zip(got[:3], ref[:3]):
+            assert np.array_equal(g, r), \
+                f"blur={blur}: {j} 回目に返した場が後の再構築で書き潰された"
+
+
+def test_field_trajectory_is_bit_identical_after_the_speedup():
+    """場モードの**軌跡**が旧 `_density_grid` 経路とビット一致(積分を通した端点検査)。"""
+    a = _calib(400, 2.0, "clump", 9, far_mode="field", field_update_every=3)
+    b = _calib(400, 2.0, "clump", 9, far_mode="field", field_update_every=3)
+    b._density_grid = lambda: _density_grid_reference(b)
+    for _ in range(30):
+        a.step(0.05)
+        b.step(0.05)
+    assert a.pos.tobytes() == b.pos.tobytes()
+    assert a.vel.tobytes() == b.vel.tobytes()
+
+
+def test_carry_grid_defaults_to_off_everywhere():
+    """★R1: 新キーは既定 false(conf・正準化・読み取りのどこにも ON が漏れない)。"""
+    raw = yaml.safe_load((REPO / "conf" / "config.yaml").read_text(encoding="utf-8"))
+    assert raw["physics"]["density_far"]["carry_grid"] is False
+    assert zones.DENSITY_FAR_DEFAULTS["carry_grid"] is False
+    cfg = zones.build_cfg({}, REPO)
+    assert cfg["density_far"]["carry_grid"] is False
+
+    class _Sim:
+        physcfg = cfg
+
+    assert P._carry_grid_on(_Sim()) is False
+    # キーを丸ごと書かない conf でも既定 false(欠測を ON と読まない)
+    assert P._carry_grid_on(type("S", (), {"physcfg": {}})()) is False
+    assert P._carry_grid_on(type("S", (), {})()) is False
+
+
+def test_carry_grid_is_declared_in_the_registry():
+    f = {x.id: x for x in R.FEATURES}["physics.density_far.carry_grid"]
+    assert f.repro_tier == "strict" and f.affects_k is False
+    assert f.fingerprint_risk == "none" and f.off_value is False
+
+
+def test_carry_grid_moves_the_field_to_the_new_engine():
+    """ON: 場と再構築カウンタが新エンジンへ渡る / OFF: 渡らない(= 巻き戻る)。"""
+    old = _calib(200, 2.0, "square", 3, far_mode="field", field_update_every=10)
+    for _ in range(4):
+        old.step(0.05)
+    assert old._field_grid is not None and old._field_tick == 4
+    new = _calib(200, 2.0, "square", 3, far_mode="field", field_update_every=10)
+    assert new._field_grid is None and new._field_tick == 0
+    P._carry_field(old, new)
+    assert new._field_grid is old._field_grid and new._field_tick == 4
+    # 作業領域は**渡さない**(渡すと次の再構築が持ち回り中の場を書き潰す)
+    assert new._field_scratch is not old._field_scratch
+    # 場を持たないエンジン(ORCA)や None が混ざっても落ちない = no-op
+    P._carry_field(None, new)
+    P._carry_field(old, None)
+
+
+DF_CARRY = dict(DF_ON, carry_grid=True)
+
+
+def _grid_rebuilds(tmp_path, name, **kw):
+    """mock 短ランで `_density_grid` の呼び出し回数を数える。"""
+    cnt = [0]
+    orig = P._CalibratedCrowd._density_grid
+
+    def spy(self):
+        cnt[0] += 1
+        return orig(self)
+
+    P._CalibratedCrowd._density_grid = spy
+    try:
+        sim = _run(tmp_path, name, engine="sfm", far=True, **kw)
+    finally:
+        P._CalibratedCrowd._density_grid = orig
+    return cnt[0], sim
+
+
+def test_carry_grid_off_is_byte_identical(tmp_path):
+    """★R1: carry_grid を明示 false にしても、書かないランと L1 がバイト一致。"""
+    a = _run(tmp_path, "carry_off_a", engine="sfm", far=True, density_far=DF_ON)
+    b = _run(tmp_path, "carry_off_b", engine="sfm", far=True,
+             density_far=dict(DF_ON, carry_grid=False))
+    assert [e.kind for e in a.logger.events].count("zone_gate") > 0, \
+        "ゾーンを 1 度も通っていない(テストが空回りしている)"
+    assert _l1(a) == _l1(b)
+    assert P.continuity(a) == P.continuity(b)
+
+
+def test_carry_grid_on_never_rebuilds_more_often(tmp_path):
+    """ON は再構築回数を増やさない(= 周期の巻き戻しを取り除くだけ)。"""
+    off_n, off = _grid_rebuilds(tmp_path, "carry_cnt_off", density_far=DF_ON)
+    on_n, on = _grid_rebuilds(tmp_path, "carry_cnt_on", density_far=DF_CARRY)
+    assert off_n > 0, "密度格子が 1 度も作られていない(テストが空回りしている)"
+    assert on_n <= off_n, f"carry_grid ON で再構築が増えた off={off_n} on={on_n}"
+    assert on.physcfg["density_far"]["carry_grid"] is True
+    assert off.physcfg["density_far"]["carry_grid"] is False
+    assert P.calib_describe(on)["density_far"]["carry_grid"] is True
+
+
+def test_carry_grid_on_is_reproducible(tmp_path):
+    """ON でも同 seed 2 ランがビット一致(場の持ち回りは決定論)。"""
+    a = _run(tmp_path, "carry_rep_a", engine="sfm", far=True, density_far=DF_CARRY)
+    b = _run(tmp_path, "carry_rep_b", engine="sfm", far=True, density_far=DF_CARRY)
+    assert [e.kind for e in a.logger.events].count("zone_gate") > 0, \
+        "ゾーンを 1 度も通っていない(テストが空回りしている)"
+    assert _l1(a) == _l1(b)
+    cont = P.continuity(a)
+    assert cont["jump_max_m"] < 1.0
+    assert cont["min_gap_m"] is None or cont["min_gap_m"] > -0.5
+
+
+def test_the_density_field_never_reaches_the_checkpoint(tmp_path):
+    """★場と作業領域は step ローカル(エンジンと同じ寿命)= checkpoint に載らない。
+
+    載ってしまうと (a) 100 万セル級の格子が毎 checkpoint に乗り (b) resume==straight が
+    「場を持ったまま再開したか」で割れる。中央管理される物理の状態は `_phys_state`
+    (カウンタとヒストグラム)だけで、個体側は `_FIELDS` の値型だけである。
+    carry_grid が場を渡すのは**同一 step の中のエンジン間**だけなので、ON でも同じ。
+    """
+    import pickle
+
+    sim = _run(tmp_path, "carry_ckpt", engine="sfm", far=True, density_far=DF_CARRY)
+    blob = P.state_of(sim)
+    assert blob is not None and set(blob) >= {"by_zone", "cont"}
+    dump = pickle.dumps(blob)
+    for marker in (b"_CalibratedCrowd", b"_field_grid", b"_field_tick",
+                   b"_field_scratch", b"ndarray"):
+        assert marker not in dump, f"checkpoint 側に {marker!r} が載っている"
+    assert not [f for f in P._FIELDS if "field" in f]
+    for a in sim.agents:
+        for f in ("_field_grid", "_field_tick", "_field_scratch"):
+            assert not hasattr(a, f), f"個体に {f} が生えている(pickle に載る)"

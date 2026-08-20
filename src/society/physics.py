@@ -134,6 +134,9 @@ P4-3 = `calib_p43_results.json`)。本体の `_CalibratedCrowd` はベンチの
       「現行 far 項の役割(混雑回避のバイアス)を保存する最小構成」の中身である。
     格子は物理 step より粗い周期(`update_every` サブステップ)で作り直し、
     各サブステップでは**現在位置で双線形サンプル**する(場は粗く、読み出しは細かく)。
+    ただしエンジンは入場・退場のたびに作り直される(`_run_zone`)ので、素のままでは
+    その周期が churn のたびに 0 へ巻き戻る。`density_far.carry_grid`(既定 false)は
+    同一ゾーン・同一 step の作り直しで場を引き継いでそれを止める(`_carry_field`)。
 
 R1: どちらのトグルも既定 OFF で、OFF のときは新しい関数が 1 度も呼ばれない
     = `_build_engine` は第一段A までと 1 バイト同じ呼び出しをする(golden 無風)。
@@ -430,6 +433,7 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict, ordered=None) -> Non
     #   SFM ゾーンにだけ効く(ORCA ゾーンでは _build_engine が無視する)。
     calib = _calib_kwargs(sim)
     cog = _cog_kwargs(sim)
+    carry = _carry_grid_on(sim)
     engine = _build_engine(zone, members, rng, calib, cog) if members else None
     cont = st["cont"]
     cont["dt_sub"] = dt
@@ -445,7 +449,10 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict, ordered=None) -> Non
                 _writeback(members, engine)   # 入場の占有判定は**最新の位置**で行う
             if _admit(sim, zone, waiting, members, signal, base_sec + t, t,
                       step, sim_min, st):
+                prev_engine = engine
                 engine = _build_engine(zone, members, rng, calib, cog)
+                if carry:
+                    _carry_field(prev_engine, engine)
         if not members:
             if not waiting:
                 break                                 # ゾーンが空 = その場で打ち切り
@@ -472,7 +479,10 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict, ordered=None) -> Non
                 _release(sim, zone, rec["agent"], step, sim_min, st,
                          reason="gate", elapsed_s=rec["elapsed_s"], rec=rec,
                          used_s=used)
+            prev_engine = engine
             engine = _build_engine(zone, members, rng, calib, cog) if members else None
+            if carry:
+                _carry_field(prev_engine, engine)
         if engine is None and not waiting:
             break
 
@@ -700,18 +710,38 @@ FIELD_UPDATE_EVERY_DEFAULT = 10   # 格子を作り直すサブステップ周�
 _FIELD_QUAD_N = 4096              # 接続係数 I₁/I₂ の数値積分の分点数(決定論・構築時 1 回)
 
 
-def _box3(a):
+def _box3(a, pad=None, out=None):
     """3×3 箱平滑(ゼロ詰め境界)。加算順序を式で固定 = 決定論。
 
     ゼロ詰めにするのは物理的に正しいから: 群衆の外側には誰も居ない。境界で密度が
     落ちるので群衆の縁には外向きの勾配が立つ = ペア版で「内側にしか相手が居ない」ときに
     外へ押される挙動と同じ向き。
+
+    `pad` / `out` は呼び出し側が持ち回る作業領域(省略すればその場で確保 = 従来と同じ)。
+    足す順序・丸め・除数は下の式のまま **一字も動かしていない**: `x + y + z` は左結合なので、
+    中間結果を毎回新しい配列に置くか同じ配列へ上書きするかは 1 ビットも結果を変えない。
+    置き場所だけを使い回す理由(実測): 25k finals conf の格子は平均 117 万セル =
+    float64 1 枚 9.4 MB あり、1 回の平滑ごとにパッド 1 枚 + 中間 8 枚を新規確保していた。
+    支配的なのは演算ではなく確保(初回書き込みのページフォルト)なので、ここを畳むだけで
+    実測 3〜4 倍になる。`pad` は内側 [1:-1,1:-1] しか書かないので縁の 0 が保たれる
+    = 何度でも使い回せる。
+
+        (p[:-2,:-2] + p[:-2,1:-1] + p[:-2,2:]
+         + p[1:-1,:-2] + p[1:-1,1:-1] + p[1:-1,2:]
+         + p[2:,:-2] + p[2:,1:-1] + p[2:,2:]) / 9.0
     """
-    p = np.zeros((a.shape[0] + 2, a.shape[1] + 2), dtype=np.float64)
-    p[1:-1, 1:-1] = a
-    return (p[:-2, :-2] + p[:-2, 1:-1] + p[:-2, 2:]
-            + p[1:-1, :-2] + p[1:-1, 1:-1] + p[1:-1, 2:]
-            + p[2:, :-2] + p[2:, 1:-1] + p[2:, 2:]) / 9.0
+    if pad is None:
+        pad = np.zeros((a.shape[0] + 2, a.shape[1] + 2), dtype=np.float64)
+    pad[1:-1, 1:-1] = a
+    s = np.add(pad[:-2, :-2], pad[:-2, 1:-1], out=out)
+    np.add(s, pad[:-2, 2:], out=s)
+    np.add(s, pad[1:-1, :-2], out=s)
+    np.add(s, pad[1:-1, 1:-1], out=s)
+    np.add(s, pad[1:-1, 2:], out=s)
+    np.add(s, pad[2:, :-2], out=s)
+    np.add(s, pad[2:, 1:-1], out=s)
+    np.add(s, pad[2:, 2:], out=s)
+    return np.divide(s, 9.0, out=s)
 
 
 class _CalibratedCrowd(_sfm.Crowd):
@@ -758,6 +788,7 @@ class _CalibratedCrowd(_sfm.Crowd):
             raise ValueError("density_far.cell_m は > 0 が必要")
         self._field_tick = 0
         self._field_grid = None           # (rho, gx, gy, ox, oy) 粗い周期で作り直す
+        self._field_scratch = None        # 箱平滑の作業領域 (pad, acc)。格子の形が同じ間だけ持つ
         # 接続係数(class docstring の I₁ / I₂)。半径は不変なので **構築時に 1 度だけ**。
         self._c_drag, self._c_grad = (self._far_field_coeffs()
                                       if (self.far_mode == "field"
@@ -867,6 +898,11 @@ class _CalibratedCrowd(_sfm.Crowd):
 
         構築は O(N + G)(G = 格子セル数): セル index の `np.bincount`(整数カウント =
         加算順序に依らず厳密)→ 3×3 箱平滑 `field_blur` 回 → 中心差分。
+
+        平滑の作業領域は格子の形が変わらない限り使い回す(`_box3` の docstring の実測)。
+        ★**返す ρ は毎回新品の配列**である(最後の 1 回だけ `out=None` で確保する)。
+          場は `_field_grid` として次の再構築まで — carry_grid ON なら次のエンジンへも —
+          持ち回られるので、作業領域そのものを返すと後の再構築が過去の場を書き潰す。
         """
         cell = self.field_cell_m
         pad = self.field_blur + 2                   # 平滑がゼロ詰め境界を跨がない余白
@@ -881,13 +917,30 @@ class _CalibratedCrowd(_sfm.Crowd):
         sel = self.active
         cnt = np.bincount((ci * ny + cj)[sel], minlength=nx * ny)
         rho = cnt.reshape(nx, ny).astype(np.float64) / (cell * cell)
-        for _ in range(self.field_blur):
-            rho = _box3(rho)
+        if self.field_blur:
+            bpad, bacc = self._blur_scratch(nx, ny)     # 上の `pad`(余白セル数)とは別物
+            last = self.field_blur - 1
+            for i in range(self.field_blur):
+                rho = _box3(rho, bpad, bacc if i < last else None)
         gx = np.zeros_like(rho)
         gy = np.zeros_like(rho)
         gx[1:-1, :] = (rho[2:, :] - rho[:-2, :]) / (2.0 * cell)
         gy[:, 1:-1] = (rho[:, 2:] - rho[:, :-2]) / (2.0 * cell)
         return rho, gx, gy, ox, oy
+
+    def _blur_scratch(self, nx, ny):
+        """箱平滑の作業領域 (pad, acc)。格子の形が変わったときだけ取り直す。
+
+        格子の外周は原点 (ox, oy) を「在場者の最小座標 − pad セル」で採るので、
+        在場者が動けば形も変わりうる。形が同じ間は使い回し、変わったら取り直す
+        (取り直しても値は変わらない = `_box3` は縁の 0 と内側の代入だけに依存する)。
+        """
+        buf = self._field_scratch
+        if buf is None or buf[1].shape != (nx, ny):
+            buf = (np.zeros((nx + 2, ny + 2), dtype=np.float64),
+                   np.empty((nx, ny), dtype=np.float64))
+            self._field_scratch = buf
+        return buf
 
     def _sample_field(self, grid):
         """格子 → 個体位置での (ρ_i, ∇ρ_i)。セル中心格子の双線形補間。"""
@@ -1005,6 +1058,35 @@ def _calib_kwargs(sim) -> dict:
     if (wl["a"] != _sfm.WALL_A_DEFAULT) or (wl["b"] != _sfm.WALL_B_DEFAULT):
         kw.update(wall_a=wl["a"], wall_b=wl["b"])
     return kw
+
+
+def _carry_grid_on(sim) -> bool:
+    """`physics.density_far.carry_grid`(既定 false)。エンジン再構築で場を引き継ぐか。"""
+    df = (getattr(sim, "physcfg", None) or {}).get("density_far") or {}
+    return bool(df.get("carry_grid"))
+
+
+def _carry_field(old, new) -> None:
+    """密度場 (ρ, ∇ρ) と再構築カウンタを旧エンジンから新エンジンへ引き継ぐ。
+
+    なぜ引き継いでよいのか: **密度場は空間の関数であって在場者の名簿ではない**。
+    格子は「その時点でゾーンに居た全員の位置」を数え上げた ρ(x) で、far 項がそこから
+    読むのは「自分の周りがどれだけ混んでいるか」だけである。エンジンの作り直しは
+    入場・退場の瞬間に起きるが、そこでは 1 サブステップも積分していない(位置の集合は
+    出入りした数体を除いて同一)ので、場の意味は保存される。そもそも場は
+    `update_every` サブステップ分だけ古いまま読まれる設計なので、
+    「メンバーが変わった瞬間に必ず作り直す」ことに物理的な根拠は無い。
+    引き継がないと、入退場のたびに `_field_tick` が 0 へ巻き戻り
+    (新インスタンスは `_field_grid=None` から始まる)、**混んでいる時間帯ほど
+    `update_every` の周期が効かなくなる**という逆立ちした特性になる。
+
+    ★作業領域(`_field_scratch`)は引き継がない: 場は新エンジンが持ち回るので、
+      その置き場所まで共有すると次の再構築が持ち回り中の場を書き潰す。
+    ★既定 OFF(carry_grid=false)ではこの関数が 1 度も呼ばれない = 現行挙動と 1 バイト同一。
+    """
+    if isinstance(old, _CalibratedCrowd) and isinstance(new, _CalibratedCrowd):
+        new._field_grid = old._field_grid
+        new._field_tick = old._field_tick
 
 
 def _cog_kwargs(sim) -> dict:
