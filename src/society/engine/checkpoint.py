@@ -639,6 +639,9 @@ def save(sim, step: int, path: str | Path, *, complete: bool = True) -> Path:
             "goods_back": getattr(sim, "_goods_back", None),
             "goods_low": getattr(sim, "_goods_low", None),
             "goods_order_win": getattr(sim, "_goods_order_win", None),
+            # ★order_on_low ON のときだけ育つ「その窓で発注できた」台帳。運ばないと
+            #   resume 直後に窓の発注枠が復活し、同じ窓で二度発注する(在庫が湧く向きの分岐)。
+            "goods_order_done": getattr(sim, "_goods_order_done", None),
             "goods_ops": getattr(sim, "_goods_ops", None),
             # ★日次で組み直す**派生索引**も運ぶ。派生だから捨ててよい、とはならない:
             #   組み直す時刻が resume では step 途中になり、その日の city_ops 再バインドや
@@ -956,6 +959,7 @@ def load(sim, path: str | Path) -> int:
     # 旧 checkpoint / 2層 OFF では素通り = 従来どおり(BY 空・フラグ無し)。
     for _attr, _key in (("_goods_back", "goods_back"), ("_goods_low", "goods_low"),
                         ("_goods_order_win", "goods_order_win"),
+                        ("_goods_order_done", "goods_order_done"),
                         ("_goods_ops", "goods_ops"),
                         # PRICE-B2: 当日の入荷バッチの標 + 見切りの段階(同じ流儀)
                         ("_goods_delivered", "goods_delivered"),

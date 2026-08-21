@@ -118,6 +118,8 @@ def build_cfg(raw_commerce) -> dict:
         "restock_batch": max(0, int(tt.get("restock_batch", 0))),   # 0=棚を満たすまで運ぶ
         "staff_restock": bool(tt.get("staff_restock", True)),       # 補充を店員の行動にする
         "staff_order": bool(tt.get("staff_order", True)),           # 発注を店主の行動にする
+        # 棚薄フラグでも発注を発火させる(窓=**発注回数**の上限へ意味を変える)。既定 OFF
+        "order_on_low": bool(tt.get("order_on_low", False)),
         "unstaffed_fallback": bool(tt.get("unstaffed_fallback", True)),
         "percept": bool(tt.get("percept", True)),                   # 来店時の棚知覚 1 行
     }
@@ -709,13 +711,61 @@ def _order_store(sim, node: str, agent, step: int, sim_min: int) -> int:
     return n
 
 
+def _order_store_unstaffed(sim, node: str, step: int, sim_min: int) -> int:
+    """担い手ゼロ POI の発注をエンジンが代替再現する(``review_and_order`` と同一の作法)。
+
+    stock_order は出さない(**当人が居ないのだから当人の行為は無い**)。出るのは発注の
+    帰結である stock_low / delivery_trip だけで、そこは既存経路と 1 バイトも変わらない。
+    タリーは order_unstaffed へ積む(誇張しない=カバー率が provenance に正直に出る)。"""
+    n = 0
+    for cat in store_cats(sim, node):
+        if _order_one(sim, node, cat, step, sim_min):
+            n += 1
+    if n > 0:
+        sim._goods_ops["order_unstaffed"] += n
+    return n
+
+
+def _order_low_stores(sim, on_duty: dict, win: int, step: int, sim_min: int) -> None:
+    """★棚薄トリガの発注(``order_on_low`` ON のときだけ通る。OFF は 1 度も呼ばれない)。
+
+    **意味論の変更(ON のときだけ)**: レビュー窓 ``_order_window`` は「その窓で 1 回だけ
+    *見る*」上限から「その窓で 1 回だけ *発注する*」上限へ変わる。理由は実測(第147 リハ):
+    窓が開いた直後の step は **店主が出勤した朝**か**窓の境界**であり、そこは棚がまだ厚い。
+    見るだけで窓を消費する現行規則だと「棚が満杯のときに 1 度見て、あとは棚が空になっても
+    その窓のあいだ二度と発注しない」という行動になり、供給が止まる(実測: 1日ラン 144 step で
+    staffed 発注 0 件・欠品棚率 0.755)。店主は「棚が薄くなったから発注する」のであって
+    「窓が開いたから発注する」のではない = 窓は**頻度の上限**としてだけ働かせる。
+
+    ここが見るのは **棚薄フラグの立った店だけ**(購入時に O(1) で立つ既存の索引)なので、
+    新しい全走査は 1 本も足さない(② 補充と同じイベント駆動・同じ有界性)。同じ窓で既に
+    発注できている店は `_goods_order_done` で弾く(多重発注は `_goods_pending` と二重に防ぐ)。
+    担い手ゼロ POI の代替再現は ② 補充と完全に同じ規約(`unstaffed_fallback` 宣言時のみ)。"""
+    tt = sim.goodscfg["two_tier"]
+    done = sim._goods_order_done
+    assigned = staffed_nodes(sim, sim_min) if tt["unstaffed_fallback"] else None
+    for node in sorted(sim._goods_low):                  # 棚薄の店だけ=イベント駆動
+        if done.get(node) == win:                        # この窓では発注済み(頻度上限)
+            continue
+        crew = on_duty.get(node)
+        if crew:
+            if _order_store(sim, node, crew[0], step, sim_min) > 0:
+                done[node] = win
+        elif assigned is not None and node not in assigned:
+            if _order_store_unstaffed(sim, node, step, sim_min) > 0:
+                done[node] = win
+
+
 def staff_phase(sim, step: int, sim_min: int) -> None:
     """INV-B の単一作用点(既定 OFF=即 return=バイト一致)。位置確定後に呼ぶ。
 
     ①在勤索引: 「自分の職場ノードに**居て**、勤務時間帯にある」個体を work_node で索引する
       (scheduler._phase_work_service / city_ops._on_duty_crew と**同じ述語**=新しい在勤概念を
       発明しない)。②補充: 棚薄フラグの立った店に在勤者が居れば、**id 最小の当人の行動**として
-      棚を埋める。③発注: 在勤者の居る店で、その窓でまだ発注していなければ当人が発注する。
+      棚を埋める。③発注: 在勤者の居る店で、その窓でまだ**見て**いなければ当人が発注する
+      (``order_on_low`` ON では、加えて **棚薄フラグが立っていてその窓でまだ発注できていない**
+       店でも発火する = 窓は「見る回数」ではなく「**発注回数**」の上限になる。既定 OFF は
+       この分岐を 1 度も通らない = 現行と 1 バイト同一。詳細は `_order_low_stores`)。
       ④担い手が 1 人も割り当てられていない POI に限り、宣言つきでエンジンが代替再現する。
       ⑤閉店前見切り(PRICE-B2。既定 OFF): 同じ在勤索引に**相乗り**して、在店店員が値札を
         替える(markdown)。見切り専用の勤務概念を発明しないための相乗りで、判定式と
@@ -760,13 +810,20 @@ def staff_phase(sim, step: int, sim_min: int) -> None:
     if staff_on and tt["staff_order"]:
         win = _order_window(sim.goodscfg, step, sim_min)
         seen = sim._goods_order_win
+        low_on = tt["order_on_low"]
         for node in sorted(on_duty):
             if seen.get(node) == win:                    # この窓ではもう見た(1 店 1 レビュー)
                 continue
             if not store_cats(sim, node):                # 店でない職場(事務所等)は素通り
                 continue
             seen[node] = win
-            _order_store(sim, node, on_duty[node][0], step, sim_min)
+            n = _order_store(sim, node, on_duty[node][0], step, sim_min)
+            if low_on and n > 0:                         # 窓の発注枠を使った(下の再発火を止める)
+                sim._goods_order_done[node] = win
+        if low_on and sim._goods_low:
+            # ★棚が薄くなった店は、窓の頭で空振りしていても**その窓の発注枠が残っていれば**
+            #   もう一度発注できる(店主の行動として正しい向き)。既定 OFF=この 1 行を通らない。
+            _order_low_stores(sim, on_duty, win, step, sim_min)
     # ---- ⑤ 閉店前見切り(PRICE-B2。既定 OFF=即 return=バイト一致)----
     if md_on:
         from . import commerce as _commerce

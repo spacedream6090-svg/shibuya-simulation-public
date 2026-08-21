@@ -678,6 +678,10 @@ class Simulation:
         self._goods_back: dict = {}                # (node, cat) -> バックヤード在庫(2層 ON のみ)
         self._goods_low: dict = {}                 # node -> {cat} 棚が補充点を割った店(O(1) 索引)
         self._goods_order_win: dict = {}           # node -> 直近に店主がレビューした窓 id
+        # node -> 直近に**実際に発注できた**窓 id(two_tier.order_on_low ON のときだけ育つ)。
+        # 「見た窓」(_goods_order_win)と分けるのは、棚薄トリガの再発火で窓が発注回数の
+        # 上限として働くようにするため(空振りのレビューが窓を潰さない)。OFF は空のまま。
+        self._goods_order_done: dict = {}
         self._goods_ops: dict = {"restock_staffed": 0, "restock_unstaffed": 0,
                                  "restock_units": 0, "order_staffed": 0,
                                  "order_unstaffed": 0}   # 観測タリー(summary.json の goods)

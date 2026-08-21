@@ -612,10 +612,11 @@ _TT_THIN = {
 _SPLIT, _TOTAL = 127, 144
 
 
-def _cfg_of(name, n_steps, every=0):
+def _cfg_of(name, n_steps, every=0, extra=None):
     ov = dict(_TT_THIN)
     if every:
         ov["observer.checkpoint_every"] = str(every)
+    ov.update(extra or {})
     dot = ["run.seed=42", "run.n_agents=30", f"run.n_steps={n_steps}",
            f"run.name={name}", "model.backend=mock"]
     dot += [f"{k}={v}" for k, v in ov.items()]
@@ -802,6 +803,229 @@ def test_frozen_streaming_spec_is_untouched_by_this_lane(tmp_path):
                              "stock_low": 0, "stock_out": 0}
     assert out["items_sold_total"] == 1, "既存の集計だけが動く(新 kind は素通り)"
     assert "shelf_restock" not in out and "stock_order" not in out
+
+
+# ====================================================== #
+# INV-B2 order_on_low: 棚薄トリガの発注(第147 1日リハで見つかった供給死の根治)
+# ------------------------------------------------------ #
+# 実測した壊れ方(finals conf・25k×144step・mock): staffed 発注 0 件 / staffed 補充 0 件 /
+#   BY 0 個 / 欠品棚率 0.755 / 品切れ 58,596 件。一方 serve は 26,834 件 = 店員は職場に居た。
+# 根本原因: レビュー窓は「その窓で 1 回だけ **見る**」上限で、`seen[node] = win` を
+#   **空振りのレビューでも**刻む。窓が開いた直後の step は「店主が出勤した朝」か「窓の境界」で
+#   棚がまだ厚いので、そこで空振りして窓を使い切り、その後どれだけ棚が空になっても
+#   次の窓まで発注されない → 納品されない → BY が空 → 棚出しも起きない、と連鎖で供給が死ぬ。
+# 直し方: 窓を「**発注回数**の上限」へ変え、棚薄フラグでも発注を発火させる(既定 OFF)。
+# ====================================================== #
+_OOL = {**_TT, "commerce.inventory.two_tier.order_on_low": "true",
+        "commerce.inventory.review_every_steps": "72"}
+_OOL_OFF = {**_TT, "commerce.inventory.review_every_steps": "72"}
+
+
+def test_order_on_low_is_off_by_default_and_byte_identical(tmp_path):
+    """既定 OFF: 明示 false と「キーを書かない」が L1 バイト一致 + 台帳が生えない。"""
+    assert goods_mod.build_cfg({"inventory": {"enabled": True}}) \
+        ["two_tier"]["order_on_low"] is False
+    a = _sim(tmp_path, "tt_ool_a", steps=48, **_TT)
+    a.run()
+    b = _sim(tmp_path, "tt_ool_b", steps=48,
+             **{**_TT, "commerce.inventory.two_tier.order_on_low": "false"})
+    b.run()
+    assert _l1(a) == _l1(b), "order_on_low OFF が現行挙動と不一致(seam が no-op でない)"
+    assert not a._goods_order_done, "OFF なのに発注済み台帳が生えている"
+    assert not b._goods_order_done
+
+
+def test_stale_review_window_starves_the_store_until_order_on_low(tmp_path):
+    """★根本原因の固定: 満杯の棚で空振りしたレビューが窓を潰し、棚が空でも発注されない。
+
+    OFF = その窓のあいだ二度と発注しない(= 第147 リハで供給が死んだ経路そのもの)。
+    ON  = 棚薄フラグが立った時点で店主が発注する(窓は発注回数の上限としてだけ働く)。"""
+    for on, want in ((False, 0), (True, 1)):
+        sim = _sim(tmp_path, f"tt_stale_{int(on)}",
+                   **{**_OOL_OFF,
+                      "commerce.inventory.two_tier.order_on_low": str(on).lower()})
+        node = _food_node(sim)
+        key = (node, "food")
+        a = _staff(sim, node, sim.agents[0])
+        sim._goods_stock[key] = goods_mod._capacity(sim.goodscfg, "food")  # 窓の頭=棚は満杯
+        goods_mod.staff_phase(sim, 0, 700)
+        assert not _kind(sim, "stock_order"), "満杯の棚で発注が出た(前提が崩れた)"
+        assert sim._goods_order_win[node] == 0, "窓を見た記録が刻まれていない"
+        sim._goods_stock[key] = 0                            # 同じ窓のうちに棚が空になる
+        goods_mod._note_shelf(sim, node, "food", 0)
+        assert goods_mod._order_window(sim.goodscfg, 30, 1000) == 0, "まだ同じ窓のはず"
+        goods_mod.staff_phase(sim, 30, 1000)
+        assert len(_kind(sim, "stock_order")) == want, \
+            f"order_on_low={on} で棚薄トリガの発注が {want} 件になっていない"
+        assert len(_kind(sim, "delivery_trip")) == want
+        assert (key in sim._goods_pending) is bool(want)
+        assert a.work_node == node
+
+
+def test_the_window_still_caps_the_number_of_orders(tmp_path):
+    """ON でも窓は**頻度の上限**として効く(同じ窓で二度は発注しない・次の窓で再開する)。"""
+    sim = _sim(tmp_path, "tt_ool_cap", **_OOL)
+    node = _food_node(sim)
+    key = (node, "food")
+    _staff(sim, node, sim.agents[0])
+    sim._goods_stock[key] = 0
+    goods_mod._note_shelf(sim, node, "food", 0)
+    goods_mod.staff_phase(sim, 0, 700)                       # 窓 0 の発注枠を使う
+    assert len(_kind(sim, "stock_order")) == 1
+    assert sim._goods_order_done[node] == 0
+    sim._goods_pending.pop(key, None)                        # 多重発注抑止を外して窓だけを見る
+    sim._goods_stock[key] = 0
+    goods_mod._note_shelf(sim, node, "food", 0)
+    goods_mod.staff_phase(sim, 30, 1000)                     # 同じ窓 = 発注枠は残っていない
+    assert len(_kind(sim, "stock_order")) == 1, "同じ窓で二度発注した(頻度上限が壊れた)"
+    goods_mod.staff_phase(sim, 72, 1420)                     # 窓 1 = 枠が戻る
+    assert len(_kind(sim, "stock_order")) == 2, "次の窓で発注が再開していない"
+    assert sim._goods_order_done[node] == 1
+
+
+def test_order_on_low_needs_a_staffed_owner_on_duty(tmp_path):
+    """★ON でも「店主が出勤していなければ発注されない」は変わらない(担い手の因果を壊さない)。"""
+    sim = _sim(tmp_path, "tt_ool_absent", **_OOL)
+    node = _food_node(sim)
+    key = (node, "food")
+    a = sim.agents[0]
+    _staff(sim, node, a)
+    a.sleeping = True                                        # 割当はあるが起きていない
+    sim._goods_stock[key] = 0
+    goods_mod._note_shelf(sim, node, "food", 0)
+    goods_mod.staff_phase(sim, 30, 1000)
+    assert not _kind(sim, "stock_order") and not _kind(sim, "delivery_trip")
+    assert not sim._goods_order_done and key not in sim._goods_pending
+
+
+def test_order_on_low_covers_unstaffed_pois_with_the_same_rule(tmp_path):
+    """担い手ゼロ POI は同じ規約で代替再現(stock_order は出さない・order_unstaffed に積む)。"""
+    sim = _sim(tmp_path, "tt_ool_unst", **_OOL)
+    node = _food_node(sim)
+    key = (node, "food")
+    _clear_all_workplaces(sim)
+    sim._goods_stock[key] = 0
+    goods_mod._note_shelf(sim, node, "food", 0)
+    goods_mod.staff_phase(sim, 30, 1000)
+    assert not _kind(sim, "stock_order"), "無人の発注が黙って当人の行為に化けている"
+    assert {e.payload["to"] for e in _kind(sim, "delivery_trip")} == {node}
+    assert sim._goods_ops["order_unstaffed"] == 1
+    assert sim._goods_ops["order_staffed"] == 0
+    assert sim._goods_order_done[node] == 0
+
+
+def test_order_on_low_fallback_can_be_declined(tmp_path):
+    """unstaffed_fallback=false なら未カバー POI は棚薄でも発注されない(宣言なしで動かさない)。"""
+    sim = _sim(tmp_path, "tt_ool_nofb",
+               **{**_OOL, "commerce.inventory.two_tier.unstaffed_fallback": "false"})
+    node = _food_node(sim)
+    _clear_all_workplaces(sim)
+    sim._goods_stock[(node, "food")] = 0
+    goods_mod._note_shelf(sim, node, "food", 0)
+    goods_mod.staff_phase(sim, 30, 1000)
+    assert not _kind(sim, "delivery_trip") and not sim._goods_order_done
+
+
+def test_order_on_low_checkpoint_roundtrips_the_order_done_ledger(tmp_path):
+    """発注済み台帳が往復で戻る(戻らないと resume で窓の発注枠が復活して二度発注する)。"""
+    from society.engine import checkpoint
+
+    src = _sim(tmp_path, "tt_ool_ck_src", **_OOL)
+    node = _food_node(src)
+    src._goods_order_done = {node: 4}
+    p = checkpoint.save(src, 5,
+                        tmp_path / "tt_ool_ck_src" / "checkpoint" / "ckpt-000005.pkl.gz")
+    dst = _sim(tmp_path, "tt_ool_ck_dst", **_OOL)
+    assert checkpoint.load(dst, p) == 5
+    assert dst._goods_order_done == {node: 4}
+
+
+def test_order_on_low_resume_matches_straight(tmp_path):
+    """★ON でも 分割走行 == 一気通し(発注済み台帳が窓を跨いで搬送される)。"""
+    from society.engine import checkpoint
+
+    extra = {"commerce.inventory.two_tier.order_on_low": "true"}
+    st_dir = tmp_path / "tt_ool_st"
+    straight = Simulation(_cfg_of("tt_ool_st", _TOTAL, extra=extra), out_dir=st_dir)
+    straight.run()
+
+    d = tmp_path / "tt_ool_rs"
+    s1 = Simulation(_cfg_of("tt_ool_rs", _SPLIT, every=_SPLIT, extra=extra), out_dir=d)
+    for step in range(_SPLIT):
+        scheduler.run_step(s1, step)
+    assert s1._goods_order_done, "発注済み台帳が 1 件も無い(空回りしている)"
+    checkpoint.save(s1, _SPLIT, d / "checkpoint" / f"ckpt-{_SPLIT:06d}.pkl.gz")
+    s1.logger.flush_segment()
+
+    s2 = Simulation(_cfg_of("tt_ool_rs", _TOTAL, every=_SPLIT, extra=extra), out_dir=d)
+    s2.run(resume_from=d)
+    assert _rows(d) == _rows(st_dir), "order_on_low ON の resume が straight と不一致"
+    assert s2._goods_order_done == straight._goods_order_done
+    assert s2._goods_stock == straight._goods_stock
+    assert s2._goods_back == straight._goods_back
+
+
+def test_order_on_low_llm_call_count_invariant(tmp_path):
+    """ON/OFF で LLM 呼数が完全一致(発注は決定論・R1 呼数不変)。"""
+    on = _run_fixed(tmp_path, "tt_ool_cc_on", **_OOL)
+    off = _run_fixed(tmp_path, "tt_ool_cc_off", **_OOL_OFF)
+    assert on.llm.calls == off.llm.calls and on.llm.calls > 0
+
+
+# ------------------------------------------------------ ★実機経路の統合ピン
+#: 第147 リハと同じ形(review_every_steps>0 の窓・薄い棚・在勤する店員)を小規模で作る。
+#  n=300 / 48 step / 開始 07:00(既定)= 朝から在勤者が居る帯を丸ごと含む。
+_SUPPLY = {
+    "commerce.inventory.enabled": "true",
+    "commerce.inventory.two_tier.enabled": "true",
+    "commerce.inventory.two_tier.default_back_ratio": "1.0",
+    "commerce.inventory.capacity": "{food: 3, cafe: 3, shop: 3, nightlife: 3}",
+    "commerce.inventory.reorder_point": "{food: 1, cafe: 1, shop: 1, nightlife: 1}",
+    "commerce.inventory.default_capacity": "3",
+    "commerce.inventory.default_reorder_point": "1",
+    "commerce.inventory.lead_time_steps": "1",
+    "commerce.inventory.review_every_steps": "48",   # 48 step ラン = 窓は 1 つだけ
+}
+
+
+def _supply_run(tmp_path, name, on):
+    sim = _sim(tmp_path, name, n=300, steps=48,
+               **{**_SUPPLY,
+                  "commerce.inventory.two_tier.order_on_low": "true" if on else "false"})
+    sim.run()
+    return sim
+
+
+def test_supply_chain_flows_end_to_end_in_a_real_run(tmp_path):
+    """★実機ピン: 48 step の実ランで 発注 → 配送 → BY → 店員の棚出し → 棚回復 が流れる。
+
+    第147 リハの壊れ方(staffed 発注 0 / BY 0 個 / 欠品棚率 0.755)を二度と通さないための固定。
+    OFF は「窓の頭で 1 度見て終わり」なので配送がほとんど走らず欠品が積み上がる。"""
+    on = _supply_run(tmp_path, "tt_supply_on", True)
+    orders = _kind(on, "stock_order")
+    assert orders, "★staffed の発注が 1 件も出ていない(供給が死んでいる)"
+    assert all(e.agent_id != -1 for e in orders), "stock_order が当人の行為でない"
+    assert _kind(on, "delivery_trip") and _kind(on, "restock"), "配送/納品が走っていない"
+    assert [e for e in _kind(on, "shelf_restock") if e.agent_id != -1], \
+        "店員による棚出しが 1 件も無い(BY が空のまま=発注が届いていない)"
+    prov = goods_mod.provenance(on)
+    assert prov["back_units"] > 0, "BY に在庫が積まれていない"
+    assert prov["order_staffed"] > 0 and prov["restock_staffed"] > 0
+    assert prov["empty_shelf_rate"] <= 0.25, \
+        f"欠品棚率が壊滅水準: {prov['empty_shelf_rate']}"
+
+    off = _supply_run(tmp_path, "tt_supply_off", False)
+    off_prov = goods_mod.provenance(off)
+    assert len(_kind(on, "delivery_trip")) > 2 * len(_kind(off, "delivery_trip")), \
+        "ON で補充トリップが増えていない(棚薄トリガが効いていない)"
+    assert prov["empty_shelf_rate"] < off_prov["empty_shelf_rate"], \
+        "ON で欠品棚率が下がっていない"
+    def _real_stockouts(sim):                            # 実在庫由来だけ(混雑プロキシは除く)
+        return [e for e in _kind(sim, "stock_out")
+                if (e.payload or {}).get("src") == "inventory"]
+
+    assert len(_real_stockouts(on)) < len(_real_stockouts(off)), \
+        "ON で実在庫由来の品切れ体験が減っていない"
 
 
 # ------------------------------------------------------ 実ラン(フル経路が閉じる)
