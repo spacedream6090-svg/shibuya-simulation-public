@@ -141,6 +141,33 @@ P4-3 = `calib_p43_results.json`)。本体の `_CalibratedCrowd` はベンチの
 R1: どちらのトグルも既定 OFF で、OFF のときは新しい関数が 1 度も呼ばれない
     = `_build_engine` は第一段A までと 1 バイト同じ呼び出しをする(golden 無風)。
 
+物理 P4 格子外延の有界化(`physics.density_far.clip_margin_m`。既定 0 = 無効。2026-08-21)
+--------------------------------------------------------------------------------------
+第145(P3)の調査で判明した密度場の真犯人は平滑でも再構築周期でもなく**格子の外延**だった:
+外延は「ゾーンを所有中の全メンバーの外接矩形」で決まるのに、所有は**経路がゾーンを通る
+個体に現在地(数百 m 先)から**始まる。結果、38×29 m の広場(hachiko_square)に
+**平均 117 万セル(~1 km 角・float64 1 枚 9.4 MB)**の場を毎回作っていた
+(P3 の高速化後も physics.phase の 67%)。
+`clip_margin_m > 0` のとき、外延を「ゾーン polygon の外接矩形 ± margin」との**共通部分**へ
+落とす(`_field_clip` → `_CalibratedCrowd.field_clip`)。
+  堆積   … 矩形の外のメンバーは数えない。**np.clip で縁のセルへ押し込まない**
+           (押し込むと数百 m 先の一人歩きの密度が縁に山積みになり場が嘘になる)。
+  読み出し… 矩形の外のメンバーは ρ=0・∇ρ=0(= 遠方場の力ゼロ)。孤立して経路を歩いている
+           個体の足元の局所密度は実際ほぼ 0 なので、これが物理的に正しい値である。
+  連続性 … 堆積の外側には既存の `pad`(= field_blur + 2)ぶんのゼロ詰め余白が付くので、
+           外延の縁で階段状の勾配は立たない。margin はさらにその外側にある。
+★クリップの厳密な意味は「矩形の外のメンバーを名簿から外した場」であって、それ以上でも
+  以下でもない(格子も値も、外した名簿で作った場とビット一致する)。落とした堆積が場へ
+  届く範囲は矩形の縁から (blur + 2) セル(平滑 blur + 中心差分 1 + 双線形 1)しかないので、
+  margin をそれ以上に採れば**切り落としの影響はポリゴンの中まで届かない**。
+★ON は世界(軌跡)を変える。理由は 2 つあり、どちらも正直に書いておく:
+  (a) 格子の原点は「在場者の最小座標」で決まるので、遠くの所有メンバーが原点を決めていた
+      ぶんだけ**離散化が載り替わる**(同じ密度でもセル境界の切れ方が変わる)。
+  (b) 圏外の個体は**自分自身の堆積による見かけの抵抗**を受けなくなる(場版だけに在る
+      自己相互作用。ペア版は i≠j なので持たない)。孤立歩行者の ρ が 0 になるのは
+      こちらの方が正しい。
+  既定 0 = 無効。
+
 R1(既定 OFF = 完全 no-op)
 ---------------------------
 `physics.zones_enabled: false`(既定)または `physics.zones: []`(既定)のとき:
@@ -431,7 +458,7 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict, ordered=None) -> Non
 
     # ★P4-2/P4-3 の較正(既定は空 dict = 従来の sfm_core.Crowd 経路そのまま)。
     #   SFM ゾーンにだけ効く(ORCA ゾーンでは _build_engine が無視する)。
-    calib = _calib_kwargs(sim)
+    calib = _calib_kwargs(sim, zone)
     cog = _cog_kwargs(sim)
     carry = _carry_grid_on(sim)
     engine = _build_engine(zone, members, rng, calib, cog) if members else None
@@ -766,7 +793,8 @@ class _CalibratedCrowd(_sfm.Crowd):
                  far_taper_m=1.0, v_of_s=False, vos_T=0.482, vos_l=0.297,
                  far_mode="pair", field_cell_m=FIELD_CELL_M_DEFAULT,
                  field_blur=FIELD_BLUR_DEFAULT,
-                 field_update_every=FIELD_UPDATE_EVERY_DEFAULT, **kw):
+                 field_update_every=FIELD_UPDATE_EVERY_DEFAULT,
+                 field_clip=None, **kw):
         super().__init__(*args, **kw)
         self.far_a2 = float(far_a2)
         self.far_b2 = float(far_b2)
@@ -786,6 +814,14 @@ class _CalibratedCrowd(_sfm.Crowd):
         self.field_update_every = max(1, int(field_update_every))
         if self.far_mode == "field" and not (self.field_cell_m > 0.0):
             raise ValueError("density_far.cell_m は > 0 が必要")
+        # P4(2026-08-21): 格子外延のクリップ矩形 (x0, y0, x1, y1) [m]。
+        # **既定 None = クリップなし = 現行挙動と 1 バイト同一**(新分岐を 1 度も通らない)。
+        self.field_clip = None
+        if field_clip is not None:
+            x0, y0, x1, y1 = (float(v) for v in field_clip)
+            if not (x0 <= x1 and y0 <= y1):
+                raise ValueError("field_clip は (x0<=x1, y0<=y1) が必要")
+            self.field_clip = (x0, y0, x1, y1)
         self._field_tick = 0
         self._field_grid = None           # (rho, gx, gy, ox, oy) 粗い周期で作り直す
         self._field_scratch = None        # 箱平滑の作業領域 (pad, acc)。格子の形が同じ間だけ持つ
@@ -893,6 +929,16 @@ class _CalibratedCrowd(_sfm.Crowd):
         return ((1.0 - self.lam) * half_pi * i1,
                 (1.0 + self.lam) * half_pi * i2)
 
+    def _clip_mask(self):
+        """クリップ矩形の中に居るメンバー(P4。`field_clip` が None のときは呼ばない)。
+
+        境界は**閉区間**(縁ちょうどは内側)= `Zone.contains` の「境界上は内側」と同じ流儀。
+        """
+        x0, y0, x1, y1 = self.field_clip
+        p = self.pos
+        return ((p[:, 0] >= x0) & (p[:, 0] <= x1)
+                & (p[:, 1] >= y0) & (p[:, 1] <= y1))
+
     def _density_grid(self):
         """密度場 ρ と勾配 (∂ρ/∂x, ∂ρ/∂y) の格子。`update_every` サブステップに 1 度作る。
 
@@ -903,18 +949,50 @@ class _CalibratedCrowd(_sfm.Crowd):
         ★**返す ρ は毎回新品の配列**である(最後の 1 回だけ `out=None` で確保する)。
           場は `_field_grid` として次の再構築まで — carry_grid ON なら次のエンジンへも —
           持ち回られるので、作業領域そのものを返すと後の再構築が過去の場を書き潰す。
+
+        P4(2026-08-21)格子外延の有界化 —— `field_clip` があるときだけ
+        ------------------------------------------------------------
+        外延は既定では**在場者の外接矩形**で決まる。ところがゾーンの所有は「経路がゾーンを
+        通り抜ける個体」に対して**現在地から**始まる(数百 m 先から所有する)ので、
+        38×29 m の広場に対して ~1 km 角(平均 117 万セル・float64 1 枚 9.4 MB)の場を
+        毎回作っていた(第145 の実測。physics.phase の 67%)。
+        `field_clip`(= ゾーン polygon の外接矩形 ± `clip_margin_m`)を渡すと、外延を
+        その矩形との**共通部分**へ落とす。得られる場は「矩形の外のメンバーを名簿から
+        外して作った場」と**格子も値もビット一致**する(= クリップは名簿を削るだけで、
+        残った側の計算には一切手を入れない)。全員が矩形の中なら外延も値も従来と同一。
+        ★圏外の個体は **np.clip で縁のセルへ押し込まない**(押し込むと数百 m 先の一人歩きの
+          密度が縁に山積みになり、場が嘘になる)。堆積させない = その場所の密度に数えない、
+          が正しい: 圏外の局所密度は読み出し側(`_sample_field`)で 0 として扱う。
+        縁の連続性は既存の `pad`(= field_blur + 2)がそのまま担う: 堆積の外側に平滑と
+        中心差分のぶんだけゼロ詰めの余白が付くので、外延の縁で階段状の勾配は立たない。
         """
         cell = self.field_cell_m
         pad = self.field_blur + 2                   # 平滑がゼロ詰め境界を跨がない余白
         pos = self.pos
-        ox = float(pos[:, 0].min()) - pad * cell
-        oy = float(pos[:, 1].min()) - pad * cell
-        nx = int(math.floor((float(pos[:, 0].max()) - ox) / cell)) + pad + 1
-        ny = int(math.floor((float(pos[:, 1].max()) - oy) / cell)) + pad + 1
+        sel = self.active
+        if self.field_clip is None:
+            ox = float(pos[:, 0].min()) - pad * cell
+            oy = float(pos[:, 1].min()) - pad * cell
+            nx = int(math.floor((float(pos[:, 0].max()) - ox) / cell)) + pad + 1
+            ny = int(math.floor((float(pos[:, 1].max()) - oy) / cell)) + pad + 1
+        else:
+            keep = self._clip_mask()
+            sel = sel & keep                        # 圏外は堆積させない(押し込まない)
+            if keep.any():
+                px, py = pos[keep, 0], pos[keep, 1]
+                ox = float(px.min()) - pad * cell
+                oy = float(py.min()) - pad * cell
+                nx = int(math.floor((float(px.max()) - ox) / cell)) + pad + 1
+                ny = int(math.floor((float(py.max()) - oy) / cell)) + pad + 1
+            else:
+                # 圏内が空 = 場は全面 0。最小格子を矩形の隅に置く(読み出しは全員 0 なので
+                # この格子の値は 1 つも使われない。形だけ整えて下の共通経路へ渡す)。
+                ox = self.field_clip[0] - pad * cell
+                oy = self.field_clip[1] - pad * cell
+                nx = ny = 3
         nx, ny = max(nx, 3), max(ny, 3)
         ci = np.clip(np.floor((pos[:, 0] - ox) / cell), 0, nx - 1).astype(np.int64)
         cj = np.clip(np.floor((pos[:, 1] - oy) / cell), 0, ny - 1).astype(np.int64)
-        sel = self.active
         cnt = np.bincount((ci * ny + cj)[sel], minlength=nx * ny)
         rho = cnt.reshape(nx, ny).astype(np.float64) / (cell * cell)
         if self.field_blur:
@@ -943,7 +1021,14 @@ class _CalibratedCrowd(_sfm.Crowd):
         return buf
 
     def _sample_field(self, grid):
-        """格子 → 個体位置での (ρ_i, ∇ρ_i)。セル中心格子の双線形補間。"""
+        """格子 → 個体位置での (ρ_i, ∇ρ_i)。セル中心格子の双線形補間。
+
+        P4: `field_clip` があるとき、**圏外の個体は ρ=0 / ∇ρ=0** を読む。
+        `np.clip` で縁のセルの値を読ませてはいけない(数百 m 先の個体が、ゾーンの縁の
+        混雑を自分の足元の混雑として受け取ってしまう)。0 が物理的に正しい:
+        圏外に居るのは経路上をひとりで歩いている個体で、その足元の局所密度は実際ほぼ 0 =
+        遠方場の混雑回避力は働かない。
+        """
         rho, gx, gy, ox, oy = grid
         cell = self.field_cell_m
         nx, ny = rho.shape
@@ -963,7 +1048,12 @@ class _CalibratedCrowd(_sfm.Crowd):
             return (a[i0, j0] * w00 + a[i1, j0] * w10
                     + a[i0, j1] * w01 + a[i1, j1] * w11)
 
-        return _bi(rho), np.stack([_bi(gx), _bi(gy)], axis=1)
+        rho_i, grad_i = _bi(rho), np.stack([_bi(gx), _bi(gy)], axis=1)
+        if self.field_clip is not None:
+            keep = self._clip_mask()
+            rho_i = np.where(keep, rho_i, 0.0)
+            grad_i[~keep] = 0.0
+        return rho_i, grad_i
 
     def _far_forces_field(self):
         """遠方場 = 密度場の連続体力(**ペア和 `_far_forces` の置換**。第二段C)。
@@ -1030,12 +1120,14 @@ class _CalibratedCrowd(_sfm.Crowd):
         return f
 
 
-def _calib_kwargs(sim) -> dict:
+def _calib_kwargs(sim, zone=None) -> dict:
     """`physics.sfm` の較正 3 機能(+ 第二段C の密度場)→ `_CalibratedCrowd` の追加引数。
 
     **既定(全部 OFF/現行値)では空 dict** を返す = 従来の `sfm_core.Crowd` 経路。
     ★`physics.density_far` は **far_field が ON のときだけ**効く(置換する当の項が
       無ければ意味がない)。OFF のまま far_field だけ立てれば第一段A までと同じペア和。
+    ★`zone` は P4 の格子クリップ矩形を作るためだけに使う(`clip_margin_m` 既定 0 =
+      矩形を作らない = 引数が 1 つも増えない = 現行と 1 バイト同一)。
     """
     cfg = getattr(sim, "physcfg", None) or {}
     s = cfg.get("sfm")
@@ -1050,6 +1142,9 @@ def _calib_kwargs(sim) -> dict:
         if df.get("enabled"):
             kw.update(far_mode="field", field_cell_m=df["cell_m"],
                       field_blur=df["blur"], field_update_every=df["update_every"])
+            clip = _field_clip(zone, df)
+            if clip is not None:
+                kw["field_clip"] = clip
     vs = s["v_of_s"]
     if vs["enabled"]:
         kw.update(v_of_s=True, vos_T=vs["T"], vos_l=vs["l"])
@@ -1058,6 +1153,22 @@ def _calib_kwargs(sim) -> dict:
     if (wl["a"] != _sfm.WALL_A_DEFAULT) or (wl["b"] != _sfm.WALL_B_DEFAULT):
         kw.update(wall_a=wl["a"], wall_b=wl["b"])
     return kw
+
+
+def _field_clip(zone, df) -> tuple | None:
+    """`physics.density_far.clip_margin_m` → 密度格子のクリップ矩形(P4)。
+
+    矩形 = **ゾーン polygon の外接矩形 ± margin**。margin が担うのは 2 つで、
+      (a) 場の数値的な依存半径 = (blur + 2) セル(平滑 blur セル + 中心差分 1 + 双線形 1)。
+          これだけ余白があれば、**切り落とした堆積の影響がポリゴンの中まで届かない**。
+      (b) 縁の外の個体が矩形へ出入りするときの力の跳びを、ゾーン本体から遠ざける。
+    ★既定 0.0 では None を返す = 引数が生えない = 現行挙動と 1 バイト同一。
+    """
+    margin = float((df or {}).get("clip_margin_m", 0.0) or 0.0)
+    if zone is None or margin <= 0.0:
+        return None
+    x0, y0, x1, y1 = zone.bbox
+    return (x0 - margin, y0 - margin, x1 + margin, y1 + margin)
 
 
 def _carry_grid_on(sim) -> bool:

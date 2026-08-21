@@ -366,6 +366,28 @@ TABLE: tuple[tuple[str, str, str], ...] = (
     ("beliefs.channels.ambient_k", RATE,
      "環境注意の点火上限 [件/step](1日あたりの総量を保つ。lod.max_llm_per_step と同型)"),
     ("commerce.inventory.lead_time_steps", STEPS, "発注→到着のリードタイム [step]"),
+    # INV-C(第143): (s,S) レビューの間隔 = **便数**。「1 日 2 便」「隔日」という実時間の
+    # 商習慣を表す量なので、Δt が変わっても実時間の周期が保たれる STEPS(逆比例)。
+    # ★0 は「日次(restock_hour)で見る」という別モードの札で、step 数ではない。
+    #   逆比例で 0 は 0 のままなので、変換しても既定 = 日次のまま動かない。
+    ("commerce.inventory.review_every_steps", STEPS,
+     "(s,S) レビューの間隔 [step](0=日次モード。便数=実時間の周期を保つ)"),
+    # PRICE-B2(第147): 閉店前見切りの段階。「閉店 3 時間前」「1.5 時間前」という実時間の
+    # 商習慣を表す量なので STEPS(逆比例=Δt が変わっても同じ**時刻**で値札が替わる)。
+    # ★平行 2 リストにしてあるのはこの変換のため: 入れ子 [[step, 係数], ...] だと
+    #   apply_dt が「数値でない要素を含むリスト」として素通しし、宣言だけあって変換されない。
+    ("commerce.markdown.stage_steps", STEPS,
+     "見切りの段階に入る「閉店まで何 step」[step](遠い→近い順。実時間の時刻を保つ)"),
+    ("commerce.markdown.stage_coefs", INVARIANT,
+     "見切りの段階係数(価格の倍率=無次元)。Δt を変えても値引き率は変わらない"),
+    # PRICE-B1(第147): 事前公表の時間帯料金表は [開始分, 終了分, 係数] = **分 of day** の
+    # 時刻表であって step 数ではない(world.inflow_pulse と同じ理由で Δt 非依存)。
+    ("commerce.price_schedule", INVARIANT,
+     "時間帯料金表 cat→[開始分, 終了分, 係数]。分 of day の時刻表=Δt と無関係"),
+    # CRWD(第147): 時間帯バンドの境界は**時**(0-23)。負荷・係数はいずれも無次元で、
+    # 在館数は「その瞬間の人数」であって [量/step] ではない(Δt を変えても人数は人数)。
+    ("commerce.crowding.band_hours", INVARIANT,
+     "予期(平常負荷 E)を引く時間帯バンドの開始時 [時]。時刻なので Δt と無関係"),
     ("services.free_steps_ref", STEPS, "daily_rate→per-step 化の基準自由 step 数"),
     ("services.services.*.stay", STEPS, "サービス滞在 [step]"),
     ("delivery.min_eta_steps", STEPS, "配送 ETA の下限 [step]"),

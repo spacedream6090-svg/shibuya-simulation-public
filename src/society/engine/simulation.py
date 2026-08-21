@@ -672,6 +672,25 @@ class Simulation:
         self._goods_stock: dict = {}               # (node, cat) -> 在庫数(遅延初期化=購入が起きた POI のみ)
         self._goods_pending: dict = {}             # (node, cat) -> 到着 step(補充トリップの在庫。多重発注抑止)
         self._goods_review_day: int = -1           # 日次 (s,S) レビューの進行管理
+        # 2層在庫 INV-A/B(commerce.inventory.two_tier。既定 OFF=以下は空のまま=バイト一致)。
+        # 棚(_goods_stock)とバックヤード(_goods_back)を分け、購入は棚だけを削り、納品は BY へ入る。
+        # 棚を埋めるのは**在店店員の行動**(_goods_low が当人の知覚トリガ)・発注は**店主の行動**。
+        self._goods_back: dict = {}                # (node, cat) -> バックヤード在庫(2層 ON のみ)
+        self._goods_low: dict = {}                 # node -> {cat} 棚が補充点を割った店(O(1) 索引)
+        self._goods_order_win: dict = {}           # node -> 直近に店主がレビューした窓 id
+        self._goods_ops: dict = {"restock_staffed": 0, "restock_unstaffed": 0,
+                                 "restock_units": 0, "order_staffed": 0,
+                                 "order_unstaffed": 0}   # 観測タリー(summary.json の goods)
+        # 当日の入荷バッチの標(PRICE-B2 見切りが読む。(node, cat) -> 納品のあった日番号)。
+        # 厳密な消費期限は実装しない=「今日入った物がまだ棚に在る」だけを表す最小形。
+        self._goods_delivered: dict = {}
+        # 閉店前見切り PRICE-B2(commerce.markdown。既定 OFF=空のまま=バイト一致)。
+        # (node, cat) -> [日番号, 段階]。段階を刻むのは**在店店員の行動 markdown** だけで、
+        # 購入時の価格はこの段階を O(1) で引く。翌朝は日番号で自動リセットされる。
+        self._md_stage: dict = {}
+        # CRWD 混雑不満(commerce.crowding。既定 OFF=None=1 走査も作らない=バイト一致)。
+        # 毎 step 冒頭に 1 回だけ作る「ノード→在館・覚醒人数」表。購入点は O(1) で引く。
+        self._crowd_counts: dict | None = None
         # B2B 卸→小売の仕入れ スライス⑤(commerce.inventory.b2b。既定 OFF=補充供給元は外生 depot のまま)。
         # 卸/製造 org(output_kinds に素材/製品)が生産で在庫を積み、小売補充が卸在庫から引かれ org 間で金+物が
         # 移転(会計保存)。卸在庫不足=補充失敗=欠品波及。決定論・乱数ゼロ・LLM 呼ゼロ。OFF=b2b_trade 0 件=
@@ -2803,6 +2822,12 @@ class Simulation:
         _tiprov = _train_prov.provenance(self)
         if _tiprov is not None:
             summary["transit_interior"] = _tiprov
+        # 2層在庫 INV-A/B(第143)。較正アンカー(欠品棚率・BY 在庫比・「BY に在るのに棚に
+        # 無い」比)と担い手カバー率の**生の観測量**。2層 OFF は None=キー自体を出さない。
+        from .. import goods as _goods_prov
+        _gdprov = _goods_prov.provenance(self)
+        if _gdprov is not None:
+            summary["goods"] = _gdprov
         # ---- E5 職場束ね coverage(レーン丙 3。pool ランで org/束ねが ON のときだけ)------
         # 既存の検収量(_pool_org_stat / _workbind_agg)は**累計**で、回転のたびに +1 される
         # ため「担い手が痩せていても増えて見える」。ここでは**最終日の在場者を分母にした

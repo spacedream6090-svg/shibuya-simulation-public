@@ -82,6 +82,15 @@ WIT-1(2026-08-20。**ユーザー承認による凍結解除**)
 WIT-2(2026-08-20。同じ承認の第 2 段。既定 OFF は引き続きバイト一致)は 3 つだけ足した:
 `place: true` の種を「同一場所(node)に居た者だけ」へ替える in_place チャネル(実装 A)・
 環境注意の 1 step 上限 `ambient_k`(実装 B)・重複曝露の観測量 n_exp / n_src(実装 C)。
+
+FACT-D(2026-08-20。**ユーザー追認による凍結解除**の第 3 段。正典
+docs/plans/inventory-two-tier-plan.md §FACT-D)は 1 つだけ足した: `beliefs.fact_dedupe`
+(既定 OFF = 現行挙動とバイト一致)。現行の重複判定は (種, step, 当事者, 座標) なので
+**同じ店の同じ品切れでも客が違えば別 fact** になる(実測 stock_out 13,003 件/12h が
+そのまま fact → 目撃 → 信念の洪水になった)。ON では「種 × 解決済みの場所 × 話題」=
+**エピソード**を単位にし、そのエピソードの目撃窓が開いているあいだは 2 件目以降を積まない
+(1 エピソード 1 fact)。索引は checkpoint に載せず**台帳から導出**する = 永続状態を
+1 つも増やさない(§`_episode_index`)。乱数ゼロ・LLM 呼数不変・k 非依存。
 """
 from __future__ import annotations
 
@@ -169,6 +178,8 @@ def check_percept(percept, *, where: str = "perception") -> None:
 DEFAULTS = {
     "enabled": False,
     "verify_actions": False,        # 「確かめる」を行動空間に足す(プロンプト 1 行・中立提示)
+    # FACT-D: 同じ出来事を 1 fact に畳む(エピソード単位)。既定 OFF=現行とバイト一致
+    "fact_dedupe": False,
     # ---- 台帳(fact の供給源)。L1 の event kind → fact 仕様(データ駆動)----
     #   topic_key  … 話題トークンに使う payload キー(場所名に加えて 1 個)
     #   value_key  … 真の値に使う payload の数値キー(無ければ定数 value)
@@ -243,7 +254,7 @@ _INT_KEYS = ("witness_window", "fact_ttl_steps", "max_facts_per_utterance",
              "max_beliefs_per_agent", "min_topic_len", "verify_deadline_steps")
 _FLOAT_KEYS = ("witness_radius_m", "hop_drift", "conf_decay", "min_conf",
                "net_conf", "ask_conf")
-_BOOL_KEYS = ("enabled", "verify_actions")
+_BOOL_KEYS = ("enabled", "verify_actions", "fact_dedupe")
 
 # 発生場所として解釈する payload キー(node id → 地図上の実ノード)
 _NODE_KEYS = ("node", "at", "to_node", "dest")
@@ -454,8 +465,74 @@ def _new_events(sim) -> list:
     return events[len(events) - new:] if new else []
 
 
+# --------------------------------------------------------------------------- #
+# FACT-D: エピソード単位の重複抑制(`beliefs.fact_dedupe`。既定 OFF=バイト一致)
+# --------------------------------------------------------------------------- #
+# 「同じ出来事」の単位 = 種 × 解決済みの場所(node / 場所名)× 話題トークン。
+# 鍵は **fact レコードに既に在る欄だけ**で組む(新しい欄も新しい永続状態も足さない)ので、
+# 索引が失われても台帳を走査すれば同じ鍵が出る = resume 後に組み直せる。
+_EPI_SEP = "\x1f"
+
+
+def _episode_key_of(fact: dict) -> str | None:
+    """fact(または同じ欄を持つ dict)から**エピソード鍵**を作る。場所不明なら None。
+
+    ★None(= 抑制しない)にする判断: 場所が解決できない fact は「どの出来事か」を同定
+      できない。同定できないものを畳むと**別の出来事どうしを 1 件に潰す**ので、
+      判らないときは黙って畳まない(WIT-2 の in_place が場所不明で黙って広げないのと同型)。
+    ★話題トークンを丸ごと鍵に入れるので、conf の `topic_key`(price_change なら cat 等)が
+      そのまま粒度になる = コードに固有名詞を書かない(fact_kinds と同じデータ駆動)。
+      stock_out の poi 名は「その node の**その cat の** POI 名」として決まるため、
+      poi 名だけで cat 相当の粒度が出る(正典 §FACT-D の「poi+cat 相当」)。"""
+    node = str(fact.get("node") or "")
+    place = str(fact.get("place") or "")
+    if not node and not place:
+        return None
+    return _EPI_SEP.join((str(fact.get("kind") or ""), node, place,
+                          *(str(t) for t in (fact.get("topics") or ()))))
+
+
+def _episode_index(sim, facts: dict) -> dict:
+    """エピソード鍵 → その鍵で**最後に積まれた** fact_id(ON 経路でのみ生やす)。
+
+    ★永続状態を 1 つも増やさない: `engine/checkpoint.py` には載せず、無ければ台帳から
+      組み直す(`_tl_poi_index` と同じ「導出キャッシュ」の族)。台帳 dict は挿入順
+      = fact 生成順なので、走査で後勝ちに畳めば逐次更新した表と 1 件も違わない
+      (tests/test_fact_dedupe.py が索引を毎回捨てるランとの一致で機械証明する)。
+    ★同じ鍵の fact のうち**最後の 1 件**だけ覚えれば足りるのは、窓幅 window が
+      種ごとの定数(`fact_kinds[kind].window`)で、種は鍵に入っているから
+      = 「どれかの fact の窓が開いている」と「最後の fact の窓が開いている」が同値。"""
+    idx = getattr(sim, "_tl_epi", None)
+    if idx is None:
+        idx = {}
+        for fid, f in facts.items():
+            ek = _episode_key_of(f)
+            if ek is not None:
+                idx[ek] = fid
+        sim._tl_epi = idx
+    return idx
+
+
+def _episode_open(facts: dict, prev_fid, at_step: int) -> bool:
+    """先行 fact の目撃窓が at_step の時点で開いているか(`_witness_pass` と同じ半開区間)。
+
+    台帳から消えた fact(将来 prune を入れたとき)は「窓なし」= 新しいエピソードとして
+    積み直す(= 抑制が幽霊の参照で続かない)。"""
+    prev = facts.get(prev_fid) if prev_fid is not None else None
+    if prev is None:
+        return False
+    return int(at_step) < int(prev["step"]) + max(1, int(prev["window"]))
+
+
 def _record_fact(sim, cfg: dict, e, spec: dict, step: int, sim_min: int) -> dict | None:
-    """1 イベントを fact として台帳へ積む(重複は積まない)。"""
+    """1 イベントを fact として台帳へ積む(重複は積まない)。
+
+    重複判定は 2 段(2 段目は FACT-D。既定 OFF では 1 度も評価しない):
+      1. **同一イベント**: (種, step, 当事者, 座標)。同じ L1 行を 2 度読まないための鍵。
+      2. **同一エピソード**(`beliefs.fact_dedupe` ON のみ): 種 × 場所 × 話題が同じ出来事は、
+         先行 fact の目撃窓が開いているあいだ 2 件目を積まない。窓が閉じた step の分から
+         次のエピソードとして積む。窓の比較点は**そのイベント自身の step**(= 積むはずだった
+         fact の窓の起点)なので、phase の走査タイミング(watermark)に依存しない。"""
     facts = facts_of(sim)
     keys = getattr(sim, "_tl_keys", None)
     if keys is None:
@@ -465,6 +542,17 @@ def _record_fact(sim, cfg: dict, e, spec: dict, step: int, sim_min: int) -> dict
     if key in keys:
         return None
     node, place_name = _resolve_place(sim, e.payload or {})
+    topics = _topics(place_name, spec, e.payload or {}, int(cfg["min_topic_len"]))
+    epi = None
+    if cfg.get("fact_dedupe"):
+        epi = _episode_key_of({"kind": e.kind, "node": node, "place": place_name,
+                               "topics": topics})
+        if epi is not None and _episode_open(facts,
+                                             _episode_index(sim, facts).get(epi),
+                                             int(e.step)):
+            st = _stats(sim)                   # 抑制量の観測(ON のときだけ生える欄)
+            st["facts_deduped"] = int(st.get("facts_deduped", 0)) + 1
+            return None
     if node is not None:
         x, y = sim.city.node_xy(node)
     else:
@@ -482,7 +570,7 @@ def _record_fact(sim, cfg: dict, e, spec: dict, step: int, sim_min: int) -> dict
         "y": round(float(y), 2),
         "value": round(_true_value(spec, e.payload or {}), 6),
         "actor": int(e.agent_id),
-        "topics": _topics(place_name, spec, e.payload or {}, int(cfg["min_topic_len"])),
+        "topics": topics,
         # 直接目撃可能条件: 半径(<=0 は市域全体)と時間窓
         "radius_m": round(radius, 2),
         "window": int(spec.get("window", cfg["witness_window"])),
@@ -491,6 +579,8 @@ def _record_fact(sim, cfg: dict, e, spec: dict, step: int, sim_min: int) -> dict
     }
     facts[fid] = fact
     keys[key] = fid
+    if epi is not None:                        # FACT-D ON: エピソードの代表を更新(後勝ち)
+        _episode_index(sim, facts)[epi] = fid
     _stats(sim)["facts"] += 1
     return fact
 

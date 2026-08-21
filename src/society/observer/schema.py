@@ -230,6 +230,15 @@ register_event_kind("delivery_trip", "補充の配送トリップ(depot=最寄�
 register_event_kind("restock",       "補充トリップの到着=在庫が上限 S へ回復(封鎖時は失敗=不発){poi, cat, qty, from}")
 register_event_kind("stock_low",     "在庫僅少=発注点 s 以下(補充発注のトリガ。世界イベント agent_id=-1){poi, cat, level}")
 # ★ stock_out は commerce 既存 kind を再利用(意味を在館数の代理→実在庫の枯渇に拡張。src="inventory")
+# ---- 2層在庫 INV-A/B(commerce.inventory.two_tier ON のみ・既定 OFF=0件。決定論・LLM/乱数ゼロ)----
+#      棚(店頭)とバックヤードを分け、棚を埋めるのは**在店店員の行動**・発注は**店主の行動**にする層。
+#      担い手が 1 人も割り当てられていない POI だけ unstaffed=true の代替再現が立つ(宣言つき)。
+register_event_kind("shelf_restock", "店員が品薄の棚へバックヤードから商品を出した(1 店 1 補充。担い手不在の POI は unstaffed=true){poi, cats, qty, n, unstaffed?}")
+register_event_kind("stock_order",   "店主/店長が出勤中に自店の在庫を確かめて発注した(欠勤なら発注されない){poi, n}")
+# ---- 閉店前見切り PRICE-B2(commerce.markdown ON のみ・既定 OFF=0件。決定論・LLM/乱数ゼロ)----
+#      閉店が近づいた店で在店店員が値札を替える(段階式 0.8→0.5)。事前公表の時間帯料金表(B1)は
+#      「価格の変化」ではないのでイベントを出さない(購入 1 件ごとの洪水を作らない)= B2 だけが載る。
+register_event_kind("markdown",      "店員が閉店前に売れ残りへ値引きの札を貼った(段階式。担い手不在の POI は unstaffed=true){poi, cats, stage, coef, unstaffed?}")
 # ---- サービスの実体化 スライス③(services ON のみ・既定 OFF=0件。決定論・新 stream "service" のみ。
 #      実装 src/society/services.py。設計: docs/research/economy-goods-services.md §7 ③)----
 register_event_kind("service_use", "サービスの受給=滞在+課金+効果(理美容/クリニック/塾/ジム/クリーニング等。需要側=供給側 serve と対){node, service, cost, poi}")

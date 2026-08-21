@@ -167,6 +167,7 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
                  snc_section: str | None = None,
                  attention_section: str | None = None,
                  trace_line: str | None = None,
+                 shelf_line: str | None = None,
                  p1_purpose: str | None = None) -> str:
     """個別文脈(時刻・場所・活動・気分・記憶・直近発話)を渡し、内容の固定化を防ぐ。
 
@@ -265,6 +266,13 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
         lines.append(trace_line)
     if nearby_pois:
         lines.append(f"周りにある店・場所: {'、'.join(nearby_pois[:_poi_n])}")
+    # いま居る店の棚の様子(INV-A・commerce.inventory.two_tier.percept 有効かつ棚が非潤沢の
+    # ときのみ)。既定 OFF は None=1行も足さない=バイト一致(trace_line と同型 seam)。
+    # ★中身は「〈カテゴリ語〉の棚は残りわずか/空だった」の定型 1 行だけ。在庫数・補充点・
+    #   機構語・実験条件語は 1 文字も出さない(society/goods.py 参照)。
+    # ★「その店の棚」を指す文なので、**店を名指しした直後**に置く(1 行欄の族)。
+    if shelf_line:
+        lines.append(shelf_line)
     if scene_lines:                      # 構造化シーン記述 v0(scene_desc 有効時のみ。方向つき視界/
         lines.extend(scene_lines)        # 注視対象/垂直関係。既定 OFF は None=1行も足さない=バイト一致)
     if wv_expect_line:                   # 場所の期待vs実際(worldview 有効かつ差が大きい時のみ。第20バッチ)

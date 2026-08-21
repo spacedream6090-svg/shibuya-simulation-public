@@ -134,6 +134,9 @@ def _reserve_stock(sim, node: str, cat: str) -> bool:
         sim._goods_stock[key] = cur
         return False
     sim._goods_stock[key] = cur - 1
+    # 2層在庫 INV-B(既定 OFF=no-op): 宅配の取り置きも棚を削るので、棚薄の知覚トリガを
+    # 購入 seam と同じ形で立てる(遅延評価しない=eager 更新)。
+    _goods.note_shelf(sim, node, cat, cur - 1)
     return True
 
 

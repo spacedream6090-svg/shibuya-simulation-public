@@ -907,3 +907,371 @@ def test_the_density_field_never_reaches_the_checkpoint(tmp_path):
     for a in sim.agents:
         for f in ("_field_grid", "_field_tick", "_field_scratch"):
             assert not hasattr(a, f), f"個体に {f} が生えている(pickle に載る)"
+
+
+# =========================================================================== #
+# (8) P4 密度格子の**外延の有界化**(2026-08-21)
+#     ── `density_far.clip_margin_m`(既定 0.0 = 無効 = 現行と 1 バイト同一)
+#
+# 発端(第145 の実測): 外延は「在場者の外接矩形」で決まるのに、ゾーンの所有は
+# 「経路がゾーンを通り抜ける個体」へ**現在地(数百 m 先)から**始まる。そのため
+# 38×29 m の広場に平均 117 万セル(~1 km 角)の場を毎回作っていた。
+# 本節が機械固定するもの:
+#   (a) 既定 0 では新しい分岐を **1 度も通らない**(= 現行と完全同一経路)。
+#   (b) クリップの意味は「矩形の外のメンバーを名簿から外す」ことと**ビット一致**する。
+#   (c) ★圏外を np.clip で縁のセルへ**押し込まない**(押し込む実装が実際に誤りである
+#       ことを、却下した設計の逐語実装と突き合わせて数字で残す)。
+#   (d) 圏外の読み出しは ρ=0・∇ρ=0(= 遠方場の力ちょうど 0)。
+# =========================================================================== #
+CLIP_MARGIN_M = 10.0
+DF_CLIP = dict(DF_ON, clip_margin_m=CLIP_MARGIN_M)
+# ゾーン _POLY(±25 m)の外接矩形 ± margin
+CLIP_RECT = (-_ZR - CLIP_MARGIN_M, -_ZR - CLIP_MARGIN_M,
+             _ZR + CLIP_MARGIN_M, _ZR + CLIP_MARGIN_M)
+
+
+def _zone_of(poly=None, zid="z1"):
+    """テスト用に 1 枚だけ Zone を作る(`bbox` が欲しいだけ)。"""
+    return zones.build_cfg(
+        {"zones_enabled": True,
+         "zones": [{"id": zid, "engine": "sfm",
+                    "polygon": list(poly or _POLY)}]}, REPO)["zones"][0]
+
+
+def test_clip_margin_defaults_to_zero_everywhere():
+    """★R1: 新キーは既定 0.0(conf・正準化・矩形の生成・エンジンのどこにも漏れない)。"""
+    raw = yaml.safe_load((REPO / "conf" / "config.yaml").read_text(encoding="utf-8"))
+    assert float(raw["physics"]["density_far"]["clip_margin_m"]) == 0.0
+    assert float(zones.DENSITY_FAR_DEFAULTS["clip_margin_m"]) == 0.0
+    cfg = zones.build_cfg({}, REPO)
+    assert cfg["density_far"]["clip_margin_m"] == 0.0
+    z = _zone_of()
+    # 既定では矩形そのものが作られない(= エンジンへ引数が生えない)
+    assert P._field_clip(z, cfg["density_far"]) is None
+    assert P._field_clip(None, {"clip_margin_m": CLIP_MARGIN_M}) is None
+    assert P._field_clip(z, {}) is None          # キーを書かない conf も 0 と読む
+    assert P._field_clip(z, None) is None
+    # エンジン側の既定も None(新分岐の入口が閉じている)
+    assert _calib(50, 2.0, "square", 1, far_mode="field").field_clip is None
+    assert _calib(50, 2.0, "square", 1).field_clip is None
+
+
+def test_clip_margin_is_declared_in_the_registry():
+    f = {x.id: x for x in R.FEATURES}["physics.density_far.clip_margin_m"]
+    assert f.repro_tier == "strict" and f.affects_k is False
+    assert f.fingerprint_risk == "none" and f.off_value == 0.0
+
+
+def test_clip_margin_rejects_a_negative_margin():
+    with pytest.raises(ValueError):
+        zones.build_cfg({"density_far": {"clip_margin_m": -1.0}}, REPO)
+    # 0 は「無効」であって不正ではない
+    assert zones.build_cfg({"density_far": {"clip_margin_m": 0.0}},
+                           REPO)["density_far"]["clip_margin_m"] == 0.0
+
+
+def test_the_clip_rectangle_is_the_zone_bbox_plus_the_margin():
+    """矩形 = ゾーン polygon の外接矩形 ± margin(それ以上でも以下でもない)。"""
+    z = _zone_of([[-24.0, -56.0], [14.0, -56.0], [14.0, -27.0], [-24.0, -27.0]])
+    assert z.bbox == (-24.0, -56.0, 14.0, -27.0)
+    got = P._field_clip(z, {"clip_margin_m": 10.0})
+    assert got == (-34.0, -66.0, 24.0, -17.0)
+
+
+def test_calib_kwargs_wires_the_rectangle_only_when_it_is_asked_for():
+    """`field_clip` が生えるのは far_field ON × density_far ON × margin>0 のときだけ。"""
+    z = _zone_of()
+
+    def _sim(df):
+        return type("S", (), {"physcfg": zones.build_cfg(
+            {"sfm": {"far_field": dict(FAR_ON)}, "density_far": df}, REPO)})()
+
+    assert "field_clip" not in P._calib_kwargs(_sim(dict(DF_ON)), z)
+    assert "field_clip" not in P._calib_kwargs(_sim(dict(DF_CLIP)), None)
+    kw = P._calib_kwargs(_sim(dict(DF_CLIP)), z)
+    assert kw["field_clip"] == CLIP_RECT and kw["far_mode"] == "field"
+    # density_far が OFF なら margin を書いても no-op(置換する当の項が無い)
+    off = P._calib_kwargs(_sim({"enabled": False, "clip_margin_m": 10.0}), z)
+    assert "field_clip" not in off and "far_mode" not in off
+    # 要約(manifest)には出る = ON の値が記録に残る
+    assert P.calib_describe(_sim(dict(DF_CLIP)))["density_far"]["clip_margin_m"] == 10.0
+
+
+def test_clip_off_never_takes_the_new_branch(tmp_path):
+    """★R1 の直接証明: 既定 0 のランでは `_clip_mask` が **1 度も呼ばれない**。"""
+    calls = [0]
+    orig = P._CalibratedCrowd._clip_mask
+
+    def spy(self):
+        calls[0] += 1
+        return orig(self)
+
+    P._CalibratedCrowd._clip_mask = spy
+    try:
+        sim = _run(tmp_path, "clip_off_branch", engine="sfm", far=True,
+                   density_far=DF_ON)
+    finally:
+        P._CalibratedCrowd._clip_mask = orig
+    assert [e.kind for e in sim.logger.events].count("zone_gate") > 0, \
+        "ゾーンを 1 度も通っていない(テストが空回りしている)"
+    assert calls[0] == 0, f"既定 OFF で新分岐を {calls[0]} 回通った"
+
+
+def test_clip_off_is_byte_identical(tmp_path):
+    """★R1: clip_margin_m を明示 0.0 にしても、書かないランと L1 がバイト一致。"""
+    a = _run(tmp_path, "clip_off_a", engine="sfm", far=True, density_far=DF_ON)
+    b = _run(tmp_path, "clip_off_b", engine="sfm", far=True,
+             density_far=dict(DF_ON, clip_margin_m=0.0))
+    assert [e.kind for e in a.logger.events].count("zone_gate") > 0
+    assert _l1(a) == _l1(b)
+    assert P.continuity(a) == P.continuity(b)
+
+
+def _clipped(n, dens, shape, seed, clip, **kw):
+    return _calib(n, dens, shape, seed, far_mode="field", field_clip=clip, **kw)
+
+
+def test_clip_is_bit_identical_when_everyone_is_inside():
+    """全員が矩形の中なら、外延も値も軌跡もクリップ無しと 1 ビット違わない。
+
+    これがクリップの定義そのもの(=「はみ出した分だけ」を切る操作)であり、
+    ON にしても混雑したゾーンの中の物理は据え置かれる、という主張の機械証明でもある。
+    """
+    a = _calib(400, 2.0, "clump", 9, far_mode="field", field_update_every=3)
+    lo = a.pos.min(axis=0) - 50.0
+    hi = a.pos.max(axis=0) + 50.0
+    b = _clipped(400, 2.0, "clump", 9, (lo[0], lo[1], hi[0], hi[1]),
+                 field_update_every=3)
+    ga, gb = a._density_grid(), b._density_grid()
+    for x, y in zip(ga[:3], gb[:3]):
+        assert np.array_equal(x, y)
+    assert ga[3] == gb[3] and ga[4] == gb[4]
+    for _ in range(30):
+        a.step(0.05)
+        b.step(0.05)
+    assert a.pos.tobytes() == b.pos.tobytes()
+    assert a.vel.tobytes() == b.vel.tobytes()
+
+
+def _with_strays(base_seed, clip, strays, **kw):
+    """在場者(密な塊)+ 圏外を一人で歩いている個体、の 2 通りのエンジンを返す。
+
+    返り値 (全員, 在場者だけ, 在場者数)。「クリップした場」と「圏外を名簿から外した場」が
+    ビット一致することを見るための対。
+    """
+    rng = np.random.default_rng(base_seed)
+    core = _layout(300, 2.0, "square", rng)
+    both = np.concatenate([core, np.asarray(strays, dtype=np.float64)], axis=0)
+
+    def _mk(p):
+        m = p.shape[0]
+        return P._CalibratedCrowd(pos=p.copy(), vel=np.zeros((m, 2)),
+                                  goal=p + np.array([100.0, 0.0]),
+                                  v0=np.full(m, 1.3), radius=np.full(m, 0.3),
+                                  neighbor_cap=12, **FAR_KW, far_mode="field",
+                                  field_clip=clip, **kw)
+
+    return _mk(both), _mk(core), core.shape[0]
+
+
+# 数百 m 先を一人で歩いている所有メンバー(finals で実際に起きている状況)
+STRAYS = [[800.0, -600.0], [-430.0, 210.0], [90.0, 640.0]]
+CORE_CLIP = (-30.0, -30.0, 60.0, 60.0)
+
+
+def test_clipping_is_exactly_dropping_the_members_outside():
+    """クリップ =「矩形の外を名簿から外す」。格子も読み出しもビット一致する。"""
+    both, core, n = _with_strays(11, CORE_CLIP, STRAYS)
+    gb, gc = both._density_grid(), core._density_grid()
+    for x, y in zip(gb[:3], gc[:3]):
+        assert x.shape == y.shape and np.array_equal(x, y), \
+            "圏外の個体が圏内の場を動かした"
+    assert gb[3] == gc[3] and gb[4] == gc[4], "圏外の個体が格子の原点を動かした"
+    rb, grb = both._sample_field(gb)
+    rc, grc = core._sample_field(gc)
+    assert np.array_equal(rb[:n], rc) and np.array_equal(grb[:n], grc)
+
+
+def test_the_field_force_on_a_member_outside_the_clip_is_exactly_zero():
+    """圏外は ρ=0・∇ρ=0 → 遠方場の力ちょうど 0(孤立歩行者に混雑回避力は働かない)。"""
+    both, _core, n = _with_strays(12, CORE_CLIP, STRAYS)
+    grid = both._density_grid()
+    rho, grad = both._sample_field(grid)
+    assert np.array_equal(rho[n:], np.zeros(len(STRAYS)))
+    assert np.array_equal(grad[n:], np.zeros((len(STRAYS), 2)))
+    f = both._far_forces_field()
+    assert np.array_equal(f[n:], np.zeros((len(STRAYS), 2))), \
+        "圏外の個体に遠方場の力が残っている"
+    assert np.abs(f[:n]).max() > 0.0, "圏内にも力が無い(テストが空回りしている)"
+
+
+def _push_in_reference(crowd):
+    """★**却下した設計**(圏外を np.clip で縁のセルへ押し込む)の逐語実装。
+
+    なぜ却下したのかを数字で残すために置く: 押し込むと、数百 m 先を一人で歩いている
+    個体の質量がクリップ矩形の**縁のセルへ山積み**になり、ゾーンの縁に居る個体が
+    「そこに居ない群衆」の密度と勾配を読む。堆積させない(名簿から外す)のが正しい。
+    ここは本体の `_density_grid` の外延計算だけを矩形固定に差し替えた同型のコードである。
+    """
+    cell = crowd.field_cell_m
+    pad = crowd.field_blur + 2
+    x0, y0, x1, y1 = crowd.field_clip
+    pos = np.clip(crowd.pos, [x0, y0], [x1, y1])        # ← 押し込み(これが誤り)
+    ox = x0 - pad * cell
+    oy = y0 - pad * cell
+    nx = int(math.floor((x1 - ox) / cell)) + pad + 1
+    ny = int(math.floor((y1 - oy) / cell)) + pad + 1
+    ci = np.clip(np.floor((pos[:, 0] - ox) / cell), 0, nx - 1).astype(np.int64)
+    cj = np.clip(np.floor((pos[:, 1] - oy) / cell), 0, ny - 1).astype(np.int64)
+    cnt = np.bincount((ci * ny + cj)[crowd.active], minlength=nx * ny)
+    return cnt.reshape(nx, ny).astype(np.float64) / (cell * cell), ox, oy
+
+
+def test_the_rejected_push_in_design_really_would_pile_density_on_the_edge():
+    """押し込み版は縁に幽霊群衆を作る / 本実装は作らない(質量保存で数える)。"""
+    both, _core, n = _with_strays(13, CORE_CLIP, STRAYS, field_blur=0)
+    cell = both.field_cell_m
+    grid = both._density_grid()
+    mass = float(grid[0].sum()) * cell * cell
+    assert math.isclose(mass, n, rel_tol=1e-9), \
+        f"堆積した人数が圏内の人数と違う {mass} != {n}"
+    push, pox, poy = _push_in_reference(both)
+    assert math.isclose(float(push.sum()) * cell * cell, n + len(STRAYS),
+                        rel_tol=1e-9), "押し込み版が圏外を数えていない(前提が違う)"
+    # 押し込み先(矩形の縁)のセルには誰も居ないのに密度が立つ
+    for sx, sy in STRAYS:
+        px = min(max(sx, CORE_CLIP[0]), CORE_CLIP[2])
+        py = min(max(sy, CORE_CLIP[1]), CORE_CLIP[3])
+        i = int(math.floor((px - pox) / cell))
+        j = int(math.floor((py - poy) / cell))
+        assert push[i, j] > 0.0, "押し込み版の前提が崩れている"
+        # 同じ場所に実在の在場者は 1 人も居ない = 幽霊
+        d = np.linalg.norm(both.pos[:n] - np.array([px, py]), axis=1)
+        assert d.min() > 5.0, "押し込み先の近くに本物が居る(テストの配置が悪い)"
+
+
+def test_clip_bounds_the_grid_by_the_rectangle():
+    """★本題: 遠方の所有メンバーが居ても格子は矩形ぶんで頭打ちになる。"""
+    both, _core, _n = _with_strays(14, CORE_CLIP, STRAYS)
+    nx, ny = both._density_grid()[0].shape
+    cell, pad = both.field_cell_m, both.field_blur + 2
+    lim_x = int(math.floor((CORE_CLIP[2] - CORE_CLIP[0]) / cell)) + 2 * pad + 1
+    lim_y = int(math.floor((CORE_CLIP[3] - CORE_CLIP[1]) / cell)) + 2 * pad + 1
+    assert nx <= lim_x and ny <= lim_y, f"外延が矩形を超えた {nx}x{ny}"
+    # クリップ無しだと同じ配置で桁が変わる(この差が P4 の全部である)
+    m = both.pos.shape[0]
+    off = P._CalibratedCrowd(pos=both.pos.copy(), vel=np.zeros((m, 2)),
+                             goal=both.pos + np.array([100.0, 0.0]),
+                             v0=np.full(m, 1.3), radius=np.full(m, 0.3),
+                             neighbor_cap=12, **FAR_KW, far_mode="field")
+    assert off._density_grid()[0].size > 100 * (nx * ny), \
+        "クリップ無しの格子が大きくない(テストが空回りしている)"
+
+
+def test_clip_survives_an_empty_rectangle():
+    """圏内が空(全員が矩形の外)でも落ちない = 場は全面 0・力は全員 0。"""
+    n = 5
+    pos = np.array([[500.0 + i, -400.0] for i in range(n)], dtype=np.float64)
+    c = P._CalibratedCrowd(pos=pos, vel=np.zeros((n, 2)),
+                           goal=pos + np.array([100.0, 0.0]),
+                           v0=np.full(n, 1.3), radius=np.full(n, 0.3),
+                           neighbor_cap=12, **FAR_KW, far_mode="field",
+                           field_clip=CORE_CLIP)
+    rho, gx, gy, _ox, _oy = c._density_grid()
+    assert rho.shape == (3, 3) and not rho.any() and not gx.any() and not gy.any()
+    assert np.array_equal(c._far_forces_field(), np.zeros((n, 2)))
+    c.step(0.05)                                  # 積分まで通す(例外が出ないこと)
+
+
+def test_clip_rejects_an_inverted_rectangle():
+    with pytest.raises(ValueError):
+        _clipped(20, 2.0, "square", 1, (10.0, 0.0, -10.0, 5.0))
+
+
+def test_clip_on_is_reproducible(tmp_path):
+    """ON: 同 seed 2 ランがビット一致(クリップは位置の比較だけ = 決定論)。"""
+    a = _run(tmp_path, "clip_rep_a", engine="sfm", far=True, density_far=DF_CLIP)
+    b = _run(tmp_path, "clip_rep_b", engine="sfm", far=True, density_far=DF_CLIP)
+    assert [e.kind for e in a.logger.events].count("zone_gate") > 0
+    assert _l1(a) == _l1(b), "同 seed 2 ランが一致しない(決定論が壊れている)"
+
+
+def test_clip_on_keeps_the_boundary_invariants(tmp_path):
+    """ON でも境界連続性の不変条件(跳び・重なり)が壊れない。"""
+    for name, df in (("clip_inv_off", DF_ON), ("clip_inv_on", DF_CLIP),
+                     ("clip_inv_carry", dict(DF_CLIP, carry_grid=True))):
+        sim = _run(tmp_path, name, engine="sfm", far=True, density_far=df)
+        cont = P.continuity(sim)
+        assert cont, f"{name}: continuity が空(ゾーンを通っていない)"
+        assert cont["jump_max_m"] < 1.0, f"{name}: 1 サブステップの跳びが大きすぎる"
+        assert cont["min_gap_m"] is None or cont["min_gap_m"] > -0.5, \
+            f"{name}: 深い重なりが出た {cont['min_gap_m']}"
+
+
+class _CountingHub:
+    """全 stream の draw を数えるプロキシ(ON の乱数消費不変を直接固定する)。"""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.draws = 0
+
+    def stream(self, *key):
+        g = self._inner.stream(*key)
+        outer = self
+
+        class _W:
+            def __getattr__(self, name):
+                attr = getattr(g, name)
+                if name in ("random", "integers", "choice", "normal", "shuffle",
+                            "permutation", "uniform"):
+                    def _wrapped(*a, **k):
+                        outer.draws += 1
+                        return attr(*a, **k)
+                    return _wrapped
+                return attr
+
+        return _W()
+
+    def key_name(self, *key):
+        return self._inner.key_name(*key)
+
+    @property
+    def master_seed(self):
+        return self._inner.master_seed
+
+
+def _draws(tmp_path, name, **kw):
+    sim = Simulation(_cfg(name, **kw), out_dir=tmp_path / name)
+    sim.hub = _CountingHub(sim.hub)
+    sim.run()
+    return sim.hub.draws, sim
+
+
+def test_clip_on_consumes_no_extra_randomness(tmp_path):
+    """ON は乱数を 1 粒も増やさない(クリップは位置の比較だけ = draw ゼロ)。"""
+    off_n, off = _draws(tmp_path, "clip_draw_off", engine="sfm", far=True,
+                        density_far=DF_ON)
+    on_n, _on = _draws(tmp_path, "clip_draw_on", engine="sfm", far=True,
+                       density_far=DF_CLIP)
+    assert [e.kind for e in off.logger.events].count("zone_gate") > 0
+    assert off_n == on_n, f"乱数消費が変わった off={off_n} on={on_n}"
+
+
+def test_the_clipped_field_never_reaches_the_checkpoint(tmp_path):
+    """★クリップ矩形も場も step ローカル(エンジンと同じ寿命)= checkpoint に載らない。
+
+    P3 の同名テストと同型。矩形はゾーン宣言から毎 step 作り直される定数なので、
+    checkpoint に持たせる理由が無い(持たせると resume==straight がそこで割れる)。
+    """
+    import pickle
+
+    sim = _run(tmp_path, "clip_ckpt", engine="sfm", far=True, density_far=DF_CLIP)
+    blob = P.state_of(sim)
+    assert blob is not None and set(blob) >= {"by_zone", "cont"}
+    dump = pickle.dumps(blob)
+    for marker in (b"_CalibratedCrowd", b"_field_grid", b"field_clip",
+                   b"_field_scratch", b"ndarray"):
+        assert marker not in dump, f"checkpoint 側に {marker!r} が載っている"
+    for a in sim.agents:
+        for f in ("_field_grid", "field_clip", "_field_scratch"):
+            assert not hasattr(a, f), f"個体に {f} が生えている(pickle に載る)"

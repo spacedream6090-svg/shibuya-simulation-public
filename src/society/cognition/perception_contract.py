@@ -101,6 +101,7 @@ class Perception:
     signage_line: str | None = None          # 街頭掲示の概況(従来の ads_line)
     place_label_line: str | None = None
     trace_line: str | None = None            # 場所に残った痕跡の 1 行(第96 IF-D)
+    shelf_line: str | None = None            # いま居る店の棚の様子(INV-A。非潤沢のときだけ)
     familiar_places: tuple[str, ...] | None = None
 
     # ---- 聴覚: 聞こえた発話とその文脈 --------------------------------------- #
@@ -272,6 +273,7 @@ _KW_FIELDS: tuple[tuple[str, str, bool], ...] = (
     ("ads_line", "signage_line", False),
     ("place_label_line", "place_label_line", False),
     ("trace_line", "trace_line", False),
+    ("shelf_line", "shelf_line", False),
     ("familiar_places", "familiar_places", True),
     # 聴覚
     ("reply_to", "heard_reply", False),

@@ -155,6 +155,12 @@ def enabled(sim) -> bool:
     return bool(cfg and cfg["enabled"])
 
 
+def spend_cat(sim) -> str:
+    """受給の課金カテゴリ(_spend の cat)。engine がサービス名を書かずに帯を渡すための口。"""
+    cfg = getattr(sim, "servicescfg", None)
+    return str(cfg["spend_cat"]) if cfg else "service"
+
+
 # ================================================================ 自助努力 affordance(T4 第52バッチ)
 # 「自力で成長・改善できる」可能性を用意する層。成長は強制せず選べる状態にする(affordance)。既存の
 # サービス受給(charge_service)に、反復利用の**累積効果**(agent.self_dev)と、経済成果への**1本だけの
@@ -390,7 +396,12 @@ def charge_service(sim, agent, step: int, sim_min: int, spend) -> bool:
     svc = sim.servicescfg["services"].get(key)
     if svc is None:
         return False
-    price = float(svc["price"])
+    # PRICE-B1(事前公表の時間帯料金表。既定 {} = 恒等=バイト一致): 料金は「掲示されている
+    # 表のとおり」に決まる=時刻の純関数で係数を引くだけ(price_change は出さない)。
+    # ★所持金の判定より**前**に掛ける(表示価格で払えるかを見るのが正しい順)。
+    from . import commerce as _commerce
+    price = _commerce.apply_price(sim, float(svc["price"]),
+                                  sim.servicescfg["spend_cat"], node, sim_min)
     if float(getattr(agent, "money", 0.0)) < price:  # 到着時点で不足=受給しない
         return False
     spend(sim, agent, price, sim.servicescfg["spend_cat"], step, sim_min)   # 課金(会計不変)

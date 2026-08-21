@@ -632,6 +632,31 @@ def save(sim, step: int, path: str | Path, *, complete: bool = True) -> Path:
             #   inventory OFF のランでは空 dict = 挙動不変(load は .get で旧 ckpt 互換)。
             "goods_stock": getattr(sim, "_goods_stock", None),
             "goods_pending": getattr(sim, "_goods_pending", None),
+            # ★INV-A/B(2層在庫): 棚の裏(BY 在庫)・棚薄フラグ(在店店員の知覚トリガ)・
+            #   店主のレビュー窓を **B3 と同じ流儀**で運ぶ。運ばないと resume 直後に
+            #   BY が空へ戻り(在庫が消滅=保存則が破れる)、棚薄フラグが落ちて補充が
+            #   止まり、店主が同じ日に二度発注する。2層 OFF では空 dict = 挙動不変。
+            "goods_back": getattr(sim, "_goods_back", None),
+            "goods_low": getattr(sim, "_goods_low", None),
+            "goods_order_win": getattr(sim, "_goods_order_win", None),
+            "goods_ops": getattr(sim, "_goods_ops", None),
+            # ★日次で組み直す**派生索引**も運ぶ。派生だから捨ててよい、とはならない:
+            #   組み直す時刻が resume では step 途中になり、その日の city_ops 再バインドや
+            #   venture_open を**straight より先に**読んでしまう(= 同じ step で担い手集合が
+            #   食い違い、発注の担当が変わって L1 が分岐する)。日番号ごと運べば分岐しない。
+            "goods_staffed": getattr(sim, "_goods_staffed", None),
+            "goods_staffed_day": int(getattr(sim, "_goods_staffed_day", -1)),
+            "goods_store_nodes": getattr(sim, "_goods_store_nodes", None),
+            "goods_store_day": int(getattr(sim, "_goods_store_day", -1)),
+            # ★PRICE-B2(閉店前見切り): 当日の入荷バッチの標と、店員が刻んだ見切りの段階。
+            #   運ばないと resume 直後に段階が 0 へ戻り(同じ夕方に 0.8 をもう一度貼る=
+            #   markdown が二重に出る)、当日バッチの標も消えて見切りが止まる。既定 OFF は
+            #   どちらも空 dict = 挙動不変(load は .get で旧 ckpt 互換)。
+            #   ★_crowd_counts(CRWD の在館数表)は**運ばない**: 毎 step 冒頭に位置から
+            #     作り直す step ローカルな派生量で、位置そのものは checkpoint に載っている
+            #     から resume==straight が自動的に成り立つ(physics の格子と同じ流儀)。
+            "goods_delivered": getattr(sim, "_goods_delivered", None),
+            "md_stage": getattr(sim, "_md_stage", None),
             # ---- 都市運営(city_ops)の世界側カウンタ ------------------------------
             # ★B4(第118 レーンC): 救急の 1 日上限(calls_by_day)と夜間清掃の
             #   「1 棟 1 晩 1 件」ガード(cleaned_night)、役割バインドの日次追随
@@ -927,6 +952,27 @@ def load(sim, path: str | Path) -> int:
     _gp = rt.get("goods_pending")
     if _gp:
         sim._goods_pending = _gp
+    # INV-A/B(2層在庫): BY 在庫・棚薄フラグ・店主のレビュー窓・観測タリー(**同じ流儀**)。
+    # 旧 checkpoint / 2層 OFF では素通り = 従来どおり(BY 空・フラグ無し)。
+    for _attr, _key in (("_goods_back", "goods_back"), ("_goods_low", "goods_low"),
+                        ("_goods_order_win", "goods_order_win"),
+                        ("_goods_ops", "goods_ops"),
+                        # PRICE-B2: 当日の入荷バッチの標 + 見切りの段階(同じ流儀)
+                        ("_goods_delivered", "goods_delivered"),
+                        ("_md_stage", "md_stage")):
+        _val = rt.get(_key)
+        if _val:
+            setattr(sim, _attr, _val)
+    # 日次の派生索引(担い手集合・店ノード)は **空集合でも運ぶ**(空 = その日は担い手ゼロ、
+    # という確定した事実。素通りさせると resume 側だけが step 途中で組み直して分岐する)。
+    for _attr, _key in (("_goods_staffed", "goods_staffed"),
+                        ("_goods_store_nodes", "goods_store_nodes")):
+        if _key in rt and rt[_key] is not None:
+            setattr(sim, _attr, rt[_key])
+    for _attr, _key in (("_goods_staffed_day", "goods_staffed_day"),
+                        ("_goods_store_day", "goods_store_day")):
+        if _key in rt:
+            setattr(sim, _attr, int(rt[_key]))
     # B4(第118 レーンC): 都市運営の世界側カウンタ(救急の日次上限・夜間清掃の 1 晩ガード・
     # 役割バインドの日次追随)。旧 checkpoint / OFF では素通り = 従来どおり遅延生成。
     _cos = rt.get("co_state")

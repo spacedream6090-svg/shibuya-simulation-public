@@ -17,6 +17,8 @@
   park             公園・緑地に滞在 → grievance−   (環境心理: 回復環境)
   own_adopted      自分の造語を他者が採用 → ownership+ efficacy+(影響の実感=当事者化)
   money_pressure   手持ちが逼迫している間 → grievance+(経済的困難=hardship。1日1回)
+  store_crowding   混んだ(閑散とした)店で買えた/受けられた → grievance±(Blut & Iyer 2020:
+                   混雑→負の感情 r≈.32-.36 が最頑健。満足・行動への効きは極小。CRWD)
   media            在宅の娯楽メディア視聴 → grievance−(気分管理 Zillmann / ゲーム気分改善
                    Vuorre 2024。既定 magnitude 0.0=OFF 時完全不変。バッチD)
 """
@@ -324,6 +326,26 @@ def on_scarcity(agent, magnitude: float, *, step: int, sim_min: int,
     config が保持する(この関数は不透明な量だけ受け取る=no-fingerprint)。発火系(drive)には接続しない
     (呼び出し側は返り値で drive.add しない)=R1: 品切れは generate 呼数を1本も動かさない。"""
     return _bump(agent, "grievance", magnitude, "scarcity",
+                 step=step, sim_min=sim_min, logger=logger)
+
+
+def on_store_crowding(agent, magnitude: float, *, step: int, sim_min: int,
+                      logger: ObserverLogger) -> float:
+    """店の混み具合(買えた/受けられた**成立時**)が残す負の感情(grievance±)。CRWD(第147)。
+
+    商業ルート(現実ギャップ): 目的を達しても「混んでいた」体験は負の感情を残す。混雑と負の感情の
+    相関はメタ分析で最も頑健(r≈.32-.36。Blut & Iyer 2020・73標本1.9万人)である一方、満足への
+    直接効果は脆く行動への効きは極小(|r|≤.06)なので、**行動を止めず grievance だけを動かす**のが
+    文献に忠実な写し方になる。★magnitude は**負にもなりうる**(空きすぎの罰は正、業態によっては
+    中密度帯が快=負)。_bump は clip[0,1] の中で素直に上下する。
+
+    R9: 呼び出し側(commerce)は業態表・在館数・cap・時間帯平常値をすべて自分側で畳んで
+    **不透明な magnitude** だけを渡し、この関数は traits も店も在館数も見ない(on_scarcity /
+    on_congestion と同型)。magnitude=0.0(混雑機構 OFF、または不満の始まり L0 未満)なら _bump が
+    state を触らず記録もしない=バイト一致。係数は commerce config が保持する(no-fingerprint)。
+    発火系(drive)には接続しない(呼び出し側は返り値で drive.add しない)=R1: 混雑は generate 呼数を
+    1 本も動かさない。"""
+    return _bump(agent, "grievance", magnitude, "store_crowding",
                  step=step, sim_min=sim_min, logger=logger)
 
 

@@ -129,6 +129,12 @@ DENSITY_FAR_DEFAULTS = {
     # = 現行挙動と 1 バイト同一**。false のままだと入退場のたびに `update_every` の
     # 周期が 0 へ巻き戻る = 粗い周期で作り直すという設計が churn の分だけ効かなくなる。
     "carry_grid": False,
+    # P4(2026-08-21): 密度格子の外延を「ゾーン polygon の外接矩形 ± この余白 [m]」との
+    # 共通部分へ落とす。**既定 0.0 = クリップしない = 現行挙動と 1 バイト同一**。
+    # なぜ要るか(第145 の実測): 外延は在場者の外接矩形で決まるのに、ゾーンの所有は
+    # 「経路がゾーンを通り抜ける個体」に**現在地(数百 m 先)から**始まるので、
+    # 38×29 m の広場に平均 117 万セル(~1 km 角)の場を作っていた。
+    "clip_margin_m": 0.0,
 }
 
 ZONE_DEFAULTS = {
@@ -471,10 +477,14 @@ def _build_density_far(raw) -> dict:
     out["blur"] = int(out["blur"])
     out["update_every"] = int(out["update_every"])
     out["carry_grid"] = bool(out["carry_grid"])
+    out["clip_margin_m"] = float(out["clip_margin_m"])
     if out["enabled"] and not (out["cell_m"] > 0.0 and out["blur"] >= 0
                                and out["update_every"] >= 1):
         raise ValueError("physics.density_far: cell_m>0 / blur>=0 /"
                          " update_every>=1 が必要")
+    if out["clip_margin_m"] < 0.0:
+        raise ValueError("physics.density_far: clip_margin_m>=0 が必要"
+                         "(0=クリップしない)")
     return out
 
 

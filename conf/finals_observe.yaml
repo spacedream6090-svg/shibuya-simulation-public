@@ -465,6 +465,12 @@ physics:
     enabled: true
   density_far:
     enabled: true
+    clip_margin_m: 10.0 # P4(2026-08-21ユーザー承認): 格子外延をゾーン外接矩形±10mへ有界化。従来は
+                        # 所有者全員の外接矩形=38×29mの広場に~1km角・平均97万セルの場を張っていた。
+                        # マスク方式(圏外は堆積せずρ=∇ρ=0=孤立歩行者に混雑回避力は働かない)。
+                        # 実測: セル1/10,600・physics.phase 30.5→9.4s/step(-69%)・基本図±20%帯/
+                        # 破綻統計はC構成と同値。下限の実証=margin 4mはfarカーネル到達5.3mを切り破綻
+                        # →10m(数値依存半径9.3mの外)。戻し=この1行を削除(既定0.0=従来外接矩形)。
     update_every: 30    # P1(2026-08-20ユーザー承認): 密度場再構築を0.5s→1.5s周期へ(読み出し=双線形
                         # サンプルは毎サブステップのまま)。根拠: prof_att火炎図で再構築24.3%(うち
                         # _box3平滑20.3%)→1/3化=全体−16%目安。base既定10は不触(golden無風)。
@@ -901,8 +907,36 @@ commerce:
   #   thr=0×sens=0 で demand_cap=0=購入時の在館数走査そのものが消える(250k の
   #   「購入×25万比較」レーンを根絶。commerce.py demand_cap docstring 参照)。
   price_sensitivity: 0.0
+  # CRWD(2026-08-20/21ユーザー承認・第146): 混雑不満=購入が成立しても負の感情だけが動く
+  #   (行動は止めない=メタ分析準拠・詳細は docs/research/crowding-dissatisfaction-empirics.md)。
+  #   ★cap は【暫定】: 基底既定は5-8千体規模の設計値で、25k外挿(購入点の平均在館≈73)では
+  #   ほぼ全件飽和(不満+記憶の洪水)になるため規模側へ置き直した。1日リハで帯分布
+  #   (閑散罰/無罰/ramp/飽和)を実測し freeze 前に確定する。
+  crowding:
+    enabled: true
+    cap: {food: 100, cafe: 60, shop: 120, nightlife: 80, service: 30}
+  # PRICE-B1(同承認): 事前公表の時間帯料金表(現実の型=ランチ/ディナー・ハッピーアワー)。
+  #   food 18-23時=1.67(900→1,500円)・nightlife 15-18時=0.8。price_change イベントは出さない
+  #   (掲示済み料金表は「価格の変化」ではない=洪水再発防止)。
+  price_schedule:
+    food:      [[1080, 1380, 1.67]]
+    nightlife: [[900, 1080, 0.8]]
+  # PRICE-B2(同承認): 閉店前見切り=在店店員の行動(公取委2009=見切りは店側裁量の法的裏付け)。
+  #   段階 0.8(閉店3h前)→0.5(1.5h前)・対象=food の当日入荷バッチ。担い手ゼロPOIのみ unstaffed。
+  markdown:
+    enabled: true
   inventory:
     enabled: true
+    # INV-A/B(2026-08-20ユーザー承認・第146): 2層在庫(棚+バックヤード)+店員/店主の行動としての
+    #   補充・発注。購入は棚のみ充足(「店内に在るが棚に無い」Gruen 25%帯を再現する機構)・
+    #   補充=在勤店員の shelf_restock 行動・発注=在勤者の stock_order 行動(欠勤なら発注されない)・
+    #   担い手ゼロのPOIのみ unstaffed_fallback(payload.unstaffed=true で観測)。
+    #   back_ratio は既定0.3(CVS/飲食の小分け納品帯。SM系1.5への業態割当は本選後の較正課題)。
+    #   戻し = two_tier ブロック削除(既定 false = 単層=現行)。
+    two_tier:
+      enabled: true
+    # INV-C(同承認): 発注レビュー窓。72 = Δt10分で1日2回(CVSの1日2-3便帯を表現)。0=現行の日次。
+    review_every_steps: 72
     b2b:
       enabled: true
       # レーン乙 D2: 卸の起動時在庫を「受け持つ小売の上限在庫 S の合計 × 日数」で与える
@@ -1248,6 +1282,11 @@ ontology:
 beliefs:
   enabled: true
   verify_actions: true
+  # FACT-D(2026-08-20ユーザー承認・第146): fact をエピソード単位に畳む(同一 kind×場所×topic の
+  #   fact は目撃窓が開いている間 1 件)。12h 継続の品切れ 1 店 = 従来「来客数ぶん」→
+  #   ceil(継続step/window)=12 件。stock_out 以外の将来のイベント洪水にも効く恒久ガード。
+  #   戻し = この 1 行を削除(既定 false = エピソード化なし=現行)。
+  fact_dedupe: true
   # WIT-1/2: 到達(半径 or 同一場所)と注意通過(p_notice)を分ける。ON の理由は「重いから切る」
   # ではなく「在場者全員が認知する世界は実測と 1 桁ずれていて研究対象(知識の非対称)を壊すから」。
   # 値の出典は docs/research/witness-empirics-ooh-retail.md(config.yaml の同ブロックに註釈)。

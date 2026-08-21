@@ -497,6 +497,22 @@ FEATURES: tuple[Feature, ...] = (
        "affects_k=false / fingerprint_risk=none は density_far.enabled と同じ理由。"
        "★格子はエンジンと同じく step ローカル(checkpoint に載らない)= resume 無風。"
        "★既定 false = 引き継がない = 現行挙動と 1 バイト同一"),
+    _f("physics.density_far.clip_margin_m", "strict", False, "none",
+       "密度格子の**外延**を「ゾーン polygon の外接矩形 ± この余白 [m]」との共通部分へ落とす。"
+       "なぜ要るか(第145 の実測): 外延は在場者の外接矩形で決まるのに、ゾーンの所有は"
+       "『経路がゾーンを通り抜ける個体』へ**現在地(数百 m 先)から**始まるので、"
+       "38×29 m の広場に平均 117 万セル(~1 km 角・float64 1 枚 9.4 MB)の場を毎回作って"
+       "いた(P3 の高速化後も physics.phase の 67%)。"
+       "★圏外は縁のセルへ押し込まず**堆積させない**(押し込むと遠方の一人歩きの密度が"
+       "縁に山積みになる)。読み出しも ρ=0・∇ρ=0 = 孤立歩行者に混雑回避力は働かない。"
+       "得られる場は『矩形の外のメンバーを名簿から外して作った場』とビット一致する"
+       "(名簿を削るだけ)。場の数値的な依存半径は (blur+2) セルしかないので、margin が"
+       "それ以上なら切り落としの影響はポリゴンの中まで届かない。"
+       "repro_tier=strict: 矩形はゾーン宣言の定数で、判定は位置の比較だけ(乱数ゼロ)。"
+       "affects_k=false / fingerprint_risk=none は density_far.enabled と同じ理由。"
+       "★格子は step ローカル(checkpoint に載らない)= resume 無風。"
+       "★既定 0.0 = クリップしない = 新分岐を 1 度も通らない = 現行挙動と 1 バイト同一",
+       off_value=0.0),
 
     # ---- economy ----
     _f("economy.enabled", "strict", False, "none",
@@ -1351,6 +1367,11 @@ FEATURES: tuple[Feature, ...] = (
        "(WIT-1)。判定は blake2b の安定ハッシュだけで乱数 stream は 1 本も引かず、"
        "プロンプトにも 1 バイト足さない(=fingerprint_risk は none)。等級が journal なのは"
        "台帳そのもの(beliefs.enabled)と同じ理由=これが効くのは台帳が ON のときだけ"),
+    _f("beliefs.fact_dedupe", "journal", False, "none",
+       "同じ出来事(種 × 解決済みの場所 × 話題トークン)の fact を、目撃窓が開いているあいだ"
+       "1 件に畳む(FACT-D。1 エピソード 1 fact)。畳む判定は台帳の既存の欄だけを見る決定論で、"
+       "乱数 stream を 1 本も引かずプロンプトにも 1 バイト足さない(=fingerprint_risk は none)。"
+       "等級が journal なのは台帳そのもの(beliefs.enabled)と同じ理由=効くのは台帳 ON のときだけ"),
 
     # ---- worldview / ontology ----
     _f("worldview.enabled", "strict", False, "possible",
@@ -1989,6 +2010,59 @@ FEATURES: tuple[Feature, ...] = (
        "商業のダイナミクス(営業時間・動的価格・品切れ)"),
     _f("commerce.inventory.enabled", "strict", False, "none",
        "実在庫・日次補充トリップ・商品実体"),
+    # ---- 2層在庫 INV-A/B/C(第143。決定論・乱数ゼロ・LLM 呼数不変・整数のみ)----
+    _f("commerce.inventory.two_tier.enabled", "strict", False, "none",
+       "2層在庫(棚+バックヤード)。購入は**棚からのみ**充足し(BY に在っても補充まで品切れ="
+       "Gruen「店内に在るが棚に無い」を再現する唯一の構造)、納品は BY へ入る。BY 容量="
+       "棚容量×back_ratio(業態別)。order-up-to は棚容量+BY容量へ 2 段拡張((R,s,S) の教科書"
+       "どおり)。既存の (s,S) 発注・リード・b2b・封鎖時の補充失敗は不変。既定 OFF=在庫は 1 層の"
+       "まま=L1 バイト一致(BY 台帳も棚薄フラグも生えない)"),
+    _f("commerce.inventory.two_tier.staff_restock", "strict", False, "none",
+       "棚出しを**在店店員の行動**にする(shelf_restock)。世界の状態(棚が補充点を割った)は"
+       "購入時に O(1) で立つ当人の知覚トリガで、変化(棚が埋まる)はその個体の行動の結果として"
+       "起きる。BY が空なら 1 個も動かない=棚は空のまま(正しい欠品)。1 店 1 補充=L1 の洪水を"
+       "作らない。two_tier OFF では 1 バイトも効かない", off_value=True),
+    _f("commerce.inventory.two_tier.staff_order", "strict", False, "none",
+       "発注を**店主/店長の出勤中の行動**にする(stock_order)。エンジンの日次一括レビューは"
+       "担い手の居る店を走査しなくなる=**欠勤すれば発注されない**(品切れが本人の事情の帰結に"
+       "なる)。発注の帰結である stock_low / delivery_trip / リード / b2b は従来と同一。"
+       "two_tier OFF では 1 バイトも効かない", off_value=True),
+    _f("commerce.inventory.two_tier.unstaffed_fallback", "strict", False, "none",
+       "**担い手(work_node を持つ個体)が 1 人も割り当てられていない POI に限り**、従来型の"
+       "エンジン規則で補充・発注を代替再現する(shelf_restock は agent_id=-1 + unstaffed=true)。"
+       "職場ノード縮退の未カバー分を黙って無人で動かさないための宣言つき退避路で、カバー率は"
+       "summary.json の goods.staff_coverage が正直に出す(誇張しない)。false=未カバー POI は"
+       "補充も発注もされない(在庫が尽きたまま)", off_value=True),
+    _f("commerce.inventory.two_tier.percept", "strict", False, "possible",
+       "来店中の客の percept へ、いま居る店の棚の様子を **非潤沢のときだけ** 1 行足す"
+       "(残りわずか=補充点未満 / 空)。購入判定が店の実在庫台帳を直接読む(pull 型)のと同じ"
+       "現場主義で、「棚を見た」ことが LLM の判断・会話・記憶に自然に効く。O(1)/来店・"
+       "LLM 呼数不変・プロンプト +1 行のみ(trace_line と同型 seam)", off_value=True),
+    # ---- CRWD 混雑不満 / PRICE-B 時間帯価格・閉店前見切り(第147。決定論・乱数ゼロ・LLM 呼数不変)----
+    _f("commerce.crowding.enabled", "strict", False, "none",
+       "混んだ(閑散とした)店で**買えた/受けられた**ときにも残る負の感情(grievance±)。"
+       "Δgrievance = m_cat · ramp(L̃; L0, L1)・L=在館数/cap_cat・"
+       "L̃=(1−w_e)L + w_e·max(0, L−E(cat,時間帯))(予期の減衰)。業態で符号が割れる"
+       "(nightlife の中密度帯は負=社会的高揚)。文献上、混雑→負の感情は最も頑健(r≈.32-.36)だが"
+       "行動への効きは極小(|r|≤.06)なので**行動を止めず grievance だけ**を動かす。"
+       "在館数は毎 step 冒頭に 1 回だけ作る表を O(1) で引く(購入ごとの全走査は復活させない)。"
+       "drive(発火系)に接続せず・乱数ゼロ・LLM 呼数不変・k 非依存=affects_k=false。"
+       "既定 OFF=1 度も評価しない=現行挙動と 1 バイト同一"),
+    _f("commerce.price_schedule", "strict", False, "none",
+       "PRICE-B1 事前公表の時間帯料金表(cat → [開始分, 終了分, 係数])。ランチ/ディナー・"
+       "ハッピーアワーのように**あらかじめ掲示された表**どおりに払う=実店舗の価格が動く現実の型。"
+       "★price_change イベントは出さない(掲示済みの表どおりに払うのは『価格の変化』ではなく、"
+       "購入 1 件ごとに 1 件出せば L1 のイベント洪水が種目を替えて再発する)。時刻の純関数・"
+       "O(帯数)・乱数ゼロ。既定 {} = 恒等 1.0 = 消費額不変 = 現行挙動と 1 バイト同一",
+       off_value={}),
+    _f("commerce.markdown.enabled", "strict", False, "none",
+       "PRICE-B2 閉店前見切り。閉店の N step 前 × 棚に当日の入荷バッチが残っている店で、"
+       "**在店店員の行動** markdown(L1・causality=AGENT)が段階係数(0.8→0.5)を貼り、"
+       "以後その店のその業態の価格に乗る。翌朝(日鍵)と閉店でリセット。担い手が 1 人も"
+       "割り当てられていない POI だけ unstaffed=true の代替再現(INV-B と同一規約)。"
+       "在勤述語は INV-B の staff_phase に相乗りする=見切り専用の勤務概念を発明しない。"
+       "在庫(commerce.inventory)ON が前提(見切る棚が要る)。乱数ゼロ・LLM 呼数不変。"
+       "既定 OFF=markdown 0 件・価格係数 1.0=現行挙動と 1 バイト同一"),
     _f("commerce.inventory.b2b.enabled", "strict", False, "none",
        "供給網の内生化(組織間の B2B 取引)"),
     # ---- 第114 レーン乙: 供給の詰まりを解く 2 件(決定論・乱数ゼロ・LLM 呼数不変)----

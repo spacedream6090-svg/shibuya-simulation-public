@@ -307,6 +307,20 @@ CAUSE_OF_KIND: dict[str, str] = {
     "restock":       DEVICE,
     "stock_low":     DEVICE,
     "stock_out":     DEVICE,
+    "shelf_restock": AGENT,          # 棚出しは**在店店員の行為**(agent_id = 当人)。担い手が 1 人も
+                                     #  割り当てられていない POI の代替再現だけ agent_id=-1 +
+                                     #  payload["unstaffed"]=true(actor_id は None へ畳まれる)。
+                                     #  ★装置 id は与えない: 棚を埋める機械は世界に無い(W3 の原則)。
+                                     #    無人の行は「担い手が居ないので誰の行為でもない」が正しく、
+                                     #    そこを pos: に寄せると「棚出し装置」という嘘の制度が生える
+    "stock_order":   AGENT,          # 発注は**店主/店長の行為**(欠勤すれば発注されない)。
+                                     #  発注の帰結である stock_low / delivery_trip は従来どおり device
+    "markdown":      AGENT,          # 見切り(値引きシール)は**在店店員の行為**=公取委2009 で
+                                     #  法的にも「店側の裁量行動」と確定している類型。shelf_restock と
+                                     #  同じ規約で、担い手ゼロの POI の代替再現だけ agent_id=-1 +
+                                     #  payload["unstaffed"]=true。★装置 id は与えない(値札を貼る
+                                     #  機械は世界に無い)。事前公表の時間帯料金表(B1)は
+                                     #  そもそもイベントを出さない=ここに現れない
     "b2b_trade":     DEVICE,
     "price_change":  DEVICE,         # device_id=commerce:pricing(購入 seam の per-emit 刻印。
                                      #  隣の spend は agent なので刻まれない = W3 の線引きの実例)

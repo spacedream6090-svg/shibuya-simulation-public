@@ -819,7 +819,11 @@ def _charge_meal(sim, agent, step: int, sim_min: int) -> None:
     """飲食 POI 到着時に代金を支払う(食事/nightlife)。
 
     商業ダイナミクス(H3)ON 時は需要(在館数)に応じて価格係数を掛け(price_change)、需要集中で
-    品切れ/行列なら購入を抑制する(stock_out+不満)。commerce OFF なら基準価格をそのまま払う(不変)。"""
+    品切れ/行列なら購入を抑制する(stock_out+不満)。commerce OFF なら基準価格をそのまま払う(不変)。
+
+    価格の合成順(PRICE-B。既定=空/OFF は恒等=1 ビットも変わらない):
+      基準価格 → 在館連動係数(既存) → 事前公表の時間帯料金表 × 閉店前見切り → 消費行動の予算。
+    購入が**成立した**あとに、その場の混み具合を不満へ写す(CRWD。既定 OFF=no-op)。"""
     if not _economy_on(sim):
         return
     cat = next((p["cat"] for p in sim.city.pois_at_node(agent.node)
@@ -831,6 +835,7 @@ def _charge_meal(sim, agent, step: int, sim_min: int) -> None:
         amount = commerce_mod.on_purchase(sim, agent, cat, amount, step, sim_min)
         if amount is None:                         # 品切れ/行列 → 購入抑制(spend を出さない)
             return
+    amount = commerce_mod.apply_price(sim, amount, cat, agent.node, sim_min)
     item = None
     if _goods_on(sim):                             # 物流①②: 実在庫を1単位消費・買った物を付与(決定論)
         ok, item = goods_mod.on_purchase(sim, agent, cat, step, sim_min)
@@ -838,6 +843,7 @@ def _charge_meal(sim, agent, step: int, sim_min: int) -> None:
             return
     amount = _budget_amount(sim, agent, cat, amount)   # E-W3 消費行動(既定 OFF=不変)
     _spend(sim, agent, amount, cat, step, sim_min, item=item)
+    commerce_mod.apply_crowding(sim, agent, cat, step, sim_min)
 
 
 def _services_on(sim) -> bool:
@@ -849,11 +855,15 @@ def _charge_service(sim, agent, step: int, sim_min: int) -> None:
     """サービス POI 到着時の受給(第46バッチ ③): 課金(_spend)+ 効果(factors on_service)+ 記憶 + service_use。
 
     経済無効なら受給しない(_charge_meal と同型)。実体は services.charge_service に閉じる(engine は
-    サービス名・効果・因子を書かない=no-fingerprint)。課金は既存 _spend 経路(会計不変)。RNG は引かない。"""
+    サービス名・効果・因子を書かない=no-fingerprint)。課金は既存 _spend 経路(会計不変)。RNG は引かない。
+
+    受給が**成立した**ときだけ、その場の混み具合を不満へ写す(CRWD。既定 OFF=no-op=バイト一致)。"""
     if not _economy_on(sim):
         agent._service_pending = None
         return
-    services_mod.charge_service(sim, agent, step, sim_min, _spend)
+    if services_mod.charge_service(sim, agent, step, sim_min, _spend):
+        commerce_mod.apply_crowding(sim, agent, services_mod.spend_cat(sim),
+                                    step, sim_min)
 
 
 def _charge_ride(sim, agent, ride: dict, step: int, sim_min: int) -> None:
@@ -2368,6 +2378,10 @@ def _gather_material(sim, agent, trigger: str, step: int, sim_min: int, *,
     # 現在ノードに残る痕跡のうち**最強 1 件**を中立 1 行に(強度・件数・階層名は出さない)。
     # 集約時に同席していた当事者には出さない。決定論・乱数ゼロ・LLM 呼ゼロ=R1。
     trace_line = traces_mod.line_for(sim, agent)
+    # 来店時の棚知覚(INV-A・commerce.inventory.two_tier.percept・既定 OFF は None=1行も足さない
+    # =バイト一致)。いま居る店の棚が **非潤沢のときだけ** 3値(残りわずか/空)を 1 行に。
+    # 決定論・乱数ゼロ・LLM 呼数不変=R1(在庫台帳を O(1) で読むだけ=trace_line と同型 seam)。
+    shelf_line = goods_mod.shelf_note(sim, agent)
     # 構造化シーン記述 v0(scene_desc 有効時のみ。方向つき視界/注視対象/垂直関係の 2〜4 行)。
     # 決定論・追加 LLM 呼ゼロ・乱数ゼロの純関数。company(同席者=LOS 済み)を注視の人ソースに
     # 使う。OFF は None=1行も足さない=バイト一致(crowd_line と同型 seam)。
@@ -2415,6 +2429,7 @@ def _gather_material(sim, agent, trigger: str, step: int, sim_min: int, *,
             "ads_line": ads_line,
             "place_label_line": place_label_line,
             "trace_line": trace_line,
+            "shelf_line": shelf_line,
             "crowd_line": crowd_line,
             "wv_expect_line": wv_expect_line,
             "wv_self_line": wv_self_line,
@@ -3698,6 +3713,9 @@ def _apply_action(sim, agent, action: dict, step: int, sim_min: int) -> None:
             price = price_of(cat, sim.economy, getattr(sim, "rulebook", None))
             if _commerce_on(sim):                  # 動的価格/在庫を消費額に反映(既存 draw の外・決定論)
                 price = commerce_mod.on_purchase(sim, agent, cat, price, step, sim_min)
+            # PRICE-B(既定=空/OFF は恒等=1 ビットも変わらない): 事前公表の時間帯料金表 ×
+            # 閉店前見切り。_charge_meal と**同じ合成順**で乗せる。
+            price = commerce_mod.apply_price(sim, price, cat, agent.node, sim_min)
             item = None
             if price is not None and _goods_on(sim):   # 物流①②: 実在庫を消費・買った物を付与(決定論)
                 ok, item = goods_mod.on_purchase(sim, agent, cat, step, sim_min)
@@ -3705,6 +3723,8 @@ def _apply_action(sim, agent, action: dict, step: int, sim_min: int) -> None:
                     price = None
             if price is not None and agent.money >= price:   # 品切れ(None)= 購入抑制
                 _spend(sim, agent, price, cat, step, sim_min, item=item)
+                # CRWD(既定 OFF=no-op): 買えた=成立時にその場の混み具合を不満へ写す。
+                commerce_mod.apply_crowding(sim, agent, cat, step, sim_min)
         cx, cy = bld["centroid"]
         agent.x = cx + float(rng.uniform(-8, 8))
         agent.y = cy + float(rng.uniform(-8, 8))
@@ -5563,6 +5583,17 @@ def _phase_goods(sim, step: int, sim_min: int) -> None:
         goods_mod.tick(sim, step, sim_min)
 
 
+def _phase_goods_staff(sim, step: int, sim_min: int) -> None:
+    """毎step: 棚出し(店員の行動)+ 自店の発注(店主の行動)(既定OFF=no-op。INV-B)。
+
+    **位置確定後**に呼ぶ(street_life / city_ops と同じ位置): 「自分の職場に居るか」を
+    この step の確定した co-location で判定するため。世界の状態(棚が減った)は当人の
+    知覚トリガであり、変化(棚が埋まる・発注される)は当人の行動の結果として起きる。
+    担い手が 1 人も割り当てられていない POI だけ、宣言つきでエンジンが代替再現する。
+    LLM 呼ゼロ・乱数ゼロ・k 非依存。2層 OFF なら完全 no-op(shelf_restock/stock_order 0 件)。"""
+    goods_mod.staff_phase(sim, step, sim_min)
+
+
 def _phase_delivery(sim, step: int, sim_min: int) -> None:
     """毎step: 宅配④の物理配車(dispatch)+ 到着処理(受給+課金+gig収入)(既定OFF=no-op。スライス④)。
 
@@ -6350,6 +6381,13 @@ def run_step(sim, step: int) -> None:
     # 入場方向(この step の帰還=enter_area)の δ_ext + 要約の記録。**physics と同じ位置**に
     # 置く = この step の退出(_try_exit / 下の再試行)が同じ整備窓の残り定員を消費する。
     devices_mod.phase(sim, step, sim_min)
+    # CRWD 混雑不満(既定 OFF=None=1 走査も作らない=バイト一致): この step の**開始時点**の
+    # 「ノード→在館・覚醒人数」表を **1 回だけ**(O(N))作る。購入/受給の成立点はこの表を
+    # O(1) で引く=購入 1 件ごとの全走査(本選規模で数十億比較)を復活させない。
+    # ★位置を動かすのは下の physics / _phase_move なので、ここが「この step で全員が同じ
+    #   時点を見る」唯一のスナップショットになる(日次のローテーション・転出入は確定済み)。
+    # ★step ローカルな派生量なので checkpoint には載せない(位置から作り直せる)。
+    sim._crowd_counts = commerce_mod.step_counts(sim)
     # P3 境界縫合(竹-4。既定 OFF=即 return=バイト一致): **_phase_move の直前**に置く。
     # この時点の (x,y) が「この step の開始時の位置」= 2 層タイムラインの下層(dt_sub)が
     # 刻むのはまさにこの step の 600 秒だから。物理が所有した個体は _phase_move が飛ばす。
@@ -6391,6 +6429,10 @@ def run_step(sim, step: int) -> None:
     # 行為連鎖で、時刻表では 1 件も撃たない。乱数ゼロ・LLM 追加呼ゼロ・プロンプトの欄ゼロ増。
     _phase_health_severity(sim, step, sim_min)     # 身体: 発症の発火・回復・転帰(既定OFF=no-op。H1)
     city_ops_mod.phase(sim, step, sim_min)
+    # 2層在庫の担い手(INV-B。既定OFF=即 return=バイト一致)。**city_ops と同じ位置**
+    # (位置確定後)に置く: 店員が自分の店に居るかを、この step の確定した co-location で
+    # 判定するため。棚出しはフラグの立った店だけ=イベント駆動(新しい全走査を足さない)。
+    _phase_goods_staff(sim, step, sim_min)
     _phase_health_tick(sim, step, sim_min)         # 疲労ゲージの毎step更新(既定OFF=no-op。後続波 H1)
     street_mod.phase(sim, step, sim_min)           # 街頭広告の視認判定(既定OFF=no-op。第18バッチ)
     # 位置が確定したこの時点で空間索引を1回だけ張る。以降の _phase_drive/_decide の

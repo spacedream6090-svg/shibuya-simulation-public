@@ -47,6 +47,69 @@ _DEFAULT_HOURS = {
     "nightlife": [18, 5],   # 夜遊び 18:00〜翌05:00(夜間営業)
 }
 
+# ---------------------------------------------------------------- CRWD 既定表(混雑不満)
+# 正典 docs/plans/inventory-two-tier-plan.md §1.6 / リサーチ
+# docs/research/crowding-dissatisfaction-empirics.md §6 表・§7(予期)・§8(常連補正は採用棄却)。
+#
+# cap_cat = 「業態別の想定同時収容」。★これは閾値の**引用ではなく設計値**である(§9: 小売文献に
+#   『人/m² の混雑知覚閾値』は存在しない)。アンカーは待ち行列・立位域 LOS B(0.9 m²/人)相当で
+#   収まる人数で、L=0.6 が LOS A/B 境界・L=1.4 が LOS D 帯に対応するよう置いた。
+_CRWD_DEFAULT_CAP = {"food": 20, "shop": 30, "nightlife": 40, "cafe": 15, "service": 8}
+
+# 業態表(§6 表)。l0=不満の始まり / l1=飽和 / m=上限マグニチュード。
+#   quiet_l/quiet_m … 閑散罰(L<quiet_l で +quiet_m。Tse 2002 の social proof=空きすぎも負)。
+#   u_lo/u_hi/u_m   … U 字の**負帯**(その区間は grievance が下がる=社会的高揚)。nightlife のみ。
+# 上限は品切れ不満(stock_grievance=0.02)の 0.3-0.5 倍・既存 congestion_grievance=0.010 と同水準。
+_CRWD_DEFAULT_TABLE = {
+    # 物販: 課題志向で最も負(Eroglu & Machleit 1990)。単調増加。
+    "shop":      {"l0": 0.6, "l1": 1.3, "m": 0.008},
+    # 飲食: 単調増加 + 閑散罰。
+    "food":      {"l0": 0.7, "l1": 1.4, "m": 0.010, "quiet_l": 0.3, "quiet_m": 0.004},
+    # カフェ: リサーチ表に独立行は無い(飲食の下位業態)。food 行を流用し cap だけ小さく置く
+    #   (Yildirim & Akalin-Baskaya 2007 の席密度=中密度選好とも矛盾しない)= 正直な設計値。
+    "cafe":      {"l0": 0.7, "l1": 1.4, "m": 0.010, "quiet_l": 0.3, "quiet_m": 0.004},
+    # 対人サービス: 待ち主体で per-event は最小。
+    "service":   {"l0": 0.6, "l1": 1.2, "m": 0.006},
+    # 夜遊び: U 字。L∈[0.3,1.1] は **負**(−0.004=社会的高揚。Noone & Mattila 2009 / Novelli 2013)、
+    #   L<0.3 は閑散罰、L>1.1 で圧迫(spatial は hedonic でこそ悪化=§2 の符号反転は human 側だけ)。
+    #   ★l1=1.8 は**設計値**: 表の l1 は「正に戻る点」(=1.1)であって飽和点ではないので、
+    #     他業態の l1−l0 ≈ 0.6-0.7 帯を踏襲して飽和点を置いた(段差にしない)。
+    "nightlife": {"l0": 1.1, "l1": 1.8, "m": 0.010,
+                  "u_lo": 0.3, "u_hi": 1.1, "u_m": -0.004,
+                  "quiet_l": 0.3, "quiet_m": 0.004},
+}
+
+#: 時間帯バンドの名前(band_hours の各要素に対応。最後の帯だけ日を跨ぐ)。
+_CRWD_BANDS = ("morning", "midday", "evening", "night")
+#: バンドの開始時(24h)。朝 05-11 / 昼 11-16 / 夕 16-21 / 夜 21-05。
+_CRWD_BAND_HOURS = (5, 11, 16, 21)
+
+# E(cat, band) = その時間帯の**平常負荷**(= L の平常水準)。予期された混雑は効果が大きく減衰する
+#   (de Oliveira Santini 2021: 予期される文脈で r=−.017 / されない文脈で −.308。ただし Machleit
+#   2000 は「減衰であって消去でない」)ので、L̃ で絶対負荷と超過分を w_e で混ぜる。
+# ★初期値は控えめに 0.2-0.8 帯へ収めた(根拠: 二山の生活リズム=飲食はランチ/ディナー・物販は
+#   夕方が最大・夜遊びは夜が本番。渋谷の実測人流に当てた較正ではない=**設計値**である)。
+_CRWD_DEFAULT_EXPECTED = {
+    "food":      {"morning": 0.2, "midday": 0.8, "evening": 0.7, "night": 0.4},
+    "cafe":      {"morning": 0.3, "midday": 0.6, "evening": 0.5, "night": 0.3},
+    "shop":      {"morning": 0.3, "midday": 0.6, "evening": 0.7, "night": 0.3},
+    "service":   {"morning": 0.2, "midday": 0.5, "evening": 0.5, "night": 0.2},
+    "nightlife": {"morning": 0.2, "midday": 0.2, "evening": 0.5, "night": 0.8},
+}
+
+# ---------------------------------------------------------------- PRICE-B2 既定(閉店前見切り)
+# 段階は「遠い→近い」順の 2 本の**平行リスト**で持つ:
+#   stage_steps … 閉店まで何 step でその段階に入るか(Δt=10 分で 18=3h / 9=1.5h)
+#   stage_coefs … その段階の価格係数(実務の段階式: まず軽く下げ、閉店 1-2 時間前に半額帯)
+# ★なぜ [[step, 係数], ...] の入れ子にしないか: step 次元の量は Δt に**逆比例**で変換される
+#   必要があり(timeconv.TABLE の STEPS)、その変換は「数値の平坦なリスト」にしか掛からない。
+#   入れ子にすると「宣言はしたが実際は変換されない」= Δt を変えた瞬間に見切りの時刻が
+#   ずれる、という静かな壊れ方をする。係数は Δt 非依存(INVARIANT)なので分けるのが正しい。
+_MD_DEFAULT_STAGE_STEPS = (18, 9)
+_MD_DEFAULT_STAGE_COEFS = (0.8, 0.5)
+#: 見切りの対象カテゴリ(当日入荷バッチの概念があるのは生鮮=飲食)。
+_MD_DEFAULT_CATS = ("food",)
+
 DEFAULTS = {
     "enabled": False,
     # ---- 営業時間(cat → (open_min, close_min)。build_cfg が時→分へ変換)----
@@ -59,6 +122,19 @@ DEFAULTS = {
     # ---- 在庫/品切れ・行列(在館数が stock_threshold 以上で品切れ/行列=購入抑制+不満)----
     "stock_threshold": 6,        # これ以上の在館で品切れ/行列(0 以下=在庫機構 無効)
     "stock_grievance": 0.02,     # 品切れ/行列に遭遇 → 不満(factors 経由。0.0=観測のみ=grievance 不変)
+    # ---- PRICE-B1 事前公表の時間帯料金表(cat → [[開始分, 終了分, 係数], ...])----
+    #      既定 {} = 恒等 1.0 = 消費額不変(バイト一致)。★price_change は出さない
+    #      (掲示済みの料金表は「価格の**変化**」ではない=イベント洪水を作らない)。
+    "price_schedule": {},
+    # ---- PRICE-B2 閉店前見切り(在店店員の行動 markdown)----
+    "markdown": {"enabled": False, "cats": list(_MD_DEFAULT_CATS),
+                 "stages": tuple(zip(_MD_DEFAULT_STAGE_STEPS, _MD_DEFAULT_STAGE_COEFS))},
+    # ---- CRWD 混雑不満(購入/受給の成立時)----
+    "crowding": {"enabled": False, "w_e": 0.6, "default_cap": 20.0,
+                 "cap": dict(_CRWD_DEFAULT_CAP),
+                 "table": {k: dict(v) for k, v in _CRWD_DEFAULT_TABLE.items()},
+                 "expected": {k: dict(v) for k, v in _CRWD_DEFAULT_EXPECTED.items()},
+                 "band_hours": list(_CRWD_BAND_HOURS)},
 }
 
 # 在館数の打ち切りが効かない(= 全走査する)ことを表す番兵。demand_cap / count_at_node で使う。
@@ -94,7 +170,67 @@ def build_cfg(raw) -> dict:
         cfg[k] = float(raw.get(k, DEFAULTS[k]))
     for k in _INT_KEYS:
         cfg[k] = int(raw.get(k, DEFAULTS[k]))
+    cfg["price_schedule"] = _build_price_schedule(raw.get("price_schedule"))
+    cfg["markdown"] = _build_markdown(raw.get("markdown"))
+    cfg["crowding"] = _build_crowding(raw.get("crowding"))
     return cfg
+
+
+def _build_price_schedule(raw) -> dict:
+    """B1: cat → [(開始分, 終了分, 係数), ...] を型強制つきで正準化(既定 {} = 恒等)。
+
+    帯は **リストの並び順に最初に当たったものが勝つ**(決定論・O(帯数))。開始>終了は
+    日跨ぎ(営業窓 is_open_window と同じ式で判定する=時刻判定を 1 か所に保つ)。"""
+    out: dict[str, tuple] = {}
+    for cat, bands in dict(raw or {}).items():
+        rows = []
+        for b in (bands or []):
+            rows.append((int(b[0]) % 1440, int(b[1]) % 1440, float(b[2])))
+        if rows:
+            out[str(cat)] = tuple(rows)
+    return out
+
+
+def _build_markdown(raw) -> dict:
+    """B2: 閉店前見切りの正準 cfg(既定 enabled=false=1 度も評価しない)。
+
+    conf は **平行な 2 本のリスト**(stage_steps / stage_coefs)で受け、内部では
+    [(閉店まで何 step, 係数), ...] を **遠い→近い順**に持つ。段階は「残り step がその閾値
+    以下」で成立し、より近い(=後ろの)段階が優先される(単調に下がる=戻らない)。
+    2 本の長さが食い違う conf は短いほうに合わせる(黙って捏造しない)。"""
+    src = dict(raw or {})
+    steps = [max(0, int(s)) for s in (src.get("stage_steps") or _MD_DEFAULT_STAGE_STEPS)]
+    coefs = [float(c) for c in (src.get("stage_coefs") or _MD_DEFAULT_STAGE_COEFS)]
+    cats = [str(c) for c in (src.get("cats") or _MD_DEFAULT_CATS)]
+    return {"enabled": bool(src.get("enabled", False)),
+            "cats": tuple(cats), "stages": tuple(zip(steps, coefs))}
+
+
+def _build_crowding(raw) -> dict:
+    """CRWD: 混雑不満の正準 cfg(既定 enabled=false=1 度も評価しない=バイト一致)。
+
+    cap / table / expected は **既定表へ上書きマージ**する(conf でカテゴリを 1 つ足す/
+    1 つの係数だけ変える、が dotlist でも YAML でもできる)。"""
+    src = dict(raw or {})
+
+    def _merge_rows(key, default_map):
+        out = {k: dict(v) for k, v in default_map.items()}
+        for k, v in dict(src.get(key) or {}).items():
+            row = dict(out.get(str(k), {}))
+            row.update({str(kk): float(vv) for kk, vv in dict(v or {}).items()})
+            out[str(k)] = row
+        return out
+
+    cap = {str(k): float(v) for k, v in _CRWD_DEFAULT_CAP.items()}
+    cap.update({str(k): float(v) for k, v in dict(src.get("cap") or {}).items()})
+    bands = [int(h) for h in (src.get("band_hours") or _CRWD_BAND_HOURS)]
+    return {"enabled": bool(src.get("enabled", False)),
+            "w_e": float(src.get("w_e", 0.6)),
+            "default_cap": float(src.get("default_cap", 20.0)),
+            "cap": cap,
+            "table": _merge_rows("table", _CRWD_DEFAULT_TABLE),
+            "expected": _merge_rows("expected", _CRWD_DEFAULT_EXPECTED),
+            "band_hours": bands}
 
 
 def enabled(sim) -> bool:
@@ -356,6 +492,350 @@ def on_purchase(sim, agent, cat: str, base_amount: float, step: int,
                                 "cat": cat, "ratio": round(coef, 3)}),
             devices_mod.DEV_COMMERCE_PRICING)
     return float(base_amount) * coef
+
+
+# =========================================================================== #
+# CRWD: 混雑不満(購入/受給の**成立時**)。第147 / 正典 §1.6
+# --------------------------------------------------------------------------- #
+# ユーザー仮説「混雑していたが買えた/食べられた場合にも不満は溜まる」を、リサーチ
+# (docs/research/crowding-dissatisfaction-empirics.md)の修正 3 点つきで実装する層:
+#   ① 線形無限伸長でなく**閾値つき飽和**(ramp)。感情尺度は端で頭打ちになる。
+#   ② 業態で符号が割れる(nightlife の中密度帯は快=U 字。human 側だけで実証済み)。
+#   ③ **予期**された混雑は効果が大きく減衰する(時間帯平常値 E からの超過で近似)。
+# 採らなかったもの(見送りでなく**採用棄却**。§8): 常連補正・c_choice(自発来店割引)。
+#   「常連は混雑に寛容」は文献的に支持されず、観測上のそれは displacement の生存者バイアスで
+#   説明できる。ABM ではその交絡を**係数でなく行動の結果**として自然発生させるのが正しい
+#   (不満の高い個体が来店時間/店を変える → 残存客の平均不満が下がる)。
+#   待ち成分も入れない(待ち行列モデルが世界に無い=無いものを係数で騙らない)。
+#
+# 費用: 乱数ゼロ・LLM 呼数不変・k 非依存・drive(発火系)に接続しない(R1)。在館数は
+#   **毎 step 冒頭に 1 回だけ**作る表(scheduler が sim._crowd_counts へ置く)を O(1) で引く。
+#   ★購入ごとの全走査(count_at_node)は**復活させない**(250k で数十億比較の再発防止)。
+# =========================================================================== #
+#: 飽和した混雑の記憶(定型文。機構語・実験条件語・因子名を 1 文字も含まない)。
+_CROWD_TEXT = "店がとても混んでいた"
+
+
+def crowding_on(sim) -> bool:
+    """混雑不満(CRWD)が有効か。既定 OFF=新経路を一切通さない(バイト一致)。
+
+    ★commerce.enabled とは**独立**に効く(inventory と同じ規約)。混雑不満は営業時間ゲートや
+    動的価格の有無と関係のない別機構なので、片方だけ ON にできるほうが対照実験しやすい。"""
+    cfg = getattr(sim, "commercecfg", None)
+    return bool(cfg and cfg["crowding"]["enabled"])
+
+
+def step_counts(sim) -> dict | None:
+    """CRWD 用に **1 step につき 1 回だけ**作る「ノード→在館・覚醒人数」表(OFF は None)。
+
+    述語は ``occupancy`` と完全に同じ(loc!=outside かつ not sleeping)。scheduler が step の
+    冒頭(位置が動く前)に 1 回だけ呼び、購入点はその表を O(1) で引く。OFF では 1 走査も
+    作らない=バイト一致・追加コストゼロ。"""
+    return node_counts(sim) if crowding_on(sim) else None
+
+
+def ramp(x: float, l0: float, l1: float) -> float:
+    """閾値つき飽和 ramp(x; L0, L1) = clamp((x−L0)/(L1−L0), 0, 1)(純関数)。
+
+    L1<=L0(退化した幅)のときは段差(x>=L1 で 1.0)= 0 除算を作らない安全側。"""
+    if l1 <= l0:
+        return 1.0 if float(x) >= l1 else 0.0
+    return _clip((float(x) - float(l0)) / (float(l1) - float(l0)), 0.0, 1.0)
+
+
+def crowding_band(cfg: dict, sim_min: int) -> str:
+    """時刻 → 平常負荷 E を引く時間帯バンド(朝/昼/夕/夜。時刻の純関数・決定論)。"""
+    hs = cfg["crowding"]["band_hours"]
+    if not hs:
+        return _CRWD_BANDS[-1]
+    h = (int(sim_min) % 1440) // 60
+    if h < int(hs[0]) or h >= int(hs[-1]):
+        return _CRWD_BANDS[-1]                       # 最後の帯(夜)だけ日を跨ぐ
+    for i in range(len(hs) - 1, -1, -1):
+        if h >= int(hs[i]):
+            return _CRWD_BANDS[min(i, len(_CRWD_BANDS) - 1)]
+    return _CRWD_BANDS[-1]
+
+
+def crowding_load(cfg: dict, cat: str, occ: int, sim_min: int) -> float:
+    """予期を織り込んだ負荷 L̃ =(1−w_e)·L + w_e·max(0, L−E(cat,band))(純関数)。
+
+    L = 在館数 / cap_cat。w_e=0.0 なら純粋な絶対負荷 L そのもの(= 予期の減衰を切る)。
+    E は「その時間帯なら普通これくらい混んでいる」水準で、ピーク帯ほど罰が軽くなる。"""
+    cr = cfg["crowding"]
+    cap = float(cr["cap"].get(str(cat), cr["default_cap"]))
+    if cap <= 0.0:
+        return 0.0
+    load = float(int(occ)) / cap
+    e = float(dict(cr["expected"].get(str(cat), {})).get(crowding_band(cfg, sim_min), 0.0))
+    w = float(cr["w_e"])
+    return (1.0 - w) * load + w * max(0.0, load - e)
+
+
+def crowding_magnitude(cfg: dict, cat: str, occ: int, sim_min: int) -> float:
+    """Δgrievance = m_cat · ramp(L̃; L0, L1)(業態別。純関数・決定論・乱数ゼロ)。
+
+    分岐は 3 本で、上から順に排他:
+      ① 閑散罰   L̃ < quiet_l → +quiet_m(food/nightlife のみ。Tse 2002: 空きすぎも負)
+      ② U 字の負帯 u_lo ≤ L̃ ≤ u_hi → u_m(**負**=社会的高揚。nightlife のみ)
+      ③ 単調増加 m · ramp(L̃; l0, l1)
+    表に無いカテゴリは 0.0(= その業態には混雑不満を入れない、という宣言)。"""
+    row = cfg["crowding"]["table"].get(str(cat))
+    if not row:
+        return 0.0
+    x = crowding_load(cfg, cat, occ, sim_min)
+    q_l = float(row.get("quiet_l", 0.0))
+    if q_l > 0.0 and x < q_l:
+        return float(row.get("quiet_m", 0.0))
+    u_m = float(row.get("u_m", 0.0))
+    if u_m != 0.0 and float(row.get("u_lo", 0.0)) <= x <= float(row.get("u_hi", 0.0)):
+        return u_m
+    return float(row.get("m", 0.0)) * ramp(x, float(row.get("l0", 0.0)),
+                                           float(row.get("l1", 1.0)))
+
+
+def crowding_saturated(cfg: dict, cat: str, occ: int, sim_min: int) -> bool:
+    """L̃ ≥ L1(= 飽和 = 印象に残る混雑)か。記憶を 1 行残すかの判定に使う(純関数)。"""
+    row = cfg["crowding"]["table"].get(str(cat))
+    if not row:
+        return False
+    return crowding_load(cfg, cat, occ, sim_min) >= float(row.get("l1", 1.0))
+
+
+def apply_crowding(sim, agent, cat: str, step: int, sim_min: int) -> float:
+    """購入/受給が**成立した**その場の混み具合を不満へ写す(CRWD の単一作用点)。
+
+    既定 OFF は即 0.0(grievance も記憶も 1 バイトも動かない=バイト一致)。ON では
+    step 冒頭の在館数表を O(1) で引き、業態別の式で**不透明な magnitude** を作って
+    factors 層 hook(on_store_crowding)へ渡す(R9: この関数の外へ因子名は出ない)。
+    飽和帯(L̃≥L1)でだけ記憶を 1 行残す(nightlife の**負帯では残さない**=快い混雑を
+    「混んでいた」と嘆かせない)。drive(発火系)には接続しない=R1: 呼数を 1 本も動かさない。
+
+    ★在館数は「この step の**開始時点**でその店に居た人数」であって、いま到着した本人は
+      含まれない(表は位置が動く前に 1 回だけ作る)。cap が 8-40 人の帯なので影響は小さく、
+      「店に居た人数を見て混んでいると感じる」という意味づけとしても自然である。"""
+    if not crowding_on(sim):
+        return 0.0
+    counts = getattr(sim, "_crowd_counts", None)
+    if counts is None:                                # 表が無い step(OFF→ON の途中等)は何もしない
+        return 0.0
+    cfg = sim.commercecfg
+    occ = int(counts.get(agent.node, 0))
+    mag = crowding_magnitude(cfg, cat, occ, sim_min)
+    delta = 0.0
+    if mag != 0.0:
+        from .factors import update as factor_update
+        delta = factor_update.on_store_crowding(agent, mag, step=step,
+                                                sim_min=sim_min, logger=sim.logger)
+    if mag > 0.0 and crowding_saturated(cfg, cat, occ, sim_min):
+        agent.remember(_CROWD_TEXT)
+    return delta
+
+
+# =========================================================================== #
+# PRICE-B: 時間帯価格(B1)+ 閉店前見切り(B2)。第147 / 正典 §1.5
+# --------------------------------------------------------------------------- #
+# ユーザー指摘「実店舗の価格は仕入れ値+利益で固定・リアルタイム変動はめったにない」を受けた
+# 価格の現実整合。現実に価格が動く 2 経路だけを、現実と同じ**型**で入れる:
+#   B1 事前公表の固定料金表(ランチ/ディナー・ハッピーアワー)= 時刻の純関数。
+#      ★price_change イベントは**出さない**。掲示済みの料金表どおりに払うのは「価格の変化」
+#        ではないし、購入 1 件ごとに 1 件出せば L1 のイベント洪水が種目を替えて再発する。
+#   B2 閉店前見切り(値引きシール)= **在店店員の行動**(markdown。L1 に載る当人の行為)。
+# どちらも決定論・乱数ゼロ・LLM 呼数不変・k 非依存。既定(空 / OFF)は恒等 1.0=バイト一致。
+# =========================================================================== #
+def price_schedule_coef(cfg: dict, cat: str, sim_min: int) -> float:
+    """B1: 事前公表の時間帯料金表から係数を引く(時刻の純関数・O(帯数)・決定論)。
+
+    帯はリストの並び順に**最初に当たったものが勝つ**。既定 {} は常に 1.0(恒等)。"""
+    bands = cfg["price_schedule"].get(str(cat))
+    if not bands:
+        return 1.0
+    for (s, e, coef) in bands:
+        if is_open_window((int(s), int(e)), sim_min):
+            return float(coef)
+    return 1.0
+
+
+def markdown_on(sim) -> bool:
+    """閉店前見切り(B2)が有効か。既定 OFF=新経路を一切通さない(バイト一致)。"""
+    cfg = getattr(sim, "commercecfg", None)
+    return bool(cfg and cfg["markdown"]["enabled"])
+
+
+def markdown_window_open(sim, sim_min: int) -> bool:
+    """この step に見切りが起きうるか(どれかの業態が閉店前の窓に入っているか)。時刻の純関数。
+
+    ★安い先読み: 見切りが起きうるのは 1 日のうち数十 step だけなので、これを先に見れば
+    「在勤者索引を組む O(N) の走査」を窓の外では 1 度も走らせずに済む(INV-B が同じ step で
+    別の用事で組んでいるときは、そちらの都合で組まれた索引に相乗りするだけ)。"""
+    cfg = getattr(sim, "commercecfg", None)
+    if not (cfg and cfg["markdown"]["enabled"]):
+        return False
+    smin, hrs = _step_minutes(sim), _md_hours(sim)
+    return any(markdown_stage_now(cfg, cat, sim_min, smin, hrs) > 0
+               for cat in cfg["markdown"]["cats"])
+
+
+def markdown_stage_now(cfg: dict, cat: str, sim_min: int, step_minutes: int,
+                       hours: dict | None = None) -> int:
+    """いまが閉店の何段階前か(0=まだ / 1=1段階目 / 2=2段階目…)。時刻の純関数・決定論。
+
+    閉店時刻は既存の営業時間表(commerce.hours)から導出する(見切り専用の時刻表を作らない)。
+    閉店中・24 時間営業・時刻表の無いカテゴリは 0(= 見切らない)。
+
+    ``hours`` を渡すと **カテゴリ単位の実効表**(夜間経済の上書き込み)を使う。
+    ★正直な限界: 判定は**カテゴリ単位**であり、POI 単位の上書き(24h コンビニ等の subcat)は
+      見ない。見切りの対象は既定で飲食 1 業態なので実害は小さいが、深夜営業の個店は
+      カテゴリの閉店時刻で値札を替えることになる(本選後の較正候補)。"""
+    hc = (cfg["hours"] if hours is None else hours).get(str(cat))
+    if hc is None:
+        return 0
+    o, c = hc
+    if o == c:
+        return 0                                     # 24 時間営業=閉店が無い=見切らない
+    if not is_open_window(hc, sim_min):
+        return 0                                     # 閉店中は値札を替えない
+    left_min = (int(c) - (int(sim_min) % 1440)) % 1440
+    left_steps = float(left_min) / float(max(1, int(step_minutes)))
+    stage = 0
+    for i, (n_steps, _coef) in enumerate(cfg["markdown"]["stages"]):
+        if left_steps <= float(n_steps):
+            stage = i + 1                            # 遠い→近い順なので後ろが勝つ
+    return stage
+
+
+def markdown_coef(sim, node: str, cat: str, sim_min: int) -> float:
+    """その (node, cat) にいま効いている見切り係数(既定 1.0)。
+
+    段階は当日の店員の行動(markdown)が刻んだ ``sim._md_stage`` から引く。翌朝は日鍵で
+    自動的にリセットされ、閉店した時点でも 1.0 へ戻る(= 見切りは営業中の売り切り施策)。"""
+    cfg = getattr(sim, "commercecfg", None)
+    if not (cfg and cfg["markdown"]["enabled"]):
+        return 1.0
+    state = getattr(sim, "_md_stage", None)
+    if not state:
+        return 1.0
+    rec = state.get((str(node), str(cat)))
+    if rec is None or int(rec[0]) != int(sim_min) // 1440:
+        return 1.0                                   # 別の日に刻んだ段階=翌朝リセット
+    if markdown_stage_now(cfg, cat, sim_min, _step_minutes(sim), _md_hours(sim)) <= 0:
+        return 1.0                                   # 閉店した=見切り終了
+    stages = cfg["markdown"]["stages"]
+    if not stages:                                   # 段階表が空の conf = 見切らない
+        return 1.0
+    idx = max(1, min(int(rec[1]), len(stages))) - 1
+    return float(stages[idx][1])
+
+
+def price_multiplier(sim, cat: str, node: str, sim_min: int) -> float:
+    """B1 × B2 の合成係数(**この順序で乗算**する=テストが順序を固定している)。
+
+    どちらも既定(price_schedule={} / markdown OFF)では 1.0 を返すので合成も 1.0=恒等。"""
+    return (price_schedule_coef(sim.commercecfg, cat, sim_min)
+            * markdown_coef(sim, node, cat, sim_min))
+
+
+def apply_price(sim, amount: float, cat: str, node: str, sim_min: int) -> float:
+    """消費額へ B1×B2 の係数を乗せる(購入の価格決定点から呼ぶ薄い seam)。
+
+    係数が 1.0 のときは **受け取った値をそのまま返す**(浮動小数の乗算すら通さない)=
+    既定 OFF/空では 1 ビットも変わらない。"""
+    cfg = getattr(sim, "commercecfg", None)
+    if cfg is None or amount is None:
+        return amount
+    coef = price_multiplier(sim, cat, node, sim_min)
+    return amount if coef == 1.0 else float(amount) * coef
+
+
+def _step_minutes(sim) -> int:
+    clock = getattr(sim, "clock", None)
+    return int(getattr(clock, "step_minutes", 10) or 10)
+
+
+def _md_hours(sim) -> dict:
+    """見切りが読むカテゴリ単位の**実効**営業時間表(夜間経済の上書きを含む)。
+
+    夜間 OFF なら cfg["hours"] と同一オブジェクト=従来どおり(tick_shop_state と同じ流儀)。"""
+    return night_mod.cat_hours(sim.commercecfg, getattr(sim, "nightcfg", None))
+
+
+#: 見切りの記憶(定型文。機構語・実験条件語・因子名を 1 文字も含まない)。
+_MARKDOWN_TEXT = "売れ残りに値引きの札を貼った"
+
+
+def markdown_phase(sim, on_duty: dict, staffed=None, *, step: int,
+                   sim_min: int) -> int:
+    """B2 の単一作用点: 在店店員が閉店前に値札を替える(**当人の行動**。goods.staff_phase 相乗り)。
+
+    引数 ``on_duty``(node → 在勤中の個体・id 昇順)と ``staffed``(担い手が 1 人でも
+    割り当てられた職場ノード集合。None=フォールバックしない)は INV-B が既に組んだものを
+    そのまま受け取る=**在勤述語を 1 つに保つ**(見切り専用の勤務概念を発明しない)。
+
+    トリガ(すべて満たしたときだけ):
+      ① いまが閉店の N step 前(段階が上がった)= 時刻の純関数
+      ② その (node, cat) の棚に在庫が残っている(売り切るものが無ければ値札は替えない)
+      ③ **当日の入荷バッチ**がある(厳密な消費期限は実装しない=当日バッチ概念のみ)
+    1 店 1 step に markdown は **1 件**(複数カテゴリは 1 件へまとめる)= L1 の洪水を作らない。
+    担い手が 1 人も居ない POI に限り agent_id=-1 + payload["unstaffed"]=true(INV-B と同一規約)。
+    戻り値=この step に出した markdown の件数。乱数ゼロ・LLM 呼ゼロ・決定論。"""
+    cfg = getattr(sim, "commercecfg", None)
+    if not (cfg and cfg["markdown"]["enabled"]):
+        return 0
+    stage_by_cat = {}
+    smin, hrs = _step_minutes(sim), _md_hours(sim)
+    for cat in cfg["markdown"]["cats"]:
+        s = markdown_stage_now(cfg, cat, sim_min, smin, hrs)
+        if s > 0:
+            stage_by_cat[str(cat)] = s
+    if not stage_by_cat:
+        return 0                                     # どの業態も窓の外=1 ノードも走査しない
+    stock = getattr(sim, "_goods_stock", None) or {}
+    if not stock:
+        return 0
+    delivered = getattr(sim, "_goods_delivered", None) or {}
+    state = sim._md_stage
+    day = int(sim_min) // 1440
+    by_node: dict[str, list] = {}
+    for key in sorted(stock):                        # 棚が実体化した (node,cat) だけ=有界
+        node, cat = str(key[0]), str(key[1])
+        stage = stage_by_cat.get(cat)
+        if stage is None:
+            continue
+        if int(stock[key]) <= 0:                     # 棚が空=見切る物が無い
+            continue
+        if int(delivered.get(key, -1)) != day:       # 当日の入荷バッチが無い
+            continue
+        rec = state.get((node, cat))
+        if rec is not None and int(rec[0]) == day and int(rec[1]) >= stage:
+            continue                                 # もうその段階まで下げてある(単調・戻らない)
+        by_node.setdefault(node, []).append((cat, stage))
+    n = 0
+    for node in sorted(by_node):
+        crew = on_duty.get(node)
+        agent = crew[0] if crew else None
+        if agent is None and (staffed is None or node in staffed):
+            continue                                 # 担い手は居るのに不在=誰も値札を替えない
+        cats, deepest = [], 0
+        for cat, stage in by_node[node]:
+            state[(node, cat)] = [day, int(stage)]
+            cats.append(cat)
+            deepest = max(deepest, int(stage))
+        stages = cfg["markdown"]["stages"]
+        payload = {"poi": node, "cats": sorted(cats), "stage": int(deepest),
+                   "coef": float(stages[min(deepest, len(stages)) - 1][1])}
+        if agent is None:
+            x, y = sim.city.node_xy(node)
+            payload["unstaffed"] = True              # 黙って無人で値札を替えない(正直な標)
+            sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=-1,
+                                 kind="markdown", x=float(x), y=float(y),
+                                 payload=payload))
+        else:
+            sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=int(agent.id),
+                                 kind="markdown", x=float(agent.x), y=float(agent.y),
+                                 payload=payload))
+            agent.remember(_MARKDOWN_TEXT)
+        n += 1
+    return n
 
 
 # ==================================================================== E-W2 VC/出資
