@@ -105,6 +105,7 @@ from ..observer.aggregate import collect
 from ..observer.schema import Event
 from ..rules import apply_bonus
 from ..world.geom import rdp
+from ..world import perception as perception_mod
 from ..world.perception import build_index, hearers_of, salience_gate
 
 
@@ -1762,6 +1763,73 @@ def _attention_limited(sim, speaker, hearers):
     #   選抜後に id 昇順へ戻すので、下流の走査順は絞らないときと同じ規則になる。
     keep = sorted(sorted(hearers, key=_key)[:cap], key=lambda h: int(h.id))
     return keep
+
+
+# ---------------------------------------------------------------- 声の段階(作用点0)
+# 正典: docs/plans/hearer-cap-plan.md §2「作用点0」。物理表(段階→距離)は
+# world/perception.py が持ち、ここは「発話の文脈 → 段階」の**決定論写像**だけを持つ。
+# ★LLM の自由文は 1 バイトも読まない(発話テキストの解析は禁止 = 較正リスクと
+#   no-fingerprint の両方の理由)。材料は既存の世界状態(名簿の役割・持ち場・イベント台帳・
+#   身体の重症度)だけ。曖昧なものは**保守側 normal** へ倒す。
+#
+#   叫び(shout)… 話者の身体重症度が severe 以上(= 悲鳴・助けを求める声)
+#   張り上げ(raised)… ①開催中イベントの**主催者**が会場ノードに立っている(集会・演説)
+#                      ②声を張る路上の生業(演説者・演奏者・募金・キッチンカーの呼び込み)が
+#                        **自分の持ち場に立っている**
+#   通常(normal)  … 上記以外すべて(既定・大多数)
+_PROJECTING_STREET_OCCS: frozenset = frozenset({
+    street_life_mod.SPEECH,        # 街頭演説
+    street_life_mod.MUSICIAN,      # 路上パフォーマンス
+    street_life_mod.FUNDRAISER,    # 街頭募金の呼びかけ
+    street_life_mod.KITCHEN,       # 屋台の呼び込み
+})
+
+
+def _live_event_hosts(sim, step: int) -> frozenset:
+    """開催中イベントの (主催者id, 会場ノード) 集合を **step ごとに 1 度だけ**組む。
+
+    声の段階が OFF のときは一度も呼ばれない(= 台帳走査ゼロ)。イベント台帳は
+    終了分も残るので、発話ごとに走査せずキャッシュする。"""
+    cached = getattr(sim, "_speech_hosts", None)
+    if cached is not None and cached[0] == step:
+        return cached[1]
+    hosts: set = set()
+    tools = getattr(sim, "tools", None)
+    events = getattr(tools, "events", None) if tools is not None else None
+    if events:
+        for ev in events.values():
+            if ev.get("started") and not ev.get("ended"):
+                hosts.add((int(ev.get("host", -1)), str(ev.get("node", ""))))
+    out = frozenset(hosts)
+    sim._speech_hosts = (step, out)
+    return out
+
+
+def _speech_level(sim, agent, step: int) -> str:
+    """この発話の声の段階(normal / raised / shout)を決定論写像する(乱数ゼロ・LLM 非参照)。"""
+    if int(getattr(agent, "severity", 0)) >= health_mod.S_SEVERE:
+        return "shout"
+    if (int(agent.id), str(getattr(agent, "node", "") or "")) in \
+            _live_event_hosts(sim, step):
+        return "raised"
+    if str(getattr(agent, "occupation", "")) in _PROJECTING_STREET_OCCS \
+            and str(getattr(agent, "street_post", "") or "") == \
+            str(getattr(agent, "node", "") or ""):
+        return "raised"
+    return "normal"
+
+
+def _speak_bounds(sim, agent, step: int) -> tuple[int, float | None]:
+    """speak ハンドラの列挙に渡す (cap, radius_eff)。既定は (0, None) = 現行と完全同一。
+
+    cap は S15(`world.attention_hearers_max`)を**列挙段へ配管**したもの。結果集合は
+    `_attention_limited`(フル列挙後の選抜)と同一規則なので二重適用しても冪等
+    (= _attention_limited は保険としてそのまま残す)。"""
+    scfg = perception_mod.speech_cfg_of(sim)
+    radius_eff = (perception_mod.speech_radius(scfg, _speech_level(sim, agent, step),
+                                               agent)
+                  if scfg["enabled"] else None)
+    return _attention_cap(sim), radius_eff
 
 
 def _select_partner(sim, agent, hearers):
@@ -3863,7 +3931,15 @@ def _apply_action(sim, agent, action: dict, step: int, sim_min: int) -> None:
         #  ON(mode:"salience")では、聞こえた全員から priority 上位 k_i 人(+ 自己名の
         #  貫通)だけを選び、その集合が hear の L1 / 記憶 / 関係 / 覚醒 / SNC 遭遇 /
         #  意見更新 / 噂 へそのまま流れる(= 非通過者には**何も起きない**・Cherry 1953)。
-        _att_all = hearers_of(agent, sim.agents, radius)
+        # ---- 有界化(hearer-cap-plan §2 作用点0/B)。**両方 既定なら現行の呼び出しそのまま** ----
+        #   作用点0 = 声の段階(発話文脈 → 実効半径)。作用点B = S15 cap を列挙段へ配管。
+        #   下の `_attention_limited` は保険として残す(同一規則なので二重適用は冪等)。
+        _b_cap, _b_rad = _speak_bounds(sim, agent, step)
+        if _b_cap or _b_rad is not None:
+            _att_all = hearers_of(agent, sim.agents, radius,
+                                  cap=_b_cap, radius_eff=_b_rad)
+        else:
+            _att_all = hearers_of(agent, sim.agents, radius)
         if attention_mod.salience_on(sim):
             _att_words = [w for w in action.get("use_items", []) if w in agent.adopted]
             hearers, _att_crowd = attention_mod.select(

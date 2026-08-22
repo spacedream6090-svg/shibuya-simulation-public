@@ -516,6 +516,12 @@ class Simulation:
         mcfg = cfg.get("memory", {}) or {}
         self.agentic_pull = bool(mcfg.get("agentic_pull", False))  # 内省の pull 想起
         self.relations_max = int(mcfg.get("relations_max", 0) or 0)  # B6: 関係台帳の上限(0=無制限)
+        # S7 退避梯子(第149・docs/plans/relations-tier-plan.md §3)。既定 "lru" = 現行と完全同一。
+        # "tiered" のときだけ agent.mem へインスタンス属性を書く(既定では 1 体も属性が生えない
+        # = pickle/checkpoint バイト一致 + 250k 体でも RAM が増えない)。
+        self.relations_evict = str(mcfg.get("relations_evict", "lru") or "lru")
+        if self.relations_evict not in ("lru", "tiered"):
+            self.relations_evict = "lru"           # 未知の値は現行挙動へ倒す(破壊的解釈を作らない)
         # M-W(第37バッチ): ACT-R 活性化記憶。既定 OFF=agent.mem.actr は None のまま=バイト一致。
         self.actrcfg = dict(mcfg.get("actr", {}) or {})
         # 社会関係の質(Wave G2 2026-07-07。既定 OFF=現行挙動と完全同一)。関係の深化段階(tier)・
@@ -1844,6 +1850,12 @@ class Simulation:
         agent.conv_turns_left = int(self.drivecfg["conv_max_turns"])
         agent.conv_cooldown_until = 0
         agent.mem.relations_max = self.relations_max   # B6: 台帳上限(既定0=無制限)
+        # S7 退避梯子(第149): 既定 "lru" では**属性を 1 つも生やさない**(ClassVar の既定が
+        # そのまま読まれる = instance __dict__ 不変 = pickle バイト一致)。
+        if self.relations_evict != "lru":
+            agent.mem.relations_evict = self.relations_evict
+            agent.mem.relations_tier_acq = float(
+                self.relationscfg["tier_acquaintance"])
         # 中央 Δt(第79バッチ): recency_decay は「毎 step の残存割合」= KEEP 類。
         # 既定 Δt=10 では scale_keep が恒等(この行自体を通らない)=バイト一致。
         if self.dt_min != _timeconv.CANON_DT_MIN:

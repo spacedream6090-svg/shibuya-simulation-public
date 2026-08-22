@@ -411,6 +411,61 @@ world:
   #   すべて「絞った聴衆」に揃う(= §2 表の #2 #3 #5 #10 #11 に掛かる乗数を下げる)。
   attention_hearers_max: 0
 
+  # ---- 作用点A(第149): C2 近傍走査の最寄り K 上限。0=無制限=現行と完全同一 -------------
+  # 正典: docs/plans/hearer-cap-plan.md §2「作用点A」。実装 src/society/conversation.py。
+  # ★★層3 = **世界の力学に触る**(伝播トポロジーが変わる)。S15 と同じ扱いで RESULTS に開示。
+  # 何が変わるか: >0 のとき、1 step に「すれ違い(C3)として認知し・会話が成立しうる」相手が
+  #   話者の最寄り K 人になる(距離二乗 昇順・同値は id 昇順の**決定論**。乱数は 1 粒も引かない)。
+  #   絞りは**列挙の中**で行うので、近傍ペア訪問そのものが K に比例して落ちる。
+  # 根拠(位相的近傍): 群衆中の相互作用は距離ではなく**位相的な 6-7 個体**で決まる
+  #   (Ballerini ほか・ムクドリ)。自由形成される会話集団の上限は ~4 人(Krems & Dunbar 2016)。
+  #   = 密度が上がると空間半径が自動的に縮む制約で、騒音下で人が距離を詰める行動とも同型。
+  # ★S15(attention_hearers_max)と別キーにしたのは、S15 正典が適用範囲を「speak ハンドラの
+  #   hearers だけ」と明示しているため(C2 への適用は別の宣言として正直に行う)。
+  c2_neighbors_max: 0
+
+  # ---- 作用点0(第149): 声の段階。既定 OFF=全発話が perception_radius_m 一律=現行と完全同一 ----
+  # 正典: docs/plans/hearer-cap-plan.md §1(音響リサーチ)/ §2「作用点0」。
+  # 実装: 物理表(段階→距離)は src/society/world/perception.py、文脈→段階の写像は
+  #   src/society/engine/scheduler.py(_speech_level)。
+  # ★★層3 = **世界の力学に触る**(伝播トポロジーが変わる)。S15 と同じ扱いで RESULTS に開示。
+  #
+  # 音響根拠: 会話音声は ~60dB@1m・距離が倍になるごとに −6dB。街頭騒音は 70-80dB(最大 95dBA)で
+  #   了解には 1m で SNR +10dB が要る → **街頭で通常声の内容了解は実質数 m**。
+  #   張り上げ +9dB ≒ 2-3 倍・叫び +18-24dB ≒ 8-16 倍。屋内(騒音 ~50dB)は同じ声が 2-3 倍届く。
+  #   出典: Conversational speech levels and SNR in realistic acoustic conditions (JASA 2019) /
+  #        Objective Assessment of Speech Intelligibility in Crowded Public Spaces (PMC7676620) /
+  #        Behavioral dynamics of conversation in noisy environments (PMC10662155)。
+  #
+  # ★発話種別 → 声量の写像表(v1・**すべて決定論**。LLM の自由文は 1 バイトも読まない)
+  # | 段階   | 判定(この順に評価。曖昧は保守側=通常へ倒す)                            |
+  # |--------|--------------------------------------------------------------------------|
+  # | shout  | 話者の身体重症度が severe 以上(health.severity>=3)= 悲鳴・助けを求める声 |
+  # | raised | ①開催中イベント(started かつ not ended)の**主催者**が会場ノードに立つ    |
+  # |        |   = 集会・演説・イベント広報(tools.events の台帳から決定論)              |
+  # |        | ②声を張る路上の生業が**自分の持ち場に立つ**(street_post == node):        |
+  # |        |   街頭演説者 / ストリートミュージシャン / 募金スタッフ / キッチンカー営業者 |
+  # | normal | 上記以外すべて(C2 の構造化会話・通常の speak = 大多数)                   |
+  # ★normal へ倒した(=張り上げにしない)もの: ティッシュ配り・路上占い師・路上支援員
+  #   (いずれも一対一の近接発話)。客引きは「無主体の確率イベント(diversity)」側の実装で
+  #   speak ハンドラを通らないため対象外。
+  # ★V2 候補(今回入れない): 局所騒音の内生化(在館数→騒音→半径縮小=Lombard 効果の逆写像)・
+  #   災害中の全市的な叫び(_disaster_active は日単位で続くので「街全体が終日 40m」になり、
+  #   現実整合でも性能でも割に合わない)。
+  # 実装上の不変条件: 各値は world.perception_radius_m 以下へ**クランプ**される(索引のセル幅
+  #   = perception_radius なので、半径がセル幅以下である限り近傍 9 セル走査のままで正しい)。
+  speech_levels:
+    enabled: false              # 既定 OFF = 半径一律 = L1 バイト一致
+    normal:                     # 通常の会話声(大多数)
+      outdoor_m: 5.0
+      indoor_m: 10.0
+    raised:                     # 張り上げ(集会・演説・呼び込み・パフォーマンス)
+      outdoor_m: 12.0
+      indoor_m: 20.0
+    shout:                      # 叫び(緊急・悲鳴)
+      outdoor_m: 30.0
+      indoor_m: 40.0
+
   # ---- ATT 層A(第143): 自律的注意機構の**顕著性 top-k 選抜**。既定 OFF=現行と完全同一 ----
   # 正典: docs/plans/attention-mechanism-plan.md §2(層A)・§6.5(個体差)・§6.6(実装決定)。
   # 文献: Cherry 1953 / Wood & Cowan 1995(非注意の発話は記憶に残らない)・Cowan 2001(k=4±1)・
@@ -2352,6 +2407,35 @@ memory:
   agentic_pull: false           # 発火・内省で能動的に記憶検索する(true でプロンプトに1行想起を追加)
   relations_max: 0              # B6(スケール): 関係台帳の上限件数。>0 で超過時に LRU(last_step 最古)を退避。
                                 # 0=無制限で従来と完全同一。大規模ラン(hub 個体の台帳肥大・checkpoint 膨張)対策。
+  # ---- S7 退避梯子(第149): 上限超過時に**何から落とすか**。既定 lru=現行と完全同一 ----
+  # 正典: docs/plans/relations-tier-plan.md §2 #1 / §3。実装 src/society/agents/memory.py。
+  # 現行 LRU の欠陥: last_step しか見ない = tier / closeness / dormant に**価値盲目**なので、
+  #   「直近に声が聞こえただけの他人」が「10 日会っていない親友」を押し出し得る。
+  # tiered の退避順(既存フィールドを順序へ接続するだけ。新しい tier 体系は作らない):
+  #   ① closeness フィールド無し(hear 洪水。減衰も休眠も効かないので数だけ増える)
+  #      → count 昇順 → last_step 昇順 → 相手id 昇順
+  #   ② tier0 かつ closeness < relations.tier_acquaintance → closeness 昇順 → last_step → id
+  #   ③ dormant(認知枠で休眠中。Levin et al. 2011 の休眠紐帯の価値 = ①②より保護)
+  #      → dormant_closeness 昇順 → last_step → id
+  #   ④ tier1(知人)→ closeness 昇順 → last_step → id
+  #   ⑤ tier2 以上(友人・親友)= **退避不可侵**。①-④に候補が無ければ cap 超過を許容する
+  #      (Granovetter 1973: 退避しすぎは情報伝播=k* 研究の対象そのものを殺す。cap は
+  #       「逼迫時だけ発火する保険」水準に置き、常時発火させない)
+  # いま接触した相手は常に保護(現行 LRU と同じ不変条件)。全段で乱数ゼロ・決定論。
+  relations_evict: lru          # lru(既定=現行と完全同一)| tiered(価値考慮の退避梯子)
+  # ---- REL 自然削除(第149): 減衰しきった紐帯を台帳から**落とす**。既定 OFF=バイト一致 ----
+  # 正典: docs/plans/relations-tier-plan.md §2 #3 / §3-3。実装 src/society/relations.py。
+  # 文献: Roberts & Dunbar 2011 = 接触が絶えた closeness は最初の区間から単調減衰し、
+  #   維持には投資が要る(= 投資されなかった紐帯は自然に消える)。
+  # ON 時、日境界の減衰の**後**に「closeness を持つ / closeness < floor / count <= count_max /
+  #   最終接触から after_days を超えて不在 / dormant でない」エントリを削除し relation_forget を
+  #   1 件記録する。★休眠(dormant)は落とさない = 認知枠の「退避であって削除でない」可逆性を守る。
+  # ★★層3 = 世界の力学に触る(関係の消滅は伝播トポロジーの変化)。ON 判断は判定ラウンド。
+  relations_forget:
+    enabled: false              # 既定 OFF = 掃引を 1 度も走らせない = 台帳・イベント列ともバイト一致
+    floor: 0.5                  # closeness がこれ未満(tier0 のさらに下 = 実質消えている)
+    count_max: 2                # 接触回数がこれ以下(一度きりの縁。常連は残す)
+    after_days: 3               # 最終接触からこの日数を**超えて**不在
   # ---- ACT-R 活性化記憶 M-W(第37バッチ)。★第114 レーン 1d で**宣言だけ**を足した ----
   # 元々 conf/config.yaml に姿が無く(コード既定 = agent.mem.actr が None)、finals_observe.yaml
   # だけが true にしていたので未宣言トグル検出の網に掛からなかった。既定値を書き足すだけ=

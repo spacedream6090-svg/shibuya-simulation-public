@@ -184,6 +184,30 @@ FEATURES: tuple[Feature, ...] = (
        "採用にはユーザーの事前登録が必要で、採るなら RESULTS に開示する。"
        "適用は speak ハンドラの hearers **だけ**(同席判定・発火条件・company は不触)",
        off_value=0),
+    # 作用点0/A(第149・声の段階 + C2 近傍 cap)。正典 docs/plans/hearer-cap-plan.md §2。
+    # ★affects_k=True を S15 と同じ理由で正直に宣言する: 聴衆/近傍を絞ると聞き手側の
+    #   drive 加算(_arouse / C2 の addressed)が減るので、呼数 cap が binding しない構成では
+    #   発火回数が動きうる。generate() の呼び出しサイトは 1 つも足さない/減らさない。
+    # ★repro_tier=strict: 判定材料は名簿の役割・持ち場・イベント台帳・身体の重症度と幾何だけで、
+    #   **LLM の自由文を 1 バイトも読まない**(発話テキストの解析は明示的に禁止した)。
+    _f("world.speech_levels.enabled", "strict", True, "none",
+       "声の段階(発話の種類 → 声の大きさ → 実効半径)。既定 OFF = 全発話が "
+       "perception_radius_m 一律 = 現行と完全同一。ON では通常声 5m(屋内 10m)/ 張り上げ "
+       "12m(20m)/ 叫び 30m(40m)へ分かれる。音響根拠: 会話音声 ~60dB@1m・距離倍で −6dB・"
+       "街頭騒音 70-95dBA → 通常声の内容了解圏は実質数 m(JASA 2019 ほか)。"
+       "段階の選択は**決定論写像のみ**(重症度 severe 以上=叫び / 開催中イベントの主催者が"
+       "会場に立つ・声を張る路上の生業が持ち場に立つ=張り上げ / それ以外=通常)で、"
+       "LLM の自由文は一切読まない。★**層3 = 世界の力学に触る**(伝播トポロジーが変わる)= "
+       "S15 と同じ扱いで RESULTS に開示する"),
+    _f("world.c2_neighbors_max", "strict", True, "none",
+       "C2 近傍走査(会話3層のすれ違い/会話成立の母集団)の最寄り K 上限。0=無制限=現行と"
+       "完全同一。>0 で 1 step に『すれ違いとして認知し・会話が成立しうる』相手が最寄り K 人に"
+       "なる(距離二乗昇順・同値は id 昇順の決定論。乱数ゼロ)。根拠: 群衆中の相互作用は"
+       "位相的近傍 6-7 個体(Ballerini)・自由形成される会話集団は ~4 人(Krems & Dunbar 2016)。"
+       "★S15(attention_hearers_max)と**別キー**にしたのは、S15 正典が適用範囲を『speak "
+       "ハンドラのみ・他用途に 1 バイトも触れない』と明示しているため(C2 への適用は別宣言)。"
+       "★**層3 = 世界の力学に触る**: RESULTS に開示する",
+       off_value=0),
     # ATT 層A(第143・自律的注意機構)。正典 docs/plans/attention-mechanism-plan.md §2 / §6.5。
     # ★affects_k=True(S15 と同じ理由を正直に): 聴衆を絞ると聞き手側の drive 加算
     #   (_arouse / on_ingroup_heard / on_vicarious)が減るので、呼数 cap が binding しない
@@ -1441,6 +1465,26 @@ FEATURES: tuple[Feature, ...] = (
        "発火・内省で能動的に記憶検索する。**LLM 呼を1本足す**(recall ラウンド)"),
     # ★第114 レーン 1d で**宣言だけ**を足した(conf/config.yaml に姿が無く
     #   finals_observe.yaml だけが true にしていたので未宣言トグル検出の網に掛からなかった)。
+    # S7 退避梯子 / REL 自然削除(第149)。正典 docs/plans/relations-tier-plan.md §3。
+    # ★repro_tier=strict: 判定材料は関係台帳の数値(count/closeness/tier/dormant/last_step)と
+    #   config だけで、**LLM の自由文を 1 バイトも読まない**。乱数も 1 本も引かない。
+    # ★affects_k=False: generate() の呼び出し点も本数も 1 つも増減しない(台帳の中身だけが変わる)。
+    # ★fingerprint_risk=possible: 台帳から相手が消えるとプロンプトの間柄行が変わる
+    #   (「○○とは友人」→ 行が出ない)= 差分に気づく余地が原理的にある。
+    _f("memory.relations_evict", "strict", False, "possible",
+       "関係台帳が relations_max を超えたときの退避規則。lru(既定=現行と完全同一・last_step "
+       "最古)/ tiered(価値考慮の退避梯子: ①closeness 無しの hear 洪水 → ②tier0 の弱い紐帯 → "
+       "③dormant → ④tier1 の順で落とし、**tier2 以上は退避不可侵**で cap 超過を許容する)。"
+       "現行 LRU は tier/closeness/dormant に価値盲目で『直近に声が聞こえただけの他人が "
+       "10 日会っていない親友を押し出す』欠陥がある。決定論・乱数ゼロ",
+       off_value="lru"),
+    _f("memory.relations_forget.enabled", "strict", False, "possible",
+       "関係の自然消滅(REL)。日境界の減衰の**後**に、closeness < floor かつ count <= count_max "
+       "かつ 最終接触から after_days 超の紐帯を台帳から削除し relation_forget を記録する。"
+       "根拠 Roberts & Dunbar 2011(維持されない紐帯の closeness は単調減衰する)。"
+       "★休眠(dunbar の dormant)は対象外 = 『退避であって削除でない』可逆性を守る。"
+       "★**層3 = 世界の力学に触る**(関係の消滅は伝播トポロジーの変化)= RESULTS に開示する。"
+       "既定 OFF = 掃引を 1 度も走らせない = 台帳・イベント列ともバイト一致"),
     _f("memory.actr.enabled", "strict", False, "possible",
        "ACT-R 活性化記憶 M-W(第37バッチ)。想起を『最近性(べき則減衰)× 頻度 × 文脈類似』の"
        "活性化式へ置き換える(現行の固定重み 0.5:2:3 の代替)。想起失敗・部分想起が起きうる"

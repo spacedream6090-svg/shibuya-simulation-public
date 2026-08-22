@@ -368,6 +368,7 @@ CAUSE_OF_KIND: dict[str, str] = {
     # ---- 社会関係 -------------------------------------------------------------- #
     "relation_tier": DEVICE,         # 親密度の閾値到達
     "relation_break": DEVICE,
+    "relation_forget": DEVICE,       # 減衰しきった紐帯の自然消滅(日境界の掃引)
     "relation_dormant": DEVICE,      # 認知枠(Dunbar)の上限超過
     "relation_rekindle": DEVICE,
     "reputation_update": DEVICE,

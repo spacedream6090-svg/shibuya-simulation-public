@@ -29,6 +29,7 @@ from .cognition import drive as drive_mod
 from . import opinion as opinion_mod
 from . import relations as relations_mod
 from .observer.schema import Event
+from .world import perception as perception_mod
 from .world import scene_desc as scene_desc_mod
 from .world.perception import hearers_of
 
@@ -100,6 +101,24 @@ def _cfg(sim) -> dict:
 
 def enabled(sim) -> bool:
     return bool(_cfg(sim)["enabled"])
+
+
+def neighbors_max(sim) -> int:
+    """C2 近傍走査の最寄り K 上限(`world.c2_neighbors_max`)。既定 0 = 無制限 = 現行同一。
+
+    正典: docs/plans/hearer-cap-plan.md §2「作用点A」。S15(`world.attention_hearers_max`)
+    と**別キー**にするのは、S15 正典が適用範囲を「speak ハンドラのみ」と明示しているため
+    (C2 への適用は別の宣言として正直に行う)。毎 step conf を辿らないよう sim にキャッシュ
+    する(値は L1 にも乱数にも現れない = _attention_cap と同型)。"""
+    cap = getattr(sim, "_c2_neighbors_max", None)
+    if cap is None:
+        try:
+            cap = max(0, int((sim.cfg.get("world", {}) or {})
+                             .get("c2_neighbors_max", 0) or 0))
+        except Exception:                      # noqa: BLE001(旧 config 互換)
+            cap = 0
+        sim._c2_neighbors_max = cap
+    return cap
 
 
 # ---------------------------------------------------------------- 会話内容(決定論写像)
@@ -292,6 +311,15 @@ def run_phase(sim, step: int, sim_min: int) -> None:
     if idx is None:
         return
     radius = float(sim.cfg.world.perception_radius_m)
+    # ---- 有界化(hearer-cap-plan §2 作用点0/A)。**両方 OFF なら現行の呼び出しがそのまま** ----
+    # 作用点0(声の段階): C2 は「近くの人と交わす普通の会話」なので段階は常に normal。
+    #   屋内/屋外は話者の文脈から決まる(perception.speech_radius)。
+    # 作用点A(位相的近傍): 1 step に「すれ違い(C3)として認知し・会話が成立しうる」相手を
+    #   最寄り K 人へ。列挙の**中**で絞るので走査コストごと落ちる。
+    c2_cap = neighbors_max(sim)
+    _speech = perception_mod.speech_cfg_of(sim)
+    _speech_on = bool(_speech["enabled"])
+    _bounded = bool(c2_cap > 0 or _speech_on)
     day = sim_min // 1440
     meet_prob = cfg["meet_prob"]
     cooldown = cfg["cooldown_steps"]
@@ -309,7 +337,14 @@ def run_phase(sim, step: int, sim_min: int) -> None:
     for a in active:
         if a.id in conversed:
             continue
-        for b in hearers_of(a, idx, radius):
+        if _bounded:
+            _near = hearers_of(
+                a, idx, radius, cap=c2_cap,
+                radius_eff=(perception_mod.speech_radius(_speech, "normal", a)
+                            if _speech_on else None))
+        else:
+            _near = hearers_of(a, idx, radius)     # ★既定 = 現行と 1 バイトも同じ呼び出し
+        for b in _near:
             if b.id <= a.id or b.id in conversed:
                 continue
             # 双方すれ違い(C3): 近くに居た=会話有無に関わらず「すれ違った」1 人に数える。

@@ -131,6 +131,12 @@ register_event_kind("affect_update", "覚醒度arousalの更新(感情・興味�
 # ---- 現実ギャップ実装 Wave G2(社会関係の質。既定 OFF。設計: docs/design-candidates/gap-implementation-plan.md)----
 register_event_kind("relation_tier",   "関係の深化段階の変化(知人→友人→親友等){other, tier, count}")
 register_event_kind("relation_break",  "関係の断絶・悪化(ネガ交流・長期不在){other, from_tier, to_tier, cause}")
+# ---- REL 自然削除(第149・memory.relations_forget ON のみ・既定 OFF=0件)。
+#      正典 docs/plans/relations-tier-plan.md §2 #3 / §3-3。減衰しきって実質消えている紐帯を
+#      **台帳から落とす**(relation_break は tier の降格・relation_dormant は退避=可逆で、
+#      本 kind だけがエントリの消滅を表す)。休眠中の関係は対象外(可逆性を守る)。
+register_event_kind("relation_forget", "関係の自然消滅=減衰しきった弱い紐帯を台帳から削除"
+                                       "(休眠=退避とは別。不可逆){other, closeness, count, gap_days}")
 register_event_kind("reputation_update", "評判・信頼スコアの更新(口コミ・語の採用で伝播){old, new, cause}")
 # ---- 現実ギャップ実装 Wave G3(制度改変の3ルート: 職域・民主・執行。既定 OFF)----
 register_event_kind("labor_action",  "労働争議の提起(職場同僚への集合行為){org, demand, initiator}")

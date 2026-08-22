@@ -185,14 +185,26 @@ class _RefMem:
       (写しを作ると「顔なじみを張った相手が退場者だと台帳が二重になる」)。
     """
 
-    __slots__ = ("relations", "relations_max")
+    __slots__ = ("relations", "relations_max", "relations_evict",
+                 "relations_tier_acq")
 
     #: ★同一実装を借りる(独立の写しを作らない = 台帳操作の真実源を 1 つに保つ)。
     record_contact = MemoryStore.record_contact
+    #: S7 退避梯子(第149)も同じ実装を借りる。借りないと `relations_evict="tiered"` の
+    #: ときだけ退場者の台帳操作が別の規則になる(= 同じ dict を 2 つの規則が触る)。
+    _evict_rank = MemoryStore._evict_rank
+    _evict_tiered = MemoryStore._evict_tiered
+    _EVICT_FLOOD = MemoryStore._EVICT_FLOOD
+    _EVICT_WEAK = MemoryStore._EVICT_WEAK
+    _EVICT_DORMANT = MemoryStore._EVICT_DORMANT
+    _EVICT_TIER1 = MemoryStore._EVICT_TIER1
 
-    def __init__(self, relations=None, relations_max: int = 0):
+    def __init__(self, relations=None, relations_max: int = 0,
+                 relations_evict: str = "lru", relations_tier_acq: float = 2.0):
         self.relations = {} if relations is None else relations
         self.relations_max = int(relations_max)
+        self.relations_evict = str(relations_evict)
+        self.relations_tier_acq = float(relations_tier_acq)
 
     def __getattr__(self, name):        # __slots__ に無い欄(episodes 等)
         raise AttributeError(
@@ -223,7 +235,9 @@ class AgentRef:
                 set_(self, name, getattr(agent, name))
         mem = getattr(agent, "mem", None)
         set_(self, "mem", _RefMem(getattr(mem, "relations", None),
-                                  getattr(mem, "relations_max", 0))
+                                  getattr(mem, "relations_max", 0),
+                                  getattr(mem, "relations_evict", "lru"),
+                                  getattr(mem, "relations_tier_acq", 2.0))
              if mem is not None else _RefMem())
         set_(self, "_extra", None)
 

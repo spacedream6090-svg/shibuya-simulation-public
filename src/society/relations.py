@@ -54,6 +54,53 @@ DEFAULTS = {
 _BOOL_KEYS = ("enabled", "faction")
 _INT_KEYS = ("decay_after_days",)
 
+# ---- REL 自然削除(第149・docs/plans/relations-tier-plan.md §2 #3 / §3-3)-------------
+# 「接触が絶えた closeness は最初の区間から単調に減衰し、維持には投資が要る」
+# (Roberts & Dunbar 2011)の完成形。減衰しきって実質消えている紐帯を**台帳から落とす**。
+# ★既定 enabled=false = 一度も走らない = 台帳・イベント列ともバイト一致。
+# ★conf 位置は `memory.relations_forget`(台帳の容量管理 = memory 側の議題なので)。
+FORGET_DEFAULTS = {
+    "enabled": False,
+    "floor": 0.5,        # closeness がこれ未満(= tier0 のさらに下)
+    "count_max": 2,      # 接触回数がこれ以下(= 一度きりの縁)
+    "after_days": 3,     # 最終接触からこの日数を超えて不在
+}
+
+
+def build_forget_cfg(raw) -> dict:
+    """conf の `memory.relations_forget` を正準化(既定 OFF = 現行と完全同一)。"""
+    try:
+        from omegaconf import OmegaConf
+        if OmegaConf.is_config(raw):
+            raw = OmegaConf.to_container(raw, resolve=True)
+    except Exception:                              # noqa: BLE001 (omegaconf 不在でも動く)
+        pass
+    raw = dict(raw or {})
+    cfg = dict(FORGET_DEFAULTS)
+    for k, v in raw.items():
+        if k not in FORGET_DEFAULTS:
+            continue
+        if k == "enabled":
+            cfg[k] = bool(v)
+        elif k in ("count_max", "after_days"):
+            cfg[k] = int(v)
+        else:
+            cfg[k] = float(v)
+    return cfg
+
+
+def forget_cfg_of(sim) -> dict:
+    """自然削除の設定を遅延構築して sim にキャッシュ(dunbar.cfg_of と同型)。"""
+    c = getattr(sim, "_rel_forget_cfg", None)
+    if c is None:
+        try:
+            raw = (sim.cfg.get("memory", None) or {}).get("relations_forget", None)
+        except Exception:                          # noqa: BLE001 (旧 config 互換)
+            raw = None
+        c = build_forget_cfg(raw)
+        sim._rel_forget_cfg = c
+    return c
+
 
 def build_cfg(raw) -> dict:
     """conf の relations ブロックを正準化(既定 OFF=現行挙動と完全同一)。
@@ -218,6 +265,51 @@ def decay_day(sim, cfg: dict, step: int, sim_min: int) -> None:
                 rel["tier"] = new_tier
                 _log_tier(agent, other_id, old_tier, new_tier,
                           int(rel.get("count", 0)), "absence", step, sim_min, logger)
+    # ---- REL 自然削除(第149。既定 OFF = 即 return = ここから下は 1 行も走らない)----
+    _forget_pass(sim, step, sim_min, today)
+
+
+def _forget_pass(sim, step: int, sim_min: int, today: int) -> None:
+    """減衰しきった紐帯を台帳から落とす(日境界・決定論・乱数ゼロ)。
+
+    削除条件(すべて満たすときだけ): closeness を持つ / closeness < floor /
+    count <= count_max / 最終接触から after_days を**超えて**不在 / dormant でない。
+    ★dormant は落とさない(認知枠の休眠は「退避であって削除でない」= 可逆性の保証。
+      Levin et al. 2011 の休眠紐帯の価値)。★走査は agent id 昇順 × 相手 id 昇順。
+    """
+    fcfg = forget_cfg_of(sim)
+    if not fcfg["enabled"]:
+        return
+    floor = float(fcfg["floor"])
+    count_max = int(fcfg["count_max"])
+    after = int(fcfg["after_days"])
+    logger = sim.logger
+    for agent in sim.agents:
+        rels = getattr(agent.mem, "relations", None)
+        if not rels:
+            continue
+        drop: list[int] = []
+        for other_id in sorted(rels):                  # 決定論(dict の並びに依らない)
+            rel = rels[other_id]
+            if "closeness" not in rel or rel.get("dormant"):
+                continue
+            if float(rel["closeness"]) >= floor:
+                continue
+            if int(rel.get("count", 0)) > count_max:
+                continue
+            last_day = sim.clock.day(int(rel.get("last_step", 0)))
+            if (today - last_day) <= after:
+                continue
+            drop.append(int(other_id))
+        for other_id in drop:
+            rel = rels.pop(other_id)
+            logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                             kind="relation_forget", x=agent.x, y=agent.y,
+                             payload={"other": int(other_id),
+                                      "closeness": round(float(rel["closeness"]), 4),
+                                      "count": int(rel.get("count", 0)),
+                                      "gap_days": int(today - sim.clock.day(
+                                          int(rel.get("last_step", 0))))}))
 
 
 # ---------------------------------------------------------------- プロンプト文

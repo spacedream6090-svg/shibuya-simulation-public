@@ -166,11 +166,14 @@ def test_finals_profile_declares_the_layer1_and_layer2_fixes():
     assert int(fin.net.follows_hard_max) == 4000
     assert int(fin.conversation.c3_distinct_cap) == 2000
     assert bool(fin.engine.gc_freeze) is True
-    # 層3(ユーザー判断待ち)は finals に**書かない**。
-    assert "attention_hearers_max" not in (fin.world or {}), \
-        "S15(層3)が事前登録なしに finals へ入っている"
-    assert "relations_max" not in (fin.get("memory", {}) or {}), \
-        "S7(層3)が事前登録なしに finals へ入っている"
+    # ★第149 で更新: 層3(S15 / S7)は **docs/plans/hearer-cap-plan.md +
+    #   docs/plans/relations-tier-plan.md で事前登録され finals へ投入された**。
+    #   「事前登録なしに入っていない」の担保は「宣言された値ちょうどで入っている」へ変わる
+    #   (黙って別の値に差し替わることを止める。RESULTS 開示の対象でもある)。
+    assert int(fin.world.attention_hearers_max) == 20, \
+        "S15(層3)の finals 値が事前登録(hearer-cap-plan §4)と食い違う"
+    assert int(fin.memory.relations_max) == 2000, \
+        "S7(層3)の finals 値が事前登録(relations-tier-plan §3-4)と食い違う"
 
 
 # --------------------------------------------------------------------------- #
@@ -701,7 +704,9 @@ def test_s7_relations_max_is_already_a_conf_key_and_unbounded_by_default():
     base = load_config()
     assert int(base.memory.relations_max) == 0
     fin = OmegaConf.load(_REPO_FINALS)
-    assert "relations_max" not in (fin.get("memory", {}) or {})
+    # ★第149 で更新: 本選プロファイルは事前登録のうえ 2000(保険水準)を投入した。
+    #   基底 conf は 0(無制限)のまま = golden は無風、という切り分けは維持される。
+    assert int(fin.memory.relations_max) == 2000
     assert int(base.pool.relations_cap) > 0, "退場時の切り取りまで無効になっている"
 
 

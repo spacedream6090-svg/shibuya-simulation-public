@@ -38,6 +38,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 import numpy as np
 
@@ -99,6 +100,14 @@ class MemoryStore:
     store_cap: int = 120
     recency_decay: float = 0.9983    # /step(= GA の 0.99/時 を10分stepに換算)
     relations_max: int = 0           # >0 で関係台帳の上限(B6)。0=無制限=従来と完全同一
+    # ---- S7 退避梯子(第149・docs/plans/relations-tier-plan.md §3)------------------
+    # ★**dataclass フィールドにしない**(ClassVar): 既定のままなら instance __dict__ に
+    #   キーが 1 つも増えない = pickle/checkpoint がバイト一致で、250k 体でも RAM が増えない
+    #   (先例 = Episode.refs の動的属性)。有効化側(simulation)が「値を変えるときだけ」
+    #   インスタンス属性として書き込む。読み取りは常に getattr(..., 既定) 経由なので、
+    #   同じ record_contact を借りる AgentRef._RefMem(__slots__)でも同一挙動になる。
+    relations_evict: ClassVar[str] = "lru"        # "lru"(既定=現行と完全同一)/ "tiered"
+    relations_tier_acq: ClassVar[float] = 2.0     # tier1(知人)の closeness 閾値
     actr: dict | None = None         # ACT-R 活性化設定(None=OFF=現行 0.5:2:3=バイト一致)
     # A7(第94バッチ OBS-U2): ACT-R 基礎活性化の時間単位。ACT-R の冪乗則忘却は **実時間**の
     # 関数だが、実装は step 差をそのまま t に使っている。Δt を細かくすると同じ実時間が
@@ -147,11 +156,66 @@ class MemoryStore:
         # B6: 上限を超えたら LRU(last_step 最古、同点は相手id小)を退避。いま触れた
         # other_id は除外(最新接触なので落とさない)。決定論。既定 0 なら何もしない。
         if self.relations_max > 0:
-            while len(self.relations) > self.relations_max:
-                victim = min((k for k in self.relations if k != other_id),
-                             key=lambda k: (self.relations[k]["last_step"], k))
-                del self.relations[victim]
+            # S7 退避梯子(第149・既定 "lru" ではこの分岐に入らない = 現行と完全同一)。
+            if getattr(self, "relations_evict", "lru") == "tiered":
+                self._evict_tiered(other_id)
+            else:
+                while len(self.relations) > self.relations_max:
+                    victim = min((k for k in self.relations if k != other_id),
+                                 key=lambda k: (self.relations[k]["last_step"], k))
+                    del self.relations[victim]
         return rel
+
+    # ---- S7 退避梯子(価値考慮退避)。正典 docs/plans/relations-tier-plan.md §2 #1 / §3 ----
+    #  現行 LRU の欠陥: last_step だけを見るので **tier / closeness / dormant を見ない** =
+    #  「直近に声が聞こえただけの他人」が「10 日会っていない親友」を押し出し得る。
+    #  梯子は既存フィールド(closeness / tier / dormant)を退避**順序**へ接続するだけで、
+    #  新しい tier 体系も新しい較正パラメータも作らない(最小・整合的)。
+    #
+    #    ① closeness フィールド無し … hear 洪水エントリ(聞こえただけ。減衰も休眠も効かない)
+    #                                 順序 = count 昇順 → last_step 昇順 → id 昇順
+    #    ② tier0 かつ closeness < 知人閾値 … 実質的に関係になっていない弱い紐帯
+    #                                 順序 = closeness 昇順 → last_step 昇順 → id 昇順
+    #    ③ dormant(認知枠で休眠中) … 退避済み(Levin et al. 2011 の休眠紐帯 = ①②より保護)
+    #                                 順序 = dormant_closeness 昇順 → last_step 昇順 → id 昇順
+    #    ④ tier1(知人)            … 順序 = closeness 昇順 → last_step 昇順 → id 昇順
+    #    ⑤ tier2 以上(友人・親友) … **退避不可侵**。①-④に候補が無ければ cap 超過を許容する
+    #                                 (Granovetter 1973 = 退避しすぎは情報伝播を殺す。cap は
+    #                                  「保険」水準に置き、常時発火させない設計)
+    #  いま接触した other_id は常に保護(現行 LRU と同じ不変条件)。全段で乱数ゼロ・決定論。
+    _EVICT_FLOOD, _EVICT_WEAK, _EVICT_DORMANT, _EVICT_TIER1 = 0, 1, 2, 3
+
+    def _evict_rank(self, rel: dict):
+        """退避梯子の段(小さいほど先に落ちる)。None = 不可侵(tier2 以上)。"""
+        if "closeness" not in rel:
+            return (self._EVICT_FLOOD, float(rel.get("count", 0)))
+        if rel.get("dormant"):
+            return (self._EVICT_DORMANT, float(rel.get("dormant_closeness", 0.0)))
+        clo = float(rel.get("closeness", 0.0))
+        if int(rel.get("tier", 0)) >= 2:
+            return None                                # ⑤ 友人・親友は落とさない
+        if int(rel.get("tier", 0)) <= 0 and clo < float(
+                getattr(self, "relations_tier_acq", 2.0)):
+            return (self._EVICT_WEAK, clo)             # ② 実質的に関係になっていない
+        return (self._EVICT_TIER1, clo)                # ④ 知人(閾値未更新の tier0 も含む)
+
+    def _evict_tiered(self, keep_id: int) -> None:
+        """梯子順で 1 件ずつ退避する(cap 内に収まるか候補が尽きるまで)。決定論。"""
+        while len(self.relations) > self.relations_max:
+            victim = None
+            best = None
+            for oid, rel in self.relations.items():    # dict の並びに依らない全順序で選ぶ
+                if oid == keep_id:
+                    continue                           # いま接触した相手は常に保護
+                rank = self._evict_rank(rel)
+                if rank is None:
+                    continue                           # ⑤ 不可侵
+                key = (rank[0], rank[1], int(rel.get("last_step", 0)), int(oid))
+                if best is None or key < best:
+                    best, victim = key, oid
+            if victim is None:
+                return                                 # 候補なし = cap 超過を許容して持ち越す
+            del self.relations[victim]
 
     # ---- 統合(就寝時、内省 LLM 呼び出しに同居)----
     def consolidate(self, step: int, summary: str | None,

@@ -458,6 +458,15 @@ TABLE: tuple[tuple[str, str, str], ...] = (
     ("freedom.sat_step", INVARIANT, "自由行動 1 回あたりの充足量(出来事単位。step ではない)"),
     ("worldview.ctrl_step", INVARIANT, "介入 1 回あたりの更新量(出来事単位)"),
     ("memory.relations_max", INVARIANT, "関係台帳の件数上限"),
+    # 有界化(第149・docs/plans/hearer-cap-plan.md §2 / relations-tier-plan.md §3)。
+    # どれも step 量ではない: 人数(位相的近傍)と距離 [m](音響の了解圏)と日数。
+    ("world.c2_neighbors_max", INVARIANT, "C2 近傍の最寄り K 人数。位相的近傍の個体数で時間ではない"),
+    ("world.speech_levels.*.*", INVARIANT,
+     "声の段階の実効半径 [m]。距離であって時間ではない(world.night_economy.refuge.max_dist_m と同族)"),
+    ("memory.relations_forget.floor", INVARIANT, "自然削除の closeness 下限(無次元の親密度)"),
+    ("memory.relations_forget.count_max", INVARIANT, "自然削除の接触回数上限(件数)"),
+    ("memory.relations_forget.after_days", INVARIANT,
+     "最終接触からの経過**日数**。実時間の量で step ではない(relations.decay_after_days と同族)"),
     ("observer.flush_every_steps", INVARIANT,
      "L1 part 書き出しの I/O 頻度。世界の因果に触れないので実験者の指定どおりにする"),
     ("observer.checkpoint_every", INVARIANT,

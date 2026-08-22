@@ -332,6 +332,36 @@ world:
     k_base: 4                 # ★同上(Cowan 4±1。実効帯は個体ごとに [2,7] へ分散)
     theta_ignition: 0.0       # ★同上(0 = 閾値なし。>0 で「静かな街では 1-2 人」が出る)
 
+  # ---- 聴衆・近傍の有界化(第149)= 物理層(声の段階)× 認知層(最寄り K)------------------
+  # 正典: docs/plans/hearer-cap-plan.md §1(音響)/ §2(作用点 0/A/B)/ §4(値表)。
+  # ★★層3 = **世界の力学に触る**(伝播トポロジーが変わる)。ATT 層A / S15 と同じ扱いで
+  #   **RESULTS に開示する**。事前登録は本計画書 + 本プロファイルの記載そのもの。
+  # ON の理由(性能ハックではない): 密度 1 人/m² の夕方に半径 40m 圏 ~5,000 人が 1 つの発話を
+  #   「聞く」現行の方が非現実で、街頭騒音下の通常声の内容了解圏は実測で数 m(§1)。
+  #   群衆中の相互作用が位相的近傍 6-7 個体で決まる(Ballerini)という所見とも同軸。
+  # ★下の 3 つの値は**すべて 8/22 の 25k 感度スイープで最終化する暫定値**(§6 工程):
+  #   比較 (i) cap のみ K=15@40m 一律 / (ii) 声の段階 + K=15 / (iii) 声の段階 + K=30。
+  #   撤退路: speech_levels.enabled=false / c2_neighbors_max=0 / attention_hearers_max=0 で
+  #   それぞれ 1 行ずつ現行へ戻せる。
+  speech_levels:
+    enabled: true             # ★8/22 スイープで最終化(false = 半径一律への 1 行撤退路)
+    normal:                   # ★以下の距離も 8/22 スイープで最終化する暫定値
+      outdoor_m: 5.0
+      indoor_m: 10.0
+    raised:
+      outdoor_m: 12.0
+      indoor_m: 20.0
+    shout:
+      outdoor_m: 30.0
+      indoor_m: 40.0
+  c2_neighbors_max: 15        # ★8/22 スイープで最終化する暫定値。位相的近傍 6-7(Ballerini)×
+                              #   会話クラスタ ~4(Krems & Dunbar 2016)の上界 + 余白
+  # S15(第142・`world.attention_hearers_max`)。正典 docs/plans/ram-rootcause-and-fix-plan.md
+  #   §3 層3。**層3 = RESULTS 開示**が条件の機能で、本行がその事前登録にあたる
+  #   (下の「S15 / S7 / S8」註記も第149 で更新済み)。値は S15 正典の例値 20 =
+  #   騒音下の内容了解圏(~3m・密度 1/m² で ~28 人)と同帯。★8/22 スイープで最終化する暫定値。
+  attention_hearers_max: 20
+
   # ---- 夜間解禁(Wave 4 III-1)。1つのクランプ修正が夜の街全体を開ける ----
   night_economy:
     enabled: true          # 日跨ぎシフト(close<open)+ 24h コンビニ + 深夜営業 + 終電後の受け皿
@@ -1223,13 +1253,20 @@ conversation:
   #   飽和が起きた個体は「2000 人以上とすれ違った」と読む(RESULTS に明記する)。
   c3_distinct_cap: 2000
 
-# ---- S15 / S7 / S8 の finals 値は**意図的に入れていない**(層3 = ユーザー判断待ち)----
-#   world.attention_hearers_max(S15)… 聴衆の注意上限。**伝播トポロジーを変える**ので
-#     事前登録なしには使わない。実装済み・既定 0(無制限)で待機。
-#   memory.relations_max(S7)……… 既に conf 化済み(conf/config.yaml の memory ブロック)。
-#     既定 0 = **無制限**で、本プロファイルでも上書きしていない = 関係台帳は現状 in-RAM で
-#     青天井(プール回転で退場する個体だけ pool.relations_cap=60 に切られる)。
-#     値を入れる = 認知容量を絞る力学変更なので、判断はユーザーへ。
+# ---- S15 / S7 / S8 の finals 値(★第149 で更新: S15・S7 は**事前登録して投入済み**)----
+#   world.attention_hearers_max(S15)… 聴衆の注意上限 = **20 を上の world ブロックへ投入**。
+#     伝播トポロジーを変える層3 なので事前登録が要件だったが、その事前登録が
+#     docs/plans/hearer-cap-plan.md(§2 作用点B・§4 値表)+ 本プロファイルの記載である。
+#     RESULTS に開示する。撤退は attention_hearers_max: 0 の 1 行。
+#   memory.relations_max(S7)……… **2000 を下の memory ブロックへ投入**(保険水準)。
+#     入口 cap(c2_neighbors_max / attention_hearers_max)後の新規接触は ≤K 人/step なので
+#     10 日ユニーク上界 ~2 万・実効は数百-数千 = S7 は「必須」から「保険」へ格下げされた。
+#     常時発火させない値に置くのは Granovetter 1973(弱い紐帯を削りすぎると情報伝播=
+#     k* 研究の対象そのものが死ぬ)への配慮。併せて退避規則を relations_evict: tiered に
+#     して、超過時に落ちるのが「hear 洪水 → 弱い紐帯 → 休眠 → 知人」の順になり
+#     **友人・親友は落ちない**ことを保証する(docs/plans/relations-tier-plan.md §3)。
+#   memory.relations_forget(REL 自然削除)… **実装のみ・finals は false 据え置き**。
+#     ON 判断は判定ラウンド(関係の消滅は不可逆なので、退避梯子の実測を見てから決める)。
 #   truth_ledger.max_beliefs_per_agent(S8)… **既に 32 で有界**(config.yaml で宣言済み・
 #     truth_ledger は凍結 SPEC_FILES)。新しい cap は要らない。
 prompts:
@@ -1297,6 +1334,13 @@ reflection:
     sleep_task_rewrite: false
 memory:
   agentic_pull: true
+  # ---- S7 関係台帳の有界化 + 退避梯子(第149。上の「S15 / S7 / S8」註記を参照)----------
+  # 正典: docs/plans/relations-tier-plan.md §3-4。★どちらも 8/22 スイープで最終化する暫定値。
+  relations_max: 2000       # ★保険水準(常時発火させない)。入口 cap 後の実効は数百-数千の見込み
+  relations_evict: tiered   # ★価値考慮の退避梯子(tier2 以上=友人・親友は退避不可侵)
+  # REL 自然削除は**実装のみ・ON 判断は判定ラウンド**(既定 false を明示的に据え置く)。
+  relations_forget:
+    enabled: false
   actr:
     enabled: true
 worldview:
