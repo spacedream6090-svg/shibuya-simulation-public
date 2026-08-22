@@ -32,9 +32,19 @@ occluder が無いとき(既定)は挙動が従来と完全にバイト一致=�
 順位は `dx*dx+dy*dy` = S15 と同一の鍵なので、ループ実装と**同じ集合・同じ順序**になる
 (tests が機械照合する)。遮蔽器が実際に据わっているときはベクトル化を捨ててループへ
 後退する(正しさ優先。本選は遮蔽未配線 = occluder None)。
+
+── 人数だけが要る呼び手(`count_hearers`)────────────────────────────────────
+観測チャンネル `ext.encounter`(cognition/channels.py)は「声が届く**人数**」しか使わない
+のに `len(hearers_of(...))` を呼んでいた = 全個体ぶんのリスト構築と id 昇順ソートを毎 step
+捨てるために作っていた(25k 夕方の py-spy で step 時間の 15.8%)。`count_hearers` は
+**同じ集合の要素数**(同じ `_context` 判定・同じ半径判定式・同じ遮蔽適用)を、列挙も整列も
+せずに返す。cap / radius_eff は受け取らない = このチャンネルの現行 semantics(物理的に
+声が届く人数)をそのまま保つ。索引経路は半径マスクの合計でベクトル化し、`np.hypot` と
+`math.hypot` の 1 ULP 差は半径まわりの帯だけ `math.hypot` で裁定する(下記 `_radius_band`)。
 """
 from __future__ import annotations
 
+import functools
 import math
 
 import numpy as np
@@ -70,6 +80,26 @@ def _context(agent) -> tuple:
     if agent.building:
         return ("bld", agent.building, agent.floor)
     return ("street",)
+
+
+# `np.hypot` と `math.hypot` は同じ入力に対して最大 1 ULP ずれる(実測: 100 万組で
+# 最大 1 ULP)。人数だけを数えるベクトル化経路(`PerceptIndex._count`)が
+# `hearers` と**厳密に同じ集合の要素数**を返すために、半径のまわりに余裕 4 ULP の帯を
+# 取り、帯の中に落ちた要素だけを `math.hypot` で裁定する(帯の外は両実装で判定が一致
+# することが 1 ULP 保証から従う)。帯に入る要素は実データでは事実上ゼロ件。
+_BAND_ULP = 4
+
+
+@functools.lru_cache(maxsize=32)
+def _radius_band(radius: float) -> tuple[float, float]:
+    """(lo, hi) = 半径の ±4 ULP。`h <= lo` は確実に圏内・`h > hi` は確実に圏外。
+
+    半径は run 内で数種類しかないので純関数として憶えておく(呼び手は個体ごと)。"""
+    lo = hi = float(radius)
+    for _ in range(_BAND_ULP):
+        lo = math.nextafter(lo, -math.inf)
+        hi = math.nextafter(hi, math.inf)
+    return lo, hi
 
 
 # --------------------------------------------------------------------------- #
@@ -169,7 +199,7 @@ class PerceptIndex:
     一度だけ構築し、その間だけ hearers_of に渡す。
     """
 
-    __slots__ = ("radius", "_inv", "cells", "_occ", "_np", "_nb")
+    __slots__ = ("radius", "_inv", "cells", "_occ", "_np", "_nb", "_nc")
 
     def __init__(self, radius: float, occluder=None):
         self.radius = float(radius)
@@ -185,6 +215,10 @@ class PerceptIndex:
         # 索引は step ごとに作り直されるのでキャッシュの寿命も 1 step(陳腐化しない)。
         self._np: dict[tuple, tuple] = {}
         self._nb: dict[tuple, tuple] = {}
+        #   _nc … 人数だけ数える経路(count_hearers)の 9 セル連結 (x, y, id)。
+        #         _nb と違い**個体オブジェクトの平坦リストを作らない**(人数に要らない)。
+        #         _np を土台に共有するので、同じセルの全員で連結は 1 回きり。
+        self._nc: dict[tuple, tuple] = {}
 
     def _cell_xy(self, x: float, y: float) -> tuple[int, int]:
         return (math.floor(x * self._inv), math.floor(y * self._inv))
@@ -306,6 +340,91 @@ class PerceptIndex:
         chosen = chosen[np.argsort(ids[chosen], kind="stable")]  # 返りは id 昇順
         return [flat[int(i)] for i in chosen]
 
+    def _count(self, speaker, occ) -> int:
+        """`len(self.hearers(speaker))` と**厳密に同値**な人数(列挙も整列もしない)。
+
+        既定経路(cap=0 / radius_eff=None)専用。返すのは人数だけなので id 昇順の整列も
+        結果リストの確保も行わず、半径マスクの合計だけを取る(第150 の観測チャネル用)。
+        遮蔽器が据わっているときはループで数える(hearers と同じ順で blocks を呼ぶ)。
+        """
+        ctx = _context(speaker)
+        if ctx[0] == "outside":
+            return 0
+        cx, cy = self._cell_xy(speaker.x, speaker.y)
+        radius = self.radius
+        sx, sy, sid = speaker.x, speaker.y, speaker.id
+        cells = self.cells
+        if occ is not None:
+            total = 0
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    bucket = cells.get((ctx, cx + dx, cy + dy))
+                    if not bucket:
+                        continue
+                    for other in bucket:
+                        if other.id == sid:
+                            continue
+                        if math.hypot(other.x - sx, other.y - sy) <= radius:
+                            if not occ.blocks(speaker, other):
+                                total += 1
+            return total
+        nb = self._count_arrays(ctx, cx, cy)
+        if nb is None:
+            return 0
+        xs, ys, ids = nb
+        lo, hi = _radius_band(radius)
+        dxa = xs - float(sx)
+        dya = ys - float(sy)
+        # ① 外接正方形で粗く落とす(**判定の揺らぎ幅 hi まで広げた**厳密に安全な前フィルタ:
+        #    |dx| > hi なら math.hypot も必ず radius を超える)。近傍は 3 セル幅 = 半径の
+        #    3 倍なので、これだけで高価な hypot に渡す要素が半分以下になる。
+        box = np.flatnonzero((np.abs(dxa) <= hi) & (np.abs(dya) <= hi)
+                             & (ids != int(sid)))
+        if box.size == 0:
+            return 0
+        h = np.hypot(dxa[box], dya[box])
+        # ② np.hypot と math.hypot は最大 1 ULP ずれうるので、境界の帯 (lo, hi] に入った
+        #    要素だけ math.hypot で**裁定**する。帯の外はどちらの実装でも判定が一致する
+        #    ことが 1 ULP 保証から従う = hearers と厳密に同じ集合の要素数。
+        total = int(np.count_nonzero(h <= lo))
+        if total != int(np.count_nonzero(h <= hi)):
+            for j in np.flatnonzero((h > lo) & (h <= hi)):
+                k = int(box[int(j)])
+                if math.hypot(float(dxa[k]), float(dya[k])) <= radius:
+                    total += 1
+        return total
+
+    def _count_arrays(self, ctx: tuple, cx: int, cy: int):
+        """近傍 9 セルを連結した (xs, ys, ids) を返す(遅延構築・セル単位で共有)。
+
+        `_neighborhood` の軽量版。人数を数えるのに個体オブジェクトは要らないので
+        平坦リストを作らない(= その分の確保と走査がまるごと消える)。"""
+        key = (ctx, cx, cy)
+        if key in self._nc:
+            return self._nc[key]
+        cells = self.cells
+        xs_l: list = []
+        ys_l: list = []
+        ids_l: list = []
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                ck = (ctx, cx + dx, cy + dy)
+                bucket = cells.get(ck)
+                if not bucket:
+                    continue
+                xa, ya, ia = self._cell_arrays(ck, bucket)
+                xs_l.append(xa)
+                ys_l.append(ya)
+                ids_l.append(ia)
+        if not xs_l:
+            self._nc[key] = None
+            return None
+        nb = (xs_l[0] if len(xs_l) == 1 else np.concatenate(xs_l),
+              ys_l[0] if len(ys_l) == 1 else np.concatenate(ys_l),
+              ids_l[0] if len(ids_l) == 1 else np.concatenate(ids_l))
+        self._nc[key] = nb
+        return nb
+
     def hearers(self, speaker, cap: int = 0, radius_eff=None) -> list:
         # ★既定(cap=0 かつ radius_eff=None)ではこの分岐に入らず、下の従来コードが
         #   1 行も変わらずそのまま走る(golden L1 バイト一致の構造的保証)。
@@ -403,3 +522,35 @@ def hearers_of(speaker, agents_or_index, radius_m: float, occluder=None,
     if bounded:                                # 最寄り K 選抜(S15 と同一規則)
         return nearest_k(speaker, result, cap)
     return sorted(result, key=lambda a: a.id)
+
+
+def count_hearers(speaker, agents_or_index, radius_m: float, occluder=None) -> int:
+    """**`len(hearers_of(speaker, agents_or_index, radius_m, occluder))` と同値**な人数。
+
+    「周囲の声が届く人数」しか要らない呼び手(第80 観測チャンネル `ext.encounter`)用。
+    集合は `hearers_of` と厳密に同じ(同じ `_context` 判定・同じ半径判定式・同じ遮蔽適用)
+    だが、**リスト構築も id 昇順の整列も行わない**。
+
+    有界化の 2 引数(cap / radius_eff)は**受け取らない**: このチャンネルの意味は
+    「物理的に声が届く人数」であって、聞き手 cap(第141 S15 / 第149)や声の段階
+    (`speech_levels`)で絞られた実際の聞き手の数ではない。現行 semantics(= cap も
+    radius_eff も掛けない `hearers_of` の長さ)をそのまま保つ = 観測値はバイト一致。
+
+    第2引数は `PerceptIndex`(近傍 9 セル・ベクトル化)または agent の反復可能列
+    (全対全 live 走査)。どちらでも同じ数を返す。
+    """
+    if isinstance(agents_or_index, PerceptIndex):
+        occ = _resolve(occluder if occluder is not None else agents_or_index._occ)
+        return agents_or_index._count(speaker, occ)
+    ctx = _context(speaker)
+    occ = _resolve(occluder)                   # None=遮蔽なし=従来と完全同一
+    sx, sy, sid = speaker.x, speaker.y, speaker.id
+    radius = radius_m
+    total = 0
+    for other in agents_or_index:
+        if other.id == sid or other.sleeping or _context(other) != ctx:
+            continue
+        if math.hypot(other.x - sx, other.y - sy) <= radius:
+            if occ is None or not occ.blocks(speaker, other):
+                total += 1
+    return total

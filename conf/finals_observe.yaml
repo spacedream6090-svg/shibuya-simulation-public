@@ -526,9 +526,12 @@ physics:
 
   zones:
     # 並び順に意味がある: 信号を持つ scramble を先頭に置く(逆順だと赤信号を無視して車道を渡る)
+    # ★8/22 J1判定: dt_sub 0.05→0.1(全ゾーン)。根拠=py-spy実測で「働く街」の夕方は物理59.6%が
+    #   支配・reference/physics_benchの品質実測(基本図±20%帯・破綻統計)は**dt=0.1のregime**で
+    #   取られており0.05はそれより細かい安全側だった=検証済み領域への引き上げでサブステップ半減。
     - id: scramble
       engine: orca
-      dt_sub: 0.05
+      dt_sub: 0.1
       layers: [0]
       polygon: [[9.92, -3.37], [0.58, 14.05], [-12.27, 10.08], [-22.54, 9.53],
                 [-32.34, 2.27], [-22.85, -13.82], [-4.22, -16.8], [1.38, -10.67]]
@@ -548,7 +551,7 @@ physics:
 
     - id: hachiko_square
       engine: sfm
-      dt_sub: 0.05
+      dt_sub: 0.1
       layers: [0]
       polygon: [[-24.0, -56.0], [14.0, -56.0], [14.0, -27.0], [-24.0, -27.0]]
       arrive_radius_m: 1.0
@@ -561,7 +564,7 @@ physics:
 
     - id: center_gai
       engine: sfm
-      dt_sub: 0.05
+      dt_sub: 0.1
       layers: [0]
       polygon: [[-85.71, 12.02], [-76.77, 11.05], [-70.69, 67.09], [-79.63, 68.06]]
       arrive_radius_m: 1.0

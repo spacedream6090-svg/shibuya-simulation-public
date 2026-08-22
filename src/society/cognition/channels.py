@@ -56,7 +56,7 @@ import json
 from dataclasses import dataclass
 
 from .. import physics as _physics
-from ..world.perception import build_index, hearers_of
+from ..world.perception import build_index, count_hearers
 
 SCHEMA = 1
 
@@ -319,7 +319,9 @@ def observe(sim, step: int, sim_min: int, since_idx: int) -> list[tuple]:
         crowd = _physics.crowd_override(sim, agent, crowd)
         values: list[float | None] = [
             crowd,
-            float(len(hearers_of(agent, index, radius))),
+            # 人数しか要らないので列挙(遮蔽判定つきリスト構築 + id 昇順ソート)はしない。
+            # `count_hearers` は `len(hearers_of(...))` と厳密に同値(perception 側で機械照合)。
+            float(count_hearers(agent, index, radius)),
             float(heard.get(aid, 0)),
             float(signage.get(aid, 0)),
             delay,
