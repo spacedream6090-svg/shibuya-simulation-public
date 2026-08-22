@@ -103,12 +103,14 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from .calendar import WEEKDAYS as _WEEKDAYS          # Mon..Fri(暦 module が唯一の定義元)
+from .calendar import days_match as _days_match      # 第144: パーサは calendar.py へ移設
+from .calendar import parse_days as _parse_days      # noqa: F401  (後方互換の再輸出)
+
 # presence キー → 優先度 tier(小さいほど先に充足=cap で落とされにくい)。
 # resident/duty/workday は「毎日概ね同じ顔」(回転が薄い)。cadence/stochastic が回転の主層。
 _TIER = {"resident": 0, "duty": 1, "workday_shift": 2, "cadence": 3, "stochastic": 4}
 _N_TIERS = 5
-
-_WEEKDAYS = frozenset({0, 1, 2, 3, 4})     # Mon..Fri(day % 7 で day0=Monday とする)
 
 
 @dataclass
@@ -135,69 +137,11 @@ class PresenceRec:
 #   **名簿が土曜出勤と宣言している 44,486 人が土曜に失格**していた = 名簿の意図と機構のズレ。
 #   これは新機能ではなく**バグ修正**なので、pool ON のランでは既定挙動が変わる(土曜の
 #   workday_shift が増える)。pool OFF(golden)は presence を 1 度も通らないので無風。
-#: 曜日名 → index(0=Mon..6=Sun)。範囲記法 "a-b" の両端に使う。
-_DAY_INDEX = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
-#: 範囲記法でない固定語彙(名簿・台帳・conf が実際に書いている語)。
-_DAYS_ALIAS: dict[str, frozenset[int]] = {
-    "all": frozenset(range(7)),
-    "everyday": frozenset(range(7)),
-    "daily": frozenset(range(7)),
-    "weekday": _WEEKDAYS,          # L5 duty_pattern("ティッシュ配り" 等)が使う語
-    "weekdays": _WEEKDAYS,
-    "school_day": _WEEKDAYS,       # cadence(通学日)
-    "weekend": frozenset({5, 6}),
-    "weekends": frozenset({5, 6}),
-    "holiday": frozenset({5, 6}),
-}
-
-
-def _parse_days(spec: str) -> frozenset[int] | None:
-    """曜日仕様 → 出勤曜日の集合。**解釈できない仕様は None**(呼び出し側が後退する)。
-
-    受理する形(名簿・台帳・conf が実際に書いている形だけ。推測で語彙を増やさない):
-      - 固定語 `_DAYS_ALIAS`("all" / "weekday" / "school_day" / "weekend" …)
-      - 範囲記法 `mon-fri` / `mon-sat` / `tue-sun` / `sat-sun`(両端含む・折り返し可)
-      - カンマ列 `mon,wed,fri`(範囲と混在可: `mon-fri,sun`)
-    """
-    key = str(spec or "").strip().lower()
-    if not key:
-        return None
-    got: set[int] = set()
-    for token in key.split(","):
-        token = token.strip()
-        if not token:
-            continue
-        alias = _DAYS_ALIAS.get(token)
-        if alias is not None:
-            got |= set(alias)
-            continue
-        if "-" in token:
-            lo_s, _, hi_s = token.partition("-")
-            lo, hi = _DAY_INDEX.get(lo_s.strip()), _DAY_INDEX.get(hi_s.strip())
-            if lo is None or hi is None:
-                return None
-            # 折り返し(例 "sat-sun" は 5,6 / "sun-tue" は 6,0,1)も素直に展開する。
-            got |= {(lo + i) % 7 for i in range((hi - lo) % 7 + 1)}
-            continue
-        one = _DAY_INDEX.get(token)
-        if one is None:
-            return None
-        got.add(one)
-    return frozenset(got) or None
-
-
-def _days_match(spec: str, weekday: int) -> bool:
-    """暦の曜日仕様と当日 weekday の一致(**解釈できない仕様だけ**平日扱いに後退)。
-
-    ★A1③: `mon-sat` 等の範囲記法を名簿の意図どおり解釈する(旧実装はここで失格させていた)。
-    後退規則そのものは残す(未知の語を黙って「毎日出勤」にしない方が安全側)。
-    """
-    if not spec or spec == "all":
-        return True
-    days = _parse_days(spec)
-    if days is None:
-        return weekday in _WEEKDAYS          # 解釈できない仕様 = 従来どおり平日扱い
-    return int(weekday) in days
+# ★第144: パーサ本体(`_DAY_INDEX` / `_DAYS_ALIAS` / `_parse_days` / `_days_match`)は
+#   `world/calendar.py` へ**移設**した。理由は「同じ曜日仕様を勤務ゲート(routine /
+#   scheduler)も読むようになり、写しが 2 つあると片方だけが直る」から。ここは上の import で
+#   同じ関数を再輸出しているだけで、**規則も戻り値も 1 ビットも変わらない**
+#   (tests/test_presence_endogenization.py は 1 行も変えずに緑)。
 
 
 def _weekly_days(hub, pid: str, week: int, n: int) -> set[int]:

@@ -212,7 +212,7 @@ def moment_context(sim, agent, step: int, sim_min: int, cfg: dict,
     if (sim_min % 1440) < window_from_min(agent, cfg):
         return None                                # 務めが終わっていない
     if routine.in_work_window(agent, sim_min, cal) \
-            or routine.in_part_time_window(agent, sim_min):
+            or routine.in_part_time_window(agent, sim_min, cal):
         return None
     ctx = _low_load_context(agent)
     if ctx is None:

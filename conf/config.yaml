@@ -572,6 +572,21 @@ world:
     start_date: "2026-04-01"    # シミュ初日の実日付(day_index=0 の日)
     weekday_work: false         # ★ON 推奨: true(平日のみ勤務・登校。土日祝は休み)
     holidays: []                # 追加の休日(例: ["2026-04-29", "2026-05-05"])。土日は自動で休日
+    # ---- 第144: 暦ゲートの2つの是正(どちらも既定 false = 現行と1バイト同一)-------------
+    # respect_work_days: weekday_work の平日ゲートを、**台帳が既に宣言している営業曜日**で解く。
+    #   組織台帳(organizations_*.json)の shift_pattern.days は mon-fri / mon-sat / all を
+    #   書き分けている(センサス較正台帳では土曜営業が約半数)が、職場束ね(work.bind_workplace)
+    #   はこれまで open/close だけを読んで days を捨てていた。そのため weekday_work=true の
+    #   ランでは**土曜営業の職場まで一律に閉まり、土曜始まりのランは初日の在勤が全滅**した。
+    #   ON にすると宣言のある個体はその曜日集合で判定し、宣言の無い個体(学校など shift_pattern を
+    #   持たない層)は従来どおり平日 + holidays へ後退する。要 enabled かつ weekday_work=true。
+    #   ★役割職(駅員・警察官・運転士 等)は shift_pattern を持たず当番表を duty_pattern.days に
+    #     書くので、そちらも後退先として読む(= presence の在場判定と曜日の出所が 1 本に揃う)。
+    # calendar_weekday: 在場(presence)とバイトのシフトが読む曜日を day%7(day0=月曜)から
+    #   **暦の曜日**へ差し替える。暦 ON のランでは「暦は土曜と言うのに presence は月曜の名簿を
+    #   出す」位相ずれが起きるため(start_date が月曜でない限り必ずずれる)。
+    respect_work_days: false    # ★ON 推奨(本番): true(台帳の営業曜日を勤務・賃金ゲートに使う)
+    calendar_weekday: false     # ★ON 推奨(本番): true(presence/バイトの曜日を暦に合わせる)
 
   # ---- 痕跡 = 場所のイベント履歴 IF-D(第96バッチ 2026-08-05。**既定 OFF=現行と完全同一**)----
   # 監査 §3 が挙げた穴: 「場所のイベント履歴 = L1 に座標付きで全部残るが**シム内から読む

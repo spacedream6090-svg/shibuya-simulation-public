@@ -526,14 +526,24 @@ def hours_since_bedtime(agent, sim_min: int) -> float:
 
 
 def early_tomorrow(agent, sim, sim_min: int, hcfg: dict) -> bool:
-    """翌日が早出か。既存の勤務開始時刻(+ 暦があれば翌日が勤務日か)だけから導く。"""
+    """翌日が早出か。既存の勤務開始時刻(+ 暦があれば翌日が勤務日か)だけから導く。
+
+    ★第144 `respect_work_days`(既定 false = 下の分岐が旧コードと 1 バイト同一): 暦ゲートは
+      `routine.in_work_window` / `scheduler._wage_worked_today` と**同一の式**で判定する
+      (「勤務日か」を答える窓口が 3 つあるので、3 つとも同じ規則で答えなければならない)。
+    """
     start = int(getattr(agent, "work_start_min", -1))
     if start < 0 or start >= int(hcfg["early_start_min"]):
         return False
     cal = getattr(sim, "calendarcfg", None)
     if cal is not None and cal.get("enabled") and cal.get("weekday_work"):
         from .world import calendar as _calendar
-        if not _calendar.is_workday(cal, int(sim_min) + 1440):
+        spec = str(getattr(agent, "work_dow", "") or "") if cal.get("respect_work_days") else ""
+        tomorrow = int(sim_min) + 1440
+        if spec:
+            if not _calendar.days_match(spec, _calendar.weekday_of(cal, tomorrow)):
+                return False
+        elif not _calendar.is_workday(cal, tomorrow):
             return False
     return True
 

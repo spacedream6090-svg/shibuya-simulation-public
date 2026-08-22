@@ -297,6 +297,11 @@ def load_bind_book(bcfg: dict, repo_root) -> dict:
             "node": wp.get("node"), "building": wp.get("building"),
             "floor": wp.get("floor"), "poi_id": wp.get("poi_id"), "cat": wp.get("cat"),
             "open": sp.get("open") or tt.get("start"), "close": sp.get("close"),
+            # ★第144: 台帳が既に宣言している**営業曜日**(mon-fri / mon-sat / all)。
+            #   これまで束ねは open/close だけを読み days を捨てていたので、暦の平日ゲート
+            #   (world.calendar.weekday_work)が土曜営業の職場まで一律に閉めていた。
+            #   学校(timetable のみ)は days を持たない = "" = 従来どおり平日ゲート。
+            "days": sp.get("days"),
         }
     return book
 
@@ -406,6 +411,23 @@ def bind_workplace(agent, record: dict, city, book: dict, bcfg: dict) -> tuple[b
     if bld is not None:                                    # 建物内の職場: 入館して勤務
         agent.work_building = bld
         agent.work_floor = int(floor) if int(floor) >= 1 else 1
+    # ★第144: 職場が宣言している**営業曜日**を個体へ写す(台帳 shift_pattern.days →
+    #   record.shift_pattern.days → record.duty_pattern.days の順に後退。どれも無ければ
+    #   属性を**生やさない**)。読むのは `world.calendar.respect_work_days` が ON のときの
+    #   勤務/賃金ゲートだけで、既定 OFF では誰も読まない = 1 バイトも挙動が変わらない
+    #   (work_wraps と同じ作法)。
+    #   ★duty_pattern を後退先に足す理由(ユーザー決定「census 宣言曜日の一貫適用」):
+    #     L5 の役割職(駅員・警察官・運転士・配信者 等)は shift_pattern を持たず、当番表を
+    #     `duty_pattern.days`("all" / "weekday" …)に書いている。ここを読まないと
+    #     respect_work_days ON でも彼らだけが土日に持ち場から消える = 街の担い手が週末に
+    #     居なくなるという現実整合の穴が残る。presence が同じ欄で在場を決めている
+    #     (`world/presence.py` の duty_days)ので、在場と勤務の曜日源が 1 本に揃う。
+    #   ※`agent.work_days` は**別物**(給料日までの本業勤務日数カウンタ・int)なので触らない。
+    dow = ((entry or {}).get("days")
+           or (record.get("shift_pattern") or {}).get("days")
+           or (record.get("duty_pattern") or {}).get("days"))
+    if dow:
+        agent.work_dow = str(dow)
     if int(getattr(agent, "work_start_min", -1)) < 0:      # 勤務窓が無い個体にだけ窓を補う
         o, c, wraps = _window(bcfg, entry, record)
         agent.work_start_min = o

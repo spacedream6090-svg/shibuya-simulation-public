@@ -161,9 +161,14 @@ def _anchor(what: str, start_min: int, dur_min: int, place: str,
             "flex": "fixed", "with": [], "alt": "", "anchor": True}
 
 
-def anchors_from_shift(agent, sim_min: int) -> list:
+def anchors_from_shift(agent, sim_min: int, cal: dict | None = None) -> list:
     """勤務・就学のシフト窓(ペルソナ/組織台帳由来の work 窓 + バイト窓)を mandatory
-    アンカーとして返す。当日のバイト曜日のみ計上する。"""
+    アンカーとして返す。当日のバイト曜日のみ計上する。
+
+    ★第144 `world.calendar.calendar_weekday`(既定 false = `(sim_min // 1440) % 7` のまま
+      = バイト一致): ON のときだけバイトの曜日を**暦**で取る。`routine.in_part_time_window`
+      と同じ時計でなければ「計画にはシフトが載るのに本人は行かない」ズレになる。
+    """
     out: list = []
     ws = int(getattr(agent, "work_start_min", -1) or -1)
     if ws >= 0:
@@ -172,7 +177,11 @@ def anchors_from_shift(agent, sim_min: int) -> list:
                             str(getattr(agent, "work_name", "") or ""), "勤務"))
     pt = getattr(agent, "part_time", None)
     if pt:
-        day = (sim_min // 1440) % 7
+        if cal is not None and cal.get("enabled") and cal.get("calendar_weekday"):
+            from ..world import calendar as _calendar
+            day = _calendar.weekday_of(cal, sim_min)
+        else:
+            day = (sim_min // 1440) % 7
         if day in (pt.get("days") or []):
             ps, pe = int(pt["start_min"]), int(pt["end_min"])
             out.append(_anchor("work", ps, pe - ps, "", "バイトのシフト"))
@@ -191,7 +200,7 @@ def compile_plan(agent, sim, items: list, sim_min: int, fw: dict):
               = 勤務窓は routine が独立に処理する)。
     summary : {n, cats, anchors} 観測用の要約。
     """
-    anchors = anchors_from_shift(agent, sim_min)
+    anchors = anchors_from_shift(agent, sim_min, getattr(sim, "calendarcfg", None))
     occupied = {a["when"] for a in anchors}          # アンカーが押さえたバンド
     fill: list = []
     for it in items:

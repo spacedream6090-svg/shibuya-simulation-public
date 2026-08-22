@@ -960,7 +960,8 @@ def _phase_jitter(sim, step: int, sim_min: int) -> None:
         at_work = (routine.in_work_window(agent, sim_min,
                                           getattr(sim, "calendarcfg", None))
                    and agent.node == agent.work_node)
-        at_pt = (agent.part_time and routine.in_part_time_window(agent, sim_min)
+        at_pt = (agent.part_time and routine.in_part_time_window(
+                     agent, sim_min, getattr(sim, "calendarcfg", None))
                  and agent.node == agent.part_time["node"])
         if at_work or at_pt:
             continue
@@ -4274,15 +4275,24 @@ def _wage_worked_today(sim, agent, sim_min: int) -> bool:
     """今日この個体が働いたか。`routine.in_work_window` と**同じ基準**(時刻の条件だけ外す)。
 
     病欠・勤務窓なし(未就業/失職)・暦の休日は働かない。在場していること自体は
-    呼び出し側(sim.agents の走査)が保証している = 在場が勤務日の資格そのもの。"""
+    呼び出し側(sim.agents の走査)が保証している = 在場が勤務日の資格そのもの。
+
+    ★第144 `respect_work_days`(既定 false = 旧コードと 1 バイト同一): 暦ゲートの分岐は
+      `routine.in_work_window` と**同一の式**でなければならない —— 食い違うと「働いたのに
+      賃金が出ない / 休んだのに賃金が出る」という会計の破れになるので、テストが同値を固定する。
+    """
     if getattr(agent, "sick", False):
         return False
     if int(getattr(agent, "work_start_min", -1)) < 0:
         return False
     cal = getattr(sim, "calendarcfg", None) or {}
-    if cal.get("enabled") and cal.get("weekday_work") \
-            and not calendar.is_workday(cal, sim_min):
-        return False
+    if cal.get("enabled") and cal.get("weekday_work"):
+        spec = str(getattr(agent, "work_dow", "") or "") if cal.get("respect_work_days") else ""
+        if spec:
+            if not calendar.days_match(spec, calendar.weekday_of(cal, sim_min)):
+                return False
+        elif not calendar.is_workday(cal, sim_min):
+            return False
     return True
 
 

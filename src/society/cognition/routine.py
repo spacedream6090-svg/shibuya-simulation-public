@@ -336,14 +336,25 @@ def in_work_window(agent, sim_min: int, cal: dict | None = None) -> bool:
     """本業・登校の勤務時間帯か。cal(world.calendar cfg)を渡し weekday_work=true のときは
     平日(非休日)だけに絞る。cal=None / 無効 / weekday_work=false なら現行=毎日勤務(不変)。
     バイト(in_part_time_window)は平日ゲートの対象外(既存の曜日挙動を変えない)。
-    病気(健康 H1、既定 OFF=agent.sick 立たず不変)のときは欠勤=勤務時間外扱い(False)。"""
+    病気(健康 H1、既定 OFF=agent.sick 立たず不変)のときは欠勤=勤務時間外扱い(False)。
+
+    ★第144 `respect_work_days`(既定 false = 下の分岐が旧コードと 1 バイト同一):
+      ON のときは「その職場が台帳で宣言している営業曜日」(`agent.work_dow`。
+      work.bind_workplace が台帳 shift_pattern.days から写す)を先に見る。宣言のある個体は
+      その曜日集合だけで判定し(= 土曜営業の職場は土曜に開く)、宣言の無い個体
+      (学校・宣言を持たない層)は**従来どおり** is_workday(平日 + holidays)へ後退する。
+    """
     if getattr(agent, "sick", False):              # 病気=欠勤(健康 H1。既定 OFF は False)
         return False
     if agent.work_start_min < 0:
         return False
-    if cal is not None and cal.get("enabled") and cal.get("weekday_work") \
-            and not _calendar.is_workday(cal, sim_min):
-        return False
+    if cal is not None and cal.get("enabled") and cal.get("weekday_work"):
+        spec = str(getattr(agent, "work_dow", "") or "") if cal.get("respect_work_days") else ""
+        if spec:
+            if not _calendar.days_match(spec, _calendar.weekday_of(cal, sim_min)):
+                return False
+        elif not _calendar.is_workday(cal, sim_min):
+            return False
     m = _minutes_of_day(sim_min)
     # 日跨ぎの勤務窓(夜勤 22:00→06:00。第101 III-1「夜間開放」)。work.bind_workplace が
     # world.night_economy ON のときだけ agent.work_wraps を立てる = **既定 OFF では属性が
@@ -353,16 +364,24 @@ def in_work_window(agent, sim_min: int, cal: dict | None = None) -> bool:
     return agent.work_start_min <= m < agent.work_end_min
 
 
-def in_part_time_window(agent, sim_min: int) -> bool:
+def in_part_time_window(agent, sim_min: int, cal: dict | None = None) -> bool:
     """バイトのシフト時間帯か(曜日+時間帯)。経済 v0: 学生・フリーター等のみ part_time を持つ。
 
-    病気(健康 H1、既定 OFF=agent.sick 立たず不変)のときは欠勤=シフト時間外扱い(False)。"""
+    病気(健康 H1、既定 OFF=agent.sick 立たず不変)のときは欠勤=シフト時間外扱い(False)。
+
+    ★第144 `calendar_weekday`(既定 false = `(sim_min // 1440) % 7` のまま = バイト一致):
+      ON のときだけ曜日を**暦**(start_date からの実曜日)で取る。バイトの曜日時計だけが
+      day0=月曜の別時計を持っていると、暦 ON のランで「金曜のはずの日に日曜のシフト」が
+      起きる(第3の時計。presence の `_pool_weekday` と同じ是正)。"""
     if getattr(agent, "sick", False):              # 病気=欠勤(健康 H1。既定 OFF は False)
         return False
     pt = agent.part_time
     if not pt:
         return False
-    day = (sim_min // 1440) % 7
+    if cal is not None and cal.get("enabled") and cal.get("calendar_weekday"):
+        day = _calendar.weekday_of(cal, sim_min)
+    else:
+        day = (sim_min // 1440) % 7
     if day not in pt["days"]:
         return False
     m = _minutes_of_day(sim_min)
@@ -722,7 +741,7 @@ def _media_action(agent, sim, sim_min: int, step: int) -> dict | None:
         return None
     # 勤務・バイトの時間帯は仕事優先(視聴を始めない・進行中でも中断)。
     if in_work_window(agent, sim_min, _cal(sim)) \
-            or in_part_time_window(agent, sim_min):
+            or in_part_time_window(agent, sim_min, _cal(sim)):
         if getattr(agent, "_media_end", -1) >= 0:
             _end_media(agent)
         return None
@@ -975,11 +994,11 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
         at_work = (agent.building == agent.work_building
                    and in_work_window(agent, sim_min, cal))
         at_pt = (agent.part_time and agent.building == agent.part_time["building"]
-                 and in_part_time_window(agent, sim_min))
+                 and in_part_time_window(agent, sim_min, cal))
         if at_work or at_pt:
             return {"type": "stay"}                # 勤務・バイト中はその場に留まる
         # バイトのシフトが始まったら、今いる建物を出てバイト先へ向かう
-        if agent.part_time and in_part_time_window(agent, sim_min) \
+        if agent.part_time and in_part_time_window(agent, sim_min, cal) \
                 and agent.building != agent.part_time["building"]:
             return {"type": "exit_building"}
         if agent.building == agent.home_building and not agent.route \
@@ -1020,7 +1039,7 @@ def decide(agent, step: int, sim, place: str, rng: np.random.Generator,
                     "activity": "commuting"}
 
     # ---- バイトのシフト時間帯: バイト先(実在 POI)へ ----
-    if agent.part_time and in_part_time_window(agent, sim_min):
+    if agent.part_time and in_part_time_window(agent, sim_min, cal):
         pt = agent.part_time
         if agent.node == pt["node"]:
             if pt["building"] and sim.city.has_building(pt["building"]):

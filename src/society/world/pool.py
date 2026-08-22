@@ -373,6 +373,14 @@ _MISC_FIELDS = (
     ("pop_stress", float, 0.0), ("pop_days", int, 0),
     ("pop_settled", bool, False), ("pop_emigrated", bool, False),
     ("pop_pair_since", int, -1),
+    # ★第144: 職場が宣言している営業曜日("mon-fri" / "mon-sat" / "all" …)。
+    #   `work.bind_workplace` が台帳 shift_pattern.days から写す文字列で、
+    #   `world.calendar.respect_work_days` が ON のとき勤務ゲート/賃金ゲートの入力になる
+    #   (= ③「行動 or 発火可否を変える」)。①個体固有 ②日を跨いで持続 も満たす。
+    #   ★束ねが OFF のラン(既定)ではこの属性が**生えない**ので退避 dict は 1 バイトも
+    #     変わらない。既定値 "" は getattr の既定と厳密に一致。
+    #   ※`work_days`(int・給料日までの勤務日数)とは**別物**。名前が似ているだけ。
+    ("work_dow", str, ""),
 )
 
 #: 世帯(H2)。★レーン乙 ブロック3: 世帯の静的部分は pool record から決定論で組み直すが、

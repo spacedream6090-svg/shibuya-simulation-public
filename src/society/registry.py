@@ -248,6 +248,21 @@ FEATURES: tuple[Feature, ...] = (
        "暦(日付・曜日・祝日)。全プロンプトへ日付1行を注入する"),
     _f("world.calendar.weekday_work", "strict", False, "none",
        "本業勤務・登校を平日だけに絞る"),
+    _f("world.calendar.respect_work_days", "strict", False, "none",
+       "weekday_work の平日ゲートを、**台帳が宣言している営業曜日**(組織の "
+       "shift_pattern.days、役割職は duty_pattern.days → agent.work_dow)で解く。"
+       "宣言のある個体はその曜日集合で "
+       "判定し(mon-sat の職場は土曜に開く)、宣言の無い個体(学校など)は従来どおり "
+       "平日 + holidays へ後退する。要 world.calendar.enabled かつ weekday_work=true "
+       "(どちらかが false なら完全 no-op)。既定 false = 現行と 1 バイト同一。"
+       "affects_k=False: LLM 呼の発生箇所を 1 つも足さない(勤務窓の真偽が変わるだけ)。"
+       "fingerprint_risk=none: プロンプトへ 1 バイトも足さない"),
+    _f("world.calendar.calendar_weekday", "strict", False, "none",
+       "在場(presence)とバイトのシフトが読む曜日を day%7(day0=月曜)から**暦の曜日**"
+       "(start_date からの実曜日)へ差し替える。暦 ON のランで「暦は土曜・presence は "
+       "月曜」という位相ずれを解消する。既定 false = 現行の day%7 と 1 バイト同一。"
+       "★入力は day と start_date だけなので presence 純関数の契約(k 非依存・trait "
+       "非依存・resume 不変・乱数ゼロ)は保たれる"),
     # 装置(device)層 = 目標を持たないアクター(actor model P2。実装 src/society/devices.py)。
     # strict の根拠: 装置は**決定論的な応答関数**であり乱数 stream を 1 本も引かない
     #   (設計契約。module に乱数の識別子が存在しないことを tests/test_devices.py が AST 固定)。

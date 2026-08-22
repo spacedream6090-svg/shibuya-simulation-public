@@ -31,6 +31,7 @@ from ..world.transit import Transit
 from ..world import presence as presence_mod
 from ..world import pool as pool_mod
 from ..world import floors as _floors_mod
+from ..world import calendar as _calendar_mod
 from .. import worldview as _wv_mod
 from . import checkpoint, scheduler
 
@@ -348,7 +349,6 @@ class Simulation:
         # 日付・カレンダー / 天気(第7バッチ 2026-07-07。すべて既定 OFF=現行挙動と完全同一)。
         # 当日の date_line/weather を run_step の日境界で確定し sim に保持(全エージェント共通・
         # k 非依存)。天気は新 stream "weather" のみ使用=既存 draw 順は不変。
-        from ..world import calendar as _calendar_mod
         from .. import weather as _weather_mod
         from .. import schedule as _schedule_mod
         raw_cal = cfg.get("world", {}).get("calendar", None)
@@ -1918,8 +1918,19 @@ class Simulation:
 
     # ---- 日次ローテーション/presence(W2 P3)------------------------------------
     def _pool_weekday(self, day: int) -> int:
-        """当日の曜日(0=Mon..6=Sun)。presence を暦 config に結合させず day のみの純関数に保つ
-        ため day % 7(day0=Monday)で決める(k 非依存・resume 不変)。"""
+        """当日の曜日(0=Mon..6=Sun)。
+
+        既定(`world.calendar.calendar_weekday` = false)は従来どおり day % 7(day0=Monday)。
+        presence を暦 config に結合させず day のみの純関数に保つための割り切りだった。
+
+        ★第144 `calendar_weekday`(既定 false = 上の式のまま = バイト一致): ON のときは
+          **暦の曜日**を使う。暦 ON のランでは「暦が土曜と言っている日に presence は月曜の
+          名簿を出す」という位相ずれが起き、名簿の曜日宣言(work_days)と勤務ゲートの曜日が
+          食い違っていた。ON でも入力は day と start_date だけ(k 非依存・trait 非依存・
+          resume 不変・乱数ゼロ)なので presence 純関数の契約は保たれる。"""
+        cal = getattr(self, "calendarcfg", None) or {}
+        if cal.get("enabled") and cal.get("calendar_weekday"):
+            return _calendar_mod.weekday_of(cal, int(day) * 1440)
         return int(day) % 7
 
     def _pool_rain(self, day: int) -> bool | None:
@@ -1927,8 +1938,9 @@ class Simulation:
 
         - habit.weather が OFF / habit そのものが OFF なら覗きにも行かない(no-op)。
         - 覗くのは `weather.peek_bad_day`(副作用ゼロ。summary の generated 件数を汚さない)。
-        ★暦は使うが presence の weekday は使わない(weekday は day%7 の純関数のまま)=
-          「暦の曜日」と「presence の曜日」は別物という現行の割り切りを 1 行も変えない。
+        ★暦は使うが presence の weekday は使わない(weekday の出所は `_pool_weekday` 1 本)。
+          その `_pool_weekday` も既定では day%7 のままで、`world.calendar.calendar_weekday`
+          を ON にしたときだけ暦の曜日へ合流する(第144)。
         """
         habit = getattr(self, "_pool_presence", None)
         if not habit or not habit["habit"]["enabled"] or not habit["habit"]["weather"]:
