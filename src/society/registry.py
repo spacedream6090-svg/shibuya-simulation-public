@@ -184,6 +184,35 @@ FEATURES: tuple[Feature, ...] = (
        "採用にはユーザーの事前登録が必要で、採るなら RESULTS に開示する。"
        "適用は speak ハンドラの hearers **だけ**(同席判定・発火条件・company は不触)",
        off_value=0),
+    # 第151(空間索引セル細分化 + 友人グラフキャッシュ)。正典
+    #   docs/plans/index-cell-and-friend-cache-plan.md §1-§2。
+    # ★どちらも**層1 = 純粋な実装最適化**: 世界の力学に 1 ビットも触らない。
+    #   repro_tier=strict / affects_k=False / fingerprint_risk=none を素直に宣言できる
+    #   (返り値・イベント列・乱数消費・LLM 呼数が定義上すべて不変で、テストが機械照合する)。
+    _f("world.perception_cell_m", "strict", False, "none",
+       "空間索引のセル寸法 [m]。0(既定)= セル寸法 = perception_radius_m = 現行と完全同一。"
+       ">0 で有界クエリ(cap / radius_eff = C2 の声の段階)だけがセル寸法 cell_m の細格子を"
+       "見る(走査リング = ceil(r/cell) セル)。索引のセル寸法が常に 40m だったせいで、"
+       "実効半径 5m の問い合わせでも(120m)² の中の全員を距離計算に流していた"
+       "(候補母集団 ~183 倍。250k 夕方 step の py-spy で `_hearers_bounded` が ~80%)。"
+       "定石は linked-cell / spatial hashing の『セル寸法 ≈ 相互作用半径』。"
+       "★既定クエリ(半径一律・count_hearers)と大半径クエリ、および**疎な近傍**は"
+       "粗格子 = 現行経路のままなので、どの半径・どの密度でも性能退行が起こりえない。"
+       "★返り値は全 radius 階級で現行と同一集合・同一順序(id 昇順 / 距離二乗昇順の"
+       "全順序なので格子の走査順に依らない)。乱数ゼロ・LLM 呼数不変・L1 の欄ゼロ増",
+       off_value=0.0),
+    _f("world.friends_cache_dir", "strict", False, "none",
+       "友人グラフ(friend_graph)の決定結果を置くディレクトリ。\"\"(既定)= OFF = "
+       "現行と完全同一。250k の py-spy で **init の 68.4% が build_friend_graph**"
+       "(40-60 分/起動)だが、生成は blake2b の安定ハッシュだけで決まる完全な決定論"
+       "(乱数 stream ゼロ・run.seed 非依存)= 毎回同じグラフを作り直していた。"
+       "ON では初回に (a, b, tier) の適用順の列を保存(tmp 書き → rename)し、2 回目以降は"
+       "キー一致でロードして**同順再生**する = in-memory の結果はバイト同一。"
+       "キーは friends.py の内容 hash・設定・tier 閾値・**居住者名簿ダイジェスト**を含むので"
+       "『キー一致 ⟹ 出力一致』が構成的に言える。不一致・破損・失敗はログ 1 行で黙って再構築"
+       "(例外を上げない)。疫学・社会 ABM(FRED / Epihiper / synthpops)が合成人口と"
+       "接触ネットワークを前処理成果物として再利用するのと同じ構成",
+       off_value=""),
     # 作用点0/A(第149・声の段階 + C2 近傍 cap)。正典 docs/plans/hearer-cap-plan.md §2。
     # ★affects_k=True を S15 と同じ理由で正直に宣言する: 聴衆/近傍を絞ると聞き手側の
     #   drive 加算(_arouse / C2 の addressed)が減るので、呼数 cap が binding しない構成では

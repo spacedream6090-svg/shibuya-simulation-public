@@ -362,6 +362,23 @@ world:
   #   騒音下の内容了解圏(~3m・密度 1/m² で ~28 人)と同帯。★8/22 スイープで最終化する暫定値。
   attention_hearers_max: 20
 
+  # ---- 第151 ホットパス 2 レバー(**層1 = 純粋な実装最適化**。世界の力学に触らない)----
+  # 正典: docs/plans/index-cell-and-friend-cache-plan.md。250k の py-spy 実測
+  #   (stepping ~80% = C2 `_hearers_bounded` / init 68.4% = friends.build_friend_graph)への対処。
+  # ★層3 の 3 レバー(speech_levels / c2_neighbors_max / attention)と違い、**返り値・
+  #   イベント列・乱数消費・LLM 呼数が定義上すべて不変**なので RESULTS 開示の対象ではない
+  #   (テストが全 radius 階級で同一集合・同一順序を機械照合する)。撤退路は
+  #   perception_cell_m: 0.0 / friends_cache_dir: "" で 1 行ずつ現行へ戻せる。
+  perception_cell_m: 5.0      # 通常声の屋外半径(speech_levels.normal.outdoor_m = 5.0)に
+                              # 合わせる(linked-cell の定石 = セル寸法 ≈ 相互作用半径)。
+                              # 0 = 現行(セル寸法 = perception_radius_m = 40m)への撤退路。
+  # ★暫定注記: 本キーは**起動を速くするだけ**の装置で、世界には 1 ビットも触らない。
+  #   ただし (1) キャッシュの実体が data/cache/ に残る = 設定を変えたら別キーになるだけで
+  #   古いファイルは自動削除されない(容量は 1 ファイル ~数十 MB 級)、(2) 本選当日の
+  #   初回起動は結局フル構築を払う(2 回目以降のリトライ・再リハが速くなる)ので、
+  #   **初日は「余裕をもって 1 回空焚きしておく」運用**を前提にした値である。
+  friends_cache_dir: data/cache/friend_graph
+
   # ---- 夜間解禁(Wave 4 III-1)。1つのクランプ修正が夜の街全体を開ける ----
   night_economy:
     enabled: true          # 日跨ぎシフト(close<open)+ 24h コンビニ + 深夜営業 + 終電後の受け皿

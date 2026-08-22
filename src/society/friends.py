@@ -26,13 +26,46 @@
 
 既定 OFF(enabled=false)= 何も張らず・relations 台帳に一切触れず・friend_graph_built も出さない
   =乱数消費・イベント列・プロンプトともバイト一致(ゴールデン golden_baseline_l1.json を守る)。
+
+── ディスクキャッシュ(`world.friends_cache_dir`。既定 "" = OFF = 現行と完全同一)──────
+250k の py-spy で **init の 68.4% が build_friend_graph**(40-60 分/起動)だった。中身は
+居住者ごとの全相手ランキング(O(N² log N) の Python ソート)で、しかも **完全な決定論**
+(`_stable_uniform` = blake2b・乱数 stream を 1 本も引かない・run.seed 非依存)。
+= 同じ入力なら毎回同じグラフを作り直している。
+
+疫学・社会 ABM の標準構成(FRED / Epihiper / synthpops)は「合成人口と接触ネットワークは
+**前処理で一度生成して成果物として再利用**する」で、ランタイムで毎回張り直す設計は無い。
+本モジュールもそれに倣い、**決定結果**(= 対称化後の (a.id, b.id, tier) を適用順に並べた列)を
+キャッシュする:
+
+  初回      … 従来どおり構築し、注入しながら決定列を集めて保存(tmp 書き → rename の原子的置換)。
+  2 回目以降… キーが一致すればロードして**同じ順序で同じ注入を再生**する
+              (closeness は保存せず、その場の cfg / tier 閾値から再計算 = 同じ float)。
+
+キー = blake2b(形式版・friends.py の内容 hash・friend_graph 設定・tier 閾値・
+  **居住者名簿ダイジェスト**・n_agents・present_cap・プール識別子)。名簿ダイジェストは
+  build_friend_graph が読む属性そのもの(id / pid / 年齢 / 職業 / org_id / org_role /
+  home_building を id 昇順で流し込む)なので、**キー一致 ⟹ 出力一致**が構成的に言える
+  (プール抽選・seed・人数の違いは必ず名簿に現れる)。
+
+不一致・破損・読み書き失敗は **ログ 1 行だけ出して黙って再構築**する(例外を上げない)=
+キャッシュが壊れてもランは止まらないし、結果は 1 バイトも変わらない。
 """
 from __future__ import annotations
 
+import array
 import hashlib
+import json
+import logging
+import os
+import struct
+import sys
+from pathlib import Path
 
 from . import relations as _relations
 from .observer.schema import Event
+
+log = logging.getLogger("society.friends")
 
 DEFAULTS = {
     "enabled": False,
@@ -226,28 +259,155 @@ def _inject(a, b, tier: int, closeness: float) -> None:
     rel["tier"] = int(tier)
 
 
-# ---------------------------------------------------------------- 起動時1回
-def build_friend_graph(sim) -> None:
-    """居住者の友人ネットワークを起動時に決定論で張る(既定 OFF=no-op=バイト一致)。
+# ---------------------------------------------------------------- ディスクキャッシュ
+_CACHE_MAGIC = b"SBYFG1\x00\x00"      # 8 バイト固定(形式の取り違えを弾く)
+_CACHE_FORMAT = 1                     # 形式版(上げるとキーが変わる=旧ファイルは自動で無視)
+_CACHE_HEAD = struct.Struct("<8sII32sQ")   # magic, format, reserved, key, n_edges
+_BIG_ENDIAN = sys.byteorder == "big"       # 保存は常にリトルエンディアン(可搬性)
 
-    顔なじみブロックの直後に1呼び出しで呼ばれる。各居住者の相手を親和スコア降順に並べ、Dunbar 層
-    (親友/友人/知人)で desired tier を割り(有向)、ペアの max tier で対称化して closeness/tier を
-    注入する。乱数 stream を1本も引かない(全 hashlib)=既存 draw 順に無影響=run.seed 非依存。"""
-    cfg = getattr(sim, "friendcfg", None)
-    if not cfg or not cfg["enabled"]:
-        return
-    residents = sorted((a for a in sim.agents if not a.visitor), key=lambda a: a.id)
-    if len(residents) < 2:
-        return
-    rc = getattr(sim, "relationscfg", None) or _relations.DEFAULTS
-    thr = {1: float(rc["tier_acquaintance"]), 2: float(rc["tier_friend"]),
-           3: float(rc["tier_close"])}
-    margin = float(cfg["margin"])
-    # β4: 層別 margin(既定は 3 層とも None = margin = 従来と 1 バイトも変わらない)。
-    # 減衰 1.0/日 の下で「その層が接触ゼロで何日もつか」を決める唯一の数値。
-    margin_of = {tier: (margin if cfg.get(key) is None else float(cfg[key]))
-                 for tier, key in _MARGIN_KEY_OF_TIER.items()}
-    # 各居住者の相手を親和スコア降順に並べ、Dunbar 層で desired tier を割る(有向)。
+
+def cache_dir_of(sim):
+    """`world.friends_cache_dir` を解決する(既定 "" = None = キャッシュ OFF = 現行同一)。
+
+    相対パスはリポジトリルート基準(既存の data 参照規約と同じ)。読めない config でも
+    例外を上げず None(= OFF)へ倒す。"""
+    try:
+        world = sim.cfg.get("world", {}) or {}
+        raw = str(world.get("friends_cache_dir", "") or "").strip()
+    except Exception:                       # noqa: BLE001(旧 config 互換)
+        return None
+    if not raw:
+        return None
+    p = Path(raw)
+    if not p.is_absolute():
+        from .config import REPO_ROOT
+        p = REPO_ROOT / p
+    return p
+
+
+def _self_hash() -> str:
+    """friends.py の内容 hash(生成規則が 1 文字でも変われば別キーになる)。"""
+    try:
+        return hashlib.blake2b(Path(__file__).read_bytes(),
+                               digest_size=16).hexdigest()
+    except Exception:                       # noqa: BLE001(zip 配布などで読めない場合)
+        return "src-unavailable"
+
+
+def cache_key(sim, residents: list, cfg: dict, thr: dict) -> bytes:
+    """キャッシュキー(32 バイト)。**キー一致 ⟹ build_friend_graph の出力一致**。
+
+    載せるもの: 形式版 / friends.py の内容 hash / friend_graph 設定 / tier 閾値 /
+    n_agents / present_cap / プール識別子 / **居住者名簿ダイジェスト**(生成規則が読む
+    属性を id 昇順で全部)。名簿を入れてあるので、プール抽選・seed・人数の差は必ず現れる。
+    """
+    h = hashlib.blake2b(digest_size=32)
+
+    def _put(label: str, value) -> None:
+        h.update(label.encode("utf-8"))
+        h.update(b"\x1f")
+        h.update(str(value).encode("utf-8"))
+        h.update(b"\x1e")
+
+    _put("format", _CACHE_FORMAT)
+    _put("src", _self_hash())
+    _put("cfg", json.dumps(cfg, sort_keys=True, ensure_ascii=False,
+                           default=str))
+    _put("thr", json.dumps({str(k): v for k, v in sorted(thr.items())},
+                           sort_keys=True))
+    _put("n_agents", len(getattr(sim, "agents", ()) or ()))
+    _put("present_cap", getattr(sim, "_pool_present_cap", None))
+    pool = getattr(sim, "_pool", None)
+    _put("pool", getattr(pool, "root", None) if pool is not None else None)
+    _put("n_residents", len(residents))
+    h.update(b"roster\x1f")
+    for a in residents:                     # residents は id 昇順(呼び手が保証)
+        h.update(("\x1f".join((
+            str(a.id), _pid(a), str(getattr(a, "age", "") or ""),
+            str(getattr(a, "occupation", "") or ""),
+            str(getattr(a, "org_id", "") or ""),
+            str(getattr(a, "org_role", "") or ""),
+            str(getattr(a, "home_building", "") or ""),
+        )) + "\x1e").encode("utf-8"))
+    return h.digest()
+
+
+def _cache_path(cache_dir: Path, key: bytes) -> Path:
+    return cache_dir / f"friend_graph_{key[:12].hex()}.bin"
+
+
+def load_edges(cache_dir, key: bytes):
+    """キャッシュから (a_ids, b_ids, tiers) を読む。無い/壊れている/合わない = None。
+
+    失敗しても**例外は上げない**(呼び手は黙って再構築する)。"""
+    path = _cache_path(cache_dir, key)
+    try:
+        blob = path.read_bytes()
+    except OSError:
+        return None
+    try:
+        head = _CACHE_HEAD.size
+        if len(blob) < head + 16:
+            raise ValueError("truncated header")
+        magic, fmt, _res, got_key, n = _CACHE_HEAD.unpack_from(blob, 0)
+        if magic != _CACHE_MAGIC or fmt != _CACHE_FORMAT or got_key != key:
+            raise ValueError("key/format mismatch")
+        body = head + int(n) * 17          # int64 + int64 + int8
+        if len(blob) != body + 16:
+            raise ValueError("truncated body")
+        if hashlib.blake2b(blob[:body], digest_size=16).digest() != blob[body:]:
+            raise ValueError("checksum mismatch")
+        n = int(n)
+        a_ids = array.array("q")
+        b_ids = array.array("q")
+        tiers = array.array("b")
+        a_ids.frombytes(blob[head:head + n * 8])
+        b_ids.frombytes(blob[head + n * 8:head + n * 16])
+        tiers.frombytes(blob[head + n * 16:body])
+        if _BIG_ENDIAN:
+            a_ids.byteswap()
+            b_ids.byteswap()
+        return a_ids, b_ids, tiers
+    except Exception as exc:                # noqa: BLE001(壊れたキャッシュで止めない)
+        log.info("friend_graph cache は使えないので再構築する(%s): %s", exc, path.name)
+        return None
+
+
+def save_edges(cache_dir, key: bytes, edges) -> None:
+    """(a_ids, b_ids, tiers) を原子的に保存する(tmp 書き → rename)。失敗はログ 1 行。"""
+    a_ids, b_ids, tiers = edges
+    path = _cache_path(cache_dir, key)
+    # tmp 名に pid を混ぜる: 同一設定のランを**同時に**起動しても書き込みが混ざらない
+    # (rename は原子的なので、勝った方のファイルだけが残る = 内容はどちらも同一)。
+    tmp = path.with_suffix(f".bin.{os.getpid()}.tmp")
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        if _BIG_ENDIAN:
+            a_ids = array.array("q", a_ids)
+            b_ids = array.array("q", b_ids)
+            a_ids.byteswap()
+            b_ids.byteswap()
+        body = b"".join((
+            _CACHE_HEAD.pack(_CACHE_MAGIC, _CACHE_FORMAT, 0, key, len(tiers)),
+            a_ids.tobytes(), b_ids.tobytes(), tiers.tobytes()))
+        with open(tmp, "wb") as f:
+            f.write(body)
+            f.write(hashlib.blake2b(body, digest_size=16).digest())
+        os.replace(tmp, path)
+    except Exception as exc:                # noqa: BLE001(保存できなくてもランは進む)
+        log.info("friend_graph cache を保存できなかった(%s): %s", exc, path.name)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------- 起動時1回
+def _desired_tiers(residents: list, cfg: dict) -> dict:
+    """各居住者の相手を親和スコア降順に並べ、Dunbar 層で desired tier を割る(有向)。
+
+    ★build_friend_graph 本体から**1 文字も変えずに**切り出した(キャッシュ有無で 2 経路に
+      分かれても生成規則は 1 つしか無い)。決定論・乱数ゼロ。"""
     desired: dict = {}
     for a in residents:
         pid = _pid(a)
@@ -272,7 +432,75 @@ def build_friend_graph(sim) -> None:
                 desired[(a.id, b.id)] = 1
             else:
                 break
+    return desired
+
+
+def _apply_cached(residents: list, edges, thr: dict, margin_of: dict) -> int:
+    """保存された決定列を**同じ順序で**再生する(初回構築の注入と 1 バイトも変わらない)。
+
+    ★注入の前に全件を検証する: 途中で不整合に気づいて中断すると台帳が半端に汚れるので、
+      「1 件でも解決できなければ 1 件も注入せず -1 を返す(= 呼び手が再構築)」にする。
+      キーに名簿ダイジェストが入っているのでここに落ちるのは hash 衝突級の異常だけ。"""
+    by_id = {a.id: a for a in residents}
+    a_ids, b_ids, tiers = edges
+    n = len(tiers)
+    if len(a_ids) != n or len(b_ids) != n:
+        return -1
+    for i in range(n):
+        if (int(a_ids[i]) not in by_id or int(b_ids[i]) not in by_id
+                or int(tiers[i]) not in margin_of):
+            return -1
+    for i in range(n):
+        tier = int(tiers[i])
+        clo = thr[tier] + margin_of[tier]
+        a = by_id[int(a_ids[i])]
+        b = by_id[int(b_ids[i])]
+        _inject(a, b, tier, clo)
+        _inject(b, a, tier, clo)
+    return n
+
+
+def build_friend_graph(sim) -> None:
+    """居住者の友人ネットワークを起動時に決定論で張る(既定 OFF=no-op=バイト一致)。
+
+    顔なじみブロックの直後に1呼び出しで呼ばれる。各居住者の相手を親和スコア降順に並べ、Dunbar 層
+    (親友/友人/知人)で desired tier を割り(有向)、ペアの max tier で対称化して closeness/tier を
+    注入する。乱数 stream を1本も引かない(全 hashlib)=既存 draw 順に無影響=run.seed 非依存。
+
+    `world.friends_cache_dir`(既定 "" = OFF)を書くと、決定結果をディスクにキャッシュして
+    2 回目以降の起動でロード + 同順再生する(モジュール docstring の「ディスクキャッシュ」)。
+    OFF では下の従来経路がそのまま走る = 1 バイトも変わらない。"""
+    cfg = getattr(sim, "friendcfg", None)
+    if not cfg or not cfg["enabled"]:
+        return
+    residents = sorted((a for a in sim.agents if not a.visitor), key=lambda a: a.id)
+    if len(residents) < 2:
+        return
+    rc = getattr(sim, "relationscfg", None) or _relations.DEFAULTS
+    thr = {1: float(rc["tier_acquaintance"]), 2: float(rc["tier_friend"]),
+           3: float(rc["tier_close"])}
+    margin = float(cfg["margin"])
+    # β4: 層別 margin(既定は 3 層とも None = margin = 従来と 1 バイトも変わらない)。
+    # 減衰 1.0/日 の下で「その層が接触ゼロで何日もつか」を決める唯一の数値。
+    margin_of = {tier: (margin if cfg.get(key) is None else float(cfg[key]))
+                 for tier, key in _MARGIN_KEY_OF_TIER.items()}
+    # ---- ディスクキャッシュ(既定 None = OFF = 以下 2 ブロックへ 1 度も入らない)----
+    cache_dir = cache_dir_of(sim)
+    key = None
+    if cache_dir is not None:
+        key = cache_key(sim, residents, cfg, thr)
+        cached = load_edges(cache_dir, key)
+        if cached is not None:
+            n_edges = _apply_cached(residents, cached, thr, margin_of)
+            if n_edges >= 0:
+                _log_built(sim, residents, n_edges)
+                return
+            log.info("friend_graph cache の名簿が合わないので再構築する")
+    # 各居住者の相手を親和スコア降順に並べ、Dunbar 層で desired tier を割る(有向)。
+    desired = _desired_tiers(residents, cfg)
     # 対称化(ペアの max tier)+ closeness/tier を注入。
+    collect = None if cache_dir is None else (array.array("q"), array.array("q"),
+                                              array.array("b"))
     n_edges = 0
     for i, a in enumerate(residents):
         for b in residents[i + 1:]:
@@ -283,6 +511,17 @@ def build_friend_graph(sim) -> None:
             _inject(a, b, tier, clo)
             _inject(b, a, tier, clo)
             n_edges += 1
+            if collect is not None:        # キャッシュ ON のときだけ決定列を並べて控える
+                collect[0].append(a.id)
+                collect[1].append(b.id)
+                collect[2].append(tier)
+    if collect is not None:
+        save_edges(cache_dir, key, collect)
+    _log_built(sim, residents, n_edges)
+
+
+def _log_built(sim, residents: list, n_edges: int) -> None:
+    """`friend_graph_built` を 1 件記録する(構築経路とキャッシュ再生経路で同一の値)。"""
     mean_deg = round(2.0 * n_edges / len(residents), 4) if residents else 0.0
     sim.logger.log(Event(step=0, sim_min=0, agent_id=-1, kind="friend_graph_built",
                          x=0.0, y=0.0,

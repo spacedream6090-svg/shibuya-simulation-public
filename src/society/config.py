@@ -31,6 +31,7 @@ _INT_KEYS = [
 ]
 _FLOAT_KEYS = [
     "world.walk_speed_m_per_step", "world.perception_radius_m",
+    "world.perception_cell_m",              # 空間索引の細格子セル寸法(第151。0=現行)
     "k.degraded_alpha", "model.temperature",
     "rewards.amount_per_adoption",          # D9: 採用1件あたりの報酬額
     "drive.slope",                          # logistic 発火のシャープさ(B段 seam)

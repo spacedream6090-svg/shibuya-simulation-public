@@ -33,6 +33,30 @@ occluder が無いとき(既定)は挙動が従来と完全にバイト一致=�
 (tests が機械照合する)。遮蔽器が実際に据わっているときはベクトル化を捨ててループへ
 後退する(正しさ優先。本選は遮蔽未配線 = occluder None)。
 
+── セル寸法の細分化(`world.perception_cell_m`。既定 0 = 現行と完全同一)────────
+索引のセル寸法は長らく **常に `perception_radius_m`(40m)** だった。声の段階(第149)が
+入って実効半径が 5m になっても、問い合わせは 40m セル × 9 個 = **(120m)² の中の全員**を
+numpy 距離計算に流していた(π(5m)² と比べて候補母集団が ~183 倍)。250k 夕方 step の
+py-spy でこの `_hearers_bounded` が step 時間の ~80% を占めていた。
+
+linked-cell / spatial hashing の定石は **セル寸法 ≈ 相互作用半径**、複数半径が混在するときは
+**セル寸法を最小半径に合わせて大半径はリング走査**(ceil(r/cell) セル)。本層はこれを
+**粗格子を残したまま**入れる:
+
+  粗格子 `cells`  … セル寸法 = `radius`(**現行のまま 1 バイトも変えない**)。
+                    既定の `hearers()` / `_count()`(= count_hearers)はここしか見ない。
+  細格子 `_fcells`… セル寸法 = `cell_m`(> 0 のときだけ・**最初の有界クエリで遅延構築**)。
+                    有界経路(cap / radius_eff)が「細格子の方が明らかに得」と判定した
+                    半径のときだけ使う: リング = ceil(r/cell)・走査 (2ring+1)² セル。
+
+  判定(`_fine_ring`。純関数・決定論): ring ≤ `_FINE_RING_MAX` かつ
+  走査面積 × `_FINE_AREA_MARGIN` ≤ 粗格子の走査面積(9·radius²)。満たさなければ 0 =
+  **粗格子(現行コード)へそのまま落ちる** = 大半径クエリ(叫び 30/40m・既定半径)に
+  性能退行が起こりえない(構造で保証)。radius=40 / cell=5 なら r ≤ 20m が細格子。
+
+**どちらの格子を通っても返り値は同一**(集合が同じ + 選抜規則が入力順に依らない:
+id は一意なので `lexsort((ids, d2))` も `argsort(ids)` も全順序)。テストが総当たりで機械照合する。
+
 ── 人数だけが要る呼び手(`count_hearers`)────────────────────────────────────
 観測チャンネル `ext.encounter`(cognition/channels.py)は「声が届く**人数**」しか使わない
 のに `len(hearers_of(...))` を呼んでいた = 全個体ぶんのリスト構築と id 昇順ソートを毎 step
@@ -88,6 +112,32 @@ def _context(agent) -> tuple:
 # 取り、帯の中に落ちた要素だけを `math.hypot` で裁定する(帯の外は両実装で判定が一致
 # することが 1 ULP 保証から従う)。帯に入る要素は実データでは事実上ゼロ件。
 _BAND_ULP = 4
+
+# ---- セル細分化(`world.perception_cell_m`)の 2 定数。既定 cell_m=0 では 1 度も読まれない ----
+# `_FINE_RING_MAX`   … 細格子で走査してよいリング半径の上限(4 = 最大 81 セル)。
+#   細セル化の代償は「走査セル数の増加」= 連結(np.concatenate)の入力本数。ここを開けすぎると
+#   セル 1 個あたりの固定費が候補削減の利得を食う(r=40 なら 17×17 = 289 本になる)。
+# `_FINE_AREA_MARGIN`… 細格子を選ぶのに要求する面積比の余裕(4 = 走査面積が 1/4 以下)。
+#   面積比が僅差なら固定費のぶん粗格子(= 現行経路)の方が速いので、迷ったら現行へ倒す。
+_FINE_RING_MAX = 4
+_FINE_AREA_MARGIN = 4.0
+# `_FINE_MIN_GAIN` … 細格子に回すのに要求する「候補削減の絶対数」(要素数)。
+#   細セル化が買うのは**要素あたりの仕事**(実測 ~2.8 ns/要素)だけで、クエリ 1 本の
+#   固定費(numpy 呼び出し ~20 本 = ~20 µs)は減らない。むしろ細格子の連結は共有相手が
+#   少ないぶん固定費が ~6 µs 増える。したがって **疎な近傍では細格子が純損**になる
+#   (実測: 0.013 人/m² で 0.7 倍 = 3 割遅い)。そこで粗格子 9 セルの在圏数から
+#   「削減できる要素数」を見積もり、6 µs / 2.8 ns ≈ 2,000 要素を超えるときだけ細格子へ回す。
+#   = 密な夕方のセルだけが細格子を通り、夜間・郊外セルは現行経路のまま(退行しえない)。
+_FINE_MIN_GAIN = 2000.0
+
+# 粗格子の走査オフセット。**現行の `for dx in (-1, 0, 1)` と同一のタプル**(順序も同一)。
+_RING1: tuple[int, ...] = (-1, 0, 1)
+
+
+@functools.lru_cache(maxsize=16)
+def _ring_offsets(ring: int) -> tuple[int, ...]:
+    """リング半径 → 走査オフセット列(-ring … +ring)。ring=1 は `_RING1` と同一の並び。"""
+    return tuple(range(-int(ring), int(ring) + 1))
 
 
 @functools.lru_cache(maxsize=32)
@@ -191,6 +241,61 @@ def nearest_k(speaker, candidates: list, cap: int) -> list:
     return sorted(sorted(candidates, key=_key)[:cap], key=lambda a: int(a.id))
 
 
+def _bounded_pick(nb, sx: float, sy: float, sid: int, radius: float,
+                  cap: int, box_prefilter: bool = True) -> list:
+    """連結済み近傍 (xs, ys, ids, flat) から「半径内 → 最寄り cap 人」を選ぶ(ベクトル化)。
+
+    ★既定枝(`box_prefilter=True`)は第149 の `_hearers_bounded` 本体から**1 文字も変えずに**
+      切り出したもの(粗格子と細格子で同じ関数を通す = 2 経路が将来にわたって食い違えない
+      構造)。演算の順序も丸めも同一なので既定経路の返り値はバイト一致。**入力の並び順に依らない**:
+      id は一意なので `lexsort((ids, d2))` も `argsort(ids)` も全順序 = 格子が変わっても同じ答え。
+
+    `box_prefilter=False`(細格子だけが使う)は ① の外接正方形を省く縮退。判定式は
+    「np.hypot <= radius かつ id != sid」で ① 有りと**厳密に同じ集合**(① は
+    hypot >= max(|dx|,|dy|) による等価な前段でしかない)。細格子では近傍の広さが半径と
+    同程度なので ① で落ちるのは半分以下で、numpy 呼び出し 5 本ぶんの固定費の方が高くつく。
+    """
+    xs, ys, ids, flat = nb
+    dx_a = xs - sx
+    dy_a = ys - sy
+    if not box_prefilter:
+        keep = np.flatnonzero((np.hypot(dx_a, dy_a) <= radius) & (ids != sid))
+        n = int(keep.size)
+        if n == 0:
+            return []
+        return _bounded_rank(dx_a, dy_a, ids, flat, keep, n, cap)
+    # ① 外接正方形で粗く落とす(hypot(dx,dy) >= max(|dx|,|dy|) なので**厳密に等価**な
+    #    前フィルタ)。声の段階(5m)のように半径がセル幅(40m)より小さいとき、
+    #    高価な hypot に渡す要素数が桁で減る。
+    box = np.flatnonzero((np.abs(dx_a) <= radius) & (np.abs(dy_a) <= radius)
+                         & (ids != sid))
+    if box.size == 0:
+        return []
+    # ② 半径判定は np.hypot(= math.hypot と同一の丸め)= ループ実装と同じ集合。
+    keep = box[np.hypot(dx_a[box], dy_a[box]) <= radius]
+    n = int(keep.size)
+    if n == 0:
+        return []
+    return _bounded_rank(dx_a, dy_a, ids, flat, keep, n, cap)
+
+
+def _bounded_rank(dx_a, dy_a, ids, flat, keep, n: int, cap: int) -> list:
+    """半径内に残った添字 `keep` から「最寄り cap 人 → id 昇順」を返す(第149 と同一の規則)。"""
+    if cap <= 0 or n <= cap:
+        sel = keep[np.argsort(ids[keep], kind="stable")]     # id 昇順(従来の並び)
+        return [flat[int(i)] for i in sel]
+    # 順位鍵は距離二乗(S15 と同一)。argpartition で cap 件の窓を切り、境界の同値だけ
+    # 厳密に (距離二乗, id) で並べ直す = 全体ソートを避けた O(n) 選抜(決定論)。
+    d2 = dx_a[keep] * dx_a[keep] + dy_a[keep] * dy_a[keep]
+    part = np.argpartition(d2, cap - 1)[:cap]
+    thresh = float(d2[part].max())
+    cand = np.flatnonzero(d2 <= thresh)
+    order = np.lexsort((ids[keep][cand], d2[cand]))
+    chosen = keep[cand[order[:cap]]]
+    chosen = chosen[np.argsort(ids[chosen], kind="stable")]  # 返りは id 昇順
+    return [flat[int(i)] for i in chosen]
+
+
 class PerceptIndex:
     """step 単位の空間ハッシュ索引。cell = (context, floor(x/r), floor(y/r))。
 
@@ -199,9 +304,10 @@ class PerceptIndex:
     一度だけ構築し、その間だけ hearers_of に渡す。
     """
 
-    __slots__ = ("radius", "_inv", "cells", "_occ", "_np", "_nb", "_nc")
+    __slots__ = ("radius", "_inv", "cells", "_occ", "_np", "_nb", "_nc",
+                 "cell_m", "_finv", "_fcells", "_fnp", "_fnb", "_fring", "_load")
 
-    def __init__(self, radius: float, occluder=None):
+    def __init__(self, radius: float, occluder=None, cell_m: float = 0.0):
         self.radius = float(radius)
         self._inv = (1.0 / self.radius) if self.radius > 0 else 0.0
         self.cells: dict[tuple, list] = {}
@@ -219,9 +325,139 @@ class PerceptIndex:
         #         _nb と違い**個体オブジェクトの平坦リストを作らない**(人数に要らない)。
         #         _np を土台に共有するので、同じセルの全員で連結は 1 回きり。
         self._nc: dict[tuple, tuple] = {}
+        # ---- 細格子(`world.perception_cell_m`)。既定 0 = 以下は全て不活性 --------------
+        # cell_m が半径以上なら細分化の意味が無い(粗格子と同じかそれより粗い)ので 0 へ倒す。
+        cm = float(cell_m or 0.0)
+        self.cell_m: float = cm if (0.0 < cm < self.radius) else 0.0
+        self._finv = (1.0 / self.cell_m) if self.cell_m > 0.0 else 0.0
+        # _fcells は **最初の細格子クエリで遅延構築**(None = まだ 1 度も要求されていない)。
+        # 既定 cell_m=0 では永遠に None のまま = 追加の走査もメモリもゼロ。
+        self._fcells: dict | None = None
+        self._fnp: dict[tuple, tuple] = {}      # 細セル 1 個の (x, y, id)
+        self._fnb: dict[tuple, tuple] = {}      # (ctx, cx, cy, ring) → 連結済み近傍
+        self._fring: dict[float, tuple] = {}    # 半径 → (リング半径, 面積比)の記憶
+        self._load: dict[tuple, int] = {}       # 粗セル → 近傍 9 セルの在圏数
 
     def _cell_xy(self, x: float, y: float) -> tuple[int, int]:
         return (math.floor(x * self._inv), math.floor(y * self._inv))
+
+    # ---- 細格子(cell_m > 0 のときだけ触られる)---------------------------------------
+    def _fine_ring(self, radius: float) -> tuple:
+        """クエリ半径 → (走査リング半径, 走査面積比)。**ring=0 = 細格子を使わない(=現行)**。
+
+        規則(決定論・純関数・step 内で憶える):
+          ring = ceil(radius / cell)  … 半径内の点が必ず ±ring セルに入る最小値。
+          採用するのは ring <= `_FINE_RING_MAX` かつ 走査面積 × `_FINE_AREA_MARGIN` が
+          粗格子の走査面積 (3·radius)² 以下のときだけ。それ以外は 0 を返して現行経路へ。
+        面積比 = 細格子の走査面積 / 粗格子の走査面積(在圏数から削減要素数を見積もる材料)。
+        """
+        cell = self.cell_m
+        if cell <= 0.0:
+            return (0, 1.0)
+        got = self._fring.get(radius)
+        if got is not None:
+            return got
+        ring = int(math.ceil(radius / cell))
+        if ring < 1:
+            ring = 1
+        while ring * cell < radius:          # 切り上げの浮動小数誤差に対する保険(通常 0 周)
+            ring += 1
+        span = (2 * ring + 1) * cell
+        wide = 3.0 * self.radius
+        ratio = (span * span) / (wide * wide) if wide > 0.0 else 1.0
+        if ring > _FINE_RING_MAX or ratio * _FINE_AREA_MARGIN > 1.0:
+            got = (0, 1.0)
+        else:
+            got = (ring, ratio)
+        self._fring[radius] = got
+        return got
+
+    def _coarse_load(self, ctx: tuple, cx: int, cy: int) -> int:
+        """粗格子 9 セルの在圏数(= 現行経路が距離計算に流す候補数)。セル単位で憶える。
+
+        細格子へ回すかの判定材料。**dict の get と len だけ**で、numpy も配列確保も伴わない。"""
+        key = (ctx, cx, cy)
+        got = self._load.get(key)
+        if got is None:
+            cells = self.cells
+            got = 0
+            for dx in _RING1:
+                for dy in _RING1:
+                    bucket = cells.get((ctx, cx + dx, cy + dy))
+                    if bucket:
+                        got += len(bucket)
+            self._load[key] = got
+        return got
+
+    def _fine_cells(self) -> dict:
+        """粗格子の中身を細セルへ振り直した dict(**最初の要求で 1 回だけ**構築)。
+
+        索引は step ごとに作り直されるので寿命も 1 step(陳腐化しない)。走査順は粗格子の
+        挿入順 = build_index に渡した agents の順で決まるが、**返り値はどのみち入力順に
+        依らない**(`_bounded_pick` / `nearest_k` の順序規則が全順序)。"""
+        fc = self._fcells
+        if fc is None:
+            fc = {}
+            inv = self._finv
+            floor = math.floor
+            for (ctx, _cx, _cy), bucket in self.cells.items():
+                for a in bucket:
+                    fc.setdefault((ctx, floor(a.x * inv), floor(a.y * inv)),
+                                  []).append(a)
+            self._fcells = fc
+        return fc
+
+    def _fine_cell_arrays(self, key: tuple, bucket: list) -> tuple:
+        """細セル 1 個の (x, y, id) を numpy 化して step 内でキャッシュする(`_cell_arrays` の細格子版)。
+
+        ★粗格子の `_np` と**別の dict** に持つ: キーの形((ctx, cx, cy))が同じでも指す
+          セルは別物なので、同居させると衝突する。"""
+        arr = self._fnp.get(key)
+        if arr is None:
+            n = len(bucket)
+            arr = (np.fromiter((float(a.x) for a in bucket), np.float64, n),
+                   np.fromiter((float(a.y) for a in bucket), np.float64, n),
+                   np.fromiter((int(a.id) for a in bucket), np.int64, n))
+            self._fnp[key] = arr
+        return arr
+
+    def _fine_neighborhood(self, ctx: tuple, cx: int, cy: int, ring: int):
+        """細格子の (2·ring+1)² セルを連結した (xs, ys, ids, flat)(遅延構築・共有)。
+
+        キーは **(中心セル, リング半径)**: 同じ中心セルでも半径階級が違えば別の連結になる
+        (声の段階が normal/raised を混ぜても互いのキャッシュを壊さない)。近傍が空なら None。
+
+        ★`_neighborhood`(粗格子・ring=1 固定)と統合しないのは、既定経路のコードを
+          1 行も動かさないため(R1 を構造で守る)。選抜の本体は `_bounded_pick` で共有する。"""
+        key = (ctx, cx, cy, ring)
+        if key in self._fnb:
+            return self._fnb[key]
+        cells = self._fine_cells()
+        offs = _ring_offsets(ring)
+        xs_l: list = []
+        ys_l: list = []
+        ids_l: list = []
+        objs: list = []
+        for dx in offs:
+            for dy in offs:
+                ck = (ctx, cx + dx, cy + dy)
+                bucket = cells.get(ck)
+                if not bucket:
+                    continue
+                xa, ya, ia = self._fine_cell_arrays(ck, bucket)
+                xs_l.append(xa)
+                ys_l.append(ya)
+                ids_l.append(ia)
+                objs.append(bucket)
+        if not objs:
+            self._fnb[key] = None
+            return None
+        nb = (xs_l[0] if len(xs_l) == 1 else np.concatenate(xs_l),
+              ys_l[0] if len(ys_l) == 1 else np.concatenate(ys_l),
+              ids_l[0] if len(ids_l) == 1 else np.concatenate(ids_l),
+              objs[0] if len(objs) == 1 else [a for b in objs for a in b])
+        self._fnb[key] = nb
+        return nb
 
     def add(self, agent) -> None:
         if agent.sleeping:
@@ -289,15 +525,26 @@ class PerceptIndex:
             return []
         radius = self.radius if radius_eff is None else min(float(radius_eff),
                                                             self.radius)
+        # ★セル細分化(`world.perception_cell_m`)。既定 cell_m=0 では ring が **常に 0**
+        #   なので、以下は 1 行残らず現行(粗格子・9 セル)と同一の経路を走る。
+        ring, _ratio = self._fine_ring(radius)
         cx, cy = self._cell_xy(speaker.x, speaker.y)
+        if ring:
+            # 局所の混み具合で最終判断(疎な近傍では細格子が純損 = `_FINE_MIN_GAIN` の注記)。
+            if (self._coarse_load(ctx, cx, cy) * (1.0 - _ratio)) < _FINE_MIN_GAIN:
+                ring = 0
+            else:
+                cx, cy = (math.floor(speaker.x * self._finv),
+                          math.floor(speaker.y * self._finv))
         sx, sy, sid = float(speaker.x), float(speaker.y), int(speaker.id)
-        cells = self.cells
         occ = _resolve(self._occ)
         if occ is not None:
             # 遮蔽器が実際に据わっている: ベクトル化を捨ててループで正しさを取る。
+            cells = self._fine_cells() if ring else self.cells
+            offs = _ring_offsets(ring) if ring else _RING1
             cands = []
-            for dx in (-1, 0, 1):
-                for dy in (-1, 0, 1):
+            for dx in offs:
+                for dy in offs:
                     bucket = cells.get((ctx, cx + dx, cy + dy))
                     if not bucket:
                         continue
@@ -308,37 +555,15 @@ class PerceptIndex:
                             if not occ.blocks(speaker, other):
                                 cands.append(other)
             return nearest_k(speaker, cands, cap)
+        if ring:
+            nb = self._fine_neighborhood(ctx, cx, cy, ring)
+            if nb is None:
+                return []
+            return _bounded_pick(nb, sx, sy, sid, radius, cap, False)
         nb = self._neighborhood(ctx, cx, cy)
         if nb is None:
             return []
-        xs, ys, ids, flat = nb
-        dx_a = xs - sx
-        dy_a = ys - sy
-        # ① 外接正方形で粗く落とす(hypot(dx,dy) >= max(|dx|,|dy|) なので**厳密に等価**な
-        #    前フィルタ)。声の段階(5m)のように半径がセル幅(40m)より小さいとき、
-        #    高価な hypot に渡す要素数が桁で減る。
-        box = np.flatnonzero((np.abs(dx_a) <= radius) & (np.abs(dy_a) <= radius)
-                             & (ids != sid))
-        if box.size == 0:
-            return []
-        # ② 半径判定は np.hypot(= math.hypot と同一の丸め)= ループ実装と同じ集合。
-        keep = box[np.hypot(dx_a[box], dy_a[box]) <= radius]
-        n = int(keep.size)
-        if n == 0:
-            return []
-        if cap <= 0 or n <= cap:
-            sel = keep[np.argsort(ids[keep], kind="stable")]     # id 昇順(従来の並び)
-            return [flat[int(i)] for i in sel]
-        # 順位鍵は距離二乗(S15 と同一)。argpartition で cap 件の窓を切り、境界の同値だけ
-        # 厳密に (距離二乗, id) で並べ直す = 全体ソートを避けた O(n) 選抜(決定論)。
-        d2 = dx_a[keep] * dx_a[keep] + dy_a[keep] * dy_a[keep]
-        part = np.argpartition(d2, cap - 1)[:cap]
-        thresh = float(d2[part].max())
-        cand = np.flatnonzero(d2 <= thresh)
-        order = np.lexsort((ids[keep][cand], d2[cand]))
-        chosen = keep[cand[order[:cap]]]
-        chosen = chosen[np.argsort(ids[chosen], kind="stable")]  # 返りは id 昇順
-        return [flat[int(i)] for i in chosen]
+        return _bounded_pick(nb, sx, sy, sid, radius, cap)
 
     def _count(self, speaker, occ) -> int:
         """`len(self.hearers(speaker))` と**厳密に同値**な人数(列挙も整列もしない)。
@@ -470,13 +695,33 @@ def salience_gate(items: list, scores: list, k: int) -> list:
     return [it for i, it in enumerate(items) if i in keep]
 
 
-def build_index(agents, radius_m: float, occluder=None) -> PerceptIndex:
+def cell_m_of(sim) -> float:
+    """`world.perception_cell_m` を遅延解決して sim にキャッシュする(既定 0.0 = 現行同一)。
+
+    キャッシュ属性 `_percept_cell_m` は L1/L2/乱数のどこにも現れない(`speech_cfg_of` と同型)。"""
+    v = getattr(sim, "_percept_cell_m", None)
+    if v is None:
+        try:
+            world = sim.cfg.get("world", {}) or {}
+            v = float(world.get("perception_cell_m", 0.0) or 0.0)
+        except Exception:                               # noqa: BLE001 (旧 config 互換)
+            v = 0.0
+        sim._percept_cell_m = v
+    return v
+
+
+def build_index(agents, radius_m: float, occluder=None,
+                cell_m: float = 0.0) -> PerceptIndex:
     """位置が確定した時点の全 agent から空間索引を1回だけ構築する。
 
     occluder(既定 None)を渡すと索引経由の hearers に視線遮蔽を効かせる。None のときは
     据え付けの既定遮蔽器(install_occluder)へ後退し、それも無ければ遮蔽なし=従来同一。
+
+    cell_m(既定 0.0)= 細格子のセル寸法 [m]。0 のときは細格子を一切持たない
+    (= 現行と完全に同一の索引)。> 0 でも構築は**最初の細格子クエリまで遅延**するので、
+    有界経路を通らないランでは追加コストが 1 命令も発生しない。
     """
-    idx = PerceptIndex(radius_m, occluder=occluder)
+    idx = PerceptIndex(radius_m, occluder=occluder, cell_m=cell_m)
     for a in agents:
         idx.add(a)
     return idx

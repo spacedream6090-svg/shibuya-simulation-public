@@ -399,6 +399,41 @@ world:
   #     例) scenario_params: { at_step: 24, title: "駅前で大規模イベント", text: "混雑注意", word: "封鎖祭り" }
   scenario_params: {}           # 既定は空(baseline では読まれない)
   perception_radius_m: 40.0     # この距離内で会話が聞こえる(建物内=同じ階のみ)
+  # ---- 空間索引のセル寸法(第151)。0 = セル寸法 = 半径 = **現行と完全同一** -------------
+  # 正典: docs/plans/index-cell-and-friend-cache-plan.md §1-§2。実装 src/society/world/perception.py。
+  # 何が問題だったか: 索引のセル寸法は常に perception_radius_m(40m)で、声の段階(第149)が
+  #   入って実効半径が 5m になっても **40m セル × 9 個 =(120m)² の中の全員**を距離計算に
+  #   流していた(π(5m)² と比べて候補母集団が ~183 倍)。250k 夕方 step の py-spy で
+  #   `_hearers_bounded` が step 時間の ~80%。
+  # 何をするか: >0 のとき、有界クエリ(cap / radius_eff = C2 の声の段階)だけが
+  #   セル寸法 cell_m の**細格子**を見る。走査リング = ceil(r/cell) セル。
+  #   ★既定クエリ(半径一律・count_hearers)と大半径クエリは**粗格子=現行経路のまま**で、
+  #     さらに「近傍が十分に混んでいる」ときだけ細格子へ回る(疎なセルは現行のまま)=
+  #     **どの半径・どの密度でも性能退行が起こりえない**構造。
+  # ★層1(純粋な実装最適化)= 世界の力学に触らない。返り値は全 radius 階級で現行と同一集合・
+  #   同一順序(tests/test_index_cell.py が総当たりで機械照合)。乱数ゼロ・LLM 呼数不変。
+  # 較正: linked-cell / spatial hashing の定石は「セル寸法 ≈ 相互作用半径」。本選の
+  #   通常声(outdoor 5m)に合わせて 5.0 が finals の値(conf/finals_observe.yaml)。
+  perception_cell_m: 0.0
+
+  # ---- 友人グラフのディスクキャッシュ(第151)。"" = OFF = **現行と完全同一** -------------
+  # 正典: docs/plans/index-cell-and-friend-cache-plan.md §1-§2。実装 src/society/friends.py。
+  # 何が問題だったか: 250k の py-spy で **init の 68.4% が friends.build_friend_graph**
+  #   (40-60 分/起動)。中身は居住者ごとの全相手ランキング(O(N² log N))で、しかも
+  #   **完全な決定論**(blake2b の安定ハッシュ・乱数 stream ゼロ・run.seed 非依存)=
+  #   同じ入力から毎回同じグラフを作り直していた。
+  # 何をするか: 初回は従来どおり構築しつつ**決定結果**(対称化後の (a,b,tier) を適用順に
+  #   並べた列)を保存(tmp 書き → rename の原子的置換)。2 回目以降はキー一致でロードし
+  #   **同じ順序で同じ注入を再生**する = in-memory の結果はバイト同一。
+  # キー = blake2b(形式版・friends.py の内容 hash・friend_graph 設定・tier 閾値・
+  #   **居住者名簿ダイジェスト**(id/pid/年齢/職業/org_id/org_role/home_building を id 昇順)・
+  #   n_agents・present_cap・プール識別子)。名簿が入っているので、プール抽選・seed・人数の
+  #   違いは必ずキーに現れる = **キー一致 ⟹ 出力一致**が構成的に言える。
+  # 不一致・破損・読み書き失敗は**ログ 1 行だけ出して黙って再構築**(例外は上げない)。
+  # ★層1(純粋な実装最適化)= 世界の力学に触らない。乱数ゼロ・LLM 呼数不変。
+  # 標準プラクティス: 疫学・社会 ABM(FRED / Epihiper / synthpops)は合成人口と接触
+  #   ネットワークを前処理成果物として再利用する。ランタイムで毎回張り直す設計は無い。
+  friends_cache_dir: ""         # 例) "data/cache/friend_graph"(相対はリポジトリルート基準)
   # ---- S15(第142): 発話 1 件あたりの聴衆上限(注意の有界性)。0=無制限=現行と完全同一 ----
   # 正典: docs/plans/ram-rootcause-and-fix-plan.md §3 **層3**(= 世界の力学に触る)。
   # ★★層3 = **世界の力学に触る**。ON 判断はユーザーの事前登録が必要で、採るなら RESULTS に

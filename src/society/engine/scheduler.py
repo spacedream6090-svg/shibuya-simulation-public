@@ -106,7 +106,7 @@ from ..observer.schema import Event
 from ..rules import apply_bonus
 from ..world.geom import rdp
 from ..world import perception as perception_mod
-from ..world.perception import build_index, hearers_of, salience_gate
+from ..world.perception import build_index, cell_m_of, hearers_of, salience_gate
 
 
 def _edge_key(u: str, v: str) -> tuple[str, str]:
@@ -6524,8 +6524,11 @@ def run_step(sim, step: int) -> None:
     # 位置が確定したこの時点で空間索引を1回だけ張る。以降の _phase_drive/_decide の
     # 知覚判定を近傍9セルだけの走査にする(全対全 O(n²) の回避)。_apply は位置が
     # 動くので索引を使わず live 走査(perception.py の設計注記を参照)。
+    # cell_m(`world.perception_cell_m`。既定 0 = セル寸法 = 半径 = 現行と完全同一)。
+    # > 0 では実効半径の小さい有界クエリ(声の段階 5m の C2)だけが細格子へ回る。
     sim.percept_index = build_index(
-        sim.agents, float(sim.cfg.world.perception_radius_m))
+        sim.agents, float(sim.cfg.world.perception_radius_m),
+        cell_m=cell_m_of(sim))
     # 対人事件の収束化 H4(既定 OFF=即 return=バイト一致): 事件を「1人1step のレート抽選」
     # ではなく **共在ペアの上の条件付き確率**(Birks/Groff の RAT)にする層。**唯一の共在索引**
     # (直上で張った sim.percept_index)の上でしか発火しないので、この位置でなければならない
