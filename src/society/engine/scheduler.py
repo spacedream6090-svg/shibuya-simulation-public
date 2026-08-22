@@ -106,7 +106,8 @@ from ..observer.schema import Event
 from ..rules import apply_bonus
 from ..world.geom import rdp
 from ..world import perception as perception_mod
-from ..world.perception import build_index, cell_m_of, hearers_of, salience_gate
+from ..world.perception import (build_index, cell_m_of, count_hearers,
+                                hearers_of, salience_gate)
 
 
 def _edge_key(u: str, v: str) -> tuple[str, str]:
@@ -3064,8 +3065,14 @@ def _decide_g(sim, agent, step: int, sim_min: int):
         return {"type": "stay"}
     rng = sim.hub.stream("decide", agent.id, step)
     radius = float(sim.cfg.world.perception_radius_m)
-    company = hearers_of(agent, _percept(sim), radius)
-    if company:
+    # 第152 小修正: ここで要るのは**同席者がいるか否か**の 1 ビットだけ(下の drive 加算と
+    #   routine.decide の has_company)。リストは 1 度も読まないのに `hearers_of` は
+    #   40m 圏を全列挙して id 昇順に整列していた(250k step0 の py-spy で step 時間の
+    #   62.6%)。`count_hearers` は `len(hearers_of(...))` と**全入力で同値**(第150 で
+    #   機械照合済み: tests/test_count_hearers.py)なので `bool(company)` == (count > 0)。
+    #   半径・知覚ソース・呼び順・乱数はここでは 1 つも変えていない。
+    has_company = count_hearers(agent, _percept(sim), radius) > 0
+    if has_company:
         drive.add(agent, "company", sim.drivecfg)
     agent._heard_unknown = False
 
@@ -3132,7 +3139,7 @@ def _decide_g(sim, agent, step: int, sim_min: int):
         _why = "fire_unparsed"
 
     action = routine.decide(agent, step, sim, _place_of(sim, agent), rng,
-                            has_company=bool(company))
+                            has_company=has_company)
     # V3: ここから先の行動は**ルール層**が決めたもの(スマホ行動も含む)。`routine.decide`
     #   の中で朝の計画のブロックが立ったなら、その来歴が出所として一緒に記録される。
     #   既定 OFF は即 return = 世界も L1 も 1 バイト不変。
