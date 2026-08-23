@@ -138,7 +138,14 @@ model:
 #   organizations.attach が「pool の密 id % 名簿人数」で無関係な配属を撒くので絶対に書かない。
 pool:
   enabled: true
-  dir: data/persona_pool   # ②③ で再生成したプール(L2 224,240 = センサス従業者 222,849 + 教職員)
+  # ★第155補2(8/24 ユーザー決定): v1 → v2 へ切替。第133 の「2系統分岐」は 8/24 未明に解決:
+  #   現 HEAD からサーバー上で決定論再生成(build_persona_pool.py --v2 --fraction 1.0 --clean)
+  #   → L1 30,000 / L2 138,759 / L3 36,690 / L4 793,259 / L5 1,292 = ローカル 8/15 系統・
+  #   設計出勤率 0.62 と一致 = 正。サーバー 8/16 生成(L2 157,715 = 0.703)は stale と確定し
+  #   data/persona_pool_v2_stale_20260816 へ退避、正規パスは現 HEAD 再生成で置換済み。
+  #   下の「切り替えると何が変わるか」表は 8/24 の meta と一致を再照合済み。
+  #   v1 へ戻すのはこの 1 行: dir: data/persona_pool
+  dir: data/persona_pool_v2
                            # ★L2 の record は台帳の org_id/role を持つ = organizations の
                            #   pool 配属(attach_record)と work.bind_workplace の入力そのもの
   # ======================================================================== #
