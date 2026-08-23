@@ -137,6 +137,39 @@ DENSITY_FAR_DEFAULTS = {
     "clip_margin_m": 0.0,
 }
 
+# `physics.adaptive_dt`(第154 レバーB「密度適応 dt = 混雑 LOD」。2026-08-23)。
+# ゾーン内の在場者数に応じて**サブステップ幅 dt を粗くする**(積分時間の総量は保存)。
+# ★既定 OFF = 係数 1 = dt 固定 = 分岐を 1 度も通らない = 現行挙動と 1 バイト同一。
+#
+# 根拠(基本図): 密度 2 人/m² を超えると歩速は 0.5 m/s を下回る(Weidmann 1993 /
+#   Older 1968 の基本図。本リポジトリの P4 較正も同じ作業点)。そこでの 1 サブステップ
+#   変位は dt=0.4 s でも 0.5×0.4 = 20 cm 未満 = **粗い刻みで失う精度が最小の領域**である。
+#   逆に閑散時は係数 1 のまま = コストゼロ(誰も損をしない)。
+# ★正直な限界: `dt_sub` の上限 0.1 s は「dt≥0.1 は ρ≥1.5 で SFM が後退爆発する」という
+#   P2 実測から来ている(zones._build_zone のバリデーション)。適応 dt はその上限を
+#   **混雑時にだけ意図的に超える**ので、ON にするときは engine 別に破綻統計
+#   (重なり min_gap / 壁貫通 / jump_max / accel_p99)を測り直すこと。
+#   前進 Euler + v_max クリップなので 1 サブステップ変位は v_max·dt_eff で有界。
+ADAPTIVE_DT_DEFAULTS = {
+    "enabled": False,
+    # [[在場者数 N, dt 係数], …]。「N を**超えたら**その係数」。N 昇順に正準化し、
+    # 該当する中でいちばん大きい N の係数を採る(該当なし = 係数 1.0 = 現行 dt)。
+    "thresholds": ((500, 2.0), (2000, 4.0)),
+    # 係数を選び直すサブステップ周期(= 「塊」の長さ)。毎サブステップ判定は
+    # それ自体がコストなので塊ごとに 1 回だけ引く。在場者数は決定論なので選択も決定論。
+    "recheck_every": 20,
+    # 適用するエンジン。**空 = 全エンジン**。`["orca"]` と書くと ORCA ゾーンだけが
+    # 粗い dt を使い、SFM ゾーンは dt_sub のまま(= そのゾーンは 1 バイト同一)。
+    # ★これが要る理由(第154 のベンチ実測 scripts/bench_physics_levers.py):
+    #     ORCA(29×29 m・0.71 人/m²・係数 2)… 体表間 +0.066 → +0.049 m(重なりゼロを維持)
+    #     SFM (93×9 m ・0.71 人/m²・係数 2)… 体表間 +0.003 → **−0.171 m(重なり)**、
+    #                                         壁クリアランス +0.102 → **−0.105 m(貫通)**、
+    #                                         平均速さ 0.40 → 0.62 m/s(斥力が解けきらず流れが速まる)
+    #   = P2 決定の「dt≥0.1 は SFM が後退爆発」という実測が、そのまま再現する。
+    #   ORCA は速度層で衝突を回避し位置層で押し戻す構成なので粗い刻みに強い。
+    "engines": (),
+}
+
 ZONE_DEFAULTS = {
     "id": "",
     "polygon": (),                # [(x,y), …] 地図ローカル m。3 点以上。
@@ -435,7 +468,8 @@ def build_cfg(raw, repo_root: Path | None = None,
     raw = dict(raw or {})
     repo_root = repo_root or Path(".")
     unknown = sorted(set(raw) - {"sfm", "zones_enabled", "zones", "perception",
-                                 "cognitive", "density_far"})
+                                 "cognitive", "density_far", "adaptive_dt",
+                                 "neighbor_cap", "separation_iters"})
     if unknown:
         raise KeyError(f"physics: 未知のキー {unknown}")
     enabled = bool(raw.get("zones_enabled", False))
@@ -446,13 +480,90 @@ def build_cfg(raw, repo_root: Path | None = None,
     sfm = _build_sfm(raw.get("sfm"))
     cognitive = _build_cognitive(raw.get("cognitive"))
     density_far = _build_density_far(raw.get("density_far"))
+    adaptive_dt = _build_adaptive_dt(raw.get("adaptive_dt"))
+    neighbor_cap = _build_neighbor_cap(raw.get("neighbor_cap"), cognitive)
+    separation_iters = _build_separation_iters(raw.get("separation_iters"))
     zones: list[Zone] = []
     if enabled:
         for spec in (raw.get("zones", ()) or ()):
-            zones.append(_build_zone(dict(spec), repo_root, step_seconds))
+            zones.append(_build_zone(dict(spec), repo_root, step_seconds,
+                                     neighbor_cap, separation_iters))
     _check_disjoint(zones)
     return {"zones_enabled": enabled, "zones": tuple(zones), "perception": perception,
-            "sfm": sfm, "cognitive": cognitive, "density_far": density_far}
+            "sfm": sfm, "cognitive": cognitive, "density_far": density_far,
+            "adaptive_dt": adaptive_dt, "neighbor_cap": neighbor_cap,
+            "separation_iters": separation_iters}
+
+
+def _build_separation_iters(raw) -> int:
+    """`physics.separation_iters`(第154 追補)。0 = 未指定 = ゾーン宣言のまま(既定)。
+
+    >0 のときは**すべての ORCA ゾーン**の `orca.separation_iters`(既定 64)を置き換える。
+    これは ORCA 専用の口である(SFM は接触斥力が硬く事後分離パスを持たない)。
+
+    何を削るのか: ORCA は「速度層(半平面 LP)+ 位置層(決定論的 push-apart)」の二層で、
+    位置層は重なりが消えるか上限反復に達するまで **(i<j) 辞書順の逐次 Gauss-Seidel** を回す。
+    密集ではここが ORCA コストの支配項になる(第154 実測: 29×29 m・3,000 体・cap 7 で
+    **ORCA 時間の ~84%**。反復上限 64 → 0 で 16.6 s → 2.6 s)。
+    ★ただし削れば残留めり込みが増える(同実測 n=1,500 で 64 → 16 は体表間 −0.006 m =
+      実質無害、n=3,000 では −0.188 m)。**上限に当たったかは `sep_iters_max` で監視できる**。
+    ★0 は「未指定」の意味に予約してあるので、分離パスを**本当に切りたい**ときは
+      ゾーン宣言側に `orca: {separation_iters: 0}` と書くこと(neighbor_cap と同じ規約)。
+    """
+    it = int(raw or 0)
+    if it < 0:
+        raise ValueError("physics.separation_iters: 0(=ゾーン宣言のまま)以上が必要")
+    return it
+
+
+def _build_adaptive_dt(raw) -> dict:
+    """`physics.adaptive_dt` の正準化(第154 レバーB)。既定 OFF = dt 固定 = 恒等。
+
+    thresholds は **N 昇順**へ正準化する(conf の記入順に依らない決定論)。
+    係数は 1.0 未満を許さない: dt を細かくするのは「積分の総量は同じだがサブステップが
+    増える」= 上限 `max_sub_steps` の意味が壊れるうえ、遅くなるだけで目的に反する。
+    """
+    out = _merge(ADAPTIVE_DT_DEFAULTS, raw)
+    out["enabled"] = bool(out["enabled"])
+    out["recheck_every"] = int(out["recheck_every"])
+    eng = tuple(str(e) for e in (out["engines"] or ()))
+    bad = [e for e in eng if e not in ENGINES]
+    if bad:
+        raise ValueError(f"physics.adaptive_dt.engines: 未知の engine {bad}(可: {ENGINES})")
+    out["engines"] = eng
+    pairs = []
+    for item in (out["thresholds"] or ()):
+        if len(tuple(item)) != 2:
+            raise ValueError("physics.adaptive_dt.thresholds は [[N, 係数], …] の形")
+        n, c = int(item[0]), float(item[1])
+        if n < 0 or c < 1.0:
+            raise ValueError("physics.adaptive_dt.thresholds: N>=0 / 係数>=1.0 が必要"
+                             "(係数 1 未満 = dt を細かくする = 目的に反する)")
+        pairs.append((n, c))
+    pairs.sort(key=lambda p: (p[0], p[1]))
+    out["thresholds"] = tuple(pairs)
+    if out["enabled"] and out["recheck_every"] < 1:
+        raise ValueError("physics.adaptive_dt: recheck_every>=1 が必要")
+    return out
+
+
+def _build_neighbor_cap(raw, cognitive: dict) -> int:
+    """`physics.neighbor_cap`(第154 レバーD)。0 = 未指定 = ゾーン宣言のまま(既定)。
+
+    >0 のときは **相互作用相手の上限を 1 点で絞る**:
+      - すべてのゾーンの `neighbor_cap`(SFM の対人斥力 / ORCA の ORCA 線)を置き換える
+      - `physics.cognitive` が ON なら、その k(`cognitive.neighbors`)も
+        `min(neighbors, neighbor_cap)` へ絞る
+    後者が要るのは、**認知的近傍 ON では `neighbor_cap` が 1 度も読まれない**から
+    (sfm_core._repulsion_cognitive / orca_core.step はどちらも cog_neighbors を使う)。
+    ここを揃えないと「cap を下げたのに何も起きない」= 二重 cap の罠になる。
+    """
+    cap = int(raw or 0)
+    if cap < 0:
+        raise ValueError("physics.neighbor_cap: 0(=ゾーン宣言のまま)以上が必要")
+    if cap > 0 and cognitive.get("enabled"):
+        cognitive["neighbors"] = min(int(cognitive["neighbors"]), cap)
+    return cap
 
 
 def _build_cognitive(raw) -> dict:
@@ -534,7 +645,8 @@ def derive_max_sub_steps(dt_sub: float, step_seconds: float | None) -> int:
     return max(1, int(round(float(step_seconds) / float(dt_sub))))
 
 
-def _build_zone(spec: dict, repo_root: Path, step_seconds: float | None = None) -> Zone:
+def _build_zone(spec: dict, repo_root: Path, step_seconds: float | None = None,
+                neighbor_cap: int = 0, separation_iters: int = 0) -> Zone:
     merged = _merge(ZONE_DEFAULTS, spec)
     zid = str(merged["id"]).strip()
     if not zid:
@@ -564,16 +676,29 @@ def _build_zone(spec: dict, repo_root: Path, step_seconds: float | None = None) 
         max_sub_steps=(int(spec["max_sub_steps"]) if "max_sub_steps" in spec
                        else derive_max_sub_steps(dt_sub, step_seconds)),
         arrive_radius_m=float(merged["arrive_radius_m"]),
-        neighbor_cap=int(merged["neighbor_cap"]),
+        # `physics.neighbor_cap`(>0)はゾーン宣言より優先する = 全ゾーン 1 点で絞る
+        # (既定 0 では宣言どおり = 1 バイト同一)。
+        neighbor_cap=(int(neighbor_cap) if int(neighbor_cap) > 0
+                      else int(merged["neighbor_cap"])),
         v_max_factor=float(merged["v_max_factor"]),
         walls=load_walls(walls_spec, repo_root),
         walkable_area_m2=load_walkable_area(walkable_spec, poly, repo_root),
         signal=load_signal(signal_spec, repo_root) or {},
         sfm=_merge(ZONE_DEFAULTS["sfm"], merged["sfm"]),
-        orca=_merge(ZONE_DEFAULTS["orca"], merged["orca"]),
+        # `physics.separation_iters`(>0)はゾーン宣言より優先(既定 0 では宣言どおり)。
+        orca=_orca_spec(_merge(ZONE_DEFAULTS["orca"], merged["orca"]),
+                        separation_iters),
         gate=_merge(GATE_DEFAULTS, merged["gate"]),
         bbox=polygon_bbox(poly),
     )
+
+
+def _orca_spec(orca: dict, separation_iters: int) -> dict:
+    """ORCA 宣言に `physics.separation_iters`(>0)を上書きする。0 = 宣言のまま = 同一。"""
+    if int(separation_iters) > 0:
+        orca = dict(orca)
+        orca["separation_iters"] = int(separation_iters)
+    return orca
 
 
 def _check_disjoint(zones) -> None:

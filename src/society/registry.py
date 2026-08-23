@@ -597,6 +597,56 @@ FEATURES: tuple[Feature, ...] = (
        "★格子は step ローカル(checkpoint に載らない)= resume 無風。"
        "★既定 0.0 = クリップしない = 新分岐を 1 度も通らない = 現行挙動と 1 バイト同一",
        off_value=0.0),
+    # ---- physics 2 レバー(第154。夕方ラッシュの物理コスト削減。既定 OFF)----
+    _f("physics.adaptive_dt.enabled", "strict", False, "none",
+       "**密度適応 dt(混雑 LOD)**。サブステップの塊ごと(recheck_every 回に 1 度)に"
+       "ゾーン内の在場者数から dt 係数を決定論選択し、dt_eff = dt_sub × 係数 で積分する。"
+       "★積分時間の総量は保存する(Σ dt_eff = n_sub × dt_sub)。端数は最終塊で吸収するので"
+       "世界時計と物理時計はずれない(『積分時間を 1 秒も失わない』が実装契約)。"
+       "根拠(基本図 Weidmann 1993 / Older 1968): 密度 2 人/m² 超で歩速 <0.5 m/s → "
+       "dt=0.4 でも 1 サブステップ変位 <20 cm = **粗い刻みで失う精度が最小の領域**。"
+       "閑散時は係数 1 = コストゼロ。"
+       "repro_tier=strict: 在場者数は決定論量で、係数はその純関数(乱数を 1 本も引かない)。"
+       "affects_k=false: generate() の呼び出し点を足さない/減らさない。"
+       "fingerprint_risk=none: プロンプトの語彙・欄が 1 つも増減しない(物理層)。"
+       "★ON は世界(軌跡)を変える: 混雑時のサブステップ幅が変わる = 離散化が載り替わる。"
+       "★正直な限界: ゾーン宣言の dt_sub 上限 0.1 は『dt≥0.1 は ρ≥1.5 で SFM が後退爆発』"
+       "という P2 実測から来た値で、本機能は混雑時にだけそれを意図的に超える。"
+       "ON にするなら engine 別に破綻統計(min_gap/壁貫通/jump_max/accel_p99)を測り直すこと。"
+       "★既定 OFF では係数を 1 度も引かず t=k·dt のまま = 現行挙動と 1 バイト同一"),
+    _f("physics.neighbor_cap", "strict", False, "none",
+       "**相互作用相手の上限を 1 点で絞る**(ORCA/SFM の近傍 cap 引き下げ)。0 = 未指定 = "
+       "ゾーン宣言の neighbor_cap(既定 12)のまま。>0 なら全ゾーンの neighbor_cap を"
+       "置き換え、physics.cognitive が ON ならその k も min(neighbors, cap) へ絞る。"
+       "★後者が要るのは認知的近傍 ON では neighbor_cap が**1 度も読まれない**から"
+       "(sfm_core._repulsion_cognitive / orca_core.step はどちらも cog_neighbors を使う)。"
+       "揃えないと『cap を下げたのに何も起きない』= 二重 cap の罠になる。"
+       "根拠: Ballerini et al. 2008 PNAS 105:1232(ムクドリの位相的近傍は密度に依らず 6-7 羽)"
+       "= docs/research/crowd-attention-physics.md の正典。引き下げは**現実整合の方向**であり"
+       "単なる粗視化ではない(ペア計算は cap にほぼ比例して減る)。"
+       "repro_tier=strict: 選抜は距離昇順 + index 昇順のタイブレークで決定論(乱数ゼロ)。"
+       "affects_k=false / fingerprint_risk=none は physics.cognitive.enabled と同じ理由。"
+       "★ON は世界(軌跡)を変える(力を及ぼす相手の集合が変わる)。"
+       "★既定 0 ではゾーン宣言をそのまま使う = 現行挙動と 1 バイト同一",
+       off_value=0),
+    _f("physics.separation_iters", "strict", False, "none",
+       "ORCA の**事後分離パス(位置層)の反復上限**を全 ORCA ゾーンで置き換える。"
+       "0 = 未指定 = ゾーン宣言(既定 64)のまま。ORCA は速度層(半平面 LP)で連続時間の"
+       "衝突回避を解き、離散化で生じた重なりを位置層の決定論的 push-apart"
+       "((i<j) 辞書順の逐次 Gauss-Seidel)で毎サブステップ潰す二層構成で、"
+       "密集ではこの位置層が支配項になる(第154 実測: 29×29 m・3,000 体・cap 7 で"
+       "**ORCA 時間の ~84%**。上限 64 → 0 で 16.6 s → 2.6 s)。"
+       "★削れば残留めり込みが増える(実測: 1,500 体で 64→16 は体表間 −0.006 m = 実質無害、"
+       "3,000 体では −0.188 m)。上限に当たったかは continuity の sep_iters_max で監視できる。"
+       "repro_tier=strict: 解消順序は (i<j) 辞書順固定・退化ペアは速度法線と index 順の"
+       "タイブレーク = 同一入力 → 同一 float64 配列(乱数ゼロ)。"
+       "affects_k=false: generate() の呼び出し点を足さない/減らさない。"
+       "fingerprint_risk=none: プロンプトの語彙・欄が 1 つも増減しない(物理層)。"
+       "★ON は世界(軌跡)を変える(押し戻しの残差が変わる)。SFM ゾーンには無関係"
+       "(接触斥力が硬く事後分離パスを持たない)。"
+       "★0 は『未指定』に予約: 分離パスを本当に切るならゾーン宣言に orca.separation_iters: 0。"
+       "★既定 0 ではゾーン宣言をそのまま使う = 現行挙動と 1 バイト同一",
+       off_value=0),
 
     # ---- economy ----
     _f("economy.enabled", "strict", False, "none",

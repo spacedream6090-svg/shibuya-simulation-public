@@ -15,6 +15,12 @@
       finals = 500 / registry 宣言 / scheduler 配線 / 凍結ファイル不触)。
   (3) 乱数を 1 粒も足さない・LLM 呼数不変(mock ランでの L1 一致がまとめて示す)。
 検証は mock のみ(実 LLM 禁止・≤24 step)。
+
+第154 追補(§(5)): 第153 が潰しきれなかった `_admit` の残存 O(W²)。
+  占有判定の相手が「呼び出し時点の在場者(`_admit_blocked`)」と「この呼び出しで
+  入った個体(`added`)」の 2 つに割れておらず、生の `members` を待ち行列ぶん
+  舐めていた(空ゾーン × 待ち 3,000 で 451 ms・信号の赤明けごとに再発)。
+  処置も同じ層1(相手の集合は 1 体も変わらない = 答えは 1 ビットも変わらない)。
 """
 from __future__ import annotations
 
@@ -665,7 +671,369 @@ def test_party_run_is_deterministic_and_repeatable(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# (5) 凍結ファイル不触
+# (5) 第154 physics `_admit` に残っていた O(W²)(入場済みの総当たり)
+#
+# 第153 は `waiting.remove` を潰したが、占有判定そのものには 2 つの総当たりが
+# 残っていた:
+#   (a) `blocked is None`(在場者 ≤ 48 = **ゾーンが空**)のとき、生の `members` を
+#       待ち行列ぶん舐める。`members` は入場のたびに伸びるので O(W²)。
+#   (b) `added`(この呼び出しで入った個体)の逐次リスト走査。これは `blocked` の
+#       有無に依らず走るので、(a) を消しても O(W²) は残る。
+#   おまけに `blocked is None` のときは `added ⊆ members` なので (b) は (a) の
+#   **完全な冗長**だった。
+# 処置: (a) は呼び出し時点のスナップショット `base` に、(b) は `_AdmitCells` の
+#       増分セル法に。相手の集合は 1 体も変わらない = 答えは 1 ビットも変わらない。
+# 実測(空ゾーン × 待ち 3,000): 広場配置 452 ms → 7.9 ms(57x)/散開配置
+# 1,408 ms → 13.8 ms(102x)/縁石配置 26.9 ms → 4.4 ms(6.1x)。
+# 「1 体も入れない」呼び出し(赤の間)の固定費は不変(4.29 ms → 4.23 ms)。
+# --------------------------------------------------------------------------- #
+def _admit_pre154(sim, zone, waiting, members, signal, sim_sec, t_in_step,
+                  step, sim_min, st) -> bool:
+    """第153(HEAD 2eb065f)の `_admit` 逐語コピー(独立オラクル)。"""
+    from society.observer.schema import Event
+    if signal is not None and not signal.can_cross(sim_sec):
+        return False
+    gap = float(zone.gate["min_gap_m"])
+    any_admitted = False
+    queue = list(waiting)
+    blocked = PH._admit_blocked(queue, members, gap)
+    added: list = []
+    for qi, rec in enumerate(queue):
+        px, py = rec["pos"]
+        free = not (blocked is not None and blocked[qi])
+        if free and blocked is None:
+            for other in members:
+                ox, oy = other["pos"]
+                need = rec["radius"] + other["radius"] + gap
+                if (px - ox) ** 2 + (py - oy) ** 2 < need * need:
+                    free = False
+                    break
+        if free and added:
+            for other in added:
+                ox, oy = other["pos"]
+                need = rec["radius"] + other["radius"] + gap
+                if (px - ox) ** 2 + (py - oy) ** 2 < need * need:
+                    free = False
+                    break
+        if not free:
+            continue
+        added.append(rec)
+        rec["waiting"] = False
+        rec["seen_inside"] = zone.contains(px, py)
+        members.append(rec)
+        any_admitted = True
+        st["enter_total"] += 1
+        agent = rec["agent"]
+        sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
+                             kind="zone_gate", x=agent.x, y=agent.y,
+                             payload={"zone": zone.id, "gate": rec["gate"],
+                                      "dir": "enter", "engine": zone.engine,
+                                      "v0": round(rec["v0"], 3),
+                                      "speed": round(float(np.hypot(*rec["vel"])), 3),
+                                      "span_m": round(float(rec["span_m"]), 1),
+                                      "wait_s": round(float(t_in_step)
+                                                      + float(rec["wait_steps"])
+                                                      * float(sim.clock.step_seconds), 2),
+                                      "waited_steps": int(rec["wait_steps"])}))
+    if any_admitted:
+        members.sort(key=lambda r: int(r["agent"].id))
+        PH._drop_recs(waiting, added)
+    return any_admitted
+
+
+# ── `_admit` を単体で回すための最小スタブ(sim/zone は使う口しか要らない)──── #
+class _StubLogger:
+    def __init__(self):
+        self.rows: list = []
+
+    def log(self, ev):
+        self.rows.append((ev.step, ev.sim_min, ev.agent_id, ev.kind, ev.x, ev.y,
+                          json.dumps(ev.payload, ensure_ascii=False,
+                                     sort_keys=True)))
+
+
+class _StubClock:
+    step_seconds = 600.0
+
+
+class _StubSim:
+    def __init__(self):
+        self.logger = _StubLogger()
+        self.clock = _StubClock()
+
+
+class _StubZone:
+    def __init__(self, gap, half=25.0):
+        self.id = "z1"
+        self.engine = "orca"
+        self.gate = {"min_gap_m": gap}
+        self.half = half
+
+    def contains(self, x, y):
+        return abs(x) <= self.half and abs(y) <= self.half
+
+
+def _wrec(i, x, y, r):
+    """`_admit_record` と同じ形の流入レコード(必要なキーだけ)。"""
+    return {"agent": _A(i, x, y), "zone": "z1", "path": [0, 1], "rest": [],
+            "gate": "g0", "exit_xy": (0.0, 0.0), "span_m": 30.0, "wp": 1,
+            "wp_xy": (0.0, 0.0), "pos": (x, y), "vel": (1.0, 0.0),
+            "dir0": (1.0, 0.0), "seg_dir": (1.0, 0.0), "v0": 1.3, "radius": r,
+            "waiting": True, "seen_inside": False, "wait_steps": i % 4,
+            "step_n": 0, "elapsed_s": 0.0}
+
+
+def _admit_outcome(fn, wrecs, mrecs, gap):
+    """入場集合・順序・座標・待ち残り・件数・イベント列 をまとめて返す。"""
+    sim, zone, st = _StubSim(), _StubZone(gap), {"enter_total": 0}
+    waiting = [dict(r) for r in wrecs]
+    members = [dict(r) for r in mrecs]
+    ret = fn(sim, zone, waiting, members, None, 0.0, 0.0, 0, 0, st)
+    return (ret,
+            [(r["agent"].id, r["pos"], r["radius"], r["waiting"],
+              r["seen_inside"]) for r in members],
+            [(r["agent"].id, r["waiting"], r["seen_inside"]) for r in waiting],
+            st["enter_total"], sim.logger.rows)
+
+
+def _admit_scene(rnd, n_w, n_m, spread, mode):
+    """(待ち, 在場) のレコード列。mode で配置の性質を変える。"""
+    def _pos():
+        if mode == "uniform":
+            return (rnd.uniform(-spread, spread), rnd.uniform(-spread, spread))
+        if mode == "lattice":                  # 距離同値・体表接触が大量に出る格子
+            return (0.35 * rnd.randint(-12, 12), 0.35 * rnd.randint(-12, 12))
+        if mode == "cellline":                 # ★セル境界(1.5·reach ≒ 1.2 m)直撃
+            eps = rnd.choice([0.0, 1e-16, -1e-16, 1e-12, -1e-12, 5e-9, -5e-9])
+            return (1.2 * rnd.randint(-8, 8) + eps,
+                    1.2 * rnd.randint(-8, 8) + eps)
+        if mode == "dup":                      # 完全同一座標の山
+            return (rnd.choice([0.0, 0.5, 1.0]), rnd.choice([0.0, 0.5, 1.0]))
+        raise AssertionError(mode)
+
+    ids = rnd.sample(range(100000), n_w + n_m)
+    recs = [_wrec(ids[k], *_pos(), rnd.uniform(0.25, 0.35))
+            for k in range(n_w + n_m)]
+    for r in recs[n_w:]:
+        r["waiting"] = False
+    return recs[:n_w], recs[n_w:]
+
+
+_ADMIT_MODES = ("uniform", "lattice", "cellline", "dup")
+
+
+@pytest.mark.parametrize("cell_min,cell_work", [
+    (24, 1),            # 実装の既定
+    (-1, 0),            # ★格子を最初の 1 体から強制 ON(セル法だけを見る)
+    (10 ** 9, 10 ** 9),  # 格子を完全 OFF(素の総当たり = 冗長ループ除去だけを見る)
+    (4, 2),             # 切替点をずらす
+])
+def test_admit_matches_the_pre154_reference_on_random_scenes(cell_min, cell_work,
+                                                             monkeypatch):
+    """★同値証明: 第153 逐語オラクルと入場集合・順序・座標・イベント列まで完全一致。
+
+    切替閾値をどこに置いても答えが同じ = 「速い経路」と「素の経路」が同値である
+    ことの直接の証拠(第153 の `world.perception_fine_gate` と同じ作法)。
+    """
+    monkeypatch.setattr(PH, "_ADMIT_CELL_MIN", cell_min)
+    monkeypatch.setattr(PH, "_ADMIT_CELL_WORK", cell_work)
+    rnd = random.Random(20260823)
+    for k in range(400):
+        mode = _ADMIT_MODES[k % len(_ADMIT_MODES)]
+        n_w = rnd.choice([0, 1, 2, 3, 7, 25, 26, 60, 120, 300])
+        n_m = rnd.choice([0, 1, 5, 47, 48, 49, 90, 250])
+        spread = rnd.choice([0.5, 2.0, 8.0, 40.0])
+        gap = rnd.choice([0.0, 0.1, 0.5, 2.0])
+        w0, m0 = _admit_scene(rnd, n_w, n_m, spread, mode)
+        assert _admit_outcome(PH._admit, w0, m0, gap) == \
+            _admit_outcome(_admit_pre154, w0, m0, gap), \
+            (k, mode, n_w, n_m, spread, gap)
+
+
+def test_admit_cells_hit_matches_the_full_scan():
+    """`_AdmitCells.hit` ≡ `for other in added:` の総当たり(同じ bool)。"""
+    rnd = random.Random(154)
+    for _ in range(400):
+        gap = rnd.choice([0.0, 0.1, 0.5])
+        pts = [(rnd.uniform(-3, 3), rnd.uniform(-3, 3), rnd.uniform(0.25, 0.35))
+               for _ in range(rnd.randint(1, 60))]
+        cells = PH._AdmitCells.build(
+            [{"radius": p[2], "pos": (p[0], p[1])} for p in pts], gap)
+        assert cells is not None
+        for p in pts:
+            cells.add(*p)
+        for _ in range(20):
+            px, py = rnd.uniform(-3.5, 3.5), rnd.uniform(-3.5, 3.5)
+            r = rnd.uniform(0.25, 0.35)
+            want = any((px - ox) ** 2 + (py - oy) ** 2
+                       < (r + orad + gap) * (r + orad + gap)
+                       for ox, oy, orad in pts)
+            assert cells.hit(px, py, r) is want
+
+
+def test_admit_cells_build_seeds_the_already_admitted():
+    """遅延構築の backfill: `seed` に渡した個体が最初の問い合わせから見えている。"""
+    seed = [_wrec(1, 0.0, 0.0, 0.30), _wrec(2, 10.0, 0.0, 0.30)]
+    cells = PH._AdmitCells.build(seed, 0.1, seed)
+    assert cells.hit(0.2, 0.0, 0.30) is True
+    assert cells.hit(10.2, 0.0, 0.30) is True
+    assert cells.hit(5.0, 0.0, 0.30) is False
+
+
+def test_admit_cells_ring_covers_every_pair_within_reach():
+    """★幾何の要: セル辺 = 1.5·reach なら `floor` の差は高々 1 = 3×3 で取りこぼし無し。
+
+    座標の桁を 10⁻³〜10¹² まで振っても差は 1 を超えない(余裕 0.333 に対して
+    丸め誤差は 10⁻¹⁶ 桁)。ここが破れると `hit` が偽陰性を返しうる。
+    """
+    import math
+    rnd = random.Random(1154)
+    worst = 0
+    for mag in (1e-3, 1.0, 1e3, 1e6, 1e9, 1e12):
+        for _ in range(20000):
+            r_max = rnd.uniform(0.25, 0.35)
+            gap = rnd.choice([0.0, 0.1, 0.5, 2.0])
+            reach = r_max + r_max + gap
+            cell = reach * PH._ADMIT_CELL_SCALE
+            px = rnd.uniform(-mag, mag)
+            ox = px + rnd.uniform(-reach, reach)
+            if abs(px - ox) > reach:
+                continue
+            worst = max(worst, abs(math.floor(px / cell) - math.floor(ox / cell)))
+    assert worst <= 1, f"3×3 リングでは足りない(floor 差 {worst})"
+
+
+def test_admit_cells_build_refuses_degenerate_input():
+    """前提が崩れる入力では格子を作らない(= 素の総当たりへ後退 = 従来と同じ答え)。"""
+    ok = [{"radius": 0.3, "pos": (0.0, 0.0)}]
+    assert PH._AdmitCells.build(ok, 0.1) is not None
+    assert PH._AdmitCells.build([], 0.1) is None                     # 空の待ち
+    assert PH._AdmitCells.build(ok, -0.1) is None                    # 負の間隙
+    assert PH._AdmitCells.build([{"radius": 0.0, "pos": (0.0, 0.0)}], 0.0) is None
+    for bad in ((float("nan"), 0.0), (float("inf"), 0.0), (0.0, float("nan"))):
+        assert PH._AdmitCells.build([{"radius": 0.3, "pos": bad}], 0.1) is None
+    assert PH._AdmitCells.build([{"radius": -0.3, "pos": (0.0, 0.0)}], 0.1) is None
+    # 極小セル × 天文学的座標(`math.floor(px/cell)` が OverflowError を投げる形)
+    assert PH._AdmitCells.build([{"radius": 0.0, "pos": (1e308, 0.0)},
+                                 {"radius": 5e-324, "pos": (0.0, 0.0)}], 0.0) is None
+
+
+def test_admit_falls_back_verbatim_on_degenerate_positions():
+    """非有限座標が混じっても第153 と同じ答え(格子は組まれず素の総当たりになる)。"""
+    rnd = random.Random(9)
+    w = [_wrec(i, rnd.uniform(-2, 2), rnd.uniform(-2, 2), 0.30) for i in range(60)]
+    w[7]["pos"] = (float("nan"), 0.0)
+    w[31]["pos"] = (0.0, float("inf"))
+    assert _admit_outcome(PH._admit, w, [], 0.1) == \
+        _admit_outcome(_admit_pre154, w, [], 0.1)
+
+
+def test_admit_work_per_agent_is_bounded_not_quadratic():
+    """★計算量のピン: 1 体あたりに見る相手の数が待ち行列長に依らず定数で収まる。
+
+    セル法が見るのは 3×3 セル。入場済みは互いに `need`(≒0.6-0.8 m)以上離れて
+    いるので、辺 1.5·reach のセル 9 個に入りうる点数は**充填限界で頭打ち**になる
+    (待ち W を 5 倍にしても 1 体あたりの候補数は増えない)。第153 は 1 体あたり
+    「それまでに入場した全員」= W/2 相当を舐めていた。
+    """
+    import math
+    seen = {"cand": 0}
+    orig_hit = PH._AdmitCells.hit
+
+    def _counting_hit(self, px, py, radius):
+        cx = math.floor(px / self.cell)
+        cy = math.floor(py / self.cell)
+        for ix in (cx - 1, cx, cx + 1):
+            for iy in (cy - 1, cy, cy + 1):
+                seen["cand"] += len(self.bins.get((ix, iy), ()))
+        return orig_hit(self, px, py, radius)
+
+    rnd = random.Random(77)
+    per = {}
+    PH._AdmitCells.hit = _counting_hit
+    try:
+        for n_w in (600, 3000):
+            seen["cand"] = 0
+            w = [_wrec(i, rnd.uniform(-40, 40), rnd.uniform(-20, 20),
+                       rnd.uniform(0.25, 0.35)) for i in range(n_w)]
+            out = _admit_outcome(PH._admit, w, [], 0.1)
+            assert out[3] > 200, "テスト前提が崩れた(ほとんど入場していない)"
+            per[n_w] = seen["cand"] / n_w
+    finally:
+        PH._AdmitCells.hit = orig_hit
+    # 充填限界: 半径 0.3 + 間隙 0.1 の点が辺 1.2 m のセル 9 個(3.6 m 角)に
+    # 入りうる数の上界は (3.6/0.6)² = 36。
+    for n_w, v in per.items():
+        assert v <= 40.0, f"1 体あたりの候補が多すぎる(W={n_w}: {v:.1f})"
+
+
+def test_admit_matches_the_pre154_reference_in_a_real_run(tmp_path, monkeypatch):
+    """★実ラン A/B: `_admit` を第153 の逐語コピーへ差し替えても L1 がバイト一致。"""
+    new = _phys_sim(tmp_path, "admit154_new")
+    new.run()
+    assert [e for e in new.logger.events if e.kind == "zone_gate"], \
+        "テスト前提が崩れた(ゾーンを誰も通らない)"
+
+    monkeypatch.setattr(PH, "_admit", _admit_pre154)
+    old = _phys_sim(tmp_path, "admit154_old")
+    old.run()
+    assert _l1(new) == _l1(old)
+
+
+def test_admit_real_run_is_l1_identical_with_the_grid_forced_on(tmp_path,
+                                                                monkeypatch):
+    """小さな実ランでは格子が組まれないので、強制 ON でも L1 が変わらないことを見る。"""
+    base = _phys_sim(tmp_path, "admit154_base")
+    base.run()
+    monkeypatch.setattr(PH, "_ADMIT_CELL_MIN", -1)
+    monkeypatch.setattr(PH, "_ADMIT_CELL_WORK", 0)
+    forced = _phys_sim(tmp_path, "admit154_forced")
+    forced.run()
+    assert _l1(base) == _l1(forced)
+
+
+class _CountingRec(dict):
+    """`rec["pos"]` の読み出し回数を数える流入レコード(冗長走査の検出器)。"""
+
+    reads = [0]
+
+    def __getitem__(self, key):
+        if key == "pos":
+            _CountingRec.reads[0] += 1
+        return dict.__getitem__(self, key)
+
+
+def test_admit_never_rescans_the_admitted_twice(monkeypatch):
+    """★冗長ループの除去: 入場済みを 2 度舐めない(`base` は呼び出し時点の写し)。
+
+    第153 は `blocked is None`(在場者 ≤ `_ADMIT_HASH_MIN`)のとき、入場のたびに
+    伸びる生の `members` を舐めた**後で** `added` をもう一度舐めていた。
+    `added ⊆ members` なので後者は完全な冗長で、W 体が全員入れる配置では
+    `rec["pos"]` の読み出しにちょうど W·(W−1)/2 回ぶん現れる。
+    格子は切って(素の経路どうしで)比べる = 冗長の除去だけを見る。
+    """
+    monkeypatch.setattr(PH, "_ADMIT_CELL_MIN", 10 ** 9)
+    monkeypatch.setattr(PH, "_ADMIT_CELL_WORK", 10 ** 9)
+    n_w, n_m = 40, 10
+    # 全員が互いに十分離れた配置 = 誰も弾かれない(走査が最後まで走る)
+    w = [_wrec(i, 100.0 * i, 0.0, 0.30) for i in range(n_w)]
+    m = [_wrec(1000 + j, -100.0 * (j + 1), 0.0, 0.30) for j in range(n_m)]
+    for r in m:
+        r["waiting"] = False
+    reads = {}
+    for tag, fn in (("new", PH._admit), ("old", _admit_pre154)):
+        sim, zone, st = _StubSim(), _StubZone(0.1), {"enter_total": 0}
+        waiting = [_CountingRec(r) for r in w]
+        members = [_CountingRec(r) for r in m]
+        _CountingRec.reads[0] = 0
+        fn(sim, zone, waiting, members, None, 0.0, 0.0, 0, 0, st)
+        assert st["enter_total"] == n_w, "テスト前提が崩れた(全員入れる配置のはず)"
+        reads[tag] = _CountingRec.reads[0]
+    assert reads["old"] - reads["new"] == n_w * (n_w - 1) // 2, reads
+
+
+# --------------------------------------------------------------------------- #
+# (6) 凍結ファイル不触
 # --------------------------------------------------------------------------- #
 def test_touched_files_are_not_frozen():
     from society.observer import metrics_spec as MS

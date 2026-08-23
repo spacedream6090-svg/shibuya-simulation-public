@@ -101,6 +101,8 @@ P4-3 = `calib_p43_results.json`)。本体の `_CalibratedCrowd` はベンチの
     集計はカウント・bool・min だけ(順序非依存)で、唯一の浮動小数の累積和 `speed_sum` は
     加算順序を変えていない
   - `_admit` … 入口の占有判定 O(W·M)/サブステップ をセル法の一括判定へ(bool の or =順序非依存)
+    ※ ここで潰したのは「**呼び出し時点の**在場者」ぶんだけで、ループ内で増える
+       「入場済み」ぶんの総当たり O(W²) は第154 まで残っていた(`_AdmitCells`)。
   - `phase` … `_by_id` の全体 sort を **1 step 1 回**に(ゾーン数×2 回 → 1 回。走査順は不変)
 検収は tests/test_physics_hash.py(旧実装を参照実装として保持し全サブステップを突合)。
 
@@ -168,6 +170,47 @@ R1: どちらのトグルも既定 OFF で、OFF のときは新しい関数が 
       こちらの方が正しい。
   既定 0 = 無効。
 
+物理 2 レバー(第154。2026-08-23。**どちらも既定 OFF = 現行と 1 バイト同一**)
+--------------------------------------------------------------------------------
+py-spy 250k v7b の実測で step 時間の 46.6% が物理(`_run_zone` の `engine.step` 本体
+34.7% / `orca_core.step` 22.4%)だった。内訳は「夕方ラッシュのゾーン内人数 × サブ
+ステップ数(dt=0.1 で 6,000/step)」の正直な掛け算なので、掛ける側を両方から削る。
+
+  レバーB 密度適応 dt(`physics.adaptive_dt`。既定 OFF)
+    サブステップの**塊ごと**(`recheck_every` 回に 1 度)に在場者数から dt 係数を
+    決定論選択し、`dt_eff = dt × 係数` で積分する。積分時間の総量は保存し
+    (Σ dt_eff = n_sub·dt)、端数は最終塊で吸収する = 世界時計とずれない。
+    根拠は基本図: ρ>2 人/m² で歩速 <0.5 m/s → dt=0.4 でも 1 サブステップ変位 <20 cm
+    = 粗い刻みで失う精度が最小の領域。閑散時は係数 1 = コストゼロ。
+    ★ゾーン宣言の `dt_sub` 上限 0.1 は「dt≥0.1 は ρ≥1.5 で SFM が後退爆発」という
+      P2 実測から来ている。適応 dt は**混雑時にだけそれを意図的に超える**。
+      `scripts/bench_physics_levers.py` の実測(0.71 人/m²・係数 2)では
+        ORCA … 体表間 +0.066 → +0.049 m(重なりゼロを維持)
+        SFM  … 体表間 +0.003 → **−0.171 m(重なり)**・壁クリアランス
+               +0.102 → **−0.105 m(壁貫通)**・平均速さ 0.40 → 0.62 m/s
+      = P2 の警告がそのまま再現した。よって `adaptive_dt.engines` で**適用エンジンを
+      絞れる**ようにしてある(本選は `[orca]`)。ORCA が粗い刻みに強いのは、衝突回避を
+      速度層(半平面)で解き、離散化で生じた重なりを位置層(決定論的 push-apart)で
+      毎サブステップ潰す二層構成だから。SFM は斥力の陽的積分そのものが刻みに依存する。
+
+  レバーD 近傍 cap の引き下げ(`physics.neighbor_cap`。既定 0 = ゾーン宣言のまま)
+    >0 なら全ゾーンの `neighbor_cap` を置き換え、`physics.cognitive` が ON なら
+    その k も `min(neighbors, cap)` へ絞る(= **作用点を 1 つに畳む**)。
+    認知的近傍が ON のとき `neighbor_cap` は 1 度も読まれない(sfm_core の
+    `_repulsion_cognitive` と orca_core.step はどちらも cog_neighbors を使う)ので、
+    ここを揃えないと「cap を下げたのに何も起きない」= 二重 cap の罠になる。
+    根拠: Ballerini et al. 2008(位相的近傍 6-7)。引き下げは現実整合の方向であって
+    粗視化ではない(docs/research/crowd-attention-physics.md の正典)。
+
+  レバーS 事後分離パスの反復上限(`physics.separation_iters`。既定 0 = ゾーン宣言のまま)
+    >0 なら全 ORCA ゾーンの `orca.separation_iters`(既定 64)を置き換える。
+    ORCA は「速度層(半平面 LP)+ 位置層(決定論的 push-apart)」の二層で、位置層は
+    重なりが消えるか上限反復に達するまで (i<j) 辞書順の逐次 Gauss-Seidel を回す。
+    ★実測(29×29 m・cap 7・dt 0.4): **位置層が ORCA 時間の ~84%**(3,000 体で
+      上限 64 → 0 が 16.6 s → 2.6 s)= B/D を掛けたあとの最大の残り。
+    削れば残留めり込みが増える(n=1,500 で 64→16 は体表間 −0.006 m = 実質無害、
+    n=3,000 では −0.188 m)。上限に当たったかは `sep_iters_max` で監視できる。
+
 R1(既定 OFF = 完全 no-op)
 ---------------------------
 `physics.zones_enabled: false`(既定)または `physics.zones: []`(既定)のとき:
@@ -191,6 +234,7 @@ from .world.indoor_flow import body_radius, desired_speed
 _ACC_BIN = 0.1            # ビン幅 [m/s²]
 _ACC_BINS = 1000          # 0 〜 100 m/s²(超過は最終ビンへ)
 STREAM = "physics"        # 用途別 named stream の名前(R1)
+_DT_DUST = 1e-6           # 適応 dt の端数吸収しきい(dt に対する比。浮動小数の塵の畳み込み)
 
 
 # --------------------------------------------------------------------------- #
@@ -325,7 +369,10 @@ def continuity(sim) -> dict:
         b = c[band]
         out[f"{band}_accel_p99"] = _hist_quantile(b["hist"], b["n"], 0.99)
         out[f"{band}_accel_max"] = _hist_max(b["hist"])
-        secs = float(b["samples"]) * dt
+        # 分母は「サンプル秒」。適応 dt(第154 レバーB)が ON だったランでは
+        # サブステップ幅が一定でないので実 dt の積算値 `sec` を使う。
+        # OFF(= `sec` が無い / 0.0)では従来どおり samples × dt_sub = 1 ビット同じ。
+        secs = float(b.get("sec", 0.0)) or (float(b["samples"]) * dt)
         out[f"{band}_reversal_rate"] = (float(b["flip"]) / secs) if secs > 0 else None
         out[f"{band}_samples"] = int(b["samples"])
     return out
@@ -412,6 +459,10 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict, ordered=None) -> Non
     step_seconds = float(sim.clock.step_seconds)
     dt = zone.dt_sub
     n_sub = min(int(zone.max_sub_steps), max(1, int(round(step_seconds / dt))))
+    # ★第154 レバーB(密度適応 dt)。既定 OFF では `adapt is None` = 下の分岐を
+    #   1 度も通らない = t も dt も従来と同じ式 = 1 バイト同一。
+    adapt = _adaptive_of(sim, zone)
+    total_s = n_sub * dt            # この step で覆う**積分時間の総量** [s](係数に依らず不変)
 
     members: list[dict] = []      # 積分対象(ゾーン内)
     waiting: list[dict] = []      # 入場待ち(guarded で弾かれた個体)
@@ -468,8 +519,25 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict, ordered=None) -> Non
     sub_done = 0
 
     # ---- (3) サブステップ・ループ(2 層タイムラインの下層)------------------ #
-    for k in range(n_sub):
-        t = k * dt
+    # 適応 dt の会計(OFF では cum=None・dt_eff=dt・t=k·dt = 従来の式そのまま)。
+    #   cum … `_accumulate` を呼ぶたびに「この step で積分した累積秒」を積む列。
+    #         個体の滞在秒は「参加した最後の m 回ぶん」= cum[-1] − cum[-1−m] で厳密に出る
+    #         (在場者は入場から退場まで連続した回に参加するので m 回は必ず末尾の連続塊)。
+    cum: list | None = [] if adapt is not None else None
+    dt_eff = dt
+    factor = 1.0
+    t = 0.0
+    int_s = 0.0                     # 積分済み秒(信号待ちの空回りは含めない)
+    k = 0
+    while k < n_sub:
+        if adapt is None:
+            t = k * dt
+        else:
+            if k % adapt[1] == 0:   # 塊の頭でだけ係数を引き直す(毎サブステップは高い)
+                factor = _dt_factor(adapt[0], len(members))
+            dt_eff, t_next = next_dt(t, total_s, dt, factor)
+            if dt_eff <= 0.0:
+                break
         # (3a) 入場(guarded + 信号)。id 昇順 = 決定論。
         if waiting:
             if engine is not None:
@@ -484,15 +552,21 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict, ordered=None) -> Non
             if not waiting:
                 break                                 # ゾーンが空 = その場で打ち切り
             sub_done += 1                             # 信号待ち: 時間だけ進める
+            k += 1
+            if adapt is not None:
+                t = t_next
             continue
         # (3b) 積分
         prev_pos = engine.pos.copy()
         prev_vel = engine.vel.copy()
-        engine.step(dt)
+        engine.step(dt_eff)
         sub_done += 1
         occ_sum += len(members)
-        _accumulate(zone, members, engine, prev_pos, prev_vel, dt, gate_xy,
-                    cont, st, pcfg)
+        _accumulate(zone, members, engine, prev_pos, prev_vel, dt_eff, gate_xy,
+                    cont, st, pcfg, dt_acc=(dt_eff if cum is not None else None))
+        if cum is not None:
+            int_s += dt_eff
+            cum.append(int_s)
         # (3c) 通過点の前進 + 退場判定
         released = _advance_and_collect(sim, zone, members, engine)
         if released:
@@ -500,7 +574,7 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict, ordered=None) -> Non
             _drop_recs(members, released)   # ← 1 件ずつ remove すると dataclass `__eq__` が走る
             for rec in released:
                 # この step で実際に積分した秒数(= step 途中で入場した個体でも正しい)
-                used = rec["step_n"] * dt
+                used = _used_s(rec, dt, cum)
                 rec["elapsed_s"] += used
                 _save_record(rec)
                 _release(sim, zone, rec["agent"], step, sim_min, st,
@@ -512,13 +586,16 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict, ordered=None) -> Non
                 _carry_field(prev_engine, engine)
         if engine is None and not waiting:
             break
+        k += 1
+        if adapt is not None:
+            t = t_next
 
     # ---- (4) step 内で終わらなかった個体は状態を持ち越す(同期完了)--------- #
     if members and engine is not None:
         _writeback(members, engine)
     forced: list = []
     for rec in list(members):
-        used = rec["step_n"] * dt
+        used = _used_s(rec, dt, cum)
         rec["elapsed_s"] += used
         _save_record(rec)
         if _maybe_force(sim, zone, rec, step, sim_min, st, used_s=used):
@@ -535,6 +612,11 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict, ordered=None) -> Non
 
     st["sub_steps_total"] += sub_done
     area = zone.walkable_area_m2 or zone.area_m2() or 1.0
+    # ★適応 dt(第154 レバーB)が ON のとき、この平均は「サブステップ重み」であって
+    #   「時間重み」ではない(1 サブステップの長さが塊ごとに変わるため)。係数は塊
+    #   (既定 20 サブステップ)単位でしか動かないので偏りは 2 次だが、厳密な時間重みに
+    #   したければ Σ(len×dt_eff)/Σdt_eff にする必要がある。**OFF では従来と 1 ビット同じ**
+    #   なので、ここは既定側のバイト一致を優先して式を変えていない。
     occ_mean = (occ_sum / sub_done) if sub_done else 0.0
     st["by_zone"][zone.id] = {
         "occupancy": len(members),
@@ -543,6 +625,82 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict, ordered=None) -> Non
         "waiting": len(waiting),
         "sub_steps": sub_done,
     }
+
+
+# --------------------------------------------------------------------------- #
+# 密度適応 dt(混雑 LOD。第154 レバーB。**既定 OFF = dt 固定 = 1 バイト同一**)
+# --------------------------------------------------------------------------- #
+# 何をするか: ゾーン内の在場者数が多い塊のあいだだけサブステップ幅を dt×係数 へ粗くする。
+#   **積分時間の総量は保存する**(Σ dt_eff = n_sub·dt = この step が覆うべき秒数)。
+#   端数は最終塊で吸収するので「1 秒も失わない」= 世界時計と物理時計はずれない。
+# なぜ粗くしてよいか: 基本図(Weidmann 1993 ほか)で密度 2 人/m² を超えると歩速は
+#   0.5 m/s を下回る。そこでの 1 サブステップ変位は dt=0.4 s でも 20 cm 未満で、
+#   **粗い刻みで失う精度が最小の領域**である。閑散時は係数 1 = コストゼロ。
+# 決定論: 係数は「その瞬間の在場者数」という決定論量からの純関数。乱数を 1 本も引かない。
+def _adaptive_of(sim, zone=None):
+    """`physics.adaptive_dt` → (thresholds, recheck_every) / 既定 OFF は None。
+
+    `engines` を書いたときは**そのエンジンのゾーンだけ**が対象(他は None = dt 固定 =
+    そのゾーンは 1 バイト同一)。ベンチ実測で SFM は係数 2 で重なり・壁貫通を出すが
+    ORCA は出さない(速度層 + 位置層の二層構成が粗い刻みに強い)ため、engine 別に
+    切れる口が要る。
+    """
+    a = (getattr(sim, "physcfg", None) or {}).get("adaptive_dt") or {}
+    if not a.get("enabled"):
+        return None
+    th = tuple(a.get("thresholds") or ())
+    if not th:
+        return None                       # 閾値ゼロ件 = 係数は常に 1 = OFF と同じ
+    eng = tuple(a.get("engines") or ())
+    if eng and zone is not None and zone.engine not in eng:
+        return None
+    return (th, max(1, int(a.get("recheck_every", 1))))
+
+
+def next_dt(t: float, total_s: float, dt: float, factor: float):
+    """次のサブステップ幅と、その後の時刻 `(dt_eff, t_next)`。**規則はここ 1 本**。
+
+    - 端数は最終塊で吸収する(会計の基準 t は total_s へ厳密に着地する。列を補償総和で
+      足し直すと 1e-14 s の丸め差が残るが、それは失った時間ではなく足し方の違い)。
+    - 残りが `dt·_DT_DUST` 以下になる場合も今回で畳む。理由は**実測された事故**である:
+      0.2 を 100 回足すと 20.0 に 3.6e-15 だけ届かず、そこに **dt≈0 のサブステップが
+      1 回生える**。ORCA はその 1 回で「時間 dt の遮断円へ射影する」枝の半径が 1/dt で
+      発散し、速度が v_max を大きく超えた(ベンチ実測: 平均速さ 0.57 → 53 m/s・
+      accel の分位が最終ビンへ張り付き)。畳んで伸びるのは高々 dt·1e-6 秒。
+    """
+    dt_eff = dt * factor
+    rest = total_s - t
+    if dt_eff >= rest or (rest - dt_eff) <= dt * _DT_DUST:
+        return rest, total_s
+    return dt_eff, t + dt_eff
+
+
+def _dt_factor(thresholds, n_members: int) -> float:
+    """在場者数 → dt 係数(thresholds は N 昇順に正準化済み = 最後に該当した係数)。"""
+    f = 1.0
+    for lim, c in thresholds:
+        if n_members > lim:
+            f = c
+        else:
+            break
+    return f
+
+
+def _used_s(rec, dt: float, cum) -> float:
+    """この step でその個体が実際に積分された秒数。
+
+    `cum is None`(適応 dt OFF)では **従来と 1 ビット同じ** `step_n × dt`。
+    ON では `cum`(= `_accumulate` を呼ぶたびに積んだ累積積分秒)の差分を採る:
+    在場者は入場から退場まで**連続した回**に参加するので、その個体の参加回 m は
+    必ず末尾の連続塊 = 使う区間は `cum[-1] − cum[-1−m]` で厳密に定まる。
+    """
+    m = int(rec["step_n"])
+    if cum is None:
+        return m * dt
+    if m <= 0:
+        return 0.0
+    j = len(cum) - 1
+    return cum[j] - (cum[j - m] if j - m >= 0 else 0.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -580,30 +738,59 @@ def _admit(sim, zone, waiting, members, signal, sim_sec, t_in_step,
     queue = list(waiting)
     # ★占有判定の候補列挙をセル法化(判定式・比較演算は 1 バイトも変えない)。
     #   判定は「近傍に 1 体でも居るか」= bool の or なので順序非依存 = 完全同値。
-    #   在場者は入場のたびに増えるが、格子は**呼び出し時点の在場者**だけを載せ、
-    #   この呼び出しで入った個体(`added`)は逐次リストで見る = 集合は常に同じ。
+    #   相手集合は 2 つに割れる:
+    #     (a) **呼び出し時点の在場者** … `_admit_blocked` の一括判定(第135 のセル法)。
+    #         出せなかったとき(在場者が少ない/退化)だけ `base` を素で舐める。
+    #     (b) **この呼び出しで入った個体**(`added`)… `_AdmitCells` の増分セル法。
+    #   `base` は呼び出し時点のスナップショットなので (a) と (b) は交わらない。
+    #   第153 まではここが `members`(= 入場のたびに伸びる生のリスト)で、(b) と
+    #   完全に重複していた上に **待ち行列ぶんの総当たり O(W·M)** が残っていた
+    #   (在場者ゼロ + 待ち 3,000 で 1.05 s。信号の赤明けごとに再発する)。
     blocked = _admit_blocked(queue, members, gap)
+    base = list(members) if blocked is None else ()
+    #   格子は **素の総当たりが元を取れなくなってから**組む(損益分岐は「素で舐めた
+    #   ペア数 > 待ち行列長」= 格子の構築費 O(W) と釣り合う点。加えて入場済みが
+    #   `_ADMIT_CELL_MIN` 体以下なら組まない)。こうすると「待ちは厚いが上流の
+    #   `blocked` でほぼ全員弾かれる」呼び出し = 赤の間のサブステップでは
+    #   格子を 1 度も組まない(`_admit` は毎サブステップ呼ばれるので固定費が効く)。
+    #   どちらの経路を通っても**見る相手の集合は同じ**なので答えは変わらない。
+    cells = None
+    cells_off = False
+    scan = 0                               # 素で舐めたペア数(上界)
+    cell_work = len(queue) * _ADMIT_CELL_WORK
     added: list = []
     for qi, rec in enumerate(queue):
         px, py = rec["pos"]
+        radius = rec["radius"]
         free = not (blocked is not None and blocked[qi])
-        if free and blocked is None:
-            for other in members:
+        if free and base:
+            for other in base:
                 ox, oy = other["pos"]
-                need = rec["radius"] + other["radius"] + gap
+                need = radius + other["radius"] + gap
                 if (px - ox) ** 2 + (py - oy) ** 2 < need * need:
                     free = False
                     break
         if free and added:
-            for other in added:
-                ox, oy = other["pos"]
-                need = rec["radius"] + other["radius"] + gap
-                if (px - ox) ** 2 + (py - oy) ** 2 < need * need:
-                    free = False
-                    break
+            n_add = len(added)
+            if (cells is None and not cells_off
+                    and n_add > _ADMIT_CELL_MIN and scan >= cell_work):
+                cells = _AdmitCells.build(queue, gap, added)
+                cells_off = cells is None      # 退化入力 = 以後も素の総当たり
+            if cells is not None:
+                free = not cells.hit(px, py, radius)
+            else:
+                scan += n_add
+                for other in added:
+                    ox, oy = other["pos"]
+                    need = radius + other["radius"] + gap
+                    if (px - ox) ** 2 + (py - oy) ** 2 < need * need:
+                        free = False
+                        break
         if not free:
             continue                       # 置けなければ移管しない(待たせる)
         added.append(rec)
+        if cells is not None:
+            cells.add(px, py, radius)
         rec["waiting"] = False
         rec["seen_inside"] = zone.contains(px, py)
         # ★入場ぶんの `waiting` からの除去は**ループを抜けてから 1 回**で行う(下の
@@ -672,6 +859,111 @@ def _drop_recs(lst: list, drop) -> None:
 
 
 _ADMIT_HASH_MIN = 48      # 在場者がこれ以下なら素の総当たりの方が安い(結果は同一)
+_ADMIT_CELL_MIN = 24      # 入場済みがこれ以下なら素の総当たりの方が安い(結果は同一)
+_ADMIT_CELL_WORK = 1      # 格子を組む損益分岐(素で舐めたペア数 ≥ 待ち行列長 × これ)
+_ADMIT_CELL_SCALE = 1.5   # セル辺 = reach × これ(1 未満の余裕が floor 差 ≤ 1 を保証)
+
+
+class _AdmitCells:
+    """`_admit` の**入場済み**(この呼び出しで入れた個体)だけを載せる増分セル法。
+
+    `_admit_blocked` は「呼び出し時点の在場者」を numpy で一括判定するが、入場は
+    ループの中で 1 体ずつ増えるので、その増分は逐次リストで舐めるしかなかった。
+    在場者ゼロ(= 信号の赤明け・夕方の空ゾーン)では **全部が増分**になり、
+    待ち W 体に対して O(W²) の総当たりが残る(W=3,000 で 1.05 s)。ここを潰す。
+
+    同値であること
+    --------------
+    判定は「近傍に 1 体でも居るか」= bool の **or** なので、相手を舐める順序にも
+    「どこまで舐めたか(break の位置)」にも依らない。必要十分は
+    **「答えが True になる相手を 1 体も取りこぼさない」**ことだけである:
+
+      - ペアの式は素朴経路と 1 バイト同じ(`need = r_i + r_j + gap` の加算順序も、
+        `(px−ox)² + (py−oy)² < need·need` の演算順序もそのまま)。
+      - `reach = r_max + r_max + gap`(`r_max` = 待ち行列の最大半径)は、この格子に
+        載る**どのペアの `need` の上界でもある**。IEEE 754 の加算は単調
+        (a≤c ∧ b≤d ⟹ fl(a+b) ≤ fl(c+d))なので `need ≤ reach` は厳密に成り立つ。
+      - `need ≥ 0` なので、判定が True なら |px−ox| ≤ dist < need ≤ reach。
+      - セル辺 `cell = 1.5·reach` なので |px/cell − ox/cell| ≤ 1/1.5 = 0.667(丸め
+        誤差は 10⁻¹⁶ 桁で、この 0.333 の余裕を食い潰せない)⟹ `floor` の差は
+        **高々 1** = 3×3 のリング探索が距離 reach 以内の全点の上位集合。
+
+    前提が崩れうる入力(半径や座標が非有限・負の半径・負の間隙)では `build` が
+    `None` を返し、呼び出し側は**従来どおりの素の総当たり**へ落ちる。
+    """
+
+    __slots__ = ("cell", "gap", "bins")
+
+    def __init__(self, cell, gap):
+        self.cell = cell
+        self.gap = gap
+        self.bins: dict = {}
+
+    @staticmethod
+    def build(queue, gap, seed=()):
+        """待ち行列から格子を作り `seed`(入場済み)を載せる(`None` = 素の総当たりへ後退)。
+
+        `r_max` は **待ち行列全体**の最大半径。格子に載るのは `seed` 以降の入場者だが、
+        問い合わせ側は待ち行列のどの個体にもなりうるので、上界は queue で取る。
+        """
+        if not queue or not (gap >= 0.0):
+            return None
+        r_max = 0.0
+        a_max = 0.0
+        for rec in queue:
+            r = rec["radius"]
+            px, py = rec["pos"]
+            if not (r >= 0.0) or not (math.isfinite(px) and math.isfinite(py)):
+                return None
+            if r > r_max:
+                r_max = r
+            a = abs(px)
+            if a > a_max:
+                a_max = a
+            a = abs(py)
+            if a > a_max:
+                a_max = a
+        cell = (r_max + r_max + gap) * _ADMIT_CELL_SCALE
+        # `a_max / cell` が有限 = `math.floor(px / cell)` が必ず int を返す
+        # (退化した極小セル × 天文学的な座標でも例外を投げない)。
+        if not (cell > 0.0) or not math.isfinite(cell) \
+                or not math.isfinite(a_max / cell):
+            return None
+        out = _AdmitCells(cell, gap)
+        for rec in seed:
+            px, py = rec["pos"]
+            out.add(px, py, rec["radius"])
+        return out
+
+    def add(self, px, py, radius) -> None:
+        cell = self.cell
+        key = (math.floor(px / cell), math.floor(py / cell))
+        bucket = self.bins.get(key)
+        if bucket is None:
+            self.bins[key] = [(px, py, radius)]
+        else:
+            bucket.append((px, py, radius))
+
+    def hit(self, px, py, radius) -> bool:
+        """`for other in added: ...` の総当たりと**同じ bool** を 3×3 セルで返す。"""
+        bins = self.bins
+        if not bins:
+            return False
+        cell = self.cell
+        gap = self.gap
+        cx = math.floor(px / cell)
+        cy = math.floor(py / cell)
+        get = bins.get
+        for ix in (cx - 1, cx, cx + 1):
+            for iy in (cy - 1, cy, cy + 1):
+                bucket = get((ix, iy))
+                if bucket is None:
+                    continue
+                for ox, oy, orad in bucket:
+                    need = radius + orad + gap
+                    if (px - ox) ** 2 + (py - oy) ** 2 < need * need:
+                        return True
+        return False
 
 
 def _admit_blocked(queue, members, gap):
@@ -1250,6 +1542,9 @@ def _cog_kwargs(sim) -> dict:
     """`physics.cognitive` → SFM/ORCA 共通の認知的近傍の引数(第二段B)。
 
     **既定 OFF では空 dict** = `_build_engine` の呼び出しは第一段A までと 1 バイト同じ。
+    ★`c["neighbors"]` は `physics.neighbor_cap`(第154 レバーD)が >0 なら構築時に
+      `min(neighbors, neighbor_cap)` へ絞り込み済み(`zones._build_neighbor_cap`)=
+      cap の作用点は**この 1 点**に畳まれている(二重 cap を作らない)。
     """
     c = (getattr(sim, "physcfg", None) or {}).get("cognitive")
     if not c or not c["enabled"]:
@@ -1278,6 +1573,15 @@ def calib_describe(sim) -> dict:
     df = cfg.get("density_far") or {}
     if df.get("enabled"):
         out["density_far"] = dict(df)
+    ad = cfg.get("adaptive_dt") or {}
+    if ad.get("enabled"):
+        out["adaptive_dt"] = {"thresholds": [list(p) for p in ad["thresholds"]],
+                              "recheck_every": int(ad["recheck_every"]),
+                              "engines": list(ad.get("engines") or ())}
+    if int(cfg.get("neighbor_cap") or 0) > 0:
+        out["neighbor_cap"] = int(cfg["neighbor_cap"])
+    if int(cfg.get("separation_iters") or 0) > 0:
+        out["separation_iters"] = int(cfg["separation_iters"])
     return out
 
 
@@ -1335,7 +1639,7 @@ def _near_gate_mask(zone, pos, gate_xy):
 
 
 def _accumulate(zone, members, engine, prev_pos, prev_vel, dt, gate_xy, cont, st,
-                pcfg) -> None:
+                pcfg, dt_acc=None) -> None:
     """境界連続性の指標と、個体別の身体観測をこのサブステップぶん積む。
 
     ★物理痩身(第一段A・2026-08-16): 全ペア距離行列(O(N²))と個体ごとの Python ループを
@@ -1346,6 +1650,10 @@ def _accumulate(zone, members, engine, prev_pos, prev_vel, dt, gate_xy, cont, st
         - min_gap は min = 順序非依存(orca_core.min_gap が全ペア版との一致を保証)。
         - speed_sum だけは浮動小数の累積和なので、**加算順序を変えていない**
           (個体ごと・サブステップ順の逐次加算のまま)。
+
+    `dt_acc`(第154 レバーB): **適応 dt が ON のときだけ** 非 None。帯ごとの
+      「サンプル秒」を実 dt で積む(反転率 [回/体·秒] の分母)。OFF では None =
+      1 行も走らない = `continuity()` は従来どおり `samples × dt_sub` を使う。
     """
     pos = engine.pos
     vel = engine.vel
@@ -1380,6 +1688,8 @@ def _accumulate(zone, members, engine, prev_pos, prev_vel, dt, gate_xy, cont, st
         b["n"] += cnt
         b["samples"] += cnt
         b["flip"] += int(np.count_nonzero(flip & mask))
+        if dt_acc is not None:      # 適応 dt: 秒は実 dt で積む(旧 blob 互換の get)
+            b["sec"] = b.get("sec", 0.0) + cnt * dt_acc
     for i in np.nonzero((sign != 0) & (sign != prev_sign))[0]:
         members[int(i)]["sign"] = int(sign[i])
     # ---- 重なり(P2 決定 条件3 の検収値)----
