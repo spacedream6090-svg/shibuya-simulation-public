@@ -52,8 +52,20 @@ run:
 # (1) 観察ランの必須記録(observe.yaml (1b)。外してはならない層)
 # ============================================================================
 model:
-  # backend/servers は本選で conf/profiles/finals-vllm7.yaml の model: ブロックへ差し替える。
-  # ここは基底(mock)のまま=縦煙とドライランがそのまま通る。
+  # ★第155(8/24 freeze): finals-vllm7.yaml の model: ブロック(backend/name/servers)を
+  #   手順書どおり貼り込み=本選の実LLM配線。checklist(plan_max_tokens 896 / api_mode chat /
+  #   plan_temperature 0.3 / recall_temperature 0.2 / tiers 5+2)は下に既存のまま温存を確認。
+  #   mock へ戻す(縦煙・ドライラン)は CLI: model.backend=mock model.name=mock-v0。
+  backend: vllm
+  name: "qwen3:8b"         # 艦隊既定モデル = 会話側(deliberate / reply / speak / ...)
+  servers:
+    - "http://localhost:8000"   # GPU0  8B
+    - "http://localhost:8001"   # GPU1  8B
+    - "http://localhost:8002"   # GPU2  8B
+    - "http://localhost:8003"   # GPU3  8B
+    - "http://localhost:8004"   # GPU4  8B
+  timeout_s: 120           # 1リクエストのタイムアウト秒(finals-vllm7 と同値)
+  format: json
   journal: true            # 全 LLM 呼のプロンプト全文+応答を llm_journal.jsonl.gz に残す
   cache_mode: free         # 観察ランは新規推論を許す(再生は llm_cache から replay で行う)
   reflect_think: false     # think=true は内省 JSON が全滅する実測(第34)。本番既定

@@ -226,15 +226,22 @@ def test_frozen_config_reresolves_identically(tmp_path):
 
 
 def test_frozen_config_captures_profile_and_dotlist(tmp_path):
-    """profile 単独では mock のまま(監査 F5 の危険そのもの)/ dotlist まで畳み込める。"""
+    """profile の実効 backend が凍結ファイルへ畳まれる / dotlist の上書きも畳み込める。
+
+    ★第155(8/24 freeze)で finals_observe に finals-vllm7 の backend/name/servers を
+    貼り込んだ(手順書どおり)。それ以前は「profile 単独では mock のまま」という
+    監査 F5 の危険をこのテストが固定していた——貼り込みで危険自体が消えたので、
+    ピンは新しい現実(profile 単独 = vllm 艦隊)へ反転。mock へ戻す縦煙経路は
+    CLI の model.backend=mock(下の dotlist 側の検証がその畳み込みを固定する)。
+    """
     prof = REPO_ROOT / "conf" / "finals_observe.yaml"
     bare = tmp_path / "bare.yaml"
     FC.freeze(profile=prof, out=bare)
-    assert OmegaConf.load(bare).model.backend == "mock", \
-        "profile 単独実行が mock になる事実(F5)が凍結ファイルに現れていない"
+    assert OmegaConf.load(bare).model.backend == "vllm", \
+        "finals_observe 単独実行が vllm 艦隊にならない(第155 の貼り込みが落ちた=F5 再発)"
     fixed = tmp_path / "fixed.yaml"
-    FC.freeze(profile=prof, overrides=["model.backend=vllm"], out=fixed)
-    assert OmegaConf.load(fixed).model.backend == "vllm"
+    FC.freeze(profile=prof, overrides=["model.backend=mock"], out=fixed)
+    assert OmegaConf.load(fixed).model.backend == "mock"
     assert FC.sha256_text(bare.read_text(encoding="utf-8")) \
         != FC.sha256_text(fixed.read_text(encoding="utf-8"))
 
