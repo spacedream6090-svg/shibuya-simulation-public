@@ -647,6 +647,55 @@ FEATURES: tuple[Feature, ...] = (
        "★0 は『未指定』に予約: 分離パスを本当に切るならゾーン宣言に orca.separation_iters: 0。"
        "★既定 0 ではゾーン宣言をそのまま使う = 現行挙動と 1 バイト同一",
        off_value=0),
+    # ---- 物理レバー(第155 レーン2。step 時間監査 A7 / C1。既定 = 現行と 1 バイト同一)----
+    # ★conf 上は `physics:` ブロックの外(トップレベル `physics_levers:`)にある。理由は
+    #   `physics:` のスキーマを持つ world/zones.py が本レーンの担当外だったため
+    #   (physics.py が sim.cfg から直接読む。詳細は conf/config.yaml の当該ブロック)。
+    _f("physics_levers.ownership_mode", "strict", False, "none",
+       "**物理ゾーン所有の有界化の判定方式**。\"\" = 無制限 = 現行。"
+       "\"euclid\" = 現在座標から最寄りゲートノードまでの直線距離 ≤ ownership_max_dist_m。"
+       "\"route_arrival\" = **残り経路に沿った**ゲートまでの距離 ≤ その個体のこの step の"
+       "移動予算(= scheduler._phase_move と同じ speeds[trip_mode] × _congestion)で、"
+       "入場位置をゲートノードに置き、到着サブ時刻(距離÷予算×step_seconds)まで入場させない。"
+       "なぜ 2 方式あるか(第155 実測): グラフ移動は 1 step で walk 800 m 進むため euclid は"
+       "『ゲート半径 X の窓に step 境界が落ちた個体』しか捕まえられず、捕捉率が"
+       "X=50m で 11.6% / 100m で 16.3% / 200m で 27.6%(n=2000・12step)まで落ちる。"
+       "repro_tier=strict: 距離は静的なエッジ長と edge_offset の和(並び順固定)、"
+       "到着時刻はその純関数。乱数を 1 本も引かない。到着順の同時刻タイブレークは id 昇順。"
+       "affects_k=false / fingerprint_risk=none(物理層)。"
+       "★状態を 1 つも足さない: 到着秒は step ローカルで agent へ焼かない = checkpoint 無風。"
+       "★ON は世界(軌跡)を変える。★既定 \"\" では判定の分岐を 1 度も通らない = 1 バイト同一",
+       off_value=""),
+    _f("physics_levers.ownership_max_dist_m", "strict", False, "none",
+       "**物理ゾーン所有の距離有界化**。0.0 = 無制限 = 現行(経路がゾーンを通るなら"
+       "現在地が数百 m 手前でも所有する)。>0 なら「個体の現在座標から**そのゾーンの"
+       "最寄りゲートノード**までのユークリッド距離が X m 以内」を所有の必要条件に足す。"
+       "動機(docs/plans/step-time-audit.md §2 G2): 所有条件が距離を持たないため、所有人数 M は"
+       "『polygon 内の人数』ではなく『そのゾーンを経路に含む在街者の総数』になっていた"
+       "(250k 夕方の火炎図で物理が step 時間の 51.3%・その本体は S × O(M) の掛け算)。"
+       "= **ゾーンの外を歩いている個体を dt_sub 刻みで 600 s ぶん積分していた**。"
+       "速度だけでなく妥当性の是正でもある(ゾーン外はグラフ移動が正典で、そこを"
+       "SFM/ORCA で歩かせる根拠は無い)。"
+       "repro_tier=strict: 判定は座標の比較だけ(地図とその step の座標の純関数・乱数ゼロ)。"
+       "affects_k=false: generate() の呼び出し点を足さない/減らさない。"
+       "fingerprint_risk=none: プロンプトの語彙・欄が 1 つも増減しない(物理層)。"
+       "★ON は世界(軌跡)を変える(何 m 手前から物理に載るかが変わる)。圏外の個体は"
+       "従来どおり _phase_move のグラフ移動で進む = 非所有個体と 1 つも変わらない経路。"
+       "新しい状態を 1 つも足さないので checkpoint は無風(resume==straight)。"
+       "★既定 0.0 では距離判定の分岐を 1 度も通らない = 現行挙動と 1 バイト同一",
+       off_value=0.0),
+    _f("physics_levers.min_gap_every", "strict", False, "none",
+       "**min_gap(体表間の最小すき間)の計測間引き**。1 = 毎サブステップ = 現行。"
+       "n>1 なら n サブステップに 1 回だけ `orca_core.min_gap` を撃つ。この量は"
+       "physics.continuity の診断値であって**力学にも L1 にも 1 バイトも効かない**"
+       "(250k 火炎図で step 時間の 2.3%)。"
+       "★間引くと報告値は真の最小すき間の**上界**になる(見落とすのは間引いた回の"
+       "一時的なめり込みだけ。1 サブステップの移動量は高々 v_max·dt)。"
+       "repro_tier=strict: 間引きは決定論カウンタ(乱数ゼロ)。カウンタは _phys_state に"
+       "載るので resume==straight。"
+       "affects_k=false / fingerprint_risk=none(観測専用の物理層)。"
+       "★既定 1 では st に鍵を 1 つも生やさない = 現行挙動と 1 バイト同一",
+       off_value=1),
 
     # ---- economy ----
     _f("economy.enabled", "strict", False, "none",

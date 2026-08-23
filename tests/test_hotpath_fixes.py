@@ -314,7 +314,10 @@ def test_fine_gate_of_reads_an_explicit_value():
 
 def test_finals_profile_declares_the_gate():
     fin = OmegaConf.load(_FINALS)
-    assert float(fin.world.perception_fine_gate) == 500.0
+    # 第155(A6): 500→64。250k 夕方の中密度帯(9セル総人数 64-508)が粗経路=40m 走査に
+    # 残るのが C2 残存の主因(監査 docs/plans/step-time-audit.md §G3)。返り値は粗/細で
+    # 同一(仕様保証・同値テスト)なので値の変更は速度のみ。
+    assert float(fin.world.perception_fine_gate) == 64.0
     # 門は細格子キーが立っているランでしか読まれない(前提の確認)。
     assert float(fin.world.perception_cell_m) > 0.0
 

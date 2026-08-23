@@ -211,6 +211,89 @@ py-spy 250k v7b の実測で step 時間の 46.6% が物理(`_run_zone` の `eng
     削れば残留めり込みが増える(n=1,500 で 64→16 は体表間 −0.006 m = 実質無害、
     n=3,000 では −0.188 m)。上限に当たったかは `sep_iters_max` で監視できる。
 
+step 時間監査の是正 A3 / A4 / A7 / C1(第155 レーン2。2026-08-23)
+--------------------------------------------------------------------------------
+正典: docs/plans/step-time-audit.md §3 ランク表 / §4 適用順。
+A3 / A4 は **出力バイト同一**(力学・L1・L2・L3・乱数・LLM 呼数のいずれも動かない)、
+A7 / C1 は conf キーの既定値が現行と 1 バイト同一で、明示的に ON にしたときだけ効く。
+
+  A3 `_accumulate` の半径配列(**バイト同一**)
+    毎サブステップ `np.array([r["radius"] for r in members])` を組み直していたが、
+    これは `_build_engine` が既に作って engine へ渡した配列と同じものである。
+    両エンジンとも `self.radius = np.asarray(radius, f64).reshape(-1).copy()`
+    (`world/sfm_core.py` の `Crowd.__init__` / `world/orca_core.py` の `OrcaCrowd.__init__`)
+    で **自分のコピーを持ち、以後 1 度も書き換えない**(読むだけ)。
+    members と engine は常に同期している(入退場のたびに `_build_engine` し直す)ので、
+    `engine.radius` は列内包の結果と**要素も並びも同一の float64 配列**である。
+
+  A4 信号ゲートの前倒し(**バイト同一**)
+    `_admit` は信号が赤のあいだ**先頭で即 False を返す**。にもかかわらず、その手前で
+    毎サブステップ `_writeback`(O(M) の純Python ループ)が走り終えていた。
+    `_writeback` が書くのは `rec["pos"] / rec["vel"] / agent.x / agent.y` の 4 つで、
+    サブステップ・ループの中でそれを読むのは **`_admit` と、入場後の `_build_engine`** だけ
+    (`_accumulate` / `_advance_and_collect` は engine の配列しか見ない)。入場が 1 体も
+    起きないサブステップでは誰も読まないまま次の `_writeback` に上書きされる = 完全な捨て仕事。
+    そこで「赤なら `_writeback` ごと飛ばす」を入れた。判定式は `_admit` の中と**同一の
+    `signal.can_cross(base_sec + t)`**(位相は絶対時刻の純関数 = 乱数ゼロ)なので、
+    通る/通らないの分岐は 1 つも変わらない。scramble は cycle 140 s に対し
+    green 37 s + flash 10 s なので **約 66% のサブステップ**がこれに当たる。
+
+  A7 `min_gap` の間引き(`physics_levers.min_gap_every`。既定 1 = 毎サブステップ = 同一)
+    `_orca.min_gap` は **L2 診断専用**の量(`continuity()` の `min_gap_m`)で、力学にも
+    L1 にも 1 バイトも効かない。250k の火炎図では step 時間の 2.3% を占めていた。
+    n サブステップに 1 回へ落とすと、報告値は真の最小すき間の**上界**になる
+    (見落とすのは間引いた回の一時的なめり込みだけ。1 サブステップで動ける距離は
+    高々 v_max·dt なので、間引き幅を小さく採れば上界の緩みも同じ桁に収まる)。
+
+  C1 所有の距離有界化(`physics_levers.ownership_max_dist_m`。既定 0 = 無制限 = 同一)
+    ゾーンの所有開始条件は「残り経路がゾーン内ノードを 1 つでも通る」だけだった。
+    `_zones.route_span` は `[現在ノード] + route` の先頭から探すので、**数百 m 手前を
+    歩いている個体もその場で `waiting` へ入る**(conf/config.yaml の physics ブロックが
+    自ら「所有中の人数であって polygon 内ではない」と申告しているとおり)。
+    `_admit` の入場条件も「その位置で誰とも `min_gap` 以内に重ならないこと」だけで
+    距離条件を持たないため、遠方の個体は誰とも重ならず即 `members` に入る。
+    結果、M(所有人数)は polygon 内の人数ではなく**そのゾーンを経路に含む在街者の総数**
+    になり、ゾーンの外を歩いている個体を dt_sub 刻みで 600 s ぶん積分していた。
+    ★これは速度の問題であると同時に**モデルの妥当性の問題**でもある(ゾーン外は
+      グラフ移動が正典であり、そこを SFM/ORCA で歩かせる根拠は無い)。
+    有界化は `>0` のとき「個体の現在座標から**そのゾーンの最寄りゲートノード**までの
+    ユークリッド距離が X m 以内」を所有の必要条件に足す。判定は座標の比較だけ
+    (乱数ゼロ・地図とその step の座標の純関数)で、圏外の個体は**従来どおり**
+    `_phase_move` のグラフ移動で進む(= 非所有個体と 1 つも変わらない経路)。
+    次 step に圏内へ入れば通常どおり `waiting` へ入る。新しい状態は 1 つも足さない
+    (`waiting` / `members` の搬送は既存の `_phys_*` 属性のまま)。
+    ★ON は世界(軌跡)を変える: ゾーンの何 m 手前から物理に載るかが変わる。
+
+    ---- 判定方式(`physics_levers.ownership_mode`。既定 "" = 無制限 = 現行)----
+    **euclid**(= 上の素朴版。`ownership_max_dist_m` [m] が閾値)
+      現在座標から最寄りゲートノードまでの**ユークリッド距離** ≤ X。
+      ★実測で分かった構造的な限界(第155 の掃引): グラフ移動は 1 step で
+        `world.modes.speeds.walk = 800 m` 進むので、ゲート半径 X の窓に step 境界が
+        落ちる確率がおよそ X/800 になる。実測の捕捉率は X=50→11.6% / 100→16.3% /
+        200→27.6%(n=2000・12step)で、**横断流の大半が物理に載らない**。
+        速いが「サンプリングになる」ことを承知で使う方式。
+
+    **route_arrival**(= 捕捉率を落とさない版。閾値は個体ごとの移動予算)
+      所有条件は「**残り経路に沿った**ゲート(ゾーン入口ノード)までの距離 ≤ その個体の
+      この step の移動予算」。予算は `_phase_move` が使うのと同じ式
+      (`speeds[trip_mode] × _congestion`。`_step_budget_m` の docstring に 1 step 遅れの
+      正直な限界を書いた)。= **この step で実際にゲートへ届く個体だけ**を所有する。
+      さらに 2 つを組で入れる(片方だけでは辻褄が合わない):
+        ・**入場位置をゲートノードにする**。手前区間はグラフが歩くはずだった区間なので
+          物理で積分しない(= euclid が X を伸ばすと重くなる原因をここで断つ)。
+        ・**到着サブ時刻 `arrive_s = 距離 / 予算 × step_seconds` まで入場させない**。
+          実装は「到着時刻昇順の `pending` 列を持ち、その時刻になってから `waiting` へ
+          送る」= `_admit` は到着前の個体を 1 度も見ない(構造で保証・O(W) の空振りも無い)。
+          待機列に入る順 = 到着順(同時刻は id 昇順)= ゲートでの先着順。
+      会計: `arrive_s` は「この step でグラフ移動に費やした秒」なので `_used_s` の結果へ
+      加えて `_release` へ渡す(= `budget_scale` が同 step の `_phase_move` へ返す予算から
+      正しく差し引かれる = 二重移動が起きない)。`Σ dt_eff == step_seconds` の物理側の
+      会計そのものは 1 行も変えていない。
+      状態: `arrive_s` は **step ローカル**(`_FIELDS` に入れない = agent へ焼かない =
+      checkpoint に載らない)。入場できずに step を跨いだ個体は次 step で 0 扱いになるが、
+      待たされた個体はその step 1 歩も動いていないので「ゲートに居る」が正しく、
+      straight と resume で同じ経路を通る(= resume==straight)。
+
 R1(既定 OFF = 完全 no-op)
 ---------------------------
 `physics.zones_enabled: false`(既定)または `physics.zones: []`(既定)のとき:
@@ -378,6 +461,33 @@ def continuity(sim) -> dict:
     return out
 
 
+def provenance(sim):
+    """summary.json の ``physics`` キー(第155)。ゾーン未使用のランは None = キー自体を出さない。
+
+    目的: 250k 縦煙で G1(サブステップ張り付き)/ G2(所有人数)/ C1(所有有界化)の
+    効きを summary から直接読めるようにする。L2 の ``zone_*`` 列は metrics_spec 凍結で
+    増やせないため、ここに置く(第117 snc_section / 第146 goods と同じ判断)。
+    ``by_zone_last_step`` は per-step 表(毎 step リセット)の**最終 step の値**。
+    累積量は scalars 側(enter/exit/dwell)と continuity 側(sub_steps_total)にある。
+    """
+    st = getattr(sim, "_phys_state", None)
+    if not st:
+        return None
+    lv = _levers(sim)
+    return {
+        "scalars": scalars(sim),
+        "continuity": continuity(sim),
+        "by_zone_last_step": {
+            str(zid): {k: (float(v) if isinstance(v, float) else int(v))
+                       for k, v in z.items()}
+            for zid, z in sorted(st["by_zone"].items())
+        },
+        "levers": {"ownership_mode": str(lv.get("ownership_mode", "")),
+                   "ownership_max_dist_m": float(lv.get("ownership_max_dist_m", 0.0)),
+                   "min_gap_every": int(lv.get("min_gap_every", 1))},
+    }
+
+
 def _hist_quantile(hist, n, q):
     if not n:
         return None
@@ -428,6 +538,153 @@ def crowd_override(sim, agent, value):
 
 
 # --------------------------------------------------------------------------- #
+# 第155 レーン2 の 2 レバー(A7 / C1)。**既定は現行と 1 バイト同一**
+# --------------------------------------------------------------------------- #
+# なぜ `physics:` ブロックではなく別のトップレベル鍵なのか(正直な申告)
+# ------------------------------------------------------------------------
+# `physics:` の conf スキーマは `src/society/world/zones.py` の `build_cfg` が
+# **未知キーを KeyError で撥ねる**厳格な allowlist として持っている。本レーンは
+# `zones.py` を触らない取り決めで作業しているため、新しい 2 鍵はトップレベルの
+# `physics_levers:` に置き、本 module が `sim.cfg` から直接読む(`sim.cfg` を読む
+# のは assets / city_ops / reflect_timing などと同じ既存イディオム)。
+# ★どちらの鍵も既定値では**分岐を 1 度も通らない**ので、鍵ごと消しても挙動は同じ。
+#   スキーマを `physics:` 側へ畳むのは 1 行の移設で足りる(zones.py の allowlist と
+#   `_merge` に足すだけ)。
+_LEVER_DEFAULTS = {
+    "ownership_mode": "",          # C1 の判定方式。"" = 無制限 = 現行
+    "ownership_max_dist_m": 0.0,   # C1(euclid)。0 = 無制限 = 現行(数百 m 手前から所有)
+    "min_gap_every": 1,            # A7。1 = 毎サブステップ計測 = 現行
+}
+OWN_MODES = ("", "euclid", "route_arrival")
+
+
+def _levers(sim) -> dict:
+    """`physics_levers` の正準化(初回のみ `sim.cfg` から作ってキャッシュ)。
+
+    キャッシュは `sim._phys_gates` と同じ**地図/conf だけの純関数**なので checkpoint に
+    載せる必要が無い(resume 後の初回呼び出しで同じ値が作り直される)。
+    """
+    got = getattr(sim, "_phys_levers", None)
+    if got is not None:
+        return got
+    cfg = getattr(sim, "cfg", None)
+    blk = cfg.get("physics_levers", None) if hasattr(cfg, "get") else None
+    out = dict(_LEVER_DEFAULTS)
+    for key in _LEVER_DEFAULTS:
+        val = blk.get(key, None) if hasattr(blk, "get") else None
+        if val is not None:
+            out[key] = val
+    out["ownership_mode"] = str(out["ownership_mode"] or "")
+    out["ownership_max_dist_m"] = float(out["ownership_max_dist_m"])
+    out["min_gap_every"] = int(out["min_gap_every"])
+    if out["ownership_mode"] not in OWN_MODES:
+        raise ValueError(f"physics_levers.ownership_mode: 未知の方式 "
+                         f"{out['ownership_mode']!r}(可: {OWN_MODES})")
+    if not (out["ownership_max_dist_m"] >= 0.0):
+        raise ValueError("physics_levers.ownership_max_dist_m: 0(= 無制限)以上が必要")
+    if out["ownership_mode"] == "euclid" and not (out["ownership_max_dist_m"] > 0.0):
+        raise ValueError("physics_levers.ownership_mode=euclid には "
+                         "ownership_max_dist_m>0 が必要")
+    if out["min_gap_every"] < 1:
+        raise ValueError("physics_levers.min_gap_every: 1(= 毎サブステップ)以上が必要")
+    # ★実効方式。`ownership_mode` が空でも `ownership_max_dist_m>0` なら euclid とみなす
+    #   (第155 前半で先に入った距離キー単体の口を壊さないための後方互換)。
+    out["_mode"] = (out["ownership_mode"]
+                    or ("euclid" if out["ownership_max_dist_m"] > 0.0 else ""))
+    if sim is not None:
+        sim._phys_levers = out
+    return out
+
+
+def _own_mode(sim) -> str:
+    """実効の所有判定方式(`""` = 無制限 = 現行と 1 バイト同一)。"""
+    return _levers(sim)["_mode"]
+
+
+def _own_bound(sim, gate_xy):
+    """C1 の判定材料 `(max_d2, box)`。既定(0 = 無制限)とゲート 0 件では `(None, None)`。
+
+    `box` は「どのゲートからも X m 以内」の**外接矩形**(必要条件)。全 N 走査の中で
+    まず 4 回の比較で落とすためだけに使う(ゲート数ぶんの平方距離は生き残りにしか撃たない)。
+    ゲートが 0 件のゾーンは `route_span` も原理的に None しか返さない
+    (ゾーン内ノードの隣がすべてゾーン内 = 出口ノードが残り経路に現れない)ので、
+    有界化の有無で挙動は変わらない = 従来どおりの経路へ落とす。
+    """
+    lv = _levers(sim)
+    d = lv["ownership_max_dist_m"]
+    if lv["_mode"] != "euclid" or not (d > 0.0) or not gate_xy:
+        return None, None
+    xs = [g[0] for g in gate_xy]
+    ys = [g[1] for g in gate_xy]
+    return d * d, (min(xs) - d, max(xs) + d, min(ys) - d, max(ys) + d)
+
+
+def _near_gates(x, y, gate_xy, max_d2, box) -> bool:
+    """現在座標が**いずれかのゲートノード**から √max_d2 [m] 以内か(決定論・乱数ゼロ)。"""
+    if x < box[0] or x > box[1] or y < box[2] or y > box[3]:
+        return False
+    for gx, gy in gate_xy:
+        dx = x - gx
+        dy = y - gy
+        if dx * dx + dy * dy <= max_d2:
+            return True
+    return False
+
+
+def _step_budget_m(sim, agent) -> float:
+    """この step でグラフ移動が使う**移動予算 [m]**(= `_phase_move` と同じ式)。
+
+    `scheduler._phase_move` は `speeds[trip_mode] × _congestion × budget_scale` を予算に
+    採る。ここで読める `_congestion` は **1 つ前の step** に `_phase_move` が据えた値である
+    (physics.phase は `_phase_move` の**直前**に走るので、今 step の混雑係数はまだ存在しない)。
+    ★これは近似ではなく「予算を決める機構そのもの」を同じ順で読んでいる:
+      既存の `_graph_speed`(入場速度の連続引き継ぎ)も同じ 1 step 遅れの係数を使っており、
+      本関数はその ×step_seconds に等しい。**遅れがあることだけが正直な限界**で、
+      混雑が急変した step では予算の見積りが 1 step ぶん古い(最大 1/0.3 倍のずれ)。
+    """
+    return _graph_speed(sim, agent) * float(sim.clock.step_seconds)
+
+
+def _gate_arrival(sim, zone, graph, agent, path, budget_m: float, horizon_s: float):
+    """route_arrival の判定。`(gate_i, dist_m, arrive_s)` か `None`(= 所有しない)。
+
+    gate_i … `path` の中で**ゾーン入口ノード**(= ゾーン外にあってゾーン内ノードに隣接する
+              ノード = `zones.gates_of` が返すのと同じ集合)を指す index。
+              `first_in == 0`(現在ノードが既にゾーン内)のときは 0 を返し、距離 0 で扱う。
+    dist_m  … 個体の現在位置から `path[gate_i]` までの**経路に沿った**距離 [m]。
+              `Σ edge_length(path[i], path[i+1]) − agent.edge_offset` で、`_phase_move` が
+              予算を減らしていくのと **1 バイト同じ量**(同じ `edge_length` と `edge_offset`)。
+    arrive_s… その距離をグラフ移動で歩き切るのに要する秒数 = dist_m / budget × step_seconds。
+
+    所有するのは `arrive_s <= horizon_s`(= この step で実際にゲートへ届く個体)だけ。
+    ★決定論: 使うのは静的なエッジ長と `edge_offset`(既存の決定論量)だけで乱数はゼロ。
+      和は `path` の並び順に固定しているので浮動小数の足し方も一意。
+    """
+    first_in = -1
+    for i, node in enumerate(path):
+        if _zones.node_in(zone, graph, node):
+            first_in = i
+            break
+    if first_in <= 0:
+        # 現在ノードが既にゾーン内(または入口が見つからない退化)= 手前区間が無いので
+        # **現在座標のまま即所有**する(gate_i=-1 = 経路も位置も切り替えない合図)。
+        return -1, 0.0, 0.0
+    gate_i = first_in - 1
+    dist = 0.0
+    for i in range(gate_i):
+        dist += float(sim.city.edge_length(path[i], path[i + 1]))
+    dist -= float(getattr(agent, "edge_offset", 0.0) or 0.0)
+    if dist < 0.0:
+        dist = 0.0
+    if not (budget_m > 0.0):
+        return None
+    arrive = dist / budget_m * float(sim.clock.step_seconds)
+    if not (arrive <= horizon_s):
+        return None
+    return gate_i, dist, arrive
+
+
+# --------------------------------------------------------------------------- #
 # 本体: 1 世界 step のゾーン実行(単一の作用点)
 # --------------------------------------------------------------------------- #
 def phase(sim, step: int, sim_min: int) -> None:
@@ -441,6 +698,12 @@ def phase(sim, step: int, sim_min: int) -> None:
         return
     st = _state(sim)
     st["by_zone"] = {}                      # per-step(累積しない = resume 安全)
+    # ★A7(第155): 間引き幅は `st` 経由で `_accumulate` へ渡す(引数を足すと既存の
+    #   spy テストの署名が壊れるため)。既定 1 では **`st` に鍵を 1 つも生やさない** =
+    #   checkpoint blob も旧ランとバイト同一。
+    mg_every = _levers(sim)["min_gap_every"]
+    if mg_every != 1:
+        st["min_gap_every"] = mg_every
     # ★id 昇順の走査列は **1 step に 1 回**だけ作る(ゾーン数×2 回の全体 sort を廃す)。
     #   `_run_zone` は sim.agents を増減させないので、全ゾーンで同じ列を使える
     #   = 走査順は 1 つも変わらない(純粋な同値変換)。
@@ -482,6 +745,17 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict, ordered=None) -> Non
         (waiting if rec["waiting"] else members).append(rec)
 
     # ---- (2) 新規流入の候補(guarded ゲートの待機列へ)---------------------- #
+    # ★C1(第155): 所有の距離有界化。既定(0 = 無制限)では `max_d2 is None` =
+    #   下の 2 行を 1 度も通らない = 走査順も所有集合も従来と 1 バイト同一。
+    #   判定を `route_span` の**手前**に置くのは意図的で、圏外の個体では
+    #   point-in-polygon(経路長ぶんの ray casting)自体が走らなくなる。
+    max_d2, box = _own_bound(sim, gate_xy)
+    #   ★route_arrival(第155 追補): 「残り経路に沿ったゲートまでの距離 ≤ この step の
+    #     移動予算」で所有し、**入場位置をゲートノードそのもの**にする。到着までの秒数は
+    #     `pending`(到着時刻昇順)で持ち、その時刻になってから待機列へ送る =
+    #     `_admit` は到着前の個体を 1 度も見ない(= 到着前に入場しない、が構造で保証される)。
+    arrival = (_own_mode(sim) == "route_arrival")
+    pending: list[dict] = []      # route_arrival: まだゲートへ着いていない所有個体
     for agent in ordered:
         if getattr(agent, "_phys_zone", None) is not None:
             continue                                  # 他ゾーン所有 or 既に本ゾーン
@@ -489,16 +763,38 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict, ordered=None) -> Non
             continue
         if getattr(agent, "_taxi_hold_until", -1) > step:
             continue                                  # 配車待ちは動かさない(既存規約)
+        if max_d2 is not None and not _near_gates(agent.x, agent.y, gate_xy,
+                                                  max_d2, box):
+            continue                                  # 圏外 = 従来どおりグラフ移動で進む
         span = _zones.route_span(zone, graph, agent.node, agent.route)
         if span is None:
             continue                                  # ゾーンを通り抜けない経路 = 所有しない
         path, rest = span
-        rec = _admit_record(sim, zone, agent, path, rest, step)
+        if arrival:
+            got = _gate_arrival(sim, zone, graph, agent, path,
+                                _step_budget_m(sim, agent), total_s)
+            if got is None:
+                continue          # この step ではゲートへ届かない = グラフ移動で進む
+            gate_i, _dist, arrive_s = got
+            if gate_i >= 0:
+                # 経路をゲートノードから始め直す(= グラフが歩くはずだった手前区間は
+                # `arrive_s` として会計へ回し、物理はゲート以降だけを積分する)。
+                path = path[gate_i:]
+                rec = _admit_record(sim, zone, agent, path, rest, step,
+                                    pos=sim.city.node_xy(path[0]),
+                                    arrive_s=arrive_s)
+            else:                      # 既にゾーン内 = 従来どおり現在座標から
+                rec = _admit_record(sim, zone, agent, path, rest, step)
+        else:
+            rec = _admit_record(sim, zone, agent, path, rest, step)
         agent._phys_zone = zone.id
         _save_record(rec)
-        waiting.append(rec)
+        (pending if (arrival and rec["arrive_s"] > 0.0) else waiting).append(rec)
+    if pending:
+        # 到着順(同時刻は id 昇順)= ゲートでの先着順。決定論のタイブレークを明示する。
+        pending.sort(key=lambda r: (r["arrive_s"], int(r["agent"].id)))
 
-    if not members and not waiting:
+    if not members and not waiting and not pending:
         return
 
     signal = (_sfm.SignalGate(**zone.signal) if zone.signal else None)
@@ -523,12 +819,17 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict, ordered=None) -> Non
     #   cum … `_accumulate` を呼ぶたびに「この step で積分した累積秒」を積む列。
     #         個体の滞在秒は「参加した最後の m 回ぶん」= cum[-1] − cum[-1−m] で厳密に出る
     #         (在場者は入場から退場まで連続した回に参加するので m 回は必ず末尾の連続塊)。
+    # ★`teleport` は route_arrival のときだけ**渡す**(既定では `**{}` = 引数ゼロ個 =
+    #   呼び出しの形が従来と 1 バイト同じ。旧実装を差し替えて突き合わせる参照テスト
+    #   tests/test_physics_hash.py / tests/test_hotpath_fixes.py がそのまま通る)。
+    admit_kw = {"teleport": True} if arrival else {}
     cum: list | None = [] if adapt is not None else None
     dt_eff = dt
     factor = 1.0
     t = 0.0
     int_s = 0.0                     # 積分済み秒(信号待ちの空回りは含めない)
     k = 0
+    pi = 0                          # route_arrival: `pending` の先頭(到着時刻昇順)
     while k < n_sub:
         if adapt is None:
             t = k * dt
@@ -539,17 +840,28 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict, ordered=None) -> Non
             if dt_eff <= 0.0:
                 break
         # (3a) 入場(guarded + 信号)。id 昇順 = 決定論。
-        if waiting:
+        # ★A4(第155): 信号が赤なら `_admit` は先頭で即 False を返す(下の `:_admit` の
+        #   1 行目)。判定式をここへ**前倒し**して、赤のサブステップでは `_writeback`
+        #   (O(M) 純Python)も `_admit` 内の numpy 一式も作らない。判定は同じ
+        #   `signal.can_cross(base_sec + t)`(絶対時刻の純関数)なので分岐は 1 つも変わらず、
+        #   `_writeback` の書いた値を読むのは `_admit` と入場後の `_build_engine` だけ
+        #   = 入場ゼロのサブステップでは誰も読まないまま次の書き込みに上書きされていた。
+        # route_arrival: ゲートへ着いた個体をここで待機列へ送る(到着時刻昇順 = 先着順)。
+        #   既定・euclid では `pi == len(pending) == 0` = while が 1 度も回らない。
+        while pi < len(pending) and pending[pi]["arrive_s"] <= t:
+            waiting.append(pending[pi])
+            pi += 1
+        if waiting and (signal is None or signal.can_cross(base_sec + t)):
             if engine is not None:
                 _writeback(members, engine)   # 入場の占有判定は**最新の位置**で行う
             if _admit(sim, zone, waiting, members, signal, base_sec + t, t,
-                      step, sim_min, st):
+                      step, sim_min, st, **admit_kw):
                 prev_engine = engine
                 engine = _build_engine(zone, members, rng, calib, cog)
                 if carry:
                     _carry_field(prev_engine, engine)
         if not members:
-            if not waiting:
+            if not waiting and pi >= len(pending):
                 break                                 # ゾーンが空 = その場で打ち切り
             sub_done += 1                             # 信号待ち: 時間だけ進める
             k += 1
@@ -574,8 +886,15 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict, ordered=None) -> Non
             _drop_recs(members, released)   # ← 1 件ずつ remove すると dataclass `__eq__` が走る
             for rec in released:
                 # この step で実際に積分した秒数(= step 途中で入場した個体でも正しい)
-                used = _used_s(rec, dt, cum)
-                rec["elapsed_s"] += used
+                # ★route_arrival: ゲートまでグラフで歩いた秒(`arrive_s`)は
+                #   **`used_s` にだけ**足す。`used_s` は「この step を何秒使ったか」=
+                #   `budget_scale` が `_phase_move` の予算から引く量なので、足さないと
+                #   同じ時間で 2 度歩く(二重移動)。一方 `elapsed_s` は**ゾーン滞在**の
+                #   意味(dwell_s / max_zone_steps の分子)なので手前の徒歩を含めない。
+                #   `pop` なので 1 step につき 1 度しか課金されない。
+                integ = _used_s(rec, dt, cum)
+                used = integ + float(rec.pop("arrive_s", 0.0))
+                rec["elapsed_s"] += integ
                 _save_record(rec)
                 _release(sim, zone, rec["agent"], step, sim_min, st,
                          reason="gate", elapsed_s=rec["elapsed_s"], rec=rec,
@@ -584,7 +903,7 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict, ordered=None) -> Non
             engine = _build_engine(zone, members, rng, calib, cog) if members else None
             if carry:
                 _carry_field(prev_engine, engine)
-        if engine is None and not waiting:
+        if engine is None and not waiting and pi >= len(pending):
             break
         k += 1
         if adapt is not None:
@@ -593,10 +912,15 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict, ordered=None) -> Non
     # ---- (4) step 内で終わらなかった個体は状態を持ち越す(同期完了)--------- #
     if members and engine is not None:
         _writeback(members, engine)
+    # route_arrival: 積分時間の総量が尽きて待機列へ届かなかったぶんを合流させる
+    #   (`_gate_arrival` が `arrive_s <= total_s` しか所有しないので通常は空)。
+    if pi < len(pending):
+        waiting.extend(pending[pi:])
     forced: list = []
     for rec in list(members):
-        used = _used_s(rec, dt, cum)
-        rec["elapsed_s"] += used
+        integ = _used_s(rec, dt, cum)       # `arrive_s` は used_s だけに乗る(上の注記)
+        used = integ + float(rec.pop("arrive_s", 0.0))
+        rec["elapsed_s"] += integ
         _save_record(rec)
         if _maybe_force(sim, zone, rec, step, sim_min, st, used_s=used):
             forced.append(rec)              # 除去は下で 1 回(`_drop_recs` の docstring)
@@ -725,11 +1049,17 @@ def _gate_nodes(sim, zone):
 
 
 def _admit(sim, zone, waiting, members, signal, sim_sec, t_in_step,
-           step, sim_min, st) -> bool:
+           step, sim_min, st, *, teleport: bool = False) -> bool:
     """待機列から入場させる(guarded: 入口が空いているときだけ・id 昇順)。
 
     信号があるゾーンでは「青(+青点滅)の間」しか入場を許さない。
     Returns: 1 体でも入場したか(= エンジンの再構築が要るか)。
+
+    `teleport`(route_arrival のときだけ True・既定 False = 従来と 1 バイト同一):
+      入場位置は**ゲートノードそのもの**なので、入場した瞬間に個体のグラフ状態
+      (`agent.x / agent.y / agent.node`)もそこへ揃える。揃えないと zone_gate の
+      enter イベントが「まだ手前を歩いていたときの座標」を載せてしまう(位置の跳びは
+      `arrive_s` として会計済みで、グラフが同じ距離を歩くのと等価)。
     """
     if signal is not None and not signal.can_cross(sim_sec):
         return False
@@ -804,6 +1134,9 @@ def _admit(sim, zone, waiting, members, signal, sim_sec, t_in_step,
         any_admitted = True
         st["enter_total"] += 1
         agent = rec["agent"]
+        if teleport:
+            agent.x, agent.y = px, py
+            agent.node = rec["path"][0]
         sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                              kind="zone_gate", x=agent.x, y=agent.y,
                              payload={"zone": zone.id, "gate": rec["gate"],
@@ -995,17 +1328,25 @@ def _admit_blocked(queue, members, gap):
     return out
 
 
-def _admit_record(sim, zone, agent, path, rest, step) -> dict:
-    """流入レコードを作る(位置 = 現在座標そのもの・速度 = グラフ速度の連続引き継ぎ)。"""
+def _admit_record(sim, zone, agent, path, rest, step, pos=None,
+                  arrive_s: float = 0.0) -> dict:
+    """流入レコードを作る(位置 = 現在座標そのもの・速度 = グラフ速度の連続引き継ぎ)。
+
+    `pos`(route_arrival のときだけ非 None・既定 None = 従来と 1 バイト同一):
+      入場位置を**ゲートノードの座標**に据える。`path` は呼び出し側でゲートノードから
+      始まるように切ってあるので、向き・`span_m`・通過点はそのままこの位置と整合する。
+    `arrive_s`: その位置へグラフ移動で着くまでにこの step で費やす秒数(会計へ回す量)。
+    """
     v0 = desired_speed(agent.id)
     exit_node = path[-1]
     ex, ey = sim.city.node_xy(exit_node)
+    ax, ay = (float(agent.x), float(agent.y)) if pos is None else \
+        (float(pos[0]), float(pos[1]))
     nx, ny = sim.city.node_xy(path[1]) if len(path) > 1 else (ex, ey)
-    dx, dy = nx - agent.x, ny - agent.y
+    dx, dy = nx - ax, ny - ay
     norm = math.hypot(dx, dy)
     if norm < 1e-9:
-        dx, dy, norm = ex - agent.x, ey - agent.y, max(math.hypot(ex - agent.x,
-                                                                  ey - agent.y), 1e-9)
+        dx, dy, norm = ex - ax, ey - ay, max(math.hypot(ex - ax, ey - ay), 1e-9)
     speed = _graph_speed(sim, agent)
     speed = min(speed, v0 * zone.v_max_factor)
     span_m = 0.0
@@ -1016,12 +1357,17 @@ def _admit_record(sim, zone, agent, path, rest, step) -> dict:
         "zone": zone.id,
         "path": list(path),
         "rest": list(rest),
-        "gate": _zones.gate_id(zone, agent.node),
+        "gate": _zones.gate_id(zone, path[0]),   # path[0] は既定モードでは agent.node と同一
         "exit_xy": (ex, ey),
         "span_m": span_m,          # ゾーン内区間のグラフ経路長 [m](dwell との比で実効速度)
         "wp": 1 if len(path) > 1 else 0,        # 目標にしている経路ノードの index
         "wp_xy": (nx, ny),                      # その座標(= engine.goal の初期値)
-        "pos": (float(agent.x), float(agent.y)),
+        "pos": (ax, ay),
+        # ★route_arrival 専用の**step ローカル**な値(`_FIELDS` に無い = agent へ焼かない =
+        #   checkpoint に載らない)。次 step の `_record_of` では消えて 0 扱いになるが、
+        #   それが正しい: 待たされた個体はこの step 1 歩も動いていないので、次 step は
+        #   ゲートに居るものとして即入場を試みる。straight でも resume でも同じ経路。
+        "arrive_s": float(arrive_s),
         "vel": (speed * dx / norm, speed * dy / norm),
         "dir0": (dx / norm, dy / norm),
         "seg_dir": (dx / norm, dy / norm),      # 反転率の基準(区間の向き。通過点ごとに更新)
@@ -1693,10 +2039,29 @@ def _accumulate(zone, members, engine, prev_pos, prev_vel, dt, gate_xy, cont, st
     for i in np.nonzero((sign != 0) & (sign != prev_sign))[0]:
         members[int(i)]["sign"] = int(sign[i])
     # ---- 重なり(P2 決定 条件3 の検収値)----
-    radius = np.array([r["radius"] for r in members], dtype=np.float64)
-    gap = _orca.min_gap(pos, radius)
-    if math.isfinite(gap):
-        st["min_gap_m"] = gap if st["min_gap_m"] is None else min(st["min_gap_m"], gap)
+    # ★A3(第155): 半径は `_build_engine` が渡した配列そのもの。両エンジンとも
+    #   `self.radius = np.asarray(radius, f64).reshape(-1).copy()` で自分のコピーを持ち、
+    #   以後 1 度も書き換えない(読むだけ)。members と engine は入退場のたびに
+    #   `_build_engine` で作り直して常に同期しているので、要素も並びも列内包と同一。
+    #   ★半径配列を持たないスタブ engine(テストの参照実装が使う軽量な差し替え)へは
+    #     従来の列内包で後退する = 値は同じで、後退した経路も旧実装と 1 バイト同じ。
+    radius = getattr(engine, "radius", None)
+    if radius is None:
+        radius = np.array([r["radius"] for r in members], dtype=np.float64)
+    # ★A7(第155): `min_gap` は **L2 診断専用**(力学にも L1 にも 1 バイトも効かない)。
+    #   `st["min_gap_every"]` は既定では**存在しない鍵** = every 1 = 毎回計測 = 従来同値。
+    every = int(st.get("min_gap_every", 1))
+    if every > 1:
+        seen = int(st.get("min_gap_i", 0))
+        st["min_gap_i"] = seen + 1
+        do_gap = (seen % every == 0)
+    else:
+        do_gap = True
+    if do_gap:
+        gap = _orca.min_gap(pos, radius)
+        if math.isfinite(gap):
+            st["min_gap_m"] = (gap if st["min_gap_m"] is None
+                               else min(st["min_gap_m"], gap))
     st["sep_iters_max"] = max(st["sep_iters_max"],
                               int(getattr(engine, "last_sep_iters", 0)))
     # ---- 個体別の身体観測(P3(3))----

@@ -25,7 +25,7 @@ import math
 from pathlib import Path
 
 from .world import scene_desc as scene_desc_mod
-from .world.perception import hearers_of
+from .world.perception import count_hearers
 from .observer.schema import Event
 
 POV_DEFAULTS = {
@@ -149,7 +149,9 @@ def run_phase(sim, step: int, sim_min: int) -> None:
         if first:
             reason = "first_visit"
         elif crowd_min > 0 and idx is not None:
-            if len(hearers_of(agent, idx, radius)) >= crowd_min:
+            # 人数比較だけなので列挙(遮蔽つきリスト構築+整列)はしない。
+            # count_hearers == len(hearers_of) は perception 側で機械照合済み(第150)。
+            if count_hearers(agent, idx, radius) >= crowd_min:
                 reason = "crowd"
         if reason is None and world_now:
             reason = "world_event"

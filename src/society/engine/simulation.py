@@ -2873,6 +2873,13 @@ class Simulation:
         _ppprov = _pop_prov.provenance(self)
         if _ppprov is not None:
             summary["population"] = _ppprov
+        # ---- 物理ゾーン(第155)。ゾーン未使用のランは None = キー自体を出さない --------
+        # 250k 縦煙で G1(サブステップ張り付き)/ C1(所有有界化)の効きを summary から
+        # 直接読むための観測量。L2 の zone_* 列は metrics_spec 凍結で増やせない。
+        from .. import physics as _physics_prov
+        _phprov = _physics_prov.provenance(self)
+        if _phprov is not None:
+            summary["physics"] = _phprov
         (self.out_dir / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         return summary

@@ -13,12 +13,19 @@
       全入力で成り立つ(密/疎/空/境界ちょうど/遮蔽あり/屋内外/就寝)。
       count == len は第150 で機械照合済み(tests/test_count_hearers.py)なので
       ここはその「> 0 とブールの一致」を独立に釘打ちする。
-  (2) ★実ランの L1 完全一致: `scheduler.count_hearers` を**修正前の式**
+  (2) ★実ランの L1 完全一致: `_decide_g` の同席判定を**修正前の式**
       (`len(hearers_of(...))`)へ差し替えた B ランと、現行 A ランの L1 が
       1 バイトも違わない = drive 加算も has_company も分岐が同一。
       乱数 stream の消費本数も同一(rng 取得は :3065 で既に済んでおり不触)。
   (3) 回帰ガード: `_decide_g` の本文が `hearers_of(` を 1 度も呼ばない
       (= リスト構築が戻っていない)。
+
+★第154 A2(docs/plans/step-time-audit.md)で `_decide_g` の同席判定は
+  `count_hearers(...) > 0` → `has_hearers(...)`(存在判定 = 最初の 1 件で打ち切り)へ
+  さらに一段落ちた。`has_hearers == (count_hearers > 0)` は tests/test_has_hearers.py が
+  総当たりで機械照合しているので、本ファイルは**第152 が守った意味論**
+  (`bool(hearers_of(...))` との一致)をそのまま釘打ったまま、差し替え先の名前だけを
+  現行の呼び口へ合わせる。
 
 検証は mock のみ(実 LLM 禁止・≤144step)。
 """
@@ -111,6 +118,8 @@ def test_bool_of_hearers_equals_count_gt_zero():
                     # len との同値も同じ入力でついでに釘打ち(第150 の再確認)
                     assert P.count_hearers(speaker, src, radius, occluder=occ) == \
                         len(P.hearers_of(speaker, src, radius, occluder=occ))
+                    # 第154 A2: 存在判定も同じ真偽値(この鎖を切らせない)
+                    assert P.has_hearers(speaker, src, radius, occluder=occ) is want
                 seen_true += int(want)
                 seen_false += int(not want)
     assert seen_true > 0 and seen_false > 0, "片側しか出ていない入力集合では検算にならない"
@@ -122,9 +131,9 @@ def test_bool_of_hearers_equals_count_gt_zero():
 def test_l1_matches_pre_fix_expression(tmp_path, monkeypatch):
     """★A(現行 count_hearers)と B(修正前 len(hearers_of)) の L1 がバイト一致。
 
-    `scheduler` 名前空間の `count_hearers` は **`_decide_g` の 1 箇所からしか**
-    呼ばれていないので、ここを差し替えることは「修正前のコードを走らせる」ことと
-    厳密に同じ(引数も半径も知覚ソースも呼び順もそのまま)。
+    `scheduler` 名前空間の同席判定(第152 は `count_hearers`・第154 A2 以降は
+    `has_hearers`)を「列挙してから真偽を取る」実装へ戻すことは、修正前のコードを
+    走らせることと厳密に同じ(引数も半径も知覚ソースも呼び順もそのまま)。
     """
     sim_a = Simulation(_cfg("cmp_a"), out_dir=tmp_path / "cmp_a")
     sim_a.run()
@@ -137,9 +146,9 @@ def test_l1_matches_pre_fix_expression(tmp_path, monkeypatch):
         calls["n"] += 1
         n = len(P.hearers_of(speaker, src, radius, occluder=occluder))
         calls["with" if n > 0 else "without"] += 1
-        return n
+        return bool(n)                     # 修正前の `bool(company)` と同じ真偽値
 
-    monkeypatch.setattr(scheduler, "count_hearers", _legacy)
+    monkeypatch.setattr(scheduler, "has_hearers", _legacy)
     sim_b = Simulation(_cfg("cmp_b"), out_dir=tmp_path / "cmp_b")
     sim_b.run()
 
@@ -157,5 +166,6 @@ def test_decide_g_uses_count_not_list():
     src = inspect.getsource(scheduler._decide_g)
     body = "\n".join(ln for ln in src.splitlines()
                      if not ln.lstrip().startswith("#"))
-    assert "count_hearers(" in body, "人数経路が消えている"
+    # 第154 A2 で `count_hearers(...) > 0` → `has_hearers(...)`(存在判定)へ。
+    assert "has_hearers(" in body, "非列挙経路が消えている"
     assert "hearers_of(" not in body, "リスト構築が戻っている(40m 圏の全列挙)"

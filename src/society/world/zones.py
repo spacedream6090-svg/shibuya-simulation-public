@@ -238,9 +238,28 @@ class Zone:
     gate: dict
     bbox: tuple[float, float, float, float] = field(default=(0.0, 0.0, 0.0, 0.0))
 
+    # ★第154 A5(docs/plans/step-time-audit.md): `node_in` のメモ化キャッシュ。
+    #   **注釈を付けない**ので dataclass の field ではない(`fields()` / `asdict()` /
+    #   `__init__` / `__eq__` / `__repr__` のどこにも現れない)。既定値はクラス側にだけ
+    #   存在し、1 度も問い合わせていない Zone の instance `__dict__` は**空のまま**
+    #   (第149 `memory` の ClassVar 既定と同型 = 属性が生えない = 状態が増えない)。
+    #   中身は `(graph, frozenset(内側ノード))`。地図は静的なので純関数の答えを憶えてよい。
+    _node_memo = None
+
     # -- 幾何 ------------------------------------------------------------- #
     def contains(self, x: float, y: float) -> bool:
         return point_in(self.polygon, x, y, self.bbox)
+
+    def __getstate__(self):
+        """pickle / deepcopy に**メモ化キャッシュを載せない**(第154 A5)。
+
+        `_node_memo` は都市グラフへの強参照を含むので、載せると checkpoint が地図を
+        まるごと抱き込む。地図は静的なので復元後に引き直せば同じ答えになる(純キャッシュ)。
+        1 度も問い合わせていない Zone では `__dict__` に `_node_memo` が無いので、
+        返る dict は従来の既定状態(= `self.__dict__` そのもの)と同じ内容・同じ順序
+        = pickle バイト一致。
+        """
+        return {k: v for k, v in self.__dict__.items() if k != "_node_memo"}
 
     def area_m2(self) -> float:
         return polygon_area(self.polygon)
@@ -714,13 +733,10 @@ def _check_disjoint(zones) -> None:
 # --------------------------------------------------------------------------- #
 # ゲート(グラフ ⇄ ゾーン の唯一の出入口)
 # --------------------------------------------------------------------------- #
-def node_in(zone: Zone, graph, node: str) -> bool:
-    """グラフノードがゾーンに**所属する**か(幾何 + 垂直レイヤー)。
+def _node_in_uncached(zone: Zone, graph, node: str) -> bool:
+    """`node_in` の生の判定(第154 A5 のメモ化前の本体そのまま。逐語で保存する)。
 
-    `zone.layers` が空(既定)なら幾何だけ = `contains` と完全に同値(従来どおり)。
-    非空なら `graph.nodes[node]["layer"]` がその集合に含まれることも要求する。
-    ★ `Zone.contains(x, y)` 側(= 物理座標の内外判定)は**一切変えない**。
-      物理はもともと 2 次元平面で走るので、変えるべきは「どのノードを縫い付けるか」だけ。
+    テストが「メモ化あり / なし」を全ノードで突合するための参照実装でもある。
     """
     d = graph.nodes[node]
     if not zone.contains(float(d["x"]), float(d["y"])):
@@ -730,9 +746,55 @@ def node_in(zone: Zone, graph, node: str) -> bool:
     return True
 
 
+def _inside_memo(zone: Zone, graph) -> frozenset:
+    """(zone, graph) → 内側ノードの frozenset を Zone インスタンスに憶える(遅延・純関数)。
+
+    ★第154 A5(docs/plans/step-time-audit.md §3): `node_in` は
+      `physics._run_zone` から **在街かつ経路持ちの全個体 × 経路長 × ゾーン数**だけ
+      呼ばれるのに、毎回 `graph.nodes[node]` の辞書引き + `Zone.contains` の ray casting を
+      やり直していた(キャッシュ皆無)。地図は静的 = `node_in` は純関数なので、
+      答えの集合(`inside_nodes` が既に返していたもの)を 1 度だけ作って憶える。
+
+    - キーに graph を**同一性**で持つ(1 run 1 グラフ。テストが別グラフを渡したら作り直す)。
+    - 書き込みは `object.__setattr__`(frozen dataclass)。`_node_memo` は field ではないので
+      `fields()` / `asdict()` / `__eq__` / `__repr__` は 1 つも変わらない。
+    - `__getstate__` が除くので pickle / checkpoint / deepcopy には載らない。
+    - 乱数ゼロ・sim 非参照(本 module の「幾何とデータだけ」の約束を保つ)。
+    """
+    memo = zone._node_memo                      # 既定 None はクラス属性(instance は空)
+    if memo is not None and memo[0] is graph:
+        return memo[1]
+    ins = frozenset(n for n in graph.nodes if _node_in_uncached(zone, graph, n))
+    object.__setattr__(zone, "_node_memo", (graph, ins))
+    return ins
+
+
+def node_in(zone: Zone, graph, node: str) -> bool:
+    """グラフノードがゾーンに**所属する**か(幾何 + 垂直レイヤー)。
+
+    `zone.layers` が空(既定)なら幾何だけ = `contains` と完全に同値(従来どおり)。
+    非空なら `graph.nodes[node]["layer"]` がその集合に含まれることも要求する。
+    ★ `Zone.contains(x, y)` 側(= 物理座標の内外判定)は**一切変えない**。
+      物理はもともと 2 次元平面で走るので、変えるべきは「どのノードを縫い付けるか」だけ。
+
+    第154 A5: 判定はゾーン別 frozenset へメモ化する(地図は静的 = 純関数)。**返り値は
+    `_node_in_uncached` と全ノードで一致**する(tests/test_zone_node_in_memo.py が
+    実地図の全ノードで突合)。グラフに無いノードは従来どおり `KeyError`
+    (`graph.nodes[node]` が投げていたもの)を投げる = 誤りを黙って False へ倒さない。
+    """
+    memo = zone._node_memo                      # 命中時は関数呼び 1 本ぶんも惜しむ(最内)
+    ins = memo[1] if (memo is not None and memo[0] is graph) \
+        else _inside_memo(zone, graph)
+    if node in ins:
+        return True
+    if node in graph.nodes:
+        return False
+    raise KeyError(node)       # 未知ノードは従来(`graph.nodes[node]`)と同じ例外
+
+
 def inside_nodes(zone: Zone, graph) -> tuple[str, ...]:
     """ゾーンの内側にあるグラフノード(id 昇順)。"""
-    return tuple(sorted(n for n in graph.nodes if node_in(zone, graph, n)))
+    return tuple(sorted(_inside_memo(zone, graph)))
 
 
 def gates_of(zone: Zone, graph) -> tuple[str, ...]:

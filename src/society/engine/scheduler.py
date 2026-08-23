@@ -106,8 +106,8 @@ from ..observer.schema import Event
 from ..rules import apply_bonus
 from ..world.geom import rdp
 from ..world import perception as perception_mod
-from ..world.perception import (build_index, cell_m_of, count_hearers,
-                                fine_gate_of, hearers_of, salience_gate)
+from ..world.perception import (build_index, cell_m_of, fine_gate_of,
+                                has_hearers, hearers_of, salience_gate)
 
 
 def _edge_key(u: str, v: str) -> tuple[str, str]:
@@ -2896,10 +2896,12 @@ def _phase_drive(sim, step: int, sim_min: int) -> None:
         # 対面会話が起きうる個体(= 下の requesters ループが face と判定する集合)。
         # engaged が「話しかける側」の突入を判定するために要る。ON のときだけ組む
         # (空間索引があるので O(N) の近傍参照。判定式は下の face と厳密に同じ)。
+        # ★第154 A1: 返り値は `and` の真偽値としてしか読まれない = 存在判定で足りる
+        #   (`has_hearers` は `bool(hearers_of(...))` と厳密に同値・最初の 1 件で打ち切り)。
         face_ids = frozenset(
             a.id for a in active
             if step >= a.conv_cooldown_until
-            and hearers_of(a, _percept(sim), radius)) \
+            and has_hearers(a, _percept(sim), radius)) \
             if engaged_mod.enabled(sim) else frozenset()
         forced |= engaged_mod.update(sim, step, sim_min, due, active, face_ids)
         requesters = [a for a in active
@@ -2917,16 +2919,21 @@ def _phase_drive(sim, step: int, sim_min: int) -> None:
         # 個体をこの phase に入れているのは **同居人との対面会話のためだけ**なので、同席者が
         # 居ない / 会話クールダウン中なら申請そのものを持たせない(= SNS 投稿・DM・独り言と
         # いった外部への経路は閉じたまま。muted 側で同居人の在宅覚醒は確認済み)。
+        # ★第154 A1: ここも `not (... and ...)` のブール文脈でしか読まない = 存在判定。
         if home_awake_mod.home_awake_now(agent) and not (
                 step >= agent.conv_cooldown_until
-                and hearers_of(agent, _percept(sim), radius)):
+                and has_hearers(agent, _percept(sim), radius)):
             continue
         stats["requests"] += 1
         req_drive = agent.drive
         reason = drive.top_reason(agent)
         rng = sim.hub.stream("drive", agent.id, step)
         # 対面会話: 同席者がいて会話クールダウン外なら抽選なしで確定発火(logistic でも不変)。
-        face = bool(hearers_of(agent, _percept(sim), radius)) \
+        # ★第154 A1(docs/plans/step-time-audit.md): `bool(...)` にしか使っていないのに
+        #   40m 圏を全列挙して id 昇順へ整列していた(第152 が `_decide_g` で潰したのと同型・
+        #   250k 夕方 py-spy で step 時間の 5.7%)。`has_hearers` は `bool(hearers_of(...))` と
+        #   厳密に同値で、最初の 1 件で走査を打ち切る(半径・知覚ソース・呼び順・乱数は不変)。
+        face = has_hearers(agent, _percept(sim), radius) \
             and step >= agent.conv_cooldown_until
         # 第81: 驚き/内部の割込みは抽選なしの確定発火(face と同格)。OFF は forced 空=不変。
         interrupt = agent.id in forced
@@ -3071,7 +3078,10 @@ def _decide_g(sim, agent, step: int, sim_min: int):
     #   62.6%)。`count_hearers` は `len(hearers_of(...))` と**全入力で同値**(第150 で
     #   機械照合済み: tests/test_count_hearers.py)なので `bool(company)` == (count > 0)。
     #   半径・知覚ソース・呼び順・乱数はここでは 1 つも変えていない。
-    has_company = count_hearers(agent, _percept(sim), radius) > 0
+    # ★第154 A2(docs/plans/step-time-audit.md): 人数すら要らないので**存在判定**へ落とす。
+    #   `has_hearers` は `count_hearers(...) > 0` と厳密に同値(tests/test_has_hearers.py が
+    #   密/疎/境界/±ULP 帯の総当たりで機械照合)で、最初の 1 件で走査を打ち切る。
+    has_company = has_hearers(agent, _percept(sim), radius)
     if has_company:
         drive.add(agent, "company", sim.drivecfg)
     agent._heard_unknown = False

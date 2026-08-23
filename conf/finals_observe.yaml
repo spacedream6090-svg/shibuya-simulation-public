@@ -381,7 +381,11 @@ world:
   #   内 argpartition 18.6% = 「中密度が粗経路に落ちる帯」が厚い(= 前者の帯が支配的)と
   #   出ているので 500 を採る。どの密度でも劣らない側に倒すなら 1000(疎側 ±2%)。
   #   ★8/22 の感度スイープで最終化。撤退路は 2000(= 既定)へ戻す 1 行。
-  perception_fine_gate: 500
+  # ★第155(A6): 500→64。監査実測=250k 夕方は中密度帯(9セル総人数 64-508)が
+  #   粗経路に落ちて 40 m 走査のまま残るのが C2 残存の主因(_bounded_pick 26.6%)。
+  #   64 で細格子側へ倒す(返り値は粗/細どちらでも同一集合・同一順序=仕様保証・同値テスト有)。
+  #   疎側の固定費 2-7% は夕方の利得(−1〜3%/step)と交換。戻し方: 500(旧値)or 2000(既定)。
+  perception_fine_gate: 64
   # ★暫定注記: 本キーは**起動を速くするだけ**の装置で、世界には 1 ビットも触らない。
   #   ただし (1) キャッシュの実体が data/cache/ に残る = 設定を変えたら別キーになるだけで
   #   古いファイルは自動削除されない(容量は 1 ファイル ~数十 MB 級)、(2) 本選当日の
@@ -1688,3 +1692,29 @@ llm:
 #   world.facilities.escalator.traps / incidents_interpersonal.theft.supersede_diversity=false /
 #   brawl.require_intox=false / brawl.night_only=false / transit_staff.dwell.require_service=false /
 #   transit_interior.include_plan_returnees=false
+
+# =============================================================================
+# 第155(8/24未明): 物理レバー(A4/A7/C1)。既定は config.yaml 側(全て現行同値)。
+# C1=物理ゾーン所有の有界化。監査(docs/plans/step-time-audit.md)の実測:
+#   従来(無制限)は「経路がゾーンを通る」だけで数百 m 手前から所有 = 所有 M が在街人口に
+#   ほぼ比例(vert6 実測: 所有 ~1万人・zone_density_mean 5.2-6.2 人/m² = 六方最密 3.22 超の
+#   物理的に不可能な値)= 物理 51.3% の構造的主因。
+# ownership_mode の実測比較(n=2000・実3ゾーン・12step・scripts/bench_physics_levers.py --ownership):
+#   euclid200      … 捕捉率 27.6%(非所有はグラフ移動 800 m/step で跳ぶため X/800 で頭打ち)
+#                     = 横断流の 72% が物理素通り。physics 6.6x。
+#   route_arrival  … 「残り経路に沿ってゲートへ今 step 内に到達する個体」を全部捕まえる
+#                     = 捕捉率 99.3%。入場位置=ゲート・到着サブ時刻まで _admit 不可視・
+#                     手前徒歩は used_s 会計(二重移動なし)。physics 4.95x(小規模の下限。
+#                     所有 M は 17.4x 減 = M が支配する 250k では M 比へ近づく)。
+#                     dwell 600 s(step 丸ごと)→ 33.8 s(実横断時間)・破綻ゼロ
+#                     (重なり/貫通/逆走/立往生とも悪化なし)・軌跡変化 31.8%(正直記録)。
+# ★ユーザー決定(8/23 夜): route_arrival 採用(「渋谷を徹底再現」= 交差点の群衆密度が
+#   実勢を指す量になる方向)。1.7 人/m² 帯の最終検証は 250k 夕方煙で行う(2000体 mock では
+#   判定不能と正直申告済み)。
+# min_gap_every=10: min_gap は L2 診断専用(力学・L1・L3 は 1 バイト不変)。10 サブステップに
+#   1 回で上界化(差 ≤ v_max·dt)。戻し方: 1。
+# 撤退路: ownership_mode を "" に戻す 1 行(= 従来の無制限所有)。
+physics_levers:
+  ownership_mode: route_arrival
+  ownership_max_dist_m: 0.0     # route_arrival では未使用(euclid 用のしきい)
+  min_gap_every: 10

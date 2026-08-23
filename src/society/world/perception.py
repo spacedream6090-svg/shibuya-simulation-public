@@ -71,6 +71,25 @@ id は一意なので `lexsort((ids, d2))` も `argsort(ids)` も全順序)。�
 せずに返す。cap / radius_eff は受け取らない = このチャンネルの現行 semantics(物理的に
 声が届く人数)をそのまま保つ。索引経路は半径マスクの合計でベクトル化し、`np.hypot` と
 `math.hypot` の 1 ULP 差は半径まわりの帯だけ `math.hypot` で裁定する(下記 `_radius_band`)。
+
+── 「居るか否か」の 1 ビットしか要らない呼び手(`has_hearers`)─────────────────
+第152 が `_decide_g` の `has_company` を `len(hearers_of(...))` → `count_hearers(...) > 0`
+へ落としたが、**人数まで数える必要も無い**呼び手がまだ 4 か所ある(`scheduler._decide_g`
+の `has_company` と `_phase_drive` の face 判定 3 か所)。`has_hearers` は
+**`count_hearers(...) > 0` と厳密に同値**な bool を、**最初の 1 件が見つかった時点で
+打ち切って**返す(docs/plans/step-time-audit.md A2)。
+
+早期打ち切りが実際に効くようにするため、索引経路は `_count` のような「近傍 9 セルの
+連結配列を作ってから全長を numpy で舐める」形を**唯一の経路にしない**。3 段構えで、
+どの段も見る要素の集合は `_count` と同一(= 順序も分割も答えに影響しない):
+  ⓪ 疎な近傍(在圏数 ≤ `_EXISTS_LOOP_MAX`)… 素の Python ループ。numpy のクエリ固定費
+     (~6 µs)を払わない = 差し替え前の `hearers_of` の速さをそのまま保つ。
+  ① 密な近傍 … 中心セルの先頭 `_EXISTS_PROBE_MAX` 人だけをループで先読み。ほぼ必ず
+     ここで当たる(実測 ~0.5 µs = `count_hearers` の 25〜120 倍速)。
+  ② 外れたら `_count` と同じ連結キャッシュを**全長 1 パス**(`_count` を超えない)。
+判定式・帯の裁定(`_radius_band`)・遮蔽の扱いは `_count` と 1 行ずつ同型なので、
+`has_hearers(...) == (count_hearers(...) > 0)` が全入力で成り立つ
+(tests/test_has_hearers.py が密/疎/境界/±ULP 帯/しきい値差し替えの総当たりで機械照合)。
 """
 from __future__ import annotations
 
@@ -148,6 +167,36 @@ _FINE_GATE_CONF_DEFAULT = 2000.0
 
 # 粗格子の走査オフセット。**現行の `for dx in (-1, 0, 1)` と同一のタプル**(順序も同一)。
 _RING1: tuple[int, ...] = (-1, 0, 1)
+
+# ---- 存在判定(`has_hearers` = `count_hearers(...) > 0`)の走査規則 --------------------
+# 走査の順序・分割は**返り値に一切影響しない**(bool の or は可換・結合的で、見る要素の
+# 集合は `_count` と同一)= 速さだけのつまみ。設計目標は 2 つで、micro bench の実測で決めた:
+#   (a) 密な近傍で速い(= A1/A2 の狙い)
+#   (b) **どんな配置でも差し替え前の 2 経路(`hearers_of` の Python ループ /
+#       `count_hearers` の numpy 全長パス)より目に見えて遅くならない**
+#
+# `_EXISTS_ORDER` … セルを見る順。中心セル(話者自身が居るセル = いちばん近い候補が
+#   集まる場所)から見る。遮蔽器あり経路と疎な近傍のループ経路が使う。
+_EXISTS_ORDER: tuple[tuple[int, int], ...] = (
+    (0, 0),
+    (-1, -1), (-1, 0), (-1, 1),
+    (0, -1), (0, 1),
+    (1, -1), (1, 0), (1, 1),
+)
+# `_EXISTS_LOOP_MAX` … 近傍 9 セルの在圏数がこれ以下なら**素の Python ループ**で見る。
+#   numpy はクエリ 1 本あたり ~6 µs の固定費(呼び出し ~7 本)を持つのに対し、
+#   Python ループは 1 要素 ~0.09 µs。疎な近傍(夜間・郊外・屋内の個室)ではループの方が
+#   桁で速い(実測: 近傍 1 人で 1.1 µs 対 8.7 µs)。差し替え前の `hearers_of` はこの
+#   ループだったので、**そこを退行させないための下駄**でもある。しきい値は当たりの無い
+#   最悪ケースの交点(6 µs ÷ 0.09 µs ≒ 65 要素)に置く。
+#   在圏数は `_coarse_load`(dict の get と len だけ・セル単位でキャッシュ)で得る。
+_EXISTS_LOOP_MAX = 64
+# `_EXISTS_PROBE_MAX` … 密な近傍での①「中心セル先読み」で見る人数の上限。
+#   中心セルに人が居れば、その先頭の数人のうち誰かが半径(= セル幅)内に居る確率はほぼ 1
+#   なので、**9 セル連結(`_count_arrays`)を作らずに** ~0.2 µs で決着することが多い。
+#   外れても損は高々この人数ぶんのループ(~3 µs)で、そのあと②へ落ちる。
+#   ここを numpy で撃つ実装も試したが、この規模ではループの方が速かった(固定費が支配的)。
+_EXISTS_PROBE_MAX = 32
 
 
 @functools.lru_cache(maxsize=16)
@@ -680,6 +729,119 @@ class PerceptIndex:
                     total += 1
         return total
 
+    def _exists_block(self, xs, ys, ids, beg: int, end: int,
+                      fsx: float, fsy: float, isid: int,
+                      lo: float, hi: float, radius: float) -> bool:
+        """連結配列の [beg, end) に「半径内で自分以外」が 1 つでもあるか(`_count` と同一判定)。
+
+        `_count` の本体(:659-681)を**逐語**でスライスへ移したもの:
+          ① 外接正方形 `max(|dx|,|dy|) <= hi` + 自分自身の除外(`hi` は +4 ULP の安全側)
+          ② `h <= lo` は両実装(np/math)とも確実に圏内 = 即決
+          ③ 帯 (lo, hi] に落ちた要素だけ `math.hypot` で裁定(`_count` と同一の裁定)
+        `_count` はこの ②③ の件数を足し上げる。ここは「1 つでもあるか」なので、
+        ② が 1 つでもあるか、③ の裁定を 1 つでも通れば True(= 部分和が正)。
+        """
+        ids_b = ids[beg:end]
+        dxa = xs[beg:end] - fsx
+        dya = ys[beg:end] - fsy
+        ax = np.abs(dxa)
+        np.maximum(ax, np.abs(dya), out=ax)
+        box = np.flatnonzero((ax <= hi) & (ids_b != isid))
+        if box.size == 0:
+            return False
+        h = np.hypot(dxa[box], dya[box])
+        if bool(np.any(h <= lo)):
+            return True
+        # ここへ来た = `h <= lo` が 1 つも無い。よって `h <= hi` の要素は必ず帯 (lo, hi] に
+        # 居る。`_count` が「lo 件数 != hi 件数」で裁定に入るのと同じ門(1 呼び)で、
+        # 実データでは事実上ここを通らない = 全長を舐める numpy 呼びが 1 本増えない。
+        if not bool(np.any(h <= hi)):
+            return False
+        for j in np.flatnonzero((h > lo) & (h <= hi)):
+            k = int(box[int(j)])
+            if math.hypot(float(dxa[k]), float(dya[k])) <= radius:
+                return True
+        return False
+
+    def _exists(self, speaker, occ) -> bool:
+        """`self._count(speaker, occ) > 0` と**厳密に同値**な存在判定(最初の 1 件で打ち切る)。
+
+        既定経路(cap=0 / radius_eff=None)専用 = `hearers()` の返り値が空でないことと同値。
+        `_count` との差は「数え上げをやめて即 return する」ことと「見る順番と分割」だけで、
+        **判定式は 1 つも変えていない**(`_exists_block` の docstring に逐語の対応):
+          - 文脈(`_context`)・自分自身の除外(`ids != sid`)・半径判定(`<= radius`)
+          - 外接正方形の前フィルタ(`max(|dx|,|dy|) <= hi`。`_count` と同じ `hi` = +4 ULP)
+          - 帯 (lo, hi] に落ちた要素の `math.hypot` 裁定(`_count` と同じ `_radius_band`)
+          - 遮蔽器が据わっているときは `hearers` と同じ順で `blocks` を呼ぶループへ後退
+        `_count` は「`h <= lo` の件数」+「帯の裁定で通った件数」の合計を返す。ここでは
+        その合計が正であること = 「どこかのブロックに 1 つでもある」と同値なので、
+        見つかった瞬間に True を返してよい(bool の or は可換・結合的 = 順序も分割も自由)。
+
+        速さの構造(**答えには一切影響しない**):
+          ⓪ 疎な近傍(在圏数 ≤ `_EXISTS_LOOP_MAX`)は**素の Python ループ**で見る。
+             判定式は `hearers()` の逐語(= 差し替え前の `hearers_of` そのもの)なので、
+             夜間・郊外の疎な個体で numpy の固定費を払わされる退行が起こらない。
+          ① 密な近傍では中心セルの先頭 `_EXISTS_PROBE_MAX` 人だけをループで先読みする。
+             ほぼ必ずここで当たるので、**9 セル連結も numpy も触らずに**決着する。
+          ② 外れたら `_count` と**同じ連結キャッシュ**(`_count_arrays` = `_nc`)を
+             **全長 1 パス**で見る。numpy の呼び方も配列も `_count` と同じ形で、
+             合計を取らずに `np.any` で抜けるだけなので、**どんな配置でも `_count` を
+             超えない**(ブロックに刻むと numpy 呼び出しの固定費が積み上がって、
+             当たりの無い近傍で逆に遅くなる。micro bench で実測して 1 パスにした)。
+          ①で見た要素を②が見直すのは無駄だが高々 32 人ぶんで、正しさには無関係。
+        """
+        ctx = _context(speaker)
+        if ctx[0] == "outside":
+            return False
+        cx, cy = self._cell_xy(speaker.x, speaker.y)
+        radius = self.radius
+        sx, sy, sid = speaker.x, speaker.y, speaker.id
+        cells = self.cells
+        if occ is not None:
+            # 遮蔽器が据わっている: `_count` と同じループで、最初の 1 件で打ち切る。
+            for dx, dy in _EXISTS_ORDER:
+                bucket = cells.get((ctx, cx + dx, cy + dy))
+                if not bucket:
+                    continue
+                for other in bucket:
+                    if other.id == sid:
+                        continue
+                    if math.hypot(other.x - sx, other.y - sy) <= radius:
+                        if not occ.blocks(speaker, other):
+                            return True
+            return False
+        # ---- ⓪ 疎な近傍は素の Python ループ(= `hearers()` と逐語同一の判定)------------
+        if self._coarse_load(ctx, cx, cy) <= _EXISTS_LOOP_MAX:
+            for dx, dy in _EXISTS_ORDER:
+                bucket = cells.get((ctx, cx + dx, cy + dy))
+                if not bucket:
+                    continue
+                for other in bucket:
+                    if other.id == sid:
+                        continue
+                    if math.hypot(other.x - sx, other.y - sy) <= radius:
+                        return True
+            return False
+        # ---- ① 中心セルの先読み(先頭 32 人だけ。密なセルはここでほぼ必ず当たる)---------
+        bucket = cells.get((ctx, cx, cy))
+        if bucket:
+            n = len(bucket)
+            for k in range(n if n < _EXISTS_PROBE_MAX else _EXISTS_PROBE_MAX):
+                other = bucket[k]
+                if other.id == sid:
+                    continue
+                if math.hypot(other.x - sx, other.y - sy) <= radius:
+                    return True
+        # ---- ② 近傍 9 セル連結(`_count` と同じキャッシュ)を全長 1 パス ------------------
+        lo, hi = _radius_band(radius)
+        fsx, fsy, isid = float(sx), float(sy), int(sid)
+        nb = self._count_arrays(ctx, cx, cy)
+        if nb is None:
+            return False
+        xs, ys, ids = nb
+        return self._exists_block(xs, ys, ids, 0, int(xs.shape[0]),
+                                  fsx, fsy, isid, lo, hi, radius)
+
     def _count_arrays(self, ctx: tuple, cx: int, cy: int):
         """近傍 9 セルを連結した (xs, ys, ids) を返す(遅延構築・セル単位で共有)。
 
@@ -891,3 +1053,30 @@ def count_hearers(speaker, agents_or_index, radius_m: float, occluder=None) -> i
             if occ is None or not occ.blocks(speaker, other):
                 total += 1
     return total
+
+
+def has_hearers(speaker, agents_or_index, radius_m: float, occluder=None) -> bool:
+    """**`count_hearers(speaker, agents_or_index, radius_m, occluder) > 0` と同値**な bool。
+
+    「同席者が居るか否か」の 1 ビットしか要らない呼び手(`scheduler._decide_g` の
+    `has_company`・`_phase_drive` の face 判定)用。人数も列挙も整列もせず、
+    **最初の 1 件が見つかった時点で走査を打ち切る**(docs/plans/step-time-audit.md A2)。
+
+    引数面は `count_hearers` と同一(cap / radius_eff は**受け取らない**)。第2引数は
+    `PerceptIndex`(近傍 9 セル・`_exists` の 3 段構え)または agent の反復可能列
+    (全対全 live 走査)。どちらでも同じ bool を返す。
+    """
+    if isinstance(agents_or_index, PerceptIndex):
+        occ = _resolve(occluder if occluder is not None else agents_or_index._occ)
+        return agents_or_index._exists(speaker, occ)
+    ctx = _context(speaker)
+    occ = _resolve(occluder)                   # None=遮蔽なし=従来と完全同一
+    sx, sy, sid = speaker.x, speaker.y, speaker.id
+    radius = radius_m
+    for other in agents_or_index:              # ★ count_hearers と同じ判定・同じ順序
+        if other.id == sid or other.sleeping or _context(other) != ctx:
+            continue
+        if math.hypot(other.x - sx, other.y - sy) <= radius:
+            if occ is None or not occ.blocks(speaker, other):
+                return True                    # 1 件見つかった時点で打ち切る
+    return False

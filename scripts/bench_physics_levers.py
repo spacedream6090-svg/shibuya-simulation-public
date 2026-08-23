@@ -1,6 +1,22 @@
-"""物理 2 レバー(第154)の検証ハーネス — 密度適応 dt(B)と近傍 cap 引き下げ(D)。
+"""物理レバーの検証ハーネス — 第154(適応 dt・近傍 cap・分離反復)と第155 C1(所有の距離有界化)。
 
     python scripts/bench_physics_levers.py [--out DIR] [--quick] [--sizes 600,1500,3000]
+    python scripts/bench_physics_levers.py --ownership 0,50,100,200 [--own-sizes 600,2000]
+
+`--ownership` は**合成シナリオではなく本体そのもの**を回す(第155 C1)。理由は、C1 が
+変えるのはエンジンの中身ではなく「**誰をゾーンに載せるか**」だからで、合成シナリオ側に
+X を注入しても意味のある数字が出ない(そこには所有もゲートも経路も無い)。代わりに
+`conf/zones_shibuya.yaml` の実 3 ゾーンを mock LLM で回し、X ごとに
+
+  ・所有人数(zone_occupancy)/ 密度(zone_density_mean)/ 滞在(zone_dwell_mean_s)
+  ・実測の局所密度(Perception.body.local_density = polygon 近傍の**本当の**密度)
+  ・基本図の作業点(実効速度 = ゾーン内グラフ経路長 span_m ÷ 滞在 dwell_s)
+  ・破綻統計(体表間 min_gap / 1 サブステップ変位 jump_max / 加速度 p99 / 逆走率 /
+    グラフ復帰の跳び handover_jump / 分離反復の上限張り付き)
+  ・軌跡差(X=0 との最終座標のずれ・退場 step のずれ)
+  ・コスト(physics.phase の実測秒 / step)
+
+を並べて出す。**判断材料を出すだけで合否は判定しない**(この repo の他のベンチと同じ)。
 
 何を測るか
 ----------
@@ -383,6 +399,207 @@ def _print_sep(r):
           f"sep_hit={r['sep_iters_max']}", flush=True)
 
 
+# =========================================================================== #
+# 第155 C1: 所有の距離有界化(**本体を回す**。合成シナリオでは測れない)
+# =========================================================================== #
+OWN_PROFILE = os.path.join(_REPO, "conf", "zones_shibuya.yaml")
+
+
+def own_spec(raw):
+    """掃引の 1 水準。`"0"`/`"off"` = 無制限 / 数値 = euclid X [m] / `"route"` = route_arrival。
+
+    Returns: (label, dotlist, ownership_max_dist_m)
+    """
+    s = str(raw).strip().lower()
+    if s in ("route", "route_arrival", "arrival"):
+        return "route", ["physics_levers.ownership_mode=route_arrival"], None
+    x = float(s)
+    if x <= 0.0:
+        return "off", [], 0.0
+    return f"euclid{int(x)}", ["physics_levers.ownership_mode=euclid",
+                               f"physics_levers.ownership_max_dist_m={x}"], x
+
+
+def _own_run(n, steps, spec, seed=42):
+    """1 水準ぶん本体を steps 回す(`spec` は `own_spec` が返す 3 つ組)。"""
+    from society import physics as _P
+    from society.config import load_config
+    from society.engine import scheduler
+    from society.engine.simulation import Simulation
+
+    label, dots, _x = spec
+    cfg = load_config([f"run.seed={seed}", f"run.n_agents={n}",
+                       f"run.n_steps={steps}", f"run.name=own_{label}_n{n}",
+                       "model.backend=mock", "observer.snapshot_every=100000"]
+                      + list(dots),
+                      profile=OWN_PROFILE)
+    sim = Simulation(cfg, out_dir=os.path.join(_REPO, "experiments",
+                                               "_own", f"{label}_n{n}"))
+    box = {"phys_s": 0.0}
+    real_phase = _P.phase
+
+    def timed(s, step, sim_min):
+        t = time.perf_counter()
+        try:
+            return real_phase(s, step, sim_min)
+        finally:
+            box["phys_s"] += time.perf_counter() - t
+
+    _P.phase = timed
+    per_zone: dict = {}
+    try:
+        t0 = time.perf_counter()
+        for step in range(steps):
+            scheduler.run_step(sim, step)
+            for zid, z in (getattr(sim, "_phys_state", None) or {}).get(
+                    "by_zone", {}).items():
+                acc = per_zone.setdefault(zid, {"occ": [], "dens": [],
+                                                "wait": [], "sub": []})
+                acc["occ"].append(float(z["occupancy_mean"]))
+                acc["dens"].append(float(z["density"]))
+                acc["wait"].append(int(z["waiting"]))
+                acc["sub"].append(int(z["sub_steps"]))
+        wall = time.perf_counter() - t0
+    finally:
+        _P.phase = real_phase
+    return sim, box["phys_s"], wall, per_zone
+
+
+def _own_metrics(sim, phys_s, wall, per_zone, steps):
+    """1 ラン ぶんの観測量を dict に畳む(判定はしない)。"""
+    from society import physics as _P
+
+    sc = _P.scalars(sim) or {}
+    cont = _P.continuity(sim) or {}
+    span: dict = {}
+    speeds: list = []
+    exit_step: dict = {}
+    for e in sim.logger.events:
+        if e.kind != "zone_gate":
+            continue
+        p = e.payload
+        key = (e.agent_id, p.get("zone"))
+        if p.get("dir") == "enter":
+            span[key] = float(p.get("span_m", 0.0))
+        elif p.get("dir") == "exit":
+            exit_step.setdefault(key, int(e.step))
+            d = float(p.get("dwell_s", 0.0))
+            s = span.pop(key, None)
+            if s is not None and d > 0.0:
+                speeds.append(s / d)
+    dens_body = [float(b["local_density"])
+                 for b in (getattr(a, "_phys_body", None) for a in sim.agents)
+                 if b and b.get("local_density") is not None]
+    blocked, body_v = [], []
+    for a in sim.agents:
+        b = getattr(a, "_phys_body", None)
+        if not b or b.get("blocked") is None:
+            continue
+        blocked.append(float(b["blocked"]))
+        # blocked = 1 − v_mean/v0 なので、実測の平均速さは v0·(1−blocked) で戻せる。
+        # ★これが基本図の縦軸で、`v_eff`(= span_m ÷ dwell_s)より信頼できる:
+        #   span_m はグラフ経路長(直前ノード起点)なので、個体が既に進んでいたぶん
+        #   過大評価になる。有界化するとその偏りが相対的に大きく出る。
+        body_v.append(desired_speed(a.id) * (1.0 - float(b["blocked"])))
+    final = {a.id: (round(float(a.x), 6), round(float(a.y), 6)) for a in sim.agents}
+    zones_out = {zid: {"occupancy_mean": round(sum(v["occ"]) / len(v["occ"]), 3),
+                       "density_mean": round(sum(v["dens"]) / len(v["dens"]), 5),
+                       "waiting_mean": round(sum(v["wait"]) / len(v["wait"]), 2),
+                       "sub_steps_mean": round(sum(v["sub"]) / len(v["sub"]), 1)}
+                 for zid, v in sorted(per_zone.items())}
+    return {
+        "occ_mean_total": round(sum(z["occupancy_mean"] for z in zones_out.values()), 3),
+        "density_mean_total": round(
+            sum(z["density_mean"] for z in zones_out.values()) / max(1, len(zones_out)), 5),
+        "waiting_mean_total": round(
+            sum(z["waiting_mean"] for z in zones_out.values()), 2),
+        "zone_occupancy_last": sc.get("zone_occupancy"),
+        "zone_density_mean_last": (round(sc["zone_density_mean"], 4)
+                                   if sc.get("zone_density_mean") is not None else None),
+        "zone_dwell_mean_s": (round(sc["zone_dwell_mean_s"], 2)
+                              if sc.get("zone_dwell_mean_s") is not None else None),
+        "enter_total": sc.get("zone_gate_enter_total"),
+        "exit_total": sc.get("zone_gate_exit_total"),
+        "by_zone": zones_out,
+        "body_density_mean": (round(sum(dens_body) / len(dens_body), 3)
+                              if dens_body else None),
+        "body_density_max": (round(max(dens_body), 3) if dens_body else None),
+        "body_blocked_mean": (round(sum(blocked) / len(blocked), 3)
+                              if blocked else None),
+        "body_speed_mean": (round(sum(body_v) / len(body_v), 4) if body_v else None),
+        "body_n": len(body_v),
+        "v_eff_mean": (round(sum(speeds) / len(speeds), 4) if speeds else None),
+        "v_eff_n": len(speeds),
+        "min_gap_m": (round(cont["min_gap_m"], 4)
+                      if cont.get("min_gap_m") is not None else None),
+        "jump_max_m": (round(cont["jump_max_m"], 4)
+                       if cont.get("jump_max_m") is not None else None),
+        "handover_jump_max_m": (round(cont["handover_jump_max_m"], 3)
+                                if cont.get("handover_jump_max_m") is not None else None),
+        "gate_accel_p99": cont.get("gate_accel_p99"),
+        "interior_accel_p99": cont.get("interior_accel_p99"),
+        "gate_reversal_rate": (round(cont["gate_reversal_rate"], 4)
+                               if cont.get("gate_reversal_rate") is not None else None),
+        "interior_reversal_rate": (round(cont["interior_reversal_rate"], 4)
+                                   if cont.get("interior_reversal_rate") is not None
+                                   else None),
+        "sep_iters_max": cont.get("sep_iters_max"),
+        "sub_steps_total": cont.get("sub_steps_total"),
+        "physics_s_per_step": round(phys_s / steps, 3),
+        "wall_s_per_step": round(wall / steps, 3),
+        "_final_xy": final,
+        "_exit_step": {f"{aid}|{zid}": st for (aid, zid), st in exit_step.items()},
+    }
+
+
+def sweep_ownership(sizes, specs, steps):
+    rows = []
+    for n in sizes:
+        base_cost = None
+        base_enter = None
+        base_xy: dict = {}
+        base_exit: dict = {}
+        for spec in specs:
+            label, _dots, x = spec
+            sim, phys_s, wall, per_zone = _own_run(n, steps, spec)
+            m = _own_metrics(sim, phys_s, wall, per_zone, steps)
+            m.update(n=n, steps=steps, config=label, ownership_max_dist_m=x)
+            xy = m.pop("_final_xy")
+            ex = m.pop("_exit_step")
+            if base_cost is None:                     # 先頭の水準が基準(通常 off = 現行)
+                base_cost, base_xy, base_exit = m["physics_s_per_step"], xy, ex
+                base_enter = m["enter_total"]
+            m["physics_speedup_x"] = (round(base_cost / m["physics_s_per_step"], 3)
+                                      if m["physics_s_per_step"] > 0 else None)
+            # ---- 捕捉率(基準の入場件数に対する比)----
+            m["capture_frac"] = (round(m["enter_total"] / base_enter, 4)
+                                 if base_enter else None)
+            # ---- 軌跡差(基準 X との正直な突き合わせ)----
+            moved = [math.hypot(xy[k][0] - base_xy[k][0], xy[k][1] - base_xy[k][1])
+                     for k in base_xy if k in xy]
+            diff = [d for d in moved if d > 1e-9]
+            m["traj_moved_agents"] = len(diff)
+            m["traj_moved_frac"] = (round(len(diff) / len(moved), 4) if moved else None)
+            m["traj_disp_mean_m"] = (round(sum(diff) / len(diff), 2) if diff else 0.0)
+            m["traj_disp_max_m"] = (round(max(diff), 2) if diff else 0.0)
+            keys = set(base_exit) | set(ex)
+            same = sum(1 for k in keys if base_exit.get(k) == ex.get(k))
+            m["exit_step_same_frac"] = round(same / len(keys), 4) if keys else None
+            m["exit_pairs_base_only"] = len(set(base_exit) - set(ex))
+            m["exit_pairs_new_only"] = len(set(ex) - set(base_exit))
+            rows.append(m)
+            print(f"  n={n:5d} {label:10s} capture={m['capture_frac']} "
+                  f"enter={m['enter_total']:5} occ_mean={m['occ_mean_total']} "
+                  f"dens_mean={m['density_mean_total']} "
+                  f"body_dens={m['body_density_mean']} dwell={m['zone_dwell_mean_s']} "
+                  f"v_body={m['body_speed_mean']} "
+                  f"gap={m['min_gap_m']} jump={m['jump_max_m']} "
+                  f"p99g={m['gate_accel_p99']} wait={m['waiting_mean_total']} "
+                  f"phys={m['physics_s_per_step']}s x{m['physics_speedup_x']} "
+                  f"moved={m['traj_moved_frac']}", flush=True)
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=os.path.join(_REPO, "experiments",
@@ -394,10 +611,37 @@ def main():
     ap.add_argument("--sep", default="",
                     help="レバーS 掃引(例 64,24,16)。指定すると crossing のみを"
                          " B+D の作業点で回し、分離パス上限だけを振る")
+    ap.add_argument("--ownership", default="",
+                    help="第155 C1 掃引(例 0,50,100,200,route)。0=無制限(現行)/ "
+                         "数値=euclid のしきい [m] / route=route_arrival。指定すると"
+                         "合成シナリオではなく **conf/zones_shibuya.yaml の実 3 ゾーンを"
+                         "本体で**回す")
+    ap.add_argument("--own-sizes", default="600,2000",
+                    help="--ownership のときの人数(既定 600,2000)")
+    ap.add_argument("--own-steps", type=int, default=12,
+                    help="--ownership のときの step 数(既定 12。mock・24 step 以内)")
     args = ap.parse_args()
     sizes = tuple(int(s) for s in args.sizes.split(",") if s.strip())
     t_total = 6.0 if args.quick else T_TOTAL
     seps = tuple(int(s) for s in args.sep.split(",") if s.strip())
+    specs = tuple(own_spec(s) for s in args.ownership.split(",") if s.strip())
+    if specs:
+        own_sizes = tuple(int(s) for s in args.own_sizes.split(",") if s.strip())
+        print(f"[bench] ownership sweep {[s[0] for s in specs]} sizes={own_sizes} "
+              f"steps={args.own_steps} profile={os.path.relpath(OWN_PROFILE, _REPO)}",
+              flush=True)
+        rows = sweep_ownership(own_sizes, specs, args.own_steps)
+        os.makedirs(args.out, exist_ok=True)
+        blob = {"meta": {"mode": "ownership", "levels": [s[0] for s in specs],
+                         "sizes": list(own_sizes), "steps": args.own_steps,
+                         "python": platform.python_version(),
+                         "numpy": np.__version__},
+                "rows": rows}
+        path = os.path.join(args.out, "levers_ownership.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(blob, f, ensure_ascii=False, indent=2)
+        print(f"[bench] wrote {path}")
+        return
     print(f"[bench] sizes={sizes} t_total={t_total}s dt_base={DT_BASE} "
           f"cognitive={args.cognitive} sep={seps or '-'}", flush=True)
     rows = (sweep_sep(sizes, t_total, seps, args.cognitive) if seps
