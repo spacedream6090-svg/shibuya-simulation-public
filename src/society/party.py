@@ -133,6 +133,13 @@ def form_parties(sim, step: int, sim_min: int) -> None:
     tier = int(cfg["tier"])
     clo = float(cfg["closeness"])
     band = [int(cfg["band_start_min"]), int(cfg["band_end_min"])]
+    n_v = len(visitors)
+    # ★連れ探索の開始位置(第153 の性能修正)。`assigned` は増える一方なので「未割当が
+    #   最初に現れる位置」は**単調に前へ進む**。従来は代表 1 人ごとに visitors を先頭から
+    #   舐め直していた(O(V²)= 250k の py-spy で form_parties が step 時間の 10.4%・
+    #   ホット行は :146 の `c.id in assigned`)。head より手前は**全員 assigned = どのみち
+    #   continue で捨てられる要素**なので、そこを飛ばしても選ばれる連れ・その順序は同一。
+    head = 0
     for leader in visitors:
         if leader.id in assigned:
             continue
@@ -140,9 +147,12 @@ def form_parties(sim, step: int, sim_min: int) -> None:
         if want < 2:
             continue
         members = [leader]
-        for c in visitors:                            # 連れ = 次の未割当来街者(id 昇順=決定論)
+        while head < n_v and visitors[head].id in assigned:
+            head += 1
+        for j in range(head, n_v):                    # 連れ = 次の未割当来街者(id 昇順=決定論)
             if len(members) >= want:
                 break
+            c = visitors[j]
             if c.id == leader.id or c.id in assigned:
                 continue
             members.append(c)

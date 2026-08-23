@@ -497,8 +497,8 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict, ordered=None) -> Non
         released = _advance_and_collect(sim, zone, members, engine)
         if released:
             _writeback(members, engine)
+            _drop_recs(members, released)   # ← 1 件ずつ remove すると dataclass `__eq__` が走る
             for rec in released:
-                members.remove(rec)
                 # この step で実際に積分した秒数(= step 途中で入場した個体でも正しい)
                 used = rec["step_n"] * dt
                 rec["elapsed_s"] += used
@@ -516,18 +516,22 @@ def _run_zone(sim, zone, step: int, sim_min: int, st: dict, ordered=None) -> Non
     # ---- (4) step 内で終わらなかった個体は状態を持ち越す(同期完了)--------- #
     if members and engine is not None:
         _writeback(members, engine)
+    forced: list = []
     for rec in list(members):
         used = rec["step_n"] * dt
         rec["elapsed_s"] += used
         _save_record(rec)
         if _maybe_force(sim, zone, rec, step, sim_min, st, used_s=used):
-            members.remove(rec)
+            forced.append(rec)              # 除去は下で 1 回(`_drop_recs` の docstring)
+    _drop_recs(members, forced)
+    forced_wait: list = []
     for rec in list(waiting):
         rec["wait_steps"] += 1
         _save_record(rec)
         st["wait_total"] += 1
         if _maybe_force_wait(sim, zone, rec, step, sim_min, st):
-            waiting.remove(rec)
+            forced_wait.append(rec)
+    _drop_recs(waiting, forced_wait)
 
     st["sub_steps_total"] += sub_done
     area = zone.walkable_area_m2 or zone.area_m2() or 1.0
@@ -602,9 +606,14 @@ def _admit(sim, zone, waiting, members, signal, sim_sec, t_in_step,
         added.append(rec)
         rec["waiting"] = False
         rec["seen_inside"] = zone.contains(px, py)
-        waiting.remove(rec)
+        # ★入場ぶんの `waiting` からの除去は**ループを抜けてから 1 回**で行う(下の
+        #   `_drop_recs`)。ここで `waiting.remove(rec)` を撃つと、目当ての要素より手前に
+        #   残っている「置けなかった」レコード 1 件ごとに dict の等値比較 → その値に
+        #   居る `Agent`(dataclass)の `__eq__` が走っていた(第153 の主犯。詳細は
+        #   `_drop_recs` の docstring)。ループ内で `waiting` を読む口は 1 つも無い
+        #   (`queue` / `members` / `added` しか見ない)ので、除去を遅らせても
+        #   判定材料は 1 ビットも変わらない。
         members.append(rec)
-        members.sort(key=lambda r: int(r["agent"].id))
         any_admitted = True
         st["enter_total"] += 1
         agent = rec["agent"]
@@ -622,7 +631,44 @@ def _admit(sim, zone, waiting, members, signal, sim_sec, t_in_step,
                                                       + float(rec["wait_steps"])
                                                       * float(sim.clock.step_seconds), 2),
                                       "waited_steps": int(rec["wait_steps"])}))
+    if any_admitted:
+        # 在場者は **agent.id 昇順**(従来は 1 体入るたびに sort していた)。id は個体ごとに
+        # 一意なので「1 体ごとに整列」も「最後に 1 回整列」も**同じ全順序**へ落ちる =
+        # 返る並びは完全に一致する。ループ内で `members` を見るのは占有判定の
+        # 「近傍に 1 体でも居るか」= bool の or だけで、並び順に依らない。
+        members.sort(key=lambda r: int(r["agent"].id))
+        _drop_recs(waiting, added)
     return any_admitted
+
+
+def _drop_recs(lst: list, drop) -> None:
+    """`for rec in drop: lst.remove(rec)` と**同値**な一括除去(比較を同一性へ落とす)。
+
+    ★第153 で潰した主犯。流入レコードは **dict** で、その値に `agent`(= `Agent` は
+      `@dataclass`)が入っている。`list.remove(rec)` は先頭から `==` を掛けるので、
+      目当ての要素より手前にある 1 件ごとに `dict.__eq__` → `Agent.__eq__`
+      (dataclass 生成 = 全フィールドのタプルを 2 本作ってから比べる)が走っていた。
+      250k の py-spy では `_admit` の `waiting.remove` 行が step 時間の 11.3%、その
+      子フレーム `__eq__ (<string>:4)` が 10.9% として現れる(合わせて ~22%)。
+      実測(待ち 2,000 体・半数入場): remove だけで 2.19 秒 / `Agent.__eq__` 499,500 回。
+
+    同値である理由: 流入レコードは agent 1 体につき 1 個で、`agent` の `id` は相異なる。
+    `dict.__eq__` は値まで見る(= `agent` 同士を比べる)ので、**相異なるレコードが
+    `==` になることはない**。したがって `list.remove` が見つける「最初の等値要素」は
+    必ず同一オブジェクトそのもの = 同一性で選んでも、取り除かれる要素も残る順序も
+    完全に一致する。念のため前提が崩れた場合(同一性で全部が見つからない・`drop` に
+    同じオブジェクトが 2 度入っている)は**従来の `remove` へそのまま後退**する。
+    """
+    if not drop:
+        return
+    marks = {id(r) for r in drop}
+    if len(marks) == len(drop):
+        kept = [r for r in lst if id(r) not in marks]
+        if len(lst) - len(kept) == len(marks):
+            lst[:] = kept
+            return
+    for rec in drop:                       # 保険(従来と 1 バイト同じ経路)
+        lst.remove(rec)
 
 
 _ADMIT_HASH_MIN = 48      # 在場者がこれ以下なら素の総当たりの方が安い(結果は同一)

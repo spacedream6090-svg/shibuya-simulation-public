@@ -54,6 +54,12 @@ linked-cell / spatial hashing の定石は **セル寸法 ≈ 相互作用半径
   **粗格子(現行コード)へそのまま落ちる** = 大半径クエリ(叫び 30/40m・既定半径)に
   性能退行が起こりえない(構造で保証)。radius=40 / cell=5 なら r ≤ 20m が細格子。
 
+  判定②(局所の混み具合。`_FINE_MIN_GAIN` / conf `world.perception_fine_gate`):
+  細セル化が買うのは「要素あたりの仕事」だけでクエリ 1 本の固定費は減らないので、
+  **疎な近傍では細格子が純損**になる。そこで粗格子 9 セルの在圏数から削減できる要素数を
+  見積もり、しきい値を超えるときだけ細格子へ回す。**しきい値をどこに置いても返り値は同一**
+  (下記)= 速さだけのつまみ。既定は実装定数(2,000)で、conf に書けば index ごとに差し替わる。
+
 **どちらの格子を通っても返り値は同一**(集合が同じ + 選抜規則が入力順に依らない:
 id は一意なので `lexsort((ids, d2))` も `argsort(ids)` も全順序)。テストが総当たりで機械照合する。
 
@@ -128,7 +134,17 @@ _FINE_AREA_MARGIN = 4.0
 #   (実測: 0.013 人/m² で 0.7 倍 = 3 割遅い)。そこで粗格子 9 セルの在圏数から
 #   「削減できる要素数」を見積もり、6 µs / 2.8 ns ≈ 2,000 要素を超えるときだけ細格子へ回す。
 #   = 密な夕方のセルだけが細格子を通り、夜間・郊外セルは現行経路のまま(退行しえない)。
+#   ★第153: この 2,000 は 25k 実測の当て推量だった。250k では**同じ密度帯の絶対数が違う**
+#     ので、しきい値そのものを conf(`world.perception_fine_gate`)から差せるようにした。
+#     既定はこの 2,000 のまま = 現行と 1 ビットも変わらない(門は集合を変えず、
+#     どちらの格子を通っても返り値は同一)。
 _FINE_MIN_GAIN = 2000.0
+
+# 出荷時 conf(`world.perception_fine_gate`)に書いてある数。**この数がそのまま書いて
+# あるときは「実装既定に従う」= 上の定数を問い合わせ時に読む**(= 定数が唯一の真実)。
+# こうしておくと「既定値を明示的に書いたラン」と「キーを書かないラン」が構造的に同値になり、
+# 既存の道具・テストが `_FINE_MIN_GAIN` を差し替えて門を開け閉めする作法もそのまま効く。
+_FINE_GATE_CONF_DEFAULT = 2000.0
 
 # 粗格子の走査オフセット。**現行の `for dx in (-1, 0, 1)` と同一のタプル**(順序も同一)。
 _RING1: tuple[int, ...] = (-1, 0, 1)
@@ -245,10 +261,13 @@ def _bounded_pick(nb, sx: float, sy: float, sid: int, radius: float,
                   cap: int, box_prefilter: bool = True) -> list:
     """連結済み近傍 (xs, ys, ids, flat) から「半径内 → 最寄り cap 人」を選ぶ(ベクトル化)。
 
-    ★既定枝(`box_prefilter=True`)は第149 の `_hearers_bounded` 本体から**1 文字も変えずに**
-      切り出したもの(粗格子と細格子で同じ関数を通す = 2 経路が将来にわたって食い違えない
-      構造)。演算の順序も丸めも同一なので既定経路の返り値はバイト一致。**入力の並び順に依らない**:
-      id は一意なので `lexsort((ids, d2))` も `argsort(ids)` も全順序 = 格子が変わっても同じ答え。
+    ★既定枝(`box_prefilter=True`)は第149 の `_hearers_bounded` 本体から切り出したもの
+      (粗格子と細格子で同じ関数を通す = 2 経路が将来にわたって食い違えない構造)。
+      第153 で**判定式を保ったまま numpy 呼び出しだけを畳んだ**(下の ① の註記。等価性は
+      tests/test_hotpath_fixes.py が第152 の逐語コピーと総当たりで機械照合する)。
+      半径判定は `np.hypot`(= `math.hypot` と同一の丸め)のままなので集合はバイト一致。
+      **入力の並び順に依らない**: id は一意なので `lexsort((ids, d2))` も `argsort(ids)` も
+      全順序 = 格子が変わっても同じ答え。
 
     `box_prefilter=False`(細格子だけが使う)は ① の外接正方形を省く縮退。判定式は
     「np.hypot <= radius かつ id != sid」で ① 有りと**厳密に同じ集合**(① は
@@ -267,33 +286,60 @@ def _bounded_pick(nb, sx: float, sy: float, sid: int, radius: float,
     # ① 外接正方形で粗く落とす(hypot(dx,dy) >= max(|dx|,|dy|) なので**厳密に等価**な
     #    前フィルタ)。声の段階(5m)のように半径がセル幅(40m)より小さいとき、
     #    高価な hypot に渡す要素数が桁で減る。
-    box = np.flatnonzero((np.abs(dx_a) <= radius) & (np.abs(dy_a) <= radius)
-                         & (ids != sid))
+    #    ★第153 の畳み込み: 判定式は同じまま **近傍全長(N)を舐める回数を 10 → 7** に減らす。
+    #      (a) `(|dx|<=r) & (|dy|<=r)` は `max(|dx|,|dy|) <= r` と**厳密に等価**
+    #          (有限座標では両辺が同じ bool。-0.0 も abs で 0.0 に潰れる)ので、
+    #          比較 2 本 + and 1 本 → maximum 1 本 + 比較 1 本に畳める。
+    #      (b) 自分自身の除外 `ids != sid` は N 要素の比較 + and だったが、外接正方形を
+    #          通った要素は(半径 5m / セル幅 40m では)全体の数 % しか無い。**通過後**に
+    #          掛ければ同じ集合・同じ昇順のまま、その 2 本が小さい配列の仕事になる。
+    ax = np.abs(dx_a)
+    np.maximum(ax, np.abs(dy_a), out=ax)
+    box = np.flatnonzero(ax <= radius)
     if box.size == 0:
         return []
     # ② 半径判定は np.hypot(= math.hypot と同一の丸め)= ループ実装と同じ集合。
-    keep = box[np.hypot(dx_a[box], dy_a[box]) <= radius]
+    ids_b = ids[box]
+    hit = (np.hypot(dx_a[box], dy_a[box]) <= radius) & (ids_b != sid)
+    keep = box[hit]
     n = int(keep.size)
     if n == 0:
         return []
-    return _bounded_rank(dx_a, dy_a, ids, flat, keep, n, cap)
+    # `ids[keep]` は既に手元にある(`ids_b[hit]`)ので選抜側で取り直さない。
+    return _bounded_rank(dx_a, dy_a, ids, flat, keep, n, cap, ids_b[hit])
 
 
-def _bounded_rank(dx_a, dy_a, ids, flat, keep, n: int, cap: int) -> list:
-    """半径内に残った添字 `keep` から「最寄り cap 人 → id 昇順」を返す(第149 と同一の規則)。"""
+def _bounded_rank(dx_a, dy_a, ids, flat, keep, n: int, cap: int, ids_k=None) -> list:
+    """半径内に残った添字 `keep` から「最寄り cap 人 → id 昇順」を返す(第149 と同一の規則)。
+
+    ★第153 の畳み込み(**値は 1 ビットも変えない**。numpy 呼び出し 24 本 → 17 本):
+      - `ids[keep]` / `dx_a[keep]` / `dy_a[keep]` を 1 度だけ取って使い回す
+        (従来は cap 枝で `dx_a[keep]` 2 回・`dy_a[keep]` 2 回・`ids[keep]` 2 回)。
+        `ids_k` は呼び手が既に持っていれば受け取る(`_bounded_pick` の外接正方形経路)。
+      - しきい値は `argpartition` で cap 件の窓を切って `max` を取っていたが、それは
+        定義上「cap 番目に小さい距離二乗」= `np.partition(d2, cap-1)[cap-1]` そのもの
+        (どちらも配列中の**同じ要素の値**で、演算を 1 つも挟まない)。4 呼び → 2 呼び。
+      - 最終の並べ替えは keep 空間の添字で行ってから 1 度だけ実体化する
+        (`ids[chosen]` を取り直さない)。返す個体の並びは従来と同一。
+      - 個体の取り出しは `.tolist()`(= Python int)経由にして、numpy スカラーごとの
+        `int()` 変換を落とす。参照する `flat` の要素は同じ。
+    """
+    if ids_k is None:
+        ids_k = ids[keep]
     if cap <= 0 or n <= cap:
-        sel = keep[np.argsort(ids[keep], kind="stable")]     # id 昇順(従来の並び)
-        return [flat[int(i)] for i in sel]
-    # 順位鍵は距離二乗(S15 と同一)。argpartition で cap 件の窓を切り、境界の同値だけ
+        sel = keep[np.argsort(ids_k, kind="stable")]         # id 昇順(従来の並び)
+        return [flat[i] for i in sel.tolist()]
+    # 順位鍵は距離二乗(S15 と同一)。cap 番目の順序統計量でしきい値を切り、境界の同値だけ
     # 厳密に (距離二乗, id) で並べ直す = 全体ソートを避けた O(n) 選抜(決定論)。
-    d2 = dx_a[keep] * dx_a[keep] + dy_a[keep] * dy_a[keep]
-    part = np.argpartition(d2, cap - 1)[:cap]
-    thresh = float(d2[part].max())
+    dx_k = dx_a[keep]
+    dy_k = dy_a[keep]
+    d2 = dx_k * dx_k + dy_k * dy_k
+    thresh = float(np.partition(d2, cap - 1)[cap - 1])
     cand = np.flatnonzero(d2 <= thresh)
-    order = np.lexsort((ids[keep][cand], d2[cand]))
-    chosen = keep[cand[order[:cap]]]
-    chosen = chosen[np.argsort(ids[chosen], kind="stable")]  # 返りは id 昇順
-    return [flat[int(i)] for i in chosen]
+    order = np.lexsort((ids_k[cand], d2[cand]))
+    sel = cand[order[:cap]]
+    sel = sel[np.argsort(ids_k[sel], kind="stable")]         # 返りは id 昇順
+    return [flat[i] for i in keep[sel].tolist()]
 
 
 class PerceptIndex:
@@ -305,9 +351,11 @@ class PerceptIndex:
     """
 
     __slots__ = ("radius", "_inv", "cells", "_occ", "_np", "_nb", "_nc",
-                 "cell_m", "_finv", "_fcells", "_fnp", "_fnb", "_fring", "_load")
+                 "cell_m", "_finv", "_fcells", "_fnp", "_fnb", "_fring", "_load",
+                 "fine_gain")
 
-    def __init__(self, radius: float, occluder=None, cell_m: float = 0.0):
+    def __init__(self, radius: float, occluder=None, cell_m: float = 0.0,
+                 fine_gain=None):
         self.radius = float(radius)
         self._inv = (1.0 / self.radius) if self.radius > 0 else 0.0
         self.cells: dict[tuple, list] = {}
@@ -337,6 +385,11 @@ class PerceptIndex:
         self._fnb: dict[tuple, tuple] = {}      # (ctx, cx, cy, ring) → 連結済み近傍
         self._fring: dict[float, tuple] = {}    # 半径 → (リング半径, 面積比)の記憶
         self._load: dict[tuple, int] = {}       # 粗セル → 近傍 9 セルの在圏数
+        # 細格子へ回す門の「削減できる要素数」しきい値(`world.perception_fine_gate`)。
+        # **None(既定)= 実装既定 `_FINE_MIN_GAIN` を問い合わせ時に読む** = 現行と完全同一
+        # (モジュール定数が唯一の真実のまま = 既存のテスト/道具がその定数を差し替えて
+        #  門を開け閉めする従来の作法をそのまま保つ)。
+        self.fine_gain = None if fine_gain is None else float(fine_gain)
 
     def _cell_xy(self, x: float, y: float) -> tuple[int, int]:
         return (math.floor(x * self._inv), math.floor(y * self._inv))
@@ -531,7 +584,10 @@ class PerceptIndex:
         cx, cy = self._cell_xy(speaker.x, speaker.y)
         if ring:
             # 局所の混み具合で最終判断(疎な近傍では細格子が純損 = `_FINE_MIN_GAIN` の注記)。
-            if (self._coarse_load(ctx, cx, cy) * (1.0 - _ratio)) < _FINE_MIN_GAIN:
+            gain = self.fine_gain
+            if gain is None:                 # 既定 = 実装既定(= 現行と完全同一)
+                gain = _FINE_MIN_GAIN
+            if (self._coarse_load(ctx, cx, cy) * (1.0 - _ratio)) < gain:
                 ring = 0
             else:
                 cx, cy = (math.floor(speaker.x * self._finv),
@@ -603,8 +659,13 @@ class PerceptIndex:
         # ① 外接正方形で粗く落とす(**判定の揺らぎ幅 hi まで広げた**厳密に安全な前フィルタ:
         #    |dx| > hi なら math.hypot も必ず radius を超える)。近傍は 3 セル幅 = 半径の
         #    3 倍なので、これだけで高価な hypot に渡す要素が半分以下になる。
-        box = np.flatnonzero((np.abs(dxa) <= hi) & (np.abs(dya) <= hi)
-                             & (ids != int(sid)))
+        #    ★第153: `(|dx|<=hi) & (|dy|<=hi)` は `max(|dx|,|dy|) <= hi` と**厳密に等価**
+        #      (有限座標では両辺が同じ bool)。近傍全長を舐める回数が 1 本減る。
+        #      ここでは自分自身の除外(`ids != sid`)は**外に出さない**: 話者が索引に載って
+        #      いない場合(睡眠・範囲外)があるので「最後に 1 引く」が成り立たないため。
+        ax = np.abs(dxa)
+        np.maximum(ax, np.abs(dya), out=ax)
+        box = np.flatnonzero((ax <= hi) & (ids != int(sid)))
         if box.size == 0:
             return 0
         h = np.hypot(dxa[box], dya[box])
@@ -710,8 +771,34 @@ def cell_m_of(sim) -> float:
     return v
 
 
+_UNSET = object()
+
+
+def fine_gate_of(sim):
+    """`world.perception_fine_gate` を遅延解決して sim にキャッシュする(既定 2000 = 現行同一)。
+
+    返すのは **None(= 実装既定 `_FINE_MIN_GAIN` に従う)** か明示の float。
+    出荷時の既定値(`_FINE_GATE_CONF_DEFAULT`)がそのまま書いてあるときは None を返す =
+    「既定値を明示したラン」と「キーを書かないラン」が構造的に同値。
+    キャッシュ属性 `_percept_fine_gate` は L1/L2/乱数のどこにも現れない(`cell_m_of` と同型)。
+    値は「細格子へ回すのに要求する候補削減の絶対数(要素数)」。**返り値には一切影響しない**
+    (粗格子/細格子のどちらを通っても同じ集合・同じ順序 = 選抜規則が入力順に依らない)。"""
+    v = getattr(sim, "_percept_fine_gate", _UNSET)
+    if v is _UNSET:
+        try:
+            world = sim.cfg.get("world", {}) or {}
+            raw = world.get("perception_fine_gate", None)
+            v = None if raw is None else float(raw)
+            if v == _FINE_GATE_CONF_DEFAULT:
+                v = None                                # = 実装既定に従う(現行と完全同一)
+        except Exception:                               # noqa: BLE001 (旧 config 互換)
+            v = None
+        sim._percept_fine_gate = v
+    return v
+
+
 def build_index(agents, radius_m: float, occluder=None,
-                cell_m: float = 0.0) -> PerceptIndex:
+                cell_m: float = 0.0, fine_gain=None) -> PerceptIndex:
     """位置が確定した時点の全 agent から空間索引を1回だけ構築する。
 
     occluder(既定 None)を渡すと索引経由の hearers に視線遮蔽を効かせる。None のときは
@@ -720,8 +807,13 @@ def build_index(agents, radius_m: float, occluder=None,
     cell_m(既定 0.0)= 細格子のセル寸法 [m]。0 のときは細格子を一切持たない
     (= 現行と完全に同一の索引)。> 0 でも構築は**最初の細格子クエリまで遅延**するので、
     有界経路を通らないランでは追加コストが 1 命令も発生しない。
+
+    fine_gain(既定 None = 実装既定 `_FINE_MIN_GAIN` = 2000)= 細格子へ回す門のしきい値
+    (`world.perception_fine_gate`)。**返り値には一切影響しない**(どちらの格子を通っても
+    同じ集合・同じ順序)= 速さだけのつまみ。cell_m=0 のランでは 1 度も読まれない。
     """
-    idx = PerceptIndex(radius_m, occluder=occluder, cell_m=cell_m)
+    idx = PerceptIndex(radius_m, occluder=occluder, cell_m=cell_m,
+                       fine_gain=fine_gain)
     for a in agents:
         idx.add(a)
     return idx
