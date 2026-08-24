@@ -1385,6 +1385,18 @@ FEATURES: tuple[Feature, ...] = (
        "注入点は 1 箇所で、節は 1 つ(重複挿入なし)。"
        "既定 OFF は 4 purpose すべてのプロンプトが現行とバイト一致"),
 
+    # ---- タイムライン1件の本文截断(第157補・day-1ゲート)----
+    # affects_k=False: 呼び出し点・乱数とも不変(変わるのはプロンプト文字列の長さだけ)。
+    # fingerprint_risk=possible: プロンプト本文の族(prompts.* 既存と同じ等級)。
+    # 背景: RT 連鎖(「RT @A: RT @B: …」)は深さ無上限で、1 件が 16,000 字に達して
+    #   vLLM のコンテキスト上限(8,192tok)超過 → HTTP 400 → 発話呼が欠落する実測
+    #   (finals 250k/400k 実機・2026-08-24)。件数は lod.input_res の feed_n が絞るが
+    #   **1 件の長さ**はここが唯一の口。
+    _f("prompts.feed_item_max_chars", "strict", False, "possible",
+       "タイムライン(SNS)1 件の本文をプロンプトに載せる際の最大文字数。超過は先頭から"
+       "切って「…」を付す(RT 連鎖の深さ爆発への防波堤)。0=無制限(現行とバイト一致)",
+       off_value=0),
+
     # ---- transit_ride(live のみ外部プロセス=none)----
     _f("transit_ride.taxi.enabled", "strict", False, "none",
        "タクシー乗車(遠距離+所持金で低確率。専用 stream)"),

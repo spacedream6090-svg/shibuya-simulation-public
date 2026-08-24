@@ -1395,6 +1395,10 @@ prompts:
   #   rev 0499c3a・温度0.9・リクエストseed=β11同型・成果物凍結=ランの決定論不変)。
   #   OFF(false)+pool.backstory_dir=""で現行1バイト同一(レーンB 30テストで機械固定)。
   backstory_enabled: true
+  # ★第157補(8/24 day-1ゲート実測): RT連鎖でタイムライン1件が16,189字に達しvLLM 400
+  #   →発話呼欠落(2件/80分・SNSカスケードは日数で深まる=放置で悪化)。140字=SNS原文の
+  #   実勢(Twitter系)に一致・feed_n(3-5件)×140字で行全体≤~700字に有界化。戻し方: 0。
+  feed_item_max_chars: 140
   variety_hint: true
   reflect_variety: false   # 実LLM検収で丸写し(placeholder echo)33% = 正味悪化のため OFF 据え置き
   dialog_history: true

@@ -3008,10 +3008,18 @@ def _feed_texts(sim, agent, step: int, sim_min: int) -> list[str]:
     なので、ON では 1 件も渡さない([] = build_prompt が TL 行を出さない)。既読マーク等の
     net 側の進行は timeline() を呼ぶこと自体で従来どおり進む(= 呼数・イベントは不変)。"""
     out = []
+    # 第157補: RT 連鎖(深さ無上限)で 1 件が 16,000 字に達し vLLM の 8,192tok を超過
+    # → HTTP 400 で発話呼が欠落する実測(finals 実機)。件数は feed_n が絞るが長さは
+    # ここが唯一の口。既定 0=無制限=現行バイト一致。
+    cap = int((getattr(sim.cfg, "prompts", None) or {}).get("feed_item_max_chars", 0)
+              or 0)
     for p in infoenv_mod.timeline(sim, agent, step, sim_min):
         meta = sim.agent_by_id.get(p["author"])
         who = "公式" if p["author"] == -1 or meta is None else meta.name
-        out.append(f"@{who}: {p['text']}")
+        text = p["text"]
+        if cap > 0 and len(text) > cap:
+            text = text[:cap] + "…"
+        out.append(f"@{who}: {text}")
     return [] if ablate_mod.propagation_off(sim) else out
 
 
