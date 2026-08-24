@@ -1606,6 +1606,15 @@ prompts:
   # ★実装 src/society/cognition/prompt_p1.py。検収 tests/test_prompt_p1.py。
   p1:
     enabled: false            # ★ON 推奨(本番): true(finals_observe.yaml で ON)
+  # ---- ペルソナ過去情報の注入(レーンB。既定 OFF=1 行も足さない=バイト一致)----
+  # 正典: src/society/world/backstory.py。ON にすると、pool.backstory_dir から読んだ
+  # 「その人のこれまで」をプロンプトの**自己紹介(ペルソナ行)の直後**へ 1 節として差し込む
+  # (接頭辞「これまでのこと: 」。発話・返答・朝の計画・夜の内省・recall の全 purpose に
+  #  同一に効く = build_prompt を共有しているので注入点は 1 箇所)。
+  # ★pool.backstory_dir(載せる)と本キー(見せる)を分けてあるので、
+  #   「読み込みは効いているがプロンプトには出ない」A/B がそのまま取れる。
+  # ★変わるのは**プロンプト文字列だけ**: LLM 呼数・乱数消費・発火列は ON/OFF で完全一致(R1)。
+  backstory_enabled: false
 
 # ---- 交通機関: タクシー+簡易バス(ユーザー要望 2026-07-06)----
 # 電車の高度化(GTFS 実ダイヤ・駅構内)は API 申請待ちのため保留(transit.gtfs_dir 参照)。
@@ -1872,6 +1881,15 @@ pool:
   dir: data/persona_pool     # P5 生成物(L1-L5 シャード + meta.json)のルート
   present_cap: 300           # 日次の総在場数の上限(層優先で充足)。ON 時は N=在場数
   dormant_cap: 0             # ドーマント退避ストアの上限(0=無制限)。>0 で LRU 退避(有界=persona-pool §3.3)
+  # ---- ペルソナ過去情報のサイドカー(レーンB。既定 ""=OFF=1 バイトも読まない=バイト一致)----
+  # 正典: src/society/world/backstory.py の docstring。事前生成した「その人のこれまで」を
+  # 層別 JSONL(gz 可。1 行 = {"pid": …, "backstory": …})で置いたディレクトリを指す。
+  # プール個体の実体化(day0 着席 / 日境界ローテーション / hydrate 再入の全経路が通る
+  # build_pool_agent)で pid 辞書引きして agent.backstory へ据える。**プール生成物にも
+  # record の中身にも 1 バイトも触らない**(= 736MB のシャードを作り直さずに足せる)。
+  # サイドカーに無い pid は無音で骨格ペルソナのまま(層ごとに警告 1 行 + 実数は stats())。
+  # ★これは「載せる」トグル。プロンプトへ「見せる」かは prompts.backstory_enabled(別トグル)。
+  backstory_dir: ""          # 例: data/persona_backstory_v2
   # ---- 退避スリム状態の台帳幅(第86バッチ保守 M-3。既定=現行値=挙動不変)----
   relations_cap: 20          # 退避する関係台帳の件数(接触回数の多い上位)。
                              #   ★dunbar(relations.dunbar)ON との相互作用: 休眠した関係は

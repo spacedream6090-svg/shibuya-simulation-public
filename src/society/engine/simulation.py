@@ -30,6 +30,7 @@ from ..world.routing import Router
 from ..world.transit import Transit
 from ..world import presence as presence_mod
 from ..world import pool as pool_mod
+from ..world import backstory as backstory_mod
 from ..world import floors as _floors_mod
 from ..world import calendar as _calendar_mod
 from .. import worldview as _wv_mod
@@ -1177,6 +1178,15 @@ class Simulation:
         self._dormant = None                # DormantStore(退場者のスリム状態退避)
         self._pool_day = 0                  # 日境界ローテーションの進行管理(day0 は init で着席済み)
         self._pool_nodes = nodes            # rotation の build_pool_agent が使う出発ノード候補
+        # ---- ペルソナ過去情報のサイドカー(レーンB・既定 OFF=None=全 seam が no-op)----
+        # 正典: src/society/world/backstory.py の docstring。pool.backstory_dir が空(既定)なら
+        # 1 バイトも読まず、agent に属性を 1 つも生やさない = L1 バイト一致。
+        # ★ロード(pool.backstory_dir)とプロンプト挿入(prompts.backstory_enabled)を
+        #   **別トグル**にしてあるのは、A/B で「載せたこと」と「見せたこと」を分離するため
+        #   (第137 V-P1 と同じ seam の作法)。
+        self._backstory = None
+        self._backstory_prompt = bool(
+            (cfg.get("prompts", {}) or {}).get("backstory_enabled", False))
         poolcfg = cfg.get("pool", {}) or {}
         # ---- pool 経路の org 配属(第109 レーン ORG。既定 OFF=None=完全 no-op)------------
         # organizations.attach は「名簿ファイル → 配属ファイル」でしか配属を引けないので、
@@ -1195,6 +1205,9 @@ class Simulation:
             if not pool_dir.is_absolute():
                 pool_dir = REPO_ROOT / pool_dir
             self._pool = pool_mod.PoolStore(pool_dir)
+            # サイドカー(既定 "" = None = build_pool_agent の 1 行が即 return)。
+            # ★day0 の着席(下の build_pool_agent ループ)より前に据える必要がある。
+            self._backstory = backstory_mod.store_of(poolcfg, repo_root=REPO_ROOT)
             self._pool_present_cap = int(poolcfg.get("present_cap", 300))
             # 層別クォータ(DP-U3 案A。既定 OFF=従来の層優先 break=選抜集合が現行と完全一致)。
             self._pool_tier_quota = bool(
@@ -1976,6 +1989,11 @@ class Simulation:
                             flat=self.flatcfg,
                             dt_min=self.dt_min)
         agent.pool_pid = pid
+        # ペルソナ過去情報(レーンB。既定 OFF=_backstory is None=1 行も通らない=属性なし)。
+        # ★ここに置く理由: day0 の着席・日境界ローテーション・hydrate 再入の**全ての実体化**が
+        #   build_pool_agent を通るので、プールが回っても入れ替わった個体に必ず付く。
+        #   検索キーは pool_pid(= record["id"])で、record 本体は 1 バイトも書き換えない。
+        self._apply_backstory(agent, record)
         # 第114 レーン 1b: 名簿の is_foreign / visit_purpose を個体へ控える(既定 OFF=
         # society_diversity.record_driven が false=属性を 1 つも生やさない)。★ここに置くのは
         # day0 の着席では下の _init_pool_agent_extras が早期 return するため(あちらだけに
@@ -2020,6 +2038,33 @@ class Simulation:
         from .. import population as _population_mod
         _population_mod.apply_on_entry(self, agent, record)
         return agent
+
+    def _apply_backstory(self, agent, record: dict) -> None:
+        """サイドカーの過去情報を個体へ据える(既定 OFF は 1 行も通らない)。
+
+        - `agent.backstory` … 本文(**サイドカーに在るときだけ**生やす)。欠損 pid は無音で
+          何も生やさない = そのまま骨格ペルソナで進む(store が層ごとに警告 1 行を出し、
+          実数は `self._backstory.stats()` の n_hit / n_miss が持つ)。
+        - `agent.backstory_prompt` … プロンプトへ差し込む合図(`prompts.backstory_enabled`)。
+          `deliberate.build_prompt` はこの 2 つを getattr で読むだけ = cognition 層は
+          conf も sim も見ない(`ontology_line` / `org_line` と同じ流儀)。
+        ★**プール record にも roster digest にも影響しない**: record は読むだけ、
+          `friends.cache_key` が読む欄(id/pid/age/occupation/org/home)には触らない
+          = friend graph のディスクキャッシュは 1 バイトも動かない。
+        ★搬送: 本文はプール由来の**不変属性**なので dehydrate/hydrate では運ばない
+          (再来街のたびに同じサイドカーから同じ文字列が付き直す = 二重の真実源を作らない)。
+          checkpoint は `sim.agents` を丸ごと pickle するので resume でも失われない。
+        """
+        store = self._backstory
+        if store is None:
+            return
+        text = store.get(str(getattr(agent, "pool_pid", "") or ""),
+                         str(record.get("layer", "") or ""))
+        if not text:
+            return
+        agent.backstory = text
+        if self._backstory_prompt:
+            agent.backstory_prompt = True
 
     # ---------------------------------------------- 起動時1回の配布 → 入場駆動(ブロック2)
     # ★なぜ要るか: 下の族はどれも ``__init__`` の一本道で「その瞬間 sim.agents に居た個体」

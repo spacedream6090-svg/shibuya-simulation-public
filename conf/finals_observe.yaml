@@ -146,6 +146,11 @@ pool:
   #   下の「切り替えると何が変わるか」表は 8/24 の meta と一致を再照合済み。
   #   v1 へ戻すのはこの 1 行: dir: data/persona_pool
   dir: data/persona_pool_v2
+  # ★第156: ペルソナ肉付けサイドカー(層別jsonl.gz・pid→過去情報2-3文)。生成来歴は
+  #   data/persona_backstory_v2/meta.json が正典(モデル/served名/servers/層割当/seed設計/
+  #   温度/プロンプト版/重複率)。読むのはpid/backstoryの2欄のみ・プール本体は不触。
+  #   欠損pidは無音で骨格のみ(層ごとにWARNING 1行)。OFFへ戻す=この1行を "" に。
+  backstory_dir: data/persona_backstory_v2
                            # ★L2 の record は台帳の org_id/role を持つ = organizations の
                            #   pool 配属(attach_record)と work.bind_workplace の入力そのもの
   # ======================================================================== #
@@ -1380,6 +1385,12 @@ conversation:
 #   truth_ledger.max_beliefs_per_agent(S8)… **既に 32 で有界**(config.yaml で宣言済み・
 #     truth_ledger は凍結 SPEC_FILES)。新しい cap は要らない。
 prompts:
+  # ★第156(8/24 ユーザー発案採用): 事前生成ペルソナ肉付け(過去情報2-3文)を自己紹介節へ
+  #   挿入(「これまでのこと: 」節・deliberate.build_prompt=全purpose共通の1箇所)。
+  #   生成=scripts/build_persona_backstory.py(mass=Qwen3-8B×5/core L1+L3=Qwen3-32B-AWQ
+  #   rev 0499c3a・温度0.9・リクエストseed=β11同型・成果物凍結=ランの決定論不変)。
+  #   OFF(false)+pool.backstory_dir=""で現行1バイト同一(レーンB 30テストで機械固定)。
+  backstory_enabled: true
   variety_hint: true
   reflect_variety: false   # 実LLM検収で丸写し(placeholder echo)33% = 正味悪化のため OFF 据え置き
   dialog_history: true

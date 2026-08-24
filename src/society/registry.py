@@ -1373,6 +1373,17 @@ FEATURES: tuple[Feature, ...] = (
        "1 プロンプト 1 つにする)+ ペルソナ直後の規律 3 行(人物設定の優先・捏造禁止・"
        "直前の反復禁止)。deliberate のヘッダは 1 バイトも変えない。"
        "既定 OFF は 4 purpose すべてのプロンプトが現行とバイト一致"),
+    # ---- ペルソナ過去情報(レーンB。正典 src/society/world/backstory.py)----
+    # affects_k=False: LLM の呼び出し点は 1 つも増減せず、乱数も 1 本も引かない
+    #   (変わるのはプロンプト文字列だけ = 呼数・発火列は ON/OFF で完全一致)。
+    # fingerprint_risk=possible: プロンプト本文に 1 節増える族(prompts.* の既存 4 件と同じ
+    #   等級)。中身は当人の来歴だけで、機構語・実験条件語・因子名は 1 語も含まない。
+    _f("prompts.backstory_enabled", "strict", False, "possible",
+       "事前生成したペルソナ過去情報(pool.backstory_dir のサイドカー)を、プロンプトの"
+       "**自己紹介行の直後**へ 1 節(接頭辞「これまでのこと: 」)として差し込む。"
+       "発話・返答・朝の計画・夜の内省・recall の全 purpose が build_prompt を共有するので"
+       "注入点は 1 箇所で、節は 1 つ(重複挿入なし)。"
+       "既定 OFF は 4 purpose すべてのプロンプトが現行とバイト一致"),
 
     # ---- transit_ride(live のみ外部プロセス=none)----
     _f("transit_ride.taxi.enabled", "strict", False, "none",
@@ -1419,6 +1430,21 @@ FEATURES: tuple[Feature, ...] = (
        "ため pool.enabled と同じ扱いにする。pool.enabled が OFF なら 1 バイトも効かない子トグル"
        "だが、ON 時は在場の層構成を作り替えるので独立に宣言する。"
        "既定 OFF では quota 経路を 1 度も通らない=現行の層優先と選抜集合が完全一致"),
+    # ---- ペルソナ過去情報のサイドカー(レーンB。正典 src/society/world/backstory.py)----
+    # off_value="": 自動 OFF は「サイドカーを読まない」= 属性が 1 つも生えない状態へ落とす。
+    # affects_k=False: プール個体の実体化時に pid で辞書引きするだけ。generate() の
+    #   呼び出し点も乱数 stream も 1 本も動かない(在場集合も 1 人も変わらない)。
+    # fingerprint_risk=possible: prompts.backstory_enabled と併せて ON のときだけ
+    #   プロンプト本文が 1 節増える(本キー単独ではプロンプトは 1 バイトも変わらない)。
+    _f("pool.backstory_dir", "strict", False, "possible",
+       "事前生成したペルソナ過去情報(層別 JSONL。1 行 = {pid, backstory})のディレクトリ。"
+       "プール個体の実体化(day0 着席 / 日境界ローテーション / hydrate 再入の全経路が通る"
+       "build_pool_agent)で pid 辞書引きして agent.backstory へ据える。**プール生成物にも"
+       "record の中身にも friends.cache_key の roster digest にも 1 バイトも触らない**。"
+       "欠損 pid は無音で骨格ペルソナのまま(層ごとに警告 1 行 + stats() の n_hit/n_miss)。"
+       "層別に遅延読み(最初に要る層だけ RAM に載る)。"
+       "既定 \"\" は 1 バイトも読まず属性を 1 つも生やさない = L1 バイト一致",
+       off_value=""),
     _f("pool.presence.mode", "strict", True, "none",
        "在場の内生化 A2(PRES)。quota(既定)= 現行の present_cap 充足経路 / emergent = "
        "**cap を一切見ない**(quota_by_ratio も通らない)= 当日の資格者がそのまま在場者。"

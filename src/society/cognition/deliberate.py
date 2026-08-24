@@ -104,6 +104,15 @@ def _equip_section(agent, venture_cost: float) -> str:
     return "\n".join((_EQUIP_INTRO, *_EQUIP_LINES, venture))
 
 
+# ペルソナ過去情報の節(レーンB。`pool.backstory_dir` + `prompts.backstory_enabled` の
+# 両方が ON のときだけ個体に属性が生える = 既定は getattr 1 回で素通り = バイト一致)。
+# ★接頭辞は `ablate.SECTIONS` のどれとも重ならない**新しい 1 種**。プラセボの文脈節には
+#   入れない: 中身は「他者・社会環境から受け取ったもの」ではなく**自分由来の静的プロファイル**
+#   であり、ペルソナ行と同じ扱いが正しい(society/ablate.py の除外基準そのまま)。
+# ★no-fingerprint: 機構語も実験条件語も因子名も 1 文字も含まない固定の接頭辞のみ。
+BACKSTORY_PREFIX = "これまでのこと: "
+
+
 _ACTIVITY_JP = {"working": "仕事中", "commuting": "通勤の途中",
                 "eating": "食事中", "shopping": "買い物中"}
 
@@ -204,6 +213,17 @@ def build_prompt(agent, *, place_name: str, surprise: str | None,
     if p1_purpose is not None:
         _head = _p1_header(p1_purpose, base=_head, city_name=city_name)
     lines = [_head, agent.persona]
+    # ペルソナ過去情報(レーンB・既定 OFF は属性が生えない = getattr 1 回で素通り =
+    # 出力バイト一致)。**自己紹介(ペルソナ行)の直後**に置く: 人物設定の続きなので
+    # 塊を割らず、Lost in the Middle(arXiv:2307.03172)の言う先頭側に収まる。
+    # ★V-P1 の規律 3 行はこの節の**後ろ**へ回る。1 行目「人物設定(すぐ上の自己紹介)を…」の
+    #   「すぐ上」が指すのはペルソナ + 過去情報の塊で、どちらも人物設定なので矛盾しない。
+    # ★全 purpose(発話・返答・朝の計画・夜の内省・recall)が build_prompt を共有するので、
+    #   注入点はここ 1 つで足りる(節は 1 つ = 重複挿入は起きない)。
+    if getattr(agent, "backstory_prompt", False):
+        _bs = getattr(agent, "backstory", "")
+        if _bs:
+            lines.append(BACKSTORY_PREFIX + _bs)
     if p1_purpose is not None:
         lines += _p1_discipline()
     # ATT 層B(第143・cognition.attention_block・既定 OFF は None=1行も足さない=バイト一致)。
