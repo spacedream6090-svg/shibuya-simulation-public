@@ -41,7 +41,9 @@
 # ============================================================================
 run:
   seed_auto: true          # 観察ラン=実験者が seed を選ばない(採取して config/summary に記録)
-  n_agents: 250000         # pool ON では present_cap が実効。名目 N も揃えておく(smoke_wide と同じ流儀)
+  n_agents: 400000         # ★第157(ユーザー指示 8/24): 250,000の制限を撤廃し400,000の**軽い上限**へ。
+                           #   v2平日資格者270,255<400,000=capは実質非拘束・在場人口は需要駆動で自然変動。
+                           #   pool ON では present_cap が実効。名目 N も揃えておく(smoke_wide と同じ流儀)
   n_steps: 1440            # 10日 = 144 step/日 × 10(Δt=10 分)。8/16-8/26 の本線
   dt_min: 10               # ★正準。≠10 は「別の世界」= 触らない
   start_tod: "00:00"       # day 境界=深夜0時。natural_start と併せて初日から全員に朝計画が出る
@@ -257,7 +259,9 @@ pool:
   #   (d) is_foreign を 0.15 → 0.30 に上げたが、engine 側の society_diversity.record_driven
   #       が ON でなければ language には効かない。
   # ======================================================================== #
-  present_cap: 250000      # 在場 = 25万(DP-U3 本線)
+  present_cap: 400000      # ★第157(ユーザー指示 8/24): 25万の制限を撤廃し40万の**軽い上限**へ。
+                           #   v2平日資格者270,255<400,000=非拘束(安全天井としてのみ機能)。
+                           #   在場人口は presence 機構の需要駆動で自然変動する。旧値=250000(DP-U3本線)。
   dormant_cap: 50000       # ★既定 0(無制限)は日次ローテーションで際限なく膨れる。LRU で有界化
   # ---- 層別クォータ(第98 小粒G・DP-U3 案A)----
   # OFF だと平日は workday_shift が cap を食い切り cadence/stochastic が 0 人=来街者ゼロの街に
@@ -1537,6 +1541,18 @@ sns_geo:
 lod:
   input_res:
     enabled: true
+    # ★第157(8/24 day-1ゲート・ユーザー指示=リサーチして値設定): 「近くにいる人」行の
+    #   無上限列挙が250k+v2深夜の建物密集で54,000字に達しvLLM 400(8,192tok超過)→
+    #   deliberate~13%欠落を確認。mid/wideのpeople_n=0(全列挙)を文献値で有界化:
+    #   narrow=2(既定・不変)/mid=**5**(Cowan 2001純容量4±1・MOT 4-5個=個体化追跡の帯)/
+    #   wide=**15**(Dunbar内層15・Sutcliffe 2012=社会時間の60%投下先・c2_neighbors_max=15と整合)。
+    #   2→5→15は層比≈3(Zhou 2005)とも一致。群衆の規模感は crowd_visual(ON)の別行が
+    #   「集団1チャンク」として保存するため情報欠損なし(attention-cognitive-foundations.md §1)。
+    #   ★levelsを書くと既定levelsを**置換**する(lod.py:45-51)ため3水準全て明記(narrowは{}=既定継承)。
+    levels:
+      narrow: {}
+      mid: {people_n: 5}
+      wide: {people_n: 15}
   # n_proportional は入れない: 25万 × 0.15 = 37,500 呼/step。LLM 予算は DP-U4(呼数)の決定事項で、
   # 8/15-16 の診断ランで R_eff を実測してから決める。
   n_proportional:
