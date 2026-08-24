@@ -7,7 +7,8 @@ data/persona_pool_v2(100万人)の各ペルソナへ、LLM が書いた過去情
 
 出力
 ----
-    <out>/<layer>.jsonl.gz   1 行 = {"pid","backstory","model","seed","prompt_sha","elements"[,"retry"]}
+    <out>/<layer>.jsonl.gz   1 行 = {"pid","backstory","model","seed","prompt_sha","elements"
+                                     [,"retry" | ,"rescue"]}
     <out>/<layer>.failed.jsonl  検品に落ちた pid と理由(再実行で再挑戦される。追記)
     <out>/meta.json          生成 config の全記録(温度・プロンプト版・モデル・層別件数・時刻・重複率)
 
@@ -58,6 +59,18 @@ servers/model は**未指定で良い**(`/v1/models` プローブもその段で
 --------------------------------------------------------------------
   ① mass 段(いま動いているサーバだけで L2+L4+L5): --layers L2,L4,L5 + --mass-* のみ
   ② core 段(大きいモデルが起動してから L1+L3): --layers L1,L3 + --core-* のみ
+
+救済(`--rescue N`)= 恒常失敗の回収
+-----------------------------------
+`<layer>.failed.jsonl` に残った pid **だけ**を対象に、試行 k=1..N で
+
+  * seed 塩 …… `blake2b(seed, pid, "backstory", "rescue<k>")`(本番の "" / "retry" とも別列)
+  * 要素組合せ …… `pick_elements(pid, seed, attempt=k)` = **別の切り口**で書かせる
+  * 字数の駄目押し 1 行(実測の恒常失敗理由 = short 対策)
+
+を順に試す。成功したら本体 jsonl.gz へ追記して failed から外し、**全 attempt 落ちた個体
+だけ**が failed に残る(理由と `rescue_attempts` を更新)。全部回収できたら failed
+ファイル自体を消す。seed 列も要素列も (pid, k) の純関数なので、再実行すれば同じ列を辿る。
 """
 from __future__ import annotations
 
@@ -137,9 +150,14 @@ def stable_seed(seed: int, pid: str, purpose: str = "backstory",
     return _stable_h(str(int(seed)), pid, purpose, ordinal) & _SEED_MASK
 
 
-def pick_elements(pid: str, seed: int) -> tuple[int, int]:
-    """pid ハッシュで ELEMENTS から**相異なる 2 つ**を選ぶ(順序も個体で変わる)。"""
-    h = _stable_h(str(int(seed)), "elements", pid)
+def pick_elements(pid: str, seed: int, attempt: int = 0) -> tuple[int, int]:
+    """pid ハッシュで ELEMENTS から**相異なる 2 つ**を選ぶ(順序も個体で変わる)。
+
+    `attempt`(救済の試行番号 1..N)を混ぜると**別の切り口**の組合せに回る。
+    ★attempt=0(本番パス)は材料を 1 つも足さない = 従来と同一値(決定論の保存)。
+    """
+    material = ("elements", pid) if not attempt else ("elements", pid, f"a{int(attempt)}")
+    h = _stable_h(str(int(seed)), *material)
     n = len(ELEMENTS)
     i = h % n
     j = (i + 1 + (h // n) % (n - 1)) % n      # i != j を構成的に保証
@@ -205,10 +223,15 @@ def skeleton_lines(rec: dict) -> list[str]:
     return out
 
 
-def build_prompt(rec: dict, seed: int) -> tuple[str, str, tuple[str, str]]:
-    """(system, user, 選ばれた要素ラベル 2 つ)。同じ record・同じ seed なら常に同一。"""
+def build_prompt(rec: dict, seed: int,
+                 attempt: int = 0) -> tuple[str, str, tuple[str, str]]:
+    """(system, user, 選ばれた要素ラベル 2 つ)。同じ record・同じ seed なら常に同一。
+
+    `attempt`(救済の試行番号 1..N)が入ると、要素の組合せが回り、字数の駄目押しが 1 行
+    足される(= 別の切り口・別の長さ圧で書かせる)。★attempt=0 は従来と 1 バイト同一。
+    """
     pid = str(rec["id"])
-    i, j = pick_elements(pid, seed)
+    i, j = pick_elements(pid, seed, attempt)
     (la, ha), (lb, hb) = ELEMENTS[i], ELEMENTS[j]
     gender = {"男": "男性", "女": "女性"}.get(str(rec.get("gender", "")), str(rec.get("gender", "")))
     head = f"【人物】{rec.get('name', '')}({rec.get('age', '')}歳・{gender})"
@@ -222,6 +245,9 @@ def build_prompt(rec: dict, seed: int) -> tuple[str, str, tuple[str, str]]:
         f"1. {la}({ha})\n"
         f"2. {lb}({hb})\n"
         f"【出力】この人物の来歴を日本語で2〜3文・{TARGET_MIN}〜{TARGET_MAX}字。本文だけ。"
+        # 救済パスだけの駄目押し(恒常失敗の実測理由 = short = 1 文で切り上げてしまう)
+        + (f"\n【字数厳守】2 文以上書き、全体で必ず {TARGET_MIN} 字以上 {TARGET_MAX} 字以内。"
+           if attempt else "")
     )
     return SYSTEM_PROMPT, user, (la, lb)
 
@@ -374,6 +400,36 @@ class Runner:
                         "retried": bool(ordinal)}
         return {"ok": False, "pid": pid, "reason": reason or "unknown",
                 "prompt_sha": sha, "tokens": tokens, "retried": True}
+
+    def run_rescue(self, rec: dict, group: Group, attempts: int) -> dict:
+        """恒常失敗個体の救済。試行ごとに seed 塩と要素組合せを変えて N 回まで引く。
+
+        seed 列 = `blake2b(seed, pid, "backstory", "rescue<k>")` の純関数 = 再実行で同じ列。
+        """
+        pid = str(rec["id"])
+        tokens = 0
+        reason = "unknown"
+        sha = ""
+        for a in range(1, int(attempts) + 1):
+            system, user, elements = build_prompt(rec, int(self.cfg.seed), attempt=a)
+            sha = prompt_sha(system, user)
+            seed = stable_seed(int(self.cfg.seed), pid, "backstory", f"rescue{a}")
+            raw, tok = self._call(group, pid, system, user, seed)
+            tokens += tok
+            if raw.startswith("__error__"):
+                reason = raw[len("__error__"):]
+                continue
+            text = normalize(raw)
+            reason = check(text) or ""
+            if not reason:
+                line = {"pid": pid, "backstory": text, "model": group.model,
+                        "seed": seed, "prompt_sha": sha,
+                        "elements": list(elements), "rescue": a}
+                return {"ok": True, "line": line, "tokens": tokens,
+                        "attempts": a, "retried": True}
+        return {"ok": False, "pid": pid, "reason": reason or "unknown",
+                "prompt_sha": sha, "tokens": tokens,
+                "attempts": int(attempts), "retried": True}
 
 
 # ---------------------------------------------------------------- 入出力
@@ -652,6 +708,161 @@ def run_layer(layer: str, group: Group, cfg: argparse.Namespace,
     }
 
 
+def _read_failed(path: Path) -> tuple[dict, list]:
+    """failed.jsonl → (pid → 最後の行, 読めなかった生行)。pid が同じ行は後勝ちで畳む。"""
+    rows: dict = {}
+    broken: list = []
+    if not path.exists():
+        return rows, broken
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        if not raw.strip():
+            continue
+        try:
+            rec = json.loads(raw)
+            pid = str(rec.get("pid", "") or "")
+        except ValueError:
+            broken.append(raw)
+            continue
+        if pid:
+            rows[pid] = rec
+        else:
+            broken.append(raw)
+    return rows, broken
+
+
+def rescue_layer(layer: str, group: Group, cfg: argparse.Namespace,
+                 out_dir: Path) -> dict | None:
+    """`<layer>.failed.jsonl` に居る pid だけを、試行ごとに条件を変えて拾い直す。
+
+    * 成功 → 本体 `<layer>.jsonl.gz` へ追記し、failed から**外す**。
+    * 全 attempt 失敗 → failed に残す(理由と試行回数を更新)。
+    * 既に本体へ入っている pid(前回の救済で回収済み)は撃たずに failed から外すだけ。
+    None を返すのは「その層に failed が無い = 何もしない」場合。
+    """
+    out_path = out_dir / f"{layer}.jsonl.gz"
+    fail_path = out_dir / f"{layer}.failed.jsonl"
+    rows, broken = _read_failed(fail_path)
+    if not rows and not broken:
+        return None
+    attempts = int(cfg.rescue)
+    done, seen, dups = load_done(out_path)
+    already = sorted(pid for pid in rows if pid in done)     # 既に本体に在る
+    pending = sorted(pid for pid in rows if pid not in done)
+    limit = int(cfg.limit) if int(cfg.limit) > 0 else 0
+    if limit:
+        pending = pending[:limit]
+    targets = set(pending)
+    # プールを 1 度だけ流して対象 record を拾う(救済対象は少数=保持して良い)
+    recs = [rec for rec in iter_pool(cfg.pool, layer)
+            if str(rec.get("id")) in targets]
+    found = {str(r["id"]) for r in recs}
+
+    prog = Progress(len(recs), cfg.progress_s)
+    prog.skipped = len(already)
+    prog.start(f"{layer}(rescue x{attempts}/{group.name}/{group.model})")
+    runner = Runner(cfg)
+    lengths: list[int] = []
+    rescued: set[str] = set()
+    still: dict = {}
+    t0 = time.time()
+    inflight: set = set()
+    bound = max(2, int(cfg.concurrency) * 2)
+
+    def drain(fut_set, fh) -> None:
+        nonlocal dups
+        for fut in fut_set:
+            res = fut.result()
+            prog.bump(ok=res["ok"], tokens=res["tokens"], retried=True)
+            if res["ok"]:
+                line = res["line"]
+                key = dup_key(line["backstory"])
+                if key in seen:
+                    dups += 1
+                else:
+                    seen.add(key)
+                lengths.append(len(line["backstory"]))
+                fh.write(json.dumps(line, ensure_ascii=False) + "\n")
+                fh.flush()
+                rescued.add(line["pid"])
+            else:
+                base = dict(rows.get(res["pid"], {"pid": res["pid"]}))
+                base.update({"reason": res["reason"],
+                             "prompt_sha": res["prompt_sha"],
+                             "rescue_attempts": res["attempts"]})
+                still[res["pid"]] = base
+
+    fh = _Appender(out_path, gz=True, compresslevel=int(cfg.compresslevel))
+    try:
+        with ThreadPoolExecutor(max_workers=int(cfg.concurrency)) as pool:
+            for rec in recs:
+                inflight.add(pool.submit(runner.run_rescue, rec, group, attempts))
+                if len(inflight) >= bound:
+                    ready, inflight = wait(inflight, return_when=FIRST_COMPLETED)
+                    drain(ready, fh)
+            while inflight:
+                ready, inflight = wait(inflight, return_when=FIRST_COMPLETED)
+                drain(ready, fh)
+    finally:
+        prog.stop()
+        fh.close()
+    prog.emit()
+
+    # failed.jsonl を書き直す。残すのは (a) 全 attempt 落ちた個体 (b) 今回撃たなかった個体
+    #   = プールに居ない pid / --limit で後回しにした pid / 壊れた生行。
+    keep: list[str] = []
+    for pid, rec in rows.items():
+        if pid in rescued or pid in already:
+            continue                                   # 回収済み = 落とす
+        if pid in still:
+            keep.append(json.dumps(still[pid], ensure_ascii=False))
+        elif pid not in found and pid in targets:      # プールに居ない = 正直に残す
+            row = dict(rec)
+            row["reason"] = "not_in_pool"
+            keep.append(json.dumps(row, ensure_ascii=False))
+        else:
+            keep.append(json.dumps(rec, ensure_ascii=False))
+    keep += broken
+    tmp = fail_path.with_suffix(".jsonl.tmp")
+    if keep:
+        tmp.write_text("\n".join(keep) + "\n", encoding="utf-8")
+        tmp.replace(fail_path)
+    else:                                              # 全部回収した = 空ファイルを残さない
+        if tmp.exists():
+            tmp.unlink()
+        fail_path.unlink(missing_ok=True)
+
+    elapsed = time.time() - t0
+    lengths.sort()
+    return {
+        "layer": layer,
+        "group": group.name,
+        "model": group.model,
+        "mode": "rescue",
+        "rescue_attempts": attempts,
+        "targets": len(rows),
+        "attempted": len(recs),
+        "rescued": len(rescued),
+        "remaining": len(keep),
+        "already_in_body": len(already),
+        "skipped_existing": len(already),
+        "written": len(rescued),
+        "failed": len(still),
+        "retried": prog.retry,
+        "completion_tokens": prog.tokens,
+        "elapsed_s": round(elapsed, 1),
+        "rate_per_s": round(prog.n / elapsed, 2) if elapsed > 0 else 0.0,
+        "length_chars": ({
+            "min": lengths[0], "p50": lengths[len(lengths) // 2],
+            "p95": lengths[min(len(lengths) - 1, int(len(lengths) * 0.95))],
+            "max": lengths[-1],
+            "mean": round(sum(lengths) / len(lengths), 1),
+        } if lengths else {}),
+        "duplicate_lines": dups,
+        "unique_backstories": len(seen),
+        "duplicate_rate": round(dups / max(1, len(seen) + dups), 6),
+    }
+
+
 # ---------------------------------------------------------------- CLI
 def _servers(text: str) -> list[str]:
     return [s.strip().rstrip("/") for s in str(text).split(",") if s.strip()]
@@ -682,6 +893,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--max-tokens", type=int, default=200)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--limit", type=int, default=0, help="層ごとの上限件数(0=全件)")
+    p.add_argument("--rescue", type=int, default=0, metavar="N",
+                   help=("救済モード: failed.jsonl の pid だけを、試行ごとに seed 塩と"
+                         "要素組合せを変えて N 回まで引き直す(0=通常生成)"))
     p.add_argument("--only-ids", type=Path, default=None,
                    help=("この pid 集合だけを生成(JSON {\"ids\":[...]} / 配列 / 1 行 1 pid)。"
                          "例: プール同梱の llm_targets.json"))
@@ -750,6 +964,8 @@ def main(argv: list[str] | None = None) -> int:
         "length_band_chars": [LEN_MIN, LEN_MAX],
         "length_target_chars": [TARGET_MIN, TARGET_MAX],
         "concurrency": int(cfg.concurrency),
+        "mode": ("rescue" if int(cfg.rescue) > 0 else "generate"),
+        "rescue_attempts": int(cfg.rescue),
         "only_ids": (None if cfg.only_ids is None else
                      {"path": str(cfg.only_ids), "count": len(cfg.only_ids_set or ())}),
         "groups": {
@@ -784,8 +1000,15 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"[bs] {layer}: プールに層が無い→スキップ", file=sys.stderr)
                 continue
             group = core if layer in core_layers else mass
-            total = int(pool_counts.get(layer, 0) or 0)
-            meta["layers"].append(run_layer(layer, group, cfg, out_dir, total))
+            if int(cfg.rescue) > 0:            # 救済モード = failed.jsonl の pid だけ
+                stat = rescue_layer(layer, group, cfg, out_dir)
+                if stat is None:
+                    print(f"[bs] {layer}: failed.jsonl が無い→スキップ", file=sys.stderr)
+                    continue
+            else:
+                total = int(pool_counts.get(layer, 0) or 0)
+                stat = run_layer(layer, group, cfg, out_dir, total)
+            meta["layers"].append(stat)
             meta["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
             meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=1),
                                  encoding="utf-8")
@@ -812,8 +1035,21 @@ def main(argv: list[str] | None = None) -> int:
         "completion_tokens": sum(x["completion_tokens"] for x in meta["layers"]),
         "elapsed_s": round(sum(x["elapsed_s"] for x in meta["layers"]), 1),
     }
+    if int(cfg.rescue) > 0:                   # 救済の収支(対象/回収/残)
+        meta["rescue"] = {
+            "attempts": int(cfg.rescue),
+            "targets": sum(x.get("targets", 0) for x in meta["layers"]),
+            "attempted": sum(x.get("attempted", 0) for x in meta["layers"]),
+            "rescued": sum(x.get("rescued", 0) for x in meta["layers"]),
+            "remaining": sum(x.get("remaining", 0) for x in meta["layers"]),
+        }
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=1),
                          encoding="utf-8")
+    if int(cfg.rescue) > 0:
+        r = meta["rescue"]
+        print(f"[bs] 救済完了 対象={r['targets']} 回収={r['rescued']} "
+              f"残={r['remaining']} → {out_dir}", file=sys.stderr)
+        return 0
     print(f"[bs] 完了 written={meta['totals']['written']} "
           f"failed={meta['totals']['failed']} → {out_dir}", file=sys.stderr)
     return 0

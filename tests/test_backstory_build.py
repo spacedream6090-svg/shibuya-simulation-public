@@ -225,7 +225,7 @@ def test_end_to_end_schema_and_routing(pool: Path, tmp_path: Path):
     assert len(core.hits) == 6 and len(mass.hits) == 8      # 層割当が守られている
     for line in l1 + l2:
         assert set(line) <= {"pid", "backstory", "model", "seed", "prompt_sha",
-                             "elements", "retry"}
+                             "elements", "retry", "rescue"}
         assert {"pid", "backstory", "model", "seed", "prompt_sha"} <= set(line)
         assert bb.check(line["backstory"]) is None
         assert len(line["elements"]) == 2
@@ -438,6 +438,114 @@ def test_model_probe_recorded(pool: Path, tmp_path: Path):
     probe = json.loads((out / "meta.json").read_text(encoding="utf-8")
                        )["groups"]["core"]["probe"]
     assert probe[0]["id"] == "stub-core" and probe[0]["max_model_len"] == 8192
+
+
+# ---------------------------------------------------------------- 救済(--rescue)
+def test_rescue_varies_seed_and_elements_per_attempt():
+    """試行ごとに seed 列と要素組合せが変わる。★attempt=0 は従来と 1 バイト同一。"""
+    rec = _rec("L1_00000000", "L1")
+    base = bb.build_prompt(rec, 42)
+    assert bb.build_prompt(rec, 42, attempt=0) == base       # 本番パスは不変
+    assert bb.pick_elements("L1_00000000", 42, 0) == bb.pick_elements("L1_00000000", 42)
+    shas = {bb.prompt_sha(*base[:2])}
+    seeds = {bb.stable_seed(42, "L1_00000000"),
+             bb.stable_seed(42, "L1_00000000", "backstory", "retry")}
+    combos = set()
+    for k in range(1, 6):
+        s, u, _ = bb.build_prompt(rec, 42, attempt=k)
+        assert bb.build_prompt(rec, 42, attempt=k) == (s, u, _)   # 決定論
+        shas.add(bb.prompt_sha(s, u))
+        seeds.add(bb.stable_seed(42, "L1_00000000", "backstory", f"rescue{k}"))
+        combos.add(bb.pick_elements("L1_00000000", 42, k))
+        assert "字数厳守" in u                                # short 対策の駄目押し
+    assert len(shas) == 6 and len(seeds) == 7                 # 全部相異なる列
+    assert len(combos) >= 3                                   # 切り口が回っている
+
+
+def test_rescue_recovers_and_prunes_failed(pool: Path, tmp_path: Path):
+    """救済成功 → 本体へ追記 + failed から除去(全部拾えたらファイル自体を消す)。"""
+    out = tmp_path / "out"
+    # 1 回目: 全件 short で落とす
+    _, core_url = _start_stub("stub-core", lambda req, i: "短い経歴。")
+    _, mass_url = _start_stub("stub-mass", lambda req, i: "短い経歴。")
+    _run(pool, out, core_url, mass_url, "--layers", "L1")
+    assert _lines(out / "L1.jsonl.gz") == []
+    assert len((out / "L1.failed.jsonl").read_text(encoding="utf-8").splitlines()) == 6
+
+    # 2 回目: rescue2 の seed でだけ合格文を返す = 1 回目の試行は落ち 2 回目で拾う
+    ok_seeds = {bb.stable_seed(42, f"L1_{i:08d}", "backstory", "rescue2")
+                for i in range(6)}
+    core2, core2_url = _start_stub(
+        "stub-core", lambda req, i: _good_text(i) if req["seed"] in ok_seeds else "短い。")
+    rc = bb.main(["--pool", str(pool), "--out", str(out), "--layers", "L1",
+                  "--core-layers", "L1", "--core-servers", core2_url,
+                  "--core-model", "stub-core", "--rescue", "3",
+                  "--concurrency", "4", "--progress-s", "0",
+                  "--http-retries", "0", "--no-probe"])
+    assert rc == 0
+    lines = _lines(out / "L1.jsonl.gz")
+    assert len(lines) == 6 and len(core2.hits) == 12          # 6 人 × 2 試行で決着
+    for line in lines:
+        assert line["rescue"] == 2
+        assert line["seed"] == bb.stable_seed(42, line["pid"], "backstory", "rescue2")
+        assert bb.check(line["backstory"]) is None
+    assert not (out / "L1.failed.jsonl").exists()             # 全部回収 = 残さない
+    meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
+    assert meta["mode"] == "rescue"
+    assert meta["rescue"] == {"attempts": 3, "targets": 6, "attempted": 6,
+                              "rescued": 6, "remaining": 0}
+    assert meta["layers"][0]["mode"] == "rescue"
+
+
+def test_rescue_keeps_hopeless_pids_in_failed(pool: Path, tmp_path: Path):
+    """全 attempt 落ちた個体だけが failed に残る(理由と試行回数を更新)。"""
+    out = tmp_path / "out"
+    _, core_url = _start_stub("stub-core", lambda req, i: "")
+    _, mass_url = _start_stub("stub-mass", lambda req, i: "")
+    _run(pool, out, core_url, mass_url, "--layers", "L1")
+    core2, core2_url = _start_stub("stub-core", lambda req, i: "")
+    rc = bb.main(["--pool", str(pool), "--out", str(out), "--layers", "L1",
+                  "--core-layers", "L1", "--core-servers", core2_url,
+                  "--core-model", "stub-core", "--rescue", "3",
+                  "--concurrency", "4", "--progress-s", "0",
+                  "--http-retries", "0", "--no-probe"])
+    assert rc == 0
+    assert _lines(out / "L1.jsonl.gz") == []
+    assert len(core2.hits) == 18                             # 6 人 × 3 試行
+    rows = [json.loads(x) for x in
+            (out / "L1.failed.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 6
+    assert {x["rescue_attempts"] for x in rows} == {3}
+    assert {x["reason"] for x in rows} == {"empty"}
+    meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
+    assert meta["rescue"]["rescued"] == 0 and meta["rescue"]["remaining"] == 6
+
+
+def test_rescue_is_idempotent_for_already_recovered(pool: Path, tmp_path: Path):
+    """本体に既に在る pid は撃たずに failed から外すだけ(2 度目の救済は無害)。"""
+    out = tmp_path / "out"
+    _, core_url = _start_stub("stub-core", lambda req, i: "短い経歴。")
+    _, mass_url = _start_stub("stub-mass", lambda req, i: "短い経歴。")
+    _run(pool, out, core_url, mass_url, "--layers", "L1")
+    # 本体へ 1 人だけ手で入れてから救済 → その 1 人は撃たれない
+    body = _lines(out / "L1.jsonl.gz")
+    assert body == []
+    import gzip as _gz
+    with _gz.open(out / "L1.jsonl.gz", "at", encoding="utf-8") as fh:
+        fh.write(json.dumps({"pid": "L1_00000000", "backstory": _good_text(1),
+                             "model": "stub-core", "seed": 1,
+                             "prompt_sha": "x" * 16}, ensure_ascii=False) + "\n")
+    core2, core2_url = _start_stub("stub-core", lambda req, i: "短い。")
+    bb.main(["--pool", str(pool), "--out", str(out), "--layers", "L1",
+             "--core-layers", "L1", "--core-servers", core2_url,
+             "--core-model", "stub-core", "--rescue", "1", "--concurrency", "4",
+             "--progress-s", "0", "--http-retries", "0", "--no-probe"])
+    assert len(core2.hits) == 5                              # 6 - 既に在る 1 人
+    rows = [json.loads(x) for x in
+            (out / "L1.failed.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert {x["pid"] for x in rows} == {f"L1_{i:08d}" for i in range(1, 6)}
+    stat = json.loads((out / "meta.json").read_text(encoding="utf-8"))["layers"][0]
+    assert stat["already_in_body"] == 1 and stat["attempted"] == 5
 
 
 # ---------------------------------------------------------------- 2 段運用
