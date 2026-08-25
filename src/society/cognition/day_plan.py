@@ -1067,6 +1067,12 @@ def apply(sim, agent, step: int, sim_min: int, response: str,
     from ..observer import gt_extras as _gt
     if _gt.enabled(sim):
         _payload.update(_gt.plan_extras(plan, blocks))
+    # PPF 夜間計画プリフェッチ(planning.day_plan.prefetch。既定 OFF では印そのものが
+    # 生えない = キーを生やさない = L1 バイト一致)。「この計画は就寝中に前倒しで
+    # 立てたぶんである」を 1 欄だけ残す(記録専用 = 読んで分岐する行はどこにも無い)。
+    from . import plan_prefetch as _ppf
+    if _ppf.marked(sim):
+        _payload["prefetch"] = True
     sim.logger.log(Event(step=step, sim_min=sim_min, agent_id=agent.id,
                          kind="plan_created", x=agent.x, y=agent.y,
                          llm_call_id=call_id, payload=_payload))

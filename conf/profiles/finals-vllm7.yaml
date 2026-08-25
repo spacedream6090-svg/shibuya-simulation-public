@@ -37,7 +37,9 @@ model:
   # 切られていた(実LLMの壊れ67%の第一容疑=予算切断)。finals_observe.yaml と同値の 896 に
   # 揃える(★この model: ブロックを finals_observe へ貼る運用のため、ここが 448 のままだと
   # 黙って旧値へ戻る。freeze_config 前に必ず一致確認)。
-  plan_max_tokens: 896
+  # 第159: 896 → 1152。本番実測で 14B plan の 6.56% が 896 打ち切り→全損(壊れた JSON→
+  # 再試行なし→骨格落ち)。1152 で全損 0 を実測。finals_observe.yaml と同値を維持。
+  plan_max_tokens: 1152
   plan_temperature: 0.3    # 第137 V-P1(構造出力の安定・deliberate/reply は temperature を維持)
   recall_temperature: 0.2  # 第137 V-P1
   reflect_max_tokens: 768
@@ -73,12 +75,10 @@ model:
         - "http://localhost:8005"   # GPU5  14B
         - "http://localhost:8006"   # GPU6  14B
       model: "qwen3:14b"
-    plan:                   # 朝の一日計画 = 構造化出力(rng_key "plan/<agent>/<step>[/retry]")
-      urls:
-        - "http://localhost:8005"   # GPU5  14B
-        - "http://localhost:8006"   # GPU6  14B
-      model: "qwen3:14b"
-    default:                # deliberate / reply / speak / recall / ... = 8B ×5 で捌く
+    # 第159: plan ティア撤去=plan は艦隊既定(8B×5)へ。根拠は finals_observe.yaml 側の
+    # 同コメント(A8=品質同点・14B 全損 6.56%・8B plan 型 9.9 呼/s=壁時計 4.4x)。
+    # 戻すには reflect: と同型の plan: ブロック(8005/8006・qwen3:14b)を復元。
+    default:                # deliberate / reply / speak / plan / recall / ... = 8B ×5 で捌く
       - "http://localhost:8000"
       - "http://localhost:8001"
       - "http://localhost:8002"

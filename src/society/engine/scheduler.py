@@ -79,6 +79,7 @@ from ..cognition import engaged as engaged_mod
 from ..cognition import fire as fire_mod
 from ..cognition import perception_contract as contract_mod
 from ..cognition import plan_boundary as boundary_mod
+from ..cognition import plan_prefetch as prefetch_mod
 from ..cognition import plasticity as plasticity_mod
 from ..cognition import prompt_p1 as prompt_p1_mod
 from ..cognition import watch as watch_mod
@@ -1000,22 +1001,59 @@ def _phase_planning(sim, step: int, sim_min: int) -> None:
     if bool(bl.get("enabled", False)):
         _phase_planning_batched(sim, step, sim_min,
                                 workers=int(bl.get("workers", 8)))
-        return
-    if sim.budget.tiers:                           # DPH-B(既定 OFF=この分岐に入らない)
+    elif sim.budget.tiers:                         # DPH-B(既定 OFF=この分岐に入らない)
         _phase_planning_tiered(sim, step, sim_min)
+    else:
+        for agent in sim.agents:
+            if agent.plan_step != step:
+                continue
+            agent.plan_step = -1
+            if agent.loc == "outside" or agent.sleeping:
+                starvation_mod.note_plan_skipped(   # DPH-O ③(OFF は即 return=不変)
+                    sim, agent, step, sim_min,
+                    "outside" if agent.loc == "outside" else "sleeping")
+                continue
+            # 行間補間(P2 S2): 前回発火以降の客観ダイジェスト。OFF は None=注入せず不変。
+            planning.make_plan(sim, agent, step, sim_min, _place_of(sim, agent),
+                               interstitial_digest=_isl_take(sim, agent))
+    # PPF 夜間計画プリフェッチ(既定 OFF=即 return=1 バイトも動かない)。上の 3 経路の
+    # **どれを通った後でも同じ位置**に置く: 当日ぶんの予約を捌き切った後の余りの予算で、
+    # まだ寝ている人の当日計画を前倒しする(既存のスキップ規則は 1 バイトも触っていない)。
+    _phase_plan_prefetch(sim, step, sim_min)
+
+
+def _phase_plan_prefetch(sim, step: int, sim_min: int) -> None:
+    """PPF: 夜間(日付確定後)に就寝中の個体の**当日**計画を先行生成する(既定 OFF=no-op)。
+
+    正典・設計・正直な限界は `cognition/plan_prefetch.py` の module docstring を読むこと
+    (記憶参照 step のずれ / 行間ダイジェストの消費点 / 内省完了の近似 / motif の抽選 step)。
+
+    ここが足すのは**入り口 1 つだけ**である:
+      - 生成は起床時とまったく同じ `planning.make_plan`(プロンプト構築・検証・修復・適用)
+      - 簿記も同じ(`plan_day` を今日にする = 起床時の `_schedule_plan` が予約を立てない)
+      - 予算も同じ `sim.budget.take("plan")`(life レーン。starvation の計上も既存と同一)
+    予算が尽きたら**静かに翌 step へ**譲る(その個体は従来どおり起床時に予約される)=
+    取り零しの新しいモードを作らない。既存の sleeping/outside スキップ
+    (`_phase_planning` / `_phase_planning_tiered`)は 1 バイトも触っていない。
+    """
+    if not prefetch_mod.enabled(sim):
         return
-    for agent in sim.agents:
-        if agent.plan_step != step:
-            continue
-        agent.plan_step = -1
-        if agent.loc == "outside" or agent.sleeping:
-            starvation_mod.note_plan_skipped(       # DPH-O ③(OFF は即 return=不変)
-                sim, agent, step, sim_min,
-                "outside" if agent.loc == "outside" else "sleeping")
-            continue
-        # 行間補間(P2 S2): 前回発火以降の客観ダイジェスト。OFF は None=注入せず不変。
-        planning.make_plan(sim, agent, step, sim_min, _place_of(sim, agent),
-                           interstitial_digest=_isl_take(sim, agent))
+    if not prefetch_mod.in_window(prefetch_mod.cfg_of(sim), sim_min):
+        return
+    picks = prefetch_mod.pick(sim, step, sim_min, prefetch_mod.budget_room(sim))
+    if not picks:
+        return
+    today = int(sim_min) // 1440
+    for agent in picks:
+        if not sim.budget.take("plan"):
+            break                                  # レーンが尽きた = この step はここまで
+        agent.plan_day = today                     # 起床時の再予約を既存ガードで抑止する
+        prefetch_mod.mark_begin(sim)               # L1 の印(ON のときだけ 1 欄増える)
+        try:
+            planning.make_plan(sim, agent, step, sim_min, _place_of(sim, agent),
+                               interstitial_digest=_isl_take(sim, agent))
+        finally:
+            prefetch_mod.mark_end(sim)
 
 
 def _defer_first(agent, attr: str, step: int) -> int:

@@ -94,8 +94,11 @@ model:
   #    のままで、plan_temperature / recall_temperature を持たない。本選は「finals-vllm7 の
   #    model: をこちらへ貼る」手順なので、**貼るときに下の 3 行を消さないこと**
   #    (消すと V-P1 の予算・温度だけが無言で元へ戻る)。freeze_config の出力で
-  #    `model.plan_max_tokens` が 896 であることを起動前に必ず目視する。
-  plan_max_tokens: 896
+  #    `model.plan_max_tokens` の値を起動前に必ず目視する。
+  # ★★ 第159: 896 → 1152。本番実測で 14B plan の 6.56%(859/13,086件)が 896 打ち切り→
+  #    壊れた JSON→再試行なし→骨格落ち=GPU を使い切って捨てていた。1152 で全損 0 を実測
+  #    (打ち切り 0/48・実効スループットも 0.77→0.96 req/s に向上)。8B 化後も保険として維持。
+  plan_max_tokens: 1152
   plan_temperature: 0.3
   recall_temperature: 0.2
   # ★★ A8 トーナメント実測 2026-08-17: 同一プロンプト束・同一 Qwen3-8B で raw completions
@@ -121,11 +124,13 @@ model:
         - "http://localhost:8005"
         - "http://localhost:8006"
       model: "qwen3:14b"
-    plan:
-      urls:
-        - "http://localhost:8005"
-        - "http://localhost:8006"
-      model: "qwen3:14b"
+    # ---- 第159: plan ティアを撤去=plan は艦隊既定(8B×5)へ --------------------------
+    # 根拠(8/25 実測・docs/plans/llm-budget-respec.md 続報):
+    #   ①plan→14B に品質根拠なし(A8 実測=8B/14B parse 100% 同点・今回の実プロンプト64対
+    #     A/B でもスキーマ CLEAN 差なし。14B はブロック +2.0/被覆 +2.5h だが全損 6.56% あり)
+    #   ②実負荷の 82% が 14B×2(GPU の 29%)に乗り 8B×5 が遊休=配分の誤り
+    #   ③8B の plan 型実測 9.9 呼/s(並列160)vs 14B 2.0 頭打ち=壁時計 4.4x
+    # 戻すには上の reflect: と同型の plan: ブロック(8005/8006・qwen3:14b)を復元する。
     default:
       - "http://localhost:8000"
       - "http://localhost:8001"
@@ -864,6 +869,18 @@ planning:
     # 「勤務末尾 2 時間 + 帰宅 + 就寝(02:30)まで」を無計画で過ごしていた。
     # プロンプトは 1 バイトも変わらず(HH:MM のまま)、朝の呼数も 1 も変わらない。
     wrap_blocks: true
+    # 第159: 4→6。plan→8B 化の密度回復(実測: 8B は min_blocks 4 で 5.2 ブロック→6 で 5.9。
+    # 14B比 -2.0→-1.3 ブロックに縮む)。上限 8 は不変。
+    min_blocks: 6
+    # ---- 第159(ユーザー要望 8/25「計画は夜のうちに作って処理を分散」)----
+    # 夜間計画プリフェッチ: 日付・天気が確定する 0 時以降の夜間 step で、就寝中(当日内省済み)
+    # のエージェントの当日計画を起床の早い順に先行生成。起床スパイク(04:40 に全起床の 54%=
+    # 3.4万人)の一斉需要を夜間の遊休 LLM 窓へ平準化する。二重生成なし(plan_day ガード)・
+    # 新規 checkpoint 状態ゼロ(ステートレス)。既定 OFF=現行バイト同一(第159実装)。
+    prefetch:
+      enabled: true
+      start_min: 10        # シミュ内 00:10 から(日境界処理・日付/天気確定の後)
+      end_min: 350         # 05:50 まで
     boundary:
       enabled: true        # 計画駆動の圏外滞在(despawn/respawn=朝の計画が予定表)
                            # transit_interior.include_plan_returnees の前提
@@ -1294,6 +1311,12 @@ net:
 # 劣化と断片化(§2 表の #13 = 実効 ×1.2-1.4)。
 engine:
   gc_freeze: true
+  # 第159: これまで CLI 上書き(enabled=true workers=16)で運用していた batch_llm を conf へ明文化。
+  # workers 16→64=艦隊プローブ実測(8B は並列 64 で 5.4-9.9 呼/s・14B は 32-48 で頭打ち)。
+  # ★リポ conf と実走 run config の食い違い(8/25 発見)の再発防止=起動時はこの値が正。
+  batch_llm:
+    enabled: true
+    workers: 64
 
 relations:
   enabled: true
@@ -1561,7 +1584,13 @@ lod:
   # 8/15-16 の診断ランで R_eff を実測してから決める。
   n_proportional:
     enabled: false
-  max_llm_per_step: 300
+  # ---- 第159(P1・ユーザー決定 8/25): 300 → 4,500=DP-U4 の宿題の執行 --------------------
+  # 目的=「渋谷に存在する全エージェントが LLM 計画を持つ」: 需要実測 20-27万計画/日に対し
+  # life 枠 0.45×4,500×144 = 29.2万/日で全員分。自発(general)1,800/step は昼帯ゼロ発火
+  # (需要 18.7万/step vs granted 0)の解消。前提=plan→8B(壁時計 4.4x)+workers 64+
+  # life_borrow false+夜間 prefetch。壁時計コスト実測見込み ETA +20-30%(ユーザー受容済み)。
+  # 撤退路: 切替後も dotlist で再変更可(--resume-accept-config・第158)。
+  max_llm_per_step: 4500
   # ---- DPH-B 二層予算 + FIFO 繰り越し(2026-08-15 ユーザー決定 D3)----
   # 塞ぐ穴(600体×3日 mock 実測): cap が binding なランでは発火側が先に食い切り、
   #   **返答保証が 08-23 時に 100% 消滅**する(reply 16,722 → 618 = −96%)。しかも
@@ -1574,9 +1603,15 @@ lod:
   budget:
     tiers:
       enabled: true
-      reply_share: 0.20
-      life_share: 0.30
-      max_defer_steps: 18   # 3 時間。超えたら骨格計画へ落とす(LLM ゼロ)
+      # 第159(P1): 0.20/0.30 → 0.15/0.45。cap 4,500 で reply 675 / life 2,025 / general 1,800。
+      # life 2,025×144=29.2万/日 ≥ 平日需要 ~27万=全員計画の供給線。
+      reply_share: 0.15
+      life_share: 0.45
+      max_defer_steps: 36   # 第159: 18→36(6時間)。入域スパイク(09:00 に 6.2万人)の繰越を
+                            # 骨格落ち前に捌く余裕。超えたら従来どおり骨格計画(LLM ゼロ)
+      # 第159(第158実装): plan/内省が general(自発発火)枠を借りる規則を止める。
+      # 24c 実測=シミュ内土曜 04:00 以降 n_fires 恒常 0(plan が general 150 を全量借用)の根治。
+      life_borrow: false
 lens:
   enabled: true
   deviation:

@@ -119,7 +119,9 @@ def test_finals_profile_turns_it_on():
     """本選プロファイルは ON + 予算 896 + 温度分化(根拠コメントは conf 側)。"""
     cfg = load_config(profile="conf/finals_observe.yaml")
     assert bool(cfg.prompts.p1.enabled) is True
-    assert int(cfg.model.plan_max_tokens) == 896
+    # 第159: 896 → 1152(意図的変更への追随)。本番実測で 14B plan の 6.56% が 896 打ち切り
+    # →全損。1152 で全損 0 を実測(打ち切り 0/48)。第137 の「予算切断を塞ぐ」意図は同方向に強化。
+    assert int(cfg.model.plan_max_tokens) == 1152
     assert 0.2 <= float(cfg.model.plan_temperature) <= 0.3
     assert 0.2 <= float(cfg.model.recall_temperature) <= 0.3
     assert int(cfg.model.reflect_max_tokens) == 768        # 別判断=据え置き

@@ -361,8 +361,11 @@ register_event_kind("zone_gate", "物理ゾーンの境界通過(流入 enter / 
 #      構造化計画とその実行。実装 src/society/cognition/day_plan.py。
 #      plan_repair / plan_fallback の件数は summary.json の day_plan.by_model にモデル別で残る。
 register_event_kind("plan_created",     "朝の構造化計画が確定した(検証→修復→フォールバック後)"
-                                        "{n, version, src, model, n_cont, blocks[]}"
-                                        "。src=llm / prev_day / skeleton")
+                                        "{n, version, src, model, n_cont, blocks[], prefetch?}"
+                                        "。src=llm / prev_day / skeleton。"
+                                        "prefetch=true は夜間プリフェッチ("
+                                        "planning.day_plan.prefetch。既定 OFF ではキー自体が無い)"
+                                        "で就寝中に前倒しで立てた計画")
 register_event_kind("plan_repair",      "決定的ルールによる計画の修復が起きた"
                                         "{ops{round|substitute|slide|truncate|drop|clip}, "
                                         "n_schema_err, n_phys_err, model}")

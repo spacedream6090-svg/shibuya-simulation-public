@@ -251,19 +251,23 @@ def test_cache_key_differs_only_when_a_tier_model_is_declared():
 @pytest.mark.parametrize("rel", ["conf/finals_observe.yaml",
                                  "conf/profiles/finals-vllm7.yaml"])
 def test_finals_confs_declare_the_14b_think_tiers(rel):
-    """本選 conf と、そこへ貼るプロファイルの**両方**が reflect/plan=14B を宣言している。
+    """本選 conf と、そこへ貼るプロファイルの**両方**が reflect=14B / plan=艦隊既定(8B)を宣言。
 
     片方だけだと「貼った側の model: ブロックに無い」= 黙って全部 8B へ戻る
-    (plan_max_tokens 896 / api_mode: chat と同じ落とし穴)。
+    (plan_max_tokens / api_mode: chat と同じ落とし穴)。
+    第159(意図的変更への追随): plan ティアは撤去= plan は default(8B×5)へ後退するのが正。
+    根拠=A8 実測で 8B/14B parse 同点・14B は plan_max_tokens 打ち切りで 6.56% 全損・
+    8B plan 型 9.9 呼/s(壁時計 4.4x)。誤って plan=14B を書き戻すとここが落ちる(双方向ピン)。
     """
     model = OmegaConf.to_container(OmegaConf.load(REPO_ROOT / rel).model,
                                    resolve=True)
     tiers = model.get("tiers")
     assert tiers, f"{rel} に model.tiers が無い"
-    for purpose in ("reflect", "plan"):
-        assert isinstance(tiers.get(purpose), dict), f"{rel}: {purpose} が dict 形式でない"
-        assert tiers[purpose]["model"] == _14B, f"{rel}: {purpose} が 14B でない"
-        assert len(tiers[purpose]["urls"]) == 2, f"{rel}: {purpose} が 2 本でない"
+    assert isinstance(tiers.get("reflect"), dict), f"{rel}: reflect が dict 形式でない"
+    assert tiers["reflect"]["model"] == _14B, f"{rel}: reflect が 14B でない"
+    assert len(tiers["reflect"]["urls"]) == 2, f"{rel}: reflect が 2 本でない"
+    assert "plan" not in tiers, \
+        f"{rel}: plan ティアが復活している(第159 で撤去済み=plan は艦隊既定 8B。戻すなら理由を再記録)"
     assert len(tiers["default"]) == 5, f"{rel}: 会話プールが 5 本でない"
     assert not set(tiers["default"]) & set(tiers["reflect"]["urls"]), \
         f"{rel}: 会話と思考が同じポートを共有している(1 サーバ = 1 モデル違反)"
@@ -281,10 +285,10 @@ def test_finals_profile_builds_a_valid_mixed_fleet():
     fleet = FleetLLM([str(s) for s in model["servers"]], str(model["name"]),
                      tiers=model["tiers"], api_mode=str(model["api_mode"]))
     assert len(model["servers"]) == 5 and fleet.model == _8B
-    assert fleet.tier_models == {"reflect": _14B, "plan": _14B}
+    # 第159: plan ティア撤去(plan は艦隊既定 8B へ)に追随。reflect のみ 14B。
+    assert fleet.tier_models == {"reflect": _14B}
     assert len(fleet._backend) == 7                     # 5 + 2 = 7 GPU 分の子
     assert sum(1 for b in fleet._backend.values() if b.model == _14B) == 2
-    for purpose in ("reflect", "plan"):
-        assert all(fleet._backend[u].model == _14B
-                   for u in fleet._tiers[purpose])
+    assert all(fleet._backend[u].model == _14B
+               for u in fleet._tiers["reflect"])
     assert all(fleet._backend[u].model == _8B for u in fleet._default)

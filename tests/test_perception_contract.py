@@ -449,6 +449,11 @@ _NON_PROMPT_WORLD_READER_MODULES = frozenset({
     # 読むのが本務。プロンプトは一切組まない(タスク文は reflection.py が持つ)。
     # 乱数ゼロ・LLM 呼び出しゼロ。engaged.py / routine.py と同じ位置づけ。P3 で契約経路へ。
     "reflect_timing.py",
+    # 第159バッチ 夜間計画プリフェッチ: 候補述語(sleeping / reflect_step / sleep_until /
+    # loc)と予算残(sim.budget)を読むのが本務で、プロンプトは 1 文字も組まない(生成は
+    # planning.make_plan へ委譲=既存経路)。ステートレス(checkpoint 新状態ゼロ)・乱数ゼロ。
+    # reflect_timing.py / engaged.py と同じ位置づけ。P3 で契約経路へ寄せる対象。
+    "plan_prefetch.py",
     # 第137バッチ V-P1(プロンプト一貫性): sim から読むのは **conf ブロック 2 つだけ**
     # (`prompts.p1` と `model.plan_temperature` / `model.recall_temperature`)で、
     # world(在場・座標・POI・時刻)には 1 度も触らない。ヘッダと規律行を組む関数
