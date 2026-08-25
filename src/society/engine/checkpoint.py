@@ -704,8 +704,17 @@ def save(sim, step: int, path: str | Path, *, complete: bool = True) -> Path:
     return path
 
 
-def load(sim, path: str | Path) -> int:
-    """checkpoint を sim へ上書き復元し、次に実行すべき step を返す。"""
+def load(sim, path: str | Path, accept_config_mismatch: bool = False) -> int:
+    """checkpoint を sim へ上書き復元し、次に実行すべき step を返す。
+
+    `accept_config_mismatch`(既定 False = 従来どおり)は **観察ランの運用レバー**:
+    走行中のランを止めて「呼数 cap / レーン配分 / workers」だけを変えて `--resume` する、
+    という操作を明示的に受理する(`scripts/run.py --resume-accept-config`)。
+    True でも照合そのものは走り、不一致なら **WARNING を 1 行出してから**続行する
+    (stored / current の両ハッシュを残す = 「いつ・何が変わったか」を事後に追える)。
+    ★これは決定論ガードの**意図的な緩和**であって、resume==straight の保証は失われる
+      (観察ランの DT 定義 = 厳密再現を求めない、に整合)。対照実験では使わないこと。
+    """
     # save と対称に**ストリームから直接** unpickle する(第117 β7)。`pickle.loads(f.read())`
     # は展開済みバイト列を丸ごと RAM に置いてから同じ物を再構築するので、復元の瞬間だけ
     # ピークが二重になっていた。共有参照の復元は 1 回の load/loads で同一(memo は呼び出し内)。
@@ -715,13 +724,23 @@ def load(sim, path: str | Path) -> int:
         raise ValueError(f"未知の checkpoint format: {blob.get('format')}")
     expect = config_hash(sim.cfg)
     if blob.get("config_hash") != expect:
-        raise ValueError(
-            "checkpoint の config が現在の config と不整合(決定論が壊れる)。"
-            " seed/n_agents/因子など resume 対象外のキーが変わっている可能性。"
-            " ★run.dt_min≠10 のランで出た場合はまず Δt の二重変換を疑うこと:"
-            " 保存済み config.yaml は apply_dt 済みなので、読み直すときは"
-            " load_config(path=…, apply_dt=False) でなければ全定数が二重に変換される"
-            "(scripts/run.py --resume は対応済み)。")
+        if not accept_config_mismatch:
+            raise ValueError(
+                "checkpoint の config が現在の config と不整合(決定論が壊れる)。"
+                " seed/n_agents/因子など resume 対象外のキーが変わっている可能性。"
+                " ★run.dt_min≠10 のランで出た場合はまず Δt の二重変換を疑うこと:"
+                " 保存済み config.yaml は apply_dt 済みなので、読み直すときは"
+                " load_config(path=…, apply_dt=False) でなければ全定数が二重に変換される"
+                "(scripts/run.py --resume は対応済み)。")
+        import logging
+        logging.getLogger("society.engine").warning(
+            "resume: checkpoint の config が現在の config と不整合ですが、"
+            "**観察ランの運用変更として操作者が受理**しました"
+            "(--resume-accept-config / accept_config_mismatch=True)。"
+            " stored_config_hash=%s current_config_hash=%s。"
+            " この resume は決定論ガードを意図的に外しており、resume==straight は"
+            " 保証されません(区間ごとに条件が違うランとして解析すること)。",
+            blob.get("config_hash"), expect)
 
     # 状態オブジェクト(共有参照は 1 pickle 内で保存済み)
     sim.agents = blob["agents"]

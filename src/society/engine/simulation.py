@@ -2425,7 +2425,8 @@ class Simulation:
             self.agent_by_id.setdefault(aid, _to_ref(agent))
         self._pool_update_budget()
 
-    def run(self, resume_from: Path | str | None = None) -> dict:
+    def run(self, resume_from: Path | str | None = None,
+            accept_config_mismatch: bool = False) -> dict:
         # P0バッチ: elapsed_sec の起点を「run 開始」に打ち直す(構築時間を除く)。
         # resume 時はこのチャンクの経過だけを測る(通算ではない)。
         self._t_start = time.perf_counter()
@@ -2441,7 +2442,12 @@ class Simulation:
             # A6(第118 レーンC): 「本体 + pool サイドカー + 全 flush」が揃った世代だけを
             # 完全とみなして選ぶ(欠けていれば一つ前へ戻る。1 つも無ければ明示エラー)。
             ckpt = self._pick_resume_checkpoint(Path(resume_from))
-            start = checkpoint.load(self, ckpt)
+            # accept_config_mismatch=False(既定)= 従来どおり config_hash 不一致で
+            # ValueError。True は「観察ランの運用変更(呼数 cap / レーン配分など)を
+            # 操作者が受理した」ことの明示で、WARNING 1 行を残して続行する
+            # (scripts/run.py --resume-accept-config からのみ渡る)。
+            start = checkpoint.load(self, ckpt,
+                                    accept_config_mismatch=bool(accept_config_mismatch))
             self._assert_no_future_segments(ckpt)   # load 済み値を読むだけ(再 unpickle しない)
             self.invalidate_present_index()       # 在場索引は load 済みの sim.agents から引き直す
             self._restore_pool_resume(start)      # pool ON 時のみ: ドーマント/日境界の復元

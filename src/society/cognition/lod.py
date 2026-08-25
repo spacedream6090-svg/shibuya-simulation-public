@@ -104,11 +104,22 @@ def assign_axis(agent_ids: list[int], stream, levels: dict[str, dict]) -> dict[i
 #   先に流すと予約が守れず、後から流しても general は既に終わっている。
 #   代わりに**逆向き**(予約超過は general の余りを借りる)だけを入れてある =
 #   総量は cap のまま・予約は必ず守られる・遊ぶのは「予約が余った分」だけ。
+#
+# life_borrow(2026-08-25。正典 docs/plans/llm-budget-respec.md §4-3)
+# --------------------------------------------------------------------
+# 上の「逆向きだけ許す」設計には、実機で顕在化した副作用がある: plan の需要は
+# **在場全員が毎朝 1 件**なので、cap が飽和するランでは life が general の余りを
+# 毎 step 全量借り切り、**自発発火(general)が昼帯ゼロ**になる(24c 実測:
+# step25 以降 n_fires=0・需要は 18.7 万件/step まで積み上がって全拒否)。
+# `life_borrow: false` は life の借用**だけ**を止める(reply の借用は 1 行も変えない)。
+# 溢れた plan は既存の FIFO 繰り越し → 骨格フォールバックの梯子が受ける。
+# **既定 true = 従来の借用そのまま = 1 バイト同一**。
 BUDGET_TIER_DEFAULTS = {
     "enabled": False,
     "reply_share": 0.20,      # 返答保証の先取り枠(cap に対する割合)
     "life_share": 0.30,       # 生活基盤(朝の計画 plan / 夜の内省 reflect)の先取り枠
     "max_defer_steps": 18,    # plan/reflect の FIFO 繰り越し上限(18 step = 3 時間 @Δt10)
+    "life_borrow": True,      # life が general の余りを借りるか(false = 自発発火の保護)
 }
 
 # 観測ラベル(purpose)→ 予算レーン。**観測の粒度と配分の粒度を分ける**ための 1 枚。
@@ -139,6 +150,7 @@ def build_budget_cfg(raw) -> dict | None:
     cfg["reply_share"] = max(0.0, float(cfg["reply_share"]))
     cfg["life_share"] = max(0.0, float(cfg["life_share"]))
     cfg["max_defer_steps"] = max(0, int(cfg["max_defer_steps"]))
+    cfg["life_borrow"] = bool(cfg["life_borrow"])
     if cfg["reply_share"] + cfg["life_share"] > 1.0:
         raise ValueError("lod.budget.tiers: reply_share + life_share は 1.0 以下。")
     return cfg
@@ -160,6 +172,9 @@ class LodBudget:
         self.counters = counters                   # None = 観測 OFF(dict も作らない)
         self.caps: dict[str, int] = {}
         self.lane_used: dict[str, int] = {}
+        # life が general の余りを借りてよいか(既定 True = 従来の挙動)。
+        # 旧 cfg dict(キーを持たない)から組んでも既定へ落ちる = 後方互換。
+        self.life_borrow = bool((self.tiers or {}).get("life_borrow", True))
         if self.tiers:
             cap = self.max_per_step
             # ★切り上げ: 宣言された予約が丸めでゼロへ消えない(cap が小さいランほど
@@ -200,6 +215,11 @@ class LodBudget:
             return True
         # 予約レーン(reply / life)は general の**余り**だけを借りられる。
         # general 自身は借りない = 予約が先に食われることが原理的に起きない。
+        # ★life_borrow=False では life(朝の計画 / 夜の内省)の借用だけを止める =
+        #   自発発火(general)の枠が plan 需要に食い尽くされない。reply の借用は
+        #   1 行も変えない(返答保証はレーン設計の第一目的)。
+        if lane == "life" and not self.life_borrow:
+            return False
         if lane != "general" and self.lane_used["general"] < self.caps["general"]:
             self.lane_used["general"] += 1
             self.used += 1

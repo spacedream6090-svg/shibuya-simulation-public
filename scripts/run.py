@@ -13,6 +13,11 @@
     python scripts/run.py --resume runs/<name>  # D16 途中再開(最新 checkpoint から続行)
         # resume は run dir の config.yaml を読む。さらに先まで回すなら run.n_steps=… を併記。
         # 例: python scripts/run.py --resume runs/day80 run.n_steps=288
+    python scripts/run.py --resume runs/<name> --resume-accept-config lod.max_llm_per_step=1500
+        # 観察ランの**運用変更**(呼数 cap / レーン配分 / workers など)を途中で入れて再開する。
+        # 既定では checkpoint の config_hash 照合が不一致で ValueError(決定論ガード)。
+        # このフラグは「操作者が受理した」ことの明示で、WARNING 1 行を残して続行する
+        # (= resume==straight は保証されない。解析時は区間注記が要る)。--resume 専用。
 
 seed の自動採取(第54バッチ 2026-07-23。純観察=不確実性許容モード):
     run.seed=auto(または run.seed_auto=true)で、起動時に OS エントロピー(secrets=os.urandom 由来)から
@@ -220,12 +225,18 @@ def main() -> None:
     resume_dir: str | None = None
     profile: str | None = None
     env: str | None = None
+    # 観察ランの運用変更を受理して resume する(--resume と併用時のみ意味を持つ)。
+    # 既定 False = 従来どおり config_hash 不一致で ValueError。
+    accept_config: bool = False
     overrides: list[str] = []
     i = 0
     while i < len(args):
         if args[i] == "--resume":
             resume_dir = args[i + 1]
             i += 2
+        elif args[i] == "--resume-accept-config":
+            accept_config = True
+            i += 1
         elif args[i] == "--profile":
             profile = args[i + 1]
             i += 2
@@ -251,7 +262,8 @@ def main() -> None:
         check_mock_production(cfg)                 # β6: resume でも同じ条件で守る
         print_banner(cfg)
         sim = Simulation(cfg, out_dir=run_dir)     # 既存 run dir は消さずに続行する
-        summary = sim.run(resume_from=run_dir)
+        summary = sim.run(resume_from=run_dir,
+                          accept_config_mismatch=accept_config)
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return
 

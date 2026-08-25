@@ -1868,6 +1868,14 @@ lod:
       reply_share: 0.20       # 返答保証の先取り枠(cap に対する割合)
       life_share: 0.30        # 朝の計画 + 夜の内省の先取り枠
       max_defer_steps: 18     # FIFO 繰り越しの上限(18 step = 3 時間 @Δt10)。超過=骨格へ
+      # ---- life の借用トグル(2026-08-25。正典 docs/plans/llm-budget-respec.md §4-3)----
+      # true(既定)= 上記のまま(life は general の余りを借りる)= **現行と 1 バイト同一**。
+      # false      = plan / 内省は general 枠を借りない = **自発発火の保護**(観察 finals 用)。
+      #   実機(24c)では plan 需要が在場全員ぶん毎朝立つため、life が general の余りを毎 step
+      #   全量借り切って昼帯の自発発火が n_fires=0 になっていた。溢れた plan は既存の
+      #   FIFO 繰り越し → 骨格フォールバックの梯子が受ける(=需要の正直な配給)。
+      #   ★reply の借用は本キーの影響を受けない(返答保証はレーン設計の第一目的)。
+      life_borrow: true
   # ---- 入力解像度LOD(第30バッチ・既定OFF=バイト一致)。docs/plans/input-resolution-lod.md ----
   # 「世界に対する解像度」の個体差: 知覚/記憶/フィードの注入件数を水準別に振る(呼数不変=R1安全)。
   # 割当は cognition/lod.py の共通軸機構(trait非依存・軸専用 stream "lod_input_res")。

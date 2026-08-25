@@ -1431,6 +1431,25 @@ FEATURES: tuple[Feature, ...] = (
        "agent_id) の全順序)し、max_defer_steps を超えたら骨格計画へ落とす(LLM ゼロ)。"
        "OFF では plan/reflect が予算外を無条件に走るため実効上限が cap+予算外 になり"
        "(実測 cap60 で 1 step 96 呼)、cap 拘束下で返答保証が枯渇する(実測 reply −96%)"),
+    # 自発枠の保護(2026-08-25。正典 docs/plans/llm-budget-respec.md §4-3)。
+    # strict の根拠: 親(tiers.enabled)と同じく、レーン残量の整数比較だけで決まる決定論。
+    #   LLM の自由文も読まず、乱数 stream も 1 本も引かない。
+    # ★affects_k=True: 借用を止めると life が取れる呼が減り general が取れる呼が増える
+    #   = generate() の**配分と本数**が動く(総量は cap のまま)。親と同じ扱いにする。
+    # off_value=True: 自動 OFF は「借用ありの従来挙動へ戻す」= 既定値そのもの
+    #   (incidents_env.crowd.enabled など既定 true のキーと同じ流儀)。
+    _f("lod.budget.tiers.life_borrow", "strict", True, "none",
+       "二層予算(DPH-B)の life レーンが general の**余り**を借りることを許すか。"
+       "既定 true = 従来どおり(= 現行と 1 バイト同一)。false では life(朝の計画 plan / "
+       "夜の内省 reflect)は自分の枠までしか取れず、general(自発発火・独り言・投稿)は"
+       "自分の枠を必ず全量使える = **自発発火の保護**。塞ぐ穴(本番 24c 実測): plan 需要は"
+       "在場全員ぶん毎朝立つので、飽和帯では life が general の余りを毎 step 借り切り、"
+       "昼帯の自発発火が n_fires=0 になっていた(需要は 18.7 万件/step まで積み上がって全拒否)。"
+       "溢れた plan は既存の FIFO 繰り越し → max_defer_steps 超過で骨格計画へ、という"
+       "従来の梯子がそのまま受ける(新しい失敗経路を足さない)。"
+       "★reply レーンの借用は本キーでは 1 行も変わらない(返答保証はレーン設計の第一目的)。"
+       "lod.budget.tiers.enabled が OFF なら 1 バイトも効かない子トグル",
+       off_value=True),
     _f("pool.enabled", "strict", True, "none",
        "ペルソナプールの日次ローテーション(在場者の決定論選択=当日の思考対象人数が変わる)"),
     _f("pool.tier_quota.enabled", "strict", True, "none",
