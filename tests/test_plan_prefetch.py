@@ -13,6 +13,9 @@
   (5) 予算が尽きたら静かに翌 step へ譲る(新しい欠落モードを作らない)。
   (6) `resume == straight`(ON・分割ランの L1 一致)= 新しい搬送状態がゼロであることの機械証明。
   (7) レジストリ宣言と conf の整合 / `plan_created` の `prefetch` 欄。
+  (8) **一括発行(`engine.batch_llm`)と組んでいる**(第160 の修正): ON では
+      `generate_many` を通り(= 1 呼ずつの逐次に落ちない)、OFF では従来の逐次のまま。
+      発行順 = 採用順 = 選抜順で決定論、予算・二重生成・起床順の保証は両経路で同じ。
 """
 from __future__ import annotations
 
@@ -437,3 +440,197 @@ def test_enabled_requires_planning(tmp_path):
     assert PPF.enabled(sim) is False
     on = _sim(tmp_path, "pf_planning", n_steps=1, n_agents=3, **PF)
     assert PPF.enabled(on) is True
+
+
+# =========================================================================== #
+# (10) 一括発行(engine.batch_llm)との合流 — 第160
+#
+# 症状(本番実測 8/26): `batch_llm.enabled: true, workers: 64` のランで、プリフェッチ
+# **だけ**が逐次の `planning.make_plan` を直接呼んでいた = vLLM Running 0-1・0.19 呼/s・
+# step 1 の 2,025 件で約 3 時間。原因は設定ではなく経路であり、以下がそれを機械で固定する。
+# =========================================================================== #
+BATCH = {"engine.batch_llm.enabled": "true", "engine.batch_llm.workers": "64"}
+
+
+class _Spy:
+    """`sim.llm` を包んで「一括発行を通ったか / 1 呼ずつ撃ったか」を数える薄い殻。"""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.many: list[tuple[int, int]] = []      # [(要求数, workers), ...]
+        self.single = 0                            # 逐次 generate の回数
+
+    def generate(self, *a, **kw):
+        self.single += 1
+        return self._inner.generate(*a, **kw)
+
+    def generate_many(self, requests, *, workers=1):
+        self.many.append((len(requests), int(workers)))
+        return self._inner.generate_many(requests, workers=workers)
+
+    def __getattr__(self, name):                   # 残りは素通し(calls/hits/_mem…)
+        return getattr(self._inner, name)
+
+
+def _spy_on(sim):
+    spy = _Spy(sim.llm)
+    sim.llm = spy
+    return spy
+
+
+def test_prefetch_uses_the_batch_issuer_when_batch_llm_is_on(tmp_path, monkeypatch):
+    """★本丸: batch ON では `generate_many` を 1 回だけ通る(逐次 make_plan を呼ばない)。"""
+    sim = _staged(tmp_path, "pf_bat_on", n_agents=6, **BATCH)
+    spy = _spy_on(sim)
+
+    def _boom(*_a, **_kw):
+        raise AssertionError("batch ON なのに逐次 planning.make_plan を直接呼んだ")
+    monkeypatch.setattr(scheduler.planning, "make_plan", _boom)
+
+    scheduler._phase_plan_prefetch(sim, NIGHT_STEP, NIGHT_MIN)
+    assert spy.many == [(6, 64)], f"一括発行を通っていない(逐次のまま): {spy.many}"
+    assert spy.single == 0, "1 呼ずつの generate が混ざっている"
+    assert len(_prefetched(sim)) == 6
+    assert PPF.marked(sim) is False, "印が立ったままフェーズを出た"
+
+
+def test_batch_off_keeps_the_sequential_path(tmp_path, monkeypatch):
+    """★batch OFF は現行のまま: `generate_many` を 1 度も使わず make_plan を選抜順に呼ぶ。"""
+    sim = _staged(tmp_path, "pf_bat_off", n_agents=6)
+    for a in sim.agents:                           # id 昇順と逆の起床順にして差を作る
+        a.sleep_until = 500 - int(a.id)
+    want = [a.id for a in sorted(sim.agents, key=lambda a: (a.sleep_until, a.id))]
+    spy = _spy_on(sim)
+    seen: list[int] = []
+    real = scheduler.planning.make_plan
+
+    def _tap(sim_, agent, *a, **kw):
+        seen.append(int(agent.id))
+        return real(sim_, agent, *a, **kw)
+    monkeypatch.setattr(scheduler.planning, "make_plan", _tap)
+
+    scheduler._phase_plan_prefetch(sim, NIGHT_STEP, NIGHT_MIN)
+    assert spy.many == [], "batch OFF なのに一括発行器を通った"
+    assert seen == want, f"逐次経路の呼び順が起床順でない: {seen} != {want}"
+    assert [e.agent_id for e in _prefetched(sim)] == want
+
+
+def test_batched_prefetch_is_byte_identical_to_sequential(tmp_path):
+    """★batch ON(workers=1/4)は OFF と L1・L1b バイト一致(build/apply 分割の同値性)。"""
+    off = _run(tmp_path, "pfb_off", n_steps=460, n_agents=20, **DP, **PF)
+    on1 = _run(tmp_path, "pfb_on1", n_steps=460, n_agents=20, **DP, **PF,
+               **{"engine.batch_llm.enabled": "true",
+                  "engine.batch_llm.workers": "1"})
+    on4 = _run(tmp_path, "pfb_on4", n_steps=460, n_agents=20, **DP, **PF,
+               **{"engine.batch_llm.enabled": "true",
+                  "engine.batch_llm.workers": "4"})
+    assert _prefetched(off) and _prefetched(on4), "前倒しが 1 件も起きていない(無風)"
+    assert _l1(off) == _l1(on1)
+    assert _l1(off) == _l1(on4)
+    assert off.logger.llm_calls == on1.logger.llm_calls == on4.logger.llm_calls
+    assert (off.llm.calls, off.llm.hits) == (on4.llm.calls, on4.llm.hits)
+
+
+def test_batched_prefetch_is_deterministic_across_runs(tmp_path):
+    """★同 seed 2 回で L1・L1b・ジャーナル鍵列が一致(発行順 = 採用順が固定)。"""
+    ov = dict(DP, **PF, **BATCH)
+    a = _run(tmp_path, "pfb_det_a", n_steps=460, n_agents=20, **ov)
+    b = _run(tmp_path, "pfb_det_b", n_steps=460, n_agents=20, **ov)
+    assert _prefetched(a), "前倒しが 1 件も起きていない(無風)"
+    assert _l1(a) == _l1(b)
+    assert a.logger.llm_calls == b.logger.llm_calls
+    # 前倒しぶんの採用順(step 内の並び)まで一致していること
+    pre = [(e.step, e.agent_id) for e in _prefetched(a)]
+    assert pre == [(e.step, e.agent_id) for e in _prefetched(b)]
+
+
+def test_batched_prefetch_respects_budget_and_wake_order(tmp_path):
+    """★batch 経路でも「予算の枠だけ・起床の早い順」が保たれる(発行数まで固定)。"""
+    sim = _staged(tmp_path, "pf_bat_order", n_agents=6, **BATCH,
+                  **{"lod.max_llm_per_step": "2"})
+    for a in sim.agents:
+        a.sleep_until = 500 - int(a.id)
+    want = [a.id for a in sorted(sim.agents, key=lambda a: (a.sleep_until, a.id))[:2]]
+    spy = _spy_on(sim)
+    scheduler._phase_plan_prefetch(sim, NIGHT_STEP, NIGHT_MIN)
+    assert spy.many == [(2, 64)], f"予算を超えて一括発行した: {spy.many}"
+    assert [e.agent_id for e in _prefetched(sim)] == want
+    assert sorted(a.id for a in sim.agents if a.plan_day == 1) == sorted(want)
+
+
+def test_batched_prefetch_uses_the_life_lane(tmp_path):
+    """二層予算 ON: batch 経路でも life レーンから取る(返答枠を食わない)。"""
+    sim = _staged(tmp_path, "pf_bat_lane", n_agents=4, **BATCH,
+                  **{"lod.budget.tiers.enabled": "true",
+                     "lod.max_llm_per_step": "20"})
+    assert sim.budget.tiers is not None
+    scheduler._phase_plan_prefetch(sim, NIGHT_STEP, NIGHT_MIN)
+    assert len(_prefetched(sim)) == 4
+    assert sim.budget.lane_used["life"] == 4
+    assert sim.budget.lane_used["reply"] == 0
+    assert sim.budget.lane_used["general"] == 0
+
+
+def test_batched_prefetch_is_silent_when_budget_is_exhausted(tmp_path):
+    """予算が尽きた step は batch 経路でも一括発行を 1 度も起こさない。"""
+    sim = _staged(tmp_path, "pf_bat_broke", n_agents=4, **BATCH)
+    while sim.budget.take("media"):
+        pass
+    spy = _spy_on(sim)
+    n0 = len(sim.logger.events)
+    scheduler._phase_plan_prefetch(sim, NIGHT_STEP, NIGHT_MIN)
+    assert spy.many == [] and spy.single == 0
+    assert sim.logger.events[n0:] == []
+    assert all(a.plan_day == -1 for a in sim.agents)
+
+
+def test_batched_prefetch_never_generates_twice_per_agent_day(tmp_path):
+    """batch 経路でも「1 個体 1 暦日 ≤ 1 本」(plan_day ガードを触っていない証拠)。"""
+    from collections import Counter
+
+    sim = _run(tmp_path, "pf_bat_guard", n_steps=460, n_agents=20,
+               **DP, **PF, **BATCH)
+    per = Counter((e.agent_id, e.sim_min // 1440) for e in _kind(sim, "plan_created"))
+    assert per, "計画が 1 本も立っていない(前提が崩れた)"
+    assert max(per.values()) == 1, f"同じ暦日に 2 本立った: {per.most_common(3)}"
+    assert _prefetched(sim), "ON なのに前倒しが 1 件も起きていない"
+
+
+def test_batched_prefetch_lowers_the_mark_even_if_issuing_raises(tmp_path,
+                                                                monkeypatch):
+    """一括発行が例外で落ちても印は降りる(以後の計画に偽の prefetch が付かない)。"""
+    sim = _staged(tmp_path, "pf_bat_raise", n_agents=2, **BATCH)
+    spy = _spy_on(sim)
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(scheduler.planning, "apply_plan_response", _boom)
+    try:
+        scheduler._phase_plan_prefetch(sim, NIGHT_STEP, NIGHT_MIN)
+    except RuntimeError:
+        pass
+    assert spy.many == [(2, 64)], "発行そのものは一括で走っていること(前提)"
+    assert PPF.marked(sim) is False
+
+
+def test_normal_wake_planning_also_uses_the_batch_issuer(tmp_path, monkeypatch):
+    """★通常の起床時計画も batch ON で並列発行器を通る(= 症状はプリフェッチ固有)。"""
+    sim = _sim(tmp_path, "pf_wake_bat", n_steps=1, n_agents=6, **DP, **BATCH)
+    for a in sim.agents:
+        a.plan_day, a.plan_step = -1, 50
+        a.reflect_step = -1
+        a.sleeping, a.loc = False, "street"
+        a.node = a.home_node
+        a.building = a.home_building
+    spy = _spy_on(sim)
+
+    def _boom(*_a, **_kw):
+        raise AssertionError("batch ON なのに逐次 planning.make_plan を直接呼んだ")
+    monkeypatch.setattr(scheduler.planning, "make_plan", _boom)
+
+    scheduler._phase_planning(sim, 50, 1440 + 500)      # 08:20 = 前倒しの窓の外
+    assert spy.many == [(6, 64)], f"朝計画が一括発行を通っていない: {spy.many}"
+    assert spy.single == 0
+    assert len(_kind(sim, "plan_created")) == 6
+    assert all("prefetch" not in e.payload for e in _kind(sim, "plan_created")), \
+        "通常の起床時計画に前倒しの印が付いた"

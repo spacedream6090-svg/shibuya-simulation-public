@@ -1035,6 +1035,10 @@ def _phase_plan_prefetch(sim, step: int, sim_min: int) -> None:
     予算が尽きたら**静かに翌 step へ**譲る(その個体は従来どおり起床時に予約される)=
     取り零しの新しいモードを作らない。既存の sleeping/outside スキップ
     (`_phase_planning` / `_phase_planning_tiered`)は 1 バイトも触っていない。
+
+    ★一括発行(`engine.batch_llm`)との合流(第160): ON のときは逐次の `make_plan` では
+      なく `_plan_prefetch_batched`(build を選抜順に済ませてから未命中だけを並行発行し、
+      同じ順に apply)を通る。OFF のときは下の逐次ループがそのまま = **1 バイト同一**。
     """
     if not prefetch_mod.enabled(sim):
         return
@@ -1042,6 +1046,11 @@ def _phase_plan_prefetch(sim, step: int, sim_min: int) -> None:
         return
     picks = prefetch_mod.pick(sim, step, sim_min, prefetch_mod.budget_room(sim))
     if not picks:
+        return
+    bl = (sim.cfg.get("engine", {}) or {}).get("batch_llm", {}) or {}
+    if bool(bl.get("enabled", False)):
+        _plan_prefetch_batched(sim, step, sim_min, picks,
+                               workers=int(bl.get("workers", 8)))
         return
     today = int(sim_min) // 1440
     for agent in picks:
@@ -1052,6 +1061,55 @@ def _phase_plan_prefetch(sim, step: int, sim_min: int) -> None:
         try:
             planning.make_plan(sim, agent, step, sim_min, _place_of(sim, agent),
                                interstitial_digest=_isl_take(sim, agent))
+        finally:
+            prefetch_mod.mark_end(sim)
+
+
+def _plan_prefetch_batched(sim, step: int, sim_min: int, picks: list,
+                           workers: int) -> None:
+    """PPF の一括発行(第160・`engine.batch_llm` ON のときだけ通る)。
+
+    症状(本番実測 8/26): プリフェッチだけが逐次の `planning.make_plan` を直接呼んでいた
+    ため、`batch_llm.enabled: true, workers: 64` のランでも vLLM の Running が 0-1 =
+    **1 呼ずつのラウンドトリップ**になり、夜間に量産するという設計目的が死んでいた
+    (実測 0.19 呼/s・step 1 の 2,025 件で約 3 時間)。原因は経路であって設定ではない。
+
+    直し方は朝計画の `_phase_planning_batched` と**同じ 3 段**である:
+      ① 選抜順((sleep_until, id) 昇順)に予算を取り・簿記を書き・要求を組む(build)
+      ② 未命中だけを `generate_many(workers=…)` で並行発行(継続バッチングを充填)
+      ③ **①と同じ順**で応答を適用する(発行順 = 採用順 = 決定論)
+    ①で崩さないもの(逐次経路との同値):
+      - `sim.budget.take("plan")` を**撃つ前に**1 人 1 回。取れなくなったら `break`
+        (= その step はそこまで。残りは翌 step / 起床時へ)。
+      - `agent.plan_day = today` を生成の前に書く(起床時の再予約を既存ガードで抑止)。
+      - `_isl_take`(行間ダイジェストの破壊的消費)は build の中で 1 回だけ。
+      - L1 の印(`prefetch: true`)は build と apply の**両方**を挟む。build 側で挟むのは
+        方針キャッシュ命中(`build_plan_request` が None を返す枝)がその場で
+        `day_plan` イベントを吐くため = 印の付き方を逐次と揃える。
+    """
+    today = int(sim_min) // 1440
+    pending: list[tuple[object, dict]] = []
+    for agent in picks:
+        if not sim.budget.take("plan"):
+            break                                  # レーンが尽きた = この step はここまで
+        agent.plan_day = today                     # 起床時の再予約を既存ガードで抑止する
+        prefetch_mod.mark_begin(sim)               # L1 の印(ON のときだけ 1 欄増える)
+        try:
+            req = planning.build_plan_request(
+                sim, agent, step, sim_min, _place_of(sim, agent),
+                interstitial_digest=_isl_take(sim, agent))
+        finally:
+            prefetch_mod.mark_end(sim)
+        if req is not None:                        # None = 方針キャッシュ命中(適用済み)
+            pending.append((agent, req))
+    if not pending:
+        return
+    results = sim.llm.generate_many([r for _a, r in pending], workers=workers)
+    for (agent, req), (response, call_id, cached) in zip(pending, results):
+        prefetch_mod.mark_begin(sim)
+        try:
+            planning.apply_plan_response(sim, agent, step, sim_min, req,
+                                         response, call_id, cached)
         finally:
             prefetch_mod.mark_end(sim)
 

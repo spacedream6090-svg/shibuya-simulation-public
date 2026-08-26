@@ -85,9 +85,13 @@ R1(既定 OFF = 現行と 1 バイト同一)
     (day_plan v1 の経路)であって、旧経路の ``day_plan`` イベントには足さない。
     ``planning.day_plan.enabled: false`` のランでプリフェッチを ON にすると
     「前倒しで撃った」ことが L1 からは判らない(summary/L2 にも列を足していない)。
-(g) **一括発行(``engine.batch_llm``)とは組んでいない**。プリフェッチは逐次経路
-    (``planning.make_plan``)を通る。本選 conf は ``batch_llm.enabled: false`` なので
-    現状の運用に穴は空かないが、一括化は v1 の範囲外である。
+(g) **一括発行(``engine.batch_llm``)と組む**(第160 で修正)。v1 はここを組んでおらず、
+    ``batch_llm.enabled: true, workers: 64`` のランでもプリフェッチだけが逐次経路
+    (``planning.make_plan``)を 1 呼ずつ回していた(本番実測 8/26: vLLM Running 0-1・
+    0.19 呼/s・step 1 の 2,025 件で約 3 時間 = 「夜のうちに量産する」設計目的が死ぬ)。
+    現在は ``scheduler._plan_prefetch_batched`` が朝計画(``_phase_planning_batched``)と
+    同じ 3 段(選抜順に build → 未命中だけ並行発行 → 同じ順に apply)を通る。
+    ``batch_llm`` OFF のランは下の逐次ループのまま = **1 バイト同一**。
 """
 from __future__ import annotations
 
