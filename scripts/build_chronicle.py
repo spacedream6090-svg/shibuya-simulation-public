@@ -1,10 +1,11 @@
 #!/usr/bin/env python
-"""Shibuya Chronicle ビューワーのビルドパイプライン(P0 俯瞰 + 画面2 関係の伝記)。
+"""Shibuya Chronicle ビューワーのビルドパイプライン(P0 + 画面2/3/4)。
 
 位置づけ
 --------
-`docs/plans/viewer-chronicle-plan.md` §1 の実装。計画の 4 画面のうち **俯瞰(画面1 の
-A 側)** と **画面2「関係の伝記」** を端から端まで動かす。作るもの:
+`docs/plans/viewer-chronicle-plan.md` §1 の実装。**俯瞰(画面1 の A 側)** /
+**画面2「関係の伝記」** / **画面3「語の一生(伝播)」** / **画面4「物語ピン +
+今日のハイライト」** を端から端まで動かす。作るもの:
 
 1. **L2 指標の時系列**(全 step)+ **L1 kind 別の毎 step 件数**(会話数など L2 に無い量)
 2. **位置 hexbin**(既定 200 m 格子 × 1 時間ビンの**在場者数**)= Uint16 量子化 + base64
@@ -13,7 +14,11 @@ A 側)** と **画面2「関係の伝記」** を端から端まで動かす。�
 4. **注目ペアの伝記**(画面2): 全ペアを母集団に、カテゴリ枠 + ドラマ性スコアで
    数百組を選抜し、1 組ぶんの「段の遷移 / 出会いの文脈 / 会話 / **実文** /
    同伴 / closeness / 2 人の軌跡」を同梱する。
-5. 自己完結 HTML `viz/chronicle/chronicle.html`(CDN 禁止・Canvas 2D・遅延なしの一体型)
+5. **伝播カスケード**(画面3): 信念 / リシェア / 語彙を同じ器(木・等時線・S 字・チャネル)へ
+6. **物語ピン**(画面4): 宣言的 sifting パターン(遺失物の連鎖・緊急の連鎖・人づて hop>=2・
+   関係の破綻→再構築・集会と不発の集会・逸脱・カスケードの離陸)を surprise で格付けし、
+   当事者の **思考 → 行為**(`l1b_llm` × `llm_journal`)を 1 ホップ添える
+7. 自己完結 HTML `viz/chronicle/chronicle.html`(CDN 禁止・Canvas 2D・遅延なしの一体型)
 
 画面2 が読む素材(1 パス目に相乗り)
 ------------------------------------
@@ -156,6 +161,61 @@ CAS_CURVE_MAX = 320                         # S 字曲線の点数上限
 BELIEF_CAP_DEFAULT = 8_000_000              # belief_update を貯める行数上限(1 件 26B)
 RESHARE_CAP_DEFAULT = 8_000_000             # sns_reshare を貯める行数上限(1 件 20B)
 STOCK_CAP_DEFAULT = 4_000_000               # stock_out を貯める行数上限(fact 命名用)
+
+#: 画面4「物語ピン + 今日のハイライト」の素材(story sifting)。
+#: 宣言的パターンが読む kind を**ここに全部並べる**。実在しない kind は静かに落ちる
+#: (Run A には `crime` / `police_response` / `event_host` が 1 行も無い = 静かに 0 件)。
+#:
+#: 連鎖の結び方(**exact join**。近接での当て推量をしない):
+#: - 遺失物: 落とし主 `owner` × 品目 `item` × **落とした step**。落とした step は
+#:   `lost_pickup.lying_steps` / `lost_notice.delay_steps` / `lost_expire.age_steps` を
+#:   その行の step から引けば厳密に復元でき、`lost_return.held_steps` は
+#:   `lost_turnin` の step を厳密に指す(engine が差分を payload に書いているため)。
+#: - 緊急: 患者 id(`collapse` は agent_id 自身、`injury` / `traffic_accident` は
+#:   payload.victim、以降は payload.patient)× 発生 step からの窓。
+#: - 集会: `event_host.event_id` × `event_attend.event_id`(完全一致)。
+STORY_KINDS = (
+    "lost_drop", "lost_notice", "lost_pickup", "lost_turnin",
+    "lost_keep", "lost_return", "lost_expire",
+    "collapse", "injury", "traffic_accident",
+    "ems_call", "ems_dispatch", "ems_transport",
+    "hospital_admit", "hospital_discharge",
+    "crime", "police_response", "nuisance",
+    "event_host", "event_attend",
+)
+
+#: パターン種(HTML の凡例・地図ピンと 1 対 1)。
+PAT_LOST, PAT_EMS, PAT_HOP, PAT_PAIR, PAT_GATHER, PAT_CRIME, PAT_VIRAL = range(7)
+PAT_LABELS = {
+    PAT_LOST: "遺失物の連鎖",
+    PAT_EMS: "緊急の連鎖",
+    PAT_HOP: "人づての語・信念",
+    PAT_PAIR: "関係のドラマ",
+    PAT_GATHER: "集まり",
+    PAT_CRIME: "逸脱と迷惑",
+    PAT_VIRAL: "離陸した投稿",
+}
+#: 地図ピンの字(絵文字を使わない = フォント差で化けない)。
+PAT_GLYPHS = {PAT_LOST: "落", PAT_EMS: "急", PAT_HOP: "語", PAT_PAIR: "縁",
+              PAT_GATHER: "集", PAT_CRIME: "犯", PAT_VIRAL: "波"}
+PAT_COLORS = {PAT_LOST: "#fbbf24", PAT_EMS: "#f87171", PAT_HOP: "#4ade80",
+              PAT_PAIR: "#f9a8d4", PAT_GATHER: "#c4b5fd", PAT_CRIME: "#fb923c",
+              PAT_VIRAL: "#7cc4ff"}
+#: 掲載枠(種別ごとの最低保証。合計は cap を超えない)。
+#: 迷惑行為は Run A で 32,718 行あり、枠が無いと稀少パターンを押し流す。
+STORY_QUOTA = {PAT_LOST: 40, PAT_EMS: 24, PAT_HOP: 24, PAT_PAIR: 40,
+               PAT_GATHER: 24, PAT_CRIME: 20, PAT_VIRAL: 20}
+
+STORY_CAP_DEFAULT = 200                     # 掲載する物語数(母集団は必ず併記)
+STORY_BEATS_MAX = 24                        # 1 物語の拍(beat)の上限
+STORY_ROW_CAP = 1_500_000                   # story kind を貯める行数上限(RAM よけ)
+NUI_BIN_STEPS = 6                           # 迷惑行為の束ね幅(6 step = 1 時間 @Δt10)
+NUI_BURST_MIN = 4                           # 「騒ぎが続いた」とみなす 1 セルの下限
+NUI_CELL_CAP = 400_000                      # 迷惑行為セル辞書の上限
+GATHER_MIN_N = 10                           # 集合の臨界(detect_gatherings の DEF_MIN_N)
+THOUGHT_CAP_DEFAULT = 60                    # 思考チェーンを付ける物語数の上限
+JOURNAL_SCAN_CAP = 400_000                  # llm_journal を舐める行数上限(走行中よけ)
+STORY_EMS_WINDOW = 12                       # 発生 → 通報/出動 を同一件とみなす step 窓
 
 #: 時系列に必ず載せる kind(L2 に相当列が無い/物語上の主役)。
 #: 実在しない kind は静かに落ちる(run_manifest 駆動の流儀)。
@@ -338,7 +398,8 @@ class _Scan:
                  conv_cap: int = CONV_CAP_DEFAULT, text_cap: int = TEXT_CAP_DEFAULT,
                  propagation: bool = True, belief_cap: int = BELIEF_CAP_DEFAULT,
                  reshare_cap: int = RESHARE_CAP_DEFAULT,
-                 stock_cap: int = STOCK_CAP_DEFAULT):
+                 stock_cap: int = STOCK_CAP_DEFAULT, stories: bool = True,
+                 story_row_cap: int = STORY_ROW_CAP):
         import numpy as np
         self.np = np
         self.grid = HexGrid(hex_m)
@@ -372,6 +433,24 @@ class _Scan:
         self.adopts: list = []          # (step, agent, item, text)
         self.binds: list = []           # (step, agent, word_text, node, x, y)
         self.vocab_use: Counter = Counter()
+
+        # ---- 画面4「物語ピン」の素材(stories=False で 1 行も読まない) ------- #
+        # 遺失物・緊急・犯罪・集会は Run A で合わせて 600 行しかないので **dict のまま**
+        # 持つ(読みやすさ優先)。唯一の大物 `nuisance`(32,718 行)だけは
+        # (ノード × 1 時間)へその場で畳んで有界にする。
+        self.stories = bool(stories)
+        self.story_row_cap = int(story_row_cap)
+        self.st: dict[str, list] = defaultdict(list)
+        self.st_pop: Counter = Counter()        # kind ごとの母集団(cap 前の行数)
+        self.st_kept = 0
+        self.st_dropped = 0
+        self.st_nodes = _Intern()               # ノード id / 交番名 / 場所名
+        self.st_words = _Intern()               # 品目・重度・原因・題名など短い語
+        #: (node_id, step // NUI_BIN_STEPS) -> [件数, 最初の step, 最後の step,
+        #:                                      x, y, [代表 agent 8 人], Counter(kind)]
+        self.nui: dict[tuple, list] = {}
+        self.nui_pop = 0
+        self.nui_dropped = 0
 
         # ---- 画面2「関係の伝記」の素材(narrative=False で 1 行も読まない) ---- #
         self.narrative = bool(narrative)
@@ -917,6 +996,161 @@ class _Scan:
                 np.asarray(t[6], dtype=np.int16)))
             self.tx_rows += len(t[0])
 
+    # ---- 物語素材(画面4) ------------------------------------------------- #
+    def _stories(self, batch, idx, kinds, xnp, ynp) -> None:
+        """遺失物 / 緊急 / 逸脱 / 集会 の行を、**連鎖を組めるだけの欄**で持ち上げる。
+
+        1 パス目に相乗りする。Python オブジェクトになるのは STORY_KINDS の行だけ
+        (Run A で 33,313 行 = 全 L1 の 0.082%)。ノード名・品目・重度は辞書化する。
+        """
+        import pyarrow as pa
+        take = pa.array(idx)
+        steps = batch.column("step").take(take).to_pylist()
+        aids = batch.column("agent_id").take(take).to_pylist()
+        pays = batch.column("payload").take(take).to_pylist()
+        xs = xnp[idx].tolist() if xnp is not None else [None] * len(steps)
+        ys = ynp[idx].tolist() if ynp is not None else [None] * len(steps)
+
+        def _i(v, dflt=-1):
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return dflt
+
+        for st, a, kd, raw, x, y in zip(steps, aids, kinds, pays, xs, ys):
+            if st is None:
+                continue
+            self.st_pop[kd] += 1
+            try:
+                p = json.loads(raw) if raw else {}
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(p, dict):
+                continue
+            st = int(st)
+            a = -1 if a is None else int(a)
+            xi, yi = _xy16(x), _xy16(y)
+
+            if kd == "nuisance":
+                # 32,718 行。1 件ずつ持たず (ノード × 1 時間) のセルへ畳む。
+                self.nui_pop += 1
+                key = (self.st_nodes(str(p.get("node") or "")), st // NUI_BIN_STEPS)
+                cell = self.nui.get(key)
+                if cell is None:
+                    if len(self.nui) >= NUI_CELL_CAP:
+                        self.nui_dropped += 1
+                        continue
+                    cell = [0, st, st, xi, yi, [], Counter()]
+                    self.nui[key] = cell
+                cell[0] += 1
+                cell[1] = min(cell[1], st)
+                cell[2] = max(cell[2], st)
+                if cell[3] == -32768 and xi != -32768:
+                    cell[3], cell[4] = xi, yi
+                if a >= 0 and len(cell[5]) < 8 and a not in cell[5]:
+                    cell[5].append(a)
+                cell[6][str(p.get("kind") or "?")] += 1
+                continue
+
+            if self.st_kept >= self.story_row_cap:
+                self.st_dropped += 1
+                continue
+
+            row = {"s": st, "a": a, "x": xi, "y": yi}
+            if kd.startswith("lost_"):
+                row["item"] = self.st_words(str(p.get("item") or ""))
+                # `node` = 物が在った場所 / `post` = 最寄りの交番。**別の量**なので分ける
+                # (混ぜると「交番へ届けた(拾った店の名前)」という嘘の行になる)。
+                row["node"] = self.st_nodes(str(p.get("node") or ""))
+                if p.get("post"):
+                    row["post"] = self.st_nodes(str(p.get("post")))
+                if kd == "lost_drop":
+                    row["owner"] = a
+                    row["cash"] = _round(p.get("cash") or 0.0, 1)
+                    row["crowd"] = _i(p.get("crowd"), 0)
+                    row["drinking"] = bool(p.get("drinking"))
+                    row["rain"] = bool(p.get("rain"))
+                    row["drop"] = st
+                elif kd == "lost_notice":
+                    row["owner"] = a
+                    row["drop"] = st - _i(p.get("delay_steps"), 0)
+                elif kd in ("lost_pickup", "lost_turnin", "lost_keep"):
+                    row["owner"] = _i(p.get("owner"))
+                    row["finder"] = a
+                    row["guardians"] = _i(p.get("guardians"), -1)
+                    if kd == "lost_pickup":
+                        row["drop"] = st - _i(p.get("lying_steps"), 0)
+                    if kd == "lost_keep":
+                        row["amount"] = _round(p.get("amount") or 0.0, 1)
+                        row["offense"] = self.st_words(str(p.get("offense") or ""))
+                elif kd == "lost_return":
+                    row["owner"] = a
+                    row["finder"] = _i(p.get("finder"))
+                    row["amount"] = _round(p.get("amount") or 0.0, 1)
+                    row["cash"] = _round(p.get("cash") or 0.0, 1)
+                    row["turnin"] = st - _i(p.get("held_steps"), 0)
+                else:                                    # lost_expire
+                    row["owner"] = _i(p.get("owner"))
+                    row["finder"] = a
+                    row["to"] = self.st_words(str(p.get("to") or ""))
+                    row["amount"] = _round(p.get("amount") or 0.0, 1)
+                    row["drop"] = st - _i(p.get("age_steps"), 0)
+
+            elif kd in ("collapse", "injury", "traffic_accident"):
+                row["patient"] = a if kd == "collapse" else _i(p.get("victim"), a)
+                row["node"] = self.st_nodes(str(p.get("node") or ""))
+                row["src"] = self.st_words(str(p.get("source") or p.get("severity") or ""))
+                row["sev"] = _i(p.get("sev", p.get("severity")), -1)
+                if kd == "traffic_accident":
+                    row["ped_n"] = _i(p.get("ped_n"), 0)
+                    row["signalized"] = bool(p.get("signalized"))
+
+            elif kd in ("ems_call", "ems_dispatch", "ems_transport"):
+                row["patient"] = _i(p.get("patient"), -1)
+                row["node"] = self.st_nodes(str(p.get("node") or ""))
+                if kd == "ems_call":
+                    row["self_call"] = bool(p.get("self_call"))
+                    row["dist_m"] = _round(p.get("dist_m"), 1)
+                    row["bystanders"] = _i(p.get("bystanders"), -1)
+                elif kd == "ems_dispatch":
+                    row["unstaffed"] = bool(p.get("unstaffed"))
+                    row["response_min"] = _round(p.get("response_min"), 1)
+                    row["crew"] = _i(p.get("crew"), -1)
+                else:
+                    row["poi"] = self.st_nodes(str(p.get("poi") or ""))
+                    row["confirmed"] = _i(p.get("confirmed"), -1)
+                    row["cost"] = _round(p.get("cost"), 1)
+
+            elif kd in ("hospital_admit", "hospital_discharge"):
+                row["patient"] = a
+                row["poi"] = self.st_nodes(str(p.get("poi") or ""))
+                row["confirmed"] = _i(p.get("confirmed"), -1)
+                row["days"] = _round(p.get("days", p.get("billed_days")), 2)
+
+            elif kd == "crime":
+                row["ckind"] = self.st_words(str(p.get("kind") or ""))
+                row["victim"] = _i(p.get("victim"), -1)
+                row["offender"] = _i(p.get("offender"), a)
+                row["amount"] = _round(p.get("amount") or 0.0, 1)
+
+            elif kd == "police_response":
+                row["node"] = self.st_nodes(str(p.get("node") or ""))
+                row["about"] = self.st_words(str(p.get("kind") or p.get("about") or ""))
+
+            elif kd == "event_host":
+                row["eid"] = _i(p.get("event_id"), -1)
+                row["title"] = self.st_words(str(p.get("title") or ""))
+                row["place"] = self.st_nodes(str(p.get("place") or p.get("node") or ""))
+                row["start"] = _i(p.get("start_step"), st)
+
+            elif kd == "event_attend":
+                row["eid"] = _i(p.get("event_id"), -1)
+                row["host"] = _i(p.get("host"), -1)
+                row["title"] = self.st_words(str(p.get("title") or ""))
+
+            self.st[kd].append(row)
+            self.st_kept += 1
+
     # ---- 1 batch --------------------------------------------------------- #
     def feed(self, batch) -> None:
         import numpy as np
@@ -949,6 +1183,7 @@ class _Scan:
         rel_idx, rel_kinds = None, None
         narr_idx, narr_kinds = None, None
         prop_idx, prop_kinds = None, None
+        story_idx, story_kinds = None, None
         if "kind" in names and "payload" in names and "agent_id" in names:
             import pyarrow as pa
             kc = batch.column("kind")
@@ -969,6 +1204,8 @@ class _Scan:
                 narr_idx, narr_kinds = _pick(NARR_KINDS)
             if self.propagation:
                 prop_idx, prop_kinds = _pick(PROP_KINDS)
+            if self.stories:
+                story_idx, story_kinds = _pick(STORY_KINDS)
 
         xnp = ynp = None
         if "x" in names and "y" in names and "agent_id" in names:
@@ -986,6 +1223,8 @@ class _Scan:
             self._narratives(batch, narr_idx, narr_kinds, xnp, ynp)
         if prop_idx is not None:
             self._propagation(batch, prop_idx, prop_kinds, xnp, ynp)
+        if story_idx is not None:
+            self._stories(batch, story_idx, story_kinds, xnp, ynp)
 
     def finish(self) -> None:
         self._flush(self._cur_bin)
@@ -998,12 +1237,13 @@ def scan_l1(run_dir, *, hex_m: float, steps_per_bin: int, rel_cap: int,
             text_cap: int = TEXT_CAP_DEFAULT, propagation: bool = True,
             belief_cap: int = BELIEF_CAP_DEFAULT,
             reshare_cap: int = RESHARE_CAP_DEFAULT,
-            stock_cap: int = STOCK_CAP_DEFAULT) -> _Scan:
+            stock_cap: int = STOCK_CAP_DEFAULT, stories: bool = True) -> _Scan:
     """L1 を 1 パスで舐める。`l1_stream` の有界読みだけを使う。"""
     import l1_stream
     sc = _Scan(hex_m, steps_per_bin, rel_cap, narrative=narrative,
                conv_cap=conv_cap, text_cap=text_cap, propagation=propagation,
-               belief_cap=belief_cap, reshare_cap=reshare_cap, stock_cap=stock_cap)
+               belief_cap=belief_cap, reshare_cap=reshare_cap, stock_cap=stock_cap,
+               stories=stories)
     cols = ["step", "sim_min", "agent_id", "kind", "x", "y", "payload"]
     t0 = time.time()
     last = t0
@@ -1027,6 +1267,10 @@ def scan_l1(run_dir, *, hex_m: float, steps_per_bin: int, rel_cap: int,
              f"(fact {len(sc.facts):,} 件)・sns_reshare {sc.rsh_kept:,}/{sc.rsh_pop:,} 行・"
              f"viral_cascade {sc.vir_rows:,}・transmission {sc.tx_rows:,}・"
              f"coin {len(sc.coins):,}・stock_out {sc.so_kept:,}/{sc.so_pop:,}")
+    if sc.stories:
+        top = ", ".join(f"{k} {v:,}" for k, v in sc.st_pop.most_common(6))
+        _log(f"  物語素材: {sc.st_kept:,} 行(母集団 {sum(sc.st_pop.values()):,})・"
+             f"迷惑行為 {sc.nui_pop:,} 行 → {len(sc.nui):,} セル・上位[{top}]")
     return sc
 
 
@@ -2335,6 +2579,1086 @@ def build_cascades(run_dir, sc: _Scan, *, hex_m: float, cap: int, nodes_cap: int
 
 
 # --------------------------------------------------------------------------- #
+# 画面4「物語ピン + 今日のハイライト」— story sifting
+#
+# 方針(計画 §1 画面4)
+# --------------------
+# * **パターンは宣言的**。1 つのパターン = 「どの kind を どの鍵で 繋ぐか」の宣言 +
+#   「当事者 / step 列 / 現場」を返す関数。器は 7 種で共通(`_story` が組む)。
+# * **surprise は説明できる形で出す**: `-log2(そのパターン種の周辺頻度 / 全イベント)`
+#   + 規模 z + 稀少構成ボーナス。3 項をそのまま payload に残し、ボーナスの根拠は
+#   人が読める日本語(`why`)で併記する(スコアだけ出して黙らない)。
+# * **母集団 → 掲載**を必ず併記する。掲載は種別枠(STORY_QUOTA)を先に埋めてから
+#   surprise 降順で埋める(迷惑行為 32,718 行が稀少パターンを押し流さないため)。
+# * 思考チェーンは **1 ホップだけ**。`l1b_llm`(agent × step → llm_call_id)で
+#   当事者の呼び出しを引き、`llm_journal.jsonl.gz` を**逐次**舐めて該当行だけ拾う
+#   (全展開しない・走行中の切れた gz でも読めたところまでで止める)。
+# --------------------------------------------------------------------------- #
+def read_llm_index(run_dir) -> dict:
+    """`l1b_llm`(agent_id, step, llm_call_id, purpose)→ {(agent, step): [id, purpose]}。
+
+    L1 本体の `llm_call_id` 列を読むと 40.6 億行ぶんの文字列を触ることになるので、
+    **同じ対応表を持つ 2 万行のサイドカー**の方を読む(1 パス目に足さない理由)。
+    """
+    import l1_stream
+    import pyarrow.parquet as pq
+    out: dict[tuple, list] = {}
+    rows = 0
+    for p in l1_stream.l1_paths(run_dir, "l1b_llm"):
+        try:
+            with l1_stream._open_shared(p) as fh:
+                t = pq.ParquetFile(fh).read(
+                    columns=["agent_id", "step", "llm_call_id", "purpose"])
+        except (OSError, ValueError, KeyError):
+            continue
+        d = t.to_pydict()
+        rows += t.num_rows
+        for aid, st, cid, pu in zip(d["agent_id"], d["step"],
+                                    d["llm_call_id"], d["purpose"]):
+            if aid is None or st is None or not cid:
+                continue
+            key = (int(aid), int(st))
+            if key not in out:                     # 同 step 複数呼びは最初の 1 本
+                out[key] = [str(cid), str(pu or "")]
+    return {"map": out, "rows": rows}
+
+
+def read_journal(run_dir, want: set, *, scan_cap: int = JOURNAL_SCAN_CAP,
+                 prompt_tail: int = 260, resp_head: int = 200) -> dict:
+    """`llm_journal.jsonl.gz` を逐次で舐め、**欲しい llm_call_id の行だけ**取り出す。
+
+    - `key` は 64 桁、L1 / l1b_llm の `llm_call_id` はその**先頭 16 桁**。
+    - 行の中身を JSON にするのは**一致した行だけ**(1 行 ~700B の prompt を
+      2 万行ぶん展開しない)。
+    - 走行中のランでは末尾が書きかけのことがある。例外は握って
+      「読めたところまで」を返す(欠測を偽の値で埋めない)。
+    """
+    import gzip
+    import zlib
+    out: dict[str, dict] = {}
+    meta = {"available": False, "scanned": 0, "matched": 0, "truncated": False,
+            "wanted": len(want)}
+    if not want:
+        return {"items": out, "meta": meta}
+    path = Path(run_dir) / "llm_journal.jsonl.gz"
+    if not path.is_file():
+        return {"items": out, "meta": meta}
+    meta["available"] = True
+    need = set(want)
+    tag = b'"key": "'
+    try:
+        with gzip.open(path, "rb") as fh:
+            for line in fh:
+                meta["scanned"] += 1
+                if meta["scanned"] > scan_cap:
+                    meta["truncated"] = True
+                    break
+                i = line.find(tag)
+                if i < 0:
+                    continue
+                j = i + len(tag)
+                cid = line[j:j + 16].decode("ascii", "ignore")
+                if cid not in need:
+                    continue
+                try:
+                    d = json.loads(line.decode("utf-8", "replace"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                pr = str(d.get("prompt") or "")
+                rs = str(d.get("response") or "")
+                out[cid] = {
+                    "rng_key": d.get("rng_key"),
+                    "backend": d.get("backend"),
+                    "think": bool(d.get("think")),
+                    "cached": bool(d.get("cached")),
+                    "prompt_len": len(pr),
+                    # プロンプトの**末尾**= 「いま何が見えているか」。冒頭の共通指示ではない。
+                    "prompt": pr[-prompt_tail:],
+                    "prompt_clipped": len(pr) > prompt_tail,
+                    "response": rs[:resp_head],
+                    "response_len": len(rs),
+                    "response_clipped": len(rs) > resp_head,
+                }
+                need.discard(cid)
+                if not need:
+                    break
+    except (OSError, EOFError, zlib.error) as exc:         # 走行中の切れた gz
+        meta["truncated"] = True
+        meta["error"] = type(exc).__name__
+    meta["matched"] = len(out)
+    return {"items": out, "meta": meta}
+
+
+def read_gathering_intent(run_dir) -> dict:
+    """`gathering_intent`(観察サイドカー)を読む。無ければ静かに空。
+
+    1 セル = (day, when_bin, place_kind, place)。同じセルが 1 日数回撮られるので
+    **n_intent が最大の行**を採る(意図のピークが「臨界まであと何人」の分子)。
+    """
+    import l1_stream
+    import pyarrow.parquet as pq
+    meta = {"available": False, "parts": 0, "rows": 0, "cells": 0}
+    best: dict[tuple, dict] = {}
+    paths = l1_stream.l1_paths(run_dir, "gathering_intent")
+    meta["parts"] = len(paths)
+    if not paths:
+        return {"cells": [], "meta": meta}
+    for p in paths:
+        try:
+            with l1_stream._open_shared(p) as fh:
+                t = pq.ParquetFile(fh).read()
+        except (OSError, ValueError, KeyError):
+            continue
+        d = t.to_pydict()
+        meta["rows"] += t.num_rows
+        for i in range(t.num_rows):
+            key = (int(d["day"][i] or 0), int(d["when_bin"][i] or 0),
+                   str(d["place_kind"][i] or ""), str(d["place"][i] or ""))
+            n = int(d["n_intent"][i] or 0)
+            cur = best.get(key)
+            if cur is not None and cur["n_intent"] >= n:
+                continue
+            try:
+                sample = json.loads(d["sample_ids"][i] or "[]")
+            except (json.JSONDecodeError, TypeError):
+                sample = []
+            try:
+                eids = json.loads(d["event_ids"][i] or "[]")
+            except (json.JSONDecodeError, TypeError):
+                eids = []
+            best[key] = {
+                "day": key[0], "when_bin": key[1], "place_kind": key[2],
+                "place": key[3], "n_intent": n,
+                "n_appointment": int(d["n_appointment"][i] or 0),
+                "n_plan": int(d["n_plan"][i] or 0),
+                "n_event": int(d["n_event"][i] or 0),
+                "cap_day": int(d["cap_day"][i] or 0),
+                "cap_min": int(d["cap_min"][i] or 0),
+                "lead_min": int(d["lead_min"][i] or 0),
+                "event_ids": eids,
+                "sample": [int(v) for v in sample[:12]],
+            }
+    meta["available"] = True
+    meta["cells"] = len(best)
+    return {"cells": [best[k] for k in sorted(best)], "meta": meta}
+
+
+def _b64_arr(s, dtype):
+    """base64(`_b64` の逆)→ numpy 配列。空文字は長さ 0。"""
+    import numpy as np
+    if not s:
+        return np.zeros(0, dtype=dtype)
+    return np.frombuffer(base64.b64decode(s), dtype=dtype)
+
+
+def _zscores(vals):
+    """規模 z(母標準偏差)。1 件しか無いパターンは 0(= 規模で加点しない)。"""
+    n = len(vals)
+    if n <= 1:
+        return [0.0] * n
+    m = sum(vals) / n
+    var = sum((v - m) ** 2 for v in vals) / n
+    sd = math.sqrt(var)
+    if sd <= 1e-9:
+        return [0.0] * n
+    return [max(-2.0, min(6.0, (v - m) / sd)) for v in vals]
+
+
+def build_stories(run_dir, sc: _Scan, *, n_steps: int, cap: int = STORY_CAP_DEFAULT,
+                  pairs_data=None, cas_data=None, thoughts: bool = True,
+                  thought_cap: int = THOUGHT_CAP_DEFAULT,
+                  node_xy=None, steps_per_day: int = 144) -> dict:
+    """宣言的 sifting パターン → surprise 格付け → 掲載(母集団を必ず併記)。"""
+    t0 = time.time()
+    words = sc.st_words.vals
+    nodes = sc.st_nodes.vals
+
+    def W(i):
+        return str(words[i]) if isinstance(i, int) and 0 <= i < len(words) else ""
+
+    #: ノード id → 表示名。地図の `nodes[].name` / POI の `node` 欄から引く。
+    #: 引けないものは **id をそのまま出す**(偽の名前を作らない)。
+    node_name = {k: v[2] for k, v in (node_xy or {}).items() if v and v[2]}
+    named_hits = [0, 0]
+
+    def N(i):
+        """辞書 id → ノードの人が読む名前(引けなければ id の文字列)。"""
+        raw = str(nodes[i]) if isinstance(i, int) and 0 <= i < len(nodes) else ""
+        if not raw:
+            return ""
+        named_hits[1] += 1
+        nm = node_name.get(raw)
+        if nm:
+            named_hits[0] += 1
+            return f"{nm}({raw})"
+        return raw
+
+    ITEM_JP = {"umbrella": "傘", "wallet": "財布", "phone": "携帯", "other": "持ち物"}
+
+    def item_jp(i):
+        w = W(i)
+        return ITEM_JP.get(w, w or "持ち物")
+
+    pop: dict = {"l1_rows": int(sc.rows),
+                 "story_rows": int(sc.st_kept),
+                 "story_rows_population": int(sum(sc.st_pop.values())),
+                 "story_rows_dropped": int(sc.st_dropped),
+                 "by_kind": {k: int(v) for k, v in sc.st_pop.most_common()},
+                 "nuisance_rows": int(sc.nui_pop),
+                 "nuisance_cells": len(sc.nui),
+                 "nuisance_cells_dropped": int(sc.nui_dropped)}
+    matches: list[dict] = []           # 母集団(パターンが見つけた全マッチ)
+    who_all: set = set()
+
+    def _story(pat, key, *, title, sub, who, s0, s1, x, y, beats,
+               size, why=None, link=None, extra=None):
+        # 拍は必ず **step 昇順**(安定ソート = 同 step は組んだ順)。時計の列が
+        # 行ったり来たりすると、連鎖の論理順と時間順の区別が読めなくなる。
+        beats = sorted(beats, key=lambda b: b[0])
+        m = {"pat": int(pat), "key": str(key), "title": title, "sub": sub,
+             "who": [int(v) for v in who if v is not None and int(v) >= 0],
+             "s0": int(s0), "s1": int(s1), "x": int(x), "y": int(y),
+             "beats": beats[:STORY_BEATS_MAX], "beats_n": len(beats),
+             "size": float(size), "why": list(why or []),
+             "bonus": 0.0, "link": link}
+        if extra:
+            m.update(extra)
+        matches.append(m)
+        who_all.update(m["who"])
+        return m
+
+    def _pos(rows):
+        """拍の列から代表座標を決める(欠測 -32768 は使わない)。"""
+        for r in rows:
+            if r is not None and r.get("x", -32768) != -32768:
+                return int(r["x"]), int(r["y"])
+        return -32768, -32768
+
+    # ===================================================================== #
+    # ① 遺失物の完全連鎖(落とす → 拾う → 交番 → 返還 / 横領)
+    #    鍵 = (落とし主, 品目, **落とした step**)。落とした step は各行の
+    #    lying_steps / delay_steps / age_steps / held_steps から厳密に復元できる。
+    # ===================================================================== #
+    chains: dict[tuple, dict] = {}
+
+    def _ch(owner, item, drop_step):
+        k = (int(owner), int(item), int(drop_step))
+        c = chains.get(k)
+        if c is None:
+            c = chains[k] = {"owner": int(owner), "item": int(item),
+                             "drop_step": int(drop_step)}
+        return c
+
+    for r in sc.st.get("lost_drop", ()):
+        _ch(r["owner"], r["item"], r["s"])["drop"] = r
+    for r in sc.st.get("lost_notice", ()):
+        _ch(r["owner"], r["item"], r["drop"])["notice"] = r
+    for r in sc.st.get("lost_pickup", ()):
+        _ch(r["owner"], r["item"], r["drop"])["pickup"] = r
+    # turnin / keep は拾得と**同じ step**に出る(engine の `_phase_pickup`)。
+    by_pick: dict[tuple, dict] = {}
+    for k, c in chains.items():
+        pk = c.get("pickup")
+        if pk is not None:
+            by_pick[(int(pk["owner"]), int(pk["item"]), int(pk["finder"]),
+                     int(pk["s"]))] = c
+    for kd in ("lost_turnin", "lost_keep"):
+        for r in sc.st.get(kd, ()):
+            c = by_pick.get((int(r["owner"]), int(r["item"]),
+                             int(r["finder"]), int(r["s"])))
+            if c is None:                          # 拾得行が cap/期間の外(正直に単独扱い)
+                c = _ch(r["owner"], r["item"], -1 - int(r["s"]))
+            c[kd[5:]] = r
+    by_turn: dict[tuple, dict] = {}
+    for c in chains.values():
+        tr = c.get("turnin")
+        if tr is not None:
+            by_turn[(int(tr["owner"]), int(tr["item"]), int(tr["s"]))] = c
+    for r in sc.st.get("lost_return", ()):
+        c = by_turn.get((int(r["owner"]), int(r["item"]), int(r["turnin"])))
+        if c is None:
+            c = _ch(r["owner"], r["item"], -1 - int(r["s"]))
+        c["return"] = r
+    for r in sc.st.get("lost_expire", ()):
+        _ch(r["owner"], r["item"], r["drop"])["expire"] = r
+
+    pop["lost_chains"] = len(chains)
+    OUTCOME = {"return": "が持ち主に返った", "keep": "を拾った人が自分のものにした",
+               "expire": "が時効・失効になった", "turnin": "が交番に届いたまま",
+               "pickup": "が拾われたまま", "drop": "が落ちたまま",
+               "notice": "の遺失届だけが残った"}
+    for key, c in sorted(chains.items()):
+        seq = [k for k in ("drop", "notice", "pickup", "turnin", "keep",
+                           "return", "expire") if c.get(k)]
+        if not seq:
+            continue
+        rows = [c[k] for k in seq]
+        rows.sort(key=lambda r: r["s"])
+        outcome = ("return" if c.get("return") else
+                   "keep" if c.get("keep") else
+                   "expire" if c.get("expire") else
+                   "turnin" if c.get("turnin") else
+                   "pickup" if c.get("pickup") else
+                   "notice" if c.get("notice") else "drop")
+        it = item_jp(c["item"])
+        owner, finder = c["owner"], -1
+        for k in ("pickup", "turnin", "keep", "return", "expire"):
+            if c.get(k) and int(c[k].get("finder", -1)) >= 0:
+                finder = int(c[k]["finder"])
+                break
+        beats = []
+        for k in ("drop", "notice", "pickup", "turnin", "keep", "return", "expire"):
+            r = c.get(k)
+            if not r:
+                continue
+            if k == "drop":
+                extra = []
+                if r.get("cash"):
+                    extra.append(f"中に {r['cash']:,.0f} 円")
+                if r.get("drinking"):
+                    extra.append("飲んでいた")
+                if r.get("rain"):
+                    extra.append("雨")
+                if int(r.get("crowd") or 0) >= 8:
+                    extra.append(f"周りに {r['crowd']} 人")
+                txt = f"{it}を落とした" + (f"({'・'.join(extra)})" if extra else "")
+                w = owner
+            elif k == "notice":
+                txt = ("失くしたことに気づいて遺失届を出した("
+                       + (N(r.get("post", -1)) or "最寄りの交番") + ")")
+                w = owner
+            elif k == "pickup":
+                g = int(r.get("guardians", -1))
+                txt = (f"{it}を拾った"
+                       + (f"(周りに {g} 人)" if g > 0
+                          else "(周りに誰も居なかった)" if g == 0 else ""))
+                w = int(r["finder"])
+            elif k == "turnin":
+                txt = ("拾った" + it + "を交番へ届けた("
+                       + (N(r.get("post", -1)) or "最寄りの交番")
+                       + (f"・落ちていたのは {N(r['node'])}" if N(r.get("node", -1))
+                          else "") + ")")
+                w = int(r["finder"])
+            elif k == "keep":
+                txt = (f"★拾った{it}をそのまま自分のものにした"
+                       f"({W(r['offense']) or '占有離脱物横領'}"
+                       + (f"・現金 {r['amount']:,.0f} 円" if r.get("amount") else "") + ")")
+                w = int(r["finder"])
+            elif k == "return":
+                txt = (f"{it}が持ち主へ返された"
+                       + (f"(報労金 {r['amount']:,.0f} 円)" if r.get("amount") else ""))
+                w = owner
+            else:
+                txt = ("時効で拾得者のものになった" if W(r["to"]) == "finder"
+                       else "誰にも拾われないまま失われた")
+                w = int(r.get("finder", -1))
+            beats.append([int(r["s"]), int(r["x"]), int(r["y"]), txt, int(w)])
+        x, y = _pos(rows)
+        why = []
+        bonus = 0.0
+        if outcome == "keep":
+            why.append("届けずに自分のものにした(占有離脱物横領)")
+            bonus += 3.0
+            if c["keep"].get("guardians") == 0:
+                why.append("拾った瞬間、周りに誰も居なかった(監視者ゼロ)")
+                bonus += 1.0
+            if c["keep"].get("amount"):
+                bonus += 0.6
+        elif outcome == "return":
+            if len(seq) >= 4:
+                why.append("落とす→拾う→交番→返還の 4 拍が全部そろった完全連鎖")
+                bonus += 1.6
+            if c["return"].get("amount"):
+                bonus += 0.4
+        elif outcome == "notice":
+            why.append("遺失届は出たが、誰も拾わなかった")
+            bonus += 0.8
+        elif outcome == "turnin":
+            why.append("交番には届いたが、持ち主はまだ取りに来ていない")
+            bonus += 0.5
+        if c.get("drop") and c["drop"].get("cash"):
+            why.append(f"財布の中に現金 {c['drop']['cash']:,.0f} 円が入っていた")
+        _story(PAT_LOST, f"lost:{key[0]}:{key[1]}:{key[2]}",
+               title=f"{it}{OUTCOME[outcome]}",
+               sub=f"落とし主 #{owner}" + (f" / 拾った人 #{finder}" if finder >= 0 else ""),
+               who=[owner, finder], s0=rows[0]["s"], s1=rows[-1]["s"], x=x, y=y,
+               beats=beats, size=len(seq), why=why,
+               extra={"outcome": outcome, "chain": seq})
+        matches[-1]["bonus"] = bonus
+
+    # ===================================================================== #
+    # ② 緊急連鎖(倒れる/事故/負傷 → 通報 → 出動 → 搬送 → 入院 → 退院)
+    #    鍵 = 患者 id × 発生 step からの窓(STORY_EMS_WINDOW step)。
+    # ===================================================================== #
+    # ★同じ (患者, step) に複数の発生行が出る: `traffic_accident` は同じ step に
+    #   `injury` も出す(`incidents_env._ems_chain`)。別々の連鎖として数えると
+    #   片方が通報行を全部持って行き、もう片方が「誰も通報しなかった」と**嘘を言う**。
+    #   同一 (患者, step) は 1 件に畳む。
+    merged: dict[tuple, list] = {}
+    for kd in ("collapse", "injury", "traffic_accident"):
+        for r in sc.st.get(kd, ()):
+            merged.setdefault((int(r["patient"]), int(r["s"])), []).append((kd, r))
+    onsets: list[tuple] = []
+    for (pid, st), lst in sorted(merged.items()):
+        # 具体的な出来事を先に(交通事故 > 負傷 > 倒れた)。位置・ノードもそれから採る。
+        lst.sort(key=lambda t: {"traffic_accident": 0, "collapse": 1,
+                                "injury": 2}.get(t[0], 3))
+        onsets.append((pid, st, lst[0][0], lst[0][1], [k for k, _ in lst]))
+    onsets.sort(key=lambda t: (t[0], t[1]))
+    by_pat: dict[int, list] = defaultdict(list)
+    for i, (pid, st, kd, r, _all) in enumerate(onsets):
+        by_pat[pid].append(i)
+    follow: dict[int, list] = defaultdict(list)
+    for kd in ("ems_call", "ems_dispatch", "ems_transport",
+               "hospital_admit", "hospital_discharge"):
+        for r in sc.st.get(kd, ()):
+            pid = int(r.get("patient", -1))
+            if pid >= 0:
+                follow[pid].append((int(r["s"]), kd, r))
+    for v in follow.values():
+        v.sort(key=lambda t: (t[0], t[1]))
+    ONSET_JP = {"collapse": "倒れた", "injury": "負傷した",
+                "traffic_accident": "交通事故に遭った"}
+    used_follow: set = set()
+    pop["ems_onsets"] = len(onsets)
+    for pid, ixs in sorted(by_pat.items()):
+        for j, i in enumerate(ixs):
+            _, st, kd, r0, all_kinds = onsets[i]
+            nxt = onsets[ixs[j + 1]][1] if j + 1 < len(ixs) else 10 ** 9
+            hi = min(nxt, st + STORY_EMS_WINDOW * 6)      # 入院・退院は日を跨ぐ
+            got = [(s, k, rr) for s, k, rr in follow.get(pid, ())
+                   if st <= s < hi and (pid, s, k) not in used_follow]
+            for s, k, _rr in got:
+                used_follow.add((pid, s, k))
+            onset_txt = "・".join(ONSET_JP.get(k, k) for k in all_kinds)
+            beats = [[int(r0["s"]), int(r0["x"]), int(r0["y"]),
+                      onset_txt
+                      + (f"({W(r0['src'])})" if W(r0["src"]) else "")
+                      + (f"・歩行者 {r0['ped_n']} 人の横断中"
+                         + ("・信号あり" if r0.get("signalized") else "・信号なし")
+                         if r0.get("ped_n") else ""), pid]]
+            who = [pid]
+            why, bonus = [], 0.0
+            kinds_got = {k for _s, k, _r in got}
+            for s, k, rr in got:
+                if k == "ems_call":
+                    self_call = bool(rr.get("self_call"))
+                    txt = ("自分で救急に通報した" if self_call
+                           else f"居合わせた人が救急に通報した({rr.get('dist_m')} m 先から)")
+                    w = int(rr["a"])
+                    if not self_call:
+                        who.append(w)
+                    if self_call:
+                        why.append("誰も気づかず、本人が自分で通報した")
+                        bonus += 0.8
+                elif k == "ems_dispatch":
+                    if rr.get("unstaffed"):
+                        txt = "★救急が出られなかった(当直不在)"
+                        why.append("通報はあったのに出動できなかった(当直不在)")
+                        bonus += 3.0
+                        w = -1
+                    else:
+                        txt = (f"救急隊 #{rr.get('crew')} が出動した"
+                               + (f"(現着 {rr.get('response_min')} 分)"
+                                  if rr.get("response_min") is not None else ""))
+                        w = int(rr.get("crew", -1))
+                        if w >= 0:
+                            who.append(w)
+                elif k == "ems_transport":
+                    txt = (f"病院へ搬送された({N(rr.get('poi', -1)) or '搬送先不明'}"
+                           + (f"・確定重症度 {rr.get('confirmed')}"
+                              if rr.get("confirmed", -1) >= 0 else "") + ")")
+                    w = pid
+                elif k == "hospital_admit":
+                    txt = (f"入院した({N(rr.get('poi', -1)) or '病院'}"
+                           + (f"・{rr.get('days')} 日の予定" if rr.get("days") else "") + ")")
+                    w = pid
+                    why.append("搬送のあと入院までつながった")
+                    bonus += 1.5
+                else:
+                    txt = f"退院した({rr.get('days')} 日ぶん請求)"
+                    w = pid
+                beats.append([int(s), int(rr["x"]), int(rr["y"]), txt, int(w)])
+            if not got:
+                why.append("倒れた/負傷したのに、通報が 1 件も出なかった(誰も見ていない)")
+                bonus += 2.5
+            if "ems_call" in kinds_got and "ems_dispatch" not in kinds_got:
+                why.append("通報だけで終わり、出動の行が無い")
+                bonus += 1.2
+            x, y = _pos([r0] + [rr for _s, _k, rr in got])
+            _story(PAT_EMS, f"ems:{pid}:{st}",
+                   title=f"#{pid} が{ONSET_JP.get(kd, kd)}",
+                   sub=(N(r0.get("node", -1)) or "場所不明")
+                       + f" / L1 {len(all_kinds) + len(got)} 行の連鎖",
+                   who=who, s0=st, s1=(got[-1][0] if got else st), x=x, y=y,
+                   beats=beats, size=len(all_kinds) + len(got), why=why,
+                   extra={"onset": kd, "onsets": all_kinds,
+                          "chain": list(all_kinds) + [k for _s, k, _r in got]})
+            matches[-1]["bonus"] = bonus
+    # 発生行の無い通報(発生が期間外・別機構)も落とさない
+    orphan = 0
+    for pid, rows in sorted(follow.items()):
+        rest = [(s, k, rr) for s, k, rr in rows if (pid, s, k) not in used_follow]
+        if not rest:
+            continue
+        orphan += 1
+        beats = [[int(s), int(rr["x"]), int(rr["y"]),
+                  f"{k}(発生行がこの期間に無い)", pid] for s, k, rr in rest]
+        x, y = _pos([rr for _s, _k, rr in rest])
+        _story(PAT_EMS, f"ems-orphan:{pid}:{rest[0][0]}",
+               title=f"#{pid} をめぐる救急の行(発生が期間の外)",
+               sub=f"L1 {len(rest)} 行", who=[pid], s0=rest[0][0], s1=rest[-1][0],
+               x=x, y=y, beats=beats, size=len(rest),
+               why=["倒れた瞬間はこの期間の外(または別の機構)にある"],
+               extra={"onset": None, "chain": [k for _s, k, _r in rest]})
+        matches[-1]["bonus"] = 0.5
+    pop["ems_orphans"] = orphan
+
+    # ===================================================================== #
+    # ③「聞く → 使う → 第三者へ」(hop >= 2)。画面3 のカスケード木を再利用する
+    #    (`_tree_pack` の a / p / s / x / y / d は kind 非依存の同じ形)。
+    # ===================================================================== #
+    import numpy as np
+    deep_pop = 0
+    if cas_data and cas_data.get("items"):
+        for ci, it in enumerate(cas_data["items"]):
+            tr = it.get("tree") or {}
+            if not tr.get("n"):
+                continue
+            a = _b64_arr(tr.get("a"), np.int32)
+            par = _b64_arr(tr.get("p"), np.int32)
+            s = _b64_arr(tr.get("s"), np.int32)
+            xs = _b64_arr(tr.get("x"), np.int16)
+            ys = _b64_arr(tr.get("y"), np.int16)
+            dp = _b64_arr(tr.get("d"), np.uint8)
+            if dp.size == 0:
+                continue
+            # `tree.d` は uint8 に丸めてある(255 で頭打ち)ので、**真の深さ**は
+            # カスケード側の `depth` を使う。木からは「見せる鎖」だけを取り出す。
+            depth = int(it.get("depth") or dp.max())
+            if depth < 2:
+                continue
+            deep_pop += 1
+            leaf = int(np.argmax(dp))
+            path = []
+            j = leaf
+            for _ in range(300):
+                path.append(j)
+                p = int(par[j]) if j < par.size else -1
+                if p < 0 or p >= par.size:
+                    break
+                j = p
+            path.reverse()
+            beats = []
+            for rank, j in enumerate(path):
+                aid = int(a[j])
+                lbl = ("最初に言い出した" if rank == 0 else
+                       f"{rank} 人目に伝わった(hop {int(dp[j])})")
+                beats.append([int(s[j]), int(xs[j]), int(ys[j]),
+                              f"{lbl}: #{aid}" if aid >= 0 else f"{lbl}: 公式(メディア)",
+                              aid])
+            kind_lb = CAS_KIND_LABELS.get(it["kind"], "?")
+            why = [f"人づての鎖が {depth} ホップ続いた"]
+            bonus = 2.0 if depth >= 3 else 0.0
+            if it["kind"] == CAS_VOCAB:
+                why.append("語彙の伝播(Run A ではほぼ観測されない)")
+                bonus += 2.5
+            if it["kind"] == CAS_BELIEF:
+                why.append("信念の人づて(Run A では 34.5 万件中 17 件だけ)")
+                bonus += 2.5
+            _story(PAT_HOP, f"hop:{it['kind']}:{it['key']}",
+                   title=f"{kind_lb}「{it['title']}」が {depth} ホップ渡った",
+                   sub=f"採用 {it['n']} 人 / 人づての辺 {it['edges']} 本 / 形 {it['shape']}"
+                       f" / たどった鎖 {len(path)} 人",
+                   who=[int(a[j]) for j in path], s0=int(s[path[0]]),
+                   s1=int(s[path[-1]]), x=int(xs[path[-1]]), y=int(ys[path[-1]]),
+                   beats=beats, size=depth, why=why,
+                   link={"cas": ci}, extra={"cas_kind": int(it["kind"]),
+                                            "depth": depth, "n": int(it["n"])})
+            matches[-1]["bonus"] = bonus
+    pop["deep_cascades"] = deep_pop
+
+    # ===================================================================== #
+    # ④ 関係ドラマ(画面2 の「破綻 → 再構築」ペアをそのまま再利用する)
+    # ===================================================================== #
+    drama_pop = 0
+    if pairs_data and pairs_data.get("items"):
+        TIERS = ["他人", "知人", "友人", "親友", "親友+", "親友++"]
+
+        def tname(t):
+            t = int(t)
+            return TIERS[t] if 0 <= t < len(TIERS) else str(t)
+
+        for pi, it in enumerate(pairs_data["items"]):
+            brk = it.get("brk") or []
+            if not brk:
+                continue
+            last_break = max(int(b[0]) for b in brk)
+            after = [t for t in (it.get("tiers") or []) if int(t[0]) > last_break]
+            rebuilt = max((int(t[1]) for t in after), default=-1)
+            worst = min(int(b[2]) for b in brk)
+            if rebuilt < 0 and (it.get("partner") is None
+                                or int(it["partner"]) <= last_break):
+                continue                                # 破綻して終わった組は画面2 の仕事
+            drama_pop += 1
+            beats = []
+            ev = [(int(t[0]), "up", int(t[1])) for t in (it.get("tiers") or [])]
+            ev += [(int(b[0]), "down", int(b[2]), int(b[1]),
+                    (pairs_data.get("causes") or [])[b[3]]
+                    if 0 <= b[3] < len(pairs_data.get("causes") or []) else "")
+                   for b in brk]
+            ev.sort(key=lambda e: e[0])
+            for e in ev:
+                # 段は**2 人のあいだ**の量なので、拍の主語は片方の名前にしない(-1)。
+                if e[1] == "up":
+                    beats.append([e[0], -32768, -32768,
+                                  f"▲ {tname(e[2])} になった", -1])
+                else:
+                    beats.append([e[0], -32768, -32768,
+                                  f"▼ {tname(e[3])} → {tname(e[2])} に下がった"
+                                  + (f"({e[4]})" if e[4] else ""), -1])
+            # 位置は会話・実文の現場から借りる(関係イベント自体は座標を持たない)
+            x, y = -32768, -32768
+            for row in (it.get("text") or []):
+                if row[3] != -32768:
+                    x, y = int(row[3]), int(row[4])
+                    break
+            if x == -32768:
+                for row in (it.get("conv") or []):
+                    if row[5] != -32768:
+                        x, y = int(row[5]), int(row[6])
+                        break
+            why = [f"一度 {tname(worst)} まで落ちてから、もう一度 {tname(rebuilt)} に戻った"]
+            bonus = 3.0
+            if len(brk) >= 2:
+                why.append(f"こじれたのは 1 度ではなく {len(brk)} 度")
+                bonus += 1.0
+            if it.get("partner") is not None and int(it["partner"]) > last_break:
+                why.append("そのあとパートナーになった")
+                bonus += 2.0
+            if (it.get("text_n") or 0) > 0:
+                why.append(f"2 人のあいだに実文が {it['text_n']} 行残っている")
+                bonus += 0.6
+            _story(PAT_PAIR, f"pair:{it['a']}:{it['b']}",
+                   title="こじれて、戻った 2 人",
+                   sub=f"#{it['a']} × #{it['b']} / 破綻 {len(brk)} 回 / "
+                       f"会話 {it.get('conv_n', 0)} 回",
+                   who=[it["a"], it["b"]], s0=int(ev[0][0]), s1=int(ev[-1][0]),
+                   x=x, y=y, beats=beats, size=len(brk) + max(0, rebuilt),
+                   why=why, link={"pair": pi},
+                   extra={"breaks": len(brk), "rebuilt": rebuilt, "worst": worst})
+            matches[-1]["bonus"] = bonus
+    pop["pair_drama"] = drama_pop
+
+    # ===================================================================== #
+    # ⑤ 集会(event_host → event_attend n 人)と、**不発の集会**
+    #    (`gathering_intent` = 現実では観測できない「集まろうとした量」)
+    # ===================================================================== #
+    hosts = {int(r["eid"]): r for r in sc.st.get("event_host", ()) if r["eid"] >= 0}
+    att: dict[int, list] = defaultdict(list)
+    for r in sc.st.get("event_attend", ()):
+        if int(r["eid"]) >= 0:
+            att[int(r["eid"])].append(r)
+    pop["events_hosted"] = len(hosts)
+    pop["events_attended"] = sum(len(v) for v in att.values())
+    for eid, h in sorted(hosts.items()):
+        rows = sorted(att.get(eid, ()), key=lambda r: r["s"])
+        beats = [[int(h["s"]), int(h["x"]), int(h["y"]),
+                  f"「{W(h['title'])}」を {N(h['place']) or '街のどこか'} で開くと決めた",
+                  int(h["a"])]]
+        for r in rows[:STORY_BEATS_MAX - 1]:
+            beats.append([int(r["s"]), int(r["x"]), int(r["y"]),
+                          f"#{r['a']} が参加した", int(r["a"])])
+        x, y = _pos([h] + rows)
+        why, bonus = [], 0.0
+        if not rows:
+            why.append("告知はしたのに、誰も来なかった")
+            bonus += 2.5
+        elif len(rows) >= 5:
+            why.append(f"{len(rows)} 人が集まった")
+            bonus += 1.0
+        _story(PAT_GATHER, f"event:{eid}",
+               title=f"「{W(h['title'])}」に {len(rows)} 人",
+               sub=f"主催 #{h['a']} / {N(h['place']) or '場所不明'}",
+               who=[h["a"]] + [r["a"] for r in rows[:12]],
+               s0=int(h["s"]), s1=int(rows[-1]["s"]) if rows else int(h["s"]),
+               x=x, y=y, beats=beats, size=len(rows), why=why,
+               extra={"event_id": eid, "attendees": len(rows)})
+        matches[-1]["bonus"] = bonus
+
+    # ---- 不発の集会(observer サイドカー `gathering_intent`)------------------ #
+    # 1 セル = (day, when_bin, place_kind, place)。Run A の実測で判ったこと:
+    #   * `n_appointment > 0` のセルは **54 件・全部 place_kind="label"**
+    #     (「渋谷」「カフェ」「ハチ公」= 場所を**語で**約束した)で、**1 件も
+    #     集会イベントにならなかった**。これが「現実では観測できない量」の本体。
+    #   * `place_kind="node"` のセルは 19,072 件あるが中身はほぼ `n_plan`
+    #     (= 通勤・通学の予定が同じ駅に集まっただけ)。**集会ではないので
+    #     物語にはせず**、日ごとの上位だけを「予定の集中」として別に出す。
+    gi = read_gathering_intent(run_dir)
+    cells = gi["cells"]
+    spd = max(1, int(steps_per_day))
+    # when_bin は「その日を slot_min で割ったビン番号」。slot_min は行に載らないので
+    # 観測された最大ビンから逆算する(Run A では 47 → 48 ビン/日 = 30 分)。
+    nb = max((c["when_bin"] for c in cells), default=-1) + 1
+    nb = nb if nb >= 2 else 48
+    slot_min = int(round(1440.0 / nb))
+    gi["meta"]["bins_per_day"] = nb
+    gi["meta"]["slot_min_inferred"] = slot_min
+    gi["meta"]["appointment_cells"] = sum(1 for c in cells if c["n_appointment"] > 0)
+    gi["meta"]["node_cells"] = sum(1 for c in cells if c["place_kind"] == "node")
+    gi["meta"]["realized_cells"] = sum(1 for c in cells if c["n_event"] > 0)
+    pop["gathering_intent"] = gi["meta"]
+
+    dt_min = max(1, 1440 // spd)
+
+    def _gi_step(c):
+        """**意図が観測された step**(cap_day / cap_min = サイドカーを撮った時刻)。
+
+        セルの (day, when_bin) は「いつ集まるつもりか」= **未来**なので、走査した
+        範囲の外にあることがある。そこへ丸めると「起きてもいない時刻」に印を打つ
+        ことになるので、拍の時刻には**観測した瞬間**を使い、目標時刻は文で言う。
+        """
+        st = int(c["cap_day"]) * spd + int(round(int(c["cap_min"]) / dt_min))
+        return max(0, min(max(0, n_steps - 1), st))
+
+    def _gi_when(c):
+        """「いつ集まるつもりだったか」。when_bin は**その日の 0 時から**の枠番号。"""
+        if c["when_bin"] < 0:
+            return "時刻を決めずに"
+        m = int(c["when_bin"]) * slot_min
+        return f"Day {c['day'] + 1} の {m // 60:02d}:{m % 60:02d} ごろ"
+
+    def _gi_xy(c):
+        if node_xy and c["place_kind"] == "node":
+            v = node_xy.get(c["place"])
+            if v:
+                return _xy16(v[0]), _xy16(v[1])
+        return -32768, -32768
+
+    def _gi_place(c):
+        if c["place_kind"] == "node":
+            nm = node_name.get(c["place"])
+            return f"{nm}({c['place']})" if nm else (c["place"] or "場所不明")
+        return c["place"] or ""
+
+    unfulfilled = 0
+    for c in cells:
+        if c["n_event"] or c["n_appointment"] <= 0:
+            continue                                # 実現した / 約束ではない(予定だけ)
+        unfulfilled += 1
+        short = max(0, GATHER_MIN_N - c["n_intent"])
+        st = _gi_step(c)
+        x, y = _gi_xy(c)
+        raw_place = _gi_place(c)
+        quoted = f"「{raw_place}」" if raw_place else "場所を決めないまま"
+        when = _gi_when(c)
+        beats = [[st, x, y,
+                  f"{quoted}で {when} 会おうと約束した人が "
+                  f"{c['n_appointment']} 人いた(この拍の時刻は"
+                  f"意図を観測した瞬間であって、集まる予定の時刻ではない)", -1],
+                 [st, x, y,
+                  ("そのセルに集会イベントは 1 件も立たなかった"
+                   + (f"(集合とみなす臨界 {GATHER_MIN_N} 人まであと {short} 人)"
+                      if short else "(頭数は臨界を超えていたのに集まりにならなかった)")),
+                  -1]]
+        why = ["現実では観測できない量:「集まろうとしたが集まらなかった」",
+               "場所は語で約束されている(地図のノードに解決されていない)"]
+        bonus = 2.5 + (1.5 if 0 < short <= 2 else 0.0)
+        if short == 0:
+            why.append("臨界人数には届いていた。足りなかったのは同時性か場所の一致")
+            bonus += 1.0
+        _story(PAT_GATHER,
+               f"gi:{c['day']}:{c['when_bin']}:{c['place_kind']}:{c['place']}",
+               title=(f"「{raw_place}」に集まらなかった {c['n_appointment']} 人"
+                      if raw_place
+                      else f"場所を決めずに約束した {c['n_appointment']} 人が"
+                           "集まらなかった"),
+               sub=f"{when} / 約束 {c['n_appointment']} 件"
+                   + (f" / 臨界まであと {short} 人" if short else " / 臨界は超えていた"),
+               who=c["sample"][:12], s0=st, s1=st, x=x, y=y, beats=beats,
+               size=c["n_appointment"], why=why,
+               extra={"unfulfilled": True, "short_by": short,
+                      "n_intent": c["n_intent"], "place_kind": c["place_kind"]})
+        matches[-1]["bonus"] = bonus
+    pop["gatherings_unfulfilled"] = unfulfilled
+
+    # 予定の集中(集会ではない)。日ごとの上位 6 セルだけを別の題で出す。
+    by_day: dict[int, list] = defaultdict(list)
+    for c in cells:
+        if c["place_kind"] == "node" and not c["n_event"] and c["n_intent"] >= GATHER_MIN_N:
+            by_day[c["day"]].append(c)
+    crowd = 0
+    for day, lst in sorted(by_day.items()):
+        lst.sort(key=lambda c: -c["n_intent"])
+        for c in lst[:6]:
+            crowd += 1
+            st = _gi_step(c)
+            x, y = _gi_xy(c)
+            when, place = _gi_when(c), _gi_place(c)
+            beats = [[st, x, y,
+                      f"{when}({slot_min} 分枠)に「{place}」へ行く予定を立てていた人が "
+                      f"{c['n_intent']:,} 人いた(予定 {c['n_plan']:,})"
+                      "。この拍の時刻は意図を観測した瞬間", -1],
+                     [st, x, y, "集会イベントにはならなかった(= 群れであって集まりではない)",
+                      -1]]
+            _story(PAT_GATHER, f"gicrowd:{c['day']}:{c['when_bin']}:{c['place']}",
+                   title=f"{c['n_intent']:,} 人ぶんの予定が 1 点に集まった",
+                   sub=f"{when} / {place}",
+                   who=c["sample"][:12], s0=st, s1=st, x=x, y=y, beats=beats,
+                   size=c["n_intent"],
+                   why=["約束ではなく予定の集中(通勤・通学の流れ)。"
+                        "集会と混同しないよう別の題で出す"],
+                   extra={"unfulfilled": True, "crowd": True,
+                          "n_intent": c["n_intent"], "place_kind": "node"})
+            matches[-1]["bonus"] = 0.0
+    pop["gatherings_crowd"] = crowd
+
+    # ===================================================================== #
+    # ⑥ 犯罪連鎖(crime → 通報 → police_response)と、迷惑行為の集中
+    #    Run A に `crime` / `police_response` は 1 行も無い = 静かに 0 件になる。
+    # ===================================================================== #
+    police = sorted((int(r["s"]), r) for r in sc.st.get("police_response", ()))
+    pop["crime_rows"] = len(sc.st.get("crime", ()))
+    pop["police_rows"] = len(police)
+    for r in sc.st.get("crime", ()):
+        beats = [[int(r["s"]), int(r["x"]), int(r["y"]),
+                  f"#{r['offender']} が #{r['victim']} から "
+                  f"{r.get('amount') or 0:,.0f} 円を盗んだ({W(r['ckind']) or '窃盗'})",
+                  int(r["offender"])]]
+        # `crime` の payload はノードを持たない(engine の cr_payload 参照)ので、
+        # 突合は **step の窓だけ**で行い、場所一致は主張しない。
+        resp = [p for s, p in police if int(r["s"]) <= s <= int(r["s"]) + 12]
+        for p in resp[:6]:
+            beats.append([int(p["s"]), int(p["x"]), int(p["y"]),
+                          f"警察が動いた({W(p['about'])})", int(p["a"])])
+        why = ["犯罪の実行が L1 に残っている"]
+        bonus = 1.5 + (1.5 if resp else 0.0)
+        if not resp:
+            why.append("警察の行は 1 件も出ていない(このランに police_response が無い)")
+        _story(PAT_CRIME, f"crime:{r['s']}:{r['offender']}",
+               title=f"{W(r['ckind']) or '窃盗'}が起きた",
+               sub=f"加害 #{r['offender']} / 被害 #{r['victim']}",
+               who=[r["offender"], r["victim"]], s0=int(r["s"]),
+               s1=int(beats[-1][0]), x=int(r["x"]), y=int(r["y"]),
+               beats=beats, size=1 + len(resp), why=why,
+               extra={"amount": r.get("amount")})
+        matches[-1]["bonus"] = bonus
+
+    bursts = 0
+    for (nid, b), cell in sorted(sc.nui.items()):
+        if cell[0] < NUI_BURST_MIN:
+            continue
+        bursts += 1
+        kinds_top = ", ".join(f"{k}×{v}" for k, v in cell[6].most_common(4))
+        beats = [[int(cell[1]), int(cell[3]), int(cell[4]),
+                  f"{N(nid) or '同じ場所'}で迷惑行為が {cell[0]} 件続いた({kinds_top})",
+                  int(cell[5][0]) if cell[5] else -1]]
+        if cell[2] != cell[1]:
+            beats.append([int(cell[2]), int(cell[3]), int(cell[4]),
+                          "その 1 時間の最後の 1 件", -1])
+        _story(PAT_CRIME, f"nui:{nid}:{b}",
+               title=f"騒がしかった 1 時間({cell[0]} 件)",
+               sub=(N(nid) or "場所不明") + f" / {kinds_top}",
+               who=cell[5], s0=int(cell[1]), s1=int(cell[2]),
+               x=int(cell[3]), y=int(cell[4]), beats=beats, size=cell[0],
+               why=[], extra={"nuisance": cell[0]})
+        matches[-1]["bonus"] = 0.0
+    pop["nuisance_bursts"] = bursts
+
+    # ===================================================================== #
+    # ⑦ viral 瞬間(採用が最も加速した step = カスケードの離陸点)
+    # ===================================================================== #
+    viral_pop = 0
+    if cas_data and cas_data.get("items"):
+        for ci, it in enumerate(cas_data["items"]):
+            curve = it.get("curve") or []
+            if int(it.get("n") or 0) < 8 or len(curve) < 3:
+                continue
+            viral_pop += 1
+            # 離陸 = 新規採用の増分が最大の点(2 階差分の最大)。
+            best, bstep, bd = 0.0, int(curve[0][0]), 0
+            for k in range(1, len(curve)):
+                d = curve[k][1] - curve[k - 1][1]
+                if d > best:
+                    best, bstep, bd = float(d), int(curve[k][0]), int(curve[k][1])
+            peak = max(curve, key=lambda c: c[1])
+            beats = [[int(curve[0][0]), -32768, -32768,
+                      f"最初の採用({curve[0][1]} 人)", -1],
+                     [bstep, -32768, -32768,
+                      f"★ここで加速した(+{best:.0f} 人 / step ・この step で {bd} 人)", -1],
+                     [int(peak[0]), -32768, -32768,
+                      f"ピーク({peak[1]} 人 / step)", -1],
+                     [int(it["s1"]), -32768, -32768,
+                      f"最後の採用(合計 {it['n']} 人)", -1]]
+            # 位置は木の代表点(等時線の芯)
+            xs = _b64_arr((it.get("tree") or {}).get("x"), np.int16)
+            ys = _b64_arr((it.get("tree") or {}).get("y"), np.int16)
+            x, y = -32768, -32768
+            ok = np.nonzero(xs != -32768)[0] if xs.size else np.zeros(0, dtype=int)
+            if ok.size:
+                x, y = int(np.median(xs[ok])), int(np.median(ys[ok]))
+            why = [f"1 step で {best:.0f} 人ぶん増えた瞬間がある"]
+            bonus = 0.0
+            if it.get("reach"):
+                why.append(f"インフルエンサー加重の到達 {it['reach']:,}")
+                bonus += 1.0
+            if int(it.get("depth") or 0) >= 5:
+                why.append(f"深さ {it['depth']} の連鎖")
+                bonus += 1.5
+            _story(PAT_VIRAL, f"viral:{it['kind']}:{it['key']}",
+                   title=f"「{it['title']}」が離陸した",
+                   sub=f"{CAS_KIND_LABELS.get(it['kind'], '?')} / 採用 {it['n']} 人 / "
+                       f"形 {it['shape']}",
+                   who=[], s0=int(it["s0"]), s1=int(it["s1"]), x=x, y=y,
+                   beats=beats, size=float(best), why=why, link={"cas": ci},
+                   extra={"takeoff_step": bstep, "takeoff_delta": _round(best, 1),
+                          "n": int(it["n"])})
+            matches[-1]["bonus"] = bonus
+    pop["viral_candidates"] = viral_pop
+
+    # ===================================================================== #
+    # surprise = -log2(そのパターン種の周辺頻度 / 全イベント) + 規模 z + 稀少構成
+    # ===================================================================== #
+    total_events = max(1, int(sc.rows))
+    by_pat: dict[int, list] = defaultdict(list)
+    for m in matches:
+        by_pat[m["pat"]].append(m)
+    rarity_of: dict[int, float] = {}
+    for pat, ms in by_pat.items():
+        p = max(1, len(ms)) / float(total_events)
+        rarity = -math.log2(p)
+        rarity_of[pat] = rarity
+        zs = _zscores([m["size"] for m in ms])
+        for m, z in zip(ms, zs):
+            m["parts"] = {"rarity": _round(rarity, 3), "size_z": _round(z, 3),
+                          "bonus": _round(m["bonus"], 3)}
+            m["surprise"] = _round(rarity + z + m["bonus"], 3)
+            m.pop("bonus", None)
+            m.pop("bonus_raw", None)
+
+    matches.sort(key=lambda m: (-(m["surprise"] or 0.0), m["pat"], m["key"]))
+
+    # ---- 掲載の選抜(種別枠 → 残りは surprise 降順) ----------------------- #
+    chosen: list[dict] = []
+    seen: set = set()
+    quota_filled = Counter()
+    shown_by_pat = Counter()
+    for pat, q in STORY_QUOTA.items():
+        got = 0
+        for m in matches:
+            if got >= q or len(chosen) >= cap:
+                break
+            if m["pat"] != pat or m["key"] in seen:
+                continue
+            chosen.append(m)
+            seen.add(m["key"])
+            got += 1
+        quota_filled[pat] = got
+        shown_by_pat[pat] = got
+    # 残枠は surprise 降順。ただし 1 種別が枠の 2 倍を超えて占めない(迷惑行為の
+    # 「騒がしかった 1 時間」が 191 件あっても、同じ題で一覧を埋め尽くさないため)。
+    for m in matches:
+        if len(chosen) >= cap:
+            break
+        if m["key"] in seen:
+            continue
+        if shown_by_pat[m["pat"]] >= 2 * STORY_QUOTA.get(m["pat"], cap):
+            continue
+        chosen.append(m)
+        seen.add(m["key"])
+        shown_by_pat[m["pat"]] += 1
+    chosen.sort(key=lambda m: (-(m["surprise"] or 0.0), m["pat"], m["key"]))
+
+    # ---- 思考 → 行為 → 結果チェーン(1 ホップぶん) ------------------------ #
+    th_meta = {"available": False, "attached": 0, "candidates": 0,
+               "index_rows": 0, "scanned": 0, "truncated": False}
+    if thoughts:
+        idx = read_llm_index(run_dir)
+        th_meta["index_rows"] = idx["rows"]
+        lut = idx["map"]
+        want: dict[str, list] = {}
+        for si, m in enumerate(chosen):
+            if len(want) >= thought_cap:
+                break
+            hit = None
+            for w in m["who"]:
+                for s in range(int(m["s0"]), min(int(m["s1"]), int(m["s0"]) + 6) + 1):
+                    v = lut.get((int(w), s))
+                    if v is not None:
+                        hit = (int(w), s, v[0], v[1])
+                        break
+                if hit:
+                    break
+            if hit:
+                want.setdefault(hit[2], []).append((si, hit))
+        th_meta["candidates"] = len(want)
+        jr = read_journal(run_dir, set(want))
+        th_meta.update({k: jr["meta"][k] for k in ("available", "scanned",
+                                                   "truncated") if k in jr["meta"]})
+        for cid, uses in want.items():
+            rec = jr["items"].get(cid)
+            if not rec:
+                continue
+            for si, hit in uses:
+                chosen[si]["thought"] = {
+                    "agent": hit[0], "step": hit[1], "call": cid,
+                    "purpose": hit[3], **rec}
+                th_meta["attached"] += 1
+
+    # ---- 名前(掲載ぶんの当事者だけ) -------------------------------------- #
+    who_shown = {int(w) for m in chosen for w in m["who"] if int(w) >= 0}
+    names = read_roster(run_dir, who_shown) if who_shown else {}
+
+    pop["node_names"] = {"resolved": named_hits[0], "asked": named_hits[1],
+                         "dictionary": len(node_name)}
+    _log(f"  物語: 母集団 {len(matches):,} 件 → 掲載 {len(chosen)} 件 / "
+         f"思考 {th_meta['attached']} 件 / ノード名 {named_hits[0]}/{named_hits[1]} 解決 "
+         f"({time.time() - t0:.1f}s)")
+    return {
+        "cap": int(cap),
+        "shown": len(chosen),
+        "population": {**pop, "matches": len(matches),
+                       "by_pat": {str(k): len(v) for k, v in sorted(by_pat.items())}},
+        "pat_labels": {str(k): v for k, v in PAT_LABELS.items()},
+        "pat_glyphs": {str(k): v for k, v in PAT_GLYPHS.items()},
+        "pat_colors": {str(k): v for k, v in PAT_COLORS.items()},
+        "quota": {str(k): {"target": v, "filled": int(quota_filled[k]),
+                           "shown": int(shown_by_pat[k]), "cap": 2 * v,
+                           "label": PAT_LABELS[k]} for k, v in STORY_QUOTA.items()},
+        "items": chosen,
+        "names": {str(k): v for k, v in names.items()},
+        "thoughts": th_meta,
+        "surprise": {
+            "total_events": total_events,
+            "rarity_by_pat": {str(k): _round(v, 3) for k, v in sorted(rarity_of.items())},
+            "formula": "surprise = -log2(そのパターンのマッチ数 / L1 全行数)"
+                       " + 規模 z(パターン内・[-2,6] で切る) + 稀少構成ボーナス",
+        },
+        "notes": [
+            "母集団=各パターンが見つけた全マッチ。掲載は種別枠を先に埋め、"
+            "残りを surprise 降順で埋める(迷惑行為 3.3 万行が稀少な連鎖を押し流さないため)。"
+            "残枠でも 1 種別は枠の 2 倍を超えて占めない(同じ題で一覧を埋めない)。",
+            "遺失物の連鎖は近接一致ではなく **exact join**: 落とした step を "
+            "lying_steps / delay_steps / age_steps / held_steps から厳密に復元して繋ぐ。",
+            "緊急の連鎖は患者 id × 発生 step からの窓。発生行がこの期間の外にある"
+            "通報も落とさず「発生が期間の外」として別に出す。",
+            "不発の集会は observer サイドカー gathering_intent(意図のピーク)のうち"
+            "**約束**(n_appointment>0)が立ったセルだけ。臨界は detect_gatherings と"
+            f"同じ既定 n>={GATHER_MIN_N} 人で測る。予定(n_plan)だけが同じ駅に集まった"
+            "セルは集会ではないので、別の題「予定が 1 点に集まった」で日ごとの上位だけ出す。",
+            "集まりの拍の時刻は「意図を**観測した**step」(サイドカーの cap_day/cap_min)。"
+            "集まる予定の時刻は走査範囲の外にありうるので、そこへ丸めて印を打たない。",
+            "ノード id は地図の nodes[].name と POI の node 欄から人が読む名前へ解決する。"
+            "引けなかったものは id をそのまま出す(偽の名前を作らない)。",
+            "思考チェーンは 1 ホップぶん: l1b_llm(agent × step → llm_call_id)で"
+            "当事者の呼び出しを引き、llm_journal.jsonl.gz を逐次で舐めて該当行だけ拾う。"
+            "プロンプトは**末尾 260 字**(= いま何が見えているか)、応答は先頭 200 字。",
+            "surprise は説明できる 3 項の和。ボーナスの根拠は why に日本語で残す。",
+        ],
+    }
+
+
+# --------------------------------------------------------------------------- #
 # L2 指標の時系列
 # --------------------------------------------------------------------------- #
 def read_l2(run_dir) -> dict:
@@ -2444,7 +3768,9 @@ def build_run(run_dir: Path, label: str, *, hex_m: float, bin_min: int,
               cas_nodes: int = CAS_NODES_DEFAULT,
               belief_cap: int = BELIEF_CAP_DEFAULT,
               reshare_cap: int = RESHARE_CAP_DEFAULT,
-              stock_cap: int = STOCK_CAP_DEFAULT) -> dict:
+              stock_cap: int = STOCK_CAP_DEFAULT, stories: bool = True,
+              story_cap: int = STORY_CAP_DEFAULT, thoughts: bool = True,
+              thought_cap: int = THOUGHT_CAP_DEFAULT, node_xy=None) -> dict:
     import l1_stream
     import run_dt
     run_dir = Path(run_dir)
@@ -2488,6 +3814,7 @@ def build_run(run_dir: Path, label: str, *, hex_m: float, bin_min: int,
             "series": {"l2_steps": [], "l2": {}, "kinds": {},
                        "kinds_population": 0, "kinds_shown": 0},
             "hexbin": None, "relations": None, "pairs": None, "cascades": None,
+            "stories": None,
             "build": {"scan_sec": 0.0},
         }
 
@@ -2496,7 +3823,7 @@ def build_run(run_dir: Path, label: str, *, hex_m: float, bin_min: int,
                  rel_cap=rel_cap, step_max=step_max, narrative=pairs,
                  conv_cap=conv_cap, text_cap=text_cap, propagation=cascades,
                  belief_cap=belief_cap, reshare_cap=reshare_cap,
-                 stock_cap=stock_cap)
+                 stock_cap=stock_cap, stories=stories)
     t_scan = time.time() - t0
 
     t0 = time.time()
@@ -2534,6 +3861,14 @@ def build_run(run_dir: Path, label: str, *, hex_m: float, bin_min: int,
         cas_data = build_cascades(run_dir, sc, hex_m=hex_m, cap=cas_cap,
                                   nodes_cap=cas_nodes, n_steps=n_steps)
 
+    # 画面4 は画面2/3 の**成果物**(注目ペア・カスケード木)を再利用するので最後に走る。
+    story_data = None
+    if stories:
+        story_data = build_stories(run_dir, sc, n_steps=n_steps, cap=story_cap,
+                                   pairs_data=pairs_data, cas_data=cas_data,
+                                   thoughts=thoughts, thought_cap=thought_cap,
+                                   node_xy=node_xy, steps_per_day=spd)
+
     parts = [p.name for p in l1_stream.l1_paths(run_dir)]
     return {
         "label": label,
@@ -2569,6 +3904,7 @@ def build_run(run_dir: Path, label: str, *, hex_m: float, bin_min: int,
         "relations": rels,
         "pairs": pairs_data,
         "cascades": cas_data,
+        "stories": story_data,
         "build": {"scan_sec": round(t_scan, 1)},
     }
 
@@ -2755,6 +4091,54 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
  font-variant-numeric:tabular-nums}
 .quote{background:#11151d;border:1px solid var(--bd);border-left:2px solid var(--acc);
  border-radius:5px;padding:6px 9px;font-size:12px;margin:5px 0}
+/* ---------- 画面4 物語ピン + 今日のハイライト ---------- */
+#slist{width:322px;flex:none;border-right:1px solid var(--bd);background:var(--panel);
+ display:flex;flex-direction:column;min-height:0}
+#slist .hd{padding:8px 9px 6px;border-bottom:1px solid var(--bd)}
+#slist select,#slist input[type=search]{background:#0d1117;color:var(--fg);
+ border:1px solid var(--bd);border-radius:4px;font:inherit;font-size:11.5px;
+ padding:3px 5px;width:100%;margin-bottom:4px}
+#srows{overflow-y:auto;flex:1;min-height:0}
+.srow{padding:6px 9px;border-bottom:1px solid rgba(255,255,255,.05);cursor:pointer}
+.srow:hover{background:#161c26}
+.srow.on{background:#1c2637;box-shadow:inset 3px 0 0 var(--acc)}
+.srow .nm{font-size:12px;font-weight:600}
+.srow .mt{color:var(--dim);font-size:10.5px;font-variant-numeric:tabular-nums;
+ display:flex;gap:7px;flex-wrap:wrap;margin-top:1px}
+.pglyph{display:inline-block;width:17px;height:17px;line-height:17px;text-align:center;
+ border-radius:4px;font-size:10.5px;font-weight:700;color:#0a0e14;margin-right:5px;
+ vertical-align:-2px}
+.sscore{font-variant-numeric:tabular-nums;font-weight:700;color:var(--warn)}
+#smain{flex:1;min-width:0;overflow-y:auto;padding:14px 18px 30px}
+#smain h3{font-size:16px;margin:0 0 3px;font-weight:650}
+#smain .subt{color:var(--dim);font-size:12px;margin-bottom:10px}
+.beat{display:flex;gap:10px;align-items:flex-start;margin:0 0 5px}
+.beat .st{flex:none;width:82px;color:var(--dim);font-size:10.5px;
+ font-variant-numeric:tabular-nums;padding-top:3px}
+.beat .bd{flex:1;min-width:0;border:1px solid var(--bd);border-radius:7px;
+ background:#11151d;padding:5px 9px;font-size:12.5px}
+.beat .bd.jump{cursor:pointer}
+.beat .bd.jump:hover{border-color:var(--acc)}
+.beat .who{font-size:10.5px;color:var(--dim);margin-bottom:1px}
+.why{margin:9px 0 0;padding:0 0 0 16px;color:#cbd5e1;font-size:11.8px;line-height:1.6}
+.lnkrow{display:flex;gap:7px;flex-wrap:wrap;margin:11px 0 3px}
+.lnk{background:#1b2331;color:var(--fg);border:1px solid var(--bd);border-radius:5px;
+ padding:4px 11px;cursor:pointer;font:inherit;font-size:11.5px}
+.lnk:hover{border-color:var(--acc)}
+#sside{width:314px;flex:none;border-left:1px solid var(--bd);background:var(--panel);
+ overflow-y:auto;padding:10px 11px 26px}
+#sside h2{font-size:11.5px;color:var(--dim);margin:12px 0 6px;font-weight:600;
+ text-transform:uppercase;letter-spacing:.06em}
+#sside h2:first-child{margin-top:0}
+.think{background:#0d1117;border:1px solid var(--bd);border-radius:6px;padding:7px 9px;
+ font-size:11.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word;
+ max-height:230px;overflow-y:auto}
+.think.resp{border-left:2px solid var(--t2)}
+.think.prompt{border-left:2px solid var(--acc);color:#b6c2d2}
+#pincard{position:absolute;left:12px;top:118px;width:290px;background:var(--panel);
+ border:1px solid var(--bd);border-radius:8px;padding:9px 11px;font-size:11.5px;
+ display:none;z-index:6;backdrop-filter:blur(6px)}
+#pincard .cl{position:absolute;right:7px;top:5px;cursor:pointer;color:var(--dim)}
 </style></head><body>
 <div id="top">
   <h1>Shibuya Chronicle</h1>
@@ -2762,6 +4146,7 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
     <button data-p="map" class="on">俯瞰</button>
     <button data-p="pair">関係の伝記</button>
     <button data-p="prop">伝播</button>
+    <button data-p="story">物語</button>
   </div>
   <span class="sub" id="runmeta"></span>
   <span style="flex:1"></span>
@@ -2779,8 +4164,14 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
         最終既知位置を持ち越す</label>
       <label><input type="checkbox" id="lyPoi" checked> ランドマーク<span id="poiN"></span></label>
       <label><input type="checkbox" id="lyLog" checked> 対数スケール</label>
+      <label><input type="checkbox" id="lyPin" checked> 物語ピン<span id="pinN"></span></label>
+      <label style="padding-left:16px">上位
+        <input type="range" id="pinTop" min="5" max="200" value="60" step="5"
+          style="width:92px;vertical-align:-3px;accent-color:var(--acc)">
+        <span id="pinTopV" style="font-variant-numeric:tabular-nums"></span> 件</label>
     </div>
     <div id="legend"></div>
+    <div id="pincard"></div>
     <div id="tip"></div>
     <div id="attrib"></div>
     <div id="ctrl">
@@ -2883,6 +4274,34 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
     <div id="cch"></div>
     <h2>母集団 → 掲載</h2>
     <div id="cpop"></div>
+  </div>
+</div>
+<div id="wrap4" class="pane">
+  <div id="slist">
+    <div class="hd">
+      <select id="spat"><option value="">種別: すべて</option></select>
+      <select id="ssort">
+        <option value="surprise">並べ替え: 驚き(surprise)</option>
+        <option value="time">並べ替え: 起きた順</option>
+        <option value="size">並べ替え: 規模</option>
+        <option value="beats">並べ替え: 拍が多い</option>
+      </select>
+      <input id="sfind" type="search" placeholder="題・当事者・場所で絞る">
+      <label style="display:block;font-size:11px;color:var(--dim);margin:2px 0 3px">
+        <input type="checkbox" id="sthonly" style="vertical-align:-1px">
+        本人の思考が付いているものだけ</label>
+      <div class="note" id="scount"></div>
+    </div>
+    <div id="srows"></div>
+  </div>
+  <div id="smain"><div id="scard"></div></div>
+  <div id="sside">
+    <h2>驚き(surprise)の内訳</h2>
+    <div id="sscore"></div>
+    <h2>本人の思考 → 行為(1 ホップ)</h2>
+    <div id="sthink"></div>
+    <h2>母集団 → 掲載</h2>
+    <div id="spop"></div>
   </div>
 </div>
 <script id="chronicle-data" type="application/json">__CHRONICLE_DATA__</script>
@@ -3149,6 +4568,7 @@ function draw(){
   if(document.getElementById('lyRoad').checked) drawRoads();
   if(document.getElementById('lyHex').checked) drawHover();
   if(document.getElementById('lyPoi').checked) drawPois();
+  drawPins();
   drawScale();
   document.getElementById('poiN').textContent =
     ' (' + poiShown + '/' + BM.pois.shown + ')';
@@ -3347,7 +4767,7 @@ function fillTop(){
     b.onclick = ()=>{ if(!HAS(k)) return; RK = k; cur = Math.min(cur, nSteps()-1);
       document.getElementById('scrub').max = nSteps()-1;
       fillTop(); fillAbout(); fillRel(); buildCharts(); pairInit(); propInit();
-      draw(); };
+      storyInit(); draw(); };
     sw.appendChild(b);
   }
   document.getElementById('attrib').textContent = BM.attribution
@@ -3369,15 +4789,29 @@ document.getElementById('hm').onclick = ()=>{ const s = HEX[RK].spb;
   cur = Math.max(0, cur - s); scrub.value = cur; requestDraw(); };
 document.getElementById('hp').onclick = ()=>{ const s = HEX[RK].spb;
   cur = Math.min(nSteps()-1, cur + s); scrub.value = cur; requestDraw(); };
-['lyBase','lyRoad','lyHex','lyCarry','lyPoi','lyLog'].forEach(id=>
+['lyBase','lyRoad','lyHex','lyCarry','lyPoi','lyLog','lyPin'].forEach(id=>
   document.getElementById(id).addEventListener('change', requestDraw));
+document.getElementById('pinTop').addEventListener('input', requestDraw);
 
-let drag = null;
+let drag = null, dragMoved = 0;
 cv.addEventListener('mousedown', e=>{ drag = {x:e.clientX, y:e.clientY,
-  cx:cam.x, cy:cam.y}; cv.classList.add('drag'); });
+  cx:cam.x, cy:cam.y}; dragMoved = 0; cv.classList.add('drag'); });
 window.addEventListener('mouseup', ()=>{ drag = null; cv.classList.remove('drag'); });
+/* 物語ピンのクリック(掴んで動かしたときは拾わない = 3px 未満だけ「押した」とみなす) */
+cv.addEventListener('click', e=>{
+  if(dragMoved > 3) return;
+  const rect = cv.getBoundingClientRect();
+  const mx = e.clientX-rect.left, my = e.clientY-rect.top;
+  let best = -1, bd = 1e9;
+  for(const g of PINGEO){ const d = (g.sx-mx)*(g.sx-mx) + (g.sy-my)*(g.sy-my);
+    if(d < g.r*g.r*1.6 && d < bd){ bd = d; best = g.i; } }
+  if(best < 0) return;
+  SSEL = best; showPinCard(best); requestDraw();
+});
 window.addEventListener('mousemove', e=>{
-  if(drag){ cam.x = drag.cx - (e.clientX-drag.x)/cam.s;
+  if(drag){ dragMoved = Math.max(dragMoved,
+              Math.abs(e.clientX-drag.x) + Math.abs(e.clientY-drag.y));
+            cam.x = drag.cx - (e.clientX-drag.x)/cam.s;
             cam.y = drag.cy + (e.clientY-drag.y)/cam.s; requestDraw(); return; }
 });
 cv.addEventListener('mousemove', e=>{
@@ -3475,9 +4909,10 @@ function setTab(t){
   document.getElementById('wrap').classList.toggle('on', t === 'map');
   document.getElementById('wrap2').classList.toggle('on', t === 'pair');
   document.getElementById('wrap3').classList.toggle('on', t === 'prop');
+  document.getElementById('wrap4').classList.toggle('on', t === 'story');
   if(t === 'map') resize();
   else if(t === 'prop') propResize();
-  else pairResize();
+  else if(t === 'pair') pairResize();
   syncHash();
 }
 document.querySelectorAll('#tabs button').forEach(b =>
@@ -3821,7 +5256,9 @@ function fillFacts(){
        + 'か、値が動かなかった)。</div>';
   }
   h += kv('ドラマ性スコア', it.score);
+  h += storyBacklink('pair', PSEL);
   host.innerHTML = h;
+  wireBacklinks(host);
 }
 function fillPop(){
   const p = P(), host = document.getElementById('ppop');
@@ -4416,7 +5853,9 @@ function fillCasFacts(){
           ? ' 描画された深さは '+T.depth_shown+'(全体は '+it.depth+')。' : '')
        + '</div>';
   h += '<div class="note">'+esc(SHAPE_HELP[it.shape]||'')+'</div>';
+  h += storyBacklink('cas', CSEL);
   host.innerHTML = h;
+  wireBacklinks(host);
 }
 function fillCasCh(){
   const it = curCas(), host = document.getElementById('cch');
@@ -4482,8 +5921,370 @@ function propInit(){
 }
 window.addEventListener('resize', ()=>{ if(TAB==='prop') propResize(); });
 
+/* =========================================================================
+   画面4「物語ピン + 今日のハイライト」(story sifting)
+   -------------------------------------------------------------------------
+   ビルド側が宣言的パターンで拾った連鎖を、surprise 降順で並べる。地図には
+   「上位 N 件」だけをピンで刺し(大きさ = surprise・字 = 種別)、押すとその
+   現場・その瞬間へ飛ぶ。カードには拍(beat)の列と、当事者の**その時の思考**
+   (llm_journal の 1 ホップ)を添える。
+   ========================================================================= */
+let SSEL = -1, SORD = [], PINGEO = [], STIDX = null;
+
+function ST(){ return R() ? R().stories : null; }
+function stItems(){ const s = ST(); return (s && s.items) ? s.items : []; }
+function curStory(){ const a = stItems();
+  return (SSEL >= 0 && SSEL < a.length) ? a[SSEL] : null; }
+function sname(id){ const s = ST(); const v = s && s.names && s.names[String(id)];
+  return (v && v[0]) ? v[0] : '#'+id; }
+function smeta(id){ const s = ST(); const v = s && s.names && s.names[String(id)];
+  if(!v) return ''; return (v[1]?v[1]+'歳':'') + (v[2]?'・'+v[2]:'') + (v[3]?'・'+v[3]:''); }
+function patCol(p){ const s = ST();
+  return (s && s.pat_colors && s.pat_colors[String(p)]) || '#94a3b8'; }
+function patLb(p){ const s = ST();
+  return (s && s.pat_labels && s.pat_labels[String(p)]) || ('種別'+p); }
+function patGl(p){ const s = ST();
+  return (s && s.pat_glyphs && s.pat_glyphs[String(p)]) || '·'; }
+function glyphHTML(p){ return '<span class="pglyph" style="background:'+patCol(p)+'">'
+  + esc(patGl(p)) + '</span>'; }
+/* 画面2/3 → 画面4 の逆引き索引(ラン切替のたびに作り直す) */
+function stIndex(){
+  if(STIDX) return STIDX;
+  STIDX = {pair:{}, cas:{}};
+  stItems().forEach((it,i)=>{ const L = it.link;
+    if(!L) return;
+    if(L.pair !== undefined && STIDX.pair[L.pair] === undefined) STIDX.pair[L.pair] = i;
+    if(L.cas !== undefined && STIDX.cas[L.cas] === undefined) STIDX.cas[L.cas] = i; });
+  return STIDX;
+}
+function storyBacklink(kind, i){
+  if(i === null || i === undefined || i < 0) return '';
+  const j = stIndex()[kind][i];
+  if(j === undefined) return '';
+  const it = stItems()[j];
+  return '<div class="lnkrow"><button class="lnk" data-story="'+j+'">'
+    + glyphHTML(it.pat) + '物語「' + esc(it.title) + '」へ(驚き '
+    + (it.surprise||0).toFixed(1) + ')</button></div>';
+}
+function wireBacklinks(host){
+  host.querySelectorAll('[data-story]').forEach(el =>
+    el.onclick = ()=> gotoStory(+el.dataset.story));
+}
+function gotoStory(i){
+  document.getElementById('sfind').value = '';
+  document.getElementById('spat').value = '';
+  document.getElementById('sthonly').checked = false;
+  buildStoryList(); setTab('story'); selectStory(i);
+}
+function gotoPair(i){
+  if(!P() || i < 0 || i >= P().items.length) return;
+  document.getElementById('pfind').value = '';
+  buildPairList(); setTab('pair'); selectPair(i);
+  const el = document.querySelector('#prows .prow[data-i="'+i+'"]');
+  if(el) el.scrollIntoView({block:'center'});
+}
+function gotoCas(i){
+  if(!CAS() || i < 0 || i >= CAS().items.length) return;
+  document.getElementById('cfind').value = '';
+  document.getElementById('ckind').value = '';
+  buildCasList(); setTab('prop'); selectCas(i);
+  const el = document.querySelector('#crows .crow[data-i="'+i+'"]');
+  if(el) el.scrollIntoView({block:'center'});
+}
+
+/* ---------- 俯瞰地図の物語ピン ---------- */
+function drawPins(){
+  PINGEO = [];
+  const badge = document.getElementById('pinN');
+  const s = ST();
+  document.getElementById('pinTopV').textContent =
+    document.getElementById('pinTop').value;
+  if(!document.getElementById('lyPin').checked || !s || !s.items.length){
+    badge.textContent = s ? ' (0/'+ (s.items||[]).length +')' : ' (素材なし)';
+    return;
+  }
+  const items = s.items, topN = +document.getElementById('pinTop').value;
+  /* items はビルド側で surprise 降順。上位 N 件のうち**座標を持つもの**を刺す
+     (関係イベントのように座標を持たない物語は地図に出さない = 偽の位置を作らない)。 */
+  const pool = [];
+  for(let i=0;i<items.length && pool.length<topN;i++)
+    if(items[i].x !== -32768) pool.push(i);
+  const smax = pool.length ? (items[pool[0]].surprise||0) : 1;
+  const smin = pool.length ? (items[pool[pool.length-1]].surprise||0) : 0;
+  ctx.save();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  let hidden = 0;
+  for(const i of pool){
+    const it = items[i], p = tf(it.x, it.y), sx = p[0], sy = p[1];
+    if(sx<-40||sy<-40||sx>cv.clientWidth+40||sy>cv.clientHeight+40) continue;
+    const t = (smax > smin) ? (it.surprise - smin)/(smax - smin) : 1;
+    const r = 8 + 9*Math.max(0, Math.min(1, t));
+    const sel = (i === SSEL);
+    /* 重なりの抑制: 渋谷駅前には物語が密集する。**驚きの高い順に置いて**、
+       既に置いたピンとほぼ重なる位置は譲る(隠した数はバッジに出す)。
+       選択中のピンだけは必ず描く(押した物語が消えないため)。 */
+    let clash = false;
+    if(!sel) for(const g of PINGEO){
+      const dx = g.sx-sx, dy = g.sy-sy;
+      if(dx*dx + dy*dy < 0.62*(g.r+r)*(g.r+r)){ clash = true; break; } }
+    if(clash){ hidden++; continue; }
+    const live = (cur >= it.s0 && cur <= it.s1);
+    ctx.globalAlpha = live ? 1 : 0.62;
+    ctx.beginPath(); ctx.arc(sx, sy, r, 0, 7);
+    ctx.fillStyle = patCol(it.pat); ctx.fill();
+    ctx.lineWidth = sel ? 2.8 : (live ? 1.8 : 1.0);
+    ctx.strokeStyle = sel ? '#ffffff' : 'rgba(10,14,20,.85)';
+    ctx.stroke();
+    if(live){ ctx.globalAlpha = 0.5; ctx.beginPath(); ctx.arc(sx, sy, r+4.5, 0, 7);
+      ctx.strokeStyle = patCol(it.pat); ctx.lineWidth = 1.4; ctx.stroke(); }
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = '#0a0e14';
+    ctx.font = '700 ' + Math.max(10, Math.round(r*1.02))
+      + 'px "Hiragino Kaku Gothic ProN",Meiryo,sans-serif';
+    ctx.fillText(patGl(it.pat), sx, sy+0.5);
+    PINGEO.push({i:i, sx:sx, sy:sy, r:r});
+  }
+  ctx.restore();
+  badge.textContent = ' ('+PINGEO.length+'/'+items.length
+    + (hidden ? ' · 重なり '+hidden+' 件は拡大で' : '') + ')';
+}
+function showPinCard(i){
+  const it = stItems()[i], host = document.getElementById('pincard');
+  if(!it){ host.style.display = 'none'; return; }
+  const c0 = clockText(it.s0);
+  host.innerHTML = '<span class="cl" id="pcx">✕</span>'
+    + '<div style="font-weight:650;font-size:12.5px;margin-bottom:2px">'
+      + glyphHTML(it.pat) + esc(it.title) + '</div>'
+    + '<div style="color:var(--dim);font-size:11px">' + esc(it.sub) + '</div>'
+    + '<div style="margin:4px 0 2px">驚き <span class="sscore">'
+      + (it.surprise||0).toFixed(2) + '</span>'
+      + ' <span style="color:var(--dim)">· ' + esc(patLb(it.pat))
+      + ' · Day '+(c0.day+1)+' '+c0.hhmm + '</span></div>'
+    + (it.why && it.why.length
+        ? '<div style="color:#cbd5e1;font-size:11px;margin-top:3px">'
+          + esc(it.why[0]) + '</div>' : '')
+    + '<div class="lnkrow"><button class="lnk" id="pcgo">詳しく見る</button>'
+      + '<button class="lnk" id="pcnow">この瞬間へ</button></div>';
+  host.style.display = 'block';
+  document.getElementById('pcx').onclick = ()=>{ host.style.display = 'none'; };
+  document.getElementById('pcgo').onclick = ()=> gotoStory(i);
+  document.getElementById('pcnow').onclick = ()=>{
+    cur = Math.max(0, Math.min(nSteps()-1, it.s0));
+    document.getElementById('scrub').value = cur; requestDraw(); };
+}
+
+/* ---------- 一覧 ---------- */
+function storyRowHTML(it, i){
+  const c0 = clockText(it.s0);
+  return '<div class="srow'+(i===SSEL?' on':'')+'" data-i="'+i+'">'
+    + '<div class="nm">' + glyphHTML(it.pat) + esc(it.title) + '</div>'
+    + '<div class="mt"><span class="sscore">'+(it.surprise||0).toFixed(2)+'</span>'
+    + '<span>Day '+(c0.day+1)+' '+c0.hhmm+'</span>'
+    + '<span>'+it.beats_n+' 拍</span>'
+    + (it.thought ? '<span style="color:var(--t2)">思考あり</span>' : '')
+    + (it.x === -32768 ? '<span style="color:var(--dim)">地図に出ない</span>' : '')
+    + '</div>'
+    + '<div class="mt" style="color:#8b98a8">'+esc(it.sub)+'</div></div>';
+}
+function buildStoryList(){
+  const s = ST(), host = document.getElementById('srows');
+  const cnt = document.getElementById('scount');
+  const sel = document.getElementById('spat');
+  if(sel.options.length <= 1 && s && s.pat_labels){
+    Object.keys(s.pat_labels).sort((a,b)=>a-b).forEach(k=>{
+      const o = document.createElement('option');
+      o.value = k; o.textContent = '種別: ' + s.pat_labels[k]; sel.appendChild(o); });
+  }
+  if(!s || !s.items.length){
+    host.innerHTML = '<div class="empty">このランには画面4 の素材がありません'
+      + '(走行中のランは flush 済みの part だけを見ます)。</div>';
+    cnt.textContent = ''; SORD = []; return;
+  }
+  const pf = sel.value, mode = document.getElementById('ssort').value;
+  const q = (document.getElementById('sfind').value||'').trim().toLowerCase();
+  const thonly = document.getElementById('sthonly').checked;
+  SORD = s.items.map((it,i)=>i);
+  if(pf !== '') SORD = SORD.filter(i => String(s.items[i].pat) === pf);
+  if(thonly) SORD = SORD.filter(i => !!s.items[i].thought);
+  if(q) SORD = SORD.filter(i => { const it = s.items[i];
+    const who = (it.who||[]).map(w=>sname(w)+' #'+w).join(' ');
+    return ((it.title||'')+' '+(it.sub||'')+' '+(it.why||[]).join(' ')+' '
+      + who + ' ' + (it.beats||[]).map(b=>b[3]).join(' ')).toLowerCase().indexOf(q) >= 0; });
+  const val = it => mode==='time' ? (it.s0||0)
+    : mode==='size' ? -(it.size||0)
+    : mode==='beats' ? -(it.beats_n||0) : -(it.surprise||0);
+  SORD.sort((x,y)=> val(s.items[x]) - val(s.items[y]) || x-y);
+  host.innerHTML = SORD.map(i => storyRowHTML(s.items[i], i)).join('');
+  cnt.innerHTML = '母集団 ' + (s.population.matches||0).toLocaleString()
+    + ' 件 → 掲載 ' + s.shown + ' 件'
+    + (SORD.length !== s.items.length ? ' / 絞り込み '+SORD.length+' 件' : '');
+  host.querySelectorAll('.srow').forEach(el =>
+    el.onclick = ()=> selectStory(+el.dataset.i));
+}
+function selectStory(i){
+  SSEL = i;
+  document.querySelectorAll('#srows .srow').forEach(el =>
+    el.classList.toggle('on', +el.dataset.i === i));
+  renderStory(); fillStoryScore(); fillThink(); syncHash();
+  if(TAB === 'map') requestDraw();
+}
+
+/* ---------- 中央: ハイライトカード ---------- */
+function renderStory(){
+  const it = curStory(), host = document.getElementById('scard');
+  if(!it){ host.innerHTML = '<div class="empty">左の一覧から物語を選ぶと、'
+    + '当事者・拍(beat)・現場・本人の思考が並びます。<br>'
+    + '俯瞰タブの地図ピンを押しても同じカードに来られます。</div>'; return; }
+  const c0 = clockText(it.s0), c1 = clockText(it.s1);
+  let h = '<h3>' + glyphHTML(it.pat) + esc(it.title) + '</h3>';
+  h += '<div class="subt">' + esc(patLb(it.pat)) + ' · ' + esc(it.sub)
+     + ' · Day '+(c0.day+1)+' '+c0.hhmm
+     + (it.s1 !== it.s0 ? ' → Day '+(c1.day+1)+' '+c1.hhmm : '')
+     + ' <span class="sscore">驚き ' + (it.surprise||0).toFixed(2) + '</span></div>';
+  if(it.who && it.who.length){
+    h += '<div class="subt">当事者: ' + it.who.slice(0,8).map(w =>
+      esc(sname(w)) + (smeta(w) ? ' <span style="opacity:.7">('+esc(smeta(w))+')</span>' : ''))
+      .join(' · ') + (it.who.length > 8 ? ' ほか '+(it.who.length-8)+' 人' : '') + '</div>';
+  }
+  h += '<div style="margin-top:8px">';
+  (it.beats||[]).forEach(b => {
+    const jump = (b[1] !== -32768);
+    h += '<div class="beat"><div class="st">' + tlClock(b[0]) + '</div>'
+      + '<div class="bd' + (jump ? ' jump" data-step="'+b[0]+'" data-x="'+b[1]
+          + '" data-y="'+b[2]+'"' : '"') + '>'
+      + (b[4] >= 0 ? '<div class="who">'+esc(sname(b[4]))+'</div>' : '')
+      + esc(b[3]) + '</div></div>';
+  });
+  h += '</div>';
+  if(it.beats_n > (it.beats||[]).length)
+    h += '<div class="note">拍は '+it.beats_n+' 件のうち先頭 '+it.beats.length
+       + ' 件を表示(1 物語の上限)。</div>';
+  if(it.why && it.why.length)
+    h += '<ul class="why">' + it.why.map(w=>'<li>'+esc(w)+'</li>').join('') + '</ul>';
+  h += '<div class="lnkrow">';
+  if(it.x !== -32768)
+    h += '<button class="lnk" id="sgomap">俯瞰のこの現場へ</button>';
+  if(it.link && it.link.pair !== undefined)
+    h += '<button class="lnk" id="sgopair">関係の伝記でこの 2 人を見る</button>';
+  if(it.link && it.link.cas !== undefined)
+    h += '<button class="lnk" id="sgocas">伝播でこの木を見る</button>';
+  h += '</div>';
+  host.innerHTML = h;
+  host.querySelectorAll('.bd.jump').forEach(el => el.onclick = ()=>
+    jumpToMap(+el.dataset.step, +el.dataset.x, +el.dataset.y));
+  const gm = document.getElementById('sgomap');
+  if(gm) gm.onclick = ()=> jumpToMap(it.s0, it.x, it.y);
+  const gp = document.getElementById('sgopair');
+  if(gp) gp.onclick = ()=> gotoPair(it.link.pair);
+  const gc = document.getElementById('sgocas');
+  if(gc) gc.onclick = ()=> gotoCas(it.link.cas);
+}
+
+/* ---------- 右パネル ---------- */
+function fillStoryScore(){
+  const it = curStory(), s = ST(), host = document.getElementById('sscore');
+  if(!it){ host.innerHTML = '<div class="note">物語未選択。</div>'; return; }
+  const p = it.parts || {};
+  let h = '';
+  h += kv('surprise', '<span class="sscore">'+(it.surprise||0).toFixed(3)+'</span>');
+  h += kv('稀少度 -log2(頻度)', (p.rarity!==undefined?p.rarity:'—'));
+  h += kv('規模 z(種別内)', (p.size_z!==undefined?p.size_z:'—'));
+  h += kv('稀少構成ボーナス', (p.bonus!==undefined?p.bonus:'—'));
+  h += kv('規模(この種別の量)', it.size);
+  h += '<div class="note">'+esc((s.surprise&&s.surprise.formula)||'')+'</div>';
+  if(s.surprise && s.surprise.rarity_by_pat){
+    h += '<div class="note">種別ごとの稀少度(母集団 / L1 '
+       + (s.surprise.total_events||0).toLocaleString() + ' 行):</div>';
+    Object.keys(s.surprise.rarity_by_pat).sort((a,b)=>a-b).forEach(k =>
+      h += kv(patLb(k), s.surprise.rarity_by_pat[k]
+        + ' <span style="color:var(--dim)">('
+        + ((s.population.by_pat||{})[k]||0).toLocaleString()+' 件)</span>'));
+  }
+  host.innerHTML = h;
+}
+function fillThink(){
+  const it = curStory(), s = ST(), host = document.getElementById('sthink');
+  const th = s ? s.thoughts : null;
+  if(!it){ host.innerHTML = '<div class="note">物語未選択。</div>'; return; }
+  if(!it.thought){
+    let why = 'この物語の当事者には、その時刻の LLM 呼び出しが残っていない。';
+    if(th && !th.available) why = 'このランに llm_journal.jsonl.gz が無い'
+      + '(ルール支配のランでは思考そのものが起きない)。';
+    host.innerHTML = '<div class="note">' + esc(why) + '</div>'
+      + (th ? '<div class="note">l1b_llm 索引 '+(th.index_rows||0).toLocaleString()
+        + ' 行 / 思考を付けた物語 '+(th.attached||0)+' 件(上限あり・'
+        + (th.truncated?'journal は途中まで':'journal は最後まで')+'走査)</div>' : '');
+    return;
+  }
+  const t = it.thought, c = clockText(t.step);
+  let h = kv('誰の思考', esc(sname(t.agent)) + ' <span style="color:var(--dim)">'
+    + esc(smeta(t.agent)) + '</span>');
+  h += kv('いつ', 'Day '+(c.day+1)+' '+c.hhmm+' (step '+t.step+')');
+  h += kv('用途 / モデル', esc(t.purpose||'?') + ' · ' + esc(t.backend||'?')
+    + (t.cached ? ' <span style="color:var(--dim)">(cache)</span>' : ''));
+  h += '<div class="note">何が見えていたか(プロンプト末尾 '
+    + (t.prompt_clipped ? '260 字・全 '+(t.prompt_len||0)+' 字' : '全文') + ')</div>';
+  h += '<div class="think prompt">' + esc((t.prompt_clipped?'…':'') + (t.prompt||'')) + '</div>';
+  h += '<div class="note">どう考えて、何をしたか(応答'
+    + (t.response_clipped ? ' 先頭 200 字・全 '+(t.response_len||0)+' 字' : '') + ')</div>';
+  h += '<div class="think resp">' + esc(t.response||'')
+    + (t.response_clipped ? ' …' : '') + '</div>';
+  h += '<div class="note">llm_call_id ' + esc(t.call) + ' · rng '
+    + esc(t.rng_key||'—') + '</div>';
+  host.innerHTML = h;
+}
+function fillStoryPop(){
+  const s = ST(), host = document.getElementById('spop');
+  if(!s){ host.innerHTML = '<div class="note">素材なし。</div>'; return; }
+  const po = s.population;
+  let h = kv('パターンのマッチ', (po.matches||0).toLocaleString()+' 件');
+  h += kv('掲載', s.shown + ' 件(上限 '+s.cap+')');
+  h += '<div class="note">種別ごとの枠(先に埋める)</div>';
+  Object.keys(s.quota).sort((a,b)=>a-b).forEach(k => h += kv(esc(s.quota[k].label),
+    (s.quota[k].shown!==undefined ? s.quota[k].shown : s.quota[k].filled)
+    + ' 件 <span style="color:var(--dim)">(枠 ' + s.quota[k].filled + '/'
+    + s.quota[k].target + ' · 母集団 '
+    + ((po.by_pat||{})[k]||0).toLocaleString()+')</span>'));
+  h += '<div class="note">素材の母集団</div>';
+  h += kv('L1 行', (po.l1_rows||0).toLocaleString());
+  h += kv('物語 kind の行', (po.story_rows||0).toLocaleString()
+    + ' / ' + (po.story_rows_population||0).toLocaleString());
+  h += kv('遺失物の連鎖', (po.lost_chains||0).toLocaleString()+' 本');
+  h += kv('倒れた/負傷/事故', (po.ems_onsets||0).toLocaleString()+' 件'
+    + (po.ems_orphans ? '(発生が期間外 '+po.ems_orphans+')' : ''));
+  h += kv('hop>=2 のカスケード', (po.deep_cascades||0).toLocaleString()+' 本');
+  h += kv('破綻→再構築のペア', (po.pair_drama||0).toLocaleString()+' 組');
+  h += kv('開かれた集会', (po.events_hosted||0).toLocaleString()+' 件'
+    + '(参加 '+(po.events_attended||0)+')');
+  const gi = po.gathering_intent || {};
+  h += kv('gathering_intent', gi.available
+    ? (gi.cells||0).toLocaleString()+' セル / '+(gi.rows||0).toLocaleString()+' 行'
+    : 'サイドカーなし');
+  h += kv('犯罪 / 警察の行', (po.crime_rows||0).toLocaleString()
+    + ' / ' + (po.police_rows||0).toLocaleString());
+  h += kv('迷惑行為', (po.nuisance_rows||0).toLocaleString()+' 行 → '
+    + (po.nuisance_cells||0).toLocaleString()+' セル(騒ぎ '
+    + (po.nuisance_bursts||0).toLocaleString()+')');
+  (s.notes||[]).forEach(n => h += '<div class="note">· '+esc(n)+'</div>');
+  host.innerHTML = h;
+}
+function storyInit(){
+  SSEL = -1; STIDX = null;
+  document.getElementById('pincard').style.display = 'none';
+  const sel = document.getElementById('spat');
+  while(sel.options.length > 1) sel.remove(1);
+  sel.value = '';
+  document.getElementById('spat').onchange = buildStoryList;
+  document.getElementById('ssort').onchange = buildStoryList;
+  document.getElementById('sfind').oninput = buildStoryList;
+  document.getElementById('sthonly').onchange = buildStoryList;
+  buildStoryList(); fillStoryPop();
+  if(SORD.length) selectStory(SORD[0]);
+  else { renderStory(); fillStoryScore(); fillThink(); }
+}
+
 /* ---------- 起動(#run=A&step=54 で「その瞬間」を直接開ける) ---------- */
-let bootTab = 'map', bootPair = -1, bootCas = -1;
+let bootTab = 'map', bootPair = -1, bootCas = -1, bootStory = -1;
 (function(){
   const h = new URLSearchParams(location.hash.replace(/^#/, ''));
   const rk = (h.get('run')||'').toUpperCase();
@@ -4491,25 +6292,30 @@ let bootTab = 'map', bootPair = -1, bootCas = -1;
   const s = parseInt(h.get('step'), 10);
   if(isFinite(s)) cur = Math.max(0, Math.min(nSteps()-1, s));
   const tb = h.get('tab');
-  if(tb === 'pair' || tb === 'prop') bootTab = tb;
+  if(tb === 'pair' || tb === 'prop' || tb === 'story') bootTab = tb;
   const pi = parseInt(h.get('pair'), 10);
   if(isFinite(pi)) bootPair = pi;
   const ci = parseInt(h.get('cas'), 10);
   if(isFinite(ci)) bootCas = ci;
+  const si = parseInt(h.get('story'), 10);
+  if(isFinite(si)) bootStory = si;
 })();
 function syncHash(){
   try { history.replaceState(null, '', '#run='+RK+'&step='+cur+'&tab='+TAB
     + (TAB==='pair' && PSEL>=0 ? '&pair='+PSEL : '')
-    + (TAB==='prop' && CSEL>=0 ? '&cas='+CSEL : '')); } catch(_){}
+    + (TAB==='prop' && CSEL>=0 ? '&cas='+CSEL : '')
+    + (TAB==='story' && SSEL>=0 ? '&story='+SSEL : '')); } catch(_){}
 }
 scrub.addEventListener('change', syncHash);
 scrub.max = nSteps()-1; scrub.value = cur;
 fillTop(); fillAbout(); fillRel(); buildCharts();
-fitAll(); resize();
 pairInit();
 propInit();
+storyInit();
+fitAll(); resize();
 if(bootPair >= 0 && P() && bootPair < P().items.length) selectPair(bootPair);
 if(bootCas >= 0 && CAS() && bootCas < CAS().items.length) selectCas(bootCas);
+if(bootStory >= 0 && bootStory < stItems().length) selectStory(bootStory);
 if(bootTab !== 'map') setTab(bootTab);
 </script></body></html>
 """
@@ -4591,6 +6397,15 @@ def main(argv=None) -> int:
                     help="stock_out を貯める行数上限(fact の場所名の推定に使う)")
     ap.add_argument("--no-cascades", action="store_true",
                     help="画面3 の素材を作らない")
+    ap.add_argument("--stories", type=int, default=STORY_CAP_DEFAULT,
+                    help=f"画面4 に載せる物語数(既定 {STORY_CAP_DEFAULT})。"
+                         "母集団は常に併記される")
+    ap.add_argument("--thoughts", type=int, default=THOUGHT_CAP_DEFAULT,
+                    help=f"思考チェーンを付ける物語数の上限(既定 {THOUGHT_CAP_DEFAULT})")
+    ap.add_argument("--no-stories", action="store_true",
+                    help="画面4 の素材を作らない")
+    ap.add_argument("--no-thoughts", action="store_true",
+                    help="llm_journal を 1 行も読まない(思考チェーンなし)")
     ap.add_argument("--max-steps", type=int, default=None,
                     help="この step までで打ち切る(検証用)")
     ap.add_argument("--repo-root", default=None, help="リポジトリの場所(リポ外実行用)")
@@ -4648,9 +6463,33 @@ def main(argv=None) -> int:
 
     t0 = time.time()
     basemap = build_basemap(map_path)
+    # ノード → (x, y, 名前)。**payload には入れない**(3,499 件を丸ごと埋め込まない)。
+    # 画面4 が「現場を地図に置く」「n7966131106 を『渋谷駅ハチ公口』と呼ぶ」ために使う。
+    # 名前つきノードは 14 件しかないので、POI の `node` 欄からも名前を引き当てる。
+    node_xy: dict = {}
+    try:
+        _city = json.loads(Path(map_path).read_text(encoding="utf-8"))
+        for _n in _city.get("nodes", ()):
+            nid = _n.get("id")
+            if nid is not None:
+                node_xy[str(nid)] = (_n.get("x"), _n.get("y"), _n.get("name") or None)
+        for _p in _city.get("pois", ()):
+            nid = _p.get("node")
+            nm = (_p.get("name") or "").strip()
+            if not nid or not nm:
+                continue
+            cur = node_xy.get(str(nid))
+            if cur is None:
+                node_xy[str(nid)] = (_p.get("x"), _p.get("y"), nm)
+            elif not cur[2]:
+                node_xy[str(nid)] = (cur[0], cur[1], nm)
+        del _city
+    except (OSError, ValueError):
+        node_xy = {}
     _log(f"basemap: {map_path.name} 道路 {basemap['roads']['n']} 本 / "
          f"鉄道 {basemap['rails']['n']} 本 / POI {basemap['pois']['shown']}"
-         f"({basemap['pois']['population']} 中) — {time.time() - t0:.1f}s")
+         f"({basemap['pois']['population']} 中) / ノード座標 {len(node_xy):,} 件"
+         f" — {time.time() - t0:.1f}s")
 
     runs: dict[str, dict] = {}
     order: list[str] = []
@@ -4667,7 +6506,10 @@ def main(argv=None) -> int:
                                 cascades=not a.no_cascades, cas_cap=a.cascades,
                                 cas_nodes=a.cascade_nodes,
                                 belief_cap=a.belief_cap, reshare_cap=a.reshare_cap,
-                                stock_cap=a.stock_cap)
+                                stock_cap=a.stock_cap,
+                                stories=not a.no_stories, story_cap=a.stories,
+                                thoughts=not a.no_thoughts,
+                                thought_cap=a.thoughts, node_xy=node_xy)
         timings[label] = round(time.time() - t1, 1)
         order.append(label)
 
@@ -4709,7 +6551,8 @@ def main(argv=None) -> int:
              f"series {_n(r['series'])/1024:.0f}KB / "
              f"relations {_n(r['relations'])/1024:.0f}KB / "
              f"pairs {_n(r.get('pairs'))/1024:.0f}KB / "
-             f"cascades {_n(r.get('cascades'))/1024:.0f}KB")
+             f"cascades {_n(r.get('cascades'))/1024:.0f}KB / "
+             f"stories {_n(r.get('stories'))/1024:.0f}KB")
     _log(f"HTML: {out_html}  {size/1024/1024:.2f} MB "
          f"(規律 {HTML_SOFT_LIMIT/1024/1024:.0f}MB)")
     if size > HTML_SOFT_LIMIT:
@@ -4749,6 +6592,21 @@ def main(argv=None) -> int:
                                   "edges": i["edges"], "depth": i["depth"],
                                   "shape": i["shape"]}
                                  for i in r["cascades"]["items"][:8]],
+                     }),
+                     "stories": (None if not r.get("stories") else {
+                         "shown": r["stories"]["shown"],
+                         "matches": r["stories"]["population"]["matches"],
+                         "by_pat": {PAT_LABELS[int(k)]: v for k, v in
+                                    r["stories"]["population"]["by_pat"].items()},
+                         "quota": {PAT_LABELS[int(t)]: q["filled"]
+                                   for t, q in r["stories"]["quota"].items()},
+                         "thoughts": r["stories"]["thoughts"],
+                         "top": [{"pat": PAT_LABELS[i["pat"]], "title": i["title"],
+                                  "sub": i["sub"], "surprise": i["surprise"],
+                                  "parts": i["parts"], "why": i["why"],
+                                  "step": i["s0"], "beats": i["beats_n"],
+                                  "thought": bool(i.get("thought"))}
+                                 for i in r["stories"]["items"][:10]],
                      }),
                      "build_sec": timings[k]}) for k, r in runs.items()},
     }, ensure_ascii=False, indent=2))
