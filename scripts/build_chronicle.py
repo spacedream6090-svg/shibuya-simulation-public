@@ -60,6 +60,7 @@ import base64
 import json
 import math
 import os
+import re
 import sys
 import time
 from collections import Counter, defaultdict
@@ -121,6 +122,40 @@ PAIR_TAG_LABELS = {
 #: 掲載枠(カテゴリごとの最低保証。合計は cap を超えない)。
 PAIR_QUOTA = {"familiar_strangers": 16, "break": 60, "fast_promote": 72,
               "rich_dialogue": 110, "outing": 24, "partner": 24, "acquaint": 30}
+
+#: 画面3「伝播」の素材。**信念 / リシェア / 語彙を同じスキーマ**で扱う(器は 1 つ)。
+#: 実測(Run A finals_observe_20260824c・L1 40,561,808 行)で判ったこと:
+#: - `belief_update` {fact, fact_kind, from, hop, src, cause, verified, value, conf}
+#:   344,822 行のうち **344,805 行が cause=witness / hop=0 / from=-1**(= 各自の目撃)。
+#:   人づて(cause=transmit / src=agent / hop=1)は **17 行だけ**。つまり Run A の
+#:   「信念の広がり」は伝播木ではなく**同じ現場を大勢が見た並列発生**である。
+#:   これは欠測ではなく所見なので、木の形(fan/chain/parallel)として素直に出す。
+#: - `belief_transmit` {fact, to[], channel, hop, topic} … 発話側の台帳。`topic` は
+#:   場所名(= fact の実名)。7 行しかないが **fact → 実名の唯一の厳密な出典**。
+#: - `sns_reshare` {post_id, author} … **親 post とその著者**。自分が作る RT post の
+#:   id は L1 に出ない(internet.react が内部で採番する)ので、下の二重ポインタで同定する。
+#: - `viral_cascade` {post_id, author, reach} … インフルエンサー加重(元 post 1 件に 1 回)。
+#: - `sns_post` {text, items} … 実文つきの投稿(Run A で 35 件)。RT と公式は本文を出さない。
+#: - `stock_out` {poi, cat, src} … fact の生成源。fact → 場所名の**推定**に使う。
+#: - `transmission` {item_id, from, channel} … 語彙の系譜(辺そのもの)。Run A で 85 行。
+#: - `vocab_coin`/`label_coin`/`label_adopt`/`place_label_bind`/`vocab_use` … 語の一生。
+PROP_KINDS = ("belief_update", "belief_transmit", "sns_reshare", "viral_cascade",
+              "sns_post", "stock_out", "transmission", "vocab_coin", "label_coin",
+              "label_adopt", "place_label_bind", "vocab_use")
+
+#: カスケードの種別(HTML の凡例と 1 対 1)。
+CAS_BELIEF, CAS_RESHARE, CAS_VOCAB = 0, 1, 2
+CAS_KIND_LABELS = {CAS_BELIEF: "信念", CAS_RESHARE: "リシェア", CAS_VOCAB: "語彙"}
+#: 種別ごとの掲載枠(合計は cap を超えない。語彙は Run A でほぼ 0 件 = 枠が余っても静か)。
+CAS_QUOTA = {CAS_BELIEF: 30, CAS_RESHARE: 30, CAS_VOCAB: 14}
+
+CAS_CAP_DEFAULT = 72                        # 掲載するカスケード数(母集団は必ず併記)
+CAS_NODES_DEFAULT = 300                     # 1 カスケードの木ノード上限
+CAS_ISO_CELLS = 400                         # 等時線に載せるヘックス数の上限
+CAS_CURVE_MAX = 320                         # S 字曲線の点数上限
+BELIEF_CAP_DEFAULT = 8_000_000              # belief_update を貯める行数上限(1 件 26B)
+RESHARE_CAP_DEFAULT = 8_000_000             # sns_reshare を貯める行数上限(1 件 20B)
+STOCK_CAP_DEFAULT = 4_000_000               # stock_out を貯める行数上限(fact 命名用)
 
 #: 時系列に必ず載せる kind(L2 に相当列が無い/物語上の主役)。
 #: 実在しない kind は静かに落ちる(run_manifest 駆動の流儀)。
@@ -300,13 +335,43 @@ class _Scan:
 
     def __init__(self, hex_m: float, steps_per_bin: int, rel_cap: int,
                  pair_cache_max: int = 8_000_000, *, narrative: bool = True,
-                 conv_cap: int = CONV_CAP_DEFAULT, text_cap: int = TEXT_CAP_DEFAULT):
+                 conv_cap: int = CONV_CAP_DEFAULT, text_cap: int = TEXT_CAP_DEFAULT,
+                 propagation: bool = True, belief_cap: int = BELIEF_CAP_DEFAULT,
+                 reshare_cap: int = RESHARE_CAP_DEFAULT,
+                 stock_cap: int = STOCK_CAP_DEFAULT):
         import numpy as np
         self.np = np
         self.grid = HexGrid(hex_m)
         self.steps_per_bin = max(1, int(steps_per_bin))
         self.rel_cap = int(rel_cap)
         self.pair_cache_max = int(pair_cache_max)
+
+        # ---- 画面3「伝播」の素材(propagation=False で 1 行も読まない) ---- #
+        self.propagation = bool(propagation)
+        self.bel_cap = int(belief_cap)
+        self.rsh_cap = int(reshare_cap)
+        self.so_cap = int(stock_cap)
+        self._bel_chunks: list = []     # step,agent,fact,from,hop,cause,src,x,y
+        self._rsh_chunks: list = []     # step,agent,post,author,x,y
+        self._vir_chunks: list = []     # step,author,post,reach
+        self._so_chunks: list = []      # step,x,y,poi,cat
+        self._tx_chunks: list = []      # step,agent,item,from,chan,x,y
+        self.bel_pop = self.bel_kept = 0
+        self.rsh_pop = self.rsh_kept = 0
+        self.so_pop = self.so_kept = 0
+        self.vir_rows = self.tx_rows = 0
+        self.facts = _Intern()          # fact id 文字列 → 連番
+        self.bel_causes, self.bel_srcs = _Intern(), _Intern()
+        self.prop_chans, self.prop_topics = _Intern(), _Intern()
+        self.pois, self.cats = _Intern(), _Intern()
+        self.items = _Intern()          # vocab item_id
+        self.prop_texts = _Intern(200_000)   # 投稿・語の実文
+        self.bel_tx: list = []          # (step, from, fact, chan, topic, n_to)
+        self.sns_posts: list = []       # (step, agent, text_id)
+        self.coins: list = []           # (step, agent, item, text, place, x, y, is_vocab)
+        self.adopts: list = []          # (step, agent, item, text)
+        self.binds: list = []           # (step, agent, word_text, node, x, y)
+        self.vocab_use: Counter = Counter()
 
         # ---- 画面2「関係の伝記」の素材(narrative=False で 1 行も読まない) ---- #
         self.narrative = bool(narrative)
@@ -677,6 +742,181 @@ class _Scan:
                 np.asarray(t_y, dtype=np.int16), np.asarray(t_ch, dtype=np.uint8)))
             self.text_pair_rows += len(t_st)
 
+    # ---- 伝播素材(画面3) ------------------------------------------------- #
+    def _propagation(self, batch, idx, kinds, xnp, ynp) -> None:
+        """信念 / リシェア / 語彙の伝播を、**同じ形**の圧縮表へ落とす。
+
+        1 パス目に相乗りする。Python オブジェクトになるのは PROP_KINDS の行だけ
+        (Run A で 953,285 行 = 全 L1 の 2.35%)。文字列(fact id・場所名・チャネル・
+        実文)はすべて辞書化する。
+        """
+        import numpy as np
+        import pyarrow as pa
+        take = pa.array(idx)
+        steps = batch.column("step").take(take).to_pylist()
+        aids = batch.column("agent_id").take(take).to_pylist()
+        pays = batch.column("payload").take(take).to_pylist()
+        xs = xnp[idx].tolist() if xnp is not None else [None] * len(steps)
+        ys = ynp[idx].tolist() if ynp is not None else [None] * len(steps)
+
+        b = [[] for _ in range(9)]      # belief_update
+        r = [[] for _ in range(6)]      # sns_reshare
+        v = [[] for _ in range(4)]      # viral_cascade
+        s = [[] for _ in range(5)]      # stock_out
+        t = [[] for _ in range(7)]      # transmission
+
+        for st, a, kd, raw, x, y in zip(steps, aids, kinds, pays, xs, ys):
+            if st is None:
+                continue
+            try:
+                p = json.loads(raw) if raw else {}
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(p, dict):
+                continue
+            st = int(st)
+            a = -1 if a is None else int(a)
+            xi, yi = _xy16(x), _xy16(y)
+
+            if kd == "belief_update":
+                self.bel_pop += 1
+                if self.bel_kept >= self.bel_cap or a < 0:
+                    continue
+                fid = p.get("fact")
+                if fid is None:
+                    continue
+                try:
+                    frm = int(p.get("from", -1))
+                except (TypeError, ValueError):
+                    frm = -1
+                b[0].append(st)
+                b[1].append(a)
+                b[2].append(self.facts(fid))
+                b[3].append(frm)
+                b[4].append(max(0, min(255, int(p.get("hop") or 0))))
+                b[5].append(self.bel_causes(p.get("cause")) + 1)
+                b[6].append(self.bel_srcs(p.get("src")) + 1)
+                b[7].append(xi)
+                b[8].append(yi)
+                self.bel_kept += 1
+
+            elif kd == "belief_transmit":
+                if len(self.bel_tx) < 200_000:
+                    to = p.get("to")
+                    self.bel_tx.append((st, a, self.facts(p.get("fact")),
+                                        self.prop_chans(p.get("channel")),
+                                        self.prop_topics(p.get("topic")),
+                                        len(to) if isinstance(to, list) else 0))
+
+            elif kd == "sns_reshare":
+                self.rsh_pop += 1
+                if self.rsh_kept >= self.rsh_cap or a < 0:
+                    continue
+                pid = p.get("post_id")
+                if pid is None:
+                    continue
+                try:
+                    au = int(p.get("author", -1))
+                except (TypeError, ValueError):
+                    au = -1
+                r[0].append(st)
+                r[1].append(a)
+                r[2].append(int(pid))
+                r[3].append(au)
+                r[4].append(xi)
+                r[5].append(yi)
+                self.rsh_kept += 1
+
+            elif kd == "viral_cascade":
+                pid = p.get("post_id")
+                if pid is None:
+                    continue
+                v[0].append(st)
+                v[1].append(int(p.get("author") if p.get("author") is not None else -1))
+                v[2].append(int(pid))
+                v[3].append(int(p.get("reach") or 0))
+
+            elif kd == "sns_post":
+                if len(self.sns_posts) < 200_000:
+                    self.sns_posts.append((st, a, self.prop_texts(p.get("text") or "")))
+
+            elif kd == "stock_out":
+                self.so_pop += 1
+                if self.so_kept >= self.so_cap:
+                    continue
+                s[0].append(st)
+                s[1].append(xi)
+                s[2].append(yi)
+                s[3].append(self.pois(p.get("poi")))
+                s[4].append(self.cats(p.get("cat")))
+                self.so_kept += 1
+
+            elif kd == "transmission":
+                it = p.get("item_id")
+                if it is None or a < 0:
+                    continue
+                try:
+                    frm = int(p.get("from", -1))
+                except (TypeError, ValueError):
+                    frm = -1
+                t[0].append(st)
+                t[1].append(a)
+                t[2].append(self.items(it))
+                t[3].append(frm)
+                t[4].append(self.prop_chans(p.get("channel")) + 1)
+                t[5].append(xi)
+                t[6].append(yi)
+
+            elif kd in ("vocab_coin", "label_coin"):
+                if len(self.coins) < 200_000:
+                    self.coins.append((st, a, self.items(p.get("item_id")),
+                                       self.prop_texts(p.get("text") or ""),
+                                       self.prop_topics(p.get("place")), xi, yi,
+                                       1 if kd == "vocab_coin" else 0))
+
+            elif kd == "label_adopt":
+                if len(self.adopts) < 500_000:
+                    self.adopts.append((st, a, self.items(p.get("item_id")),
+                                        self.prop_texts(p.get("text") or "")))
+
+            elif kd == "place_label_bind":
+                if len(self.binds) < 200_000:
+                    self.binds.append((st, a, self.prop_texts(p.get("word") or ""),
+                                       str(p.get("node") or ""), xi, yi))
+
+            elif kd == "vocab_use":
+                self.vocab_use[self.items(p.get("item_id"))] += 1
+
+        if b[0]:
+            self._bel_chunks.append((
+                np.asarray(b[0], dtype=np.int32), np.asarray(b[1], dtype=np.int64),
+                np.asarray(b[2], dtype=np.int32), np.asarray(b[3], dtype=np.int64),
+                np.asarray(b[4], dtype=np.uint8), np.asarray(b[5], dtype=np.uint8),
+                np.asarray(b[6], dtype=np.uint8), np.asarray(b[7], dtype=np.int16),
+                np.asarray(b[8], dtype=np.int16)))
+        if r[0]:
+            self._rsh_chunks.append((
+                np.asarray(r[0], dtype=np.int32), np.asarray(r[1], dtype=np.int64),
+                np.asarray(r[2], dtype=np.int64), np.asarray(r[3], dtype=np.int64),
+                np.asarray(r[4], dtype=np.int16), np.asarray(r[5], dtype=np.int16)))
+        if v[0]:
+            self._vir_chunks.append((
+                np.asarray(v[0], dtype=np.int32), np.asarray(v[1], dtype=np.int64),
+                np.asarray(v[2], dtype=np.int64), np.asarray(v[3], dtype=np.int32)))
+            self.vir_rows += len(v[0])
+        if s[0]:
+            self._so_chunks.append((
+                np.asarray(s[0], dtype=np.int32), np.asarray(s[1], dtype=np.int16),
+                np.asarray(s[2], dtype=np.int16), np.asarray(s[3], dtype=np.int32),
+                np.asarray(s[4], dtype=np.int16)))
+        if t[0]:
+            self._tx_chunks.append((
+                np.asarray(t[0], dtype=np.int32), np.asarray(t[1], dtype=np.int64),
+                np.asarray(t[2], dtype=np.int32), np.asarray(t[3], dtype=np.int64),
+                np.asarray(t[4], dtype=np.uint8), np.asarray(t[5], dtype=np.int16),
+                np.asarray(t[6], dtype=np.int16)))
+            self.tx_rows += len(t[0])
+
     # ---- 1 batch --------------------------------------------------------- #
     def feed(self, batch) -> None:
         import numpy as np
@@ -708,6 +948,7 @@ class _Scan:
         # (全 40.6 億行の Python 文字列化を避ける)。
         rel_idx, rel_kinds = None, None
         narr_idx, narr_kinds = None, None
+        prop_idx, prop_kinds = None, None
         if "kind" in names and "payload" in names and "agent_id" in names:
             import pyarrow as pa
             kc = batch.column("kind")
@@ -726,6 +967,8 @@ class _Scan:
             rel_idx, rel_kinds = _pick(REL_KINDS)
             if self.narrative:
                 narr_idx, narr_kinds = _pick(NARR_KINDS)
+            if self.propagation:
+                prop_idx, prop_kinds = _pick(PROP_KINDS)
 
         xnp = ynp = None
         if "x" in names and "y" in names and "agent_id" in names:
@@ -741,6 +984,8 @@ class _Scan:
             self._relations(batch, rel_idx, rel_kinds)
         if narr_idx is not None:
             self._narratives(batch, narr_idx, narr_kinds, xnp, ynp)
+        if prop_idx is not None:
+            self._propagation(batch, prop_idx, prop_kinds, xnp, ynp)
 
     def finish(self) -> None:
         self._flush(self._cur_bin)
@@ -750,11 +995,15 @@ class _Scan:
 def scan_l1(run_dir, *, hex_m: float, steps_per_bin: int, rel_cap: int,
             step_max=None, batch_rows: int = 262_144, narrative: bool = True,
             conv_cap: int = CONV_CAP_DEFAULT,
-            text_cap: int = TEXT_CAP_DEFAULT) -> _Scan:
+            text_cap: int = TEXT_CAP_DEFAULT, propagation: bool = True,
+            belief_cap: int = BELIEF_CAP_DEFAULT,
+            reshare_cap: int = RESHARE_CAP_DEFAULT,
+            stock_cap: int = STOCK_CAP_DEFAULT) -> _Scan:
     """L1 を 1 パスで舐める。`l1_stream` の有界読みだけを使う。"""
     import l1_stream
     sc = _Scan(hex_m, steps_per_bin, rel_cap, narrative=narrative,
-               conv_cap=conv_cap, text_cap=text_cap)
+               conv_cap=conv_cap, text_cap=text_cap, propagation=propagation,
+               belief_cap=belief_cap, reshare_cap=reshare_cap, stock_cap=stock_cap)
     cols = ["step", "sim_min", "agent_id", "kind", "x", "y", "payload"]
     t0 = time.time()
     last = t0
@@ -773,6 +1022,11 @@ def scan_l1(run_dir, *, hex_m: float, steps_per_bin: int, rel_cap: int,
              f"実文 {len(sc.texts):,} 種 → ペア行 {sc.text_pair_rows:,}・"
              f"acquaint {len(sc.acq):,} 組・train_copresence {len(sc.tc):,} 組・"
              f"同伴(step>0) {sc.ja_kept:,}/{sc.ja_pop:,} 件")
+    if sc.propagation:
+        _log(f"  伝播素材: belief_update {sc.bel_kept:,}/{sc.bel_pop:,} 行"
+             f"(fact {len(sc.facts):,} 件)・sns_reshare {sc.rsh_kept:,}/{sc.rsh_pop:,} 行・"
+             f"viral_cascade {sc.vir_rows:,}・transmission {sc.tx_rows:,}・"
+             f"coin {len(sc.coins):,}・stock_out {sc.so_kept:,}/{sc.so_pop:,}")
     return sc
 
 
@@ -1440,6 +1694,647 @@ def build_pairs(run_dir, sc: _Scan, arrs, *, n_steps: int, cap: int,
 
 
 # --------------------------------------------------------------------------- #
+# 画面3「伝播」— 信念 / リシェア / 語彙のカスケード
+#
+# 方針(計画 §1 画面3)
+# --------------------
+# * **器は 1 つ**。信念・リシェア・語彙のどれも `{木・等時線・S字・チャネル分解}` の
+#   同じ 4 点セットにする。Run A では語彙がほぼ 0 件だが、空でも壊れない形で出す
+#   (Run B の語彙イベントが来たらそのまま点灯する)。
+# * 母集団(全カスケード)と掲載(cap 件)は必ず併記する。
+# * 木は「見て分かる」ことが目的なので、ノードは上限つき。間引くときは
+#   **内部ノード(子を持つ節)を全部残してから**葉を等間隔で落とす
+#   = 形(タンポポ / 連鎖)が保存される。
+# * 位置は採用イベントの (x, y)。等時線は俯瞰と同じヘックス格子の
+#   「そのセルに初めて届いた step」。
+# --------------------------------------------------------------------------- #
+#: `stock_out.poi` が POI 名でなく地図ノード id のことがある(名前のない店)。
+_NODE_ID_RE = re.compile(r"n\d{4,}")
+
+
+def _tree_pack(agents, parents, steps, xs, ys, depths, *, cap):
+    """ノード列 → base64。cap 超過は内部ノード優先で間引く(形を壊さない)。
+
+    間引いた節の子は、**残っている最も近い祖先へ付け替える**(= 木の収縮)。
+    親を落として根にしてしまうと「独立に発生した」と誤読されるので、そうしない。
+    付け替えた辺の本数は `contracted` として必ず併記する。
+    """
+    import numpy as np
+    pop = int(agents.size)
+    if pop == 0:
+        return {"n": 0, "population": 0, "contracted": 0, "a": "", "p": "",
+                "s": "", "x": "", "y": "", "d": ""}
+    keep = np.arange(pop, dtype=np.int64)
+    if pop > cap:
+        # 各節の**子孫の数**で優先順位をつける。親の子孫数は必ず子より大きいので、
+        # 「子孫数の多い順に上から cap 個」は**祖先について閉じている**
+        # = 付け替え(contraction)が 1 本も起きず、幹と太い枝がそのまま残る。
+        size = np.ones(pop, dtype=np.int64)
+        par_i = parents.tolist()
+        sz = size.tolist()
+        for i in range(pop - 1, -1, -1):        # 親 index < 子 index なので 1 パス
+            p = par_i[i]
+            if p >= 0:
+                sz[p] += sz[i]
+        size = np.asarray(sz, dtype=np.int64)
+        trunk = np.nonzero(size > 1)[0]         # 子を持つ節(幹と枝)
+        sel = []
+        budget = int(cap)
+        if trunk.size:
+            if trunk.size > budget:
+                # 子孫数の多い順。同数は index 昇順(= 早い者順)で安定に切る。
+                ordv = trunk[np.lexsort((trunk, -size[trunk]))][:budget]
+                sel.append(ordv)
+                budget = 0
+            else:
+                sel.append(trunk)
+                budget -= int(trunk.size)
+        if budget > 0:                           # 残枠は葉を step 昇順で等間隔に
+            leaves = np.nonzero(size <= 1)[0]
+            if leaves.size > budget:
+                leaves = leaves[np.linspace(0, leaves.size - 1,
+                                            budget).astype(np.int64)]
+            if leaves.size:
+                sel.append(leaves)
+        keep = np.sort(np.concatenate(sel)) if sel else np.zeros(0, dtype=np.int64)
+    remap = np.full(pop, -1, dtype=np.int64)
+    remap[keep] = np.arange(keep.size, dtype=np.int64)
+    # 残った最近祖先(親 index < 自分 index なので 1 パスで解ける)
+    anc = np.full(pop, -1, dtype=np.int64)
+    par_l = parents.tolist()
+    rm_l = remap.tolist()
+    anc_l = anc.tolist()
+    for i in range(pop):
+        p = par_l[i]
+        if p < 0:
+            anc_l[i] = -1
+        else:
+            anc_l[i] = rm_l[p] if rm_l[p] >= 0 else anc_l[p]
+    anc = np.asarray(anc_l, dtype=np.int64)
+    npar = anc[keep]
+    contracted = int(np.count_nonzero((parents[keep] >= 0)
+                                      & (remap[np.clip(parents[keep], 0, pop - 1)] < 0)
+                                      & (npar >= 0)))
+    return {
+        "n": int(keep.size),
+        "population": pop,
+        "contracted": contracted,
+        "depth_shown": int(depths[keep].max()) if keep.size else 0,
+        "a": _b64(agents[keep].astype(np.int32)),      # -1 = 公式(メディア)
+        "p": _b64(npar.astype(np.int32)),
+        "s": _b64(steps[keep].astype(np.int32)),
+        "x": _b64(xs[keep].astype(np.int16)),
+        "y": _b64(ys[keep].astype(np.int16)),
+        "d": _b64(np.clip(depths[keep], 0, 255).astype(np.uint8)),
+    }
+
+
+def _iso_grid(xs, ys, hex_m: float) -> HexGrid:
+    """カスケードの広がりに合わせたヘックス格子(1 枚に 20-40 個くらい並ぶ大きさ)。
+
+    信念は目撃半径のなかに全員が居るので 200 m 格子だと 1 個に潰れ、リシェアは
+    街全体に散るので 25 m 格子だと数千個になる。**同じ 200 m を全部に当てない**。
+    """
+    import numpy as np
+    ok = (xs != -32768) & (ys != -32768)
+    if int(np.count_nonzero(ok)) < 2:
+        return HexGrid(hex_m)
+    w = float(xs[ok].max() - xs[ok].min())
+    h = float(ys[ok].max() - ys[ok].min())
+    span = max(w, h)
+    if span <= 0:
+        return HexGrid(25.0)
+    return HexGrid(min(400.0, max(25.0, round(span / 16.0))))
+
+
+def _iso_cells(grid: HexGrid, xs, ys, steps, *, cap=CAS_ISO_CELLS):
+    """採用者の位置 → ヘックス別の (q, r, 初到達 step, 人数)。母集団も返す。"""
+    import numpy as np
+    ok = (xs != -32768) & (ys != -32768)
+    if not ok.any():
+        return [], 0
+    q, r = grid.to_axial(xs[ok].astype(np.float64), ys[ok].astype(np.float64))
+    code = _encode_cell(q, r)
+    st = steps[ok].astype(np.int64)
+    o = np.lexsort((st, code))
+    code, st = code[o], st[o]
+    starts, ends = _group_bounds(code)
+    rows = []
+    for a, b in zip(starts.tolist(), ends.tolist()):
+        qq, rr = _decode_cell(int(code[a]))
+        rows.append([int(qq), int(rr), int(st[a]), int(b - a)])
+    pop = len(rows)
+    if pop > cap:
+        # 半分は人数の多いセル(波紋の芯)、残り半分は初到達 step 順に等間隔
+        # (人数だけで切ると遅く届いた外周が丸ごと消えて「波が止まる」)。
+        rows.sort(key=lambda v: (-v[3], v[2]))
+        head = rows[: cap // 2]
+        taken = {(v[0], v[1]) for v in head}
+        rest = [v for v in rows if (v[0], v[1]) not in taken]
+        rest.sort(key=lambda v: v[2])
+        need = cap - len(head)
+        if rest and need > 0:
+            import numpy as _np
+            ix = _np.linspace(0, len(rest) - 1, min(need, len(rest)))
+            head += [rest[int(round(j))] for j in ix.tolist()]
+        rows = head
+    rows.sort(key=lambda v: v[2])
+    return rows, pop
+
+
+def _curve(steps, *, cap=CAS_CURVE_MAX):
+    """step ごとの新規採用者数(累積はビューワー側で取る)。長すぎるときは畳む。"""
+    import numpy as np
+    if steps.size == 0:
+        return []
+    u, c = np.unique(steps.astype(np.int64), return_counts=True)
+    if u.size <= cap:
+        return [[int(a), int(b)] for a, b in zip(u.tolist(), c.tolist())]
+    lo, hi = int(u[0]), int(u[-1])
+    w = max(1, int(math.ceil((hi - lo + 1) / cap)))
+    b = (u - lo) // w
+    ub, ix = np.unique(b, return_inverse=True)
+    agg = np.zeros(ub.size, dtype=np.int64)
+    np.add.at(agg, ix, c)
+    return [[int(lo + int(bb) * w), int(v)] for bb, v in zip(ub.tolist(), agg.tolist())]
+
+
+def _shape_of(edges: int, depth: int, internal: int, n: int, roots: int) -> str:
+    """木の形の分類。分岐数 = 辺 / 子を持つ節(= 1 人が平均何人へ渡したか)。
+
+    parallel … 辺ゼロ(= 全員が独立に知った。Run A の信念はほぼこれ)
+    seeded   … 辺はあるが 8 割超が独立発生(= ほぼ並列・一部だけ人づて)
+    fan      … 深さ 1(= 1 人から一斉に広がったタンポポ)
+    chain    … 分岐 1.5 未満(= 数珠つなぎ)
+    tree     … 分岐 4 以上(= よく枝分かれした)
+    mixed    … その中間
+    """
+    if edges <= 0:
+        return "parallel"
+    if n > 4 and roots > 0.8 * n:
+        return "seeded"
+    if depth <= 1:
+        return "fan"
+    branch = edges / float(max(1, internal))
+    if branch < 1.5:
+        return "chain"
+    return "tree" if branch >= 4.0 else "mixed"
+
+
+def _cascade_item(kind, key, *, title, title_src, text, agents, parents, steps,
+                  xs, ys, depths, hex_m, nodes_cap, ch, who=None, extra=None):
+    """1 カスケードぶんの 4 点セット(木 / 等時線 / S 字 / チャネル)を組む。"""
+    import numpy as np
+    n = int(agents.size)
+    edges = int(np.count_nonzero(parents >= 0))
+    roots = n - edges
+    depth = int(depths.max()) if n else 0
+    pp = parents[parents >= 0]
+    internal = 0
+    if pp.size:
+        up, uc = np.unique(pp, return_counts=True)
+        internal = int(up.size)
+        if who is not None:                     # よく配った人は名前を引く(木の吹き出し)
+            top = up[np.argsort(-uc)[:12]]
+            for j in top.tolist():
+                if 0 <= j < n:
+                    who.add(int(agents[j]))
+    grid = _iso_grid(xs, ys, hex_m)
+    it = {
+        "kind": int(kind),
+        "key": str(key),
+        "title": title,
+        "title_src": title_src,
+        "text": text,
+        "n": n,
+        "edges": edges,
+        "roots": roots,
+        "internal": internal,
+        "branch": _round(edges / float(max(1, internal)), 2),
+        "depth": depth,
+        "shape": _shape_of(edges, depth, internal, n, roots),
+        "s0": int(steps.min()) if n else 0,
+        "s1": int(steps.max()) if n else 0,
+        "ch": {k: int(v) for k, v in sorted(ch.items(), key=lambda kv: -kv[1])},
+        "curve": _curve(steps),
+        "tree": _tree_pack(agents, parents, steps, xs, ys, depths, cap=nodes_cap),
+        "iso_hex_m": round(grid.hex_m, 1),
+    }
+    iso, iso_pop = _iso_cells(grid, xs, ys, steps)
+    it["iso"] = iso
+    it["iso_population"] = iso_pop
+    if extra:
+        it.update(extra)
+    return it
+
+
+def build_cascades(run_dir, sc: _Scan, *, hex_m: float, cap: int, nodes_cap: int,
+                   n_steps: int) -> dict:
+    """信念 / リシェア / 語彙のカスケードを 1 つの器に組む(L1 の追加走査なし)。"""
+    import numpy as np
+    t0 = time.time()
+    pop = {
+        "belief_rows": sc.bel_pop, "belief_kept": sc.bel_kept,
+        "belief_facts": 0, "belief_facts_with_edges": 0, "belief_edges": 0,
+        "reshare_rows": sc.rsh_pop, "reshare_kept": sc.rsh_kept,
+        "reshare_cascades": 0, "viral_rows": sc.vir_rows,
+        "vocab_rows": sc.tx_rows, "vocab_items": 0,
+        "coins": len(sc.coins), "label_adopts": len(sc.adopts),
+        "place_binds": len(sc.binds), "stock_out_rows": sc.so_pop,
+    }
+    cands: list[tuple] = []             # (kind, サイズ, 優先度, 生成関数)
+    who: set[int] = set()               # 名前を引く体(根・主要な媒介者)
+
+    # ---- 1. 信念 --------------------------------------------------------- #
+    bel = _concat_chunks(sc._bel_chunks, 9)
+    sc._bel_chunks.clear()
+    bel_groups: dict[int, tuple] = {}
+    if bel is not None:
+        b_st, b_ag, b_fa, b_fr, b_hp, b_ca, b_sr, b_x, b_y = bel
+        o = np.lexsort((b_st, b_fa))
+        b_st, b_ag, b_fa = b_st[o], b_ag[o], b_fa[o]
+        b_fr, b_hp, b_ca, b_sr = b_fr[o], b_hp[o], b_ca[o], b_sr[o]
+        b_x, b_y = b_x[o], b_y[o]
+        starts, ends = _group_bounds(b_fa.astype(np.int64))
+        pop["belief_facts"] = int(starts.size)
+        for s, e in zip(starts.tolist(), ends.tolist()):
+            fid = int(b_fa[s])
+            edges = int(np.count_nonzero(b_fr[s:e] >= 0))
+            pop["belief_edges"] += edges
+            if edges:
+                pop["belief_facts_with_edges"] += 1
+            bel_groups[fid] = (s, e, int(e - s), edges)
+        for fid, (s, e, n, edges) in bel_groups.items():
+            # 人づて(hop>=1)が 1 本でもある fact は稀少 = 必ず候補の先頭へ
+            cands.append((CAS_BELIEF, n, 0 if edges else 1, fid))
+
+    # fact → 場所名。厳密な出典は belief_transmit.topic、無ければ stock_out から推定。
+    fact_topic: dict[int, int] = {}
+    fact_tx_ch: dict[int, Counter] = defaultdict(Counter)
+    for st, frm, fa, ch, tp, n_to in sc.bel_tx:
+        if fa >= 0 and tp >= 0:
+            fact_topic.setdefault(fa, tp)
+        if fa >= 0:
+            fact_tx_ch[fa][ch] += 1
+    so = _concat_chunks(sc._so_chunks, 5)
+    sc._so_chunks.clear()
+    if so is not None:
+        so_order = np.argsort(so[0], kind="stable")
+        so = [c[so_order] for c in so]
+
+    def _fact_name(fid, s, e):
+        """fact の実名。① belief_transmit の topic(厳密)② 最寄の stock_out(推定)。"""
+        tp = fact_topic.get(fid)
+        if tp is not None and 0 <= tp < len(sc.prop_topics.vals):
+            return str(sc.prop_topics.vals[tp]), "transmit_topic", None
+        if so is None:
+            return None, "none", None
+        s0 = int(b_st[s])
+        # fact が立った step の目撃者だけで重心を取る(半径内に散るので中央値)
+        m = b_st[s:e] == s0
+        xs0 = b_x[s:e][m]
+        ys0 = b_y[s:e][m]
+        xs0 = xs0[xs0 != -32768]
+        ys0 = ys0[ys0 != -32768]
+        if xs0.size == 0:
+            return None, "none", None
+        cx, cy = float(np.median(xs0)), float(np.median(ys0))
+        lo = int(np.searchsorted(so[0], s0 - 3, side="left"))
+        hi = int(np.searchsorted(so[0], s0, side="right"))
+        if hi <= lo:
+            return None, "none", None
+        dx = so[1][lo:hi].astype(np.float64) - cx
+        dy = so[2][lo:hi].astype(np.float64) - cy
+        d2 = dx * dx + dy * dy
+        j = int(np.argmin(d2))
+        poi = so[3][lo + j]
+        nm = sc.pois.vals[int(poi)] if 0 <= int(poi) < len(sc.pois.vals) else None
+        if not nm:
+            return None, "none", None
+        nm = str(nm)
+        if _NODE_ID_RE.fullmatch(nm):        # POI 名でなく地図ノード id(名前のない店)
+            nm = f"名称のない店({nm})"
+        return nm, "poi_near", round(float(math.sqrt(d2[j])), 1)
+
+    # ---- 2. リシェア ------------------------------------------------------ #
+    rsh = _concat_chunks(sc._rsh_chunks, 6)
+    sc._rsh_chunks.clear()
+    rsh_groups: dict[int, list] = {}
+    par_ev = root_of = depth_ev = None
+    if rsh is not None:
+        o = np.argsort(rsh[0], kind="stable")
+        r_st, r_ag, r_po, r_au, r_x, r_y = [c[o] for c in rsh]
+        n_ev = int(r_st.size)
+        # 「X が post P をリシェアすると RT post が 1 件生まれる」が、その id は L1 に
+        # 出ない。post id は追記通し番号(= 生成時刻の昇順)なので、著者 A について
+        #   観測された post id(昇順) × A が RT を作った step(昇順)
+        # を単調に突き合わせれば A の k 番目の RT post が同定できる。
+        created: dict[int, list] = defaultdict(list)
+        seen: dict[int, dict] = defaultdict(dict)
+        ag_l, po_l, au_l = r_ag.tolist(), r_po.tolist(), r_au.tolist()
+        for i in range(n_ev):
+            created[ag_l[i]].append(i)
+            d = seen[au_l[i]]
+            if po_l[i] not in d:
+                d[po_l[i]] = i
+        creator: dict[int, int] = {}
+        st_l = r_st.tolist()
+        for au, posts in seen.items():
+            if au < 0:                       # 公式(メディア)は RT で作られない
+                continue
+            cre = created.get(au) or ()
+            j = 0
+            for pid in sorted(posts):
+                if j >= len(cre):
+                    break
+                if st_l[cre[j]] <= st_l[posts[pid]]:
+                    creator[pid] = cre[j]
+                    j += 1
+        par_ev = np.asarray([creator.get(p, -1) for p in po_l], dtype=np.int64)
+        root_of = np.full(n_ev, -1, dtype=np.int64)
+        depth_ev = np.zeros(n_ev, dtype=np.int64)
+        pe = par_ev.tolist()
+        for i in range(n_ev):
+            if root_of[i] >= 0:
+                continue
+            chain = []
+            j, root = i, -1
+            for _ in range(512):
+                if root_of[j] >= 0:
+                    root = int(root_of[j])
+                    break
+                chain.append(j)
+                nj = pe[j]
+                if nj < 0:
+                    root = po_l[j]
+                    break
+                j = nj
+            if root < 0:
+                root = po_l[chain[-1]] if chain else po_l[i]
+            for c in chain:
+                root_of[c] = root
+        for i in range(n_ev):
+            p = pe[i]
+            depth_ev[i] = 1 if p < 0 else int(depth_ev[p]) + 1
+        ro = np.argsort(root_of, kind="stable")
+        rk = root_of[ro]
+        starts, ends = _group_bounds(rk)
+        pop["reshare_cascades"] = int(starts.size)
+        for s, e in zip(starts.tolist(), ends.tolist()):
+            rsh_groups[int(rk[s])] = [ro[s:e], int(e - s)]
+            cands.append((CAS_RESHARE, int(e - s), 1, int(rk[s])))
+
+    # viral_cascade の reach を「その post を含むカスケード」へ寄せる
+    vir = _concat_chunks(sc._vir_chunks, 4)
+    sc._vir_chunks.clear()
+    vir_reach: dict[int, int] = defaultdict(int)
+    vir_hits: dict[int, int] = defaultdict(int)
+    if vir is not None and rsh is not None:
+        for pid, rc in zip(vir[2].tolist(), vir[3].tolist()):
+            ev = creator.get(pid)
+            root = int(root_of[ev]) if ev is not None else pid
+            vir_reach[root] += int(rc)
+            vir_hits[root] += 1
+
+    # 元 post の実文(sns_post は 著者 × step でしか引けないので「その著者の直近投稿」)
+    posts_by_author: dict[int, list] = defaultdict(list)
+    for st, ag, tid in sc.sns_posts:
+        posts_by_author[int(ag)].append((int(st), int(tid)))
+    for v in posts_by_author.values():
+        v.sort()
+
+    def _post_text(author: int, before: int):
+        v = posts_by_author.get(int(author)) or ()
+        best = None
+        for st, tid in v:
+            if st <= before:
+                best = tid
+            else:
+                break
+        if best is None:
+            return None
+        return sc.prop_texts.vals[best] if 0 <= best < len(sc.prop_texts.vals) else None
+
+    # ---- 3. 語彙 ---------------------------------------------------------- #
+    tx = _concat_chunks(sc._tx_chunks, 7)
+    sc._tx_chunks.clear()
+    tx_groups: dict[int, tuple] = {}
+    if tx is not None:
+        o = np.lexsort((tx[0], tx[2]))
+        t_st, t_ag, t_it, t_fr, t_ch, t_x, t_y = [c[o] for c in tx]
+        starts, ends = _group_bounds(t_it.astype(np.int64))
+        pop["vocab_items"] = int(starts.size)
+        for s, e in zip(starts.tolist(), ends.tolist()):
+            tx_groups[int(t_it[s])] = (s, e)
+            cands.append((CAS_VOCAB, int(e - s), 0, int(t_it[s])))
+    # 語の造語イベント(伝播 0 件でも「生まれた」ことは載せる)
+    coin_of: dict[int, tuple] = {}
+    for st, ag, it_, tid, place, xi, yi, is_vocab in sc.coins:
+        if it_ >= 0 and it_ not in coin_of:
+            coin_of[it_] = (st, ag, tid, place, xi, yi)
+            if it_ not in tx_groups:
+                cands.append((CAS_VOCAB, 0, 2, it_))
+    adopt_of: dict[int, list] = defaultdict(list)
+    for st, ag, it_, tid in sc.adopts:
+        adopt_of[it_].append((int(st), int(ag)))
+
+    # ---- 4. 選抜(種別ごとの枠 → 残りは規模順) ---------------------------- #
+    cands.sort(key=lambda c: (c[2], -c[1]))
+    chosen: list[tuple] = []
+    seen_keys: set = set()
+    quota_filled = Counter()
+    for kd, quota in CAS_QUOTA.items():
+        got = 0
+        for c in cands:
+            if got >= quota or len(chosen) >= cap:
+                break
+            if c[0] != kd or (c[0], c[3]) in seen_keys:
+                continue
+            chosen.append(c)
+            seen_keys.add((c[0], c[3]))
+            got += 1
+        quota_filled[kd] = got
+    for c in cands:
+        if len(chosen) >= cap:
+            break
+        if (c[0], c[3]) not in seen_keys:
+            chosen.append(c)
+            seen_keys.add((c[0], c[3]))
+    chosen.sort(key=lambda c: (c[2], -c[1]))
+
+    # ---- 5. 掲載ぶんを組む ------------------------------------------------- #
+    items: list[dict] = []
+    for kd, size, pri, key in chosen:
+        if kd == CAS_BELIEF:
+            s, e, n, edges = bel_groups[key]
+            ag = b_ag[s:e].astype(np.int64)
+            fr = b_fr[s:e].astype(np.int64)
+            st = b_st[s:e].astype(np.int64)
+            first: dict[int, int] = {}
+            for i, a in enumerate(ag.tolist()):
+                first.setdefault(a, i)
+            par = np.asarray([first.get(f, -1) if f >= 0 else -1
+                              for f in fr.tolist()], dtype=np.int64)
+            par = np.where(par < np.arange(par.size), par, -1)   # 前向きの辺だけ
+            ch = Counter()
+            for c, cnt in zip(*np.unique(b_ca[s:e], return_counts=True)):
+                nm = sc.bel_causes.vals[int(c) - 1] if 0 < int(c) <= len(sc.bel_causes.vals) else "?"
+                ch[str(nm)] += int(cnt)
+            for c, cnt in fact_tx_ch.get(key, {}).items():
+                nm = sc.prop_chans.vals[int(c)] if 0 <= int(c) < len(sc.prop_chans.vals) else "?"
+                ch[f"発話({nm})"] += int(cnt)
+            nm, src, dist = _fact_name(key, s, e)
+            fid_s = sc.facts.vals[key] if 0 <= key < len(sc.facts.vals) else str(key)
+            title = (f"{nm} が品切れ" if nm else f"事実 {fid_s}")
+            it = _cascade_item(
+                CAS_BELIEF, fid_s, title=title, title_src=src, text=None,
+                agents=ag, parents=par, steps=st, xs=b_x[s:e], ys=b_y[s:e],
+                depths=b_hp[s:e].astype(np.int64), hex_m=hex_m, nodes_cap=nodes_cap,
+                ch=ch, who=who, extra={"place": nm, "place_dist_m": dist,
+                                       "fact_kind": "stock_out"})
+            for f in fr.tolist():
+                if f >= 0:
+                    who.add(int(f))
+            if ag.size:
+                who.add(int(ag[0]))
+            items.append(it)
+
+        elif kd == CAS_RESHARE:
+            ix, n = rsh_groups[key]
+            ag = r_ag[ix].astype(np.int64)
+            st = r_st[ix].astype(np.int64)
+            xs_ = r_x[ix]
+            ys_ = r_y[ix]
+            dp = depth_ev[ix].astype(np.int64)
+            loc = {int(g): i for i, g in enumerate(ix.tolist())}
+            par = np.asarray([loc.get(int(p), -1) for p in par_ev[ix].tolist()],
+                             dtype=np.int64)
+            # 根(元 post の著者)を 0 番のノードとして先頭に足す
+            root_au = int(r_au[ix[0]])
+            ag = np.concatenate([[root_au], ag])
+            st = np.concatenate([[int(st.min())], st])
+            xs_ = np.concatenate([np.asarray([-32768], dtype=np.int16), xs_])
+            ys_ = np.concatenate([np.asarray([-32768], dtype=np.int16), ys_])
+            dp = np.concatenate([[0], dp])
+            par = np.concatenate([[-1], np.where(par >= 0, par + 1, 0)])
+            txt = _post_text(root_au, int(st[0])) if root_au >= 0 else None
+            if root_au < 0:
+                title = f"公式(メディア)の投稿 #{key}"
+                tsrc = "media"
+            elif txt:
+                title = txt[:40]
+                tsrc = "post_text"
+            else:
+                title = f"#{root_au} の投稿 #{key}"
+                tsrc = "none"
+            it = _cascade_item(
+                CAS_RESHARE, f"post:{key}", title=title, title_src=tsrc, text=txt,
+                agents=ag, parents=par, steps=st, xs=xs_, ys=ys_, depths=dp,
+                hex_m=hex_m, nodes_cap=nodes_cap, ch=Counter({"sns": int(n)}),
+                who=who, extra={"post_id": int(key), "author": root_au,
+                       "reach": int(vir_reach.get(key, 0)),
+                       "viral_events": int(vir_hits.get(key, 0))})
+            who.add(root_au)
+            items.append(it)
+
+        else:                                     # CAS_VOCAB
+            item_s = sc.items.vals[key] if 0 <= key < len(sc.items.vals) else str(key)
+            coin = coin_of.get(key)
+            g = tx_groups.get(key)
+            if g is not None:
+                s, e = g
+                ag = t_ag[s:e].astype(np.int64)
+                st = t_st[s:e].astype(np.int64)
+                fr = t_fr[s:e].astype(np.int64)
+                xs_ = t_x[s:e]
+                ys_ = t_y[s:e]
+                ch = Counter()
+                for c, cnt in zip(*np.unique(t_ch[s:e], return_counts=True)):
+                    nm = (sc.prop_chans.vals[int(c) - 1]
+                          if 0 < int(c) <= len(sc.prop_chans.vals) else "?")
+                    ch[str(nm)] += int(cnt)
+            else:
+                ag = np.zeros(0, dtype=np.int64)
+                st = np.zeros(0, dtype=np.int64)
+                fr = np.zeros(0, dtype=np.int64)
+                xs_ = np.zeros(0, dtype=np.int16)
+                ys_ = np.zeros(0, dtype=np.int16)
+                ch = Counter()
+            if coin is not None:                  # 造語者を 0 番のノードに置く
+                ag = np.concatenate([[int(coin[1])], ag])
+                st = np.concatenate([[int(coin[0])], st])
+                fr = np.concatenate([[-1], fr])
+                xs_ = np.concatenate([np.asarray([coin[4]], dtype=np.int16), xs_])
+                ys_ = np.concatenate([np.asarray([coin[5]], dtype=np.int16), ys_])
+            first = {}
+            for i, a in enumerate(ag.tolist()):
+                first.setdefault(a, i)
+            par = np.asarray([first.get(f, -1) if f >= 0 else -1
+                              for f in fr.tolist()], dtype=np.int64)
+            par = np.where(par < np.arange(par.size), par, -1)
+            dp = np.zeros(par.size, dtype=np.int64)
+            for i in range(par.size):
+                p = int(par[i])
+                dp[i] = 0 if p < 0 else int(dp[p]) + 1
+            text = None
+            if coin is not None and 0 <= coin[2] < len(sc.prop_texts.vals):
+                text = sc.prop_texts.vals[coin[2]]
+            it = _cascade_item(
+                CAS_VOCAB, item_s, title=(f"「{text}」" if text else item_s),
+                title_src=("coin_text" if text else "none"), text=text,
+                agents=ag, parents=par, steps=st, xs=xs_, ys=ys_, depths=dp,
+                hex_m=hex_m, nodes_cap=nodes_cap, ch=ch, who=who,
+                extra={"coin_step": (int(coin[0]) if coin else None),
+                       "coiner": (int(coin[1]) if coin else None),
+                       "coin_place": (sc.prop_topics.vals[coin[3]]
+                                      if coin and 0 <= coin[3] < len(sc.prop_topics.vals)
+                                      else None),
+                       "adopts": [[s2, a2] for s2, a2 in
+                                  sorted(adopt_of.get(key, ()))[:40]],
+                       "adopts_n": len(adopt_of.get(key, ())),
+                       "uses": int(sc.vocab_use.get(key, 0))})
+            if coin is not None:
+                who.add(int(coin[1]))
+            items.append(it)
+
+    # ---- 6. 名前(根と媒介者だけ) ---------------------------------------- #
+    who = {a for a in who if a >= 0}
+    names = read_roster(run_dir, who) if who else {}
+
+    _log(f"  カスケード: 候補 {len(cands):,} 本 → 掲載 {len(items)} 本 "
+         f"({time.time() - t0:.1f}s)")
+    return {
+        "cap": int(cap),
+        "shown": len(items),
+        "nodes_cap": int(nodes_cap),
+        "population": pop,
+        "kind_labels": {str(k): v for k, v in CAS_KIND_LABELS.items()},
+        "quota": {str(k): {"target": v, "filled": int(quota_filled[k]),
+                           "label": CAS_KIND_LABELS[k]} for k, v in CAS_QUOTA.items()},
+        "items": items,
+        "names": {str(k): v for k, v in names.items()},
+        "hex_m": float(hex_m),
+        "belief_causes": list(sc.bel_causes.vals),
+        "belief_srcs": list(sc.bel_srcs.vals),
+        "channels": list(sc.prop_chans.vals),
+        "notes": [
+            "母集団=全カスケード(fact / 元 post / 語)。掲載は種別枠を先に埋め、"
+            "残りを規模順で埋める。",
+            "木のノードは上限つき。間引くときは内部ノード(子を持つ節)を全部残して"
+            "から葉を等間隔で落とすので、タンポポ型/連鎖型の別は保存される。",
+            "等時線 = 俯瞰と同じヘックス格子の「そのセルに初めて届いた step」。"
+            "位置は採用イベントの座標(位置を持たない採用は等時線に出ない)。",
+            "belief_update の cause=witness は**人づてではなく各自の目撃**。"
+            "親(from)を持つ辺だけが伝播である。",
+            "fact の場所名は belief_transmit.topic があれば厳密、無ければ"
+            "「fact が立った step の目撃者の中央位置に最も近い stock_out」からの推定。",
+            "リシェアの木は post id が追記通し番号であることを使って親を同定した"
+            "(自分の RT post の id は L1 に出ない)。元投稿が公式(メディア)のとき本文は無い。",
+        ],
+    }
+
+
+# --------------------------------------------------------------------------- #
 # L2 指標の時系列
 # --------------------------------------------------------------------------- #
 def read_l2(run_dir) -> dict:
@@ -1544,7 +2439,12 @@ def build_run(run_dir: Path, label: str, *, hex_m: float, bin_min: int,
               pair_cap: int = PAIR_CAP_DEFAULT, pair_conv: int = PAIR_CONV_DEFAULT,
               pair_traj: int = PAIR_TRAJ_DEFAULT,
               conv_cap: int = CONV_CAP_DEFAULT,
-              text_cap: int = TEXT_CAP_DEFAULT) -> dict:
+              text_cap: int = TEXT_CAP_DEFAULT, cascades: bool = True,
+              cas_cap: int = CAS_CAP_DEFAULT,
+              cas_nodes: int = CAS_NODES_DEFAULT,
+              belief_cap: int = BELIEF_CAP_DEFAULT,
+              reshare_cap: int = RESHARE_CAP_DEFAULT,
+              stock_cap: int = STOCK_CAP_DEFAULT) -> dict:
     import l1_stream
     import run_dt
     run_dir = Path(run_dir)
@@ -1587,14 +2487,16 @@ def build_run(run_dir: Path, label: str, *, hex_m: float, bin_min: int,
             "sim_min_range": [None, None], "kind_totals": {},
             "series": {"l2_steps": [], "l2": {}, "kinds": {},
                        "kinds_population": 0, "kinds_shown": 0},
-            "hexbin": None, "relations": None, "pairs": None,
+            "hexbin": None, "relations": None, "pairs": None, "cascades": None,
             "build": {"scan_sec": 0.0},
         }
 
     t0 = time.time()
     sc = scan_l1(run_dir, hex_m=hex_m, steps_per_bin=steps_per_bin,
                  rel_cap=rel_cap, step_max=step_max, narrative=pairs,
-                 conv_cap=conv_cap, text_cap=text_cap)
+                 conv_cap=conv_cap, text_cap=text_cap, propagation=cascades,
+                 belief_cap=belief_cap, reshare_cap=reshare_cap,
+                 stock_cap=stock_cap)
     t_scan = time.time() - t0
 
     t0 = time.time()
@@ -1626,6 +2528,11 @@ def build_run(run_dir: Path, label: str, *, hex_m: float, bin_min: int,
         pairs_data = build_pairs(run_dir, sc, arrs, n_steps=n_steps, cap=pair_cap,
                                  per_conv=pair_conv, traj_max=pair_traj,
                                  step_max=step_max)
+
+    cas_data = None
+    if cascades:
+        cas_data = build_cascades(run_dir, sc, hex_m=hex_m, cap=cas_cap,
+                                  nodes_cap=cas_nodes, n_steps=n_steps)
 
     parts = [p.name for p in l1_stream.l1_paths(run_dir)]
     return {
@@ -1661,6 +2568,7 @@ def build_run(run_dir: Path, label: str, *, hex_m: float, bin_min: int,
         "hexbin": hexb,
         "relations": rels,
         "pairs": pairs_data,
+        "cascades": cas_data,
         "build": {"scan_sec": round(t_scan, 1)},
     }
 
@@ -1787,12 +2695,73 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
 .abcol .t{font-size:10.5px;color:var(--dim);margin-bottom:2px}
 .abcol canvas{display:block;width:100%;height:52px}
 .empty{padding:26px;color:var(--dim);font-size:12.5px;text-align:center}
+/* ---------- 画面3 伝播 ---------- */
+#clist{width:304px;flex:none;border-right:1px solid var(--bd);background:var(--panel);
+ display:flex;flex-direction:column;min-height:0}
+#clist .hd{padding:8px 9px 6px;border-bottom:1px solid var(--bd)}
+#clist select,#clist input{background:#0d1117;color:var(--fg);border:1px solid var(--bd);
+ border-radius:4px;font:inherit;font-size:11.5px;padding:3px 5px;width:100%;margin-bottom:4px}
+#crows{overflow-y:auto;flex:1;min-height:0}
+.crow{padding:6px 9px;border-bottom:1px solid rgba(255,255,255,.05);cursor:pointer}
+.crow:hover{background:#161c26}
+.crow.on{background:#1c2637;box-shadow:inset 3px 0 0 var(--acc)}
+.crow .nm{font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;
+ text-overflow:ellipsis}
+.crow .mt{color:var(--dim);font-size:10.5px;font-variant-numeric:tabular-nums;
+ display:flex;gap:7px;flex-wrap:wrap;margin-top:1px}
+.kbd{display:inline-block;padding:0 5px;border-radius:3px;font-size:9.5px;line-height:15px;
+ margin-right:4px}
+.kbd.k0{background:#16304a;color:#7cc4ff}.kbd.k1{background:#3b1f33;color:#f9a8d4}
+.kbd.k2{background:#14342a;color:#4ade80}
+.shp{display:inline-block;padding:0 5px;border-radius:3px;font-size:9.5px;line-height:15px;
+ background:#243040;color:#b6c2d2}
+#cmain{flex:1;min-width:0;display:flex;flex-direction:column}
+#isowrap{position:relative;flex:0 0 54%;min-height:210px;border-bottom:1px solid var(--bd)}
+#icv{display:block;width:100%;height:100%;cursor:crosshair}
+#ihead{position:absolute;left:12px;top:9px;font-size:12.5px;pointer-events:none;
+ max-width:60%}
+#ihead b{font-size:14px}
+#ilegend{position:absolute;right:12px;top:9px;background:var(--panel);border:1px solid var(--bd);
+ border-radius:7px;padding:7px 9px;font-size:10.5px;min-width:148px;pointer-events:none}
+#ilegend .bar{height:9px;border-radius:2px;margin:5px 0 3px}
+#ilegend .lb{display:flex;justify-content:space-between;color:var(--dim);
+ font-variant-numeric:tabular-nums}
+#ictrl{position:absolute;left:12px;right:12px;bottom:10px;background:var(--panel);
+ border:1px solid var(--bd);border-radius:8px;padding:6px 11px;display:flex;
+ align-items:center;gap:10px;backdrop-filter:blur(6px)}
+#ictrl button{background:#1b212c;color:var(--fg);border:1px solid var(--bd);border-radius:5px;
+ width:30px;height:26px;cursor:pointer;font:inherit;font-size:12px}
+#ictrl input[type=range]{flex:1;accent-color:var(--acc)}
+#iclock{font-variant-numeric:tabular-nums;font-size:11.5px;min-width:168px}
+#itip,#ttip{position:absolute;pointer-events:none;background:#0d1117ee;border:1px solid var(--bd);
+ border-radius:5px;padding:5px 8px;font-size:11.5px;display:none;white-space:nowrap;z-index:6}
+#cbot{flex:1;min-height:0;display:flex}
+#scurve{flex:0 0 44%;min-width:0;position:relative;border-right:1px solid var(--bd)}
+#ctree{flex:1;min-width:0;position:relative}
+#scurve canvas,#ctree canvas{display:block;width:100%;height:100%}
+.cvtitle{position:absolute;left:10px;top:7px;font-size:10.5px;color:var(--dim);
+ pointer-events:none}
+#cside{width:306px;flex:none;border-left:1px solid var(--bd);background:var(--panel);
+ overflow-y:auto;padding:10px 11px 26px}
+#cside h2{font-size:11.5px;color:var(--dim);margin:12px 0 6px;font-weight:600;
+ text-transform:uppercase;letter-spacing:.06em}
+#cside h2:first-child{margin-top:0}
+.chbar{display:flex;align-items:center;gap:6px;margin:3px 0}
+.chbar .lb{width:96px;flex:none;font-size:11px;color:var(--dim);white-space:nowrap;
+ overflow:hidden;text-overflow:ellipsis}
+.chbar .tr{flex:1;height:9px;background:#161c22;border-radius:2px;overflow:hidden}
+.chbar .fl{height:100%;background:var(--acc)}
+.chbar .vv{width:58px;flex:none;text-align:right;font-size:10.5px;
+ font-variant-numeric:tabular-nums}
+.quote{background:#11151d;border:1px solid var(--bd);border-left:2px solid var(--acc);
+ border-radius:5px;padding:6px 9px;font-size:12px;margin:5px 0}
 </style></head><body>
 <div id="top">
   <h1>Shibuya Chronicle</h1>
   <div class="tabs" id="tabs">
     <button data-p="map" class="on">俯瞰</button>
     <button data-p="pair">関係の伝記</button>
+    <button data-p="prop">伝播</button>
   </div>
   <span class="sub" id="runmeta"></span>
   <span style="flex:1"></span>
@@ -1864,6 +2833,56 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
     <div id="ppop"></div>
     <h2>A/B ペア母集団の対比</h2>
     <div id="pstat"></div>
+  </div>
+</div>
+<div id="wrap3" class="pane">
+  <div id="clist">
+    <div class="hd">
+      <select id="ckind">
+        <option value="">種別: すべて</option>
+        <option value="0">種別: 信念(fact)</option>
+        <option value="1">種別: リシェア(SNS)</option>
+        <option value="2">種別: 語彙</option>
+      </select>
+      <select id="csort">
+        <option value="n">並べ替え: 規模(採用者数)</option>
+        <option value="edges">並べ替え: 人づての辺が多い</option>
+        <option value="depth">並べ替え: 深さ</option>
+        <option value="speed">並べ替え: 離陸が速い</option>
+        <option value="s0">並べ替え: 発生が早い</option>
+      </select>
+      <input id="cfind" type="search" placeholder="題・場所・語で絞る">
+      <div class="note" id="ccount"></div>
+    </div>
+    <div id="crows"></div>
+  </div>
+  <div id="cmain">
+    <div id="isowrap">
+      <canvas id="icv"></canvas>
+      <div id="ihead"></div>
+      <div id="ilegend"></div>
+      <div id="itip"></div>
+      <div id="ictrl">
+        <button id="iplay" title="波紋を再生">▶</button>
+        <div id="iclock"></div>
+        <input type="range" id="iscrub" min="0" max="0" value="0" step="1">
+        <button id="ifit" title="全体に合わせる">⤢</button>
+      </div>
+    </div>
+    <div id="cbot">
+      <div id="scurve"><canvas id="ccv"></canvas>
+        <div class="cvtitle">採用 S 字曲線(累積 / 新規)</div></div>
+      <div id="ctree"><canvas id="tcv"></canvas><div id="ttip"></div>
+        <div class="cvtitle">カスケード木(中心=火元・外周=遠いホップ)</div></div>
+    </div>
+  </div>
+  <div id="cside">
+    <h2>このカスケードについて</h2>
+    <div id="cfacts"></div>
+    <h2>チャネル分解</h2>
+    <div id="cch"></div>
+    <h2>母集団 → 掲載</h2>
+    <div id="cpop"></div>
   </div>
 </div>
 <script id="chronicle-data" type="application/json">__CHRONICLE_DATA__</script>
@@ -2303,7 +3322,9 @@ function fillRel(){
     + '残りを等間隔で間引いた。</div>';
   h += '<div class="note">この表は画面2「関係の伝記」の母集団。'
      + '<a href="#" style="color:var(--acc)" onclick="setTab(\'pair\');return false">'
-     + '2 人の物語を見る →</a></div>';
+     + '2 人の物語を見る →</a>'
+     + ' · <a href="#" style="color:var(--acc)" onclick="setTab(\'prop\');return false">'
+     + '話の広がりを見る →</a></div>';
   document.getElementById('relbox').innerHTML = h;
 }
 function updateClock(){
@@ -2325,7 +3346,8 @@ function fillTop(){
     if(k === RK) b.className = 'on';
     b.onclick = ()=>{ if(!HAS(k)) return; RK = k; cur = Math.min(cur, nSteps()-1);
       document.getElementById('scrub').max = nSteps()-1;
-      fillTop(); fillAbout(); fillRel(); buildCharts(); pairInit(); draw(); };
+      fillTop(); fillAbout(); fillRel(); buildCharts(); pairInit(); propInit();
+      draw(); };
     sw.appendChild(b);
   }
   document.getElementById('attrib').textContent = BM.attribution
@@ -2452,7 +3474,10 @@ function setTab(t){
     b.classList.toggle('on', b.dataset.p === t));
   document.getElementById('wrap').classList.toggle('on', t === 'map');
   document.getElementById('wrap2').classList.toggle('on', t === 'pair');
-  if(t === 'map') resize(); else pairResize();
+  document.getElementById('wrap3').classList.toggle('on', t === 'prop');
+  if(t === 'map') resize();
+  else if(t === 'prop') propResize();
+  else pairResize();
   syncHash();
 }
 document.querySelectorAll('#tabs button').forEach(b =>
@@ -2897,29 +3922,595 @@ function pairInit(){
 }
 window.addEventListener('resize', ()=>{ if(TAB==='pair') pairResize(); });
 
+/* =========================================================================
+   画面3「伝播」— 信念 / リシェア / 語彙を同じ器で
+   -------------------------------------------------------------------------
+   1 本のカスケードにつき 4 点セットを描く。
+     ① 等時線マップ … 俯瞰と同じヘックス格子で「そのセルに初めて届いた step」を色に。
+                      再生すると波紋になる(scrub は step ではなく **このカスケードの時間**)。
+     ② 採用 S 字曲線 … 累積(面)と新規(棒)。離陸 step と飽和が読める。
+     ③ カスケード木 … 中心=火元・外周=遠いホップの放射レイアウト。
+                      辺ゼロ(= 全員が独立に知った)のときは時間軸の帯に切り替える。
+     ④ チャネル分解 … 対面 / SNS / DM / 目撃 の辺数。
+   色は俯瞰の hexbin と同じ rampColor を使う(画面をまたいで色の意味を揃える)。
+   ========================================================================= */
+const CAS_KCLS = {0:'k0', 1:'k1', 2:'k2'};
+const SHAPE_LABEL = {parallel:'並列発生', seeded:'ほぼ並列', fan:'タンポポ',
+                     chain:'連鎖', tree:'枝分かれ', mixed:'混在'};
+const SHAPE_HELP = {
+  parallel:'親(from)を持つ採用が 1 件も無い = 人づてではなく、全員が独立に同じ現場を見た。',
+  seeded:'8 割超が独立発生で、人づての辺はごく一部。ほぼ並列に起きたなかに'
+    + '数本だけ伝播が混じっている。',
+  fan:'深さ 1。1 人から一斉に広がった(タンポポ型)。',
+  chain:'深さのわりに枝が少ない = 数珠つなぎに伝わった。',
+  tree:'深さも枝もある = 何段にも枝分かれした。',
+  mixed:'枝分かれと連鎖が混在。'};
+let CSEL = -1, CORD = [], CT = 0, CPLAY = false, CGEO = [], CTREE = {}, TGEO = [];
+let ICAM = {x:0, y:0, s:1}, ilastT = 0, IFIT_W = 0;
+
+function CAS(){ return R() ? R().cascades : null; }
+function curCas(){ const c = CAS();
+  return (c && CSEL>=0 && CSEL<c.items.length) ? c.items[CSEL] : null; }
+function cname(id){ const c = CAS();
+  if(id === -1) return '公式(メディア)';
+  const v = c && c.names[String(id)];
+  return (v && v[0]) ? v[0] : '#'+id; }
+function casTree(i){
+  const key = RK+'/'+i;
+  if(CTREE[key] === undefined){
+    const t = CAS().items[i].tree;
+    CTREE[key] = !t || !t.n ? null : {
+      n: t.n, population: t.population, orphans: t.orphans,
+      a: bin(t.a, Int32Array), p: bin(t.p, Int32Array), s: bin(t.s, Int32Array),
+      x: bin(t.x, Int16Array), y: bin(t.y, Int16Array), d: bin(t.d, Uint8Array)};
+  }
+  return CTREE[key];
+}
+function casSpan(it){ return Math.max(1, (it.s1|0) - (it.s0|0)); }
+/* 離陸の速さ = 採用の半分が済むまでの step 数(小さいほど速い) */
+function casHalf(it){
+  const cur2 = it.curve||[]; let tot = 0;
+  for(const c of cur2) tot += c[1];
+  let acc = 0;
+  for(const c of cur2){ acc += c[1]; if(acc*2 >= tot) return c[0] - it.s0; }
+  return casSpan(it);
+}
+
+/* ---------- 一覧 ---------- */
+function casRowHTML(it, i){
+  const kd = it.kind|0;
+  return '<div class="crow'+(i===CSEL?' on':'')+'" data-i="'+i+'">'
+    + '<div class="nm"><span class="kbd '+CAS_KCLS[kd]+'">'
+    + esc(CAS().kind_labels[String(kd)]) + '</span>' + esc(it.title||it.key) + '</div>'
+    + '<div class="mt"><span>' + it.n.toLocaleString() + ' 人</span>'
+    + '<span>深さ ' + it.depth + '</span>'
+    + '<span>人づて ' + it.edges.toLocaleString() + ' 辺</span>'
+    + '<span class="shp">' + esc(SHAPE_LABEL[it.shape]||it.shape) + '</span>'
+    + '</div></div>';
+}
+function buildCasList(){
+  const c = CAS(), host = document.getElementById('crows');
+  const cnt = document.getElementById('ccount');
+  if(!c || !c.items.length){
+    host.innerHTML = '<div class="empty">このランには画面3 の素材がありません'
+      + '(走行中のランは flush 済みの part だけを見ます)。</div>';
+    cnt.textContent = ''; CORD = []; return;
+  }
+  const kf = document.getElementById('ckind').value;
+  const mode = document.getElementById('csort').value;
+  const q = (document.getElementById('cfind').value||'').trim().toLowerCase();
+  CORD = c.items.map((it,i)=>i);
+  if(kf !== '') CORD = CORD.filter(i => String(c.items[i].kind) === kf);
+  if(q) CORD = CORD.filter(i => { const it = c.items[i];
+    return ((it.title||'')+' '+(it.text||'')+' '+it.key+' '+(it.place||''))
+      .toLowerCase().indexOf(q) >= 0; });
+  const val = it => mode==='edges' ? -(it.edges||0)
+    : mode==='depth' ? -(it.depth||0)
+    : mode==='speed' ? casHalf(it)
+    : mode==='s0' ? (it.s0||0) : -(it.n||0);
+  CORD.sort((x,y)=> val(c.items[x]) - val(c.items[y]) || x-y);
+  host.innerHTML = CORD.map(i => casRowHTML(c.items[i], i)).join('');
+  const po = c.population;
+  const totPop = (po.belief_facts||0) + (po.reshare_cascades||0) + (po.vocab_items||0);
+  cnt.innerHTML = '母集団 ' + totPop.toLocaleString() + ' 本 → 掲載 ' + c.shown + ' 本'
+    + (CORD.length !== c.items.length ? ' / 絞り込み '+CORD.length+' 本' : '');
+  host.querySelectorAll('.crow').forEach(el =>
+    el.onclick = ()=> selectCas(+el.dataset.i));
+}
+function selectCas(i){
+  CSEL = i;
+  document.querySelectorAll('#crows .crow').forEach(el =>
+    el.classList.toggle('on', +el.dataset.i === i));
+  const it = curCas();
+  const sc3 = document.getElementById('iscrub');
+  if(it){ sc3.min = it.s0; sc3.max = Math.max(it.s0, it.s1); CT = it.s1;
+          sc3.value = CT; isoFit(); }
+  drawIso(); drawCurve(); drawTree(); fillCasFacts(); fillCasCh(); syncHash();
+}
+
+/* ---------- 等時線マップ ---------- */
+const icv = document.getElementById('icv'), ictx = icv.getContext('2d');
+function propResize(){
+  const dpr = Math.min(2, window.devicePixelRatio||1);
+  for(const el of [icv, document.getElementById('ccv'),
+                   document.getElementById('tcv')]){
+    el.width = Math.round(el.clientWidth*dpr);
+    el.height = Math.round(el.clientHeight*dpr);
+    el.getContext('2d').setTransform(dpr,0,0,dpr,0,0);
+  }
+  if(IFIT_W <= 0) isoFit();      /* 非表示のまま合わせた枠を実寸で取り直す */
+  drawIso(); drawCurve(); drawTree();
+}
+function hexXY(q, r, R2){
+  const S3 = Math.sqrt(3);
+  return [R2*(S3*q + S3/2*r), R2*(1.5*r)];
+}
+function isoR(){ const it = curCas();
+  return ((it && it.iso_hex_m) || (CAS() ? CAS().hex_m : 200))/Math.sqrt(3); }
+function isoFit(){
+  const it = curCas(); if(!it || !it.iso.length){ ICAM = {x:0,y:0,s:0.6}; return; }
+  const R2 = isoR();
+  let x0=1e9, y0=1e9, x1=-1e9, y1=-1e9;
+  for(const c of it.iso){ const p = hexXY(c[0], c[1], R2);
+    x0=Math.min(x0,p[0]); x1=Math.max(x1,p[0]);
+    y0=Math.min(y0,p[1]); y1=Math.max(y1,p[1]); }
+  const pad = R2*3;
+  x0-=pad; x1+=pad; y0-=pad; y1+=pad;
+  const W = icv.clientWidth||600, H = icv.clientHeight||300;
+  ICAM.s = Math.min(W/Math.max(1,x1-x0), H/Math.max(1,y1-y0));
+  ICAM.x = (x0+x1)/2; ICAM.y = (y0+y1)/2;
+  IFIT_W = icv.clientWidth;      /* 非表示のまま合わせた枠は表示時に取り直す */
+}
+function itf(wx, wy){ return [ (wx-ICAM.x)*ICAM.s + icv.clientWidth/2,
+                               -(wy-ICAM.y)*ICAM.s + icv.clientHeight/2 ]; }
+function iinv(sx, sy){ return [ (sx - icv.clientWidth/2)/ICAM.s + ICAM.x,
+                                -(sy - icv.clientHeight/2)/ICAM.s + ICAM.y ]; }
+function drawIso(){
+  const W = icv.clientWidth, H = icv.clientHeight;
+  ictx.fillStyle = '#080c12'; ictx.fillRect(0,0,W,H);
+  const it = curCas();
+  const head = document.getElementById('ihead'), leg = document.getElementById('ilegend');
+  if(!it){ head.innerHTML = '<span style="color:var(--dim)">'
+    + '左の一覧からカスケードを選ぶと、どの順で街に届いたかが出ます</span>';
+    leg.innerHTML = ''; document.getElementById('iclock').textContent = ''; return; }
+  /* 道路(薄く) */
+  ictx.lineWidth = 1; ictx.strokeStyle = 'rgba(226,232,240,.10)';
+  const ppm = ICAM.s;
+  for(let i=0;i<ROADS.length;i++){
+    const kls = BM.road_classes[ROADCLS[i]] || 'footway';
+    if(ppm < 0.25 && !(kls==='primary'||kls==='secondary'||kls==='tertiary')) continue;
+    const p = ROADS[i]; ictx.beginPath();
+    let s = itf(p[0], p[1]); ictx.moveTo(s[0], s[1]);
+    for(let j=2;j<p.length;j+=2){ s = itf(p[j], p[j+1]); ictx.lineTo(s[0], s[1]); }
+    ictx.stroke();
+  }
+  ictx.strokeStyle = 'rgba(148,163,184,.20)'; ictx.lineWidth = 1.6;
+  for(const p of RAILS){ ictx.beginPath();
+    let s = itf(p[0], p[1]); ictx.moveTo(s[0], s[1]);
+    for(let j=2;j<p.length;j+=2){ s = itf(p[j], p[j+1]); ictx.lineTo(s[0], s[1]); }
+    ictx.stroke(); }
+  /* ヘックス(初到達 step を色に。CT より後のセルは輪郭だけ = まだ届いていない) */
+  const R2 = isoR(), rpx = R2*ICAM.s;
+  const s0 = it.s0, s1 = Math.max(it.s1, it.s0+1);
+  CGEO = [];
+  for(const c of it.iso){
+    const p = hexXY(c[0], c[1], R2), sc4 = itf(p[0], p[1]);
+    if(sc4[0] < -rpx || sc4[0] > W+rpx || sc4[1] < -rpx || sc4[1] > H+rpx) continue;
+    CGEO.push({x:sc4[0], y:sc4[1], c:c});
+    const t = (c[2]-s0)/(s1-s0);
+    ictx.beginPath();
+    for(let k=0;k<6;k++){ const a = Math.PI/180*(60*k - 30);
+      const px = sc4[0]+rpx*Math.cos(a), py = sc4[1]+rpx*Math.sin(a);
+      if(k===0) ictx.moveTo(px,py); else ictx.lineTo(px,py); }
+    ictx.closePath();
+    if(c[2] <= CT){
+      ictx.fillStyle = rampColor(1-t*0.92);
+      ictx.globalAlpha = 0.86; ictx.fill(); ictx.globalAlpha = 1;
+      if(c[2] === CT){ ictx.strokeStyle = '#fff'; ictx.lineWidth = 2; ictx.stroke(); }
+    } else {
+      ictx.strokeStyle = 'rgba(148,163,184,.20)'; ictx.lineWidth = 1; ictx.stroke();
+    }
+  }
+  /* 火元(木の根の位置) */
+  const T = casTree(CSEL);
+  /* 火元の印は「火元が数人」のときだけ。根が何百もあるカスケードで 60 個だけ
+     打つと「その 60 人が特別」に見えてしまうので打たない。 */
+  if(T && it.edges > 0 && it.roots <= 12){ let drawn = 0;
+    for(let i=0;i<T.n && drawn<60;i++){
+      if(T.p[i] >= 0 || T.x[i] === -32768) continue;
+      const s5 = itf(T.x[i], T.y[i]);
+      ictx.beginPath(); ictx.arc(s5[0], s5[1], 4, 0, 6.284);
+      ictx.fillStyle = '#fbbf24'; ictx.fill();
+      ictx.strokeStyle = '#0b0f16'; ictx.lineWidth = 1.4; ictx.stroke();
+      drawn++;
+    } }
+  const arrived = it.iso.filter(c => c[2] <= CT).length;
+  head.innerHTML = '<b>'+esc(it.title||it.key)+'</b><br>'
+    + '<span style="color:var(--dim);font-size:11px">'
+    + esc(CAS().kind_labels[String(it.kind)]) + ' · ' + it.n.toLocaleString() + ' 人 · '
+    + esc(SHAPE_LABEL[it.shape]||it.shape) + ' · ヘックス ' + arrived + '/'
+    + it.iso.length + ' 到達</span>';
+  let bar = '';
+  for(let i=0;i<=10;i++) bar += rampColor(1-(i/10)*0.92)+(i<10?',':'');
+  leg.innerHTML = '<div>初到達 step</div><div class="bar" style="background:'
+    + 'linear-gradient(90deg,'+bar+')"></div>'
+    + '<div class="lb"><span>'+clockText(s0).hhmm+'</span><span>'
+    + clockText(it.s1).hhmm+'</span></div>'
+    + '<div style="margin-top:5px;color:var(--dim)">'
+    + (it.edges<=0 ? '全員が根(並列発生)'
+       : (it.roots<=12 ? '◯ = 火元(根)' : '根 '+it.roots.toLocaleString()+' 人(印は略)'))
+    + '</div>'
+    + '<div style="color:var(--dim)">輪郭のみ = 未到達</div>'
+    + '<div style="color:var(--dim)">1 ヘックス = '
+    + (it.iso_hex_m||CAS().hex_m) + ' m(広がりに合わせて可変)</div>';
+  const ck = clockText(CT);
+  document.getElementById('iclock').innerHTML = '<b>Day '+(ck.day+1)+' '+ck.hhmm
+    + '</b> <span style="color:var(--dim)">step '+CT+'</span>';
+}
+document.getElementById('iscrub').addEventListener('input', e=>{
+  CT = +e.target.value; drawIso(); drawCurve(); });
+document.getElementById('iplay').addEventListener('click', ()=>{
+  CPLAY = !CPLAY;
+  document.getElementById('iplay').textContent = CPLAY ? '❚❚' : '▶';
+  if(CPLAY){ const it = curCas(); if(it && CT >= it.s1) CT = it.s0;
+    requestAnimationFrame(itick); } });
+function itick(t){
+  if(!CPLAY) return;
+  const it = curCas();
+  if(!it){ CPLAY = false; return; }
+  if(t - ilastT > 110){ ilastT = t;
+    CT = CT >= it.s1 ? it.s0 : CT+1;
+    document.getElementById('iscrub').value = CT;
+    drawIso(); drawCurve(); }
+  requestAnimationFrame(itick);
+}
+document.getElementById('ifit').onclick = ()=>{ isoFit(); drawIso(); };
+icv.addEventListener('wheel', e=>{
+  e.preventDefault();
+  const rect = icv.getBoundingClientRect();
+  const w = iinv(e.clientX-rect.left, e.clientY-rect.top);
+  const k = Math.exp(-e.deltaY*0.0016);
+  const ns = Math.max(0.02, Math.min(8, ICAM.s*k));
+  ICAM.x = w[0] - (w[0]-ICAM.x)*(ICAM.s/ns);
+  ICAM.y = w[1] - (w[1]-ICAM.y)*(ICAM.s/ns);
+  ICAM.s = ns; drawIso();
+}, {passive:false});
+let idrag = null;
+icv.addEventListener('mousedown', e=>{ idrag = {x:e.clientX, y:e.clientY,
+  cx:ICAM.x, cy:ICAM.y}; });
+window.addEventListener('mouseup', ()=>{ idrag = null; });
+icv.addEventListener('mousemove', e=>{
+  const rect = icv.getBoundingClientRect();
+  if(idrag){ ICAM.x = idrag.cx - (e.clientX-idrag.x)/ICAM.s;
+             ICAM.y = idrag.cy + (e.clientY-idrag.y)/ICAM.s; drawIso(); return; }
+  const mx = e.clientX-rect.left, my = e.clientY-rect.top;
+  const tip = document.getElementById('itip');
+  let best = null, bd = Math.pow(Math.max(6, isoR()*ICAM.s), 2);
+  for(const g of CGEO){ const d = (g.x-mx)*(g.x-mx)+(g.y-my)*(g.y-my);
+    if(d < bd){ bd = d; best = g; } }
+  if(!best){ tip.style.display = 'none'; return; }
+  const ck = clockText(best.c[2]);
+  tip.innerHTML = '<b>'+best.c[3].toLocaleString()+' 人</b>がここで知った<br>'
+    + '<span style="color:var(--dim)">初到達 Day '+(ck.day+1)+' '+ck.hhmm
+    + ' · step '+best.c[2]+'</span>';
+  tip.style.display = 'block';
+  tip.style.left = Math.min(icv.clientWidth-210, mx+13)+'px';
+  tip.style.top = (my+12)+'px';
+});
+icv.addEventListener('mouseleave', ()=>{
+  document.getElementById('itip').style.display = 'none'; });
+icv.addEventListener('dblclick', e=>{
+  const rect = icv.getBoundingClientRect();
+  let best = null, bd = Math.pow(Math.max(6, isoR()*ICAM.s), 2);
+  const mx = e.clientX-rect.left, my = e.clientY-rect.top;
+  for(const g of CGEO){ const d = (g.x-mx)*(g.x-mx)+(g.y-my)*(g.y-my);
+    if(d < bd){ bd = d; best = g; } }
+  if(!best) return;
+  const p = hexXY(best.c[0], best.c[1], isoR());
+  jumpToMap(best.c[2], p[0], p[1]);
+});
+
+/* ---------- 採用 S 字曲線 ---------- */
+function drawCurve(){
+  const cv3 = document.getElementById('ccv'), c = cv3.getContext('2d');
+  const W = cv3.clientWidth, H = cv3.clientHeight;
+  c.fillStyle = '#0c111a'; c.fillRect(0,0,W,H);
+  const it = curCas(); if(!it || !it.curve.length) return;
+  const L = 42, Rr = 12, Tp = 24, B = 24;
+  const s0 = it.s0, s1 = Math.max(it.s1, it.s0+1);
+  let tot = 0, mxn = 1;
+  for(const p of it.curve){ tot += p[1]; mxn = Math.max(mxn, p[1]); }
+  const X = s => L + (s-s0)/(s1-s0)*(W-L-Rr);
+  const Yc = v => H-B - v/Math.max(1,tot)*(H-Tp-B);
+  /* 新規(棒) */
+  const bw = Math.max(1.2, (W-L-Rr)/Math.max(1,(s1-s0+1)) - 1);
+  c.fillStyle = 'rgba(96,165,250,.34)';
+  for(const p of it.curve){
+    const h = p[1]/mxn*(H-Tp-B)*0.55;
+    c.fillRect(X(p[0])-bw/2, H-B-h, bw, h);
+  }
+  /* 累積(面 + 線) */
+  let acc = 0; const pts = [];
+  for(const p of it.curve){ acc += p[1]; pts.push([X(p[0]), Yc(acc)]); }
+  c.beginPath(); c.moveTo(pts[0][0], H-B);
+  for(const p of pts) c.lineTo(p[0], p[1]);
+  c.lineTo(pts[pts.length-1][0], H-B); c.closePath();
+  c.fillStyle = 'rgba(74,222,128,.14)'; c.fill();
+  c.beginPath(); c.moveTo(pts[0][0], pts[0][1]);
+  for(const p of pts) c.lineTo(p[0], p[1]);
+  c.strokeStyle = '#4ade80'; c.lineWidth = 1.8; c.stroke();
+  /* いま(等時線の時刻)の縦線 */
+  c.strokeStyle = 'rgba(255,255,255,.42)'; c.lineWidth = 1;
+  c.beginPath(); c.moveTo(X(CT), Tp-6); c.lineTo(X(CT), H-B); c.stroke();
+  /* 目盛り */
+  c.fillStyle = '#6b7686'; c.font = '9.5px sans-serif'; c.textAlign = 'left';
+  c.fillText('累積 '+tot.toLocaleString()+' 人', L, Tp-10);
+  c.textAlign = 'right';
+  c.fillText(clockText(s1).hhmm, W-Rr, H-8);
+  c.textAlign = 'left';
+  c.fillText(clockText(s0).hhmm, L, H-8);
+  c.textAlign = 'right';
+  c.fillText(tot.toLocaleString(), L-4, Tp+8);
+  c.fillText('0', L-4, H-B);
+  c.strokeStyle = 'rgba(255,255,255,.10)';
+  c.beginPath(); c.moveTo(L, Tp-2); c.lineTo(L, H-B); c.lineTo(W-Rr, H-B); c.stroke();
+}
+
+/* ---------- カスケード木 ---------- */
+function drawTree(){
+  const cv4 = document.getElementById('tcv'), c = cv4.getContext('2d');
+  const W = cv4.clientWidth, H = cv4.clientHeight;
+  c.fillStyle = '#0c111a'; c.fillRect(0,0,W,H);
+  TGEO = [];
+  const it = curCas(); if(!it) return;
+  const T = casTree(CSEL); if(!T || !T.n) return;
+  const n = T.n, s0 = it.s0, s1 = Math.max(it.s1, it.s0+1);
+  const col = i => rampColor(1-((T.s[i]-s0)/(s1-s0))*0.92);
+  const px = new Float64Array(n), py = new Float64Array(n);
+  if(it.edges <= 0){
+    /* 辺ゼロ = 並列発生。step ごとの縦の房(蜂群)にして「一斉に起きた」を見せる。
+       同じ step の人が重ならないよう、房の中で高さいっぱいに広げる。 */
+    const cnt = new Map(), seen = new Map();
+    for(let i=0;i<n;i++) cnt.set(T.s[i], (cnt.get(T.s[i])||0)+1);
+    for(let i=0;i<n;i++){
+      const st2 = T.s[i], m = cnt.get(st2), k = seen.get(st2)||0;
+      seen.set(st2, k+1);
+      px[i] = 30 + (st2-s0)/(s1-s0)*(W-60) + ((k % 7) - 3)*2.4;
+      py[i] = 22 + (k+0.5)/m*(H-46);
+    }
+    c.strokeStyle = 'rgba(255,255,255,.10)';
+    c.beginPath(); c.moveTo(24, H-12); c.lineTo(W-24, H-12); c.stroke();
+  } else {
+    const kids = []; for(let i=0;i<n;i++) kids.push([]);
+    const roots = [];
+    for(let i=0;i<n;i++){ if(T.p[i] < 0) roots.push(i); else kids[T.p[i]].push(i); }
+    const leaf = new Float64Array(n);
+    for(let i=n-1;i>=0;i--){
+      if(!kids[i].length){ leaf[i] = 1; continue; }
+      let s = 0; for(const k of kids[i]) s += leaf[k]; leaf[i] = s;
+    }
+    const a0 = new Float64Array(n), a1 = new Float64Array(n);
+    let tot = 0; for(const r of roots) tot += leaf[r];
+    let acc = 0;
+    for(const r of roots){ a0[r] = acc/tot*6.28318; acc += leaf[r];
+                           a1[r] = acc/tot*6.28318; }
+    for(let i=0;i<n;i++){
+      if(!kids[i].length) continue;
+      let a = a0[i]; const span = a1[i]-a0[i];
+      for(const k of kids[i]){ a0[k] = a; a += span*leaf[k]/leaf[i]; a1[k] = a; }
+    }
+    let maxd = 0; for(let i=0;i<n;i++) maxd = Math.max(maxd, T.d[i]);
+    const cx = W/2, cy = H/2, RR = Math.min(W,H)/2 - 20;
+    const base = roots.length > 1 ? 0.16 : 0;
+    /* 深い連鎖(ホップが何十段もある)は同心円だと潰れるので渦巻きにする。
+       角度も深さで回すと「数珠つなぎ」がそのまま螺旋に見える。 */
+    const spiral = maxd > 24, turns = 3.0;
+    for(let i=0;i<n;i++){
+      const mid = (a0[i]+a1[i])/2;
+      const f = maxd > 0 ? T.d[i]/maxd : 0;
+      const rr = (base + (1-base)*f)*RR;
+      const ang = spiral ? (6.28318*turns*f + (mid-Math.PI)*0.30) : mid;
+      px[i] = cx + Math.cos(ang)*rr; py[i] = cy + Math.sin(ang)*rr;
+    }
+    c.strokeStyle = 'rgba(148,163,184,.30)'; c.lineWidth = 1;
+    c.beginPath();
+    for(let i=0;i<n;i++){ const p = T.p[i]; if(p < 0) continue;
+      c.moveTo(px[p], py[p]); c.lineTo(px[i], py[i]); }
+    c.stroke();
+  }
+  /* 火元(根)だけ黄色。ただし辺ゼロ = 全員が根なので、そのときは step の色に戻す
+     (全部黄色だと「いつ知ったか」が読めなくなる)。 */
+  const markRoot = it.edges > 0;
+  for(let i=0;i<n;i++){
+    const isRoot = markRoot && T.p[i] < 0;
+    const r = isRoot ? 4.2 : (T.d[i] <= 1 ? 3.0 : 2.3);
+    c.beginPath(); c.arc(px[i], py[i], r, 0, 6.284);
+    c.fillStyle = isRoot ? '#fbbf24' : col(i); c.fill();
+    if(isRoot){ c.strokeStyle = '#0b0f16'; c.lineWidth = 1.2; c.stroke(); }
+    TGEO.push({x:px[i], y:py[i], i:i});
+  }
+  c.fillStyle = '#6b7686'; c.font = '9.5px sans-serif'; c.textAlign = 'right';
+  c.fillText('ノード ' + T.n.toLocaleString()
+    + (T.population > T.n ? ' / 母集団 '+T.population.toLocaleString() : '')
+    + (it.edges<=0 ? ' · 横軸=時刻'
+       : ' · 深さ '+(T.depth_shown!==undefined&&T.depth_shown!==it.depth
+                    ? T.depth_shown+'/'+it.depth : it.depth)
+         + ' · 分岐 '+(it.branch!==undefined?it.branch:'-')),
+    W-10, H-8);
+}
+const tcv = document.getElementById('tcv');
+tcv.addEventListener('mousemove', e=>{
+  const rect = tcv.getBoundingClientRect(), mx = e.clientX-rect.left,
+        my = e.clientY-rect.top;
+  const tip = document.getElementById('ttip');
+  let best = null, bd = 90;
+  for(const g of TGEO){ const d = (g.x-mx)*(g.x-mx)+(g.y-my)*(g.y-my);
+    if(d < bd){ bd = d; best = g; } }
+  if(!best){ tip.style.display = 'none'; return; }
+  const T = casTree(CSEL), i = best.i, ck = clockText(T.s[i]);
+  tip.innerHTML = '<b>'+esc(cname(T.a[i]))+'</b>'
+    + (T.p[i] < 0 ? ' <span style="color:#fbbf24">(火元)</span>' : '')
+    + '<br><span style="color:var(--dim)">hop '+T.d[i]+' · Day '+(ck.day+1)+' '
+    + ck.hhmm + (T.p[i] >= 0 ? ' · ←'+esc(cname(T.a[T.p[i]])) : '') + '</span>';
+  tip.style.display = 'block';
+  tip.style.left = Math.min(tcv.clientWidth-230, mx+12)+'px';
+  tip.style.top = (my+12)+'px';
+});
+tcv.addEventListener('mouseleave', ()=>{
+  document.getElementById('ttip').style.display = 'none'; });
+tcv.addEventListener('click', e=>{
+  const rect = tcv.getBoundingClientRect(), mx = e.clientX-rect.left,
+        my = e.clientY-rect.top;
+  let best = null, bd = 90;
+  for(const g of TGEO){ const d = (g.x-mx)*(g.x-mx)+(g.y-my)*(g.y-my);
+    if(d < bd){ bd = d; best = g; } }
+  if(!best) return;
+  const T = casTree(CSEL);
+  if(T.x[best.i] === -32768){ CT = T.s[best.i];
+    document.getElementById('iscrub').value = CT; drawIso(); drawCurve(); return; }
+  jumpToMap(T.s[best.i], T.x[best.i], T.y[best.i]);
+});
+
+/* ---------- 右パネル ---------- */
+function fillCasFacts(){
+  const it = curCas(), c = CAS(), host = document.getElementById('cfacts');
+  if(!it){ host.innerHTML = '<div class="note">カスケード未選択。</div>'; return; }
+  let h = '';
+  if(it.text) h += '<div class="quote">'+esc(it.text)+'</div>';
+  h += kv('種別', esc(c.kind_labels[String(it.kind)]));
+  h += kv('識別子', esc(it.key));
+  if(it.place) h += kv('場所', esc(it.place)
+    + (it.title_src === 'poi_near'
+       ? ' <span class="warn">(推定 ±'+(it.place_dist_m||0)+'m)</span>'
+       : ' <span style="color:var(--dim)">(belief_transmit 由来)</span>'));
+  if(it.coiner !== undefined && it.coiner !== null)
+    h += kv('造語者', esc(cname(it.coiner))
+      + (it.coin_place ? ' <span style="color:var(--dim)">@'+esc(it.coin_place)+'</span>' : ''));
+  if(it.author !== undefined) h += kv('元の著者', esc(cname(it.author)));
+  h += kv('採用者', it.n.toLocaleString()+' 人');
+  h += kv('人づての辺', it.edges.toLocaleString()+' 本');
+  h += kv('根(親なし)', it.roots.toLocaleString()+' 人');
+  h += kv('最大ホップ', it.depth);
+  h += kv('形', esc(SHAPE_LABEL[it.shape]||it.shape));
+  const ck0 = clockText(it.s0), ck1 = clockText(it.s1);
+  h += kv('期間', 'Day '+(ck0.day+1)+' '+ck0.hhmm+' → Day '+(ck1.day+1)+' '+ck1.hhmm
+    + ' <span style="color:var(--dim)">('+(it.s1-it.s0)+' step)</span>');
+  h += kv('半数到達', casHalf(it)+' step');
+  if(it.reach) h += kv('viral reach', it.reach.toLocaleString()
+    + ' <span style="color:var(--dim)">('+(it.viral_events||0)+' 回加重)</span>');
+  if(it.adopts_n !== undefined){
+    h += kv('label_adopt', (it.adopts_n||0)+' 件');
+    h += kv('vocab_use', (it.uses||0)+' 件');
+  }
+  h += kv('等時線ヘックス', it.iso.length
+    + (it.iso_population > it.iso.length ? ' / 母集団 '+it.iso_population : ''));
+  h += kv('分岐(辺/媒介者)', (it.branch!==undefined?it.branch:'—')
+    + ' <span style="color:var(--dim)">媒介者 '+(it.internal||0)+' 人</span>');
+  const T = casTree(CSEL);
+  if(T && T.population > T.n)
+    h += '<div class="note">木のノードは母集団 '+T.population.toLocaleString()
+       + ' から '+T.n.toLocaleString()+' へ間引いた。残す基準は<b>子孫の数</b>で、'
+       + 'これは祖先について閉じているので<b>幹と太い枝がそのまま残り</b>、辺の'
+       + '付け替えは '+(T.contracted||0)+' 本(= 0 なら描いた辺はすべて実在の辺)。'
+       + (T.depth_shown!==undefined && T.depth_shown < it.depth
+          ? ' 描画された深さは '+T.depth_shown+'(全体は '+it.depth+')。' : '')
+       + '</div>';
+  h += '<div class="note">'+esc(SHAPE_HELP[it.shape]||'')+'</div>';
+  host.innerHTML = h;
+}
+function fillCasCh(){
+  const it = curCas(), host = document.getElementById('cch');
+  if(!it){ host.innerHTML = '<div class="note">—</div>'; return; }
+  const ks = Object.keys(it.ch||{});
+  if(!ks.length){ host.innerHTML = '<div class="note">チャネルの記録なし。</div>'; return; }
+  let mx = 1; for(const k of ks) mx = Math.max(mx, it.ch[k]);
+  const NAME = {witness:'目撃(自分の目)', transmit:'人づて(発話)', face:'対面',
+                sns:'SNS', dm:'DM', search:'検索', direct:'直接', agent:'他人から',
+                verify:'現場で確認', net:'ネット'};
+  let h = '';
+  for(const k of ks){
+    h += '<div class="chbar"><div class="lb" title="'+esc(k)+'">'
+      + esc(NAME[k]||k)+'</div><div class="tr"><div class="fl" style="width:'
+      + (it.ch[k]/mx*100).toFixed(1)+'%"></div></div><div class="vv">'
+      + it.ch[k].toLocaleString()+'</div></div>';
+  }
+  h += '<div class="note">信念は「採用の理由」の内訳(witness = 自分で見た = '
+     + '伝播ではない)。語彙とリシェアは<b>辺</b>の内訳。</div>';
+  host.innerHTML = h;
+}
+function fillCasPop(){
+  const c = CAS(), host = document.getElementById('cpop');
+  if(!c){ host.innerHTML = '<div class="note">素材なし。</div>'; return; }
+  const p = c.population;
+  let h = '';
+  h += kv('掲載', c.shown + ' / cap ' + c.cap + ' 本');
+  h += '<div class="note">枠の埋まり方: ' + Object.keys(c.quota).map(k =>
+    esc(c.quota[k].label)+' '+c.quota[k].filled+'/'+c.quota[k].target).join(' · ')
+    + '</div>';
+  h += kv('信念 fact', (p.belief_facts||0).toLocaleString()
+    + ' 本 <span style="color:var(--dim)">(うち人づて有 '
+    + (p.belief_facts_with_edges||0)+')</span>');
+  h += kv('· belief_update', (p.belief_kept||0).toLocaleString()+' / '
+    + (p.belief_rows||0).toLocaleString()+' 行');
+  h += kv('· うち人づての辺', (p.belief_edges||0).toLocaleString()+' 本');
+  h += kv('リシェア連鎖', (p.reshare_cascades||0).toLocaleString()+' 本');
+  h += kv('· sns_reshare', (p.reshare_kept||0).toLocaleString()+' / '
+    + (p.reshare_rows||0).toLocaleString()+' 行');
+  h += kv('· viral_cascade', (p.viral_rows||0).toLocaleString()+' 件');
+  h += kv('語彙 item', (p.vocab_items||0).toLocaleString()+' 本');
+  h += kv('· transmission', (p.vocab_rows||0).toLocaleString()+' 行');
+  h += kv('· 造語(coin)', (p.coins||0).toLocaleString()+' 件');
+  h += kv('· label_adopt', (p.label_adopts||0).toLocaleString()+' 件');
+  h += kv('· place_label_bind', (p.place_binds||0).toLocaleString()+' 件');
+  h += kv('stock_out(fact の源)', (p.stock_out_rows||0).toLocaleString()+' 行');
+  if((p.belief_edges||0) === 0 && (p.belief_rows||0) > 0)
+    h += '<div class="note warn">このランの信念は<b>人づての辺が 1 本も無い</b>。'
+       + '= 全員が独立に同じ現場を見た(並列発生)。伝播木ではないことを、'
+       + '形「並列発生」としてそのまま出している。</div>';
+  h += '<div class="note">' + c.notes.map(esc).join('<br>') + '</div>';
+  host.innerHTML = h;
+}
+function propInit(){
+  CSEL = -1; CTREE = {};
+  document.getElementById('ckind').onchange = buildCasList;
+  document.getElementById('csort').onchange = buildCasList;
+  document.getElementById('cfind').oninput = buildCasList;
+  buildCasList(); fillCasPop();
+  const c = CAS();
+  if(c && c.items.length && CORD.length) selectCas(CORD[0]);
+  else { drawIso(); drawCurve(); drawTree(); fillCasFacts(); fillCasCh(); }
+}
+window.addEventListener('resize', ()=>{ if(TAB==='prop') propResize(); });
+
 /* ---------- 起動(#run=A&step=54 で「その瞬間」を直接開ける) ---------- */
-let bootTab = 'map', bootPair = -1;
+let bootTab = 'map', bootPair = -1, bootCas = -1;
 (function(){
   const h = new URLSearchParams(location.hash.replace(/^#/, ''));
   const rk = (h.get('run')||'').toUpperCase();
   if(HAS(rk)) RK = rk;
   const s = parseInt(h.get('step'), 10);
   if(isFinite(s)) cur = Math.max(0, Math.min(nSteps()-1, s));
-  if(h.get('tab') === 'pair') bootTab = 'pair';
+  const tb = h.get('tab');
+  if(tb === 'pair' || tb === 'prop') bootTab = tb;
   const pi = parseInt(h.get('pair'), 10);
   if(isFinite(pi)) bootPair = pi;
+  const ci = parseInt(h.get('cas'), 10);
+  if(isFinite(ci)) bootCas = ci;
 })();
 function syncHash(){
   try { history.replaceState(null, '', '#run='+RK+'&step='+cur+'&tab='+TAB
-    + (TAB==='pair' && PSEL>=0 ? '&pair='+PSEL : '')); } catch(_){}
+    + (TAB==='pair' && PSEL>=0 ? '&pair='+PSEL : '')
+    + (TAB==='prop' && CSEL>=0 ? '&cas='+CSEL : '')); } catch(_){}
 }
 scrub.addEventListener('change', syncHash);
 scrub.max = nSteps()-1; scrub.value = cur;
 fillTop(); fillAbout(); fillRel(); buildCharts();
 fitAll(); resize();
 pairInit();
+propInit();
 if(bootPair >= 0 && P() && bootPair < P().items.length) selectPair(bootPair);
-if(bootTab === 'pair') setTab('pair');
+if(bootCas >= 0 && CAS() && bootCas < CAS().items.length) selectCas(bootCas);
+if(bootTab !== 'map') setTab(bootTab);
 </script></body></html>
 """
 
@@ -2987,6 +4578,19 @@ def main(argv=None) -> int:
                     help="実文の distinct 上限(RAM よけ)")
     ap.add_argument("--no-pairs", action="store_true",
                     help="画面2 の素材を作らない(P0 と同じ出力になる)")
+    ap.add_argument("--cascades", type=int, default=CAS_CAP_DEFAULT,
+                    help=f"画面3 に載せるカスケード数(既定 {CAS_CAP_DEFAULT})。"
+                         "母集団は常に併記される")
+    ap.add_argument("--cascade-nodes", type=int, default=CAS_NODES_DEFAULT,
+                    help=f"1 カスケードの木ノード上限(既定 {CAS_NODES_DEFAULT})")
+    ap.add_argument("--belief-cap", type=int, default=BELIEF_CAP_DEFAULT,
+                    help="belief_update を貯める行数上限(RAM よけ・1 件 26B)")
+    ap.add_argument("--reshare-cap", type=int, default=RESHARE_CAP_DEFAULT,
+                    help="sns_reshare を貯める行数上限(RAM よけ・1 件 20B)")
+    ap.add_argument("--stock-cap", type=int, default=STOCK_CAP_DEFAULT,
+                    help="stock_out を貯める行数上限(fact の場所名の推定に使う)")
+    ap.add_argument("--no-cascades", action="store_true",
+                    help="画面3 の素材を作らない")
     ap.add_argument("--max-steps", type=int, default=None,
                     help="この step までで打ち切る(検証用)")
     ap.add_argument("--repo-root", default=None, help="リポジトリの場所(リポ外実行用)")
@@ -3059,7 +4663,11 @@ def main(argv=None) -> int:
                                 rel_cap=a.rel_cap, step_max=a.max_steps,
                                 pairs=not a.no_pairs, pair_cap=a.pairs,
                                 pair_conv=a.pair_conv, pair_traj=a.pair_traj,
-                                conv_cap=a.conv_cap, text_cap=a.text_cap)
+                                conv_cap=a.conv_cap, text_cap=a.text_cap,
+                                cascades=not a.no_cascades, cas_cap=a.cascades,
+                                cas_nodes=a.cascade_nodes,
+                                belief_cap=a.belief_cap, reshare_cap=a.reshare_cap,
+                                stock_cap=a.stock_cap)
         timings[label] = round(time.time() - t1, 1)
         order.append(label)
 
@@ -3100,7 +4708,8 @@ def main(argv=None) -> int:
         _log(f"[{label}] 内訳: hexbin {_n(r['hexbin'])/1024:.0f}KB / "
              f"series {_n(r['series'])/1024:.0f}KB / "
              f"relations {_n(r['relations'])/1024:.0f}KB / "
-             f"pairs {_n(r.get('pairs'))/1024:.0f}KB")
+             f"pairs {_n(r.get('pairs'))/1024:.0f}KB / "
+             f"cascades {_n(r.get('cascades'))/1024:.0f}KB")
     _log(f"HTML: {out_html}  {size/1024/1024:.2f} MB "
          f"(規律 {HTML_SOFT_LIMIT/1024/1024:.0f}MB)")
     if size > HTML_SOFT_LIMIT:
@@ -3126,6 +4735,20 @@ def main(argv=None) -> int:
                          "quota": {t: q["filled"] for t, q in r["pairs"]["quota"].items()},
                          "texts": len(r["pairs"]["texts"]),
                          "names_missing": r["pairs"]["names_missing_n"],
+                     }),
+                     "cascades": (None if not r.get("cascades") else {
+                         "shown": r["cascades"]["shown"],
+                         "population": r["cascades"]["population"],
+                         "quota": {t: q["filled"]
+                                   for t, q in r["cascades"]["quota"].items()},
+                         "by_kind": dict(Counter(
+                             CAS_KIND_LABELS[i["kind"]]
+                             for i in r["cascades"]["items"])),
+                         "top": [{"kind": CAS_KIND_LABELS[i["kind"]],
+                                  "title": i["title"], "n": i["n"],
+                                  "edges": i["edges"], "depth": i["depth"],
+                                  "shape": i["shape"]}
+                                 for i in r["cascades"]["items"][:8]],
                      }),
                      "build_sec": timings[k]}) for k, r in runs.items()},
     }, ensure_ascii=False, indent=2))
