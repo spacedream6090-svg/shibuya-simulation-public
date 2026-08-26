@@ -31,3 +31,6 @@ experiments/
 # 完全解決済み本番conf(scripts/freeze_config.py が本番直前に生成。sha256 は manifest 側に残る)
 conf/finals_*_frozen.yaml
 conf/finals_*_frozen.yaml.sha256
+
+# Chronicle ビューワーの生成物(build_chronicle.py の出力・ランデータ由来のためコミットしない)
+viz/chronicle/
