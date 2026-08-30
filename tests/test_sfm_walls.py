@@ -42,7 +42,7 @@ GOLDEN_INDOOR = "fb96c5945ae79ff5e3ae6a981ba53af59e96ed9323f4db15131c65002354dae
 GOLDEN_WALLFORCE = "4215dd19fc8a071b7a04e8fb6378e6247cc467ed3c3d8f9fd27e2196dc622fc6"
 
 # ★上の 3 定数は Windows(開発機=正典)で採ったバイト列。Linux は libm の float 丸め差で
-#   軌跡バイトが変わるため照合しない(2026-08-16 gpu-server フルゲート実測=不一致は
+#   軌跡バイトが変わるため照合しない(2026-08-16 Linuxゲート機フルゲート実測=不一致は
 #   この定数照合の 4 assert のみ・宣言済み例外・docs/plans/pre-production-gate.md A1)。
 #   **Linux 値で GOLDEN を上書きしない**。プラットフォーム非依存の不変量(引数無視の
 #   バイト一致・ハッシュ枝刈りのビット一致・非貫通・同 seed 再現)は全 OS で検収を維持する。
